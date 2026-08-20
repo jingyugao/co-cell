@@ -10,6 +10,7 @@ RUN pnpm install --frozen-lockfile
 
 COPY src ./src
 COPY bin ./bin
+COPY templates ./templates
 
 # The controller talks to the host daemon through a mounted Docker socket.
 # Agent sandboxes themselves never receive that socket.

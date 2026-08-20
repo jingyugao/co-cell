@@ -29,8 +29,8 @@ RUN case "$TARGETARCH" in \
     && rm -rf /tmp/glab.tar.gz /tmp/bin
 
 COPY bin/apply_patch /usr/local/bin/apply_patch
-COPY bin/git-askpass /usr/local/bin/git-askpass
-COPY bin/gitlab-init /usr/local/bin/gitlab-init
+COPY templates/software-engineer/sandbox/bin/git-askpass /usr/local/bin/git-askpass
+COPY templates/software-engineer/sandbox/bin/gitlab-init /usr/local/bin/gitlab-init
 RUN chmod 0755 \
       /usr/local/bin/apply_patch \
       /usr/local/bin/git-askpass \

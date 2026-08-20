@@ -5,7 +5,8 @@ services:
     image: agent-staff-control:local
     environment:
       AGENT_SANDBOX: ${AGENT_SANDBOX:-shared-docker}
-      AGENT_SANDBOX_IMAGE: agent-staff-sandbox-python:3.12
+      AGENT_TEMPLATE_DIR: ${AGENT_TEMPLATE_DIR:-/app/templates/software-engineer}
+      AGENT_SANDBOX_IMAGE: ${AGENT_SANDBOX_IMAGE:-agent-staff-sandbox-python:3.12}
       AGENT_SHARED_SANDBOX_NAME: ${AGENT_SHARED_SANDBOX_NAME:-agent-staff-dev-sandbox}
       AGENT_SANDBOX_NETWORK: ${AGENT_SANDBOX_NETWORK:-none}
       AGENT_WORKSPACE_ROOT: ${AGENT_WORKSPACE_ROOT:-/srv/agent-workspaces}
@@ -29,8 +30,8 @@ services:
     profiles: ["images"]
     build:
       context: .
-      dockerfile: docker/sandbox-python/Dockerfile
-    image: agent-staff-sandbox-python:3.12
+      dockerfile: ${AGENT_SANDBOX_DOCKERFILE:-templates/software-engineer/sandbox/Dockerfile}
+    image: ${AGENT_SANDBOX_IMAGE:-agent-staff-sandbox-python:3.12}
     command: ["true"]
 
   checkpoint-postgres:

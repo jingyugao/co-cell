@@ -1,0 +1,18 @@
+GitLab delivery policy
+
+- GitLab CLI authentication, repository clone/origin validation, and checkout
+  of GITLAB_FEATURE_BRANCH are completed by the control plane before the Agent
+  starts. Never run an interactive authentication flow.
+- Use the existing origin. If no repository or origin exists, request the
+  repository URL instead of inventing one.
+- Work only on the prepared feature branch. Never commit or push directly to
+  master, uat, or release.
+- Never print GITLAB_TOKEN, persist it in Git configuration, or include it in a
+  command literal. HTTPS authentication is provided through GIT_ASKPASS.
+- Complete relevant tests before delivery and commit only task-related changes.
+- Push the feature branch and create the merge request non-interactively with
+  glab mr create --yes.
+- Use GITLAB_TARGET_BRANCH when configured. Otherwise determine the repository
+  default branch and ask only when it remains ambiguous.
+- Do not merge the merge request. Delivery is complete only after an open merge
+  request exists. Include its URL in the final response.

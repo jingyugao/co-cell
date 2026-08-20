@@ -7,6 +7,7 @@ import { loginWithDeviceCode } from "./auth/codex-oauth.js";
 import { createPostgresCheckpointer } from "./persistence/postgres-checkpointer.js";
 import { verifyGitLabMergeRequest } from "./integrations/gitlab.js";
 import { createTerminalUserInputHandler } from "./tools/request-user-input.js";
+import { loadAgentTemplate } from "./templates/loader.js";
 import {
   allocateAgentWorkspace,
   createTaskSandbox,
@@ -152,18 +153,13 @@ async function main(): Promise<void> {
         "GitLab delivery requires a Docker sandbox so authentication and repository initialization complete before the Agent starts",
       );
     }
-    const gitlabDeliveryInstructions = gitlabEnvironment
-      ? [
-          `GitLab delivery is required for this task.
-- GitLab CLI authentication, repository clone/origin validation, and checkout of GITLAB_FEATURE_BRANCH were completed by the control plane before you started. Never run an interactive auth flow.
-- If GITLAB_REPOSITORY is absent, use the existing origin. If neither exists, request the repository URL instead of inventing one.
-- Work only on a feature branch. Never commit or push directly to master, uat, or release.
-- Never print, persist in Git config, or include GITLAB_TOKEN in a command literal; HTTPS Git authentication is already provided through GIT_ASKPASS.
-- Complete relevant tests before delivery, commit only task-related changes, and push the feature branch.
-- Create the MR non-interactively with glab mr create --yes. Use GITLAB_TARGET_BRANCH when set; otherwise determine the repository default branch and ask only if it remains ambiguous.
-- Do not merge the MR. The task is complete only after an MR exists; include its URL in the final response.`,
-        ]
-      : [];
+    const template = await loadAgentTemplate({
+      directory:
+        valueAfter("--template") ??
+        process.env.AGENT_TEMPLATE_DIR ??
+        resolve("templates/software-engineer"),
+      capabilities: new Set(gitlabEnvironment ? ["gitlab"] : []),
+    });
     try {
       const sandbox = await createTaskSandbox({
         backend: sandboxBackend,
@@ -190,7 +186,7 @@ async function main(): Promise<void> {
           model: valueAfter("--model"),
           requestUserInput: createTerminalUserInputHandler(),
           runId,
-          additionalInstructions: gitlabDeliveryInstructions,
+          additionalInstructions: template.instructions,
           requireMergeRequest: Boolean(gitlabEnvironment),
           ...(checkpointHandle
             ? { checkpointer: checkpointHandle.checkpointer, threadId }
@@ -219,6 +215,7 @@ async function main(): Promise<void> {
   process.stderr.write(
     "Usage:\n" +
       "  pnpm auth\n" +
+      "  pnpm agent -- --template PATH --agent-id ID --task TEXT\n" +
       "  pnpm agent -- --agent-id ID --task TEXT  # shared-docker allocates workspace\n" +
       "  pnpm agent -- --workspace PATH --task TEXT\n" +
       "  pnpm agent -- --workspace PATH --task-file FILE\n" +

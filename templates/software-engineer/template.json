@@ -1,0 +1,19 @@
+{
+  "id": "software-engineer",
+  "name": "Software Engineer",
+  "version": 1,
+  "knowledge": [
+    {
+      "path": "knowledge/software-engineering.txt"
+    },
+    {
+      "path": "knowledge/gitlab-delivery.txt",
+      "when": "gitlab"
+    }
+  ],
+  "sandbox": {
+    "dockerfile": "sandbox/Dockerfile",
+    "image": "agent-staff-sandbox-python:3.12"
+  },
+  "environmentExample": ".env.example"
+}

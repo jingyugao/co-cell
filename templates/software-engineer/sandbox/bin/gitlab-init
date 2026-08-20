@@ -23,13 +23,13 @@ if ! glab auth status --hostname "$GITLAB_HOST" >"$auth_log" 2>&1; then
       --git-protocol "$protocol" \
       --api-protocol "$protocol" \
       >"$auth_log" 2>&1; then
-    cat "$auth_log" >&2
+    sed 's/token:.*/token: [redacted]/' "$auth_log" >&2
     exit 1
   fi
 fi
 
 if ! glab auth status --hostname "$GITLAB_HOST" >"$auth_log" 2>&1; then
-  cat "$auth_log" >&2
+  sed 's/token:.*/token: [redacted]/' "$auth_log" >&2
   exit 1
 fi
 printf 'gitlab=%s authenticated\n' "$GITLAB_HOST"

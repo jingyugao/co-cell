@@ -1,0 +1,33 @@
+{
+  "name": "agent-staff-coding-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "auth": "tsx src/cli.ts auth",
+    "agent": "tsx src/cli.ts run",
+    "check": "pnpm typecheck && pnpm test",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:postgres": "vitest run test/postgres-checkpointer.integration.test.ts --reporter=verbose"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.0.6",
+    "@langchain/langgraph": "^1.4.12",
+    "@langchain/langgraph-checkpoint": "^1.1.5",
+    "@langchain/langgraph-checkpoint-postgres": "^1.0.5",
+    "@langchain/openai": "^1.5.9",
+    "langchain": "^1.5.10",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  },
+  "packageManager": "pnpm@10.33.4"
+}

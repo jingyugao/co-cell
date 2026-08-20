@@ -1,0 +1,105 @@
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+
+import { describe, expect, test } from "vitest";
+
+import type {
+  DockerCommandResult,
+  DockerCommandRunner,
+} from "../src/sandbox/docker.js";
+import { SharedDockerSandboxProvider } from "../src/sandbox/shared-docker.js";
+import type { SandboxSpec } from "../src/sandbox/types.js";
+
+class FakeChild extends EventEmitter {
+  stdin = new PassThrough();
+  stdout = new PassThrough();
+  stderr = new PassThrough();
+  pid = 999_998;
+
+  kill(): boolean {
+    return true;
+  }
+}
+
+class FakeRunner implements DockerCommandRunner {
+  readonly calls: string[][] = [];
+  readonly children: FakeChild[] = [];
+
+  async run(args: readonly string[]): Promise<DockerCommandResult> {
+    this.calls.push([...args]);
+    if (args[0] === "inspect") {
+      return { stdout: "", stderr: "not found", exitCode: 1 };
+    }
+    return { stdout: "shared-container\n", stderr: "", exitCode: 0 };
+  }
+
+  spawn(args: readonly string[]): ChildProcessWithoutNullStreams {
+    this.calls.push([...args]);
+    const child = new FakeChild();
+    this.children.push(child);
+    return child as unknown as ChildProcessWithoutNullStreams;
+  }
+}
+
+function spec(): SandboxSpec {
+  return {
+    runId: "requirement-1001",
+    image: "agent-staff-sandbox-python:3.12",
+    workspace: {
+      id: "requirement-1001",
+      mountPath: "/agent-workspaces/requirement-1001/repo",
+    },
+    workingDirectory: "/agent-workspaces/requirement-1001/repo",
+    resources: { cpu: 2, memoryMb: 4096 },
+    networkProfile: "bridge",
+    env: { HOME: "/tmp/agent-home-requirement-1001" },
+  };
+}
+
+describe("SharedDockerSandboxProvider", () => {
+  test("creates one persistent container and only destroys the logical handle", async () => {
+    const runner = new FakeRunner();
+    const provider = new SharedDockerSandboxProvider({
+      hostWorkspaceRoot: process.cwd(),
+      containerName: "agent-staff-test-shared",
+      commandRunner: runner,
+      user: "1234:1234",
+    });
+
+    const sandbox = await provider.create(spec());
+    expect(runner.calls[0]).toEqual(["inspect", "agent-staff-test-shared"]);
+    const create = runner.calls.find((call) => call[0] === "create") ?? [];
+    expect(create).toContain("agent-staff.shared-sandbox=true");
+    expect(create).toContain("agent-staff-sandbox-python:3.12");
+
+    const pending = sandbox.exec({ command: "pwd" });
+    const child = runner.children[0];
+    if (!child) throw new Error("Expected docker exec child");
+    child.stdout.write("/agent-workspaces/requirement-1001/repo\n");
+    child.emit("exit", 0, null);
+    await expect(pending).resolves.toMatchObject({ exitCode: 0 });
+
+    const exec = runner.calls.at(-1) ?? [];
+    expect(exec).toContain("HOME=/tmp/agent-home-requirement-1001");
+    expect(exec).toContain("/agent-workspaces/requirement-1001/repo");
+
+    await sandbox.destroy();
+    expect(runner.calls.some((call) => call[0] === "rm")).toBe(false);
+    await expect(provider.get(sandbox.id)).resolves.toBeUndefined();
+  });
+
+  test("rejects commands outside the assigned Agent directory", async () => {
+    const runner = new FakeRunner();
+    const provider = new SharedDockerSandboxProvider({
+      hostWorkspaceRoot: process.cwd(),
+      commandRunner: runner,
+    });
+    const sandbox = await provider.create(spec());
+
+    await expect(
+      sandbox.exec({ command: "pwd", cwd: "/agent-workspaces/another-agent" }),
+    ).rejects.toThrow("outside agent workspace");
+    await sandbox.destroy();
+  });
+});

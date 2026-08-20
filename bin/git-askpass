@@ -1,0 +1,16 @@
+#!/bin/sh
+
+case "$1" in
+  *sername*)
+    printf '%s\n' "${GITLAB_USERNAME:-oauth2}"
+    ;;
+  *assword*)
+    if [ -z "${GITLAB_TOKEN:-}" ]; then
+      exit 1
+    fi
+    printf '%s\n' "$GITLAB_TOKEN"
+    ;;
+  *)
+    exit 1
+    ;;
+esac

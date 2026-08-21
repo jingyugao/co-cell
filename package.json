@@ -6,27 +6,43 @@
   "scripts": {
     "auth": "tsx src/cli.ts auth",
     "agent": "tsx src/cli.ts run",
-    "check": "pnpm typecheck && pnpm test",
+    "check": "pnpm typecheck && pnpm typecheck:web && pnpm test",
+    "db:migrate": "tsx src/persistence/migrate-business-database.ts",
+    "server": "tsx src/server/main.ts",
     "typecheck": "tsc --noEmit",
+    "typecheck:web": "tsc --noEmit -p web/tsconfig.json",
     "test": "vitest run",
-    "test:postgres": "vitest run test/postgres-checkpointer.integration.test.ts --reporter=verbose"
+    "test:postgres": "vitest run test/postgres-checkpointer.integration.test.ts test/business-database.integration.test.ts test/workbench-api.integration.test.ts test/requirement-workflow.integration.test.ts --reporter=verbose",
+    "web:dev": "vite --config web/vite.config.ts",
+    "web:build": "pnpm typecheck:web && vite build --config web/vite.config.ts",
+    "web:preview": "vite preview --config web/vite.config.ts"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "@hono/node-server": "^2.1.1",
     "@langchain/core": "^1.0.6",
     "@langchain/langgraph": "^1.4.12",
     "@langchain/langgraph-checkpoint": "^1.1.5",
     "@langchain/langgraph-checkpoint-postgres": "^1.0.5",
     "@langchain/openai": "^1.5.9",
+    "hono": "^4.13.3",
     "langchain": "^1.5.10",
+    "pg": "^8.23.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.1.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
+    "vite": "^8.2.2",
     "vitest": "^4.0.18"
   },
   "packageManager": "pnpm@10.33.4"

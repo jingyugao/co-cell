@@ -102,4 +102,21 @@ describe("SharedDockerSandboxProvider", () => {
     ).rejects.toThrow("outside agent workspace");
     await sandbox.destroy();
   });
+
+  test("resolves relative command directories from the assigned workspace", async () => {
+    const runner = new FakeRunner();
+    const provider = new SharedDockerSandboxProvider({
+      hostWorkspaceRoot: process.cwd(),
+      commandRunner: runner,
+    });
+    const sandbox = await provider.create(spec());
+
+    const pending = sandbox.exec({ command: "pwd", cwd: "." });
+    const child = runner.children[0];
+    if (!child) throw new Error("Expected docker exec child");
+    child.emit("exit", 0, null);
+    await expect(pending).resolves.toMatchObject({ exitCode: 0 });
+    expect(runner.calls.at(-1)).toContain("/agent-workspaces/requirement-1001/repo");
+    await sandbox.destroy();
+  });
 });

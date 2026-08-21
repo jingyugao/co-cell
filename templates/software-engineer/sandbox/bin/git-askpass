@@ -1,8 +1,0 @@
-#!/bin/sh
-set -eu
-
-case "${1:-}" in
-  *sername*|*Username*) printf '%s\n' "${GITLAB_USERNAME:-oauth2}" ;;
-  *assword*|*Password*) printf '%s\n' "${GITLAB_TOKEN:?GITLAB_TOKEN is required}" ;;
-  *) printf '\n' ;;
-esac

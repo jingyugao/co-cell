@@ -224,10 +224,11 @@ class SharedDockerSandbox implements Sandbox {
     if (this.status !== "running") {
       throw new Error(`Cannot execute command in ${this.status} sandbox`);
     }
-    const cwd =
-      request.cwd ??
-      this.options.spec.workingDirectory ??
-      this.options.spec.workspace.mountPath;
+    const defaultCwd =
+      this.options.spec.workingDirectory ?? this.options.spec.workspace.mountPath;
+    const cwd = request.cwd
+      ? isAbsolute(request.cwd) ? request.cwd : posix.resolve(defaultCwd, request.cwd)
+      : defaultCwd;
     assertWorkspacePath(cwd, this.options.spec.workspace);
     const args = ["exec", "-i", "--workdir", cwd];
     const environment = { ...this.options.spec.env, ...request.env };

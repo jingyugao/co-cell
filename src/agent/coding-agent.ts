@@ -1,5 +1,6 @@
 import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
+import { isInterrupted } from "@langchain/langgraph";
 import {
   createAgent,
   createMiddleware,
@@ -15,6 +16,7 @@ import { findGitLabMergeRequestUrl } from "../integrations/gitlab.js";
 import { BashProcessManager, createBashTool } from "../tools/bash.js";
 import {
   createRequestUserInputTool,
+  type RequestUserInput,
   type RequestUserInputHandler,
 } from "../tools/request-user-input.js";
 import { createViewImageTool } from "../tools/view-image.js";
@@ -189,6 +191,7 @@ export interface CodingTaskResult {
   messages: unknown[];
   todos: Todo[];
   mergeRequestUrl?: string;
+  userInputRequest?: RequestUserInput;
 }
 
 export function renderMessageContent(content: unknown): string {
@@ -287,6 +290,15 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
       },
     );
     const messages = result.messages ?? [];
+    if (isInterrupted<RequestUserInput>(result)) {
+      const request = result.__interrupt__[0]?.value;
+      return {
+        finalResponse: "",
+        messages,
+        todos: result.todos ?? [],
+        ...(request ? { userInputRequest: request } : {}),
+      };
+    }
     const finalMessage = [...messages]
       .reverse()
       .find((message): message is AIMessage => message instanceof AIMessage);

@@ -7,6 +7,7 @@ import { tool } from "langchain";
 import { z } from "zod";
 
 import type { Sandbox } from "../sandbox/types.js";
+import { redactSensitiveText } from "../security/redact.js";
 
 export interface BashResult {
   wall_time_seconds: number;
@@ -35,7 +36,10 @@ const BashInputSchema = z
     workdir: z
       .string()
       .optional()
-      .describe("Working directory. Defaults to the sandbox workspace."),
+      .describe(
+        "Working directory inside the assigned workspace. Relative paths are resolved " +
+        "from the workspace root; defaults to the workspace root.",
+      ),
     session_id: z
       .string()
       .optional()
@@ -247,7 +251,8 @@ export function createBashTool(executor: BashProcessManager | Sandbox) {
   return tool(
     async (input: BashInput) => {
       if (executor instanceof BashProcessManager) {
-        return JSON.stringify(await executor.execute(input));
+        const result = await executor.execute(input);
+        return JSON.stringify({ ...result, output: redactSensitiveText(result.output) });
       }
       const result = input.session_id
         ? await executor.continue({
@@ -265,7 +270,7 @@ export function createBashTool(executor: BashProcessManager | Sandbox) {
           });
       return JSON.stringify({
         wall_time_seconds: result.wallTimeSeconds,
-        output: result.output,
+        output: redactSensitiveText(result.output),
         ...(result.exitCode === undefined ? {} : { exit_code: result.exitCode }),
         ...(result.sessionId ? { session_id: result.sessionId } : {}),
         ...(result.originalTokenCount

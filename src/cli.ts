@@ -7,7 +7,7 @@ import { loginWithDeviceCode } from "./auth/codex-oauth.js";
 import { createPostgresCheckpointer } from "./persistence/postgres-checkpointer.js";
 import { verifyGitLabMergeRequest } from "./integrations/gitlab.js";
 import { createTerminalUserInputHandler } from "./tools/request-user-input.js";
-import { loadAgentTemplate } from "./templates/loader.js";
+import { loadAgentSpec } from "./specs/loader.js";
 import {
   allocateAgentWorkspace,
   createTaskSandbox,
@@ -114,9 +114,6 @@ async function main(): Promise<void> {
       );
     }
     const gitlabUsername = process.env.GITLAB_USERNAME?.trim() || "oauth2";
-    const gitlabTargetBranch = process.env.GITLAB_TARGET_BRANCH?.trim();
-    const gitlabRepository =
-      valueAfter("--repository") ?? process.env.GITLAB_REPOSITORY?.trim();
     const gitlabFeatureBranch =
       process.env.GITLAB_FEATURE_BRANCH?.trim() ||
       `agent/${threadId.toLowerCase().replace(/[^a-z0-9._-]/g, "-").slice(0, 80)}`;
@@ -135,13 +132,7 @@ async function main(): Promise<void> {
             GLAB_CONFIG_DIR: `${gitlabHome}/.config/glab-cli`,
             GIT_ASKPASS: "/usr/local/bin/git-askpass",
             GIT_TERMINAL_PROMPT: "0",
-            ...(gitlabRepository
-              ? { GITLAB_REPOSITORY: gitlabRepository }
-              : {}),
             GITLAB_FEATURE_BRANCH: gitlabFeatureBranch,
-            ...(gitlabTargetBranch
-              ? { GITLAB_TARGET_BRANCH: gitlabTargetBranch }
-              : {}),
           }
         : undefined;
     if (
@@ -153,11 +144,11 @@ async function main(): Promise<void> {
         "GitLab delivery requires a Docker sandbox so authentication and repository initialization complete before the Agent starts",
       );
     }
-    const template = await loadAgentTemplate({
+    const spec = await loadAgentSpec({
       directory:
-        valueAfter("--template") ??
-        process.env.AGENT_TEMPLATE_DIR ??
-        resolve("templates/software-engineer"),
+        valueAfter("--spec") ??
+        process.env.AGENT_SPEC_DIR ??
+        resolve("agent-specs/software-engineer"),
       capabilities: new Set(gitlabEnvironment ? ["gitlab"] : []),
     });
     try {
@@ -186,7 +177,7 @@ async function main(): Promise<void> {
           model: valueAfter("--model"),
           requestUserInput: createTerminalUserInputHandler(),
           runId,
-          additionalInstructions: template.instructions,
+          additionalInstructions: spec.instructions,
           requireMergeRequest: Boolean(gitlabEnvironment),
           ...(checkpointHandle
             ? { checkpointer: checkpointHandle.checkpointer, threadId }
@@ -212,17 +203,22 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "server") {
+    await import("./server/main.js");
+    return;
+  }
+
   process.stderr.write(
-    "Usage:\n" +
+      "Usage:\n" +
       "  pnpm auth\n" +
-      "  pnpm agent -- --template PATH --agent-id ID --task TEXT\n" +
+      "  pnpm run server\n" +
+      "  pnpm agent -- --spec PATH --agent-id ID --task TEXT\n" +
       "  pnpm agent -- --agent-id ID --task TEXT  # shared-docker allocates workspace\n" +
       "  pnpm agent -- --workspace PATH --task TEXT\n" +
       "  pnpm agent -- --workspace PATH --task-file FILE\n" +
       "  AGENT_CHECKPOINT_DATABASE_URL=... pnpm agent -- --thread-id THREAD --workspace PATH --task TEXT\n" +
       "  AGENT_CHECKPOINT_DATABASE_URL=... pnpm agent -- --resume --thread-id THREAD --workspace PATH\n" +
       "  pnpm agent -- --sandbox docker --sandbox-image IMAGE --workspace PATH --task TEXT\n" +
-      "  pnpm agent -- --repository GITLAB_URL --workspace PATH --task TEXT\n" +
       "  OPENAI_API_KEY=... pnpm agent -- --base-url URL --model MODEL --workspace PATH --task TEXT\n",
   );
   process.exitCode = 2;

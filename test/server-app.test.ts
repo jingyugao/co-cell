@@ -1,0 +1,309 @@
+import { randomUUID } from "node:crypto";
+
+import { describe, expect, test, vi } from "vitest";
+
+import type { WorkbenchQueries } from "../src/application/workbench-query-service.js";
+import type { RequirementWorkflow } from "../src/application/requirement-workflow-service.js";
+import { NotFoundError } from "../src/application/errors.js";
+import type { AgentInstanceDetail, AgentSpecSummary, ProjectWorkbench, RunDetail } from "../src/contracts/workbench.js";
+import { createApp } from "../src/server/app.js";
+
+const projectId = randomUUID();
+const runId = randomUUID();
+const assignmentId = randomUUID();
+const agentInstanceId = randomUUID();
+const softwareEngineerSpec: AgentSpecSummary = {
+  id: "software-engineer",
+  name: "Software Engineer",
+  version: 1,
+  knowledge: [],
+  sandbox: { dockerfile: "sandbox/Dockerfile", image: "agent-staff:latest" },
+  environmentExample: ".env.example",
+};
+const workbenchResponse: ProjectWorkbench = {
+  project: {
+    id: projectId,
+    source: "feishu",
+    externalProjectId: "PROJ-1",
+    name: "Example",
+    status: "active",
+    owner: "研发组",
+    updatedAt: "2026-08-20T12:00:00.000Z",
+  },
+  statistics: { activeRuns: 1, totalRuns: 1, completedRuns: 0, successRate: null },
+  primaryAgentInstance: null,
+  currentRun: null,
+  recentRuns: [],
+  latestInboxEvent: null,
+  runtime: { status: "unknown", name: "sandbox", latencyMs: null },
+};
+
+function queries(overrides: Partial<WorkbenchQueries> = {}): WorkbenchQueries {
+  return {
+    ping: vi.fn(async () => undefined),
+    listProjects: vi.fn(async () => ({ items: [], nextCursor: null })),
+    listProjectRuns: vi.fn(async () => ({ items: [], nextCursor: null })),
+    listInboxEvents: vi.fn(async () => ({ items: [], nextCursor: null })),
+    listRuns: vi.fn(async () => ({ items: [], nextCursor: null })),
+    listAllInboxEvents: vi.fn(async () => ({ items: [], nextCursor: null })),
+    getAgentSpecUsage: vi.fn(async () => ({
+      statistics: { instances: 0, activeRequirements: 0, runningInstances: 0 },
+      activeRequirements: [],
+    })),
+    getProjectWorkbench: vi.fn(async () => workbenchResponse),
+    getAgentInstance: vi.fn(async (): Promise<AgentInstanceDetail> => ({
+      agentInstance: {
+        id: randomUUID(),
+        specKey: "software-engineer",
+        specVersion: 1,
+        status: "idle",
+        workspaceKey: "workspace",
+        threadId: "thread",
+        lastActiveAt: null,
+        createdAt: "2026-08-20T12:00:00.000Z",
+      },
+      assignment: null,
+      currentRun: null,
+      recentRuns: [],
+    })),
+    getAgentConversation: vi.fn(async () => ({
+      threadId: "thread",
+      checkpointId: null,
+      messages: [],
+    })),
+    getRun: vi.fn(async (): Promise<RunDetail> => ({
+      id: runId,
+      projectId,
+      agentInstanceId: randomUUID(),
+      status: "running",
+      taskSummary: "Task",
+      resultSummary: null,
+      mergeRequestUrl: null,
+      error: null,
+      trigger: null,
+      startedAt: null,
+      finishedAt: null,
+      createdAt: "2026-08-20T12:00:00.000Z",
+      updatedAt: "2026-08-20T12:00:00.000Z",
+    })),
+    getRunEvents: vi.fn(async () => ({ items: [], lastSequence: 0 })),
+    ...overrides,
+  };
+}
+
+describe("Hono server app", () => {
+  const specCatalog = {
+    list: vi.fn(async () => ({ items: [] })),
+    get: vi.fn(async () => null),
+  };
+  test("serves liveness and readiness checks", async () => {
+    const app = createApp({ workbench: queries(), specCatalog, enableRequestLogger: false });
+    expect((await app.request("/healthz")).status).toBe(200);
+    expect((await app.request("/readyz")).status).toBe(200);
+  });
+
+  test("returns 503 when the database is not ready", async () => {
+    const app = createApp({
+      workbench: queries({ ping: vi.fn(async () => Promise.reject(new Error("down"))) }),
+      specCatalog,
+      enableRequestLogger: false,
+    });
+    expect((await app.request("/readyz")).status).toBe(503);
+  });
+
+  test("validates and serves the workbench route", async () => {
+    const getProjectWorkbench = vi.fn(async () => workbenchResponse);
+    const app = createApp({
+      workbench: queries({ getProjectWorkbench }),
+      specCatalog,
+      enableRequestLogger: false,
+    });
+    const response = await app.request(`/api/v1/projects/${projectId}/workbench`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ project: { id: projectId } });
+    expect(getProjectWorkbench).toHaveBeenCalledWith(projectId);
+    expect((await app.request("/api/v1/projects/not-a-uuid/workbench")).status).toBe(400);
+  });
+
+  test("maps application errors and validates event pagination", async () => {
+    const app = createApp({
+      workbench: queries({
+        getProjectWorkbench: vi.fn(async () => Promise.reject(new NotFoundError("Project"))),
+      }),
+      specCatalog,
+      enableRequestLogger: false,
+    });
+    expect((await app.request(`/api/v1/projects/${projectId}/workbench`)).status).toBe(404);
+    expect((await app.request(`/api/v1/runs/${runId}/events?limit=0`)).status).toBe(400);
+  });
+
+  test("serves the read-only Project tabs", async () => {
+    const listProjectRuns = vi.fn(async () => ({ items: [], nextCursor: null }));
+    const listInboxEvents = vi.fn(async () => ({ items: [], nextCursor: null }));
+    const app = createApp({
+      workbench: queries({ listProjectRuns, listInboxEvents }),
+      specCatalog,
+      enableRequestLogger: false,
+    });
+    expect((await app.request(`/api/v1/projects/${projectId}/runs?limit=25`)).status).toBe(200);
+    expect((await app.request(`/api/v1/projects/${projectId}/inbox-events?limit=25`)).status).toBe(200);
+    expect(listProjectRuns).toHaveBeenCalledWith(projectId, { limit: 25 });
+    expect(listInboxEvents).toHaveBeenCalledWith(projectId, { limit: 25 });
+  });
+
+  test("serves the global read-only navigation", async () => {
+    const app = createApp({ workbench: queries(), specCatalog, enableRequestLogger: false });
+    expect((await app.request("/api/v1/runs?limit=25")).status).toBe(200);
+    expect((await app.request("/api/v1/inbox-events?limit=25")).status).toBe(200);
+    expect((await app.request("/api/v1/agent-specs")).status).toBe(200);
+  });
+
+  test("serves and validates the Agent Instance detail route", async () => {
+    const getAgentInstance = vi.fn(async (): Promise<AgentInstanceDetail> => ({
+      agentInstance: {
+        id: agentInstanceId,
+        specKey: "software-engineer",
+        specVersion: 1,
+        status: "idle",
+        workspaceKey: "workspace",
+        threadId: "thread",
+        lastActiveAt: null,
+        createdAt: "2026-08-20T12:00:00.000Z",
+      },
+      assignment: null,
+      currentRun: null,
+      recentRuns: [],
+    }));
+    const app = createApp({
+      workbench: queries({ getAgentInstance }),
+      specCatalog,
+      enableRequestLogger: false,
+    });
+    const response = await app.request(`/api/v1/agent-instances/${agentInstanceId}`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ agentInstance: { id: agentInstanceId } });
+    expect(getAgentInstance).toHaveBeenCalledWith(agentInstanceId);
+    expect((await app.request("/api/v1/agent-instances/not-a-uuid")).status).toBe(400);
+  });
+
+  test("serves an Agent Instance conversation", async () => {
+    const getAgentConversation = vi.fn(async () => ({
+      threadId: "thread",
+      checkpointId: "checkpoint-1",
+      messages: [{
+        id: "message-1",
+        role: "ai" as const,
+        name: "coding-agent",
+        content: "正在检查代码",
+        toolCallId: null,
+        toolCalls: [],
+        status: null,
+      }],
+    }));
+    const app = createApp({
+      workbench: queries({ getAgentConversation }),
+      specCatalog,
+      enableRequestLogger: false,
+    });
+    const response = await app.request(`/api/v1/agent-instances/${agentInstanceId}/conversation`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ messages: [{ content: "正在检查代码" }] });
+    expect(getAgentConversation).toHaveBeenCalledWith(agentInstanceId);
+  });
+
+  test("serves an Agent Spec with each active requirement association", async () => {
+    const getAgentSpecUsage = vi.fn(async () => ({
+      statistics: { instances: 2, activeRequirements: 2, runningInstances: 1 },
+      activeRequirements: [],
+    }));
+    const app = createApp({
+      workbench: queries({ getAgentSpecUsage }),
+      specCatalog: {
+        list: vi.fn(async () => ({ items: [softwareEngineerSpec] })),
+        get: vi.fn(async (key: string) => key === softwareEngineerSpec.id ? softwareEngineerSpec : null),
+      },
+      enableRequestLogger: false,
+    });
+    const response = await app.request("/api/v1/agent-specs/software-engineer");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      spec: { id: "software-engineer" },
+      statistics: { instances: 2, activeRequirements: 2 },
+    });
+    expect(getAgentSpecUsage).toHaveBeenCalledWith("software-engineer");
+    expect((await app.request("/api/v1/agent-specs/unknown")).status).toBe(404);
+    expect((await app.request("/api/v1/agent-specs/invalid%20key")).status).toBe(400);
+  });
+
+  test("previews a live Feishu requirement and starts an assigned Agent", async () => {
+    const preview = vi.fn(async () => ({
+      sourceUrl: "https://project.feishu.cn/example-project/story/detail/1234567890",
+      projectKey: "space-key",
+      project: { key: "space-key", simpleName: "example-project", name: "研发空间" },
+      workItemId: "1234567890",
+      workItemType: { key: "story", name: "需求" },
+      title: "实时需求",
+      status: { key: "developing", name: "开发中" },
+      roles: [],
+      currentNodes: [],
+      fields: [],
+      updatedAt: null,
+      assignments: [],
+    }));
+    const assign = vi.fn(async () => ({
+      projectId,
+      assignmentId,
+      agentInstance: {
+        id: randomUUID(),
+        specKey: "software-engineer",
+        specVersion: 1,
+        role: "backend-a",
+        workspaceKey: "workspace",
+        threadId: "thread",
+        status: "idle" as const,
+      },
+    }));
+    const start = vi.fn(async () => ({
+      runId,
+      projectId,
+      agentInstanceId: randomUUID(),
+      status: "queued" as const,
+    }));
+    const requirements: RequirementWorkflow = { preview, assign, start };
+    const app = createApp({
+      workbench: queries(),
+      specCatalog,
+      requirements,
+      enableRequestLogger: false,
+    });
+    const sourceUrl = "https://project.feishu.cn/example-project/story/detail/1234567890";
+    const previewResponse = await app.request("/api/v1/feishu-project/work-items/preview", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: sourceUrl }),
+    });
+    expect(previewResponse.status).toBe(200);
+    expect(await previewResponse.json()).toMatchObject({ title: "实时需求" });
+    expect(preview).toHaveBeenCalledWith(sourceUrl);
+
+    const assignmentResponse = await app.request("/api/v1/agent-assignments", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        url: sourceUrl,
+        specKey: "software-engineer",
+        role: "backend-a",
+      }),
+    });
+    expect(assignmentResponse.status).toBe(201);
+    expect(await assignmentResponse.json()).toMatchObject({ assignmentId });
+    expect(assign).toHaveBeenCalledOnce();
+
+    const runResponse = await app.request(`/api/v1/agent-assignments/${assignmentId}/runs`, {
+      method: "POST",
+    });
+    expect(runResponse.status).toBe(202);
+    expect(await runResponse.json()).toMatchObject({ runId, status: "queued" });
+    expect(start).toHaveBeenCalledWith(assignmentId);
+  });
+});

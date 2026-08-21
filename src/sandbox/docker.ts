@@ -221,7 +221,11 @@ class DockerSandbox implements Sandbox {
     if (this.status !== "running") {
       throw new Error(`Cannot execute command in ${this.status} sandbox`);
     }
-    const cwd = request.cwd ?? this.options.spec.workingDirectory ?? `${this.options.spec.workspace.mountPath}/repo`;
+    const defaultCwd =
+      this.options.spec.workingDirectory ?? `${this.options.spec.workspace.mountPath}/repo`;
+    const cwd = request.cwd
+      ? isAbsolute(request.cwd) ? request.cwd : posix.resolve(defaultCwd, request.cwd)
+      : defaultCwd;
     assertContainerPath(cwd, this.options.spec.workspace);
     const args = ["exec", "-i", "--workdir", cwd];
     for (const [key, value] of Object.entries(request.env ?? {})) {

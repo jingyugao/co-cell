@@ -2,6 +2,9 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { AIMessage } from "@langchain/core/messages";
+import { MemorySaver, StateGraph, MessagesAnnotation, isInterrupted, interrupt } from "@langchain/langgraph";
+import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -34,6 +37,47 @@ describe("request_user_input", () => {
     expect(JSON.parse(result)).toEqual({
       answers: { scope: { answers: ["Small (Recommended)"] } },
     });
+  });
+
+  it("pauses the graph instead of converting leader input into a tool error", async () => {
+    const request = createRequestUserInputTool(async (input) => interrupt(input));
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode("tools", new ToolNode([request]))
+      .addEdge("__start__", "tools")
+      .addEdge("tools", "__end__")
+      .compile({ checkpointer: new MemorySaver() });
+    const question = {
+      questions: [{
+        id: "repository",
+        header: "代码仓库",
+        question: "请提供目标仓库路径。",
+        options: [
+          { label: "提供路径 (Recommended)", description: "按明确仓库继续。" },
+          { label: "补充线索", description: "提供服务名称后再定位。" },
+        ],
+      }],
+    };
+    const result = await graph.invoke(
+      {
+        messages: [new AIMessage({
+          content: "缺少仓库信息，需要负责人确认。",
+          tool_calls: [{
+            id: "request-1",
+            name: "request_user_input",
+            args: question,
+            type: "tool_call",
+          }],
+        })],
+      },
+      { configurable: { thread_id: "missing-repository" } },
+    );
+
+    expect(isInterrupted(result)).toBe(true);
+    if (!isInterrupted(result)) throw new Error("Expected an interrupted graph");
+    expect(result.__interrupt__[0]?.value).toEqual(question);
+    expect(result.messages.some((message) =>
+      message.type === "tool" && String(message.content).includes("Please fix your mistakes")
+    )).toBe(false);
   });
 });
 

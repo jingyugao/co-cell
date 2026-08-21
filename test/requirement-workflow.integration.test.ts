@@ -79,7 +79,7 @@ describePostgres("requirement workflow integration", () => {
       }>(
         `SELECT name, metadata, external_url, external_project_key,
                 external_work_item_type, external_project_id
-           FROM agent_staff.projects WHERE id = $1`,
+           FROM swarm_hive.projects WHERE id = $1`,
         [projectId],
       );
       expect(stored.rows[0]).toEqual({
@@ -109,14 +109,14 @@ describePostgres("requirement workflow integration", () => {
       expect(launch).toHaveBeenCalledWith(runId);
     } finally {
       if (projectId) {
-        await pool.query("DELETE FROM agent_staff.agent_instance_run_events WHERE agent_instance_run_id = $1", [runId]).catch(() => undefined);
-        await pool.query("DELETE FROM agent_staff.agent_instance_runs WHERE project_id = $1", [projectId]).catch(() => undefined);
-        await pool.query("DELETE FROM agent_staff.inbox_events WHERE project_id = $1", [projectId]).catch(() => undefined);
-        await pool.query("DELETE FROM agent_staff.project_agent_instances WHERE project_id = $1", [projectId]).catch(() => undefined);
-        await pool.query("DELETE FROM agent_staff.projects WHERE id = $1", [projectId]).catch(() => undefined);
+        await pool.query("DELETE FROM swarm_hive.agent_instance_run_events WHERE agent_instance_run_id = $1", [runId]).catch(() => undefined);
+        await pool.query("DELETE FROM swarm_hive.agent_instance_runs WHERE project_id = $1", [projectId]).catch(() => undefined);
+        await pool.query("DELETE FROM swarm_hive.inbox_events WHERE project_id = $1", [projectId]).catch(() => undefined);
+        await pool.query("DELETE FROM swarm_hive.project_agent_instances WHERE project_id = $1", [projectId]).catch(() => undefined);
+        await pool.query("DELETE FROM swarm_hive.projects WHERE id = $1", [projectId]).catch(() => undefined);
       }
       if (agentInstanceId) {
-        await pool.query("DELETE FROM agent_staff.agent_instances WHERE id = $1", [agentInstanceId]).catch(() => undefined);
+        await pool.query("DELETE FROM swarm_hive.agent_instances WHERE id = $1", [agentInstanceId]).catch(() => undefined);
       }
       await pool.end();
     }

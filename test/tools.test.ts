@@ -83,8 +83,8 @@ describe("request_user_input", () => {
 
 describe("view_image", () => {
   it("returns an OpenAI input_image block and enforces workspace boundaries", async () => {
-    const workspace = await mkdtemp(join(tmpdir(), "agent-staff-image-"));
-    const outside = await mkdtemp(join(tmpdir(), "agent-staff-outside-"));
+    const workspace = await mkdtemp(join(tmpdir(), "swarm-hive-image-"));
+    const outside = await mkdtemp(join(tmpdir(), "swarm-hive-outside-"));
     try {
       const png = Buffer.from(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",

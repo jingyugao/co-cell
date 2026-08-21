@@ -43,6 +43,7 @@ const runLauncher = new CodingRunLauncher({
   gitlabBaseUrl: config.gitlabBaseUrl,
   gitlabToken: config.gitlabToken,
   gitlabUsername: config.gitlabUsername,
+  kubeconfigPath: config.kubeconfigPath,
   feishuProjectMcpUrl: config.feishuProjectMcpUrl,
   feishuProjectMcpToken: config.feishuProjectMcpToken,
 });
@@ -69,7 +70,7 @@ const app = createApp({
 });
 const server = serve({ fetch: app.fetch, hostname: config.host, port: config.port });
 
-process.stdout.write(`Agent Staff listening on http://${config.host}:${config.port}\n`);
+process.stdout.write(`SwarmHive listening on http://${config.host}:${config.port}\n`);
 
 let stopping = false;
 async function stop(signal: string): Promise<void> {

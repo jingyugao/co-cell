@@ -184,6 +184,17 @@ export function createApp(options: CreateAppOptions): Hono {
     return context.json(await options.workbench.getRun(runId));
   });
 
+  // Keep unknown API routes as JSON 404s; the HTML fallback below is only for SPA pages.
+  app.all("/api/*", (context) =>
+    context.json(
+      {
+        error: { code: "not_found", message: "Resource was not found" },
+        requestId: context.get("requestId"),
+      },
+      404,
+    ),
+  );
+
   app.notFound((context) =>
     context.json(
       {

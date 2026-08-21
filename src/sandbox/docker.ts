@@ -143,6 +143,12 @@ export class DockerSandboxProvider implements SandboxProvider {
       "--workdir",
       workingDirectory,
     ];
+    for (const mount of spec.mounts ?? []) {
+      args.push(
+        "--mount",
+        `type=bind,src=${mount.source},dst=${mount.target}${mount.readOnly ? ",readonly" : ""}`,
+      );
+    }
     for (const [key, value] of Object.entries(spec.env ?? {})) {
       args.push("--env", `${key}=${value}`);
     }

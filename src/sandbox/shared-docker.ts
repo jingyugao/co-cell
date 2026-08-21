@@ -23,7 +23,7 @@ interface DockerInspect {
     Labels?: Record<string, string>;
   };
   State?: { Running?: boolean };
-  Mounts?: Array<{ Source?: string; Destination?: string }>;
+  Mounts?: Array<{ Source?: string; Destination?: string; RW?: boolean }>;
 }
 
 function wait(milliseconds: number): Promise<void> {
@@ -97,7 +97,7 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
   }
 
   private get containerName(): string {
-    return this.options.containerName ?? "agent-staff-dev-sandbox";
+    return this.options.containerName ?? "swarm-hive-dev-sandbox";
   }
 
   private get containerWorkspaceRoot(): string {
@@ -120,12 +120,12 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
       return;
     }
 
-    const createResult = await this.runner.run([
+    const createArgs = [
       "create",
       "--name",
       this.containerName,
       "--label",
-      "agent-staff.shared-sandbox=true",
+      "swarm-hive.shared-sandbox=true",
       "--network",
       spec.networkProfile,
       "--user",
@@ -134,11 +134,20 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
       `type=bind,src=${hostRoot},dst=${this.containerWorkspaceRoot}`,
       "--workdir",
       this.containerWorkspaceRoot,
+    ];
+    for (const mount of spec.mounts ?? []) {
+      createArgs.push(
+        "--mount",
+        `type=bind,src=${mount.source},dst=${mount.target}${mount.readOnly ? ",readonly" : ""}`,
+      );
+    }
+    createArgs.push(
       "--entrypoint",
       "sleep",
       spec.image,
       "infinity",
-    ]);
+    );
+    const createResult = await this.runner.run(createArgs);
     if (createResult.exitCode !== 0) {
       // Two controller processes may race while creating the first shared
       // container. Accept the winner only after applying the same validation.
@@ -164,9 +173,9 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
     const inspected = JSON.parse(inspectOutput) as DockerInspect[];
     const container = inspected[0];
     if (!container) throw new Error("docker inspect returned no shared container");
-    if (container.Config?.Labels?.["agent-staff.shared-sandbox"] !== "true") {
+    if (container.Config?.Labels?.["swarm-hive.shared-sandbox"] !== "true") {
       throw new Error(
-        `Container ${this.containerName} exists but is not managed by agent-staff`,
+        `Container ${this.containerName} exists but is not managed by SwarmHive`,
       );
     }
     if (container.Config.Image !== spec.image) {
@@ -181,6 +190,20 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
       throw new Error(
         `Shared sandbox ${this.containerName} is mounted to a different workspace root`,
       );
+    }
+    for (const required of spec.mounts ?? []) {
+      const configured = container.Mounts?.find(
+        (candidate) => candidate.Destination === required.target,
+      );
+      if (
+        !configured ||
+        (await realpath(configured.Source ?? "")) !== await realpath(required.source) ||
+        (required.readOnly === true && configured.RW !== false)
+      ) {
+        throw new Error(
+          `Shared sandbox ${this.containerName} is missing required mount ${required.target}. Recreate it before starting agents.`,
+        );
+      }
     }
     if (!container.State?.Running) {
       const startResult = await this.runner.run(["start", this.containerName]);

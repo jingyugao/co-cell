@@ -55,13 +55,13 @@ describePostgres("business database integration", () => {
     try {
       await client.query("BEGIN");
       const project = await client.query<{ id: string }>(
-        `INSERT INTO agent_staff.projects(source, external_project_id, name)
+        `INSERT INTO swarm_hive.projects(source, external_project_id, name)
          VALUES ('feishu_project', $1, 'Migration integration project')
          RETURNING id`,
         [`project-${randomUUID()}`],
       );
       const agentInstance = await client.query<{ id: string }>(
-        `INSERT INTO agent_staff.agent_instances(
+        `INSERT INTO swarm_hive.agent_instances(
            spec_key, spec_version, thread_id, workspace_key
          ) VALUES ('software-engineer', 1, $1, $2)
          RETURNING id`,
@@ -72,27 +72,27 @@ describePostgres("business database integration", () => {
       if (!projectId || !agentInstanceId) throw new Error("Test IDs missing");
 
       await client.query(
-        `INSERT INTO agent_staff.project_agent_instances(
+        `INSERT INTO swarm_hive.project_agent_instances(
            project_id, agent_instance_id
          ) VALUES ($1, $2)`,
         [projectId, agentInstanceId],
       );
       const inboxEvent = await client.query<{ id: string }>(
-        `INSERT INTO agent_staff.inbox_events(
+        `INSERT INTO swarm_hive.inbox_events(
            source, external_event_id, project_id, event_type
          ) VALUES ('feishu', $1, $2, 'requirement_ready')
          RETURNING id`,
         [`event-${randomUUID()}`, projectId],
       );
       const run = await client.query<{ id: string }>(
-        `INSERT INTO agent_staff.agent_instance_runs(
+        `INSERT INTO swarm_hive.agent_instance_runs(
            project_id, agent_instance_id, trigger_event_id, task_summary
          ) VALUES ($1, $2, $3, 'Implement requirement')
          RETURNING id`,
         [projectId, agentInstanceId, inboxEvent.rows[0]?.id],
       );
       await client.query(
-        `INSERT INTO agent_staff.agent_instance_run_events(
+        `INSERT INTO swarm_hive.agent_instance_run_events(
            agent_instance_run_id, sequence_no, event_type, title
          ) VALUES ($1, 1, 'started', 'Agent instance run started')`,
         [run.rows[0]?.id],
@@ -100,7 +100,7 @@ describePostgres("business database integration", () => {
 
       const timeline = await client.query<{ count: string }>(
         `SELECT count(*)::text AS count
-           FROM agent_staff.agent_instance_run_events
+           FROM swarm_hive.agent_instance_run_events
           WHERE agent_instance_run_id = $1`,
         [run.rows[0]?.id],
       );

@@ -4,7 +4,7 @@ import { isAbsolute, posix, relative, resolve, sep } from "node:path";
 
 import { DockerSandboxProvider } from "./docker.js";
 import { SharedDockerSandboxProvider } from "./shared-docker.js";
-import type { Sandbox } from "./types.js";
+import type { Sandbox, SandboxMount } from "./types.js";
 
 export type SandboxBackend = "local" | "docker" | "shared-docker";
 
@@ -26,6 +26,7 @@ export interface TaskSandboxOptions {
   pids?: number;
   timeoutMs?: number;
   env?: Readonly<Record<string, string>>;
+  mounts?: readonly SandboxMount[];
   initializers?: readonly SandboxInitializer[];
   sharedContainerName?: string;
 }
@@ -136,6 +137,16 @@ export async function createTaskSandbox(
   if (!image) throw new Error("A Docker sandbox image is required");
 
   const workspaceStat = await stat(workspace);
+  const mounts = await Promise.all((options.mounts ?? []).map(async (mount) => {
+    if (!isAbsolute(mount.target) || mount.target === "/") {
+      throw new Error(`Sandbox mount target must be an absolute non-root path: ${mount.target}`);
+    }
+    const source = await realpath(resolve(mount.source));
+    if (source.includes(",") || mount.target.includes(",")) {
+      throw new Error("Sandbox mount paths cannot contain commas");
+    }
+    return { ...mount, source };
+  }));
   const runId = options.runId ?? randomUUID();
   const user = `${workspaceStat.uid}:${workspaceStat.gid}`;
   let provider: DockerSandboxProvider | SharedDockerSandboxProvider;
@@ -188,6 +199,7 @@ export async function createTaskSandbox(
     workingDirectory: mountPath,
     timeoutMs: options.timeoutMs ?? 30 * 60_000,
     env: sandboxEnvironment,
+    mounts,
   });
 
   try {

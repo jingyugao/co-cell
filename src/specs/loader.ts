@@ -10,7 +10,7 @@ export interface AgentSpecManifest {
   id: string;
   name: string;
   version: number;
-  taskPrompt: string;
+  prompt: string;
   knowledge: AgentSpecKnowledge[];
   sandbox: {
     dockerfile: string;
@@ -22,7 +22,7 @@ export interface AgentSpecManifest {
 export interface LoadedAgentSpec {
   directory: string;
   manifest: AgentSpecManifest;
-  taskPrompt: string;
+  prompt: string;
   instructions: string[];
 }
 
@@ -42,8 +42,8 @@ function parseManifest(value: unknown): AgentSpecManifest {
     typeof manifest.name !== "string" ||
     !manifest.name.trim() ||
     !Number.isInteger(manifest.version) ||
-    typeof manifest.taskPrompt !== "string" ||
-    !manifest.taskPrompt.trim() ||
+    typeof manifest.prompt !== "string" ||
+    !manifest.prompt.trim() ||
     !Array.isArray(manifest.knowledge) ||
     !manifest.sandbox ||
     typeof manifest.sandbox.dockerfile !== "string" ||
@@ -85,8 +85,8 @@ export async function loadAgentSpec(options: {
   const directory = await realpath(resolve(options.directory));
   const manifestText = await readSpecFile(directory, "spec.json");
   const manifest = parseManifest(JSON.parse(manifestText) as unknown);
-  const [taskPrompt] = await Promise.all([
-    readSpecFile(directory, manifest.taskPrompt),
+  const [prompt] = await Promise.all([
+    readSpecFile(directory, manifest.prompt),
     readSpecFile(directory, manifest.sandbox.dockerfile),
     readSpecFile(directory, manifest.environmentExample),
   ]);
@@ -102,7 +102,7 @@ export async function loadAgentSpec(options: {
   return {
     directory,
     manifest,
-    taskPrompt: taskPrompt.trim(),
+    prompt: prompt.trim(),
     instructions: instructions.filter(Boolean),
   };
 }

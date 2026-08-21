@@ -42,6 +42,12 @@ import {
   previewFeishuWorkItem,
   startAgentRun,
 } from "./api";
+import {
+  createWorkbenchUrl,
+  readWorkbenchRoute,
+  type MainSection,
+  type WorkbenchRoute,
+} from "./navigation";
 
 const WorkbenchContext = createContext<ProjectWorkbench | null>(null);
 
@@ -108,8 +114,6 @@ function StatusBadge({ status }: { status: RunStatus }) {
   );
 }
 
-type MainSection = "import" | "requirements" | "instance" | "runs" | "events" | "specs";
-
 function Sidebar({ active, onChange }: { active: MainSection; onChange: (section: MainSection) => void }) {
   const data = useContext(WorkbenchContext);
   const [projectCount, setProjectCount] = useState(data ? 1 : 0);
@@ -123,14 +127,14 @@ function Sidebar({ active, onChange }: { active: MainSection; onChange: (section
   const statistics = data?.statistics ?? { activeRuns: 0, totalRuns: 0 };
   const navigation = [
     { key: "import" as const, icon: "+", label: "导入需求" },
-    { key: "requirements" as const, icon: "▦", label: "需求列表", badge: String(projectCount) },
+    { key: "projects" as const, icon: "▦", label: "需求列表", badge: String(projectCount) },
     { key: "runs" as const, icon: "◫", label: "运行记录", badge: String(statistics.totalRuns) },
     { key: "events" as const, icon: "↯", label: "事件中心" },
     { key: "specs" as const, icon: "◇", label: "Agent Specs" },
   ];
   return (
     <aside className="sidebar">
-      <div className="brand"><div className="brand-mark">AS</div><div><strong>Agent Staff</strong><span>AI 员工平台</span></div></div>
+      <div className="brand"><div className="brand-mark">SH</div><div><strong>SwarmHive</strong><span>AI Agent 蜂群工作台</span></div></div>
       <div className="nav-label">工作台</div>
       <nav aria-label="主导航">
         {navigation.map((item) => (
@@ -595,10 +599,17 @@ function AgentSpecsView() {
   </>;
 }
 
-function RequirementListView({ initialProjectId, onOpenAgent }: { initialProjectId: string | null; onOpenAgent: (agentInstanceId: string) => void }) {
+function RequirementListView({
+  selectedProjectId,
+  onSelectProject,
+  onOpenAgent,
+}: {
+  selectedProjectId: string | null;
+  onSelectProject: (projectId: string | null) => void;
+  onOpenAgent: (agentInstanceId: string) => void;
+}) {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [previews, setPreviews] = useState<Record<string, FeishuWorkItemPreview>>({});
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(initialProjectId);
   const [starting, setStarting] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -631,10 +642,6 @@ function RequirementListView({ initialProjectId, onOpenAgent }: { initialProject
     return () => { active = false; };
   }, []);
 
-  useEffect(() => {
-    if (initialProjectId) setSelectedProjectId(initialProjectId);
-  }, [initialProjectId]);
-
   async function start(assignment: AgentAssignmentResult) {
     setStarting(assignment.assignmentId);
     setError(null);
@@ -656,7 +663,7 @@ function RequirementListView({ initialProjectId, onOpenAgent }: { initialProject
   if (selectedProjectId && selected) {
     const highlightedFields = selected.fields.filter((field) => ["描述", "优先级", "预计上车版本", "标签"].includes(field.name));
     return <>
-      <button className="back-button" type="button" onClick={() => setSelectedProjectId(null)}>← 返回需求列表</button>
+      <button className="back-button" type="button" onClick={() => onSelectProject(null)}>← 返回需求列表</button>
       <GlobalHeader eyebrow="REQUIREMENT DETAIL" title={selected.title} description={`${selected.project.name} · ${selected.workItemType.name} #${selected.workItemId}`} />
       {error && <div className="form-error" role="alert">{error}</div>}
       <div className="live-requirement-grid requirement-detail-grid">
@@ -689,7 +696,7 @@ function RequirementListView({ initialProjectId, onOpenAgent }: { initialProject
         {projects.map((project) => {
           const preview = previews[project.id];
           const title = preview?.title ?? project.name ?? `飞书需求 #${project.externalProjectId}`;
-          return <button type="button" className="project-directory-item" key={project.id} onClick={() => setSelectedProjectId(project.id)}><span className="project-directory-symbol">需</span><span className="project-directory-main"><strong>{title}</strong><small>{preview?.status?.name ?? "飞书项目"} · {project.externalProjectId}</small></span><span>{preview?.assignments.length ?? (project.agentInstance ? 1 : 0)} 个 Agent</span></button>;
+          return <button type="button" className="project-directory-item" key={project.id} onClick={() => onSelectProject(project.id)}><span className="project-directory-symbol">需</span><span className="project-directory-main"><strong>{title}</strong><small>{preview?.status?.name ?? "飞书项目"} · {project.externalProjectId}</small></span><span>{preview?.assignments.length ?? (project.agentInstance ? 1 : 0)} 个 Agent</span></button>;
         })}
         {loading && <div className="empty-state">正在读取需求…</div>}
         {!loading && projects.length === 0 && <div className="empty-state">尚未导入需求，请先从“导入需求”绑定 Agent</div>}
@@ -776,24 +783,45 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
 }
 
 function WorkbenchPage({ data }: { data: ProjectWorkbench | null }) {
-  const [activeSection, setActiveSection] = useState<MainSection>("import");
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-  const [selectedAgentInstanceId, setSelectedAgentInstanceId] = useState<string | null>(null);
-  function openRequirement(projectId: string) { setSelectedProjectId(projectId); setActiveSection("requirements"); }
-  function openAgent(agentInstanceId: string) { setSelectedAgentInstanceId(agentInstanceId); setActiveSection("instance"); }
-  function changeSection(section: MainSection) {
-    if (section === "requirements") setSelectedProjectId(null);
-    setActiveSection(section);
+  const [route, setRoute] = useState<WorkbenchRoute>(() =>
+    readWorkbenchRoute(new URL(window.location.href)),
+  );
+
+  useEffect(() => {
+    const replaceUrl = createWorkbenchUrl(new URL(window.location.href), route);
+    window.history.replaceState(null, "", replaceUrl);
+    const handlePopState = () => {
+      setRoute(readWorkbenchRoute(new URL(window.location.href)));
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  function navigate(nextRoute: WorkbenchRoute) {
+    const url = createWorkbenchUrl(new URL(window.location.href), nextRoute);
+    window.history.pushState(null, "", url);
+    setRoute(nextRoute);
   }
-  const sectionTitle = activeSection === "import" ? "导入需求" : activeSection === "requirements" ? "需求列表" : activeSection === "instance" ? "Agent Instance" : activeSection === "runs" ? "运行记录" : activeSection === "events" ? "事件中心" : "Agent Specs";
+
+  const { section: activeSection, projectId: selectedProjectId, agentInstanceId: selectedAgentInstanceId } = route;
+  function openRequirement(projectId: string) {
+    navigate({ section: "projects", projectId, agentInstanceId: null });
+  }
+  function openAgent(agentInstanceId: string) {
+    navigate({ section: "instance", projectId: selectedProjectId, agentInstanceId });
+  }
+  function changeSection(section: MainSection) {
+    navigate({ section, projectId: null, agentInstanceId: null });
+  }
+  const sectionTitle = activeSection === "import" ? "导入需求" : activeSection === "projects" ? "需求列表" : activeSection === "instance" ? "Agent Instance" : activeSection === "runs" ? "运行记录" : activeSection === "events" ? "事件中心" : "Agent Specs";
   return <div className="app-shell">
-    <Sidebar active={activeSection} onChange={changeSection} />
+    <Sidebar active={activeSection === "instance" ? "projects" : activeSection} onChange={changeSection} />
     <main className="workspace">
-      <header className="topbar"><div className="breadcrumbs"><span>工作台</span><span className="breadcrumb-separator">/</span><strong>{sectionTitle}</strong></div><div className="topbar-meta">{activeSection !== "import" && <span className="readonly-badge"><Glyph>◉</Glyph>{activeSection === "requirements" || activeSection === "instance" ? "实时状态" : "只读视图"}</span>}</div></header>
+      <header className="topbar"><div className="breadcrumbs"><span>工作台</span><span className="breadcrumb-separator">/</span><strong>{sectionTitle}</strong></div><div className="topbar-meta">{activeSection !== "import" && <span className="readonly-badge"><Glyph>◉</Glyph>{activeSection === "projects" || activeSection === "instance" ? "实时状态" : "只读视图"}</span>}</div></header>
       <div className="page-content">
         {activeSection === "import" && <FeishuRequirementView onOpenRequirement={openRequirement} />}
-        {activeSection === "requirements" && <RequirementListView initialProjectId={selectedProjectId} onOpenAgent={openAgent} />}
-        {activeSection === "instance" && selectedAgentInstanceId && <AgentInstanceDetailView agentInstanceId={selectedAgentInstanceId} onBack={() => setActiveSection("requirements")} />}
+        {activeSection === "projects" && <RequirementListView selectedProjectId={selectedProjectId} onSelectProject={(projectId) => navigate({ section: "projects", projectId, agentInstanceId: null })} onOpenAgent={openAgent} />}
+        {activeSection === "instance" && selectedAgentInstanceId && <AgentInstanceDetailView agentInstanceId={selectedAgentInstanceId} onBack={() => navigate({ section: "projects", projectId: selectedProjectId, agentInstanceId: null })} />}
         {activeSection === "runs" && <GlobalRunsView />}
         {activeSection === "events" && <GlobalEventsView />}
         {activeSection === "specs" && <AgentSpecsView />}

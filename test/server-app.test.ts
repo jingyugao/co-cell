@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { describe, expect, test, vi } from "vitest";
 
@@ -17,7 +20,7 @@ const softwareEngineerSpec: AgentSpecSummary = {
   name: "Software Engineer",
   version: 1,
   knowledge: [],
-  sandbox: { dockerfile: "sandbox/Dockerfile", image: "agent-staff:latest" },
+  sandbox: { dockerfile: "sandbox/Dockerfile", image: "swarm-hive:latest" },
   environmentExample: ".env.example",
 };
 const workbenchResponse: ProjectWorkbench = {
@@ -156,6 +159,34 @@ describe("Hono server app", () => {
     expect((await app.request("/api/v1/runs?limit=25")).status).toBe(200);
     expect((await app.request("/api/v1/inbox-events?limit=25")).status).toBe(200);
     expect((await app.request("/api/v1/agent-specs")).status).toBe(200);
+  });
+
+  test("serves SPA routes while preserving JSON API 404 responses", async () => {
+    const staticRoot = await mkdtemp(join(tmpdir(), "swarm-hive-static-"));
+    await writeFile(join(staticRoot, "index.html"), "<!doctype html><title>SwarmHive</title>");
+    try {
+      const app = createApp({
+        workbench: queries(),
+        specCatalog,
+        staticRoot,
+        enableRequestLogger: false,
+      });
+      const pageResponse = await app.request(
+        `/projects/${projectId}/agents/${agentInstanceId}`,
+      );
+      expect(pageResponse.status).toBe(200);
+      expect(pageResponse.headers.get("content-type")).toContain("text/html");
+      expect(await pageResponse.text()).toContain("SwarmHive");
+
+      const apiResponse = await app.request("/api/v1/does-not-exist");
+      expect(apiResponse.status).toBe(404);
+      expect(apiResponse.headers.get("content-type")).toContain("application/json");
+      expect(await apiResponse.json()).toMatchObject({
+        error: { code: "not_found" },
+      });
+    } finally {
+      await rm(staticRoot, { recursive: true, force: true });
+    }
   });
 
   test("serves and validates the Agent Instance detail route", async () => {

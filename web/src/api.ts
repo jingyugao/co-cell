@@ -15,6 +15,7 @@ import type {
   FeishuWorkItemPreview,
   StartAgentRunResult,
 } from "../../src/contracts/requirements";
+import { readWorkbenchRoute } from "./navigation";
 
 interface ApiErrorBody {
   error?: { code?: string; message?: string };
@@ -43,7 +44,7 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 }
 
 export async function loadProjectWorkbench(): Promise<ProjectWorkbench | null> {
-  const requestedProjectId = new URLSearchParams(window.location.search).get("projectId");
+  const requestedProjectId = readWorkbenchRoute(new URL(window.location.href)).projectId;
   let projectId = requestedProjectId;
   if (!projectId) {
     const projects = await getJson<ProjectListResponse>("/api/v1/projects?limit=1");

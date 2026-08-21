@@ -130,7 +130,6 @@ async function main(): Promise<void> {
             GITLAB_USERNAME: gitlabUsername,
             HOME: gitlabHome,
             GLAB_CONFIG_DIR: `${gitlabHome}/.config/glab-cli`,
-            GIT_ASKPASS: "/usr/local/bin/git-askpass",
             GIT_TERMINAL_PROMPT: "0",
             GITLAB_FEATURE_BRANCH: gitlabFeatureBranch,
           }

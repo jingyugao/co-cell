@@ -17,7 +17,7 @@ async function seedCompletedRun(
   },
 ): Promise<void> {
   const event = await client.query<{ id: string }>(
-    `INSERT INTO agent_staff.inbox_events(
+    `INSERT INTO swarm_hive.inbox_events(
        source, external_event_id, project_id, event_type, status, processed_at,
        received_at
      ) VALUES ('feishu', $1, $2, $3, 'completed', now(), now() - ($4 * interval '1 minute'))
@@ -27,7 +27,7 @@ async function seedCompletedRun(
     [options.eventId, options.projectId, options.eventType, options.minutesAgo],
   );
   await client.query(
-    `INSERT INTO agent_staff.agent_instance_runs(
+    `INSERT INTO swarm_hive.agent_instance_runs(
        project_id, agent_instance_id, trigger_event_id, status, task_summary,
        result_summary, started_at, finished_at, created_at
      )
@@ -37,7 +37,7 @@ async function seedCompletedRun(
             now() - ($6 * interval '1 minute') + ($7 * interval '1 second'),
             now() - ($6 * interval '1 minute')
      WHERE NOT EXISTS (
-       SELECT 1 FROM agent_staff.agent_instance_runs WHERE trigger_event_id = $3
+       SELECT 1 FROM swarm_hive.agent_instance_runs WHERE trigger_event_id = $3
      )`,
     [
       options.projectId,
@@ -57,7 +57,7 @@ export async function seedWorkbenchTestData(connectionString: string): Promise<s
   try {
     await client.query("BEGIN");
     const project = await client.query<{ id: string }>(
-      `INSERT INTO agent_staff.projects(
+      `INSERT INTO swarm_hive.projects(
          source, external_project_id, name, status, metadata
        ) VALUES (
          'test', $1, 'Workbench integration fixture', 'active', '{"owner":"test"}'::jsonb
@@ -71,7 +71,7 @@ export async function seedWorkbenchTestData(connectionString: string): Promise<s
     if (!projectId) throw new Error("Development project was not created");
 
     const agent = await client.query<{ id: string }>(
-      `INSERT INTO agent_staff.agent_instances(
+      `INSERT INTO swarm_hive.agent_instances(
          spec_key, spec_version, thread_id, workspace_key, status, last_active_at
        ) VALUES (
          'software-engineer', 1, 'test-workbench-primary',
@@ -88,23 +88,23 @@ export async function seedWorkbenchTestData(connectionString: string): Promise<s
     if (!agentInstanceId) throw new Error("Development Agent Instance was not created");
 
     await client.query(
-      `INSERT INTO agent_staff.project_agent_instances(project_id, agent_instance_id)
+      `INSERT INTO swarm_hive.project_agent_instances(project_id, agent_instance_id)
        SELECT $1, $2
        WHERE NOT EXISTS (
-         SELECT 1 FROM agent_staff.project_agent_instances
+         SELECT 1 FROM swarm_hive.project_agent_instances
           WHERE project_id = $1 AND unbound_at IS NULL AND is_primary
        )`,
       [projectId, agentInstanceId],
     );
     await client.query(
-      `UPDATE agent_staff.project_agent_instances
+      `UPDATE swarm_hive.project_agent_instances
           SET role = 'backend-module-a'
         WHERE project_id = $1 AND agent_instance_id = $2 AND unbound_at IS NULL`,
       [projectId, agentInstanceId],
     );
 
     const secondaryAgent = await client.query<{ id: string }>(
-      `INSERT INTO agent_staff.agent_instances(
+      `INSERT INTO swarm_hive.agent_instances(
          spec_key, spec_version, thread_id, workspace_key, status, last_active_at
        ) VALUES (
          'software-engineer', 1, 'test-workbench-secondary',
@@ -122,12 +122,12 @@ export async function seedWorkbenchTestData(connectionString: string): Promise<s
       throw new Error("Secondary development Agent Instance was not created");
     }
     await client.query(
-      `INSERT INTO agent_staff.project_agent_instances(
+      `INSERT INTO swarm_hive.project_agent_instances(
          project_id, agent_instance_id, role, is_primary
        )
        SELECT $1, $2, 'backend-module-b', false
        WHERE NOT EXISTS (
-         SELECT 1 FROM agent_staff.project_agent_instances
+         SELECT 1 FROM swarm_hive.project_agent_instances
           WHERE agent_instance_id = $2 AND unbound_at IS NULL
        )`,
       [projectId, secondaryAgentInstanceId],
@@ -165,7 +165,7 @@ export async function seedWorkbenchTestData(connectionString: string): Promise<s
     });
 
     const trigger = await client.query<{ id: string }>(
-      `INSERT INTO agent_staff.inbox_events(
+      `INSERT INTO swarm_hive.inbox_events(
          source, external_event_id, project_id, event_type, status, processed_at
        ) VALUES ('feishu', 'demo-requirement-ready', $1, 'requirement_ready', 'completed', now())
        ON CONFLICT (source, external_event_id) DO UPDATE
@@ -175,12 +175,12 @@ export async function seedWorkbenchTestData(connectionString: string): Promise<s
     );
     const triggerEventId = trigger.rows[0]?.id;
     const activeRun = await client.query<{ id: string }>(
-      `INSERT INTO agent_staff.agent_instance_runs(
+      `INSERT INTO swarm_hive.agent_instance_runs(
          project_id, agent_instance_id, trigger_event_id, status, task_summary, started_at
        )
        SELECT $1, $2, $3, 'running', 'Workbench integration task', now() - interval '27 minutes'
        WHERE NOT EXISTS (
-         SELECT 1 FROM agent_staff.agent_instance_runs
+         SELECT 1 FROM swarm_hive.agent_instance_runs
           WHERE agent_instance_id = $2 AND status IN ('queued','running','waiting_user')
        )
        RETURNING id`,
@@ -190,7 +190,7 @@ export async function seedWorkbenchTestData(connectionString: string): Promise<s
       ? activeRun.rows[0]
       : (
           await client.query<{ id: string }>(
-            `SELECT id FROM agent_staff.agent_instance_runs
+            `SELECT id FROM swarm_hive.agent_instance_runs
               WHERE agent_instance_id = $1 AND status IN ('queued','running','waiting_user')
               ORDER BY created_at DESC LIMIT 1`,
             [agentInstanceId],
@@ -208,7 +208,7 @@ export async function seedWorkbenchTestData(connectionString: string): Promise<s
     ] as const;
     for (const [sequence, eventType, title, detail, state, progressPercent] of events) {
       await client.query(
-        `INSERT INTO agent_staff.agent_instance_run_events(
+        `INSERT INTO swarm_hive.agent_instance_run_events(
            agent_instance_run_id, sequence_no, event_type, title, detail, data
          ) VALUES ($1, $2, $3::text, $4::text, $5::text, jsonb_build_object(
            'schemaVersion', 1,

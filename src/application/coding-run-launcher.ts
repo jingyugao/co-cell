@@ -26,6 +26,7 @@ export interface CodingRunLauncherOptions {
   gitlabBaseUrl?: string;
   gitlabToken?: string;
   gitlabUsername: string;
+  kubeconfigPath?: string;
   feishuProjectMcpUrl: string;
   feishuProjectMcpToken: string;
 }
@@ -96,13 +97,37 @@ export class CodingRunLauncher implements AgentRunLauncher {
         GITLAB_FEATURE_BRANCH: `agent/${branchSlug(`${context.workItemId}-${context.role}`)}`,
         HOME: agentHome,
         GLAB_CONFIG_DIR: `${agentHome}/.config/glab-cli`,
-        GIT_ASKPASS: "/usr/local/bin/git-askpass",
         GIT_TERMINAL_PROMPT: "0",
         FEISHU_PROJECT_MCP_URL: this.options.feishuProjectMcpUrl,
         FEISHU_PROJECT_MCP_TOKEN: this.options.feishuProjectMcpToken,
         FEISHU_PROJECT_WORK_ITEM_URL: context.sourceUrl,
+        ...(this.options.kubeconfigPath
+          ? { KUBECONFIG: "/etc/swarm-hive/kubeconfig" }
+          : {}),
       },
-      initializers: [{ name: "gitlab", command: "gitlab-init" }],
+      mounts: this.options.kubeconfigPath
+        ? [{
+            source: this.options.kubeconfigPath,
+            target: "/etc/swarm-hive/kubeconfig",
+            readOnly: true,
+          }]
+        : [],
+      initializers: [
+        { name: "gitlab", command: "gitlab-init" },
+        ...(this.options.kubeconfigPath
+          ? [{
+              name: "kubernetes",
+              command: [
+                "kubectl config get-contexts example_data >/dev/null",
+                "kubectl config get-contexts common >/dev/null",
+                "kubectl --context example_data auth can-i get deployments.apps --all-namespaces >/dev/null",
+                "kubectl --context common auth can-i get deployments.apps --all-namespaces >/dev/null",
+                "! kubectl --context example_data auth can-i create deployments.apps --all-namespaces >/dev/null 2>&1",
+                "! kubectl --context common auth can-i create deployments.apps --all-namespaces >/dev/null 2>&1",
+              ].join(" && "),
+            }]
+          : []),
+      ],
     });
     const spec = await loadAgentSpec({
       directory: resolve(this.options.specsRoot, context.specKey),
@@ -120,10 +145,9 @@ export class CodingRunLauncher implements AgentRunLauncher {
         detail: context.role,
         data: { state: "running", progressPercent: 15 },
       });
-      const prompt = renderAgentTaskPrompt(spec.taskPrompt, {
+      const prompt = renderAgentTaskPrompt(spec.prompt, {
         role: context.role,
         source_url: context.sourceUrl,
-        requirement_json: JSON.stringify(requirement.raw, null, 2),
       });
       const result = await runCodingTask({
         workspace: allocation.workspace,

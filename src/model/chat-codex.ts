@@ -44,7 +44,7 @@ export async function createCodexModel(
         originator:
           options.originator ??
           process.env.LANGCHAIN_CODEX_ORIGINATOR ??
-          "agent-staff",
+          "swarm-hive",
       },
     },
   });

@@ -88,7 +88,7 @@ describePostgres("workbench API integration", () => {
             name: "Software Engineer",
             version: 1,
             knowledge: [],
-            sandbox: { dockerfile: "sandbox/Dockerfile", image: "agent-staff:latest" },
+            sandbox: { dockerfile: "sandbox/Dockerfile", image: "swarm-hive:latest" },
             environmentExample: ".env.example",
           } : null,
         },
@@ -118,23 +118,23 @@ describePostgres("workbench API integration", () => {
       expect(specBody.statistics.activeRequirements).toBeGreaterThanOrEqual(2);
     } finally {
       const agents = await pool.query<{ agent_instance_id: string }>(
-        `SELECT agent_instance_id FROM agent_staff.project_agent_instances
+        `SELECT agent_instance_id FROM swarm_hive.project_agent_instances
           WHERE project_id = $1`,
         [projectId],
       );
       await pool.query(
-        `DELETE FROM agent_staff.agent_instance_run_events
+        `DELETE FROM swarm_hive.agent_instance_run_events
           WHERE agent_instance_run_id IN (
-            SELECT id FROM agent_staff.agent_instance_runs WHERE project_id = $1
+            SELECT id FROM swarm_hive.agent_instance_runs WHERE project_id = $1
           )`,
         [projectId],
       );
-      await pool.query("DELETE FROM agent_staff.agent_instance_runs WHERE project_id = $1", [projectId]);
-      await pool.query("DELETE FROM agent_staff.inbox_events WHERE project_id = $1", [projectId]);
-      await pool.query("DELETE FROM agent_staff.project_agent_instances WHERE project_id = $1", [projectId]);
-      await pool.query("DELETE FROM agent_staff.projects WHERE id = $1", [projectId]);
+      await pool.query("DELETE FROM swarm_hive.agent_instance_runs WHERE project_id = $1", [projectId]);
+      await pool.query("DELETE FROM swarm_hive.inbox_events WHERE project_id = $1", [projectId]);
+      await pool.query("DELETE FROM swarm_hive.project_agent_instances WHERE project_id = $1", [projectId]);
+      await pool.query("DELETE FROM swarm_hive.projects WHERE id = $1", [projectId]);
       for (const agent of agents.rows) {
-        await pool.query("DELETE FROM agent_staff.agent_instances WHERE id = $1", [agent.agent_instance_id]);
+        await pool.query("DELETE FROM swarm_hive.agent_instances WHERE id = $1", [agent.agent_instance_id]);
       }
       await pool.end();
     }

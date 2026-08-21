@@ -63,6 +63,11 @@ function spec(): SandboxSpec {
     networkProfile: "code-development",
     workingDirectory: "/workspace/repo",
     env: { TEST_DELIVERY_MODE: "merge-request" },
+    mounts: [{
+      source: "/host/credentials/kubeconfig",
+      target: "/etc/swarm-hive/kubeconfig",
+      readOnly: true,
+    }],
   };
 }
 
@@ -84,6 +89,9 @@ describe("DockerSandboxProvider", () => {
     expect(create).toContain("1234:1234");
     expect(create).toContain("coding-agent:test");
     expect(create).toContain("TEST_DELIVERY_MODE=merge-request");
+    expect(create).toContain(
+      "type=bind,src=/host/credentials/kubeconfig,dst=/etc/swarm-hive/kubeconfig,readonly",
+    );
     expect(await provider.get(sandbox.id)).toBe(sandbox);
 
     await sandbox.destroy();

@@ -1,16 +1,19 @@
+name: swarm-hive
+
 services:
   agent-control:
     build:
       context: .
-    image: agent-staff-control:local
+    image: swarm-hive-control:local
     environment:
       AGENT_SANDBOX: ${AGENT_SANDBOX:-shared-docker}
       AGENT_SPEC_DIR: ${AGENT_SPEC_DIR:-/app/agent-specs/software-engineer}
       AGENT_SPECS_ROOT: ${AGENT_SPECS_ROOT:-/app/agent-specs}
-      AGENT_SANDBOX_IMAGE: ${AGENT_SANDBOX_IMAGE:-agent-staff-sandbox-python:3.12}
-      AGENT_SHARED_SANDBOX_NAME: ${AGENT_SHARED_SANDBOX_NAME:-agent-staff-dev-sandbox}
+      AGENT_SANDBOX_IMAGE: ${AGENT_SANDBOX_IMAGE:-swarm-hive-sandbox-python:3.12}
+      AGENT_SHARED_SANDBOX_NAME: ${AGENT_SHARED_SANDBOX_NAME:-swarm-hive-dev-sandbox}
       AGENT_SANDBOX_NETWORK: ${AGENT_SANDBOX_NETWORK:-none}
       AGENT_WORKSPACE_ROOT: ${AGENT_WORKSPACE_ROOT:-/srv/agent-workspaces}
+      AGENT_KUBECONFIG: ${AGENT_KUBECONFIG:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       FeishuProjectMcpUrl: ${FeishuProjectMcpUrl:-${FEISHU_PROJECT_MCP_URL:-}}
@@ -37,20 +40,20 @@ services:
     build:
       context: .
       dockerfile: ${AGENT_SANDBOX_DOCKERFILE:-agent-specs/software-engineer/sandbox/Dockerfile}
-    image: ${AGENT_SANDBOX_IMAGE:-agent-staff-sandbox-python:3.12}
+    image: ${AGENT_SANDBOX_IMAGE:-swarm-hive-sandbox-python:3.12}
     command: ["true"]
 
   checkpoint-postgres:
     profiles: ["persistence"]
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: ${AGENT_POSTGRES_DB:-agent_staff}
+      POSTGRES_DB: ${AGENT_POSTGRES_DB:-swarm_hive}
       POSTGRES_USER: ${AGENT_POSTGRES_USER:-agent}
       POSTGRES_PASSWORD: ${AGENT_POSTGRES_PASSWORD:-REDACTED_PASSWORD}
     ports:
       - 127.0.0.1:${AGENT_POSTGRES_PORT:-55432}:5432
     volumes:
-      - agent-checkpoint-postgres-data:/var/lib/postgresql/data
+      - swarm-hive-postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 2s
@@ -58,4 +61,5 @@ services:
       retries: 20
 
 volumes:
-  agent-checkpoint-postgres-data:
+  swarm-hive-postgres-data:
+    name: swarm-hive-postgres-data

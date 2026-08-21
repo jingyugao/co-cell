@@ -203,7 +203,7 @@ export class FeishuProjectMcpClient {
         params: {
           protocolVersion: this.config.protocolVersion,
           capabilities: {},
-          clientInfo: { name: "agent-staff", version: "0.1.0" },
+          clientInfo: { name: "swarm-hive", version: "0.1.0" },
         },
       },
       false,

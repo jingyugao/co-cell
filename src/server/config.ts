@@ -21,6 +21,7 @@ export interface ServerConfig {
   gitlabBaseUrl?: string;
   gitlabToken?: string;
   gitlabUsername: string;
+  kubeconfigPath?: string;
 }
 
 function integerEnvironment(name: string, fallback: number): number {
@@ -63,9 +64,9 @@ export function loadServerConfig(): ServerConfig {
     databaseUrl,
     staticRoot: resolve(process.env.AGENT_WEB_ROOT?.trim() || "dist/web"),
     sandboxName:
-      process.env.AGENT_SHARED_SANDBOX_NAME?.trim() || "agent-staff-dev-sandbox",
+      process.env.AGENT_SHARED_SANDBOX_NAME?.trim() || "swarm-hive-dev-sandbox",
     specsRoot: resolve(process.env.AGENT_SPECS_ROOT?.trim() || "agent-specs"),
-    workspaceRoot: resolve(process.env.AGENT_WORKSPACE_ROOT?.trim() || ".agent-staff/workspaces"),
+    workspaceRoot: resolve(process.env.AGENT_WORKSPACE_ROOT?.trim() || ".swarm-hive/workspaces"),
     sandboxBackend,
     ...(process.env.AGENT_SANDBOX_IMAGE?.trim()
       ? { sandboxImage: process.env.AGENT_SANDBOX_IMAGE.trim() }
@@ -79,5 +80,8 @@ export function loadServerConfig(): ServerConfig {
     ...(gitlabBaseUrl ? { gitlabBaseUrl } : {}),
     ...(gitlabToken ? { gitlabToken } : {}),
     gitlabUsername: process.env.GITLAB_USERNAME?.trim() || "oauth2",
+    ...(process.env.AGENT_KUBECONFIG?.trim()
+      ? { kubeconfigPath: resolve(process.env.AGENT_KUBECONFIG.trim()) }
+      : {}),
   };
 }

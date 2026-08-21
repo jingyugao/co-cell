@@ -48,8 +48,8 @@ interface DevicePollResponse {
 
 export function defaultAuthPath(): string {
   return resolve(
-    process.env.AGENT_STAFF_AUTH_FILE ??
-      `${homedir()}/.agent-staff/chatgpt-auth.json`,
+    process.env.SWARM_HIVE_AUTH_FILE ??
+      `${homedir()}/.swarm-hive/chatgpt-auth.json`,
   );
 }
 

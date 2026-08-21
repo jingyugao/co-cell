@@ -123,10 +123,10 @@ export class PostgresWorkbenchRepository {
               ai.workspace_key, ai.thread_id, ai.last_active_at, ai.created_at,
               pai.id AS assignment_id, pai.role, pai.is_primary, pai.bound_at,
               p.id AS project_id, p.source, p.external_project_id, p.external_url
-         FROM agent_staff.agent_instances ai
-         LEFT JOIN agent_staff.project_agent_instances pai
+         FROM swarm_hive.agent_instances ai
+         LEFT JOIN swarm_hive.project_agent_instances pai
            ON pai.agent_instance_id = ai.id AND pai.unbound_at IS NULL
-         LEFT JOIN agent_staff.projects p ON p.id = pai.project_id
+         LEFT JOIN swarm_hive.projects p ON p.id = pai.project_id
         WHERE ai.id = $1`,
       [agentInstanceId],
     );
@@ -152,8 +152,8 @@ export class PostgresWorkbenchRepository {
                 coalesce(r.finished_at, now()) - coalesce(r.started_at, r.created_at)
               )))::bigint::text AS duration_seconds,
               e.source AS trigger_source, e.event_type AS trigger_event_type
-         FROM agent_staff.agent_instance_runs r
-         LEFT JOIN agent_staff.inbox_events e ON e.id = r.trigger_event_id
+         FROM swarm_hive.agent_instance_runs r
+         LEFT JOIN swarm_hive.inbox_events e ON e.id = r.trigger_event_id
         WHERE r.agent_instance_id = $1
         ORDER BY r.created_at DESC, r.id DESC
         LIMIT 50`,
@@ -220,7 +220,7 @@ export class PostgresWorkbenchRepository {
   }
 
   async projectExists(projectId: string): Promise<boolean> {
-    const result = await this.pool.query("SELECT 1 FROM agent_staff.projects WHERE id = $1", [projectId]);
+    const result = await this.pool.query("SELECT 1 FROM swarm_hive.projects WHERE id = $1", [projectId]);
     return result.rowCount === 1;
   }
 
@@ -265,13 +265,13 @@ export class PostgresWorkbenchRepository {
               ai.id AS agent_instance_id, ai.status AS agent_instance_status,
               ai.spec_key, active_run.id AS run_id,
               active_run.status AS run_status, active_run.task_summary
-         FROM agent_staff.projects p
-         LEFT JOIN agent_staff.project_agent_instances pai
+         FROM swarm_hive.projects p
+         LEFT JOIN swarm_hive.project_agent_instances pai
            ON pai.project_id = p.id AND pai.unbound_at IS NULL AND pai.is_primary
-         LEFT JOIN agent_staff.agent_instances ai ON ai.id = pai.agent_instance_id
+         LEFT JOIN swarm_hive.agent_instances ai ON ai.id = pai.agent_instance_id
          LEFT JOIN LATERAL (
            SELECT r.id, r.status, r.task_summary
-             FROM agent_staff.agent_instance_runs r
+             FROM swarm_hive.agent_instance_runs r
             WHERE r.project_id = p.id
               AND r.status IN ('queued', 'running', 'waiting_user')
             ORDER BY r.created_at DESC
@@ -331,7 +331,7 @@ export class PostgresWorkbenchRepository {
       }>(
         `SELECT id, source, external_project_id, name, status,
                 metadata->>'owner' AS owner, updated_at
-           FROM agent_staff.projects
+           FROM swarm_hive.projects
           WHERE id = $1`,
         [projectId],
       );
@@ -352,8 +352,8 @@ export class PostgresWorkbenchRepository {
       }>(
         `SELECT ai.id, ai.spec_key, ai.spec_version, ai.status,
                 ai.workspace_key, ai.thread_id, ai.last_active_at
-           FROM agent_staff.project_agent_instances pai
-           JOIN agent_staff.agent_instances ai ON ai.id = pai.agent_instance_id
+           FROM swarm_hive.project_agent_instances pai
+           JOIN swarm_hive.agent_instances ai ON ai.id = pai.agent_instance_id
           WHERE pai.project_id = $1 AND pai.unbound_at IS NULL AND pai.is_primary
           LIMIT 1`,
         [projectId],
@@ -368,7 +368,7 @@ export class PostgresWorkbenchRepository {
                 count(*)::text AS total_runs,
                 count(*) FILTER (WHERE status IN ('succeeded','failed'))::text AS completed_runs,
                 count(*) FILTER (WHERE status = 'succeeded')::text AS succeeded_runs
-           FROM agent_staff.agent_instance_runs
+           FROM swarm_hive.agent_instance_runs
           WHERE project_id = $1`,
         [projectId],
       );
@@ -385,8 +385,8 @@ export class PostgresWorkbenchRepository {
         `SELECT r.id, r.status, r.task_summary, r.started_at, r.created_at,
                 greatest(0, extract(epoch FROM (now() - coalesce(r.started_at, r.created_at))))::bigint::text AS elapsed_seconds,
                 e.source AS trigger_source, e.event_type AS trigger_event_type
-           FROM agent_staff.agent_instance_runs r
-           LEFT JOIN agent_staff.inbox_events e ON e.id = r.trigger_event_id
+           FROM swarm_hive.agent_instance_runs r
+           LEFT JOIN swarm_hive.inbox_events e ON e.id = r.trigger_event_id
           WHERE r.project_id = $1 AND r.status IN ('queued','running','waiting_user')
           ORDER BY r.created_at DESC LIMIT 1`,
         [projectId],
@@ -405,8 +405,8 @@ export class PostgresWorkbenchRepository {
                   coalesce(r.finished_at, now()) - coalesce(r.started_at, r.created_at)
                 )))::bigint::text AS duration_seconds,
                 e.source AS trigger_source, e.event_type AS trigger_event_type
-           FROM agent_staff.agent_instance_runs r
-           LEFT JOIN agent_staff.inbox_events e ON e.id = r.trigger_event_id
+           FROM swarm_hive.agent_instance_runs r
+           LEFT JOIN swarm_hive.inbox_events e ON e.id = r.trigger_event_id
           WHERE r.project_id = $1
           ORDER BY r.created_at DESC LIMIT 3`,
         [projectId],
@@ -420,7 +420,7 @@ export class PostgresWorkbenchRepository {
         received_at: Date;
       }>(
         `SELECT id, source, external_event_id, event_type, status, received_at
-           FROM agent_staff.inbox_events
+           FROM swarm_hive.inbox_events
           WHERE project_id = $1
           ORDER BY received_at DESC LIMIT 1`,
         [projectId],
@@ -557,8 +557,8 @@ export class PostgresWorkbenchRepository {
               r.error_code, r.error_message, r.started_at, r.finished_at,
               r.created_at, r.updated_at, e.id AS trigger_id,
               e.source AS trigger_source, e.event_type AS trigger_event_type
-         FROM agent_staff.agent_instance_runs r
-         LEFT JOIN agent_staff.inbox_events e ON e.id = r.trigger_event_id
+         FROM swarm_hive.agent_instance_runs r
+         LEFT JOIN swarm_hive.inbox_events e ON e.id = r.trigger_event_id
         WHERE r.id = $1`,
       [runId],
     );
@@ -622,8 +622,8 @@ export class PostgresWorkbenchRepository {
                 coalesce(r.finished_at, now()) - coalesce(r.started_at, r.created_at)
               )))::bigint::text AS duration_seconds,
               e.source AS trigger_source, e.event_type AS trigger_event_type
-         FROM agent_staff.agent_instance_runs r
-         LEFT JOIN agent_staff.inbox_events e ON e.id = r.trigger_event_id
+         FROM swarm_hive.agent_instance_runs r
+         LEFT JOIN swarm_hive.inbox_events e ON e.id = r.trigger_event_id
         WHERE r.project_id = $1 ${cursorWhere}
         ORDER BY r.created_at DESC, r.id DESC
         LIMIT $${values.length}`,
@@ -680,7 +680,7 @@ export class PostgresWorkbenchRepository {
     }>(
       `SELECT id, source, external_event_id, event_type, status, retry_count,
               error_message, received_at, processed_at
-         FROM agent_staff.inbox_events
+         FROM swarm_hive.inbox_events
         WHERE project_id = $1 ${cursorWhere}
         ORDER BY received_at DESC, id DESC
         LIMIT $${values.length}`,
@@ -742,9 +742,9 @@ export class PostgresWorkbenchRepository {
               )))::bigint::text AS duration_seconds,
               e.source AS trigger_source, e.event_type AS trigger_event_type,
               p.id AS project_id, p.name AS project_name, p.external_project_id
-         FROM agent_staff.agent_instance_runs r
-         JOIN agent_staff.projects p ON p.id = r.project_id
-         LEFT JOIN agent_staff.inbox_events e ON e.id = r.trigger_event_id
+         FROM swarm_hive.agent_instance_runs r
+         JOIN swarm_hive.projects p ON p.id = r.project_id
+         LEFT JOIN swarm_hive.inbox_events e ON e.id = r.trigger_event_id
         ${cursorWhere}
         ORDER BY r.created_at DESC, r.id DESC
         LIMIT $${values.length}`,
@@ -809,8 +809,8 @@ export class PostgresWorkbenchRepository {
       `SELECT e.id, e.source, e.external_event_id, e.event_type, e.status,
               e.retry_count, e.error_message, e.received_at, e.processed_at,
               p.id AS project_id, p.name AS project_name, p.external_project_id
-         FROM agent_staff.inbox_events e
-         LEFT JOIN agent_staff.projects p ON p.id = e.project_id
+         FROM swarm_hive.inbox_events e
+         LEFT JOIN swarm_hive.projects p ON p.id = e.project_id
         ${cursorWhere}
         ORDER BY e.received_at DESC, e.id DESC
         LIMIT $${values.length}`,
@@ -851,7 +851,7 @@ export class PostgresWorkbenchRepository {
       this.pool.query<{ instances: string; running_instances: string }>(
         `SELECT count(*)::text AS instances,
                 count(*) FILTER (WHERE status = 'running')::text AS running_instances
-           FROM agent_staff.agent_instances
+           FROM swarm_hive.agent_instances
           WHERE spec_key = $1`,
         [specKey],
       ),
@@ -880,14 +880,14 @@ export class PostgresWorkbenchRepository {
                 ai.workspace_key, ai.last_active_at,
                 active_run.id AS run_id, active_run.status AS run_status,
                 active_run.task_summary
-           FROM agent_staff.agent_instances ai
-           JOIN agent_staff.project_agent_instances pai
+           FROM swarm_hive.agent_instances ai
+           JOIN swarm_hive.project_agent_instances pai
              ON pai.agent_instance_id = ai.id AND pai.unbound_at IS NULL
-           JOIN agent_staff.projects p
+           JOIN swarm_hive.projects p
              ON p.id = pai.project_id AND p.status = 'active'
            LEFT JOIN LATERAL (
              SELECT r.id, r.status, r.task_summary
-               FROM agent_staff.agent_instance_runs r
+               FROM swarm_hive.agent_instance_runs r
               WHERE r.agent_instance_id = ai.id
                 AND r.project_id = p.id
                 AND r.status IN ('queued', 'running', 'waiting_user')
@@ -953,7 +953,7 @@ export class PostgresWorkbenchRepository {
     try {
       await client.query("BEGIN");
       const project = await client.query<{ id: string }>(
-        `INSERT INTO agent_staff.projects(
+        `INSERT INTO swarm_hive.projects(
            source, external_project_id, external_url, external_project_key,
            external_work_item_type, name, status
          ) VALUES ('feishu_project', $1, $2, $3, $4, NULL, 'active')
@@ -972,7 +972,7 @@ export class PostgresWorkbenchRepository {
       const projectId = project.rows[0]?.id;
       if (!projectId) throw new Error("External work item reference was not created");
       const instance = await client.query<{ id: string }>(
-        `INSERT INTO agent_staff.agent_instances(
+        `INSERT INTO swarm_hive.agent_instances(
            spec_key, spec_version, thread_id, workspace_key, status
          ) VALUES ($1, $2, $3, $4, 'idle')
          RETURNING id`,
@@ -981,12 +981,12 @@ export class PostgresWorkbenchRepository {
       const agentInstanceId = instance.rows[0]?.id;
       if (!agentInstanceId) throw new Error("Agent Instance was not created");
       const assignment = await client.query<{ id: string }>(
-        `INSERT INTO agent_staff.project_agent_instances(
+        `INSERT INTO swarm_hive.project_agent_instances(
            project_id, agent_instance_id, role, is_primary
          ) VALUES (
            $1, $2, $3,
            NOT EXISTS (
-             SELECT 1 FROM agent_staff.project_agent_instances
+             SELECT 1 FROM swarm_hive.project_agent_instances
               WHERE project_id = $1 AND unbound_at IS NULL AND is_primary
            )
          )
@@ -1037,10 +1037,10 @@ export class PostgresWorkbenchRepository {
               ai.id AS agent_instance_id, ai.spec_key, ai.spec_version,
               pai.role,
               ai.workspace_key, ai.thread_id, ai.status
-         FROM agent_staff.projects p
-         JOIN agent_staff.project_agent_instances pai
+         FROM swarm_hive.projects p
+         JOIN swarm_hive.project_agent_instances pai
            ON pai.project_id = p.id AND pai.unbound_at IS NULL
-         JOIN agent_staff.agent_instances ai ON ai.id = pai.agent_instance_id
+         JOIN swarm_hive.agent_instances ai ON ai.id = pai.agent_instance_id
         WHERE p.source = 'feishu_project'
           AND p.external_project_key = $1
           AND p.external_work_item_type = $2
@@ -1074,8 +1074,8 @@ export class PostgresWorkbenchRepository {
       }>(
         `SELECT pai.project_id, pai.agent_instance_id,
                 p.external_project_id AS work_item_id
-           FROM agent_staff.project_agent_instances pai
-           JOIN agent_staff.projects p ON p.id = pai.project_id
+           FROM swarm_hive.project_agent_instances pai
+           JOIN swarm_hive.projects p ON p.id = pai.project_id
           WHERE pai.id = $1 AND pai.unbound_at IS NULL
           FOR UPDATE`,
         [assignmentId],
@@ -1083,14 +1083,14 @@ export class PostgresWorkbenchRepository {
       const row = assignment.rows[0];
       if (!row) throw new Error("Agent Assignment was not found");
       const event = await client.query<{ id: string }>(
-        `INSERT INTO agent_staff.inbox_events(
+        `INSERT INTO swarm_hive.inbox_events(
            source, external_event_id, project_id, event_type, status, processed_at
-         ) VALUES ('agent_staff_ui', $1, $2, 'development_requested', 'completed', now())
+         ) VALUES ('swarm_hive_ui', $1, $2, 'development_requested', 'completed', now())
          RETURNING id`,
         [`development-${randomUUID()}`, row.project_id],
       );
       const run = await client.query<{ id: string }>(
-        `INSERT INTO agent_staff.agent_instance_runs(
+        `INSERT INTO swarm_hive.agent_instance_runs(
            project_id, agent_instance_id, trigger_event_id, status, task_summary
          ) VALUES ($1, $2, $3, 'queued', $4)
          RETURNING id`,
@@ -1104,7 +1104,7 @@ export class PostgresWorkbenchRepository {
       const runId = run.rows[0]?.id;
       if (!runId) throw new Error("Agent Run was not created");
       await client.query(
-        `UPDATE agent_staff.agent_instances SET status = 'queued', last_active_at = now()
+        `UPDATE swarm_hive.agent_instances SET status = 'queued', last_active_at = now()
           WHERE id = $1`,
         [row.agent_instance_id],
       );
@@ -1144,13 +1144,13 @@ export class PostgresWorkbenchRepository {
               p.external_project_id, ai.id AS agent_instance_id,
               ai.spec_key, ai.spec_version, pai.role,
               ai.thread_id, ai.workspace_key
-         FROM agent_staff.agent_instance_runs r
-         JOIN agent_staff.agent_instances ai ON ai.id = r.agent_instance_id
-         JOIN agent_staff.project_agent_instances pai
+         FROM swarm_hive.agent_instance_runs r
+         JOIN swarm_hive.agent_instances ai ON ai.id = r.agent_instance_id
+         JOIN swarm_hive.project_agent_instances pai
            ON pai.project_id = r.project_id
           AND pai.agent_instance_id = r.agent_instance_id
           AND pai.unbound_at IS NULL
-         JOIN agent_staff.projects p ON p.id = r.project_id
+         JOIN swarm_hive.projects p ON p.id = r.project_id
         WHERE r.id = $1`,
       [runId],
     );
@@ -1188,7 +1188,7 @@ export class PostgresWorkbenchRepository {
         : input.status === "failed" ? "failed" : "idle";
     await this.pool.query(
       `WITH updated_run AS (
-         UPDATE agent_staff.agent_instance_runs
+         UPDATE swarm_hive.agent_instance_runs
             SET status = $2,
                 result_summary = coalesce($3, result_summary),
                 merge_request_url = coalesce($4, merge_request_url),
@@ -1199,7 +1199,7 @@ export class PostgresWorkbenchRepository {
           WHERE id = $1
           RETURNING agent_instance_id
        )
-       UPDATE agent_staff.agent_instances
+       UPDATE swarm_hive.agent_instances
           SET status = $7, last_active_at = now()
         WHERE id = (SELECT agent_instance_id FROM updated_run)`,
       [
@@ -1223,11 +1223,11 @@ export class PostgresWorkbenchRepository {
     data?: Record<string, unknown>;
   }): Promise<void> {
     await this.pool.query(
-      `INSERT INTO agent_staff.agent_instance_run_events(
+      `INSERT INTO swarm_hive.agent_instance_run_events(
          agent_instance_run_id, sequence_no, event_type, level, title, detail, data
        )
        SELECT $1, coalesce(max(sequence_no), 0) + 1, $2, $3, $4, $5, $6::jsonb
-         FROM agent_staff.agent_instance_run_events
+         FROM swarm_hive.agent_instance_run_events
         WHERE agent_instance_run_id = $1`,
       [
         input.runId,
@@ -1241,7 +1241,7 @@ export class PostgresWorkbenchRepository {
   }
 
   async runExists(runId: string): Promise<boolean> {
-    const result = await this.pool.query("SELECT 1 FROM agent_staff.agent_instance_runs WHERE id = $1", [runId]);
+    const result = await this.pool.query("SELECT 1 FROM swarm_hive.agent_instance_runs WHERE id = $1", [runId]);
     return result.rowCount === 1;
   }
 
@@ -1261,7 +1261,7 @@ export class PostgresWorkbenchRepository {
       created_at: Date;
     }>(
       `SELECT sequence_no, event_type, level, title, detail, data, created_at
-         FROM agent_staff.agent_instance_run_events
+         FROM swarm_hive.agent_instance_run_events
         WHERE agent_instance_run_id = $1 AND sequence_no > $2 AND visible_to_user
         ORDER BY sequence_no ASC LIMIT $3`,
       [runId, afterSequence, limit],

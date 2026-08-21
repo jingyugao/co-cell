@@ -19,6 +19,14 @@ export interface WorkspaceRef {
   mountPath: string;
 }
 
+export interface SandboxMount {
+  /** Absolute host path. */
+  source: string;
+  /** Absolute path exposed inside the sandbox. */
+  target: string;
+  readOnly?: boolean;
+}
+
 export interface SandboxSpec {
   runId: string;
   image: string;
@@ -29,6 +37,7 @@ export interface SandboxSpec {
   timeoutMs?: number;
   env?: Readonly<Record<string, string>>;
   labels?: Readonly<Record<string, string>>;
+  mounts?: readonly SandboxMount[];
 }
 
 export interface SandboxExecRequest {

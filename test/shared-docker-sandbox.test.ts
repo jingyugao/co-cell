@@ -45,7 +45,7 @@ class FakeRunner implements DockerCommandRunner {
 function spec(): SandboxSpec {
   return {
     runId: "requirement-1001",
-    image: "agent-staff-sandbox-python:3.12",
+    image: "swarm-hive-sandbox-python:3.12",
     workspace: {
       id: "requirement-1001",
       mountPath: "/agent-workspaces/requirement-1001/repo",
@@ -54,6 +54,11 @@ function spec(): SandboxSpec {
     resources: { cpu: 2, memoryMb: 4096 },
     networkProfile: "bridge",
     env: { HOME: "/tmp/agent-home-requirement-1001" },
+    mounts: [{
+      source: "/host/credentials/kubeconfig",
+      target: "/etc/swarm-hive/kubeconfig",
+      readOnly: true,
+    }],
   };
 }
 
@@ -62,16 +67,19 @@ describe("SharedDockerSandboxProvider", () => {
     const runner = new FakeRunner();
     const provider = new SharedDockerSandboxProvider({
       hostWorkspaceRoot: process.cwd(),
-      containerName: "agent-staff-test-shared",
+      containerName: "swarm-hive-test-shared",
       commandRunner: runner,
       user: "1234:1234",
     });
 
     const sandbox = await provider.create(spec());
-    expect(runner.calls[0]).toEqual(["inspect", "agent-staff-test-shared"]);
+    expect(runner.calls[0]).toEqual(["inspect", "swarm-hive-test-shared"]);
     const create = runner.calls.find((call) => call[0] === "create") ?? [];
-    expect(create).toContain("agent-staff.shared-sandbox=true");
-    expect(create).toContain("agent-staff-sandbox-python:3.12");
+    expect(create).toContain("swarm-hive.shared-sandbox=true");
+    expect(create).toContain("swarm-hive-sandbox-python:3.12");
+    expect(create).toContain(
+      "type=bind,src=/host/credentials/kubeconfig,dst=/etc/swarm-hive/kubeconfig,readonly",
+    );
 
     const pending = sandbox.exec({ command: "pwd" });
     const child = runner.children[0];

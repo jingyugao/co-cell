@@ -3,9 +3,12 @@ import { resolve } from "node:path";
 
 import { Pool, type PoolClient } from "pg";
 
-export const BUSINESS_DATABASE_SCHEMA = "agent_staff";
+export const BUSINESS_DATABASE_SCHEMA = "swarm_hive";
+const LEGACY_BUSINESS_DATABASE_SCHEMA = "agent_staff";
 const MIGRATION_FILE_PATTERN = /^\d{3}_[a-z0-9_]+\.sql$/;
-const MIGRATION_LOCK_KEY = "agent_staff_business_migrations";
+const MIGRATION_LOCK_KEY = "swarm_hive_business_migrations";
+const LEGACY_INITIAL_MIGRATION = "001_create_agent_staff_business_tables.sql";
+const INITIAL_MIGRATION = "001_create_swarm_hive_business_tables.sql";
 
 export interface BusinessMigrationOptions {
   connectionString: string;
@@ -21,6 +24,21 @@ async function migrationFiles(directory: string): Promise<string[]> {
 }
 
 async function ensureMigrationInfrastructure(client: PoolClient): Promise<void> {
+  const schemas = await client.query<{ legacy: string | null; current: string | null }>(
+    "SELECT to_regnamespace($1)::text AS legacy, to_regnamespace($2)::text AS current",
+    [LEGACY_BUSINESS_DATABASE_SCHEMA, BUSINESS_DATABASE_SCHEMA],
+  );
+  const { legacy, current } = schemas.rows[0] ?? { legacy: null, current: null };
+  if (legacy && current) {
+    throw new Error(
+      `Both ${LEGACY_BUSINESS_DATABASE_SCHEMA} and ${BUSINESS_DATABASE_SCHEMA} schemas exist; migrate them manually before startup`,
+    );
+  }
+  if (legacy && !current) {
+    await client.query(
+      `ALTER SCHEMA ${LEGACY_BUSINESS_DATABASE_SCHEMA} RENAME TO ${BUSINESS_DATABASE_SCHEMA}`,
+    );
+  }
   await client.query(`CREATE SCHEMA IF NOT EXISTS ${BUSINESS_DATABASE_SCHEMA}`);
   await client.query(`
     CREATE TABLE IF NOT EXISTS ${BUSINESS_DATABASE_SCHEMA}.schema_migrations (
@@ -28,6 +46,12 @@ async function ensureMigrationInfrastructure(client: PoolClient): Promise<void> 
       applied_at timestamptz NOT NULL DEFAULT now()
     )
   `);
+  await client.query(
+    `UPDATE ${BUSINESS_DATABASE_SCHEMA}.schema_migrations
+        SET version = $1
+      WHERE version = $2`,
+    [INITIAL_MIGRATION, LEGACY_INITIAL_MIGRATION],
+  );
 }
 
 /** Apply pending business-schema migrations under a PostgreSQL advisory lock. */

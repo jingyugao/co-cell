@@ -20,3 +20,9 @@ export class InvalidRequestError extends ApplicationError {
     super(message, "invalid_request", 400);
   }
 }
+
+export class ConflictError extends ApplicationError {
+  constructor(message: string) {
+    super(message, "conflict", 409);
+  }
+}

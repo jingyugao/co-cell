@@ -16,7 +16,7 @@ describe("checkpoint configuration", () => {
     await expect(
       runCodingTask({
         workspace: process.cwd(),
-        resume: true,
+        resume: { answers: { approval: { answers: ["通过"] } } },
         threadId: "requirement-1",
         requestUserInput: unusedInputHandler,
       }),

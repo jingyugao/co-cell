@@ -298,6 +298,17 @@ h1 { color: #182236; font-size: 23px; letter-spacing: -0.5px; }
 .instance-heading { display: grid; grid-template-columns: 40px 1fr 8px; align-items: center; gap: 11px; }
 .instance-icon { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 11px; color: #5456c4; background: #ebecff; font-size: 11px; font-weight: 800; letter-spacing: -0.2px; }
 .instance-heading h2 { margin-top: 4px; color: #2d374b; font-size: 13px; }
+.instance-actions { display: flex; gap: 8px; margin-top: 12px; }
+.instance-actions button { min-height: 38px; flex: 1; padding: 0 14px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 650; }
+.instance-actions .primary-button { width: auto; }
+.instance-actions .danger-button { color: var(--danger); border: 1px solid #f0c8cc; background: #fff7f7; }
+.instance-actions button:disabled { cursor: wait; opacity: .6; }
+.agent-approval-form { display: grid; gap: 12px; margin-top: 14px; padding: 14px; border: 1px solid #f0dfbd; border-radius: 9px; background: #fffbf2; }
+.agent-approval-form label { display: grid; gap: 5px; }
+.agent-approval-form label strong { color: #4a5365; font-size: 11px; }
+.agent-approval-form label span { color: #7e8797; font-size: 10px; line-height: 1.5; }
+.agent-approval-form input { min-width: 0; height: 36px; padding: 0 10px; border: 1px solid #dfe3eb; border-radius: 7px; color: #384256; background: white; font-size: 11px; }
+.agent-approval-form button { min-height: 36px; }
 .live-indicator { width: 7px; height: 7px; border-radius: 50%; background: #32b88a; box-shadow: 0 0 0 4px #eaf8f3; }
 .instance-state-card { display: flex; align-items: center; justify-content: space-between; margin-top: 18px; padding: 13px 14px; border-radius: 9px; background: #f6f7ff; border: 1px solid #ebeaff; }
 .instance-state-card span { display: block; color: #929aad; font-size: 9px; }

@@ -300,7 +300,13 @@ describe("Hono server app", () => {
       agentInstanceId: randomUUID(),
       status: "queued" as const,
     }));
-    const requirements: RequirementWorkflow = { preview, assign, start };
+    const cancel = vi.fn(async () => ({
+      runId,
+      agentInstanceId,
+      status: "cancelled" as const,
+    }));
+    const resume = vi.fn(async () => ({ runId, status: "running" as const }));
+    const requirements: RequirementWorkflow = { preview, assign, start, resume, cancel };
     const app = createApp({
       workbench: queries(),
       specCatalog,
@@ -336,5 +342,25 @@ describe("Hono server app", () => {
     expect(runResponse.status).toBe(202);
     expect(await runResponse.json()).toMatchObject({ runId, status: "queued" });
     expect(start).toHaveBeenCalledWith(assignmentId);
+
+    const cancelResponse = await app.request(`/api/v1/runs/${runId}/cancel`, {
+      method: "POST",
+    });
+    expect(cancelResponse.status).toBe(200);
+    expect(await cancelResponse.json()).toMatchObject({ runId, status: "cancelled" });
+    expect(cancel).toHaveBeenCalledWith(runId);
+
+    const resumeResponse = await app.request(`/api/v1/runs/${runId}/resume`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        answers: { design_approval: { answers: ["通过方案"] } },
+      }),
+    });
+    expect(resumeResponse.status).toBe(202);
+    expect(await resumeResponse.json()).toMatchObject({ runId, status: "running" });
+    expect(resume).toHaveBeenCalledWith(runId, {
+      answers: { design_approval: { answers: ["通过方案"] } },
+    });
   });
 });

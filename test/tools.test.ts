@@ -9,11 +9,31 @@ import { describe, expect, it } from "vitest";
 
 import {
   createRequestUserInputTool,
+  parseRequestUserInput,
+  renderRequestUserInput,
   type RequestUserInput,
 } from "../src/tools/request-user-input.js";
 import { createViewImageTool } from "../src/tools/view-image.js";
 
 describe("request_user_input", () => {
+  it("validates and renders a durable human-readable gate message", () => {
+    const request = parseRequestUserInput({
+      questions: [{
+        id: "scope",
+        header: "范围",
+        question: "选择本次实现范围？",
+        options: [
+          { label: "Small (Recommended)", description: "Only required work." },
+          { label: "Large", description: "Also refactor related code." },
+        ],
+      }],
+    });
+
+    expect(request).toBeDefined();
+    expect(renderRequestUserInput(request!)).toContain("[范围] 选择本次实现范围？");
+    expect(renderRequestUserInput(request!)).toContain("- Small (Recommended)：Only required work.");
+  });
+
   it("passes structured questions to the UI handler", async () => {
     let received: RequestUserInput | undefined;
     const request = createRequestUserInputTool(async (input) => {

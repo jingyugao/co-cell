@@ -14,10 +14,10 @@ import type {
   SandboxSpec,
 } from "../src/sandbox/types.js";
 import {
-  agentWorkspaceSlug,
-  allocateAgentWorkspace,
+  allocateSpecProjectWorkspace,
   createTaskSandbox,
   runSandboxInitializers,
+  workspaceSlug,
 } from "../src/sandbox/factory.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -158,25 +158,38 @@ describe("DockerSandboxProvider", () => {
 });
 
 describe("createTaskSandbox", () => {
-  test("allocates a stable, separate workspace for each Agent", async () => {
-    const root = await mkdtemp(join(tmpdir(), "agent-workspaces-"));
+  test("allocates one persistent Spec HOME with separate project workspaces", async () => {
+    const root = await mkdtemp(join(tmpdir(), "spec-workspaces-"));
     try {
-      const first = await allocateAgentWorkspace({
+      const first = await allocateSpecProjectWorkspace({
         workspaceRoot: root,
-        agentId: "REQ/1001",
+        specKey: "software-engineer",
+        projectId: "project-1001",
       });
-      const repeated = await allocateAgentWorkspace({
+      const repeated = await allocateSpecProjectWorkspace({
         workspaceRoot: root,
-        agentId: "REQ/1001",
+        specKey: "software-engineer",
+        projectId: "project-1001",
       });
-      const second = await allocateAgentWorkspace({
+      const second = await allocateSpecProjectWorkspace({
         workspaceRoot: root,
-        agentId: "REQ/1002",
+        specKey: "software-engineer",
+        projectId: "project-1002",
+      });
+      const otherSpec = await allocateSpecProjectWorkspace({
+        workspaceRoot: root,
+        specKey: "data-analyst",
+        projectId: "project-1001",
       });
 
       expect(first.workspace).toBe(repeated.workspace);
       expect(first.workspace).not.toBe(second.workspace);
-      expect(first.slug).toBe(agentWorkspaceSlug("REQ/1001"));
+      expect(first.home).toBe(second.home);
+      expect(first.home).not.toBe(otherSpec.home);
+      expect(first.specSlug).toBe(workspaceSlug("software-engineer"));
+      expect(first.projectSlug).toBe(workspaceSlug("project-1001"));
+      expect(first.projectRoot).toBe(join(first.home, "projects", first.projectSlug));
+      expect(first.workspace).toBe(join(first.projectRoot, "repo"));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

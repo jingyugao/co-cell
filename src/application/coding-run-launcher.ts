@@ -5,14 +5,23 @@ import { runCodingTask } from "../agent/coding-agent.js";
 import type { RequestUserInput } from "../tools/request-user-input.js";
 import { createPostgresCheckpointer } from "../persistence/postgres-checkpointer.js";
 import type { PostgresWorkbenchRepository } from "../persistence/workbench-repository.js";
-import { allocateAgentWorkspace, createTaskSandbox, type SandboxBackend } from "../sandbox/factory.js";
+import {
+  allocateSpecProjectWorkspace,
+  createTaskSandbox,
+  type SandboxBackend,
+} from "../sandbox/factory.js";
 import { loadAgentSpec } from "../specs/loader.js";
-import { renderAgentTaskPrompt } from "../specs/task-prompt.js";
-import type { AgentRunLauncher, FeishuWorkItemSource } from "./requirement-workflow-service.js";
+import type {
+  CancelAgentRunResult,
+  ResumeAgentRunInput,
+  ResumeAgentRunResult,
+} from "../contracts/requirements.js";
+import type { Sandbox } from "../sandbox/types.js";
+import { ConflictError } from "./errors.js";
+import type { AgentRunLauncher } from "./requirement-workflow-service.js";
 
 export interface CodingRunLauncherOptions {
   repository: PostgresWorkbenchRepository;
-  source: FeishuWorkItemSource;
   databaseUrl: string;
   specsRoot: string;
   workspaceRoot: string;
@@ -27,68 +36,142 @@ export interface CodingRunLauncherOptions {
   gitlabToken?: string;
   gitlabUsername: string;
   kubeconfigPath?: string;
-  feishuProjectMcpUrl: string;
-  feishuProjectMcpToken: string;
+  meegleUserAccessToken: string;
+}
+
+interface ActiveRun {
+  controller: AbortController;
+  cancelled: boolean;
+  sandbox?: Sandbox;
 }
 
 function branchSlug(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 70);
 }
 
+export function buildFeishuProjectTaskPrompt(
+  basePrompt: string,
+  sourceUrl: string,
+): string {
+  return `${basePrompt.trim()}\n\n当前任务：\n\n- 飞书项目地址：${sourceUrl}`;
+}
+
 export class CodingRunLauncher implements AgentRunLauncher {
-  private readonly active = new Set<string>();
+  private readonly active = new Map<string, ActiveRun>();
 
   constructor(private readonly options: CodingRunLauncherOptions) {}
 
   launch(runId: string): void {
     if (this.active.has(runId)) return;
-    this.active.add(runId);
-    void this.execute(runId)
-      .catch((error) => this.fail(runId, error))
+    const activeRun: ActiveRun = {
+      controller: new AbortController(),
+      cancelled: false,
+    };
+    this.active.set(runId, activeRun);
+    void this.execute(runId, activeRun)
+      .catch((error) => activeRun.cancelled ? undefined : this.fail(runId, error))
       .finally(() => this.active.delete(runId));
   }
 
-  private async execute(runId: string): Promise<void> {
-    if (this.options.sandboxBackend === "local") {
-      throw new Error("Web-started development requires docker or shared-docker sandboxing");
+  async resume(
+    runId: string,
+    input: ResumeAgentRunInput,
+  ): Promise<ResumeAgentRunResult> {
+    if (this.active.has(runId)) {
+      throw new ConflictError("Agent Run is already active");
     }
+    const resumed = await this.options.repository.resumeWaitingAgentRun(runId);
+    if (!resumed) {
+      throw new ConflictError("Agent Run is not waiting for user input");
+    }
+    const activeRun: ActiveRun = {
+      controller: new AbortController(),
+      cancelled: false,
+    };
+    this.active.set(runId, activeRun);
+    await this.options.repository.appendAgentRunEvent({
+      runId,
+      eventType: "user_input_received",
+      title: "已收到人工确认",
+      detail: Object.values(input.answers)
+        .flatMap((answer) => answer.answers)
+        .join("；"),
+      data: { state: "completed" },
+    });
+    void this.execute(runId, activeRun, input)
+      .catch((error) => activeRun.cancelled ? undefined : this.fail(runId, error))
+      .finally(() => this.active.delete(runId));
+    return { runId, status: "running" };
+  }
+
+  async cancel(runId: string): Promise<CancelAgentRunResult> {
+    const result = await this.options.repository.cancelAgentRun(runId);
+    if (!result) {
+      throw new ConflictError("Agent Run is not active and cannot be cancelled");
+    }
+    const activeRun = this.active.get(runId);
+    if (activeRun) {
+      activeRun.cancelled = true;
+      activeRun.controller.abort();
+      await activeRun.sandbox?.destroy().catch(() => undefined);
+    }
+    return result;
+  }
+
+  private assertActive(activeRun: ActiveRun): void {
+    if (activeRun.cancelled || activeRun.controller.signal.aborted) {
+      throw new Error("Agent Run was cancelled");
+    }
+  }
+
+  private async execute(
+    runId: string,
+    activeRun: ActiveRun,
+    resumeInput?: ResumeAgentRunInput,
+  ): Promise<void> {
+    if (this.options.sandboxBackend !== "shared-docker") {
+      throw new Error(
+        "Web-started development requires one shared-docker pod per Agent Spec",
+      );
+    }
+    this.assertActive(activeRun);
     const context = await this.options.repository.getAgentRunExecutionContext(runId);
     if (!context) throw new Error("Agent Run execution context was not found");
-    await this.options.repository.updateAgentRun({ runId, status: "running" });
-    await this.options.repository.appendAgentRunEvent({
-      runId,
-      eventType: "requirement_loading_started",
-      title: "正在读取飞书需求",
-      detail: "Agent 启动前重新读取飞书中的最新工作项内容",
-      data: { state: "running", progressPercent: 5 },
-    });
-    const requirement = await this.options.source.get(context.sourceUrl);
-    await this.options.repository.appendAgentRunEvent({
-      runId,
-      eventType: "requirement_loading_completed",
-      title: "已读取飞书需求",
-      detail: `${requirement.preview.title} · ${requirement.preview.currentNodes.map((node) => node.name).join("、") || "无当前节点"}`,
-      data: { state: "completed", progressPercent: 10 },
-    });
-
-    const allocation = await allocateAgentWorkspace({
+    if (!resumeInput) {
+      const claimed = await this.options.repository.updateAgentRun({ runId, status: "running" });
+      if (!claimed) return;
+    }
+    this.assertActive(activeRun);
+    const allocation = await allocateSpecProjectWorkspace({
       workspaceRoot: this.options.workspaceRoot,
-      agentId: context.agentInstanceId,
+      specKey: context.specKey,
+      projectId: context.projectId,
     });
     const gitlabConfigured = Boolean(this.options.gitlabBaseUrl && this.options.gitlabToken);
     if (!gitlabConfigured) {
       throw new Error("GITLAB_BASE_URL and GITLAB_TOKEN are required to start development");
     }
     const gitlabHost = new URL(this.options.gitlabBaseUrl!).host;
-    const agentHome = "/tmp/agent-home";
+    const meegleHost = new URL(context.sourceUrl).host;
+    const agentHome = "/home/agent";
+    const specSandboxPath = resolve(
+      this.options.specsRoot,
+      context.specKey,
+      "sandbox",
+    );
+    const feishuCredentialsPath = resolve(
+      this.options.specsRoot,
+      context.specKey,
+      ".credentials/feishu",
+    );
     const sandbox = await createTaskSandbox({
       backend: this.options.sandboxBackend,
       workspace: allocation.workspace,
-      workspaceRoot: this.options.workspaceRoot,
+      workspaceRoot: allocation.home,
       runId,
       image: this.options.sandboxImage,
       network: this.options.sandboxNetwork,
-      sharedContainerName: this.options.sharedSandboxName,
+      sharedContainerName: `${this.options.sharedSandboxName}-${allocation.specSlug}`,
       env: {
         GITLAB_BASE_URL: this.options.gitlabBaseUrl!,
         GITLAB_HOST: gitlabHost,
@@ -98,22 +181,53 @@ export class CodingRunLauncher implements AgentRunLauncher {
         HOME: agentHome,
         GLAB_CONFIG_DIR: `${agentHome}/.config/glab-cli`,
         GIT_TERMINAL_PROMPT: "0",
-        FEISHU_PROJECT_MCP_URL: this.options.feishuProjectMcpUrl,
-        FEISHU_PROJECT_MCP_TOKEN: this.options.feishuProjectMcpToken,
+        PATH: `${agentHome}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
+        AGENT_SPEC_SANDBOX_DIR: "/opt/swarm-hive/spec-sandbox",
         FEISHU_PROJECT_WORK_ITEM_URL: context.sourceUrl,
+        MEEGLE_HOST: meegleHost,
+        MEEGLE_USER_ACCESS_TOKEN: this.options.meegleUserAccessToken,
         ...(this.options.kubeconfigPath
           ? { KUBECONFIG: "/etc/swarm-hive/kubeconfig" }
           : {}),
       },
-      mounts: this.options.kubeconfigPath
-        ? [{
+      mounts: [
+        {
+          source: resolve(feishuCredentialsPath, ".lark-cli"),
+          target: `${agentHome}/.lark-cli`,
+        },
+        {
+          source: resolve(
+            feishuCredentialsPath,
+            ".local/share/lark-cli",
+          ),
+          target: `${agentHome}/.local/share/lark-cli`,
+        },
+        {
+          source: specSandboxPath,
+          target: "/opt/swarm-hive/spec-sandbox",
+          readOnly: true,
+        },
+        ...(this.options.kubeconfigPath
+          ? [{
             source: this.options.kubeconfigPath,
             target: "/etc/swarm-hive/kubeconfig",
             readOnly: true,
           }]
-        : [],
+          : []),
+      ],
       initializers: [
-        { name: "gitlab", command: "gitlab-init" },
+        {
+          name: "spec-tools",
+          command: "sh /opt/swarm-hive/spec-sandbox/bin/tools-init",
+        },
+        {
+          name: "gitlab",
+          command: "sh /opt/swarm-hive/spec-sandbox/bin/gitlab-init",
+        },
+        {
+          name: "feishu-cli",
+          command: "sh /opt/swarm-hive/spec-sandbox/bin/feishu-init",
+        },
         ...(this.options.kubeconfigPath
           ? [{
               name: "kubernetes",
@@ -129,6 +243,11 @@ export class CodingRunLauncher implements AgentRunLauncher {
           : []),
       ],
     });
+    activeRun.sandbox = sandbox;
+    if (activeRun.cancelled || activeRun.controller.signal.aborted) {
+      await sandbox?.destroy();
+    }
+    this.assertActive(activeRun);
     const spec = await loadAgentSpec({
       directory: resolve(this.options.specsRoot, context.specKey),
       capabilities: new Set(["gitlab"]),
@@ -141,14 +260,11 @@ export class CodingRunLauncher implements AgentRunLauncher {
       await this.options.repository.appendAgentRunEvent({
         runId,
         eventType: "agent_started",
-        title: "Agent 开始开发",
-        detail: context.role,
-        data: { state: "running", progressPercent: 15 },
+        title: resumeInput ? "Agent 继续当前流程" : "Agent 开始处理需求",
+        detail: "控制面仅提供飞书 Project 地址；Agent 将使用 Sandbox 内的 Meegle 和 Lark CLI 自主读取最新需求",
+        data: { state: "running", progressPercent: 5 },
       });
-      const prompt = renderAgentTaskPrompt(spec.prompt, {
-        role: context.role,
-        source_url: context.sourceUrl,
-      });
+      const prompt = buildFeishuProjectTaskPrompt(spec.prompt, context.sourceUrl);
       const result = await runCodingTask({
         workspace: allocation.workspace,
         sandbox,
@@ -156,10 +272,12 @@ export class CodingRunLauncher implements AgentRunLauncher {
         threadId: context.threadId,
         runId,
         checkpointer: checkpoint.checkpointer,
+        ...(resumeInput ? { resume: resumeInput } : {}),
         model: this.options.model,
         additionalInstructions: spec.instructions,
         requestUserInput: async (request) =>
           interrupt<RequestUserInput, never>(request),
+        signal: activeRun.controller.signal,
         ...(this.options.openAIBaseUrl && this.options.openAIApiKey
           ? {
               openAICompatible: {
@@ -169,9 +287,14 @@ export class CodingRunLauncher implements AgentRunLauncher {
             }
           : {}),
       });
+      this.assertActive(activeRun);
       if (result.userInputRequest) {
-        await this.options.repository.updateAgentRun({ runId, status: "waiting_user" });
-        await this.options.repository.appendAgentRunEvent({
+        const updated = await this.options.repository.updateAgentRun({
+          runId,
+          status: "waiting_user",
+          resultSummary: result.finalResponse,
+        });
+        if (updated) await this.options.repository.appendAgentRunEvent({
           runId,
           eventType: "user_input_requested",
           level: "warning",
@@ -183,13 +306,13 @@ export class CodingRunLauncher implements AgentRunLauncher {
         });
         return;
       }
-      await this.options.repository.updateAgentRun({
+      const updated = await this.options.repository.updateAgentRun({
         runId,
         status: "succeeded",
         resultSummary: result.finalResponse,
         mergeRequestUrl: result.mergeRequestUrl,
       });
-      await this.options.repository.appendAgentRunEvent({
+      if (updated) await this.options.repository.appendAgentRunEvent({
         runId,
         eventType: "agent_completed",
         title: "Agent 已完成本次执行",
@@ -204,13 +327,13 @@ export class CodingRunLauncher implements AgentRunLauncher {
 
   private async fail(runId: string, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
-    await this.options.repository.updateAgentRun({
+    const updated = await this.options.repository.updateAgentRun({
       runId,
       status: "failed",
       errorCode: "agent_execution_failed",
       errorMessage: message,
-    }).catch(() => undefined);
-    await this.options.repository.appendAgentRunEvent({
+    }).catch(() => false);
+    if (updated) await this.options.repository.appendAgentRunEvent({
       runId,
       eventType: "agent_failed",
       level: "error",

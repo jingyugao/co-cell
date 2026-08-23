@@ -44,3 +44,18 @@ export interface StartAgentRunResult {
   agentInstanceId: string;
   status: RunStatus;
 }
+
+export interface CancelAgentRunResult {
+  runId: string;
+  agentInstanceId: string;
+  status: "cancelled";
+}
+
+export interface ResumeAgentRunInput {
+  answers: Record<string, { answers: string[] }>;
+}
+
+export interface ResumeAgentRunResult {
+  runId: string;
+  status: "running";
+}

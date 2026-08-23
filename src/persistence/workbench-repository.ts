@@ -19,6 +19,7 @@ import type {
 } from "../contracts/workbench.js";
 import type {
   AgentAssignmentResult,
+  CancelAgentRunResult,
   StartAgentRunResult,
 } from "../contracts/requirements.js";
 
@@ -1103,10 +1104,12 @@ export class PostgresWorkbenchRepository {
       );
       const runId = run.rows[0]?.id;
       if (!runId) throw new Error("Agent Run was not created");
+      const threadId = `run:${runId}:${randomUUID()}`;
       await client.query(
-        `UPDATE swarm_hive.agent_instances SET status = 'queued', last_active_at = now()
+        `UPDATE swarm_hive.agent_instances
+            SET status = 'queued', thread_id = $2, last_active_at = now()
           WHERE id = $1`,
-        [row.agent_instance_id],
+        [row.agent_instance_id, threadId],
       );
       await client.query("COMMIT");
       return {
@@ -1115,6 +1118,49 @@ export class PostgresWorkbenchRepository {
         agentInstanceId: row.agent_instance_id,
         status: "queued",
       };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async cancelAgentRun(runId: string): Promise<CancelAgentRunResult | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const cancelled = await client.query<{ agent_instance_id: string }>(
+        `WITH cancelled_run AS (
+           UPDATE swarm_hive.agent_instance_runs
+              SET status = 'cancelled', finished_at = now()
+            WHERE id = $1
+              AND status IN ('queued', 'running', 'waiting_user')
+            RETURNING agent_instance_id
+         ), idle_instance AS (
+           UPDATE swarm_hive.agent_instances
+              SET status = 'idle', last_active_at = now()
+            WHERE id = (SELECT agent_instance_id FROM cancelled_run)
+            RETURNING id
+         )
+         SELECT agent_instance_id FROM cancelled_run`,
+        [runId],
+      );
+      const agentInstanceId = cancelled.rows[0]?.agent_instance_id;
+      if (!agentInstanceId) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      await client.query("COMMIT");
+      await this.appendAgentRunEvent({
+        runId,
+        eventType: "agent_cancelled",
+        level: "warning",
+        title: "用户结束了本次运行",
+        detail: "可以重新启动 Agent；新 Run 将使用全新的对话，工作区内容保持不变",
+        data: { state: "completed" },
+      }).catch(() => undefined);
+      return { runId, agentInstanceId, status: "cancelled" };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
@@ -1180,13 +1226,13 @@ export class PostgresWorkbenchRepository {
     mergeRequestUrl?: string;
     errorCode?: string;
     errorMessage?: string;
-  }): Promise<void> {
+  }): Promise<boolean> {
     const instanceStatus = input.status === "running"
       ? "running"
       : input.status === "waiting_user"
         ? "waiting"
         : input.status === "failed" ? "failed" : "idle";
-    await this.pool.query(
+    const updated = await this.pool.query(
       `WITH updated_run AS (
          UPDATE swarm_hive.agent_instance_runs
             SET status = $2,
@@ -1197,11 +1243,13 @@ export class PostgresWorkbenchRepository {
                 started_at = CASE WHEN $2 = 'running' THEN coalesce(started_at, now()) ELSE started_at END,
                 finished_at = CASE WHEN $2 IN ('succeeded','failed') THEN now() ELSE NULL END
           WHERE id = $1
+            AND status IN ('queued', 'running', 'waiting_user')
           RETURNING agent_instance_id
        )
        UPDATE swarm_hive.agent_instances
           SET status = $7, last_active_at = now()
-        WHERE id = (SELECT agent_instance_id FROM updated_run)`,
+        WHERE id = (SELECT agent_instance_id FROM updated_run)
+        RETURNING id`,
       [
         input.runId,
         input.status,
@@ -1212,6 +1260,25 @@ export class PostgresWorkbenchRepository {
         instanceStatus,
       ],
     );
+    return updated.rowCount === 1;
+  }
+
+  async resumeWaitingAgentRun(runId: string): Promise<boolean> {
+    const updated = await this.pool.query(
+      `WITH updated_run AS (
+         UPDATE swarm_hive.agent_instance_runs
+            SET status = 'running', finished_at = NULL,
+                error_code = NULL, error_message = NULL
+          WHERE id = $1 AND status = 'waiting_user'
+          RETURNING agent_instance_id
+       )
+       UPDATE swarm_hive.agent_instances
+          SET status = 'running', last_active_at = now()
+        WHERE id = (SELECT agent_instance_id FROM updated_run)
+        RETURNING id`,
+      [runId],
+    );
+    return updated.rowCount === 1;
   }
 
   async appendAgentRunEvent(input: {

@@ -12,8 +12,11 @@ import type {
 } from "../../src/contracts/workbench";
 import type {
   AgentAssignmentResult,
+  CancelAgentRunResult,
   FeishuWorkItemPreview,
   StartAgentRunResult,
+  ResumeAgentRunInput,
+  ResumeAgentRunResult,
 } from "../../src/contracts/requirements";
 import { readWorkbenchRoute } from "./navigation";
 
@@ -116,5 +119,22 @@ export function startAgentRun(assignmentId: string): Promise<StartAgentRunResult
   return postJson<StartAgentRunResult>(
     `/api/v1/agent-assignments/${encodeURIComponent(assignmentId)}/runs`,
     {},
+  );
+}
+
+export function cancelAgentRun(runId: string): Promise<CancelAgentRunResult> {
+  return postJson<CancelAgentRunResult>(
+    `/api/v1/runs/${encodeURIComponent(runId)}/cancel`,
+    {},
+  );
+}
+
+export function resumeAgentRun(
+  runId: string,
+  input: ResumeAgentRunInput,
+): Promise<ResumeAgentRunResult> {
+  return postJson<ResumeAgentRunResult>(
+    `/api/v1/runs/${encodeURIComponent(runId)}/resume`,
+    input,
   );
 }

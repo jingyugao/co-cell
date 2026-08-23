@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { runCodingTask } from "./agent/coding-agent.js";
@@ -9,7 +9,7 @@ import { verifyGitLabMergeRequest } from "./integrations/gitlab.js";
 import { createTerminalUserInputHandler } from "./tools/request-user-input.js";
 import { loadAgentSpec } from "./specs/loader.js";
 import {
-  allocateAgentWorkspace,
+  allocateSpecProjectWorkspace,
   createTaskSandbox,
   type SandboxBackend,
 } from "./sandbox/factory.js";
@@ -23,6 +23,26 @@ async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks).toString("utf8");
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function firstUrlHost(...values: Array<string | undefined>): string | undefined {
+  for (const value of values) {
+    if (!value?.trim()) continue;
+    try {
+      return new URL(value.trim()).host;
+    } catch {
+      // Ignore malformed optional values; the corresponding integration remains disabled.
+    }
+  }
+  return undefined;
 }
 
 async function main(): Promise<void> {
@@ -53,26 +73,6 @@ async function main(): Promise<void> {
     }
     const workspaceRoot = process.env.AGENT_WORKSPACE_ROOT;
     const requestedWorkspace = valueAfter("--workspace");
-    let allocation;
-    if (!requestedWorkspace && sandboxBackend === "shared-docker") {
-      if (!workspaceRoot) {
-        throw new Error(
-          "AGENT_WORKSPACE_ROOT is required to allocate an Agent workspace",
-        );
-      }
-      allocation = await allocateAgentWorkspace({
-        workspaceRoot,
-        agentId: threadId,
-      });
-    }
-    const workspace = resolve(
-      requestedWorkspace ?? allocation?.workspace ?? process.cwd(),
-    );
-    if (allocation) {
-      process.stderr.write(
-        `agent_id=${threadId}\nworkspace=${allocation.workspace}\n`,
-      );
-    }
     const resume = process.argv.includes("--resume");
     const taskPath = valueAfter("--task-file");
     const inlineTask = valueAfter("--task");
@@ -150,28 +150,131 @@ async function main(): Promise<void> {
         resolve("agent-specs/software-engineer"),
       capabilities: new Set(gitlabEnvironment ? ["gitlab"] : []),
     });
+    const feishuCredentialsRoot = resolve(spec.directory, ".credentials/feishu");
+    const larkConfigPath = resolve(feishuCredentialsRoot, ".lark-cli");
+    const larkDataPath = resolve(
+      feishuCredentialsRoot,
+      ".local/share/lark-cli",
+    );
+    const meegleUserAccessToken =
+      process.env.MEEGLE_USER_ACCESS_TOKEN?.trim() ||
+      process.env.FEISHU_PROJECT_MCP_TOKEN?.trim() ||
+      process.env.FeishuProjectMcpToken?.trim();
+    const meegleHost =
+      process.env.MEEGLE_HOST?.trim() ||
+      firstUrlHost(
+        process.env.FEISHU_PROJECT_WORK_ITEM_URL,
+        process.env.FEISHU_PROJECT_MCP_URL,
+        process.env.FeishuProjectMcpUrl,
+      );
+    const feishuCliConfigured = Boolean(
+      meegleUserAccessToken &&
+      meegleHost &&
+      await isDirectory(larkConfigPath) &&
+      await isDirectory(larkDataPath),
+    );
+    let allocation;
+    if (!requestedWorkspace && sandboxBackend === "shared-docker") {
+      if (!workspaceRoot) {
+        throw new Error(
+          "AGENT_WORKSPACE_ROOT is required to allocate a Spec project workspace",
+        );
+      }
+      allocation = await allocateSpecProjectWorkspace({
+        workspaceRoot,
+        specKey: spec.manifest.id,
+        projectId: valueAfter("--project-id") ?? threadId,
+      });
+    }
+    const workspace = resolve(
+      requestedWorkspace ?? allocation?.workspace ?? process.cwd(),
+    );
+    if (allocation) {
+      process.stderr.write(
+        `spec=${spec.manifest.id}\nproject=${allocation.projectId}\nworkspace=${allocation.workspace}\n`,
+      );
+    }
+    const specSandboxPath = resolve(spec.directory, "sandbox");
+    const sandboxHome = sandboxBackend === "shared-docker"
+      ? "/home/agent"
+      : "/tmp/agent-home";
+    const sandboxEnvironment = sandboxBackend === "docker" || sandboxBackend === "shared-docker"
+      ? {
+          ...gitlabEnvironment,
+          HOME: sandboxHome,
+          GLAB_CONFIG_DIR: `${sandboxHome}/.config/glab-cli`,
+          PATH: `${sandboxHome}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
+          AGENT_SPEC_SANDBOX_DIR: "/opt/swarm-hive/spec-sandbox",
+          ...(feishuCliConfigured
+            ? {
+                MEEGLE_HOST: meegleHost!,
+                MEEGLE_USER_ACCESS_TOKEN: meegleUserAccessToken!,
+              }
+            : {}),
+        }
+      : gitlabEnvironment;
     try {
       const sandbox = await createTaskSandbox({
         backend: sandboxBackend,
         workspace,
-        workspaceRoot,
+        workspaceRoot: allocation?.home ?? workspaceRoot,
         runId,
         image: valueAfter("--sandbox-image") ?? process.env.AGENT_SANDBOX_IMAGE,
         network:
           valueAfter("--sandbox-network") ??
           process.env.AGENT_SANDBOX_NETWORK ??
           "none",
-        env: gitlabEnvironment,
-        sharedContainerName: process.env.AGENT_SHARED_SANDBOX_NAME,
-        initializers: gitlabEnvironment
-          ? [{ name: "gitlab", command: "gitlab-init" }]
+        env: sandboxEnvironment,
+        mounts: sandboxBackend === "docker" || sandboxBackend === "shared-docker"
+          ? [
+              {
+                source: specSandboxPath,
+                target: "/opt/swarm-hive/spec-sandbox",
+                readOnly: true,
+              },
+              ...(feishuCliConfigured
+                ? [
+                    {
+                      source: larkConfigPath,
+                      target: `${sandboxHome}/.lark-cli`,
+                    },
+                    {
+                      source: larkDataPath,
+                      target: `${sandboxHome}/.local/share/lark-cli`,
+                    },
+                  ]
+                : []),
+            ]
+          : undefined,
+        sharedContainerName: sandboxBackend === "shared-docker"
+          ? `${process.env.AGENT_SHARED_SANDBOX_NAME ?? "swarm-hive-dev-sandbox"}-${allocation?.specSlug ?? spec.manifest.id}`
+          : undefined,
+        initializers: sandboxBackend === "docker" || sandboxBackend === "shared-docker"
+          ? [
+              {
+                name: "spec-tools",
+                command: "sh /opt/swarm-hive/spec-sandbox/bin/tools-init",
+              },
+              ...(gitlabEnvironment
+                ? [{
+                    name: "gitlab",
+                    command: "sh /opt/swarm-hive/spec-sandbox/bin/gitlab-init",
+                  }]
+                : []),
+              ...(feishuCliConfigured
+                ? [{
+                    name: "feishu-cli",
+                    command: "sh /opt/swarm-hive/spec-sandbox/bin/feishu-init",
+                  }]
+                : []),
+            ]
           : undefined,
       });
       try {
         const result = await runCodingTask({
           workspace,
           prompt,
-          resume,
+          ...(resume ? { resume: true as const } : {}),
           sandbox,
           model: valueAfter("--model"),
           requestUserInput: createTerminalUserInputHandler(),

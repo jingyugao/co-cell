@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import type {
   AgentAssignmentResult,
+  CancelAgentRunResult,
   FeishuWorkItemPreview,
+  ResumeAgentRunInput,
+  ResumeAgentRunResult,
   StartAgentRunResult,
 } from "../contracts/requirements.js";
 import type { FeishuProjectWorkItemDetails } from "../integrations/feishu-project-mcp.js";
@@ -108,6 +111,8 @@ export class McpFeishuWorkItemSource implements FeishuWorkItemSource {
 
 export interface AgentRunLauncher {
   launch(runId: string): void;
+  resume(runId: string, input: ResumeAgentRunInput): Promise<ResumeAgentRunResult>;
+  cancel(runId: string): Promise<CancelAgentRunResult>;
 }
 
 export interface RequirementWorkflow {
@@ -118,6 +123,8 @@ export interface RequirementWorkflow {
     role: string;
   }): Promise<AgentAssignmentResult>;
   start(assignmentId: string): Promise<StartAgentRunResult>;
+  resume(runId: string, input: ResumeAgentRunInput): Promise<ResumeAgentRunResult>;
+  cancel(runId: string): Promise<CancelAgentRunResult>;
 }
 
 export class RequirementWorkflowService implements RequirementWorkflow {
@@ -164,5 +171,13 @@ export class RequirementWorkflowService implements RequirementWorkflow {
     const result = await this.repository.createAgentRun(assignmentId);
     queueMicrotask(() => this.launcher.launch(result.runId));
     return result;
+  }
+
+  resume(runId: string, input: ResumeAgentRunInput): Promise<ResumeAgentRunResult> {
+    return this.launcher.resume(runId, input);
+  }
+
+  cancel(runId: string): Promise<CancelAgentRunResult> {
+    return this.launcher.cancel(runId);
   }
 }

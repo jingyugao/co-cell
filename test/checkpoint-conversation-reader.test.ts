@@ -40,4 +40,38 @@ describe("checkpoint conversation reader", () => {
       }),
     ]);
   });
+
+  test("renders an empty request_user_input tool call as a visible confirmation message", () => {
+    const messages = serializeConversationMessages([
+      new AIMessage({
+        id: "ai-gate",
+        content: "",
+        tool_calls: [{
+          id: "request-1",
+          name: "request_user_input",
+          type: "tool_call",
+          args: {
+            questions: [{
+              id: "delivery_scope",
+              header: "交付范围",
+              question: "本期是否只交付后端接口？",
+              options: [
+                { label: "仅后端 (Recommended)", description: "在当前仓库完成接口。" },
+                { label: "包含页面", description: "需要补充前端仓库。" },
+              ],
+            }],
+          },
+        }],
+      }),
+    ]);
+
+    expect(messages[0]).toMatchObject({
+      role: "ai",
+      content:
+        "需要人工确认：\n\n" +
+        "[交付范围] 本期是否只交付后端接口？\n" +
+        "- 仅后端 (Recommended)：在当前仓库完成接口。\n" +
+        "- 包含页面：需要补充前端仓库。",
+    });
+  });
 });

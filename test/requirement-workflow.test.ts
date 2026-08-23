@@ -69,7 +69,15 @@ describe("Requirement workflow", () => {
           environmentExample: ".env.example",
         }),
       },
-      { launch: vi.fn() },
+      {
+        launch: vi.fn(),
+        resume: vi.fn(async (runId: string) => ({ runId, status: "running" as const })),
+        cancel: vi.fn(async (runId: string) => ({
+          runId,
+          agentInstanceId: "instance-id",
+          status: "cancelled" as const,
+        })),
+      },
     );
     await service.assign({
       url: sourceUrl,

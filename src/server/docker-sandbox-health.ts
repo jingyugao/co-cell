@@ -26,10 +26,18 @@ export class DockerSandboxHealthProvider implements SandboxHealthProvider {
     try {
       const result = await execFileAsync(
         "docker",
-        ["inspect", "--format", "{{.State.Running}}", this.containerName],
+        [
+          "ps",
+          "--all",
+          "--filter",
+          `name=^/${this.containerName}-`,
+          "--format",
+          "{{.State}}",
+        ],
         { timeout: 2_000 },
       );
-      status = result.stdout.trim() === "true" ? "online" : "offline";
+      const states = result.stdout.trim().split("\n").filter(Boolean);
+      status = states.some((state) => state === "running") ? "online" : "offline";
     } catch (error) {
       const exitCode =
         error !== null && typeof error === "object" && "code" in error
@@ -40,7 +48,7 @@ export class DockerSandboxHealthProvider implements SandboxHealthProvider {
 
     const value: SandboxRuntimeStatus = {
       status,
-      name: this.containerName,
+      name: `${this.containerName}-*`,
       latencyMs: Math.round(performance.now() - started),
     };
     this.cached = { expiresAt: now + this.cacheMilliseconds, value };

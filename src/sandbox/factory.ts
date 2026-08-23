@@ -31,43 +31,78 @@ export interface TaskSandboxOptions {
   sharedContainerName?: string;
 }
 
-export interface AgentWorkspace {
-  agentId: string;
-  slug: string;
-  root: string;
+export interface SpecProjectWorkspace {
+  specKey: string;
+  projectId: string;
+  specSlug: string;
+  projectSlug: string;
+  projectRoot: string;
   workspace: string;
+  home: string;
+  projectsRoot: string;
 }
 
-export function agentWorkspaceSlug(agentId: string): string {
-  const normalized = agentId
+export function workspaceSlug(value: string): string {
+  const normalized = value
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 48) || "agent";
-  const digest = createHash("sha256").update(agentId).digest("hex").slice(0, 8);
+    .slice(0, 48) || "workspace";
+  const digest = createHash("sha256").update(value).digest("hex").slice(0, 8);
   return `${normalized}-${digest}`;
 }
 
-/** Allocate a stable host directory for one long-lived Agent conversation. */
-export async function allocateAgentWorkspace(options: {
+/** Allocate one project directory inside the persistent HOME owned by a Spec pod. */
+export async function allocateSpecProjectWorkspace(options: {
   workspaceRoot: string;
-  agentId: string;
-}): Promise<AgentWorkspace> {
+  specKey: string;
+  projectId: string;
+}): Promise<SpecProjectWorkspace> {
   const requestedRoot = resolve(options.workspaceRoot);
   await mkdir(requestedRoot, { recursive: true });
   const root = await realpath(requestedRoot);
   const rootStat = await stat(root);
-  const slug = agentWorkspaceSlug(options.agentId);
-  const agentRoot = resolve(root, slug);
-  const workspace = resolve(agentRoot, "repo");
-  await mkdir(workspace, { recursive: true });
+  const specSlug = workspaceSlug(options.specKey);
+  const projectSlug = workspaceSlug(options.projectId);
+  const specRoot = resolve(root, "specs", specSlug);
+  const home = resolve(specRoot, "home");
+  const projectsRoot = resolve(home, "projects");
+  const projectRoot = resolve(projectsRoot, projectSlug);
+  const workspace = resolve(projectRoot, "repo");
+  const persistentDirectories = [
+    specRoot,
+    home,
+    resolve(home, ".local"),
+    resolve(home, ".local/share"),
+    resolve(home, ".local/share/lark-cli"),
+    resolve(home, ".lark-cli"),
+    projectsRoot,
+    projectRoot,
+    workspace,
+  ];
+  for (const directory of persistentDirectories) {
+    await mkdir(directory, { recursive: true });
+  }
   // The controller commonly runs as root to access docker.sock. Preserve the
-  // host workspace-root owner so files created by the shared container remain
-  // editable by the local developer.
-  await chown(agentRoot, rootStat.uid, rootStat.gid);
-  await chown(workspace, rootStat.uid, rootStat.gid);
-  return { agentId: options.agentId, slug, root: agentRoot, workspace };
+  // host workspace-root owner across the Spec HOME, mount points, and project.
+  // Docker otherwise creates missing nested bind-mount targets as root.
+  for (const directory of persistentDirectories) {
+    const directoryStat = await stat(directory);
+    if (directoryStat.uid !== rootStat.uid || directoryStat.gid !== rootStat.gid) {
+      await chown(directory, rootStat.uid, rootStat.gid);
+    }
+  }
+  return {
+    specKey: options.specKey,
+    projectId: options.projectId,
+    specSlug,
+    projectSlug,
+    projectRoot,
+    workspace,
+    home,
+    projectsRoot,
+  };
 }
 
 const INITIALIZER_YIELD_MS = 30_000;
@@ -161,11 +196,11 @@ export async function createTaskSandbox(
     if (!workspaceRelative || workspaceRelative.startsWith("..")) {
       throw new Error("Shared Agent workspace must be below AGENT_WORKSPACE_ROOT");
     }
-    mountPath = `/agent-workspaces/${workspaceRelative.split(sep).join("/")}`;
-    const hostAgentHome = resolve(workspace, "..", ".home");
-    await mkdir(hostAgentHome, { recursive: true });
-    await chown(hostAgentHome, workspaceStat.uid, workspaceStat.gid);
-    const agentHome = posix.join(posix.dirname(mountPath), ".home");
+    const agentHome = "/home/agent";
+    mountPath = posix.join(
+      agentHome,
+      workspaceRelative.split(sep).join("/"),
+    );
     sandboxEnvironment = {
       ...options.env,
       HOME: agentHome,
@@ -173,6 +208,7 @@ export async function createTaskSandbox(
     };
     provider = new SharedDockerSandboxProvider({
       hostWorkspaceRoot: workspaceRoot,
+      containerWorkspaceRoot: agentHome,
       containerName: options.sharedContainerName,
       user,
     });

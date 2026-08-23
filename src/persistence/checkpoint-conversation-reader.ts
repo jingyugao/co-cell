@@ -6,6 +6,10 @@ import type {
   AgentConversationResponse,
 } from "../contracts/workbench.js";
 import { redactSensitiveText } from "../security/redact.js";
+import {
+  parseRequestUserInput,
+  renderRequestUserInput,
+} from "../tools/request-user-input.js";
 
 function supportedRole(value: string): value is AgentConversationMessage["role"] {
   return value === "human" || value === "ai" || value === "tool" || value === "system";
@@ -21,11 +25,18 @@ export function serializeConversationMessages(messages: unknown[]): AgentConvers
           args: call.args,
         }))
       : [];
+    const requestUserInput = toolCalls
+      .filter((call) => call.name === "request_user_input")
+      .map((call) => parseRequestUserInput(call.args))
+      .find((request) => request !== undefined);
+    const content = value.text.trim() || (requestUserInput
+      ? renderRequestUserInput(requestUserInput)
+      : value.text);
     return [{
       id: value.id ?? `message-${index}`,
       role: value.type,
       name: value.name ?? null,
-      content: redactSensitiveText(value.text),
+      content: redactSensitiveText(content),
       toolCallId: isToolMessage(value) ? value.tool_call_id : null,
       toolCalls,
       status: isToolMessage(value) ? value.status ?? null : null,

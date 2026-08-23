@@ -1,6 +1,6 @@
 import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
-import { isInterrupted } from "@langchain/langgraph";
+import { Command, isInterrupted } from "@langchain/langgraph";
 import {
   createAgent,
   createMiddleware,
@@ -16,8 +16,10 @@ import { findGitLabMergeRequestUrl } from "../integrations/gitlab.js";
 import { BashProcessManager, createBashTool } from "../tools/bash.js";
 import {
   createRequestUserInputTool,
+  renderRequestUserInput,
   type RequestUserInput,
   type RequestUserInputHandler,
+  type RequestUserInputResponse,
 } from "../tools/request-user-input.js";
 import { createViewImageTool } from "../tools/view-image.js";
 
@@ -164,7 +166,8 @@ export interface CodingTask {
   workspace: string;
   /** New user input. Omit only when resuming an interrupted/failed checkpoint. */
   prompt?: string;
-  resume?: boolean;
+  /** Human response used to resume a request_user_input interrupt. */
+  resume?: RequestUserInputResponse | true;
   /** Optional externally managed execution sandbox. Defaults to local execution. */
   sandbox?: Sandbox;
   model?: string;
@@ -184,6 +187,8 @@ export interface CodingTask {
     apiKey: string;
     baseURL: string;
   };
+  /** Stops model execution while the sandbox is being terminated. */
+  signal?: AbortSignal;
 }
 
 export interface CodingTaskResult {
@@ -266,10 +271,11 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
     const threadId = task.threadId?.trim();
     const result = await agent.invoke(
       task.resume
-        ? null
+        ? new Command({ resume: task.resume })
         : { messages: [new HumanMessage(task.prompt!)] },
       {
         recursionLimit: task.recursionLimit ?? 200,
+        ...(task.signal ? { signal: task.signal } : {}),
         ...(threadId
           ? {
               configurable: {
@@ -293,7 +299,9 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
     if (isInterrupted<RequestUserInput>(result)) {
       const request = result.__interrupt__[0]?.value;
       return {
-        finalResponse: "",
+        finalResponse: request
+          ? renderRequestUserInput(request)
+          : "Agent 正在等待人工确认。",
         messages,
         todos: result.todos ?? [],
         ...(request ? { userInputRequest: request } : {}),

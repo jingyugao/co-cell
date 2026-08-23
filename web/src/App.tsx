@@ -29,6 +29,7 @@ import type {
 } from "../../src/contracts/requirements";
 import {
   createAgentAssignment,
+  cancelAgentRun,
   loadInboxEvents,
   loadAllRuns,
   loadAllInboxEvents,
@@ -40,6 +41,7 @@ import {
   loadProjects,
   loadProjectWorkbench,
   previewFeishuWorkItem,
+  resumeAgentRun,
   startAgentRun,
 } from "./api";
 import {
@@ -68,6 +70,32 @@ const instanceStatusLabels: Record<AgentInstanceStatus, string> = {
   disabled: "已停用",
   failed: "运行异常",
 };
+
+interface PendingAgentQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: Array<{ label: string; description: string }>;
+}
+
+function pendingAgentQuestions(
+  conversation: AgentConversationResponse | null,
+): PendingAgentQuestion[] {
+  for (const message of [...(conversation?.messages ?? [])].reverse()) {
+    const call = [...message.toolCalls].reverse()
+      .find((candidate) => candidate.name === "request_user_input");
+    if (!call || !call.args || typeof call.args !== "object") continue;
+    const questions = (call.args as { questions?: unknown }).questions;
+    if (!Array.isArray(questions)) continue;
+    return questions.filter((question): question is PendingAgentQuestion => {
+      if (!question || typeof question !== "object") return false;
+      const value = question as Partial<PendingAgentQuestion>;
+      return typeof value.id === "string" && typeof value.header === "string" &&
+        typeof value.question === "string" && Array.isArray(value.options);
+    });
+  }
+  return [];
+}
 
 function useWorkbench(): ProjectWorkbench {
   const value = useContext(WorkbenchContext);
@@ -734,6 +762,9 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
   const [detail, setDetail] = useState<AgentInstanceDetail | null>(null);
   const [conversation, setConversation] = useState<AgentConversationResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [acting, setActing] = useState<"start" | "cancel" | "resume" | null>(null);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [refreshVersion, setRefreshVersion] = useState(0);
   useEffect(() => {
     let active = true;
     let timer: number | undefined;
@@ -763,10 +794,58 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [agentInstanceId]);
+  }, [agentInstanceId, refreshVersion]);
   if (error) return <div className="form-error" role="alert">{error}</div>;
   if (!detail) return <div className="empty-state">正在读取 Agent Instance…</div>;
   const instance = detail.agentInstance;
+  const assignment = detail.assignment;
+  const activeRun = detail.currentRun && ["queued", "running", "waiting_user"].includes(detail.currentRun.status)
+    ? detail.currentRun
+    : null;
+  const canStart = Boolean(assignment) && (instance.status === "idle" || instance.status === "failed");
+  const pendingQuestions = activeRun?.status === "waiting_user"
+    ? pendingAgentQuestions(conversation)
+    : [];
+  async function runAction(action: "start" | "cancel") {
+    setActing(action);
+    setError(null);
+    try {
+      if (action === "cancel" && activeRun) {
+        await cancelAgentRun(activeRun.id);
+      } else if (action === "start" && assignment) {
+        setConversation(null);
+        await startAgentRun(assignment.id);
+      }
+      setRefreshVersion((value) => value + 1);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setActing(null);
+    }
+  }
+  async function submitAnswers(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!activeRun || pendingQuestions.length === 0) return;
+    const response = Object.fromEntries(pendingQuestions.map((question) => [
+      question.id,
+      { answers: [answers[question.id]?.trim() ?? ""] },
+    ]));
+    if (Object.values(response).some((answer) => !answer.answers[0])) {
+      setError("请回答全部确认项");
+      return;
+    }
+    setActing("resume");
+    setError(null);
+    try {
+      await resumeAgentRun(activeRun.id, { answers: response });
+      setAnswers({});
+      setRefreshVersion((value) => value + 1);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setActing(null);
+    }
+  }
   return <>
     <button className="back-button" type="button" onClick={onBack}>← 返回需求详情</button>
     <GlobalHeader eyebrow="AGENT INSTANCE" title={detail.assignment?.role ?? "Agent Instance"} description={`${instance.specKey} · ${instance.id}`} />
@@ -774,6 +853,15 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
       <section className="panel instance-panel">
         <div className="instance-heading"><div className="instance-icon">AI</div><div><div className="eyebrow">AGENT INSTANCE</div><h2>{detail.assignment?.role ?? instance.specKey}</h2></div><span className={instance.status === "running" ? "live-indicator" : "idle-indicator"} /></div>
         <div className="instance-state-card"><div><span>当前状态</span><strong>{instanceStatusLabels[instance.status]}</strong></div></div>
+        <div className="instance-actions">
+          {activeRun && <button className="danger-button" type="button" disabled={acting !== null} onClick={() => void runAction("cancel")}>{acting === "cancel" ? "正在结束…" : "结束 Agent"}</button>}
+          {canStart && <button className="primary-button" type="button" disabled={acting !== null} onClick={() => void runAction("start")}>{acting === "start" ? "正在启动…" : "启动 Agent"}</button>}
+        </div>
+        {activeRun?.status === "waiting_user" && pendingQuestions.length > 0 && <form className="agent-approval-form" onSubmit={(event) => void submitAnswers(event)}>
+          <div className="eyebrow">HUMAN GATE</div>
+          {pendingQuestions.map((question) => <label key={question.id}><strong>{question.header}</strong><span>{question.question}</span><input list={`agent-answer-${question.id}`} value={answers[question.id] ?? ""} onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))} placeholder="选择建议项或输入反馈" disabled={acting !== null} /><datalist id={`agent-answer-${question.id}`}>{question.options.map((option) => <option value={option.label} key={option.label}>{option.description}</option>)}</datalist></label>)}
+          <button className="primary-button" type="submit" disabled={acting !== null}>{acting === "resume" ? "正在继续…" : "提交并继续"}</button>
+        </form>}
         <dl className="definition-list"><DefinitionRow label="Instance ID"><code>{instance.id}</code></DefinitionRow><DefinitionRow label="Agent Spec">{instance.specKey} · v{instance.specVersion}</DefinitionRow><DefinitionRow label="Workspace"><code>{instance.workspaceKey}</code></DefinitionRow><DefinitionRow label="Thread ID"><code>{instance.threadId}</code></DefinitionRow><DefinitionRow label="最近活跃">{formatDate(instance.lastActiveAt)}</DefinitionRow></dl>
       </section>
       <ConversationPanel conversation={conversation} runStatus={detail.currentRun?.status ?? null} />

@@ -19,6 +19,12 @@ describePostgres("requirement workflow integration", () => {
     const workItemId = `test-${suffix}`;
     const sourceUrl = `https://project.feishu.cn/test-space/story/detail/${workItemId}`;
     const launch = vi.fn();
+    const resume = vi.fn(async (runId: string) => ({ runId, status: "running" as const }));
+    const cancel = vi.fn(async (runId: string) => ({
+      runId,
+      agentInstanceId: randomUUID(),
+      status: "cancelled" as const,
+    }));
     const service = new RequirementWorkflowService(
       {
         get: async () => ({
@@ -55,7 +61,7 @@ describePostgres("requirement workflow integration", () => {
           environmentExample: ".env.example",
         }),
       },
-      { launch },
+      { launch, resume, cancel },
     );
     let projectId: string | undefined;
     let agentInstanceId: string | undefined;
@@ -105,8 +111,32 @@ describePostgres("requirement workflow integration", () => {
       const run = await service.start(assignmentId);
       runId = run.runId;
       expect(run.status).toBe("queued");
+      const activated = await pool.query<{ thread_id: string; status: string }>(
+        "SELECT thread_id, status FROM swarm_hive.agent_instances WHERE id = $1",
+        [agentInstanceId],
+      );
+      expect(activated.rows[0]?.thread_id).not.toBe(assignment.agentInstance.threadId);
+      expect(activated.rows[0]?.thread_id).toMatch(/^run:/);
+      expect(activated.rows[0]?.status).toBe("queued");
       await new Promise((resolve) => setImmediate(resolve));
       expect(launch).toHaveBeenCalledWith(runId);
+
+      await expect(repository.cancelAgentRun(runId)).resolves.toMatchObject({
+        runId,
+        agentInstanceId,
+        status: "cancelled",
+      });
+      const cancelled = await pool.query<{ run_status: string; instance_status: string }>(
+        `SELECT r.status AS run_status, ai.status AS instance_status
+           FROM swarm_hive.agent_instance_runs r
+           JOIN swarm_hive.agent_instances ai ON ai.id = r.agent_instance_id
+          WHERE r.id = $1`,
+        [runId],
+      );
+      expect(cancelled.rows[0]).toEqual({
+        run_status: "cancelled",
+        instance_status: "idle",
+      });
     } finally {
       if (projectId) {
         await pool.query("DELETE FROM swarm_hive.agent_instance_run_events WHERE agent_instance_run_id = $1", [runId]).catch(() => undefined);

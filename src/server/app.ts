@@ -48,6 +48,12 @@ const assignmentSchema = z.object({
   specKey: specKeySchema,
   role: z.string().trim().min(1).max(100),
 });
+const resumeRunSchema = z.object({
+  answers: z.record(
+    z.string().regex(/^[a-z][a-z0-9_]*$/),
+    z.object({ answers: z.array(z.string().trim().min(1)).min(1) }),
+  ).refine((answers) => Object.keys(answers).length > 0),
+});
 
 function requirements(options: CreateAppOptions): RequirementWorkflow {
   if (!options.requirements) {
@@ -129,6 +135,18 @@ export function createApp(options: CreateAppOptions): Hono {
   app.post("/api/v1/agent-assignments/:assignmentId/runs", async (context) => {
     const assignmentId = validatedId(context.req.param("assignmentId"), "assignmentId");
     return context.json(await requirements(options).start(assignmentId), 202);
+  });
+
+  app.post("/api/v1/runs/:runId/cancel", async (context) => {
+    const runId = validatedId(context.req.param("runId"), "runId");
+    return context.json(await requirements(options).cancel(runId));
+  });
+
+  app.post("/api/v1/runs/:runId/resume", async (context) => {
+    const runId = validatedId(context.req.param("runId"), "runId");
+    const parsed = resumeRunSchema.safeParse(await context.req.json().catch(() => null));
+    if (!parsed.success) throw new InvalidRequestError("Valid Agent answers are required");
+    return context.json(await requirements(options).resume(runId, parsed.data), 202);
   });
 
   app.get("/api/v1/projects/:projectId/workbench", async (context) => {

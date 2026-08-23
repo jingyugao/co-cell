@@ -29,7 +29,6 @@ const requirementSource = new McpFeishuWorkItemSource((url) =>
 );
 const runLauncher = new CodingRunLauncher({
   repository,
-  source: requirementSource,
   databaseUrl: config.databaseUrl,
   specsRoot: config.specsRoot,
   workspaceRoot: config.workspaceRoot,
@@ -44,8 +43,7 @@ const runLauncher = new CodingRunLauncher({
   gitlabToken: config.gitlabToken,
   gitlabUsername: config.gitlabUsername,
   kubeconfigPath: config.kubeconfigPath,
-  feishuProjectMcpUrl: config.feishuProjectMcpUrl,
-  feishuProjectMcpToken: config.feishuProjectMcpToken,
+  meegleUserAccessToken: config.feishuProjectMcpToken,
 });
 const requirements = new RequirementWorkflowService(
   requirementSource,

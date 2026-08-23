@@ -48,12 +48,12 @@ function spec(): SandboxSpec {
     image: "swarm-hive-sandbox-python:3.12",
     workspace: {
       id: "requirement-1001",
-      mountPath: "/agent-workspaces/requirement-1001/repo",
+      mountPath: "/home/agent/projects/project-1001/repo",
     },
-    workingDirectory: "/agent-workspaces/requirement-1001/repo",
+    workingDirectory: "/home/agent/projects/project-1001/repo",
     resources: { cpu: 2, memoryMb: 4096 },
     networkProfile: "bridge",
-    env: { HOME: "/tmp/agent-home-requirement-1001" },
+    env: { HOME: "/home/agent" },
     mounts: [{
       source: "/host/credentials/kubeconfig",
       target: "/etc/swarm-hive/kubeconfig",
@@ -67,6 +67,7 @@ describe("SharedDockerSandboxProvider", () => {
     const runner = new FakeRunner();
     const provider = new SharedDockerSandboxProvider({
       hostWorkspaceRoot: process.cwd(),
+      containerWorkspaceRoot: "/home/agent",
       containerName: "swarm-hive-test-shared",
       commandRunner: runner,
       user: "1234:1234",
@@ -84,13 +85,13 @@ describe("SharedDockerSandboxProvider", () => {
     const pending = sandbox.exec({ command: "pwd" });
     const child = runner.children[0];
     if (!child) throw new Error("Expected docker exec child");
-    child.stdout.write("/agent-workspaces/requirement-1001/repo\n");
+    child.stdout.write("/home/agent/projects/project-1001/repo\n");
     child.emit("exit", 0, null);
     await expect(pending).resolves.toMatchObject({ exitCode: 0 });
 
     const exec = runner.calls.at(-1) ?? [];
-    expect(exec).toContain("HOME=/tmp/agent-home-requirement-1001");
-    expect(exec).toContain("/agent-workspaces/requirement-1001/repo");
+    expect(exec).toContain("HOME=/home/agent");
+    expect(exec).toContain("/home/agent/projects/project-1001/repo");
 
     await sandbox.destroy();
     expect(runner.calls.some((call) => call[0] === "rm")).toBe(false);
@@ -101,12 +102,13 @@ describe("SharedDockerSandboxProvider", () => {
     const runner = new FakeRunner();
     const provider = new SharedDockerSandboxProvider({
       hostWorkspaceRoot: process.cwd(),
+      containerWorkspaceRoot: "/home/agent",
       commandRunner: runner,
     });
     const sandbox = await provider.create(spec());
 
     await expect(
-      sandbox.exec({ command: "pwd", cwd: "/agent-workspaces/another-agent" }),
+      sandbox.exec({ command: "pwd", cwd: "/home/agent/projects/another-project/repo" }),
     ).rejects.toThrow("outside agent workspace");
     await sandbox.destroy();
   });
@@ -115,6 +117,7 @@ describe("SharedDockerSandboxProvider", () => {
     const runner = new FakeRunner();
     const provider = new SharedDockerSandboxProvider({
       hostWorkspaceRoot: process.cwd(),
+      containerWorkspaceRoot: "/home/agent",
       commandRunner: runner,
     });
     const sandbox = await provider.create(spec());
@@ -124,7 +127,7 @@ describe("SharedDockerSandboxProvider", () => {
     if (!child) throw new Error("Expected docker exec child");
     child.emit("exit", 0, null);
     await expect(pending).resolves.toMatchObject({ exitCode: 0 });
-    expect(runner.calls.at(-1)).toContain("/agent-workspaces/requirement-1001/repo");
+    expect(runner.calls.at(-1)).toContain("/home/agent/projects/project-1001/repo");
     await sandbox.destroy();
   });
 });

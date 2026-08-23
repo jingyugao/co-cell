@@ -52,6 +52,21 @@ export type RequestUserInputHandler = (
   request: RequestUserInput,
 ) => Promise<RequestUserInputResponse>;
 
+export function parseRequestUserInput(value: unknown): RequestUserInput | undefined {
+  const parsed = RequestUserInputSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+export function renderRequestUserInput(request: RequestUserInput): string {
+  const questions = request.questions.map((question) => {
+    const options = question.options
+      .map((option) => `- ${option.label}：${option.description}`)
+      .join("\n");
+    return `[${question.header}] ${question.question}\n${options}`;
+  });
+  return `需要人工确认：\n\n${questions.join("\n\n")}`;
+}
+
 export function createRequestUserInputTool(handler: RequestUserInputHandler) {
   return tool(async (input: RequestUserInput) => JSON.stringify(await handler(input)), {
     name: "request_user_input",

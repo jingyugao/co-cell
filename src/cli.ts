@@ -9,7 +9,13 @@ import { verifyGitLabMergeRequest } from "./integrations/gitlab.js";
 import { createTerminalUserInputHandler } from "./tools/request-user-input.js";
 import { loadAgentSpec } from "./specs/loader.js";
 import {
-  allocateSpecProjectWorkspace,
+  AGENT_MEMORY_SANDBOX_PATH,
+  createAgentMemorySnapshot,
+  loadAgentMemory,
+  renderAgentMemoryInstructions,
+} from "./specs/memory.js";
+import {
+  allocateInstanceProjectWorkspace,
   createTaskSandbox,
   type SandboxBackend,
 } from "./sandbox/factory.js";
@@ -148,7 +154,6 @@ async function main(): Promise<void> {
         valueAfter("--spec") ??
         process.env.AGENT_SPEC_DIR ??
         resolve("agent-specs/software-engineer"),
-      capabilities: new Set(gitlabEnvironment ? ["gitlab"] : []),
     });
     const feishuCredentialsRoot = resolve(spec.directory, ".credentials/feishu");
     const larkConfigPath = resolve(feishuCredentialsRoot, ".lark-cli");
@@ -180,9 +185,9 @@ async function main(): Promise<void> {
           "AGENT_WORKSPACE_ROOT is required to allocate a Spec project workspace",
         );
       }
-      allocation = await allocateSpecProjectWorkspace({
+      allocation = await allocateInstanceProjectWorkspace({
         workspaceRoot,
-        specKey: spec.manifest.id,
+        instanceKey: spec.manifest.id,
         projectId: valueAfter("--project-id") ?? threadId,
       });
     }
@@ -205,6 +210,7 @@ async function main(): Promise<void> {
           GLAB_CONFIG_DIR: `${sandboxHome}/.config/glab-cli`,
           PATH: `${sandboxHome}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
           AGENT_SPEC_SANDBOX_DIR: "/opt/swarm-hive/spec-sandbox",
+          ...(allocation ? { AGENT_MEMORY_FILE: AGENT_MEMORY_SANDBOX_PATH } : {}),
           ...(feishuCliConfigured
             ? {
                 MEEGLE_HOST: meegleHost!,
@@ -214,6 +220,9 @@ async function main(): Promise<void> {
         }
       : gitlabEnvironment;
     try {
+      const memory = allocation
+        ? await loadAgentMemory(allocation.home, spec.memorySeed)
+        : createAgentMemorySnapshot(spec.memorySeed);
       const sandbox = await createTaskSandbox({
         backend: sandboxBackend,
         workspace,
@@ -247,7 +256,7 @@ async function main(): Promise<void> {
             ]
           : undefined,
         sharedContainerName: sandboxBackend === "shared-docker"
-          ? `${process.env.AGENT_SHARED_SANDBOX_NAME ?? "swarm-hive-dev-sandbox"}-${allocation?.specSlug ?? spec.manifest.id}`
+          ? `${process.env.AGENT_SHARED_SANDBOX_NAME ?? "swarm-hive-dev-sandbox"}-${allocation?.instanceSlug ?? spec.manifest.id}`
           : undefined,
         initializers: sandboxBackend === "docker" || sandboxBackend === "shared-docker"
           ? [
@@ -279,7 +288,7 @@ async function main(): Promise<void> {
           model: valueAfter("--model"),
           requestUserInput: createTerminalUserInputHandler(),
           runId,
-          additionalInstructions: spec.instructions,
+          additionalInstructions: [spec.prompt, renderAgentMemoryInstructions(memory)],
           requireMergeRequest: Boolean(gitlabEnvironment),
           ...(checkpointHandle
             ? { checkpointer: checkpointHandle.checkpointer, threadId }

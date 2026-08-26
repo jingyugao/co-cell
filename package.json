@@ -27,6 +27,7 @@
     "@langchain/langgraph-checkpoint": "^1.1.5",
     "@langchain/langgraph-checkpoint-postgres": "^1.0.5",
     "@langchain/openai": "^1.5.9",
+    "@larksuiteoapi/node-sdk": "^1.73.0",
     "hono": "^4.13.3",
     "langchain": "^1.5.10",
     "pg": "^8.23.0",

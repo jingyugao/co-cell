@@ -1,3 +1,6 @@
+import { readFile, realpath } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
+
 import type {
   ProjectListResponse,
   ProjectWorkbench,
@@ -18,6 +21,7 @@ import {
   PostgresWorkbenchRepository,
 } from "../persistence/workbench-repository.js";
 import { InvalidRequestError, NotFoundError } from "./errors.js";
+import { workspaceSlug } from "../sandbox/factory.js";
 
 export interface SandboxRuntimeStatus {
   status: "online" | "offline" | "unknown";
@@ -40,8 +44,9 @@ export interface WorkbenchQueries {
   listAllInboxEvents(options: { limit: number; cursor?: string }): Promise<GlobalInboxEventsResponse>;
   getAgentSpecUsage(specKey: string): Promise<AgentSpecUsage>;
   getAgentInstance(agentInstanceId: string): Promise<AgentInstanceDetail>;
-  getAgentConversation(agentInstanceId: string): Promise<AgentConversationResponse>;
+  getAgentConversation(agentSessionId: string): Promise<AgentConversationResponse>;
   getRunEvents(runId: string, afterSequence: number, limit: number): Promise<RunEventsResponse>;
+  getReportMarkdown(reportId: string): Promise<{ content: string; filename: string }>;
 }
 
 export class WorkbenchQueryService implements WorkbenchQueries {
@@ -49,6 +54,7 @@ export class WorkbenchQueryService implements WorkbenchQueries {
     private readonly repository: PostgresWorkbenchRepository,
     private readonly sandboxHealth: SandboxHealthProvider,
     private readonly conversationReader?: AgentConversationReader,
+    private readonly workspaceRoot = ".swarm-hive/workspaces",
   ) {}
 
   ping(): Promise<void> {
@@ -86,13 +92,13 @@ export class WorkbenchQueryService implements WorkbenchQueries {
     return result;
   }
 
-  async getAgentConversation(agentInstanceId: string): Promise<AgentConversationResponse> {
-    const instance = await this.repository.getAgentInstanceDetail(agentInstanceId);
-    if (!instance) throw new NotFoundError("Agent Instance");
+  async getAgentConversation(agentSessionId: string): Promise<AgentConversationResponse> {
+    const threadId = await this.repository.getAgentSessionThreadId(agentSessionId);
+    if (!threadId) throw new NotFoundError("Agent Session");
     if (!this.conversationReader) {
-      return { threadId: instance.agentInstance.threadId, checkpointId: null, messages: [] };
+      return { threadId, checkpointId: null, messages: [] };
     }
-    return this.conversationReader.getConversation(instance.agentInstance.threadId);
+    return this.conversationReader.getConversation(threadId);
   }
 
   async getRunEvents(
@@ -108,6 +114,34 @@ export class WorkbenchQueryService implements WorkbenchQueries {
     const run = await this.repository.getRun(runId);
     if (!run) throw new NotFoundError("Run");
     return run;
+  }
+
+  async getReportMarkdown(reportId: string): Promise<{ content: string; filename: string }> {
+    const context = await this.repository.getReportFileContext(reportId);
+    if (!context) throw new NotFoundError("Report");
+    if (
+      isAbsolute(context.relativePath) ||
+      !context.relativePath.startsWith(".swarm-hive/reports/")
+    ) {
+      throw new Error("Report path is invalid");
+    }
+    const projectRoot = await realpath(resolve(
+      this.workspaceRoot,
+      "specs",
+      workspaceSlug(context.specKey),
+      "home",
+      "projects",
+      workspaceSlug(context.projectId),
+    ));
+    const path = await realpath(resolve(projectRoot, context.relativePath));
+    const relativeToProject = relative(projectRoot, path);
+    if (relativeToProject.startsWith("..") || isAbsolute(relativeToProject)) {
+      throw new Error("Report path escapes the project workspace");
+    }
+    return {
+      content: await readFile(path, "utf8"),
+      filename: context.relativePath.split("/").at(-1) ?? "report.md",
+    };
   }
 
   async listProjectRuns(

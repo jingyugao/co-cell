@@ -15,6 +15,8 @@ export interface ServerConfig {
   sandboxNetwork: string;
   feishuProjectMcpUrl: string;
   feishuProjectMcpToken: string;
+  larkAppId?: string;
+  larkAppSecret?: string;
   openAIBaseUrl?: string;
   openAIApiKey?: string;
   model?: string;
@@ -58,6 +60,11 @@ export function loadServerConfig(): ServerConfig {
   if (Boolean(gitlabBaseUrl) !== Boolean(gitlabToken)) {
     throw new Error("GITLAB_BASE_URL and GITLAB_TOKEN must be configured together");
   }
+  const larkAppId = process.env.LARK_APP_ID?.trim();
+  const larkAppSecret = process.env.LARK_APP_SECRET?.trim();
+  if (Boolean(larkAppId) !== Boolean(larkAppSecret)) {
+    throw new Error("LARK_APP_ID and LARK_APP_SECRET must be configured together");
+  }
   return {
     host: process.env.AGENT_SERVER_HOST?.trim() || "127.0.0.1",
     port: integerEnvironment("AGENT_SERVER_PORT", 3000),
@@ -74,6 +81,8 @@ export function loadServerConfig(): ServerConfig {
     sandboxNetwork: process.env.AGENT_SANDBOX_NETWORK?.trim() || "bridge",
     feishuProjectMcpUrl,
     feishuProjectMcpToken,
+    ...(larkAppId ? { larkAppId } : {}),
+    ...(larkAppSecret ? { larkAppSecret } : {}),
     ...(openAIBaseUrl ? { openAIBaseUrl } : {}),
     ...(openAIApiKey ? { openAIApiKey } : {}),
     ...(process.env.AGENT_MODEL?.trim() ? { model: process.env.AGENT_MODEL.trim() } : {}),

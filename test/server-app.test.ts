@@ -13,13 +13,13 @@ import { createApp } from "../src/server/app.js";
 
 const projectId = randomUUID();
 const runId = randomUUID();
-const assignmentId = randomUUID();
+const forkId = randomUUID();
 const agentInstanceId = randomUUID();
 const softwareEngineerSpec: AgentSpecSummary = {
   id: "software-engineer",
   name: "Software Engineer",
   version: 1,
-  knowledge: [],
+  memory: "memory.txt",
   sandbox: { dockerfile: "sandbox/Dockerfile", image: "swarm-hive:latest" },
   environmentExample: ".env.example",
 };
@@ -34,7 +34,7 @@ const workbenchResponse: ProjectWorkbench = {
     updatedAt: "2026-08-20T12:00:00.000Z",
   },
   statistics: { activeRuns: 1, totalRuns: 1, completedRuns: 0, successRate: null },
-  primaryAgentInstance: null,
+  primaryAgentFork: null,
   currentRun: null,
   recentRuns: [],
   latestInboxEvent: null,
@@ -59,14 +59,12 @@ function queries(overrides: Partial<WorkbenchQueries> = {}): WorkbenchQueries {
         id: randomUUID(),
         specKey: "software-engineer",
         specVersion: 1,
-        status: "idle",
+        status: "active",
         workspaceKey: "workspace",
-        threadId: "thread",
         lastActiveAt: null,
         createdAt: "2026-08-20T12:00:00.000Z",
       },
-      assignment: null,
-      currentRun: null,
+      forks: [],
       recentRuns: [],
     })),
     getAgentConversation: vi.fn(async () => ({
@@ -74,6 +72,7 @@ function queries(overrides: Partial<WorkbenchQueries> = {}): WorkbenchQueries {
       checkpointId: null,
       messages: [],
     })),
+    getReportMarkdown: vi.fn(async () => ({ content: "# Report\n", filename: "0001.md" })),
     getRun: vi.fn(async (): Promise<RunDetail> => ({
       id: runId,
       projectId,
@@ -195,14 +194,12 @@ describe("Hono server app", () => {
         id: agentInstanceId,
         specKey: "software-engineer",
         specVersion: 1,
-        status: "idle",
+        status: "active",
         workspaceKey: "workspace",
-        threadId: "thread",
         lastActiveAt: null,
         createdAt: "2026-08-20T12:00:00.000Z",
       },
-      assignment: null,
-      currentRun: null,
+      forks: [],
       recentRuns: [],
     }));
     const app = createApp({
@@ -236,10 +233,28 @@ describe("Hono server app", () => {
       specCatalog,
       enableRequestLogger: false,
     });
-    const response = await app.request(`/api/v1/agent-instances/${agentInstanceId}/conversation`);
+    const response = await app.request(`/api/v1/agent-sessions/${agentInstanceId}/conversation`);
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ messages: [{ content: "正在检查代码" }] });
     expect(getAgentConversation).toHaveBeenCalledWith(agentInstanceId);
+  });
+
+  test("serves a published Markdown report", async () => {
+    const reportId = randomUUID();
+    const app = createApp({
+      workbench: queries({
+        getReportMarkdown: vi.fn(async () => ({
+          content: "# 阶段汇报\n",
+          filename: "0001.md",
+        })),
+      }),
+      specCatalog,
+      enableRequestLogger: false,
+    });
+    const response = await app.request(`/api/v1/reports/${reportId}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/markdown");
+    expect(await response.text()).toBe("# 阶段汇报\n");
   });
 
   test("serves an Agent Spec with each active requirement association", async () => {
@@ -279,25 +294,32 @@ describe("Hono server app", () => {
       currentNodes: [],
       fields: [],
       updatedAt: null,
-      assignments: [],
+      forks: [],
     }));
-    const assign = vi.fn(async () => ({
+    const fork = vi.fn(async () => ({
       projectId,
-      assignmentId,
+      forkId,
+      role: "backend-a",
       agentInstance: {
         id: randomUUID(),
         specKey: "software-engineer",
         specVersion: 1,
-        role: "backend-a",
+        status: "active" as const,
+      },
+      session: {
+        id: randomUUID(),
         workspaceKey: "workspace",
         threadId: "thread",
-        status: "idle" as const,
+        status: "active" as const,
       },
+      currentRun: null,
     }));
     const start = vi.fn(async () => ({
       runId,
       projectId,
       agentInstanceId: randomUUID(),
+      forkId,
+      sessionId: randomUUID(),
       status: "queued" as const,
     }));
     const cancel = vi.fn(async () => ({
@@ -306,7 +328,7 @@ describe("Hono server app", () => {
       status: "cancelled" as const,
     }));
     const resume = vi.fn(async () => ({ runId, status: "running" as const }));
-    const requirements: RequirementWorkflow = { preview, assign, start, resume, cancel };
+    const requirements: RequirementWorkflow = { preview, fork, start, resume, cancel };
     const app = createApp({
       workbench: queries(),
       specCatalog,
@@ -323,7 +345,7 @@ describe("Hono server app", () => {
     expect(await previewResponse.json()).toMatchObject({ title: "实时需求" });
     expect(preview).toHaveBeenCalledWith(sourceUrl);
 
-    const assignmentResponse = await app.request("/api/v1/agent-assignments", {
+    const assignmentResponse = await app.request("/api/v1/agent-forks", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -333,15 +355,15 @@ describe("Hono server app", () => {
       }),
     });
     expect(assignmentResponse.status).toBe(201);
-    expect(await assignmentResponse.json()).toMatchObject({ assignmentId });
-    expect(assign).toHaveBeenCalledOnce();
+    expect(await assignmentResponse.json()).toMatchObject({ forkId });
+    expect(fork).toHaveBeenCalledOnce();
 
-    const runResponse = await app.request(`/api/v1/agent-assignments/${assignmentId}/runs`, {
+    const runResponse = await app.request(`/api/v1/agent-forks/${forkId}/runs`, {
       method: "POST",
     });
     expect(runResponse.status).toBe(202);
     expect(await runResponse.json()).toMatchObject({ runId, status: "queued" });
-    expect(start).toHaveBeenCalledWith(assignmentId);
+    expect(start).toHaveBeenCalledWith(forkId);
 
     const cancelResponse = await app.request(`/api/v1/runs/${runId}/cancel`, {
       method: "POST",
@@ -354,13 +376,22 @@ describe("Hono server app", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        answers: { design_approval: { answers: ["通过方案"] } },
+        message: "通过方案",
       }),
     });
     expect(resumeResponse.status).toBe(202);
     expect(await resumeResponse.json()).toMatchObject({ runId, status: "running" });
     expect(resume).toHaveBeenCalledWith(runId, {
-      answers: { design_approval: { answers: ["通过方案"] } },
+      message: "通过方案",
     });
+
+    const legacyResumeResponse = await app.request(`/api/v1/runs/${runId}/resume`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        answers: { "solution-design-approval": { answers: ["通过方案"] } },
+      }),
+    });
+    expect(legacyResumeResponse.status).toBe(400);
   });
 });

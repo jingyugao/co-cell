@@ -11,7 +11,7 @@ import type {
   AgentConversationResponse,
 } from "../../src/contracts/workbench";
 import type {
-  AgentAssignmentResult,
+  AgentForkResult,
   CancelAgentRunResult,
   FeishuWorkItemPreview,
   StartAgentRunResult,
@@ -97,9 +97,9 @@ export function loadAgentInstance(agentInstanceId: string): Promise<AgentInstanc
   );
 }
 
-export function loadAgentConversation(agentInstanceId: string): Promise<AgentConversationResponse> {
+export function loadAgentConversation(agentSessionId: string): Promise<AgentConversationResponse> {
   return getJson<AgentConversationResponse>(
-    `/api/v1/agent-instances/${encodeURIComponent(agentInstanceId)}/conversation`,
+    `/api/v1/agent-sessions/${encodeURIComponent(agentSessionId)}/conversation`,
   );
 }
 
@@ -107,17 +107,17 @@ export function previewFeishuWorkItem(url: string): Promise<FeishuWorkItemPrevie
   return postJson<FeishuWorkItemPreview>("/api/v1/feishu-project/work-items/preview", { url });
 }
 
-export function createAgentAssignment(input: {
+export function createAgentFork(input: {
   url: string;
   specKey: string;
   role: string;
-}): Promise<AgentAssignmentResult> {
-  return postJson<AgentAssignmentResult>("/api/v1/agent-assignments", input);
+}): Promise<AgentForkResult> {
+  return postJson<AgentForkResult>("/api/v1/agent-forks", input);
 }
 
-export function startAgentRun(assignmentId: string): Promise<StartAgentRunResult> {
+export function startAgentRun(forkId: string): Promise<StartAgentRunResult> {
   return postJson<StartAgentRunResult>(
-    `/api/v1/agent-assignments/${encodeURIComponent(assignmentId)}/runs`,
+    `/api/v1/agent-forks/${encodeURIComponent(forkId)}/runs`,
     {},
   );
 }

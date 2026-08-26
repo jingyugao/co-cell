@@ -31,10 +31,10 @@ export interface TaskSandboxOptions {
   sharedContainerName?: string;
 }
 
-export interface SpecProjectWorkspace {
-  specKey: string;
+export interface InstanceProjectWorkspace {
+  instanceKey: string;
   projectId: string;
-  specSlug: string;
+  instanceSlug: string;
   projectSlug: string;
   projectRoot: string;
   workspace: string;
@@ -53,25 +53,25 @@ export function workspaceSlug(value: string): string {
   return `${normalized}-${digest}`;
 }
 
-/** Allocate one project directory inside the persistent HOME owned by a Spec pod. */
-export async function allocateSpecProjectWorkspace(options: {
+/** Allocate one project directory inside the persistent HOME owned by an Instance. */
+export async function allocateInstanceProjectWorkspace(options: {
   workspaceRoot: string;
-  specKey: string;
+  instanceKey: string;
   projectId: string;
-}): Promise<SpecProjectWorkspace> {
+}): Promise<InstanceProjectWorkspace> {
   const requestedRoot = resolve(options.workspaceRoot);
   await mkdir(requestedRoot, { recursive: true });
   const root = await realpath(requestedRoot);
   const rootStat = await stat(root);
-  const specSlug = workspaceSlug(options.specKey);
+  const instanceSlug = workspaceSlug(options.instanceKey);
   const projectSlug = workspaceSlug(options.projectId);
-  const specRoot = resolve(root, "specs", specSlug);
-  const home = resolve(specRoot, "home");
+  const instanceRoot = resolve(root, "instances", instanceSlug);
+  const home = resolve(instanceRoot, "home");
   const projectsRoot = resolve(home, "projects");
   const projectRoot = resolve(projectsRoot, projectSlug);
   const workspace = resolve(projectRoot, "repo");
   const persistentDirectories = [
-    specRoot,
+    instanceRoot,
     home,
     resolve(home, ".local"),
     resolve(home, ".local/share"),
@@ -94,9 +94,9 @@ export async function allocateSpecProjectWorkspace(options: {
     }
   }
   return {
-    specKey: options.specKey,
+    instanceKey: options.instanceKey,
     projectId: options.projectId,
-    specSlug,
+    instanceSlug,
     projectSlug,
     projectRoot,
     workspace,

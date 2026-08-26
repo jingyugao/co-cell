@@ -21,27 +21,38 @@ export interface FeishuWorkItemPreview {
   }>;
   fields: Array<{ key: string; name: string; value: unknown }>;
   updatedAt: string | null;
-  assignments: AgentAssignmentResult[];
+  forks: AgentForkResult[];
 }
 
-export interface AgentAssignmentResult {
+export interface AgentForkResult {
   projectId: string;
-  assignmentId: string;
+  forkId: string;
+  role: string;
   agentInstance: {
     id: string;
     specKey: string;
     specVersion: number;
-    role: string;
-    workspaceKey: string;
-    threadId: string;
     status: AgentInstanceStatus;
   };
+  session: {
+    id: string;
+    threadId: string;
+    workspaceKey: string;
+    status: "active" | "waiting" | "closed";
+  };
+  currentRun: {
+    id: string;
+    status: RunStatus;
+    taskSummary: string | null;
+  } | null;
 }
 
 export interface StartAgentRunResult {
   runId: string;
   projectId: string;
   agentInstanceId: string;
+  forkId: string;
+  sessionId: string;
   status: RunStatus;
 }
 
@@ -52,7 +63,7 @@ export interface CancelAgentRunResult {
 }
 
 export interface ResumeAgentRunInput {
-  answers: Record<string, { answers: string[] }>;
+  message: string;
 }
 
 export interface ResumeAgentRunResult {

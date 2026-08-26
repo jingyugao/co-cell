@@ -1,0 +1,207 @@
+import type { Pool } from "pg";
+
+import {
+  buildRunHandoff,
+  type RunHandoffSource,
+} from "../application/run-handoff.js";
+
+export interface AgentRunHandoff {
+  sourceRunId: string;
+  content: string;
+  createdAt: string;
+}
+
+function iso(value: Date | string): string {
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+}
+
+export class PostgresRunHandoffRepository {
+  constructor(private readonly pool: Pool) {}
+
+  async getOrCreatePreviousForRun(runId: string): Promise<AgentRunHandoff | null> {
+    const previous = await this.pool.query<{ id: string }>(
+      `SELECT previous.id
+         FROM swarm_hive.agent_runs current
+         JOIN LATERAL (
+           SELECT candidate.id
+             FROM swarm_hive.agent_runs candidate
+            WHERE candidate.agent_session_id = current.agent_session_id
+              AND (candidate.created_at, candidate.id) < (current.created_at, current.id)
+              AND candidate.status IN ('succeeded', 'failed', 'cancelled')
+            ORDER BY candidate.created_at DESC, candidate.id DESC
+            LIMIT 1
+         ) previous ON true
+        WHERE current.id = $1`,
+      [runId],
+    );
+    const sourceRunId = previous.rows[0]?.id;
+    return sourceRunId ? this.getOrCreateForRun(sourceRunId) : null;
+  }
+
+  async getOrCreateForRun(sourceRunId: string): Promise<AgentRunHandoff> {
+    const existing = await this.getForRun(sourceRunId);
+    if (existing) return existing;
+    const source = await this.loadSource(sourceRunId);
+    if (!source) throw new Error("Run handoff source was not found");
+    const content = buildRunHandoff(source);
+    const saved = await this.pool.query<{
+      source_run_id: string;
+      content: string;
+      created_at: Date | string;
+    }>(
+      `INSERT INTO swarm_hive.agent_run_handoffs(
+         agent_fork_id, source_run_id, content, metadata
+       )
+       SELECT session.agent_fork_id, run.id, $2,
+              jsonb_build_object('generator', 'deterministic-v1')
+         FROM swarm_hive.agent_runs run
+         JOIN swarm_hive.agent_sessions session ON session.id = run.agent_session_id
+        WHERE run.id = $1
+       ON CONFLICT (source_run_id) DO UPDATE SET
+         content = excluded.content,
+         metadata = excluded.metadata
+       RETURNING source_run_id, content, created_at`,
+      [sourceRunId, content],
+    );
+    const row = saved.rows[0];
+    if (!row) throw new Error("Run handoff was not saved");
+    return {
+      sourceRunId: row.source_run_id,
+      content: row.content,
+      createdAt: iso(row.created_at),
+    };
+  }
+
+  private async getForRun(sourceRunId: string): Promise<AgentRunHandoff | null> {
+    const result = await this.pool.query<{
+      source_run_id: string;
+      content: string;
+      created_at: Date | string;
+    }>(
+      `SELECT source_run_id, content, created_at
+         FROM swarm_hive.agent_run_handoffs
+        WHERE source_run_id = $1`,
+      [sourceRunId],
+    );
+    const row = result.rows[0];
+    return row ? {
+      sourceRunId: row.source_run_id,
+      content: row.content,
+      createdAt: iso(row.created_at),
+    } : null;
+  }
+
+  private async loadSource(sourceRunId: string): Promise<RunHandoffSource | null> {
+    const run = await this.pool.query<{
+      id: string;
+      project_id: string;
+      status: string;
+      task_summary: string | null;
+      result_summary: string | null;
+      merge_request_url: string | null;
+      finished_at: Date | null;
+    }>(
+      `SELECT id, project_id, status, task_summary, result_summary,
+              merge_request_url, finished_at
+         FROM swarm_hive.agent_runs WHERE id = $1`,
+      [sourceRunId],
+    );
+    const row = run.rows[0];
+    if (!row) return null;
+    const cutoff = row.finished_at;
+    const [confirmations, deferredItems, reports, events] = await Promise.all([
+      this.pool.query<{
+        confirmation_key: string;
+        phase: string;
+        status: string;
+        question: string;
+        answer: string | null;
+        artifact_url: string | null;
+        artifact_revision: number | null;
+      }>(
+        `SELECT confirmation_key, phase, status, question, answer,
+                artifact_url, artifact_revision
+         FROM swarm_hive.project_confirmations
+          WHERE project_id = $1
+            AND ($2::timestamptz IS NULL OR updated_at <= $2)
+          ORDER BY updated_at DESC, id DESC LIMIT 12`,
+        [row.project_id, cutoff],
+      ),
+      this.pool.query<{
+        item_key: string;
+        phase: string;
+        status: string;
+        title: string;
+        detail: string | null;
+      }>(
+        `SELECT item_key, phase, status, title, detail
+         FROM swarm_hive.project_deferred_items
+          WHERE project_id = $1 AND status = 'open'
+            AND ($2::timestamptz IS NULL OR updated_at <= $2)
+          ORDER BY updated_at DESC, id DESC LIMIT 12`,
+        [row.project_id, cutoff],
+      ),
+      this.pool.query<{
+        phase: string;
+        version: number;
+        status: string;
+        conclusion: string;
+        relative_path: string;
+      }>(
+        `SELECT phase, version, status, conclusion, relative_path
+         FROM swarm_hive.project_reports
+          WHERE project_id = $1
+            AND ($2::timestamptz IS NULL OR created_at <= $2)
+          ORDER BY created_at DESC, id DESC LIMIT 10`,
+        [row.project_id, cutoff],
+      ),
+      this.pool.query<{
+        event_type: string;
+        title: string;
+        detail: string | null;
+      }>(
+        `SELECT event_type, title, detail
+           FROM swarm_hive.agent_run_events
+          WHERE agent_run_id = $1 AND visible_to_user
+          ORDER BY sequence_no DESC LIMIT 12`,
+        [sourceRunId],
+      ),
+    ]);
+    return {
+      runId: row.id,
+      status: row.status,
+      taskSummary: row.task_summary,
+      resultSummary: row.result_summary,
+      mergeRequestUrl: row.merge_request_url,
+      finishedAt: row.finished_at ? row.finished_at.toISOString() : null,
+      confirmations: confirmations.rows.map((item) => ({
+        key: item.confirmation_key,
+        phase: item.phase,
+        status: item.status,
+        question: item.question,
+        answer: item.answer,
+        artifactUrl: item.artifact_url,
+        artifactRevision: item.artifact_revision,
+      })),
+      deferredItems: deferredItems.rows.map((item) => ({
+        key: item.item_key,
+        phase: item.phase,
+        status: item.status,
+        title: item.title,
+        detail: item.detail,
+      })),
+      reports: reports.rows.map((item) => ({
+        phase: item.phase,
+        version: item.version,
+        status: item.status,
+        conclusion: item.conclusion,
+        relativePath: item.relative_path,
+      })),
+      events: events.rows.map((item) => ({
+        eventType: item.event_type,
+        title: item.title,
+        detail: item.detail,
+      })),
+    };
+  }
+}

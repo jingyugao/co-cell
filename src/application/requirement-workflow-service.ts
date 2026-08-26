@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type {
-  AgentAssignmentResult,
+  AgentForkResult,
   CancelAgentRunResult,
   FeishuWorkItemPreview,
   ResumeAgentRunInput,
@@ -103,7 +103,7 @@ export class McpFeishuWorkItemSource implements FeishuWorkItemSource {
         })),
         updatedAt:
           typeof attribute.update_time === "string" ? attribute.update_time : null,
-        assignments: [],
+        forks: [],
       },
     };
   }
@@ -111,18 +111,19 @@ export class McpFeishuWorkItemSource implements FeishuWorkItemSource {
 
 export interface AgentRunLauncher {
   launch(runId: string): void;
+  notify(runId: string): void;
   resume(runId: string, input: ResumeAgentRunInput): Promise<ResumeAgentRunResult>;
   cancel(runId: string): Promise<CancelAgentRunResult>;
 }
 
 export interface RequirementWorkflow {
   preview(url: string): Promise<FeishuWorkItemPreview>;
-  assign(input: {
+  fork(input: {
     url: string;
     specKey: string;
     role: string;
-  }): Promise<AgentAssignmentResult>;
-  start(assignmentId: string): Promise<StartAgentRunResult>;
+  }): Promise<AgentForkResult>;
+  start(forkId: string): Promise<StartAgentRunResult>;
   resume(runId: string, input: ResumeAgentRunInput): Promise<ResumeAgentRunResult>;
   cancel(runId: string): Promise<CancelAgentRunResult>;
 }
@@ -137,24 +138,24 @@ export class RequirementWorkflowService implements RequirementWorkflow {
 
   async preview(url: string): Promise<FeishuWorkItemPreview> {
     const { preview } = await this.source.get(url);
-    const assignments = await this.repository.listAgentAssignments({
+    const forks = await this.repository.listAgentForks({
       externalProjectKey: preview.projectKey,
       externalWorkItemType: preview.workItemType.key,
       externalWorkItemId: preview.workItemId,
     });
-    return { ...preview, assignments };
+    return { ...preview, forks };
   }
 
-  async assign(input: {
+  async fork(input: {
     url: string;
     specKey: string;
     role: string;
-  }): Promise<AgentAssignmentResult> {
+  }): Promise<AgentForkResult> {
     const spec = await this.specs.get(input.specKey);
     if (!spec) throw new NotFoundError("Agent Spec");
     const { preview } = await this.source.get(input.url);
     const unique = randomUUID();
-    return this.repository.createAgentAssignment({
+    return this.repository.createAgentFork({
       sourceUrl: preview.sourceUrl,
       externalProjectKey: preview.projectKey,
       externalWorkItemType: preview.workItemType.key,
@@ -167,8 +168,8 @@ export class RequirementWorkflowService implements RequirementWorkflow {
     });
   }
 
-  async start(assignmentId: string): Promise<StartAgentRunResult> {
-    const result = await this.repository.createAgentRun(assignmentId);
+  async start(forkId: string): Promise<StartAgentRunResult> {
+    const result = await this.repository.createAgentRun(forkId);
     queueMicrotask(() => this.launcher.launch(result.runId));
     return result;
   }

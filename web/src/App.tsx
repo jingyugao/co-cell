@@ -24,11 +24,11 @@ import type {
   RunStatus,
 } from "../../src/contracts/workbench";
 import type {
-  AgentAssignmentResult,
+  AgentForkResult,
   FeishuWorkItemPreview,
 } from "../../src/contracts/requirements";
 import {
-  createAgentAssignment,
+  createAgentFork,
   cancelAgentRun,
   loadInboxEvents,
   loadAllRuns,
@@ -63,12 +63,8 @@ const runStatusLabels: Record<RunStatus, string> = {
 };
 
 const instanceStatusLabels: Record<AgentInstanceStatus, string> = {
-  idle: "空闲",
-  queued: "等待运行",
-  running: "正在执行任务",
-  waiting: "等待人工",
+  active: "已激活",
   disabled: "已停用",
-  failed: "运行异常",
 };
 
 interface PendingAgentQuestion {
@@ -203,7 +199,7 @@ function FeishuRequirementView({ onOpenRequirement }: { onOpenRequirement: (proj
   const [specs, setSpecs] = useState<AgentSpecSummary[]>([]);
   const [specKey, setSpecKey] = useState("software-engineer");
   const [role, setRole] = useState("");
-  const [assignments, setAssignments] = useState<AgentAssignmentResult[]>([]);
+  const [forks, setForks] = useState<AgentForkResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [assigning, setAssigning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -227,11 +223,11 @@ function FeishuRequirementView({ onOpenRequirement }: { onOpenRequirement: (proj
     setLoading(true);
     setError(null);
     setPreview(null);
-    setAssignments([]);
+    setForks([]);
     try {
       const result = await previewFeishuWorkItem(url.trim());
       setPreview(result);
-      setAssignments(result.assignments);
+      setForks(result.forks);
       setRole(result.currentNodes[0]?.name ?? "backend");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -246,12 +242,12 @@ function FeishuRequirementView({ onOpenRequirement }: { onOpenRequirement: (proj
     setAssigning(true);
     setError(null);
     try {
-      const assignment = await createAgentAssignment({
+      const fork = await createAgentFork({
         url: preview.sourceUrl,
         specKey,
         role: role.trim(),
       });
-      setAssignments((items) => [...items, assignment]);
+      setForks((items) => [...items, fork]);
       setRole("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -265,7 +261,7 @@ function FeishuRequirementView({ onOpenRequirement }: { onOpenRequirement: (proj
   ) ?? [];
 
   return <>
-    <GlobalHeader eyebrow="REQUIREMENT IMPORT" title="导入飞书需求" description="读取飞书需求并绑定至少一个 Agent Instance；绑定完成即视为导入" />
+    <GlobalHeader eyebrow="REQUIREMENT IMPORT" title="导入飞书需求" description="读取飞书需求并绑定一个 Agent Instance；绑定完成即视为导入" />
     <section className="panel requirement-opener">
       <form className="url-form" onSubmit={openRequirement}>
         <label htmlFor="feishu-url">飞书项目需求地址</label>
@@ -282,17 +278,17 @@ function FeishuRequirementView({ onOpenRequirement }: { onOpenRequirement: (proj
         <div className="role-list"><div className="eyebrow">ROLES</div><div>{preview.roles.map((item) => <span key={item.key}><strong>{item.name}</strong>{item.members.map((member) => member.name).join("、") || "未分配"}</span>)}</div></div>
       </section>
       <section className="panel assignment-card">
-        <div className="records-heading"><div><div className="eyebrow">AGENT ASSIGNMENT</div><h2>绑定开发 Agent</h2><p>首次绑定后需求将出现在需求列表；同一需求可以绑定多个 Agent Instance</p></div></div>
-        <form className="assignment-form" onSubmit={assignAgent}>
+        <div className="records-heading"><div><div className="eyebrow">AGENT ASSIGNMENT</div><h2>绑定开发 Agent</h2><p>首次绑定后需求将出现在需求列表；当前每个需求仅支持绑定一个 Agent Instance</p></div></div>
+        {forks.length === 0 && <form className="assignment-form" onSubmit={assignAgent}>
           <label>Agent Spec<select value={specKey} onChange={(event) => setSpecKey(event.target.value)}>{specs.map((spec) => <option value={spec.id} key={spec.id}>{spec.name} · v{spec.version}</option>)}</select></label>
           <label>职责 / 模块<input required value={role} onChange={(event) => setRole(event.target.value)} placeholder="例如 backend-module-a" /></label>
           <button className="primary-button" type="submit" disabled={assigning}>{assigning ? "正在绑定…" : "绑定并导入"}</button>
-        </form>
+        </form>}
         <div className="assigned-list">
-          {assignments.map((assignment) => {
-            return <div className="assigned-agent" key={assignment.assignmentId}><div><strong>{assignment.agentInstance.role}</strong><span>{assignment.agentInstance.specKey} · Agent Instance</span><code>{assignment.agentInstance.id}</code></div><button type="button" onClick={() => onOpenRequirement(assignment.projectId)}>查看需求</button></div>;
+          {forks.map((fork) => {
+            return <div className="assigned-agent" key={fork.forkId}><div><strong>{fork.role}</strong><span>{fork.agentInstance.specKey} · Agent Fork</span><code>{fork.forkId}</code></div><button type="button" onClick={() => onOpenRequirement(fork.projectId)}>查看需求</button></div>;
           })}
-          {assignments.length === 0 && <div className="empty-state compact-empty">尚未绑定 Agent；绑定后完成导入</div>}
+          {forks.length === 0 && <div className="empty-state compact-empty">尚未创建 Agent Fork；创建后完成导入</div>}
         </div>
       </section>
     </div>}
@@ -378,14 +374,14 @@ function DefinitionRow({ label, children }: { label: string; children: ReactNode
 }
 
 function AgentInstancePanel() {
-  const { primaryAgentInstance: instance, latestInboxEvent: inbox, runtime } = useWorkbench();
+  const { primaryAgentFork: instance, currentRun, latestInboxEvent: inbox, runtime } = useWorkbench();
   return (
     <aside className="detail-column" aria-label="Agent Instance 信息">
       <section className="panel instance-panel">
-        <div className="instance-heading"><div className="instance-icon">AI</div><div><div className="eyebrow">AGENT INSTANCE</div><h2>研发员工实例</h2></div><span className={instance?.status === "running" ? "live-indicator" : "idle-indicator"} /></div>
+        <div className="instance-heading"><div className="instance-icon">AI</div><div><div className="eyebrow">AGENT INSTANCE</div><h2>研发员工实例</h2></div><span className={currentRun?.status === "running" ? "live-indicator" : "idle-indicator"} /></div>
         {instance ? (
           <>
-            <div className="instance-state-card"><div><span>当前状态</span><strong>{instanceStatusLabels[instance.status]}</strong></div>{instance.status === "running" && <span className="pulse-bars" aria-hidden="true"><i /><i /><i /></span>}</div>
+            <div className="instance-state-card"><div><span>启用状态</span><strong>{instanceStatusLabels[instance.status]}</strong></div></div>
             <dl className="definition-list">
               <DefinitionRow label="Instance ID"><code>{instance.id}</code></DefinitionRow>
               <DefinitionRow label="Agent Spec"><span className="spec-chip">{instance.specKey}</span><span className="version-chip">v{instance.specVersion}</span></DefinitionRow>
@@ -507,7 +503,7 @@ function InboxEventsView() {
 }
 
 function BasicInfoView() {
-  const { project, primaryAgentInstance: instance, runtime } = useWorkbench();
+  const { project, primaryAgentFork: instance, runtime } = useWorkbench();
   return (
     <div className="basic-grid" id="panel-basic" role="tabpanel">
       <section className="panel basic-panel">
@@ -527,7 +523,7 @@ function BasicInfoView() {
         <dl className="basic-definition-list">
           <DefinitionRow label="Instance ID"><code>{instance?.id ?? "—"}</code></DefinitionRow>
           <DefinitionRow label="Agent Spec">{instance ? `${instance.specKey} · v${instance.specVersion}` : "—"}</DefinitionRow>
-          <DefinitionRow label="Instance 状态">{instance ? instanceStatusLabels[instance.status] : "未绑定"}</DefinitionRow>
+          <DefinitionRow label="Instance 启用状态">{instance ? instanceStatusLabels[instance.status] : "未绑定"}</DefinitionRow>
           <DefinitionRow label="Workspace"><code>{instance?.workspaceKey ?? "—"}</code></DefinitionRow>
           <DefinitionRow label="Thread ID"><code>{instance?.threadId ?? "—"}</code></DefinitionRow>
           <DefinitionRow label="开发容器">{runtime.name}</DefinitionRow>
@@ -603,14 +599,13 @@ function AgentSpecsView() {
               <DefinitionRow label="Sandbox Image"><code>{spec.sandbox.image}</code></DefinitionRow>
               <DefinitionRow label="Dockerfile"><code>{spec.sandbox.dockerfile}</code></DefinitionRow>
               <DefinitionRow label="Environment"><code>{spec.environmentExample}</code></DefinitionRow>
-              <DefinitionRow label="知识模块">{spec.knowledge.length} 个</DefinitionRow>
+              <DefinitionRow label="长期记忆"><code>{spec.memory}</code></DefinitionRow>
             </dl>
-            <div className="knowledge-list">{spec.knowledge.map((knowledge) => <span key={`${knowledge.path}-${knowledge.when ?? "always"}`}><code>{knowledge.path}</code>{knowledge.when && <em>需要 {knowledge.when}</em>}</span>)}</div>
             <div className="requirements-heading"><div><div className="eyebrow">ACTIVE REQUIREMENTS</div><h3>进行中的 Agent 需求</h3></div><span>{activeRequirements.length} 个关联</span></div>
             <div className="requirements-table" aria-label={`${spec.name} 进行中的需求`}>
               <div className="requirement-row requirement-header"><span>需求</span><span>职责</span><span>Agent Instance</span><span>当前状态</span><span>最近活跃</span></div>
               {activeRequirements.map((requirement) => (
-                <div className="requirement-row" key={requirement.associationId}>
+                <div className="requirement-row" key={requirement.forkId}>
                   <div className="record-primary"><strong>{requirement.project.name ?? requirement.project.externalProjectId}</strong><code>{requirement.project.externalProjectId}</code></div>
                   <span className="role-chip">{requirement.role}{requirement.isPrimary && <em>主</em>}</span>
                   <div className="record-primary"><strong>{requirement.agentInstance.workspaceKey}</strong><code>{requirement.agentInstance.id}</code></div>
@@ -670,12 +665,12 @@ function RequirementListView({
     return () => { active = false; };
   }, []);
 
-  async function start(assignment: AgentAssignmentResult) {
-    setStarting(assignment.assignmentId);
+  async function start(fork: AgentForkResult) {
+    setStarting(fork.forkId);
     setError(null);
     try {
-      await startAgentRun(assignment.assignmentId);
-      onOpenAgent(assignment.agentInstance.id);
+      await startAgentRun(fork.forkId);
+      onOpenAgent(fork.agentInstance.id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -704,11 +699,14 @@ function RequirementListView({
         <section className="panel assignment-card">
           <div className="records-heading"><div><div className="eyebrow">AGENT INSTANCES</div><h2>需求 Agent</h2><p>查看职责与运行状态；空闲实例可直接启动</p></div></div>
           <div className="assigned-list requirement-agent-list">
-            {selected.assignments.map((assignment) => {
-              const canStart = assignment.agentInstance.status === "idle" || assignment.agentInstance.status === "failed";
-              return <div className="assigned-agent" key={assignment.assignmentId}><div><strong>{assignment.agentInstance.role}</strong><span>{assignment.agentInstance.specKey} · {instanceStatusLabels[assignment.agentInstance.status]}</span><code>{assignment.agentInstance.id}</code></div><div className="assigned-agent-actions"><button className="secondary-button" type="button" onClick={() => onOpenAgent(assignment.agentInstance.id)}>查看 Agent</button>{canStart && <button type="button" onClick={() => void start(assignment)} disabled={starting === assignment.assignmentId}>{starting === assignment.assignmentId ? "正在唤醒…" : "启动 Agent"}</button>}</div></div>;
+            {selected.forks.map((fork) => {
+              const canStart = fork.agentInstance.status === "active" && !fork.currentRun;
+              const state = fork.currentRun
+                ? runStatusLabels[fork.currentRun.status]
+                : instanceStatusLabels[fork.agentInstance.status];
+              return <div className="assigned-agent" key={fork.forkId}><div><strong>{fork.role}</strong><span>{fork.agentInstance.specKey} · {state}</span><code>{fork.forkId}</code></div><div className="assigned-agent-actions"><button className="secondary-button" type="button" onClick={() => onOpenAgent(fork.agentInstance.id)}>查看 Agent Instance</button>{canStart && <button type="button" onClick={() => void start(fork)} disabled={starting === fork.forkId}>{starting === fork.forkId ? "正在唤醒…" : "启动 Agent"}</button>}</div></div>;
             })}
-            {selected.assignments.length === 0 && <div className="empty-state">该需求尚未绑定 Agent</div>}
+            {selected.forks.length === 0 && <div className="empty-state">该需求尚未创建 Agent Fork</div>}
           </div>
         </section>
       </div>
@@ -724,7 +722,7 @@ function RequirementListView({
         {projects.map((project) => {
           const preview = previews[project.id];
           const title = preview?.title ?? project.name ?? `飞书需求 #${project.externalProjectId}`;
-          return <button type="button" className="project-directory-item" key={project.id} onClick={() => onSelectProject(project.id)}><span className="project-directory-symbol">需</span><span className="project-directory-main"><strong>{title}</strong><small>{preview?.status?.name ?? "飞书项目"} · {project.externalProjectId}</small></span><span>{preview?.assignments.length ?? (project.agentInstance ? 1 : 0)} 个 Agent</span></button>;
+          return <button type="button" className="project-directory-item" key={project.id} onClick={() => onSelectProject(project.id)}><span className="project-directory-symbol">需</span><span className="project-directory-main"><strong>{title}</strong><small>{preview?.status?.name ?? "飞书项目"} · {project.externalProjectId}</small></span><span>{preview?.forks.length ?? (project.agentInstance ? 1 : 0)} 个 Fork</span></button>;
         })}
         {loading && <div className="empty-state">正在读取需求…</div>}
         {!loading && projects.length === 0 && <div className="empty-state">尚未导入需求，请先从“导入需求”绑定 Agent</div>}
@@ -771,18 +769,17 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
     const refresh = async () => {
       let shouldPoll = true;
       try {
-        const [instance, messages] = await Promise.all([
-          loadAgentInstance(agentInstanceId),
-          loadAgentConversation(agentInstanceId),
-        ]);
+        const instance = await loadAgentInstance(agentInstanceId);
+        const sessionId = instance.forks[0]?.session.id;
+        const messages = sessionId ? await loadAgentConversation(sessionId) : null;
         if (active) {
           setDetail(instance);
-          setConversation((current) =>
-            current?.checkpointId === messages.checkpointId ? current : messages,
-          );
+          setConversation((current) => !messages || current?.checkpointId === messages.checkpointId
+            ? current
+            : messages);
           setError(null);
-          shouldPoll = instance.agentInstance.status === "queued" ||
-            instance.agentInstance.status === "running";
+          shouldPoll = instance.forks.some((fork) => Boolean(fork.currentRun &&
+            ["queued", "running", "waiting_user"].includes(fork.currentRun.status)));
         }
       } catch (reason) {
         if (active) setError(reason instanceof Error ? reason.message : String(reason));
@@ -798,13 +795,14 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
   if (error) return <div className="form-error" role="alert">{error}</div>;
   if (!detail) return <div className="empty-state">正在读取 Agent Instance…</div>;
   const instance = detail.agentInstance;
-  const assignment = detail.assignment;
-  const activeRun = detail.currentRun && ["queued", "running", "waiting_user"].includes(detail.currentRun.status)
-    ? detail.currentRun
+  const fork = detail.forks[0];
+  const activeRun = fork?.currentRun && ["queued", "running", "waiting_user"].includes(fork.currentRun.status)
+    ? fork.currentRun
     : null;
-  const canStart = Boolean(assignment) && (instance.status === "idle" || instance.status === "failed");
+  const canStart = Boolean(fork) && instance.status === "active" && !activeRun;
+  const durableQuestions: PendingAgentQuestion[] = [];
   const pendingQuestions = activeRun?.status === "waiting_user"
-    ? pendingAgentQuestions(conversation)
+    ? (durableQuestions.length > 0 ? durableQuestions : pendingAgentQuestions(conversation))
     : [];
   async function runAction(action: "start" | "cancel") {
     setActing(action);
@@ -812,9 +810,9 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
     try {
       if (action === "cancel" && activeRun) {
         await cancelAgentRun(activeRun.id);
-      } else if (action === "start" && assignment) {
+      } else if (action === "start" && fork) {
         setConversation(null);
-        await startAgentRun(assignment.id);
+        await startAgentRun(fork.id);
       }
       setRefreshVersion((value) => value + 1);
     } catch (reason) {
@@ -826,18 +824,22 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
   async function submitAnswers(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!activeRun || pendingQuestions.length === 0) return;
-    const response = Object.fromEntries(pendingQuestions.map((question) => [
-      question.id,
-      { answers: [answers[question.id]?.trim() ?? ""] },
-    ]));
-    if (Object.values(response).some((answer) => !answer.answers[0])) {
+    const responses = pendingQuestions.map((question) => ({
+      question,
+      answer: answers[question.id]?.trim() ?? "",
+    }));
+    if (responses.some((response) => !response.answer)) {
       setError("请回答全部确认项");
       return;
     }
     setActing("resume");
     setError(null);
     try {
-      await resumeAgentRun(activeRun.id, { answers: response });
+      await resumeAgentRun(activeRun.id, {
+        message: responses
+          .map(({ question, answer }) => `[${question.header}] ${question.question}\n用户回复：${answer}`)
+          .join("\n\n"),
+      });
       setAnswers({});
       setRefreshVersion((value) => value + 1);
     } catch (reason) {
@@ -848,11 +850,11 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
   }
   return <>
     <button className="back-button" type="button" onClick={onBack}>← 返回需求详情</button>
-    <GlobalHeader eyebrow="AGENT INSTANCE" title={detail.assignment?.role ?? "Agent Instance"} description={`${instance.specKey} · ${instance.id}`} />
+    <GlobalHeader eyebrow="AGENT INSTANCE" title={instance.specKey} description={`${detail.forks.length} 个 Fork · ${instance.id}`} />
     <div className="agent-detail-grid">
       <section className="panel instance-panel">
-        <div className="instance-heading"><div className="instance-icon">AI</div><div><div className="eyebrow">AGENT INSTANCE</div><h2>{detail.assignment?.role ?? instance.specKey}</h2></div><span className={instance.status === "running" ? "live-indicator" : "idle-indicator"} /></div>
-        <div className="instance-state-card"><div><span>当前状态</span><strong>{instanceStatusLabels[instance.status]}</strong></div></div>
+        <div className="instance-heading"><div className="instance-icon">AI</div><div><div className="eyebrow">AGENT INSTANCE</div><h2>{instance.specKey}</h2></div><span className={activeRun?.status === "running" ? "live-indicator" : "idle-indicator"} /></div>
+        <div className="instance-state-card"><div><span>启用状态</span><strong>{instanceStatusLabels[instance.status]}</strong></div></div>
         <div className="instance-actions">
           {activeRun && <button className="danger-button" type="button" disabled={acting !== null} onClick={() => void runAction("cancel")}>{acting === "cancel" ? "正在结束…" : "结束 Agent"}</button>}
           {canStart && <button className="primary-button" type="button" disabled={acting !== null} onClick={() => void runAction("start")}>{acting === "start" ? "正在启动…" : "启动 Agent"}</button>}
@@ -862,10 +864,11 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
           {pendingQuestions.map((question) => <label key={question.id}><strong>{question.header}</strong><span>{question.question}</span><input list={`agent-answer-${question.id}`} value={answers[question.id] ?? ""} onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))} placeholder="选择建议项或输入反馈" disabled={acting !== null} /><datalist id={`agent-answer-${question.id}`}>{question.options.map((option) => <option value={option.label} key={option.label}>{option.description}</option>)}</datalist></label>)}
           <button className="primary-button" type="submit" disabled={acting !== null}>{acting === "resume" ? "正在继续…" : "提交并继续"}</button>
         </form>}
-        <dl className="definition-list"><DefinitionRow label="Instance ID"><code>{instance.id}</code></DefinitionRow><DefinitionRow label="Agent Spec">{instance.specKey} · v{instance.specVersion}</DefinitionRow><DefinitionRow label="Workspace"><code>{instance.workspaceKey}</code></DefinitionRow><DefinitionRow label="Thread ID"><code>{instance.threadId}</code></DefinitionRow><DefinitionRow label="最近活跃">{formatDate(instance.lastActiveAt)}</DefinitionRow></dl>
+        <dl className="definition-list"><DefinitionRow label="Instance ID"><code>{instance.id}</code></DefinitionRow><DefinitionRow label="Agent Spec">{instance.specKey} · v{instance.specVersion}</DefinitionRow><DefinitionRow label="共享 Workspace"><code>{instance.workspaceKey}</code></DefinitionRow><DefinitionRow label="最近活跃">{formatDate(instance.lastActiveAt)}</DefinitionRow></dl>
       </section>
-      <ConversationPanel conversation={conversation} runStatus={detail.currentRun?.status ?? null} />
+      <ConversationPanel conversation={conversation} runStatus={fork?.currentRun?.status ?? null} />
     </div>
+    <section className="panel recent-panel"><div className="panel-header compact-header"><div><div className="eyebrow">AGENT FORKS</div><h2>项目分身</h2></div><span className="muted-count">{detail.forks.length} 个</span></div><div className="run-list">{detail.forks.map((item) => <div className="run-row" key={item.id}><code>{item.session.status}</code><div className="run-description"><strong>{item.role} · {item.project.externalProjectId}</strong><span>{item.session.threadId}</span></div></div>)}</div></section>
     <section className="panel recent-panel agent-run-history"><div className="panel-header compact-header"><div><div className="eyebrow">RUN HISTORY</div><h2>运行记录</h2></div><span className="muted-count">{detail.recentRuns.length} 次</span></div><div className="run-list">{detail.recentRuns.map((run) => <div className="run-row" key={run.id}><code>{run.id.slice(0, 8)}</code><div className="run-description"><strong>{run.taskSummary ?? "未命名任务"}</strong><span>{formatDate(run.createdAt)}</span></div><span className="run-duration">{formatDuration(run.durationSeconds)}</span><StatusBadge status={run.status} /></div>)}{detail.recentRuns.length === 0 && <div className="empty-state">尚无运行记录</div>}</div></section>
   </>;
 }

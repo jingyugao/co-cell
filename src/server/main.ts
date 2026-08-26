@@ -10,7 +10,16 @@ import { getCompleteFeishuProjectWorkItem } from "../integrations/feishu-project
 import { migrateBusinessDatabase } from "../persistence/business-migrations.js";
 import { createBusinessDatabase } from "../persistence/database.js";
 import { PostgresWorkbenchRepository } from "../persistence/workbench-repository.js";
+import { PostgresWorkflowCoordinationRepository } from "../persistence/workflow-coordination-repository.js";
 import { PostgresAgentConversationReader } from "../persistence/checkpoint-conversation-reader.js";
+import { PostgresRunHandoffRepository } from "../persistence/run-handoff-repository.js";
+import { FeishuCommentEventSubscriber } from "../integrations/feishu-comment-events.js";
+import {
+  PostgresProjectEventBus,
+  SingleAgentProjectEventDispatcher,
+} from "../events/project-event-bus.js";
+import { PostgresProjectEventInteractions } from "../events/project-event-interactions.js";
+import { FeishuCommentReplyAdapter } from "../integrations/feishu-comment-replies.js";
 import { createApp } from "./app.js";
 import { loadServerConfig } from "./config.js";
 import { DockerSandboxHealthProvider } from "./docker-sandbox-health.js";
@@ -20,6 +29,18 @@ const config = loadServerConfig();
 await migrateBusinessDatabase({ connectionString: config.databaseUrl });
 const database = createBusinessDatabase(config.databaseUrl);
 const repository = new PostgresWorkbenchRepository(database.pool);
+const workflowRepository = new PostgresWorkflowCoordinationRepository(database.pool);
+const handoffRepository = new PostgresRunHandoffRepository(database.pool);
+const eventBus = new PostgresProjectEventBus(database.pool);
+const eventInteractions = new PostgresProjectEventInteractions(
+  database.pool,
+  config.larkAppId && config.larkAppSecret
+    ? [new FeishuCommentReplyAdapter({
+        appId: config.larkAppId,
+        appSecret: config.larkAppSecret,
+      })]
+    : [],
+);
 const specCatalog = new FilesystemAgentSpecCatalog(config.specsRoot);
 const requirementSource = new McpFeishuWorkItemSource((url) =>
   getCompleteFeishuProjectWorkItem(
@@ -29,6 +50,10 @@ const requirementSource = new McpFeishuWorkItemSource((url) =>
 );
 const runLauncher = new CodingRunLauncher({
   repository,
+  workflowRepository,
+  eventBus,
+  eventInteractions,
+  handoffRepository,
   databaseUrl: config.databaseUrl,
   specsRoot: config.specsRoot,
   workspaceRoot: config.workspaceRoot,
@@ -45,6 +70,28 @@ const runLauncher = new CodingRunLauncher({
   kubeconfigPath: config.kubeconfigPath,
   meegleUserAccessToken: config.feishuProjectMcpToken,
 });
+const projectEventDispatcher = new SingleAgentProjectEventDispatcher(eventBus, runLauncher);
+const commentEvents = config.larkAppId && config.larkAppSecret
+  ? new FeishuCommentEventSubscriber({
+      appId: config.larkAppId,
+      appSecret: config.larkAppSecret,
+      eventBus,
+      dispatcher: projectEventDispatcher,
+      onReady: () => process.stdout.write("Feishu comment event connection ready\n"),
+      onError: (error, notice) => {
+        process.stderr.write(
+          `Feishu comment event failed${notice?.comment_id ? ` for ${notice.comment_id}` : ""}: ${error.message}\n`,
+        );
+      },
+      onEvent: ({ notice, outcome, publishResult }) => {
+        process.stdout.write(
+          `Feishu comment event ${outcome}` +
+          `${notice.comment_id ? ` comment=${notice.comment_id}` : ""}` +
+          `${publishResult ? ` projects=${publishResult.deliveredProjectIds.length}` : ""}\n`,
+        );
+      },
+    })
+  : undefined;
 const requirements = new RequirementWorkflowService(
   requirementSource,
   repository,
@@ -59,6 +106,7 @@ const workbench = new WorkbenchQueryService(
   repository,
   new DockerSandboxHealthProvider(config.sandboxName),
   conversationReader,
+  config.workspaceRoot,
 );
 const app = createApp({
   workbench,
@@ -67,6 +115,18 @@ const app = createApp({
   staticRoot: config.staticRoot,
 });
 const server = serve({ fetch: app.fetch, hostname: config.host, port: config.port });
+if (commentEvents) {
+  void commentEvents.start().catch((error) => {
+    process.stderr.write(`Unable to start Feishu comment events: ${String(error)}\n`);
+  });
+} else {
+  process.stderr.write("Feishu comment events disabled: LARK_APP_ID/LARK_APP_SECRET are not configured\n");
+}
+void eventBus.pendingProjectIds()
+  .then((projectIds) => projectEventDispatcher.dispatch(projectIds))
+  .catch((error) => {
+    process.stderr.write(`Unable to resume pending project events: ${String(error)}\n`);
+  });
 
 process.stdout.write(`SwarmHive listening on http://${config.host}:${config.port}\n`);
 
@@ -75,6 +135,7 @@ async function stop(signal: string): Promise<void> {
   if (stopping) return;
   stopping = true;
   process.stdout.write(`Received ${signal}, shutting down\n`);
+  commentEvents?.stop();
   server.close();
   await conversationReader.close();
   await database.close();

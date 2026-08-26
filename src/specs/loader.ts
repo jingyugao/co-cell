@@ -1,29 +1,23 @@
 import { readFile, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 
-export interface AgentSpecKnowledge {
-  path: string;
-  when?: string;
-}
-
 export interface AgentSpecManifest {
   id: string;
   name: string;
   version: number;
   prompt: string;
-  knowledge: AgentSpecKnowledge[];
+  memory: string;
   sandbox: {
     dockerfile: string;
     image: string;
   };
-  environmentExample: string;
 }
 
 export interface LoadedAgentSpec {
   directory: string;
   manifest: AgentSpecManifest;
   prompt: string;
-  instructions: string[];
+  memorySeed: string;
 }
 
 function isWithin(root: string, candidate: string): boolean {
@@ -44,24 +38,13 @@ function parseManifest(value: unknown): AgentSpecManifest {
     !Number.isInteger(manifest.version) ||
     typeof manifest.prompt !== "string" ||
     !manifest.prompt.trim() ||
-    !Array.isArray(manifest.knowledge) ||
+    typeof manifest.memory !== "string" ||
+    !manifest.memory.trim() ||
     !manifest.sandbox ||
     typeof manifest.sandbox.dockerfile !== "string" ||
-    typeof manifest.sandbox.image !== "string" ||
-    typeof manifest.environmentExample !== "string"
+    typeof manifest.sandbox.image !== "string"
   ) {
     throw new Error("Agent Spec manifest is invalid");
-  }
-  for (const entry of manifest.knowledge) {
-    if (
-      !entry ||
-      typeof entry !== "object" ||
-      typeof entry.path !== "string" ||
-      !entry.path.trim() ||
-      (entry.when !== undefined && typeof entry.when !== "string")
-    ) {
-      throw new Error("Agent Spec knowledge entry is invalid");
-    }
   }
   return manifest as AgentSpecManifest;
 }
@@ -77,32 +60,20 @@ async function readSpecFile(
   return readFile(candidate, "utf8");
 }
 
-/** Load deployment knowledge from a versioned Agent Spec. */
-export async function loadAgentSpec(options: {
-  directory: string;
-  capabilities?: ReadonlySet<string>;
-}): Promise<LoadedAgentSpec> {
+/** Load the immutable prompt and initial memory from a versioned Agent Spec. */
+export async function loadAgentSpec(options: { directory: string }): Promise<LoadedAgentSpec> {
   const directory = await realpath(resolve(options.directory));
   const manifestText = await readSpecFile(directory, "spec.json");
   const manifest = parseManifest(JSON.parse(manifestText) as unknown);
-  const [prompt] = await Promise.all([
+  const [prompt, memorySeed] = await Promise.all([
     readSpecFile(directory, manifest.prompt),
+    readSpecFile(directory, manifest.memory),
     readSpecFile(directory, manifest.sandbox.dockerfile),
-    readSpecFile(directory, manifest.environmentExample),
   ]);
-  const capabilities = options.capabilities ?? new Set<string>();
-  const activeKnowledge = manifest.knowledge.filter(
-    (entry) => !entry.when || capabilities.has(entry.when),
-  );
-  const instructions = await Promise.all(
-    activeKnowledge.map(async (entry) =>
-      (await readSpecFile(directory, entry.path)).trim(),
-    ),
-  );
   return {
     directory,
     manifest,
     prompt: prompt.trim(),
-    instructions: instructions.filter(Boolean),
+    memorySeed: memorySeed.trim(),
   };
 }

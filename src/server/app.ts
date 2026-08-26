@@ -49,10 +49,7 @@ const assignmentSchema = z.object({
   role: z.string().trim().min(1).max(100),
 });
 const resumeRunSchema = z.object({
-  answers: z.record(
-    z.string().regex(/^[a-z][a-z0-9_]*$/),
-    z.object({ answers: z.array(z.string().trim().min(1)).min(1) }),
-  ).refine((answers) => Object.keys(answers).length > 0),
+  message: z.string().trim().min(1).max(20_000),
 });
 
 function requirements(options: CreateAppOptions): RequirementWorkflow {
@@ -126,15 +123,15 @@ export function createApp(options: CreateAppOptions): Hono {
     return context.json(await requirements(options).preview(parsed.data.url));
   });
 
-  app.post("/api/v1/agent-assignments", async (context) => {
+  app.post("/api/v1/agent-forks", async (context) => {
     const parsed = assignmentSchema.safeParse(await context.req.json().catch(() => null));
-    if (!parsed.success) throw new InvalidRequestError("Agent Assignment is invalid");
-    return context.json(await requirements(options).assign(parsed.data), 201);
+    if (!parsed.success) throw new InvalidRequestError("Agent Fork is invalid");
+    return context.json(await requirements(options).fork(parsed.data), 201);
   });
 
-  app.post("/api/v1/agent-assignments/:assignmentId/runs", async (context) => {
-    const assignmentId = validatedId(context.req.param("assignmentId"), "assignmentId");
-    return context.json(await requirements(options).start(assignmentId), 202);
+  app.post("/api/v1/agent-forks/:forkId/runs", async (context) => {
+    const forkId = validatedId(context.req.param("forkId"), "forkId");
+    return context.json(await requirements(options).start(forkId), 202);
   });
 
   app.post("/api/v1/runs/:runId/cancel", async (context) => {
@@ -145,7 +142,7 @@ export function createApp(options: CreateAppOptions): Hono {
   app.post("/api/v1/runs/:runId/resume", async (context) => {
     const runId = validatedId(context.req.param("runId"), "runId");
     const parsed = resumeRunSchema.safeParse(await context.req.json().catch(() => null));
-    if (!parsed.success) throw new InvalidRequestError("Valid Agent answers are required");
+    if (!parsed.success) throw new InvalidRequestError("A valid Agent message is required");
     return context.json(await requirements(options).resume(runId, parsed.data), 202);
   });
 
@@ -189,12 +186,20 @@ export function createApp(options: CreateAppOptions): Hono {
     return context.json(await options.workbench.getAgentInstance(agentInstanceId));
   });
 
-  app.get("/api/v1/agent-instances/:agentInstanceId/conversation", async (context) => {
-    const agentInstanceId = validatedId(
-      context.req.param("agentInstanceId"),
-      "agentInstanceId",
+  app.get("/api/v1/agent-sessions/:agentSessionId/conversation", async (context) => {
+    const agentSessionId = validatedId(
+      context.req.param("agentSessionId"),
+      "agentSessionId",
     );
-    return context.json(await options.workbench.getAgentConversation(agentInstanceId));
+    return context.json(await options.workbench.getAgentConversation(agentSessionId));
+  });
+
+  app.get("/api/v1/reports/:reportId", async (context) => {
+    const reportId = validatedId(context.req.param("reportId"), "reportId");
+    const report = await options.workbench.getReportMarkdown(reportId);
+    context.header("content-type", "text/markdown; charset=utf-8");
+    context.header("content-disposition", `inline; filename="${report.filename}"`);
+    return context.body(report.content);
   });
 
   app.get("/api/v1/runs/:runId", async (context) => {

@@ -4,6 +4,11 @@ import { describe, expect, it } from "vitest";
 import {
   CODEX_DERIVED_HARNESS_INSTRUCTIONS,
   CODING_AGENT_INSTRUCTIONS,
+  CODING_CONTEXT_SUMMARY_PROMPT,
+  CONVERSATION_SUMMARY_KEEP_MESSAGES,
+  CONVERSATION_SUMMARY_TRIGGER_MESSAGES,
+  CONVERSATION_SUMMARY_TRIGGER_TOKENS,
+  EFFECTIVELY_UNBOUNDED_RECURSION_LIMIT,
   buildCodingAgentInstructions,
   isTransientModelError,
   renderMessageContent,
@@ -20,6 +25,21 @@ describe("coding agent instructions", () => {
     expect(buildCodingAgentInstructions(["  host policy  ", "  "])).toBe(
       `${CODEX_DERIVED_HARNESS_INSTRUCTIONS}\n\nhost policy`,
     );
+  });
+});
+
+describe("coding agent context bounds", () => {
+  it("uses durable automatic summarization before history becomes unbounded", () => {
+    expect(CONVERSATION_SUMMARY_TRIGGER_TOKENS).toBe(80_000);
+    expect(CONVERSATION_SUMMARY_TRIGGER_MESSAGES).toBe(80);
+    expect(CONVERSATION_SUMMARY_KEEP_MESSAGES).toBe(24);
+    expect(CODING_CONTEXT_SUMMARY_PROMPT).toContain("unresolved questions");
+    expect(CODING_CONTEXT_SUMMARY_PROMPT).toContain("validation results");
+  });
+
+  it("does not impose the former 200-step workflow limit", () => {
+    expect(EFFECTIVELY_UNBOUNDED_RECURSION_LIMIT).toBe(Number.MAX_SAFE_INTEGER);
+    expect(EFFECTIVELY_UNBOUNDED_RECURSION_LIMIT).toBeGreaterThan(200);
   });
 });
 

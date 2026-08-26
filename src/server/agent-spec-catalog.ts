@@ -26,9 +26,9 @@ export class FilesystemAgentSpecCatalog implements AgentSpecCatalog {
         id: manifest.id,
         name: manifest.name,
         version: manifest.version,
-        knowledge: manifest.knowledge,
+        memory: manifest.memory,
         sandbox: manifest.sandbox,
-        environmentExample: manifest.environmentExample,
+        environmentExample: ".env.example",
       })),
     };
   }

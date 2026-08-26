@@ -8,43 +8,21 @@ import { loadAgentSpec } from "../src/specs/loader.js";
 const specDirectory = resolve("agent-specs/software-engineer");
 
 describe("loadAgentSpec", () => {
-  test("loads unconditional engineering knowledge", async () => {
+  test("loads one prompt and one memory file", async () => {
     const spec = await loadAgentSpec({ directory: specDirectory });
 
     expect(spec.manifest.id).toBe("software-engineer");
     expect(spec.manifest.sandbox.dockerfile).toBe("sandbox/Dockerfile");
     expect(spec.manifest.prompt).toBe("prompt.txt");
+    expect(spec.manifest.memory).toBe("memory.txt");
     expect(spec.prompt).not.toContain("{{");
-    expect(spec.prompt).toContain("glab mr create --yes");
+    expect(spec.prompt).toContain("confirmation_list");
     expect(spec.prompt).not.toContain("{{requirement_json}}");
-    expect(spec.instructions).toHaveLength(3);
-    expect(spec.instructions[0]).toContain("业务架构：[待补充]");
-    expect(spec.instructions[0]).toContain("测试环境：[待补充]");
-    expect(spec.instructions.join("\n")).toContain("gitlab.example.com/example-user/example-data");
-    expect(spec.instructions.join("\n")).toContain("meegle url decode");
-    expect(spec.instructions.join("\n")).toContain("lark-cli docs +fetch");
-    expect(spec.instructions.join("\n")).toContain("solution_design");
-    expect(spec.instructions.join("\n")).toContain("production_verification");
-    expect(spec.instructions.join("\n")).toContain("form_item_type=field");
-    expect(spec.instructions.join("\n")).toContain("飞书文档");
-    expect(spec.instructions[2]).toContain("需求文档可以很短");
-    expect(spec.instructions[2]).toContain("技术方案深度必须与需求规模和风险匹配");
-    expect(spec.instructions[1]).toContain('--fields \'["description","wiki"]\'');
-    expect(spec.instructions[2]).toContain("永远禁止覆盖");
-    expect(spec.instructions[2]).toContain("简单模板没有专用技术方案字段时，不修改任何 Meegle 链接字段");
-    expect(spec.prompt).toContain("solution_design");
-    expect(spec.prompt).toContain("统一遵循“单 Agent 研发交付流程”");
+    expect(spec.memorySeed).toContain("example-data");
+    expect(spec.memorySeed).toContain("Meegle");
+    expect(spec.memorySeed).toContain("技术方案调研");
+    expect(spec.memorySeed).toContain("example-tool-server");
     expect(spec.prompt).not.toContain("project_cli");
-  });
-
-  test("loads the same long-term knowledge for GitLab capability", async () => {
-    const spec = await loadAgentSpec({
-      directory: specDirectory,
-      capabilities: new Set(["gitlab"]),
-    });
-
-    expect(spec.instructions).toHaveLength(3);
-    expect(spec.prompt).toContain("GitLab 交付规范");
   });
 
   test("starts a Run with only the Feishu Project URL as task input", async () => {
@@ -54,7 +32,9 @@ describe("loadAgentSpec", () => {
     );
 
     expect(launcher).not.toContain("this.options.source.get");
-    expect(launcher).toContain("buildFeishuProjectTaskPrompt(spec.prompt, context.sourceUrl)");
+    expect(launcher).toContain("buildProjectTaskPrompt(context.sourceUrl)");
+    expect(launcher).toContain("spec.prompt");
+    expect(launcher).toContain("getAgentSessionMemory(context.sessionId)");
     expect(launcher).not.toContain("role: context.role");
   });
 
@@ -66,6 +46,7 @@ describe("loadAgentSpec", () => {
 
     expect(initializer).toContain('AGENT_GIT_NAME:-code_agent');
     expect(initializer).toContain('AGENT_GIT_EMAIL:-code_agent@noreply.${email_host}');
+    expect(initializer).toContain("Always refresh the stored credential");
   });
 
   test("installs native Feishu CLIs into the persistent Spec HOME", async () => {

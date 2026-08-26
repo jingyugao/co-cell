@@ -12,7 +12,7 @@ const databaseUrl = process.env.AGENT_BUSINESS_TEST_DATABASE_URL;
 const describePostgres = databaseUrl ? describe : describe.skip;
 
 describePostgres("business database integration", () => {
-  test("migrates six business tables and supports their core relationship", async () => {
+  test("migrates business tables and supports their core relationship", async () => {
     await migrateBusinessDatabase({ connectionString: databaseUrl! });
     await expect(
       migrateBusinessDatabase({ connectionString: databaseUrl! }),
@@ -24,15 +24,24 @@ describePostgres("business database integration", () => {
          FROM information_schema.tables
         WHERE table_schema = $1
           AND table_name <> 'schema_migrations'
+          AND table_type = 'BASE TABLE'
         ORDER BY table_name`,
       [BUSINESS_DATABASE_SCHEMA],
     );
     expect(tables.rows.map((row) => row.table_name)).toEqual([
-      "agent_instance_run_events",
-      "agent_instance_runs",
+      "agent_forks",
       "agent_instances",
+      "agent_run_events",
+      "agent_run_handoffs",
+      "agent_runs",
+      "agent_sessions",
+      "event_interactions",
+      "external_events",
       "inbox_events",
-      "project_agent_instances",
+      "project_confirmations",
+      "project_deferred_items",
+      "project_reports",
+      "project_subscriptions",
       "projects",
     ]);
     const guardIndexes = await pool.query<{ indexname: string }>(
@@ -40,15 +49,15 @@ describePostgres("business database integration", () => {
          FROM pg_indexes
         WHERE schemaname = $1
           AND indexname IN (
-            'uq_agent_instance_runs_trigger_event',
-            'uq_agent_instance_runs_active_instance'
+            'uq_agent_runs_trigger_event',
+            'uq_agent_runs_active_session'
           )
         ORDER BY indexname`,
       [BUSINESS_DATABASE_SCHEMA],
     );
     expect(guardIndexes.rows.map((row) => row.indexname)).toEqual([
-      "uq_agent_instance_runs_active_instance",
-      "uq_agent_instance_runs_trigger_event",
+      "uq_agent_runs_active_session",
+      "uq_agent_runs_trigger_event",
     ]);
 
     const client = await pool.connect();
@@ -62,7 +71,7 @@ describePostgres("business database integration", () => {
       );
       const agentInstance = await client.query<{ id: string }>(
         `INSERT INTO swarm_hive.agent_instances(
-           spec_key, spec_version, thread_id, workspace_key
+           spec_key, spec_version, instance_key, workspace_key
          ) VALUES ('software-engineer', 1, $1, $2)
          RETURNING id`,
         [`thread-${randomUUID()}`, `workspace-${randomUUID()}`],
@@ -71,11 +80,18 @@ describePostgres("business database integration", () => {
       const agentInstanceId = agentInstance.rows[0]?.id;
       if (!projectId || !agentInstanceId) throw new Error("Test IDs missing");
 
-      await client.query(
-        `INSERT INTO swarm_hive.project_agent_instances(
-           project_id, agent_instance_id
-         ) VALUES ($1, $2)`,
-        [projectId, agentInstanceId],
+      const fork = await client.query<{ id: string }>(
+        `INSERT INTO swarm_hive.agent_forks(
+           project_id, agent_instance_id, workspace_key
+         ) VALUES ($1, $2, $3)
+         RETURNING id`,
+        [projectId, agentInstanceId, `fork-${randomUUID()}`],
+      );
+      const session = await client.query<{ id: string }>(
+        `INSERT INTO swarm_hive.agent_sessions(agent_fork_id, thread_id)
+         VALUES ($1, $2)
+         RETURNING id`,
+        [fork.rows[0]?.id, `thread-${randomUUID()}`],
       );
       const inboxEvent = await client.query<{ id: string }>(
         `INSERT INTO swarm_hive.inbox_events(
@@ -85,23 +101,23 @@ describePostgres("business database integration", () => {
         [`event-${randomUUID()}`, projectId],
       );
       const run = await client.query<{ id: string }>(
-        `INSERT INTO swarm_hive.agent_instance_runs(
-           project_id, agent_instance_id, trigger_event_id, task_summary
-         ) VALUES ($1, $2, $3, 'Implement requirement')
+        `INSERT INTO swarm_hive.agent_runs(
+           project_id, agent_instance_id, agent_session_id, trigger_event_id, task_summary
+         ) VALUES ($1, $2, $3, $4, 'Implement requirement')
          RETURNING id`,
-        [projectId, agentInstanceId, inboxEvent.rows[0]?.id],
+        [projectId, agentInstanceId, session.rows[0]?.id, inboxEvent.rows[0]?.id],
       );
       await client.query(
-        `INSERT INTO swarm_hive.agent_instance_run_events(
-           agent_instance_run_id, sequence_no, event_type, title
+        `INSERT INTO swarm_hive.agent_run_events(
+           agent_run_id, sequence_no, event_type, title
          ) VALUES ($1, 1, 'started', 'Agent instance run started')`,
         [run.rows[0]?.id],
       );
 
       const timeline = await client.query<{ count: string }>(
         `SELECT count(*)::text AS count
-           FROM swarm_hive.agent_instance_run_events
-          WHERE agent_instance_run_id = $1`,
+           FROM swarm_hive.agent_run_events
+          WHERE agent_run_id = $1`,
         [run.rows[0]?.id],
       );
       expect(timeline.rows[0]?.count).toBe("1");

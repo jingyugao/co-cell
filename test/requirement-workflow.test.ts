@@ -41,20 +41,25 @@ describe("Requirement workflow", () => {
 
   test("reads Feishu again before saving only an Agent assignment", async () => {
     const source = new McpFeishuWorkItemSource(async () => rawWorkItem());
-    const createAgentAssignment = vi.fn(async (input) => ({
+    const createAgentFork = vi.fn(async (input) => ({
       projectId: "project-id",
-      assignmentId: "assignment-id",
+      forkId: "fork-id",
+      role: input.role,
       agentInstance: {
         id: "instance-id",
         specKey: input.specKey,
         specVersion: input.specVersion,
-        role: input.role,
+        status: "active" as const,
+      },
+      session: {
+        id: "session-id",
         workspaceKey: input.workspaceKey,
         threadId: input.threadId,
-        status: "idle" as const,
+        status: "active" as const,
       },
+      currentRun: null,
     }));
-    const repository = { createAgentAssignment } as unknown as PostgresWorkbenchRepository;
+    const repository = { createAgentFork } as unknown as PostgresWorkbenchRepository;
     const service = new RequirementWorkflowService(
       source,
       repository,
@@ -64,13 +69,14 @@ describe("Requirement workflow", () => {
           id: "software-engineer",
           name: "Software Engineer",
           version: 1,
-          knowledge: [],
+          memory: "memory.txt",
           sandbox: { dockerfile: "sandbox/Dockerfile", image: "image" },
           environmentExample: ".env.example",
         }),
       },
       {
         launch: vi.fn(),
+        notify: vi.fn(),
         resume: vi.fn(async (runId: string) => ({ runId, status: "running" as const })),
         cancel: vi.fn(async (runId: string) => ({
           runId,
@@ -79,19 +85,19 @@ describe("Requirement workflow", () => {
         })),
       },
     );
-    await service.assign({
+    await service.fork({
       url: sourceUrl,
       specKey: "software-engineer",
       role: "backend-a",
     });
-    expect(createAgentAssignment).toHaveBeenCalledWith(expect.objectContaining({
+    expect(createAgentFork).toHaveBeenCalledWith(expect.objectContaining({
       sourceUrl,
       externalProjectKey: "space-key",
       externalWorkItemType: "story",
       externalWorkItemId: "1234567890",
       role: "backend-a",
     }));
-    const persisted = createAgentAssignment.mock.calls[0]?.[0];
+    const persisted = createAgentFork.mock.calls[0]?.[0];
     expect(persisted).not.toHaveProperty("title");
     expect(persisted).not.toHaveProperty("fields");
     expect(persisted).not.toHaveProperty("status");

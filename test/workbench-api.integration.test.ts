@@ -32,7 +32,7 @@ describePostgres("workbench API integration", () => {
 
       const workbench = await service.getProjectWorkbench(projectId);
       expect(workbench.project.name).toBe("Workbench integration fixture");
-      expect(workbench.primaryAgentInstance?.specKey).toBe("software-engineer");
+      expect(workbench.primaryAgentFork?.specKey).toBe("software-engineer");
       expect(workbench.currentRun?.progress.percent).toBe(67);
       expect(workbench.currentRun?.events).toHaveLength(6);
       expect(workbench.runtime.status).toBe("online");
@@ -60,24 +60,20 @@ describePostgres("workbench API integration", () => {
       expect((await service.listAllInboxEvents({ limit: 100 })).items.length).toBeGreaterThanOrEqual(4);
 
       const specUsage = await service.getAgentSpecUsage("software-engineer");
-      expect(specUsage.statistics.instances).toBeGreaterThanOrEqual(2);
-      expect(specUsage.statistics.activeRequirements).toBeGreaterThanOrEqual(2);
+      expect(specUsage.statistics.instances).toBe(1);
+      expect(specUsage.statistics.activeRequirements).toBeGreaterThanOrEqual(1);
       const fixtureRequirements = specUsage.activeRequirements.filter(
         (item) => item.project.id === projectId,
       );
-      expect(fixtureRequirements).toHaveLength(2);
-      expect(fixtureRequirements.map((item) => item.role).sort()).toEqual([
-        "backend-module-a",
-        "backend-module-b",
-      ]);
-      expect(new Set(fixtureRequirements.map((item) => item.agentInstance.id)).size).toBe(2);
+      expect(fixtureRequirements).toHaveLength(1);
+      expect(fixtureRequirements[0]?.role).toBe("backend-module-a");
 
       const agentInstanceId = fixtureRequirements[0]?.agentInstance.id;
       if (!agentInstanceId) throw new Error("Seeded Agent Instance is missing");
       const agentDetail = await service.getAgentInstance(agentInstanceId);
       expect(agentDetail.agentInstance.id).toBe(agentInstanceId);
-      expect(agentDetail.assignment?.project.id).toBe(projectId);
-      expect(agentDetail.assignment?.role).toBe(fixtureRequirements[0]?.role);
+      expect(agentDetail.forks[0]?.project.id).toBe(projectId);
+      expect(agentDetail.forks[0]?.role).toBe(fixtureRequirements[0]?.role);
 
       const app = createApp({
         workbench: service,
@@ -87,7 +83,7 @@ describePostgres("workbench API integration", () => {
             id: "software-engineer",
             name: "Software Engineer",
             version: 1,
-            knowledge: [],
+            memory: "memory.txt",
             sandbox: { dockerfile: "sandbox/Dockerfile", image: "swarm-hive:latest" },
             environmentExample: ".env.example",
           } : null,
@@ -106,7 +102,7 @@ describePostgres("workbench API integration", () => {
       expect(agentResponse.status).toBe(200);
       expect(await agentResponse.json()).toMatchObject({
         agentInstance: { id: agentInstanceId },
-        assignment: { project: { id: projectId } },
+        forks: [{ project: { id: projectId } }],
       });
       const specResponse = await app.request("/api/v1/agent-specs/software-engineer");
       expect(specResponse.status).toBe(200);
@@ -115,23 +111,23 @@ describePostgres("workbench API integration", () => {
         statistics: { activeRequirements: number };
       };
       expect(specBody.spec.id).toBe("software-engineer");
-      expect(specBody.statistics.activeRequirements).toBeGreaterThanOrEqual(2);
+      expect(specBody.statistics.activeRequirements).toBeGreaterThanOrEqual(1);
     } finally {
       const agents = await pool.query<{ agent_instance_id: string }>(
-        `SELECT agent_instance_id FROM swarm_hive.project_agent_instances
+        `SELECT agent_instance_id FROM swarm_hive.agent_forks
           WHERE project_id = $1`,
         [projectId],
       );
       await pool.query(
-        `DELETE FROM swarm_hive.agent_instance_run_events
-          WHERE agent_instance_run_id IN (
-            SELECT id FROM swarm_hive.agent_instance_runs WHERE project_id = $1
+        `DELETE FROM swarm_hive.agent_run_events
+          WHERE agent_run_id IN (
+            SELECT id FROM swarm_hive.agent_runs WHERE project_id = $1
           )`,
         [projectId],
       );
-      await pool.query("DELETE FROM swarm_hive.agent_instance_runs WHERE project_id = $1", [projectId]);
+      await pool.query("DELETE FROM swarm_hive.agent_runs WHERE project_id = $1", [projectId]);
       await pool.query("DELETE FROM swarm_hive.inbox_events WHERE project_id = $1", [projectId]);
-      await pool.query("DELETE FROM swarm_hive.project_agent_instances WHERE project_id = $1", [projectId]);
+      await pool.query("DELETE FROM swarm_hive.agent_forks WHERE project_id = $1", [projectId]);
       await pool.query("DELETE FROM swarm_hive.projects WHERE id = $1", [projectId]);
       for (const agent of agents.rows) {
         await pool.query("DELETE FROM swarm_hive.agent_instances WHERE id = $1", [agent.agent_instance_id]);

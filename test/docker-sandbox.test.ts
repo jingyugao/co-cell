@@ -14,7 +14,7 @@ import type {
   SandboxSpec,
 } from "../src/sandbox/types.js";
 import {
-  allocateSpecProjectWorkspace,
+  allocateInstanceProjectWorkspace,
   createTaskSandbox,
   runSandboxInitializers,
   workspaceSlug,
@@ -161,24 +161,24 @@ describe("createTaskSandbox", () => {
   test("allocates one persistent Spec HOME with separate project workspaces", async () => {
     const root = await mkdtemp(join(tmpdir(), "spec-workspaces-"));
     try {
-      const first = await allocateSpecProjectWorkspace({
+      const first = await allocateInstanceProjectWorkspace({
         workspaceRoot: root,
-        specKey: "software-engineer",
+        instanceKey: "software-engineer",
         projectId: "project-1001",
       });
-      const repeated = await allocateSpecProjectWorkspace({
+      const repeated = await allocateInstanceProjectWorkspace({
         workspaceRoot: root,
-        specKey: "software-engineer",
+        instanceKey: "software-engineer",
         projectId: "project-1001",
       });
-      const second = await allocateSpecProjectWorkspace({
+      const second = await allocateInstanceProjectWorkspace({
         workspaceRoot: root,
-        specKey: "software-engineer",
+        instanceKey: "software-engineer",
         projectId: "project-1002",
       });
-      const otherSpec = await allocateSpecProjectWorkspace({
+      const otherSpec = await allocateInstanceProjectWorkspace({
         workspaceRoot: root,
-        specKey: "data-analyst",
+        instanceKey: "data-analyst",
         projectId: "project-1001",
       });
 
@@ -186,7 +186,7 @@ describe("createTaskSandbox", () => {
       expect(first.workspace).not.toBe(second.workspace);
       expect(first.home).toBe(second.home);
       expect(first.home).not.toBe(otherSpec.home);
-      expect(first.specSlug).toBe(workspaceSlug("software-engineer"));
+      expect(first.instanceSlug).toBe(workspaceSlug("software-engineer"));
       expect(first.projectSlug).toBe(workspaceSlug("project-1001"));
       expect(first.projectRoot).toBe(join(first.home, "projects", first.projectSlug));
       expect(first.workspace).toBe(join(first.projectRoot, "repo"));

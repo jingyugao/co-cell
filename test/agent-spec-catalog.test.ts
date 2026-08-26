@@ -12,7 +12,8 @@ describe("filesystem Agent Spec catalog", () => {
       expect.objectContaining({
         id: "software-engineer",
         name: "Software Engineer",
-        version: 8,
+        version: 11,
+        memory: "memory.txt",
         environmentExample: ".env.example",
       }),
     ]);

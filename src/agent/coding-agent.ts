@@ -1,10 +1,12 @@
 import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
+import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import { Command, isInterrupted } from "@langchain/langgraph";
 import {
   createAgent,
   createMiddleware,
   modelRetryMiddleware,
+  summarizationMiddleware,
   todoListMiddleware,
   type Todo,
 } from "langchain";
@@ -19,7 +21,6 @@ import {
   renderRequestUserInput,
   type RequestUserInput,
   type RequestUserInputHandler,
-  type RequestUserInputResponse,
 } from "../tools/request-user-input.js";
 import { createViewImageTool } from "../tools/view-image.js";
 
@@ -72,6 +73,34 @@ Escalation and completion:
   request leader input with the attempts, evidence, and exact decision needed.
 - The final response must state the outcome, changed files, validation and results,
   untested cases, risks, and the exact blocker when incomplete.
+`.trim();
+
+/**
+ * LangGraph requires a positive recursion limit even when the application does
+ * not want to impose a workflow-depth limit. This value is effectively
+ * unbounded for a real Agent Run while preserving the framework contract.
+ */
+export const EFFECTIVELY_UNBOUNDED_RECURSION_LIMIT = Number.MAX_SAFE_INTEGER;
+
+export const CONVERSATION_SUMMARY_TRIGGER_TOKENS = 80_000;
+export const CONVERSATION_SUMMARY_TRIGGER_MESSAGES = 80;
+export const CONVERSATION_SUMMARY_KEEP_MESSAGES = 24;
+export const CONVERSATION_SUMMARY_INPUT_TOKENS = 60_000;
+
+export const CODING_CONTEXT_SUMMARY_PROMPT = `
+Summarize the coding Agent conversation for continued autonomous execution.
+Preserve concrete requirements, user decisions, unresolved questions, repository
+and branch state, changed files, commands and validation results, external artifact
+URLs, workflow reports, confirmation keys and answers, errors already investigated,
+and the exact next action. Distinguish verified facts from assumptions. Omit verbose
+tool output, repeated progress narration, help text, and failed attempts once their
+cause is known. Never invent completion, validation, permissions, or external state.
+The summary will replace the older messages, so make it concise but operationally
+complete. Respond only with the summary.
+
+<messages>
+{messages}
+</messages>
 `.trim();
 
 export function buildCodingAgentInstructions(
@@ -166,8 +195,8 @@ export interface CodingTask {
   workspace: string;
   /** New user input. Omit only when resuming an interrupted/failed checkpoint. */
   prompt?: string;
-  /** Human response used to resume a request_user_input interrupt. */
-  resume?: RequestUserInputResponse | true;
+  /** Unstructured human message used to resume a request_user_input interrupt. */
+  resume?: { message: string } | true;
   /** Optional externally managed execution sandbox. Defaults to local execution. */
   sandbox?: Sandbox;
   model?: string;
@@ -183,6 +212,14 @@ export interface CodingTask {
   requestUserInput: RequestUserInputHandler;
   /** Host- or deployment-specific developer instructions appended after the base. */
   additionalInstructions?: readonly string[];
+  /** Project-scoped durable workflow tools supplied by the control plane. */
+  workflowTools?: readonly StructuredToolInterface[];
+  /** Durable external events checked before every model call. */
+  externalEvents?: {
+    claim(): Promise<Array<{ id: string; content: string }>>;
+    complete(ids: string[]): Promise<void>;
+    fail(ids: string[], error: string): Promise<void>;
+  };
   openAICompatible?: {
     apiKey: string;
     baseURL: string;
@@ -235,6 +272,7 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
     : await BashProcessManager.create({ workspace: task.workspace });
   const executor = task.sandbox ?? localManager;
   if (!executor) throw new Error("No sandbox executor is available");
+  const claimedExternalEventIds = new Set<string>();
   try {
     const instructions = buildCodingAgentInstructions(task.additionalInstructions);
     const model = task.openAICompatible
@@ -245,6 +283,22 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
         })
       : await createCodexModel({ model: task.model, instructions });
     const viewImage = await createViewImageTool({ workspace: task.workspace });
+    const externalEventMiddleware = task.externalEvents
+      ? createMiddleware({
+          name: "externalEventMiddleware",
+          beforeModel: async () => {
+            const events = await task.externalEvents!.claim();
+            if (events.length === 0) return undefined;
+            events.forEach((event) => claimedExternalEventIds.add(event.id));
+            return {
+              messages: events.map((event) => new HumanMessage({
+                id: `external-event:${event.id}`,
+                content: event.content,
+              })),
+            };
+          },
+        })
+      : undefined;
     const agent = createAgent({
       name: "coding-agent",
       model,
@@ -252,9 +306,22 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
         createBashTool(executor),
         viewImage,
         createRequestUserInputTool(task.requestUserInput),
+        ...(task.workflowTools ?? []),
       ],
       middleware: [
         requireInitialToolCallMiddleware,
+        ...(externalEventMiddleware ? [externalEventMiddleware] : []),
+        summarizationMiddleware({
+          model,
+          trigger: [
+            { tokens: CONVERSATION_SUMMARY_TRIGGER_TOKENS },
+            { messages: CONVERSATION_SUMMARY_TRIGGER_MESSAGES },
+          ],
+          keep: { messages: CONVERSATION_SUMMARY_KEEP_MESSAGES },
+          trimTokensToSummarize: CONVERSATION_SUMMARY_INPUT_TOKENS,
+          summaryPrompt: CODING_CONTEXT_SUMMARY_PROMPT,
+          summaryPrefix: "以下是此前研发对话的自动压缩摘要：",
+        }),
         modelRetryMiddleware({
           maxRetries: 5,
           initialDelayMs: 2_000,
@@ -269,33 +336,45 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
       checkpointer: task.checkpointer,
     });
     const threadId = task.threadId?.trim();
-    const result = await agent.invoke(
-      task.resume
-        ? new Command({ resume: task.resume })
-        : { messages: [new HumanMessage(task.prompt!)] },
-      {
-        recursionLimit: task.recursionLimit ?? 200,
-        ...(task.signal ? { signal: task.signal } : {}),
-        ...(threadId
-          ? {
-              configurable: {
-                thread_id: threadId,
-                ...(task.runId ? { run_id: task.runId } : {}),
-              },
-              durability: "sync" as const,
-            }
-          : {}),
-        ...(task.runId || threadId
-          ? {
-              metadata: {
-                ...(task.runId ? { run_id: task.runId } : {}),
-                ...(threadId ? { thread_id: threadId } : {}),
-              },
-            }
-          : {}),
-      },
-    );
+    let result;
+    try {
+      result = await agent.invoke(
+        task.resume
+          ? new Command({ resume: task.resume })
+          : { messages: [new HumanMessage(task.prompt!)] },
+        {
+          recursionLimit:
+            task.recursionLimit ?? EFFECTIVELY_UNBOUNDED_RECURSION_LIMIT,
+          ...(task.signal ? { signal: task.signal } : {}),
+          ...(threadId
+            ? {
+                configurable: {
+                  thread_id: threadId,
+                  ...(task.runId ? { run_id: task.runId } : {}),
+                },
+                durability: "sync" as const,
+              }
+            : {}),
+          ...(task.runId || threadId
+            ? {
+                metadata: {
+                  ...(task.runId ? { run_id: task.runId } : {}),
+                  ...(threadId ? { thread_id: threadId } : {}),
+                },
+              }
+            : {}),
+        },
+      );
+      await task.externalEvents?.complete([...claimedExternalEventIds]);
+    } catch (error) {
+      await task.externalEvents?.fail(
+        [...claimedExternalEventIds],
+        error instanceof Error ? error.message : String(error),
+      ).catch(() => undefined);
+      throw error;
+    }
     const messages = result.messages ?? [];
+    const todos = (result as unknown as { todos?: Todo[] }).todos ?? [];
     if (isInterrupted<RequestUserInput>(result)) {
       const request = result.__interrupt__[0]?.value;
       return {
@@ -303,7 +382,7 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
           ? renderRequestUserInput(request)
           : "Agent 正在等待人工确认。",
         messages,
-        todos: result.todos ?? [],
+        todos,
         ...(request ? { userInputRequest: request } : {}),
       };
     }
@@ -322,7 +401,7 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
     return {
       finalResponse,
       messages,
-      todos: result.todos ?? [],
+      todos,
       ...(mergeRequest ? { mergeRequestUrl: mergeRequest.url } : {}),
     };
   } finally {

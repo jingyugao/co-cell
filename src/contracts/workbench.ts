@@ -1,11 +1,5 @@
 export type ProjectStatus = "active" | "closed" | "archived";
-export type AgentInstanceStatus =
-  | "idle"
-  | "queued"
-  | "running"
-  | "waiting"
-  | "disabled"
-  | "failed";
+export type AgentInstanceStatus = "active" | "disabled";
 export type RunStatus =
   | "queued"
   | "running"
@@ -66,8 +60,11 @@ export interface ProjectWorkbench {
     completedRuns: number;
     successRate: number | null;
   };
-  primaryAgentInstance: {
+  primaryAgentFork: {
     id: string;
+    agentInstanceId: string;
+    sessionId: string;
+    role: string;
     specKey: string;
     specVersion: number;
     status: AgentInstanceStatus;
@@ -200,7 +197,7 @@ export interface AgentSpecSummary {
   id: string;
   name: string;
   version: number;
-  knowledge: Array<{ path: string; when?: string }>;
+  memory: string;
   sandbox: { dockerfile: string; image: string };
   environmentExample: string;
 }
@@ -216,7 +213,7 @@ export interface AgentSpecUsage {
     runningInstances: number;
   };
   activeRequirements: Array<{
-    associationId: string;
+    forkId: string;
     role: string;
     isPrimary: boolean;
     boundAt: string;
@@ -252,14 +249,14 @@ export interface AgentInstanceDetail {
     specVersion: number;
     status: AgentInstanceStatus;
     workspaceKey: string;
-    threadId: string;
     lastActiveAt: string | null;
     createdAt: string;
   };
-  assignment: {
+  forks: Array<{
     id: string;
     role: string;
     isPrimary: boolean;
+    workspaceKey: string;
     boundAt: string;
     project: {
       id: string;
@@ -267,14 +264,19 @@ export interface AgentInstanceDetail {
       externalProjectId: string;
       externalUrl: string | null;
     };
-  } | null;
-  currentRun: {
-    id: string;
-    status: RunStatus;
-    taskSummary: string | null;
-    startedAt: string | null;
-    events: RunEventDto[];
-  } | null;
+    session: {
+      id: string;
+      status: "active" | "waiting" | "closed";
+      threadId: string;
+      lastActiveAt: string | null;
+    };
+    currentRun: {
+      id: string;
+      status: RunStatus;
+      taskSummary: string | null;
+      startedAt: string | null;
+    } | null;
+  }>;
   recentRuns: ProjectRunListItem[];
 }
 

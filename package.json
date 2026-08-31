@@ -12,7 +12,7 @@
     "typecheck": "tsc --noEmit",
     "typecheck:web": "tsc --noEmit -p web/tsconfig.json",
     "test": "vitest run",
-    "test:postgres": "vitest run test/postgres-checkpointer.integration.test.ts test/business-database.integration.test.ts test/workbench-api.integration.test.ts test/requirement-workflow.integration.test.ts --reporter=verbose",
+    "test:postgres": "vitest run test/postgres-checkpointer.integration.test.ts test/business-database.integration.test.ts test/workbench-api.integration.test.ts test/project-workflow.integration.test.ts --reporter=verbose",
     "web:dev": "vite --config web/vite.config.ts",
     "web:build": "pnpm typecheck:web && vite build --config web/vite.config.ts",
     "web:preview": "vite preview --config web/vite.config.ts"
@@ -27,6 +27,7 @@
     "@langchain/langgraph-checkpoint": "^1.1.5",
     "@langchain/langgraph-checkpoint-postgres": "^1.0.5",
     "@langchain/openai": "^1.5.9",
+    "@larksuiteoapi/node-sdk": "^1.73.0",
     "hono": "^4.13.3",
     "langchain": "^1.5.10",
     "pg": "^8.23.0",

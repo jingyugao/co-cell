@@ -1,5 +1,9 @@
 import { resolve } from "node:path";
 
+import {
+  loadContextCompressionConfig,
+  type ContextCompressionConfig,
+} from "../agent/context-compression.js";
 import type { SandboxBackend } from "../sandbox/factory.js";
 
 export interface ServerConfig {
@@ -9,15 +13,19 @@ export interface ServerConfig {
   staticRoot: string;
   sandboxName: string;
   specsRoot: string;
+  runtimeSpecKey: string;
   workspaceRoot: string;
   sandboxBackend: SandboxBackend;
   sandboxImage?: string;
   sandboxNetwork: string;
   feishuProjectMcpUrl: string;
   feishuProjectMcpToken: string;
+  larkAppId?: string;
+  larkAppSecret?: string;
   openAIBaseUrl?: string;
   openAIApiKey?: string;
   model?: string;
+  contextCompression: ContextCompressionConfig;
   gitlabBaseUrl?: string;
   gitlabToken?: string;
   gitlabUsername: string;
@@ -58,6 +66,11 @@ export function loadServerConfig(): ServerConfig {
   if (Boolean(gitlabBaseUrl) !== Boolean(gitlabToken)) {
     throw new Error("GITLAB_BASE_URL and GITLAB_TOKEN must be configured together");
   }
+  const larkAppId = process.env.LARK_APP_ID?.trim();
+  const larkAppSecret = process.env.LARK_APP_SECRET?.trim();
+  if (Boolean(larkAppId) !== Boolean(larkAppSecret)) {
+    throw new Error("LARK_APP_ID and LARK_APP_SECRET must be configured together");
+  }
   return {
     host: process.env.AGENT_SERVER_HOST?.trim() || "127.0.0.1",
     port: integerEnvironment("AGENT_SERVER_PORT", 3000),
@@ -66,6 +79,7 @@ export function loadServerConfig(): ServerConfig {
     sandboxName:
       process.env.AGENT_SHARED_SANDBOX_NAME?.trim() || "swarm-hive-dev-sandbox",
     specsRoot: resolve(process.env.AGENT_SPECS_ROOT?.trim() || "agent-specs"),
+    runtimeSpecKey: process.env.AGENT_RUNTIME_SPEC_KEY?.trim() || "software-engineer",
     workspaceRoot: resolve(process.env.AGENT_WORKSPACE_ROOT?.trim() || ".swarm-hive/workspaces"),
     sandboxBackend,
     ...(process.env.AGENT_SANDBOX_IMAGE?.trim()
@@ -74,9 +88,12 @@ export function loadServerConfig(): ServerConfig {
     sandboxNetwork: process.env.AGENT_SANDBOX_NETWORK?.trim() || "bridge",
     feishuProjectMcpUrl,
     feishuProjectMcpToken,
+    ...(larkAppId ? { larkAppId } : {}),
+    ...(larkAppSecret ? { larkAppSecret } : {}),
     ...(openAIBaseUrl ? { openAIBaseUrl } : {}),
     ...(openAIApiKey ? { openAIApiKey } : {}),
     ...(process.env.AGENT_MODEL?.trim() ? { model: process.env.AGENT_MODEL.trim() } : {}),
+    contextCompression: loadContextCompressionConfig(),
     ...(gitlabBaseUrl ? { gitlabBaseUrl } : {}),
     ...(gitlabToken ? { gitlabToken } : {}),
     gitlabUsername: process.env.GITLAB_USERNAME?.trim() || "oauth2",

@@ -14,39 +14,39 @@ describe("workbench URL navigation", () => {
     expect(route).toEqual({
       section: "projects",
       projectId: "project-1",
-      agentInstanceId: null,
+      agentSeatId: null,
     });
   });
 
-  it("restores an agent instance nested under its Project", () => {
+  it("restores an Agent Seat nested under its Project", () => {
     const route = readWorkbenchRoute(
       new URL(
-        "http://localhost:3000/projects/project-1/agents/agent-1",
+        "http://localhost:3000/projects/project-1/agent-seats/seat-1",
       ),
     );
 
     expect(route).toEqual({
-      section: "instance",
+      section: "seat",
       projectId: "project-1",
-      agentInstanceId: "agent-1",
+      agentSeatId: "seat-1",
     });
   });
 
-  it("writes a canonical Project URL and preserves filter parameters", () => {
+  it("writes a canonical Project URL without legacy query state", () => {
     const url = createWorkbenchUrl(
       new URL("http://localhost:3000/?debug=true&page=import"),
       {
         section: "projects",
         projectId: "project-1",
-        agentInstanceId: null,
+        agentSeatId: null,
       },
     );
 
     expect(url.pathname).toBe("/projects/project-1");
     expect(url.searchParams.get("page")).toBeNull();
     expect(url.searchParams.get("projectId")).toBeNull();
-    expect(url.searchParams.get("agentInstanceId")).toBeNull();
-    expect(url.searchParams.get("debug")).toBe("true");
+    expect(url.searchParams.get("agentSeatId")).toBeNull();
+    expect(url.search).toBe("");
   });
 
   it("uses dedicated paths for top-level pages", () => {
@@ -54,7 +54,7 @@ describe("workbench URL navigation", () => {
       createWorkbenchUrl(new URL("http://localhost:3000/"), {
         section: "specs",
         projectId: null,
-        agentInstanceId: null,
+        agentSeatId: null,
       }).pathname,
     ).toBe("/agent-specs");
     expect(
@@ -62,19 +62,19 @@ describe("workbench URL navigation", () => {
     ).toEqual({
       section: "import",
       projectId: null,
-      agentInstanceId: null,
+      agentSeatId: null,
     });
   });
 
-  it("migrates legacy query links to the Project route model", () => {
+  it("does not retain the retired query-string route model", () => {
     expect(
       readWorkbenchRoute(
         new URL("http://localhost:3000/?page=requirements&projectId=project-1"),
       ),
     ).toEqual({
-      section: "projects",
-      projectId: "project-1",
-      agentInstanceId: null,
+      section: "import",
+      projectId: null,
+      agentSeatId: null,
     });
   });
 });

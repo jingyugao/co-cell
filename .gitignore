@@ -2,7 +2,8 @@ node_modules/
 dist/
 .env
 .swarm-hive/
-agent-specs/
+agent-specs/**/.credentials/
+agent-specs/**/.env
 tmp/
 coverage/
 *.log

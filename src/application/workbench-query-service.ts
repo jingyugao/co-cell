@@ -39,8 +39,10 @@ export interface WorkbenchQueries {
   listRuns(options: { limit: number; cursor?: string }): Promise<GlobalRunsResponse>;
   listAllInboxEvents(options: { limit: number; cursor?: string }): Promise<GlobalInboxEventsResponse>;
   getAgentSpecUsage(specKey: string): Promise<AgentSpecUsage>;
+  listAgentInstancesBySpec(specKey: string): Promise<AgentInstanceDetail[]>;
   getAgentInstance(agentInstanceId: string): Promise<AgentInstanceDetail>;
-  getAgentConversation(agentInstanceId: string): Promise<AgentConversationResponse>;
+  getAgentSeat(agentSeatId: string): Promise<AgentInstanceDetail>;
+  getAgentConversation(agentSessionId: string): Promise<AgentConversationResponse>;
   getRunEvents(runId: string, afterSequence: number, limit: number): Promise<RunEventsResponse>;
 }
 
@@ -86,13 +88,19 @@ export class WorkbenchQueryService implements WorkbenchQueries {
     return result;
   }
 
-  async getAgentConversation(agentInstanceId: string): Promise<AgentConversationResponse> {
-    const instance = await this.repository.getAgentInstanceDetail(agentInstanceId);
-    if (!instance) throw new NotFoundError("Agent Instance");
+  async getAgentSeat(agentSeatId: string): Promise<AgentInstanceDetail> {
+    const result = await this.repository.getAgentSeatDetail(agentSeatId);
+    if (!result) throw new NotFoundError("Agent Seat");
+    return result;
+  }
+
+  async getAgentConversation(agentSessionId: string): Promise<AgentConversationResponse> {
+    const threadId = await this.repository.getAgentSessionThreadId(agentSessionId);
+    if (!threadId) throw new NotFoundError("Agent Session");
     if (!this.conversationReader) {
-      return { threadId: instance.agentInstance.threadId, checkpointId: null, messages: [] };
+      return { threadId, checkpointId: null, messages: [] };
     }
-    return this.conversationReader.getConversation(instance.agentInstance.threadId);
+    return this.conversationReader.getConversation(threadId);
   }
 
   async getRunEvents(
@@ -156,6 +164,10 @@ export class WorkbenchQueryService implements WorkbenchQueries {
 
   getAgentSpecUsage(specKey: string): Promise<AgentSpecUsage> {
     return this.repository.getAgentSpecUsage(specKey);
+  }
+
+  listAgentInstancesBySpec(specKey: string): Promise<AgentInstanceDetail[]> {
+    return this.repository.listAgentInstanceDetailsBySpec(specKey);
   }
 
   private decodeCursor(cursor?: string) {

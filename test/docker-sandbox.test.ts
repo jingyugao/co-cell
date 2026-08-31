@@ -14,7 +14,7 @@ import type {
   SandboxSpec,
 } from "../src/sandbox/types.js";
 import {
-  allocateSpecProjectWorkspace,
+  allocateAgentSeatWorkspace,
   createTaskSandbox,
   runSandboxInitializers,
   workspaceSlug,
@@ -158,38 +158,38 @@ describe("DockerSandboxProvider", () => {
 });
 
 describe("createTaskSandbox", () => {
-  test("allocates one persistent Spec HOME with separate project workspaces", async () => {
+  test("allocates one AgentHome per Instance and one Workspace per Seat", async () => {
     const root = await mkdtemp(join(tmpdir(), "spec-workspaces-"));
     try {
-      const first = await allocateSpecProjectWorkspace({
+      const first = await allocateAgentSeatWorkspace({
         workspaceRoot: root,
-        specKey: "software-engineer",
-        projectId: "project-1001",
+        agentInstanceId: "software-engineer:default",
+        agentSeatId: "seat-1001",
       });
-      const repeated = await allocateSpecProjectWorkspace({
+      const repeated = await allocateAgentSeatWorkspace({
         workspaceRoot: root,
-        specKey: "software-engineer",
-        projectId: "project-1001",
+        agentInstanceId: "software-engineer:default",
+        agentSeatId: "seat-1001",
       });
-      const second = await allocateSpecProjectWorkspace({
+      const second = await allocateAgentSeatWorkspace({
         workspaceRoot: root,
-        specKey: "software-engineer",
-        projectId: "project-1002",
+        agentInstanceId: "software-engineer:default",
+        agentSeatId: "seat-1002",
       });
-      const otherSpec = await allocateSpecProjectWorkspace({
+      const otherInstance = await allocateAgentSeatWorkspace({
         workspaceRoot: root,
-        specKey: "data-analyst",
-        projectId: "project-1001",
+        agentInstanceId: "data-analyst:default",
+        agentSeatId: "seat-2001",
       });
 
-      expect(first.workspace).toBe(repeated.workspace);
-      expect(first.workspace).not.toBe(second.workspace);
+      expect(first.repository).toBe(repeated.repository);
+      expect(first.repository).not.toBe(second.repository);
       expect(first.home).toBe(second.home);
-      expect(first.home).not.toBe(otherSpec.home);
-      expect(first.specSlug).toBe(workspaceSlug("software-engineer"));
-      expect(first.projectSlug).toBe(workspaceSlug("project-1001"));
-      expect(first.projectRoot).toBe(join(first.home, "projects", first.projectSlug));
-      expect(first.workspace).toBe(join(first.projectRoot, "repo"));
+      expect(first.home).not.toBe(otherInstance.home);
+      expect(first.agentInstanceSlug).toBe(workspaceSlug("software-engineer:default"));
+      expect(first.agentSeatSlug).toBe(workspaceSlug("seat-1001"));
+      expect(first.workspaceRoot).toBe(join(first.seatRoot, "workspace"));
+      expect(first.repository).toBe(join(first.workspaceRoot, "repo"));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

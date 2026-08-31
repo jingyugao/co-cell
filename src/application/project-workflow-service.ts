@@ -1,18 +1,18 @@
-import { randomUUID } from "node:crypto";
-
 import type {
-  AgentAssignmentResult,
+  AgentSeatResult,
   CancelAgentRunResult,
   FeishuWorkItemPreview,
   ResumeAgentRunInput,
   ResumeAgentRunResult,
   StartAgentRunResult,
-} from "../contracts/requirements.js";
+  ProjectMessageResult,
+} from "../contracts/projects.js";
 import type { FeishuProjectWorkItemDetails } from "../integrations/feishu-project-mcp.js";
 import { parseFeishuProjectWorkItemUrl } from "../integrations/feishu-project-mcp.js";
 import type { PostgresWorkbenchRepository } from "../persistence/workbench-repository.js";
 import { NotFoundError } from "./errors.js";
 import type { AgentSpecCatalog } from "../server/agent-spec-catalog.js";
+import type { PostgresProjectEventBus } from "../events/project-event-bus.js";
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -103,7 +103,7 @@ export class McpFeishuWorkItemSource implements FeishuWorkItemSource {
         })),
         updatedAt:
           typeof attribute.update_time === "string" ? attribute.update_time : null,
-        assignments: [],
+        seats: [],
       },
     };
   }
@@ -111,64 +111,67 @@ export class McpFeishuWorkItemSource implements FeishuWorkItemSource {
 
 export interface AgentRunLauncher {
   launch(runId: string): void;
+  notify(runId: string): void;
   resume(runId: string, input: ResumeAgentRunInput): Promise<ResumeAgentRunResult>;
   cancel(runId: string): Promise<CancelAgentRunResult>;
 }
 
-export interface RequirementWorkflow {
+export interface ProjectWorkflow {
   preview(url: string): Promise<FeishuWorkItemPreview>;
-  assign(input: {
+  assignSeat(input: {
     url: string;
     specKey: string;
-    role: string;
-  }): Promise<AgentAssignmentResult>;
-  start(assignmentId: string): Promise<StartAgentRunResult>;
+    responsibility: string;
+    isCoordinator?: boolean;
+  }): Promise<AgentSeatResult>;
+  start(seatId: string): Promise<StartAgentRunResult>;
   resume(runId: string, input: ResumeAgentRunInput): Promise<ResumeAgentRunResult>;
   cancel(runId: string): Promise<CancelAgentRunResult>;
+  message(projectId: string, input: ResumeAgentRunInput): Promise<ProjectMessageResult>;
 }
 
-export class RequirementWorkflowService implements RequirementWorkflow {
+export class ProjectWorkflowService implements ProjectWorkflow {
   constructor(
     private readonly source: FeishuWorkItemSource,
     private readonly repository: PostgresWorkbenchRepository,
     private readonly specs: AgentSpecCatalog,
     private readonly launcher: AgentRunLauncher,
+    private readonly eventBus?: PostgresProjectEventBus,
   ) {}
 
   async preview(url: string): Promise<FeishuWorkItemPreview> {
     const { preview } = await this.source.get(url);
-    const assignments = await this.repository.listAgentAssignments({
+    const seats = await this.repository.listAgentSeats({
       externalProjectKey: preview.projectKey,
       externalWorkItemType: preview.workItemType.key,
       externalWorkItemId: preview.workItemId,
     });
-    return { ...preview, assignments };
+    return { ...preview, seats };
   }
 
-  async assign(input: {
+  async assignSeat(input: {
     url: string;
     specKey: string;
-    role: string;
-  }): Promise<AgentAssignmentResult> {
+    responsibility: string;
+    isCoordinator?: boolean;
+  }): Promise<AgentSeatResult> {
     const spec = await this.specs.get(input.specKey);
     if (!spec) throw new NotFoundError("Agent Spec");
     const { preview } = await this.source.get(input.url);
-    const unique = randomUUID();
-    return this.repository.createAgentAssignment({
+    return this.repository.createAgentSeat({
       sourceUrl: preview.sourceUrl,
       externalProjectKey: preview.projectKey,
       externalWorkItemType: preview.workItemType.key,
       externalWorkItemId: preview.workItemId,
       specKey: spec.id,
       specVersion: spec.version,
-      role: input.role,
-      threadId: `feishu:${preview.projectKey}:${preview.workItemType.key}:${preview.workItemId}:${unique}`,
-      workspaceKey: `feishu-${preview.workItemId}-${unique.slice(0, 8)}`,
+      responsibility: input.responsibility,
+      isCoordinator: input.isCoordinator ?? true,
     });
   }
 
-  async start(assignmentId: string): Promise<StartAgentRunResult> {
-    const result = await this.repository.createAgentRun(assignmentId);
+  async start(seatId: string): Promise<StartAgentRunResult> {
+    const result = await this.repository.createAgentRun(seatId, { sessionMode: "fresh" });
     queueMicrotask(() => this.launcher.launch(result.runId));
     return result;
   }
@@ -179,5 +182,25 @@ export class RequirementWorkflowService implements RequirementWorkflow {
 
   cancel(runId: string): Promise<CancelAgentRunResult> {
     return this.launcher.cancel(runId);
+  }
+
+  async message(projectId: string, input: ResumeAgentRunInput): Promise<ProjectMessageResult> {
+    if (!this.eventBus) throw new NotFoundError("Project event bus");
+    const seat = await this.repository.getCoordinatorSeat(projectId);
+    if (!seat) throw new NotFoundError("Project Coordinator");
+    await this.eventBus.publishProjectEvent({
+      projectId,
+      source: "swarm_hive_ui",
+      eventType: "user_message_received",
+      payload: { message: input.message },
+    });
+    const target = await this.eventBus.findDispatchTarget(projectId);
+    if (target) {
+      this.launcher.notify(target.runId);
+      return { projectId, runId: target.runId, status: "notified" };
+    }
+    const run = await this.repository.createAgentRun(seat.seatId);
+    queueMicrotask(() => this.launcher.launch(run.runId));
+    return { projectId, runId: run.runId, status: "queued" };
   }
 }

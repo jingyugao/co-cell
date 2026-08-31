@@ -3,8 +3,6 @@ import { describe, expect, test } from "vitest";
 import { runCodingTask } from "../src/agent/coding-agent.js";
 import { createPostgresCheckpointer } from "../src/persistence/postgres-checkpointer.js";
 
-const unusedInputHandler = async () => ({ answers: {} });
-
 describe("checkpoint configuration", () => {
   test("rejects an empty PostgreSQL connection string before connecting", async () => {
     await expect(
@@ -16,9 +14,8 @@ describe("checkpoint configuration", () => {
     await expect(
       runCodingTask({
         workspace: process.cwd(),
-        resume: { answers: { approval: { answers: ["通过"] } } },
+        resume: { message: "通过" },
         threadId: "requirement-1",
-        requestUserInput: unusedInputHandler,
       }),
     ).rejects.toThrow("checkpointing and threadId are required");
   });

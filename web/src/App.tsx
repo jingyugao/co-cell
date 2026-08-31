@@ -24,17 +24,17 @@ import type {
   RunStatus,
 } from "../../src/contracts/workbench";
 import type {
-  AgentAssignmentResult,
+  AgentSeatResult,
   FeishuWorkItemPreview,
-} from "../../src/contracts/requirements";
+} from "../../src/contracts/projects";
 import {
-  createAgentAssignment,
+  createAgentSeat,
   cancelAgentRun,
   loadInboxEvents,
   loadAllRuns,
   loadAllInboxEvents,
   loadAgentSpecs,
-  loadAgentInstance,
+  loadAgentSeat,
   loadAgentConversation,
   loadAgentSpecOverview,
   loadProjectRuns,
@@ -63,13 +63,19 @@ const runStatusLabels: Record<RunStatus, string> = {
 };
 
 const instanceStatusLabels: Record<AgentInstanceStatus, string> = {
-  idle: "空闲",
-  queued: "等待运行",
-  running: "正在执行任务",
-  waiting: "等待人工",
+  active: "已激活",
   disabled: "已停用",
-  failed: "运行异常",
 };
+
+const taskStatusLabels = {
+  pending: "待处理",
+  assigned: "已分配",
+  running: "进行中",
+  blocked: "阻塞",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+} as const;
 
 interface PendingAgentQuestion {
   id: string;
@@ -154,8 +160,8 @@ function Sidebar({ active, onChange }: { active: MainSection; onChange: (section
   }, []);
   const statistics = data?.statistics ?? { activeRuns: 0, totalRuns: 0 };
   const navigation = [
-    { key: "import" as const, icon: "+", label: "导入需求" },
-    { key: "projects" as const, icon: "▦", label: "需求列表", badge: String(projectCount) },
+    { key: "import" as const, icon: "+", label: "导入项目" },
+    { key: "projects" as const, icon: "▦", label: "项目列表", badge: String(projectCount) },
     { key: "runs" as const, icon: "◫", label: "运行记录", badge: String(statistics.totalRuns) },
     { key: "events" as const, icon: "↯", label: "事件中心" },
     { key: "specs" as const, icon: "◇", label: "Agent Specs" },
@@ -197,13 +203,14 @@ function displayFieldValue(value: unknown): string {
   return String(value);
 }
 
-function FeishuRequirementView({ onOpenRequirement }: { onOpenRequirement: (projectId: string) => void }) {
+function FeishuProjectImportView({ onOpenProject }: { onOpenProject: (projectId: string) => void }) {
   const [url, setUrl] = useState("");
   const [preview, setPreview] = useState<FeishuWorkItemPreview | null>(null);
   const [specs, setSpecs] = useState<AgentSpecSummary[]>([]);
-  const [specKey, setSpecKey] = useState("software-engineer");
-  const [role, setRole] = useState("");
-  const [assignments, setAssignments] = useState<AgentAssignmentResult[]>([]);
+  const [specKey, setSpecKey] = useState("project-coordinator");
+  const [responsibility, setResponsibility] = useState("");
+  const [isCoordinator, setIsCoordinator] = useState(true);
+  const [seats, setSeats] = useState<AgentSeatResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [assigning, setAssigning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -222,17 +229,17 @@ function FeishuRequirementView({ onOpenRequirement }: { onOpenRequirement: (proj
     return () => { active = false; };
   }, []);
 
-  async function openRequirement(event: FormEvent) {
+  async function previewProject(event: FormEvent) {
     event.preventDefault();
     setLoading(true);
     setError(null);
     setPreview(null);
-    setAssignments([]);
+    setSeats([]);
     try {
       const result = await previewFeishuWorkItem(url.trim());
       setPreview(result);
-      setAssignments(result.assignments);
-      setRole(result.currentNodes[0]?.name ?? "backend");
+      setSeats(result.seats);
+      setResponsibility("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -246,13 +253,14 @@ function FeishuRequirementView({ onOpenRequirement }: { onOpenRequirement: (proj
     setAssigning(true);
     setError(null);
     try {
-      const assignment = await createAgentAssignment({
+      const seat = await createAgentSeat({
         url: preview.sourceUrl,
         specKey,
-        role: role.trim(),
+        responsibility: responsibility.trim(),
+        isCoordinator,
       });
-      setAssignments((items) => [...items, assignment]);
-      setRole("");
+      setSeats((items) => [...items, seat]);
+      setResponsibility("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -265,34 +273,36 @@ function FeishuRequirementView({ onOpenRequirement }: { onOpenRequirement: (proj
   ) ?? [];
 
   return <>
-    <GlobalHeader eyebrow="REQUIREMENT IMPORT" title="导入飞书需求" description="读取飞书需求并绑定至少一个 Agent Instance；绑定完成即视为导入" />
-    <section className="panel requirement-opener">
-      <form className="url-form" onSubmit={openRequirement}>
-        <label htmlFor="feishu-url">飞书项目需求地址</label>
-        <div><input id="feishu-url" type="url" required value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://project.feishu.cn/space/story/detail/123456" /><button type="submit" disabled={loading}>{loading ? "读取中…" : "打开需求"}</button></div>
+    <GlobalHeader eyebrow="PROJECT IMPORT" title="导入飞书项目" description="读取飞书工作项并分配 Agent Seat；分配完成即视为导入" />
+    <section className="panel project-opener">
+      <form className="url-form" onSubmit={previewProject}>
+        <label htmlFor="feishu-url">飞书项目工作项地址</label>
+        <div><input id="feishu-url" type="url" required value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://project.feishu.cn/space/story/detail/123456" /><button type="submit" disabled={loading}>{loading ? "读取中…" : "打开项目"}</button></div>
       </form>
       {error && <div className="form-error" role="alert">{error}</div>}
     </section>
-    {preview && <div className="live-requirement-grid">
-      <section className="panel live-requirement-card">
+    {preview && <div className="live-project-grid">
+      <section className="panel live-project-card">
         <div className="live-source"><span className="health-dot" />飞书实时数据 <a href={preview.sourceUrl} target="_blank" rel="noreferrer">在飞书中打开 ↗</a></div>
-        <div className="requirement-title"><div className="project-symbol">需</div><div><h2>{preview.title}</h2><p>{preview.project.name} · {preview.workItemType.name} #{preview.workItemId}</p></div><span className="project-status"><span />{preview.status?.name ?? "未知状态"}</span></div>
+        <div className="project-title"><div className="project-symbol">需</div><div><h2>{preview.title}</h2><p>{preview.project.name} · {preview.workItemType.name} #{preview.workItemId}</p></div><span className="project-status"><span />{preview.status?.name ?? "未知状态"}</span></div>
         <div className="node-list"><div className="eyebrow">CURRENT NODE</div>{preview.currentNodes.map((node) => <div className="node-item" key={node.id}><strong>{node.name}</strong><span>{node.owners.map((owner) => owner.name).join("、") || "未设置负责人"}</span></div>)}</div>
         <dl className="live-fields">{highlightedFields.map((field) => <DefinitionRow key={field.key} label={field.name}>{displayFieldValue(field.value)}</DefinitionRow>)}</dl>
         <div className="role-list"><div className="eyebrow">ROLES</div><div>{preview.roles.map((item) => <span key={item.key}><strong>{item.name}</strong>{item.members.map((member) => member.name).join("、") || "未分配"}</span>)}</div></div>
       </section>
       <section className="panel assignment-card">
-        <div className="records-heading"><div><div className="eyebrow">AGENT ASSIGNMENT</div><h2>绑定开发 Agent</h2><p>首次绑定后需求将出现在需求列表；同一需求可以绑定多个 Agent Instance</p></div></div>
+        <div className="records-heading"><div><div className="eyebrow">AGENT ASSIGNMENT</div><h2>配置项目 Agents</h2><p>一个 Coordinator 对外负责；Software Engineer 执行技术调研与研发交付</p></div></div>
         <form className="assignment-form" onSubmit={assignAgent}>
-          <label>Agent Spec<select value={specKey} onChange={(event) => setSpecKey(event.target.value)}>{specs.map((spec) => <option value={spec.id} key={spec.id}>{spec.name} · v{spec.version}</option>)}</select></label>
-          <label>职责 / 模块<input required value={role} onChange={(event) => setRole(event.target.value)} placeholder="例如 backend-module-a" /></label>
-          <button className="primary-button" type="submit" disabled={assigning}>{assigning ? "正在绑定…" : "绑定并导入"}</button>
+          <label>Agent Spec<select value={specKey} onChange={(event) => { const value = event.target.value; setSpecKey(value); setIsCoordinator(value === "project-coordinator"); }}>{specs.map((spec) => <option value={spec.id} key={spec.id}>{spec.name} · v{spec.version}</option>)}</select></label>
+          <label>职责 / 模块（可选）<input value={responsibility} onChange={(event) => setResponsibility(event.target.value)} placeholder="仅在同类 Agent 分工时填写，例如 backend-module-a" /></label>
+          <label className="coordinator-toggle"><input type="checkbox" checked={isCoordinator} onChange={(event) => setIsCoordinator(event.target.checked)} /> 设为项目对外 Coordinator</label>
+          <button className="primary-button" type="submit" disabled={assigning}>{assigning ? "正在绑定…" : "绑定 Agent"}</button>
         </form>
         <div className="assigned-list">
-          {assignments.map((assignment) => {
-            return <div className="assigned-agent" key={assignment.assignmentId}><div><strong>{assignment.agentInstance.role}</strong><span>{assignment.agentInstance.specKey} · Agent Instance</span><code>{assignment.agentInstance.id}</code></div><button type="button" onClick={() => onOpenRequirement(assignment.projectId)}>查看需求</button></div>;
+          {seats.map((seat) => {
+            const defaultResponsibility = specs.find((spec) => spec.id === seat.agentInstance.specKey)?.defaultResponsibility;
+            return <div className="assigned-agent" key={seat.seatId}><div><strong>{seat.responsibility || defaultResponsibility || "默认职责"}{seat.isCoordinator ? " · Coordinator" : ""}</strong><span>{seat.agentInstance.specKey} · Agent Seat</span><code>{seat.seatId}</code></div><button type="button" onClick={() => onOpenProject(seat.projectId)}>查看项目</button></div>;
           })}
-          {assignments.length === 0 && <div className="empty-state compact-empty">尚未绑定 Agent；绑定后完成导入</div>}
+          {seats.length === 0 && <div className="empty-state compact-empty">尚未分配 Agent Seat；分配后完成导入</div>}
         </div>
       </section>
     </div>}
@@ -378,19 +388,22 @@ function DefinitionRow({ label, children }: { label: string; children: ReactNode
 }
 
 function AgentInstancePanel() {
-  const { primaryAgentInstance: instance, latestInboxEvent: inbox, runtime } = useWorkbench();
+  const { coordinatorSeat, currentRun, latestInboxEvent: inbox, runtime } = useWorkbench();
+  const instance = coordinatorSeat?.agentInstance;
   return (
     <aside className="detail-column" aria-label="Agent Instance 信息">
       <section className="panel instance-panel">
-        <div className="instance-heading"><div className="instance-icon">AI</div><div><div className="eyebrow">AGENT INSTANCE</div><h2>研发员工实例</h2></div><span className={instance?.status === "running" ? "live-indicator" : "idle-indicator"} /></div>
-        {instance ? (
+        <div className="instance-heading"><div className="instance-icon">AI</div><div><div className="eyebrow">AGENT INSTANCE</div><h2>研发员工实例</h2></div><span className={currentRun?.status === "running" ? "live-indicator" : "idle-indicator"} /></div>
+        {coordinatorSeat && instance ? (
           <>
-            <div className="instance-state-card"><div><span>当前状态</span><strong>{instanceStatusLabels[instance.status]}</strong></div>{instance.status === "running" && <span className="pulse-bars" aria-hidden="true"><i /><i /><i /></span>}</div>
+            <div className="instance-state-card"><div><span>启用状态</span><strong>{instanceStatusLabels[instance.status]}</strong></div></div>
             <dl className="definition-list">
+              <DefinitionRow label="Seat ID"><code>{coordinatorSeat.id}</code></DefinitionRow>
+              <DefinitionRow label="职责">{coordinatorSeat.responsibility || "—"}</DefinitionRow>
               <DefinitionRow label="Instance ID"><code>{instance.id}</code></DefinitionRow>
               <DefinitionRow label="Agent Spec"><span className="spec-chip">{instance.specKey}</span><span className="version-chip">v{instance.specVersion}</span></DefinitionRow>
-              <DefinitionRow label="Workspace"><code className="path-code">{instance.workspaceKey}</code></DefinitionRow>
-              <DefinitionRow label="Thread ID"><code className="path-code">{instance.threadId}</code></DefinitionRow>
+              <DefinitionRow label="Workspace"><code className="path-code">{coordinatorSeat.workspaceKey}</code></DefinitionRow>
+              <DefinitionRow label="Thread ID"><code className="path-code">{coordinatorSeat.session.threadId}</code></DefinitionRow>
               <DefinitionRow label="最近激活">{formatDate(instance.lastActiveAt)}</DefinitionRow>
             </dl>
           </>
@@ -507,7 +520,8 @@ function InboxEventsView() {
 }
 
 function BasicInfoView() {
-  const { project, primaryAgentInstance: instance, runtime } = useWorkbench();
+  const { project, coordinatorSeat, runtime } = useWorkbench();
+  const instance = coordinatorSeat?.agentInstance;
   return (
     <div className="basic-grid" id="panel-basic" role="tabpanel">
       <section className="panel basic-panel">
@@ -525,11 +539,14 @@ function BasicInfoView() {
       <section className="panel basic-panel">
         <div className="records-heading"><div><div className="eyebrow">AGENT INSTANCE</div><h2>实例与运行环境</h2></div></div>
         <dl className="basic-definition-list">
+          <DefinitionRow label="Seat ID"><code>{coordinatorSeat?.id ?? "—"}</code></DefinitionRow>
+          <DefinitionRow label="职责">{coordinatorSeat?.responsibility || "—"}</DefinitionRow>
           <DefinitionRow label="Instance ID"><code>{instance?.id ?? "—"}</code></DefinitionRow>
           <DefinitionRow label="Agent Spec">{instance ? `${instance.specKey} · v${instance.specVersion}` : "—"}</DefinitionRow>
-          <DefinitionRow label="Instance 状态">{instance ? instanceStatusLabels[instance.status] : "未绑定"}</DefinitionRow>
-          <DefinitionRow label="Workspace"><code>{instance?.workspaceKey ?? "—"}</code></DefinitionRow>
-          <DefinitionRow label="Thread ID"><code>{instance?.threadId ?? "—"}</code></DefinitionRow>
+          <DefinitionRow label="Instance 启用状态">{instance ? instanceStatusLabels[instance.status] : "未绑定"}</DefinitionRow>
+          <DefinitionRow label="Agent Home"><code>{instance?.homeKey ?? "—"}</code></DefinitionRow>
+          <DefinitionRow label="Workspace"><code>{coordinatorSeat?.workspaceKey ?? "—"}</code></DefinitionRow>
+          <DefinitionRow label="Thread ID"><code>{coordinatorSeat?.session.threadId ?? "—"}</code></DefinitionRow>
           <DefinitionRow label="开发容器">{runtime.name}</DefinitionRow>
           <DefinitionRow label="容器状态">{runtime.status}</DefinitionRow>
         </dl>
@@ -573,68 +590,103 @@ function GlobalEventsView() {
 function AgentSpecsView() {
   const [data, setData] = useState<AgentSpecOverviewResponse[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedSpecId, setSelectedSpecId] = useState<string | null>(null);
+  const [tab, setTab] = useState<"overview" | "prompt" | "memory" | "work">("overview");
   useEffect(() => {
     let active = true;
     loadAgentSpecs().then((result) =>
       Promise.all(result.items.map((spec) => loadAgentSpecOverview(spec.id))),
     ).then(
-      (result) => { if (active) setData(result); },
+      (result) => {
+        if (!active) return;
+        setData(result);
+        setSelectedSpecId((current) => current ?? result[0]?.spec.id ?? null);
+      },
       (reason: unknown) => { if (active) setError(reason instanceof Error ? reason.message : String(reason)); },
     );
     return () => { active = false; };
   }, []);
+  const selected = data?.find((item) => item.spec.id === selectedSpecId) ?? data?.[0] ?? null;
   return <>
-    <GlobalHeader eyebrow="AGENT CATALOG" title="Agent Specs" description="查看 Agent 的能力定义，以及每个 Spec 当前参与的研发需求" />
+    <GlobalHeader eyebrow="AGENT CATALOG" title="Agent Specs" description="查看 Agent 的完整定义、长期记忆、运行实例与当前工作" />
     {error ? <section className="panel empty-state error-state">{error}</section> : !data ? <section className="panel empty-state">正在读取 Agent Specs…</section> : (
-      <div className="spec-grid">
-        {data.map(({ spec, statistics, activeRequirements }) => (
-          <section className="panel spec-card" key={spec.id}>
-            <div className="spec-card-heading">
-              <div className="instance-icon">AI</div>
-              <div><h2>{spec.name}</h2><code>{spec.id}</code></div>
-              <span className="version-chip">v{spec.version}</span>
+      <div className="spec-workbench">
+        <aside className="panel spec-directory" aria-label="Agent Spec 列表">
+          <div className="spec-directory-heading"><span>SPEC LIBRARY</span><strong>{data.length} 个定义</strong></div>
+          {data.map(({ spec, statistics }) => (
+            <button
+              className={`spec-selector ${selected?.spec.id === spec.id ? "is-selected" : ""}`}
+              key={spec.id}
+              onClick={() => { setSelectedSpecId(spec.id); setTab("overview"); }}
+              type="button"
+            >
+              <span className="instance-icon">AI</span>
+              <span className="spec-selector-copy"><strong>{spec.name}</strong><code>{spec.id}</code></span>
+              <span className="spec-selector-meta"><em>v{spec.version}</em><small>{statistics.instances} Ins</small></span>
+            </button>
+          ))}
+        </aside>
+        {selected && <section className="panel spec-detail">
+          <header className="spec-detail-hero">
+            <div className="spec-detail-title"><div className="instance-icon large">AI</div><div><span className="eyebrow">AGENT SPEC</span><h2>{selected.spec.name}</h2><code>{selected.spec.id} · version {selected.spec.version}</code></div></div>
+            <div className="spec-metrics" aria-label={`${selected.spec.name} 使用情况`}>
+              <div><strong>{selected.statistics.instances}</strong><span>Agent Instances</span></div>
+              <div><strong>{selected.statistics.activeSeats}</strong><span>活跃 Seats</span></div>
+              <div><strong>{selected.statistics.runningSeats}</strong><span>运行中 Seats</span></div>
             </div>
-            <div className="spec-metrics" aria-label={`${spec.name} 使用情况`}>
-              <div><strong>{statistics.instances}</strong><span>Agent Instances</span></div>
-              <div><strong>{statistics.activeRequirements}</strong><span>进行中需求</span></div>
-              <div><strong>{statistics.runningInstances}</strong><span>运行中实例</span></div>
-            </div>
-            <dl className="basic-definition-list spec-definition-list">
-              <DefinitionRow label="Sandbox Image"><code>{spec.sandbox.image}</code></DefinitionRow>
-              <DefinitionRow label="Dockerfile"><code>{spec.sandbox.dockerfile}</code></DefinitionRow>
-              <DefinitionRow label="Environment"><code>{spec.environmentExample}</code></DefinitionRow>
-              <DefinitionRow label="知识模块">{spec.knowledge.length} 个</DefinitionRow>
-            </dl>
-            <div className="knowledge-list">{spec.knowledge.map((knowledge) => <span key={`${knowledge.path}-${knowledge.when ?? "always"}`}><code>{knowledge.path}</code>{knowledge.when && <em>需要 {knowledge.when}</em>}</span>)}</div>
-            <div className="requirements-heading"><div><div className="eyebrow">ACTIVE REQUIREMENTS</div><h3>进行中的 Agent 需求</h3></div><span>{activeRequirements.length} 个关联</span></div>
-            <div className="requirements-table" aria-label={`${spec.name} 进行中的需求`}>
-              <div className="requirement-row requirement-header"><span>需求</span><span>职责</span><span>Agent Instance</span><span>当前状态</span><span>最近活跃</span></div>
-              {activeRequirements.map((requirement) => (
-                <div className="requirement-row" key={requirement.associationId}>
-                  <div className="record-primary"><strong>{requirement.project.name ?? requirement.project.externalProjectId}</strong><code>{requirement.project.externalProjectId}</code></div>
-                  <span className="role-chip">{requirement.role}{requirement.isPrimary && <em>主</em>}</span>
-                  <div className="record-primary"><strong>{requirement.agentInstance.workspaceKey}</strong><code>{requirement.agentInstance.id}</code></div>
-                  <span className={`event-status event-status-${requirement.currentRun?.status ?? requirement.agentInstance.status}`}><i />{requirement.currentRun ? runStatusLabels[requirement.currentRun.status] : instanceStatusLabels[requirement.agentInstance.status]}</span>
-                  <span>{formatDate(requirement.agentInstance.lastActiveAt ?? requirement.boundAt)}</span>
-                </div>
-              ))}
-              {activeRequirements.length === 0 && <div className="empty-state compact-empty">当前没有进行中的需求</div>}
-            </div>
-          </section>
-        ))}
+          </header>
+          <nav className="spec-detail-tabs" aria-label="Spec 详情导航">
+            {([{"value":"overview","label":"概览"},{"value":"prompt","label":"系统提示词"},{"value":"memory","label":"Memory"},{"value":"work","label":"Instances 与工作"}] as const).map((item) => <button className={tab === item.value ? "is-active" : ""} key={item.value} onClick={() => setTab(item.value)} type="button">{item.label}{item.value === "work" && <span>{selected.instances.length}</span>}</button>)}
+          </nav>
+          <div className="spec-detail-body">
+            {tab === "overview" && <div className="spec-overview-grid">
+              <section><div className="section-heading"><span className="eyebrow">RUNTIME</span><h3>运行定义</h3></div><dl className="basic-definition-list spec-definition-list">
+                <DefinitionRow label="Sandbox Image"><code>{selected.spec.sandbox.image}</code></DefinitionRow>
+                <DefinitionRow label="Dockerfile"><code>{selected.spec.sandbox.dockerfile}</code></DefinitionRow>
+                <DefinitionRow label="Environment"><code>{selected.spec.environmentExample}</code></DefinitionRow>
+                <DefinitionRow label="Memory 文件"><code>{selected.spec.memory}</code></DefinitionRow>
+                <DefinitionRow label="默认职责">{selected.spec.defaultResponsibility}</DefinitionRow>
+              </dl></section>
+              <section><div className="section-heading"><span className="eyebrow">INSTANCES</span><h3>当前实例</h3></div><div className="instance-summary-list">
+                {selected.instances.map(({ agentInstance, seats, tasks }) => <div className="instance-summary" key={agentInstance.id}><span className={`event-status event-status-${agentInstance.status}`}><i />{instanceStatusLabels[agentInstance.status]}</span><div><strong>{agentInstance.instanceKey}</strong><code>{agentInstance.id}</code></div><span>{seats.length} 项目 · {tasks.filter((task) => !["completed", "cancelled"].includes(task.status)).length} 项工作</span></div>)}
+                {selected.instances.length === 0 && <div className="empty-state compact-empty">这个 Spec 尚未实例化</div>}
+              </div></section>
+            </div>}
+            {tab === "prompt" && <SpecSource title="系统提示词" filename="prompt.txt" content={selected.definition.prompt} />}
+            {tab === "memory" && <SpecSource title="Spec Memory" filename={selected.spec.memory} content={selected.definition.memory} />}
+            {tab === "work" && <AgentInstanceWork instances={selected.instances} />}
+          </div>
+        </section>}
       </div>
     )}
   </>;
 }
 
-function RequirementListView({
+function SpecSource({ title, filename, content }: { title: string; filename: string; content: string }) {
+  return <section className="spec-source-panel"><div className="section-heading source-heading"><div><span className="eyebrow">SPEC CONTENT</span><h3>{title}</h3></div><code>{filename}</code></div><pre className="spec-source">{content || "（文件为空）"}</pre></section>;
+}
+
+function AgentInstanceWork({ instances }: { instances: AgentInstanceDetail[] }) {
+  if (instances.length === 0) return <div className="empty-state">这个 Spec 尚未实例化，也没有关联工作</div>;
+  return <div className="instance-work-list">{instances.map(({ agentInstance, seats, tasks, recentRuns }) => <article className="instance-work-card" key={agentInstance.id}>
+    <header><div><span className="eyebrow">AGENT INSTANCE</span><h3>{agentInstance.instanceKey}</h3><code>{agentInstance.id}</code></div><span className={`event-status event-status-${agentInstance.status}`}><i />{instanceStatusLabels[agentInstance.status]}</span></header>
+    <div className="instance-facts"><span><small>HOME KEY</small><code>{agentInstance.homeKey}</code></span><span><small>最近活跃</small><strong>{formatDate(agentInstance.lastActiveAt)}</strong></span><span><small>创建时间</small><strong>{formatDate(agentInstance.createdAt)}</strong></span></div>
+    <div className="instance-work-columns">
+      <section><div className="work-column-heading"><strong>关联项目与 Seat</strong><span>{seats.length}</span></div>{seats.map((seat) => <a className="work-item" href={`/projects/${encodeURIComponent(seat.project.id)}/agent-seats/${encodeURIComponent(seat.id)}`} key={seat.id}><div><strong>{seat.project.externalProjectId}</strong><small>{seat.responsibility || "默认职责"}{seat.isCoordinator ? " · Coordinator" : ""}</small></div>{seat.currentRun ? <StatusBadge status={seat.currentRun.status} /> : <span className="muted">{seat.session.status}</span>}</a>)}{seats.length === 0 && <p className="muted-empty">暂无活跃项目席位</p>}</section>
+      <section><div className="work-column-heading"><strong>分配的工作</strong><span>{tasks.length}</span></div>{tasks.map((task) => <div className="work-item" key={task.id}><div><strong>{task.title}</strong><small>{task.project.name ?? task.project.externalProjectId} · {formatDate(task.updatedAt)}</small>{task.blockedReason && <em>{task.blockedReason}</em>}</div><span className={`event-status event-status-${task.status}`}><i />{taskStatusLabels[task.status]}</span></div>)}{tasks.length === 0 && <p className="muted-empty">暂无分配任务</p>}</section>
+    </div>
+    <footer><span>最近运行 {recentRuns.length} 次</span>{recentRuns[0] && <><StatusBadge status={recentRuns[0].status} /><strong>{recentRuns[0].taskSummary ?? "未命名任务"}</strong><time>{formatDate(recentRuns[0].createdAt)}</time></>}</footer>
+  </article>)}</div>;
+}
+
+function ProjectListView({
   selectedProjectId,
   onSelectProject,
-  onOpenAgent,
+  onOpenSeat,
 }: {
   selectedProjectId: string | null;
   onSelectProject: (projectId: string | null) => void;
-  onOpenAgent: (agentInstanceId: string) => void;
+  onOpenSeat: (agentSeatId: string) => void;
 }) {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [previews, setPreviews] = useState<Record<string, FeishuWorkItemPreview>>({});
@@ -646,11 +698,11 @@ function RequirementListView({
     let active = true;
     loadProjects().then(async (response) => {
       if (!active) return;
-      const requirements = response.items.filter(
+      const importedProjects = response.items.filter(
         (project) => project.source === "feishu_project" && project.externalUrl,
       );
-      setProjects(requirements);
-      const loaded = await Promise.all(requirements.map(async (project) => {
+      setProjects(importedProjects);
+      const loaded = await Promise.all(importedProjects.map(async (project) => {
         try {
           return [project.id, await previewFeishuWorkItem(project.externalUrl!)] as const;
         } catch {
@@ -670,12 +722,12 @@ function RequirementListView({
     return () => { active = false; };
   }, []);
 
-  async function start(assignment: AgentAssignmentResult) {
-    setStarting(assignment.assignmentId);
+  async function start(seat: AgentSeatResult) {
+    setStarting(seat.seatId);
     setError(null);
     try {
-      await startAgentRun(assignment.assignmentId);
-      onOpenAgent(assignment.agentInstance.id);
+      await startAgentRun(seat.seatId);
+      onOpenSeat(seat.seatId);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -686,29 +738,32 @@ function RequirementListView({
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const selected = selectedProjectId ? previews[selectedProjectId] : undefined;
   if (selectedProjectId && selectedProject && !selected && loading) {
-    return <div className="empty-state">正在读取需求详情…</div>;
+    return <div className="empty-state">正在读取项目详情…</div>;
   }
   if (selectedProjectId && selected) {
     const highlightedFields = selected.fields.filter((field) => ["描述", "优先级", "预计上车版本", "标签"].includes(field.name));
     return <>
-      <button className="back-button" type="button" onClick={() => onSelectProject(null)}>← 返回需求列表</button>
-      <GlobalHeader eyebrow="REQUIREMENT DETAIL" title={selected.title} description={`${selected.project.name} · ${selected.workItemType.name} #${selected.workItemId}`} />
+      <button className="back-button" type="button" onClick={() => onSelectProject(null)}>← 返回项目列表</button>
+      <GlobalHeader eyebrow="PROJECT DETAIL" title={selected.title} description={`${selected.project.name} · ${selected.workItemType.name} #${selected.workItemId}`} />
       {error && <div className="form-error" role="alert">{error}</div>}
-      <div className="live-requirement-grid requirement-detail-grid">
-        <section className="panel live-requirement-card">
+      <div className="live-project-grid project-detail-grid">
+        <section className="panel live-project-card">
           <div className="live-source"><span className="health-dot" />飞书实时数据 <a href={selected.sourceUrl} target="_blank" rel="noreferrer">在飞书中打开 ↗</a></div>
-          <div className="requirement-title"><div className="project-symbol">需</div><div><h2>{selected.title}</h2><p>{selected.project.name} · #{selected.workItemId}</p></div><span className="project-status"><span />{selected.status?.name ?? "未知状态"}</span></div>
+          <div className="project-title"><div className="project-symbol">需</div><div><h2>{selected.title}</h2><p>{selected.project.name} · #{selected.workItemId}</p></div><span className="project-status"><span />{selected.status?.name ?? "未知状态"}</span></div>
           <div className="node-list"><div className="eyebrow">CURRENT NODE</div>{selected.currentNodes.map((node) => <div className="node-item" key={node.id}><strong>{node.name}</strong><span>{node.owners.map((owner) => owner.name).join("、") || "未设置负责人"}</span></div>)}</div>
           <dl className="live-fields">{highlightedFields.map((field) => <DefinitionRow key={field.key} label={field.name}>{displayFieldValue(field.value)}</DefinitionRow>)}</dl>
         </section>
         <section className="panel assignment-card">
-          <div className="records-heading"><div><div className="eyebrow">AGENT INSTANCES</div><h2>需求 Agent</h2><p>查看职责与运行状态；空闲实例可直接启动</p></div></div>
-          <div className="assigned-list requirement-agent-list">
-            {selected.assignments.map((assignment) => {
-              const canStart = assignment.agentInstance.status === "idle" || assignment.agentInstance.status === "failed";
-              return <div className="assigned-agent" key={assignment.assignmentId}><div><strong>{assignment.agentInstance.role}</strong><span>{assignment.agentInstance.specKey} · {instanceStatusLabels[assignment.agentInstance.status]}</span><code>{assignment.agentInstance.id}</code></div><div className="assigned-agent-actions"><button className="secondary-button" type="button" onClick={() => onOpenAgent(assignment.agentInstance.id)}>查看 Agent</button>{canStart && <button type="button" onClick={() => void start(assignment)} disabled={starting === assignment.assignmentId}>{starting === assignment.assignmentId ? "正在唤醒…" : "启动 Agent"}</button>}</div></div>;
+          <div className="records-heading"><div><div className="eyebrow">AGENT SEATS</div><h2>项目 Agents</h2><p>查看席位职责与运行状态；空闲席位可直接启动</p></div></div>
+          <div className="assigned-list project-agent-list">
+            {selected.seats.map((seat) => {
+              const canStart = seat.agentInstance.status === "active" && !seat.currentRun;
+              const state = seat.currentRun
+                ? runStatusLabels[seat.currentRun.status]
+                : instanceStatusLabels[seat.agentInstance.status];
+              return <div className="assigned-agent" key={seat.seatId}><div><strong>{seat.responsibility || "默认职责"}</strong><span>{seat.agentInstance.specKey} · {state}</span><code>{seat.seatId}</code></div><div className="assigned-agent-actions"><button className="secondary-button" type="button" onClick={() => onOpenSeat(seat.seatId)}>查看 Agent Seat</button>{canStart && <button type="button" onClick={() => void start(seat)} disabled={starting === seat.seatId}>{starting === seat.seatId ? "正在唤醒…" : "启动 Agent"}</button>}</div></div>;
             })}
-            {selected.assignments.length === 0 && <div className="empty-state">该需求尚未绑定 Agent</div>}
+            {selected.seats.length === 0 && <div className="empty-state">该项目尚未分配 Agent Seat</div>}
           </div>
         </section>
       </div>
@@ -716,18 +771,18 @@ function RequirementListView({
   }
 
   return <>
-    <GlobalHeader eyebrow="REQUIREMENTS" title="需求列表" description="所有已绑定 Agent Instance、完成导入的需求" />
+    <GlobalHeader eyebrow="PROJECTS" title="项目列表" description="所有已经分配 Agent Seat、完成导入的飞书工作项" />
     {error && <div className="form-error" role="alert">{error}</div>}
     <section className="panel project-directory">
-      <div className="project-directory-heading"><div><h2>已导入需求</h2><p>点击需求进入详情并管理关联 Agent</p></div><span>{projects.length} 个</span></div>
+      <div className="project-directory-heading"><div><h2>已导入项目</h2><p>点击项目进入详情并查看关联 Agent Seat</p></div><span>{projects.length} 个</span></div>
       <div className="project-directory-list">
         {projects.map((project) => {
           const preview = previews[project.id];
-          const title = preview?.title ?? project.name ?? `飞书需求 #${project.externalProjectId}`;
-          return <button type="button" className="project-directory-item" key={project.id} onClick={() => onSelectProject(project.id)}><span className="project-directory-symbol">需</span><span className="project-directory-main"><strong>{title}</strong><small>{preview?.status?.name ?? "飞书项目"} · {project.externalProjectId}</small></span><span>{preview?.assignments.length ?? (project.agentInstance ? 1 : 0)} 个 Agent</span></button>;
+          const title = preview?.title ?? project.name ?? `飞书工作项 #${project.externalProjectId}`;
+          return <button type="button" className="project-directory-item" key={project.id} onClick={() => onSelectProject(project.id)}><span className="project-directory-symbol">项</span><span className="project-directory-main"><strong>{title}</strong><small>{preview?.status?.name ?? "飞书项目"} · {project.externalProjectId}</small></span><span>{preview?.seats.length ?? (project.coordinatorSeat ? 1 : 0)} 个 Seat</span></button>;
         })}
-        {loading && <div className="empty-state">正在读取需求…</div>}
-        {!loading && projects.length === 0 && <div className="empty-state">尚未导入需求，请先从“导入需求”绑定 Agent</div>}
+        {loading && <div className="empty-state">正在读取项目…</div>}
+        {!loading && projects.length === 0 && <div className="empty-state">尚未导入项目，请先从“导入项目”分配 Agent Seat</div>}
       </div>
     </section>
   </>;
@@ -758,7 +813,7 @@ const ConversationPanel = memo(function ConversationPanel({
   </section>;
 });
 
-function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId: string; onBack: () => void }) {
+function AgentSeatDetailView({ agentSeatId, onBack }: { agentSeatId: string; onBack: () => void }) {
   const [detail, setDetail] = useState<AgentInstanceDetail | null>(null);
   const [conversation, setConversation] = useState<AgentConversationResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -771,18 +826,17 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
     const refresh = async () => {
       let shouldPoll = true;
       try {
-        const [instance, messages] = await Promise.all([
-          loadAgentInstance(agentInstanceId),
-          loadAgentConversation(agentInstanceId),
-        ]);
+        const instance = await loadAgentSeat(agentSeatId);
+        const sessionId = instance.seats.find((seat) => seat.id === agentSeatId)?.session.id;
+        const messages = sessionId ? await loadAgentConversation(sessionId) : null;
         if (active) {
           setDetail(instance);
-          setConversation((current) =>
-            current?.checkpointId === messages.checkpointId ? current : messages,
-          );
+          setConversation((current) => !messages || current?.checkpointId === messages.checkpointId
+            ? current
+            : messages);
           setError(null);
-          shouldPoll = instance.agentInstance.status === "queued" ||
-            instance.agentInstance.status === "running";
+          shouldPoll = instance.seats.some((seat) => Boolean(seat.currentRun &&
+            ["queued", "running", "waiting_user"].includes(seat.currentRun.status)));
         }
       } catch (reason) {
         if (active) setError(reason instanceof Error ? reason.message : String(reason));
@@ -794,17 +848,18 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [agentInstanceId, refreshVersion]);
+  }, [agentSeatId, refreshVersion]);
   if (error) return <div className="form-error" role="alert">{error}</div>;
   if (!detail) return <div className="empty-state">正在读取 Agent Instance…</div>;
   const instance = detail.agentInstance;
-  const assignment = detail.assignment;
-  const activeRun = detail.currentRun && ["queued", "running", "waiting_user"].includes(detail.currentRun.status)
-    ? detail.currentRun
+  const seat = detail.seats.find((item) => item.id === agentSeatId);
+  const activeRun = seat?.currentRun && ["queued", "running", "waiting_user"].includes(seat.currentRun.status)
+    ? seat.currentRun
     : null;
-  const canStart = Boolean(assignment) && (instance.status === "idle" || instance.status === "failed");
+  const canStart = Boolean(seat) && instance.status === "active" && !activeRun;
+  const durableQuestions: PendingAgentQuestion[] = [];
   const pendingQuestions = activeRun?.status === "waiting_user"
-    ? pendingAgentQuestions(conversation)
+    ? (durableQuestions.length > 0 ? durableQuestions : pendingAgentQuestions(conversation))
     : [];
   async function runAction(action: "start" | "cancel") {
     setActing(action);
@@ -812,9 +867,9 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
     try {
       if (action === "cancel" && activeRun) {
         await cancelAgentRun(activeRun.id);
-      } else if (action === "start" && assignment) {
+      } else if (action === "start" && seat) {
         setConversation(null);
-        await startAgentRun(assignment.id);
+        await startAgentRun(seat.id);
       }
       setRefreshVersion((value) => value + 1);
     } catch (reason) {
@@ -826,18 +881,22 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
   async function submitAnswers(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!activeRun || pendingQuestions.length === 0) return;
-    const response = Object.fromEntries(pendingQuestions.map((question) => [
-      question.id,
-      { answers: [answers[question.id]?.trim() ?? ""] },
-    ]));
-    if (Object.values(response).some((answer) => !answer.answers[0])) {
+    const responses = pendingQuestions.map((question) => ({
+      question,
+      answer: answers[question.id]?.trim() ?? "",
+    }));
+    if (responses.some((response) => !response.answer)) {
       setError("请回答全部确认项");
       return;
     }
     setActing("resume");
     setError(null);
     try {
-      await resumeAgentRun(activeRun.id, { answers: response });
+      await resumeAgentRun(activeRun.id, {
+        message: responses
+          .map(({ question, answer }) => `[${question.header}] ${question.question}\n用户回复：${answer}`)
+          .join("\n\n"),
+      });
       setAnswers({});
       setRefreshVersion((value) => value + 1);
     } catch (reason) {
@@ -847,12 +906,12 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
     }
   }
   return <>
-    <button className="back-button" type="button" onClick={onBack}>← 返回需求详情</button>
-    <GlobalHeader eyebrow="AGENT INSTANCE" title={detail.assignment?.role ?? "Agent Instance"} description={`${instance.specKey} · ${instance.id}`} />
+    <button className="back-button" type="button" onClick={onBack}>← 返回项目详情</button>
+    <GlobalHeader eyebrow="AGENT SEAT" title={seat?.responsibility || instance.specKey} description={`${instance.specKey}:${instance.instanceKey} · ${agentSeatId}`} />
     <div className="agent-detail-grid">
       <section className="panel instance-panel">
-        <div className="instance-heading"><div className="instance-icon">AI</div><div><div className="eyebrow">AGENT INSTANCE</div><h2>{detail.assignment?.role ?? instance.specKey}</h2></div><span className={instance.status === "running" ? "live-indicator" : "idle-indicator"} /></div>
-        <div className="instance-state-card"><div><span>当前状态</span><strong>{instanceStatusLabels[instance.status]}</strong></div></div>
+        <div className="instance-heading"><div className="instance-icon">AI</div><div><div className="eyebrow">AGENT INSTANCE</div><h2>{instance.specKey}</h2></div><span className={activeRun?.status === "running" ? "live-indicator" : "idle-indicator"} /></div>
+        <div className="instance-state-card"><div><span>启用状态</span><strong>{instanceStatusLabels[instance.status]}</strong></div></div>
         <div className="instance-actions">
           {activeRun && <button className="danger-button" type="button" disabled={acting !== null} onClick={() => void runAction("cancel")}>{acting === "cancel" ? "正在结束…" : "结束 Agent"}</button>}
           {canStart && <button className="primary-button" type="button" disabled={acting !== null} onClick={() => void runAction("start")}>{acting === "start" ? "正在启动…" : "启动 Agent"}</button>}
@@ -862,10 +921,11 @@ function AgentInstanceDetailView({ agentInstanceId, onBack }: { agentInstanceId:
           {pendingQuestions.map((question) => <label key={question.id}><strong>{question.header}</strong><span>{question.question}</span><input list={`agent-answer-${question.id}`} value={answers[question.id] ?? ""} onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))} placeholder="选择建议项或输入反馈" disabled={acting !== null} /><datalist id={`agent-answer-${question.id}`}>{question.options.map((option) => <option value={option.label} key={option.label}>{option.description}</option>)}</datalist></label>)}
           <button className="primary-button" type="submit" disabled={acting !== null}>{acting === "resume" ? "正在继续…" : "提交并继续"}</button>
         </form>}
-        <dl className="definition-list"><DefinitionRow label="Instance ID"><code>{instance.id}</code></DefinitionRow><DefinitionRow label="Agent Spec">{instance.specKey} · v{instance.specVersion}</DefinitionRow><DefinitionRow label="Workspace"><code>{instance.workspaceKey}</code></DefinitionRow><DefinitionRow label="Thread ID"><code>{instance.threadId}</code></DefinitionRow><DefinitionRow label="最近活跃">{formatDate(instance.lastActiveAt)}</DefinitionRow></dl>
+        <dl className="definition-list"><DefinitionRow label="Seat ID"><code>{seat?.id ?? "—"}</code></DefinitionRow><DefinitionRow label="职责">{seat?.responsibility || "—"}</DefinitionRow><DefinitionRow label="Workspace"><code>{seat?.workspaceKey ?? "—"}</code></DefinitionRow><DefinitionRow label="Instance ID"><code>{instance.id}</code></DefinitionRow><DefinitionRow label="Agent Spec">{instance.specKey} · v{instance.specVersion}</DefinitionRow><DefinitionRow label="Instance Key"><code>{instance.instanceKey}</code></DefinitionRow><DefinitionRow label="Agent Home"><code>{instance.homeKey}</code></DefinitionRow><DefinitionRow label="最近活跃">{formatDate(instance.lastActiveAt)}</DefinitionRow></dl>
       </section>
-      <ConversationPanel conversation={conversation} runStatus={detail.currentRun?.status ?? null} />
+      <ConversationPanel conversation={conversation} runStatus={seat?.currentRun?.status ?? null} />
     </div>
+    <section className="panel recent-panel"><div className="panel-header compact-header"><div><div className="eyebrow">AGENT SEATS</div><h2>项目席位</h2></div><span className="muted-count">{detail.seats.length} 个</span></div><div className="run-list">{detail.seats.map((item) => <div className="run-row" key={item.id}><code>{item.session.status}</code><div className="run-description"><strong>{item.responsibility || "默认职责"} · {item.project.externalProjectId}</strong><span>{item.session.threadId}</span></div></div>)}</div></section>
     <section className="panel recent-panel agent-run-history"><div className="panel-header compact-header"><div><div className="eyebrow">RUN HISTORY</div><h2>运行记录</h2></div><span className="muted-count">{detail.recentRuns.length} 次</span></div><div className="run-list">{detail.recentRuns.map((run) => <div className="run-row" key={run.id}><code>{run.id.slice(0, 8)}</code><div className="run-description"><strong>{run.taskSummary ?? "未命名任务"}</strong><span>{formatDate(run.createdAt)}</span></div><span className="run-duration">{formatDuration(run.durationSeconds)}</span><StatusBadge status={run.status} /></div>)}{detail.recentRuns.length === 0 && <div className="empty-state">尚无运行记录</div>}</div></section>
   </>;
 }
@@ -891,25 +951,25 @@ function WorkbenchPage({ data }: { data: ProjectWorkbench | null }) {
     setRoute(nextRoute);
   }
 
-  const { section: activeSection, projectId: selectedProjectId, agentInstanceId: selectedAgentInstanceId } = route;
-  function openRequirement(projectId: string) {
-    navigate({ section: "projects", projectId, agentInstanceId: null });
+  const { section: activeSection, projectId: selectedProjectId, agentSeatId: selectedAgentSeatId } = route;
+  function openProject(projectId: string) {
+    navigate({ section: "projects", projectId, agentSeatId: null });
   }
-  function openAgent(agentInstanceId: string) {
-    navigate({ section: "instance", projectId: selectedProjectId, agentInstanceId });
+  function openSeat(agentSeatId: string) {
+    navigate({ section: "seat", projectId: selectedProjectId, agentSeatId });
   }
   function changeSection(section: MainSection) {
-    navigate({ section, projectId: null, agentInstanceId: null });
+    navigate({ section, projectId: null, agentSeatId: null });
   }
-  const sectionTitle = activeSection === "import" ? "导入需求" : activeSection === "projects" ? "需求列表" : activeSection === "instance" ? "Agent Instance" : activeSection === "runs" ? "运行记录" : activeSection === "events" ? "事件中心" : "Agent Specs";
+  const sectionTitle = activeSection === "import" ? "导入项目" : activeSection === "projects" ? "项目列表" : activeSection === "seat" ? "Agent Seat" : activeSection === "runs" ? "运行记录" : activeSection === "events" ? "事件中心" : "Agent Specs";
   return <div className="app-shell">
-    <Sidebar active={activeSection === "instance" ? "projects" : activeSection} onChange={changeSection} />
+    <Sidebar active={activeSection === "seat" ? "projects" : activeSection} onChange={changeSection} />
     <main className="workspace">
-      <header className="topbar"><div className="breadcrumbs"><span>工作台</span><span className="breadcrumb-separator">/</span><strong>{sectionTitle}</strong></div><div className="topbar-meta">{activeSection !== "import" && <span className="readonly-badge"><Glyph>◉</Glyph>{activeSection === "projects" || activeSection === "instance" ? "实时状态" : "只读视图"}</span>}</div></header>
+      <header className="topbar"><div className="breadcrumbs"><span>工作台</span><span className="breadcrumb-separator">/</span><strong>{sectionTitle}</strong></div><div className="topbar-meta">{activeSection !== "import" && <span className="readonly-badge"><Glyph>◉</Glyph>{activeSection === "projects" || activeSection === "seat" ? "实时状态" : "只读视图"}</span>}</div></header>
       <div className="page-content">
-        {activeSection === "import" && <FeishuRequirementView onOpenRequirement={openRequirement} />}
-        {activeSection === "projects" && <RequirementListView selectedProjectId={selectedProjectId} onSelectProject={(projectId) => navigate({ section: "projects", projectId, agentInstanceId: null })} onOpenAgent={openAgent} />}
-        {activeSection === "instance" && selectedAgentInstanceId && <AgentInstanceDetailView agentInstanceId={selectedAgentInstanceId} onBack={() => navigate({ section: "projects", projectId: selectedProjectId, agentInstanceId: null })} />}
+        {activeSection === "import" && <FeishuProjectImportView onOpenProject={openProject} />}
+        {activeSection === "projects" && <ProjectListView selectedProjectId={selectedProjectId} onSelectProject={(projectId) => navigate({ section: "projects", projectId, agentSeatId: null })} onOpenSeat={openSeat} />}
+        {activeSection === "seat" && selectedAgentSeatId && <AgentSeatDetailView agentSeatId={selectedAgentSeatId} onBack={() => navigate({ section: "projects", projectId: selectedProjectId, agentSeatId: null })} />}
         {activeSection === "runs" && <GlobalRunsView />}
         {activeSection === "events" && <GlobalEventsView />}
         {activeSection === "specs" && <AgentSpecsView />}

@@ -7,6 +7,7 @@ import { loadAgentSpec } from "../specs/loader.js";
 export interface AgentSpecCatalog {
   list(): Promise<AgentSpecsResponse>;
   get(key: string): Promise<AgentSpecSummary | null>;
+  getDefinition?(key: string): Promise<{ prompt: string; memory: string } | null>;
 }
 
 export class FilesystemAgentSpecCatalog implements AgentSpecCatalog {
@@ -26,9 +27,10 @@ export class FilesystemAgentSpecCatalog implements AgentSpecCatalog {
         id: manifest.id,
         name: manifest.name,
         version: manifest.version,
-        knowledge: manifest.knowledge,
+        defaultResponsibility: manifest.defaultResponsibility,
+        memory: manifest.memory,
         sandbox: manifest.sandbox,
-        environmentExample: manifest.environmentExample,
+        environmentExample: ".env.example",
       })),
     };
   }
@@ -36,5 +38,17 @@ export class FilesystemAgentSpecCatalog implements AgentSpecCatalog {
   async get(key: string): Promise<AgentSpecSummary | null> {
     const result = await this.list();
     return result.items.find((spec) => spec.id === key) ?? null;
+  }
+
+  async getDefinition(key: string): Promise<{ prompt: string; memory: string } | null> {
+    const entries = await readdir(this.root, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const loaded = await loadAgentSpec({ directory: resolve(this.root, entry.name) });
+      if (loaded.manifest.id === key) {
+        return { prompt: loaded.prompt, memory: loaded.memorySeed };
+      }
+    }
+    return null;
   }
 }

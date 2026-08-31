@@ -44,7 +44,7 @@ export interface ProjectEventPublishResult {
 export interface ProjectEventDispatchTarget {
   projectId: string;
   runId: string;
-  agentInstanceId: string;
+  seatId: string;
 }
 
 export interface ProjectEventRunNotifier {
@@ -262,6 +262,37 @@ export class PostgresProjectEventBus {
     return result.rowCount === 1;
   }
 
+  async publishAgentEvent(input: {
+    projectId: string;
+    targetAgentSeatId: string;
+    source: string;
+    externalEventId?: string;
+    eventType: string;
+    payload: Record<string, unknown>;
+  }): Promise<boolean> {
+    const externalEventId = input.externalEventId ?? `${input.eventType}-${randomUUID()}`;
+    const externalEventRecordId = await this.recordExternalEvent({
+      source: input.source,
+      externalEventId,
+      resourceType: "agent_seat",
+      resourceId: input.targetAgentSeatId,
+      eventType: input.eventType,
+      payload: input.payload,
+    });
+    const result = await this.pool.query(
+      `INSERT INTO swarm_hive.inbox_events(
+         source, external_event_id, external_event_record_id, project_id,
+         target_agent_seat_id, event_type, payload
+       ) SELECT $1, $2, $3, $4, seat.id, $6, $7::jsonb
+           FROM swarm_hive.agent_seats seat
+          WHERE seat.id = $5 AND seat.project_id = $4 AND seat.released_at IS NULL
+       ON CONFLICT (project_id, source, external_event_id) DO NOTHING`,
+      [input.source, externalEventId, externalEventRecordId, input.projectId,
+        input.targetAgentSeatId, input.eventType, JSON.stringify(input.payload)],
+    );
+    return result.rowCount === 1;
+  }
+
   async claimPendingEvents(runId: string, limit = 20): Promise<ExternalAgentEvent[]> {
     await this.recoverStaleProcessingEvents();
     const result = await this.pool.query<{
@@ -276,7 +307,11 @@ export class PostgresProjectEventBus {
          SELECT event.id
            FROM swarm_hive.inbox_events event
            JOIN swarm_hive.agent_runs run ON run.project_id = event.project_id
+           JOIN swarm_hive.agent_sessions session ON session.id = run.agent_session_id
+           JOIN swarm_hive.agent_seats seat ON seat.id = session.agent_seat_id
           WHERE run.id = $1
+            AND (event.target_agent_seat_id = seat.id
+              OR (event.target_agent_seat_id IS NULL AND seat.is_coordinator))
             AND (event.status = 'pending' OR (event.status = 'failed' AND event.retry_count < 3))
           ORDER BY event.received_at, event.id
           LIMIT $2
@@ -309,6 +344,35 @@ export class PostgresProjectEventBus {
         WHERE id = ANY($1::uuid[])`,
       [eventIds],
     );
+  }
+
+  async getReplyRoutes(runId: string, eventIds: readonly string[]): Promise<Array<{
+    inboxEventId: string;
+    source: string;
+    payload: Record<string, unknown>;
+  }>> {
+    if (eventIds.length === 0) return [];
+    const result = await this.pool.query<{
+      id: string;
+      source: string;
+      payload: unknown;
+    }>(
+      `SELECT event.id, event.source, event.payload
+         FROM swarm_hive.inbox_events event
+         JOIN swarm_hive.agent_runs run ON run.id = $1 AND run.project_id = event.project_id
+         JOIN swarm_hive.agent_sessions session ON session.id = run.agent_session_id
+         JOIN swarm_hive.agent_seats seat ON seat.id = session.agent_seat_id
+        WHERE event.id = ANY($2::uuid[])
+          AND (event.target_agent_seat_id = seat.id
+            OR (event.target_agent_seat_id IS NULL AND seat.is_coordinator))
+        ORDER BY event.received_at, event.id`,
+      [runId, eventIds],
+    );
+    return result.rows.map((row) => ({
+      inboxEventId: row.id,
+      source: row.source,
+      payload: object(row.payload),
+    }));
   }
 
   async failEvents(eventIds: string[], error: string): Promise<void> {
@@ -352,19 +416,21 @@ export class PostgresProjectEventBus {
     const result = await this.pool.query<{
       project_id: string;
       run_id: string;
-      agent_instance_id: string;
+      seat_id: string;
     }>(
-      `SELECT run.project_id, run.id AS run_id, run.agent_instance_id
+      `SELECT run.project_id, run.id AS run_id, seat.id AS seat_id
          FROM swarm_hive.agent_runs run
+         JOIN swarm_hive.agent_sessions session ON session.id = run.agent_session_id
+         JOIN swarm_hive.agent_seats seat
+           ON seat.id = session.agent_seat_id AND seat.released_at IS NULL AND seat.is_coordinator
          JOIN swarm_hive.agent_instances instance
            ON instance.id = run.agent_instance_id
           AND instance.status = 'active'
         WHERE run.project_id = $1
-          AND run.status IN ('running', 'waiting_user', 'failed')
+          AND run.status IN ('running', 'waiting_user')
         ORDER BY CASE run.status
                    WHEN 'running' THEN 0
                    WHEN 'waiting_user' THEN 1
-                   ELSE 2
                  END,
                  run.created_at DESC
         LIMIT 1`,
@@ -372,7 +438,36 @@ export class PostgresProjectEventBus {
     );
     const row = result.rows[0];
     return row
-      ? { projectId: row.project_id, runId: row.run_id, agentInstanceId: row.agent_instance_id }
+      ? { projectId: row.project_id, runId: row.run_id, seatId: row.seat_id }
+      : null;
+  }
+
+  async findDispatchTargetBySeat(
+    projectId: string,
+    seatId: string,
+  ): Promise<ProjectEventDispatchTarget | null> {
+    const result = await this.pool.query<{
+      project_id: string;
+      run_id: string;
+      seat_id: string;
+    }>(
+      `SELECT run.project_id, run.id AS run_id, seat.id AS seat_id
+         FROM swarm_hive.agent_runs run
+         JOIN swarm_hive.agent_sessions session ON session.id = run.agent_session_id
+         JOIN swarm_hive.agent_seats seat
+           ON seat.id = session.agent_seat_id AND seat.released_at IS NULL
+         JOIN swarm_hive.agent_instances instance
+           ON instance.id = run.agent_instance_id AND instance.status = 'active'
+        WHERE run.project_id = $1 AND seat.id = $2
+          AND run.status IN ('running', 'waiting_user')
+        ORDER BY CASE run.status WHEN 'running' THEN 0 WHEN 'waiting_user' THEN 1 END,
+                 run.created_at DESC
+        LIMIT 1`,
+      [projectId, seatId],
+    );
+    const row = result.rows[0];
+    return row
+      ? { projectId: row.project_id, runId: row.run_id, seatId: row.seat_id }
       : null;
   }
 
@@ -405,7 +500,7 @@ export class PostgresProjectEventBus {
   }
 }
 
-export class SingleAgentProjectEventDispatcher {
+export class CoordinatorProjectEventDispatcher {
   constructor(
     private readonly eventBus: Pick<PostgresProjectEventBus, "findDispatchTarget">,
     private readonly notifier: ProjectEventRunNotifier,

@@ -47,8 +47,8 @@ describe("Coding Run task prompt", () => {
     expect(prompt).toContain("technical_design_comment_received");
     expect(prompt).toContain("方案通过");
     expect(prompt).toContain("Inbox Event ID：event-id");
-    expect(prompt).toContain("event_reply");
-    expect(prompt).toContain("event_defer");
+    expect(prompt).toContain("最终回复");
+    expect(prompt).toContain("框架负责按来源投递");
     expect(prompt).toContain("关联文档：https://example.feishu.cn/docx/document-token");
     expect(prompt).toContain("文件 Token：document-token");
     expect(prompt).toContain("Comment ID：comment-1");
@@ -64,13 +64,12 @@ describe("Coding Run task prompt", () => {
       source: "swarm_hive_ui",
       externalEventId: "message-1",
       eventType: "user_message_received",
-      payload: { content: "已配置权限。" },
+      payload: { message: "已配置权限。" },
       receivedAt: "2026-08-25T13:43:57Z",
     }]);
     expect(prompt).toContain("已配置权限。");
-    expect(prompt).toContain("不与任何确认项预绑定");
-    expect(prompt).toContain("confirmation_list");
-    expect(prompt).toContain("只有消息明确且充分回答某个确认点");
+    expect(prompt).toContain("项目文件和 Task 状态");
+    expect(prompt).toContain("自动送回原消息通道");
   });
 });
 
@@ -83,21 +82,18 @@ describe("Run handoff", () => {
       resultSummary: "方案已通过，下一阶段开始开发。",
       mergeRequestUrl: null,
       finishedAt: "2026-08-24T09:36:01.000Z",
-      confirmations: [{
-        key: "design-approval",
-        phase: "solution_design",
-        status: "resolved",
-        question: "是否通过方案？",
-        answer: "通过方案",
-        artifactUrl: "https://example.feishu.cn/docx/design",
-        artifactRevision: 8,
-      }],
-      deferredItems: [],
-      reports: [{
-        phase: "solution_design",
-        version: 6,
+      tasks: [{
+        id: "design-task",
+        title: "设计需求",
         status: "completed",
-        conclusion: "方案通过。",
+        assigneeSeatId: "architect-seat",
+        blockedReason: null,
+        result: "通过方案",
+      }],
+      publications: [{
+        kind: "phase_result",
+        version: 6,
+        summary: "方案通过，revision 8。",
         relativePath: ".swarm-hive/reports/solution_design/0006.md",
       }],
       events: [{
@@ -122,9 +118,8 @@ describe("Run handoff", () => {
       resultSummary: "x".repeat(30_000),
       mergeRequestUrl: null,
       finishedAt: null,
-      confirmations: [],
-      deferredItems: [],
-      reports: [],
+      tasks: [],
+      publications: [],
       events: [],
     });
     expect(handoff.length).toBeLessThanOrEqual(16_000);

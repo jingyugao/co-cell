@@ -50,19 +50,6 @@ export interface ProjectDeferredItem {
   completedAt: string | null;
 }
 
-export interface ProjectReport {
-  id: string;
-  reportType: string;
-  phase: string;
-  version: number;
-  status: string;
-  conclusion: string;
-  relativePath: string;
-  sha256: string;
-  metadata: Record<string, unknown>;
-  createdAt: string;
-}
-
 export interface ExternalAgentEvent {
   id: string;
   source: string;

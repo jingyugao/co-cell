@@ -1,0 +1,63 @@
+#!/bin/sh
+set -eu
+
+: "${GITLAB_BASE_URL:?GITLAB_BASE_URL is required}"
+: "${GITLAB_HOST:?GITLAB_HOST is required}"
+: "${GITLAB_TOKEN:?GITLAB_TOKEN is required}"
+
+export HOME="${HOME:-/tmp/agent-home}"
+export GLAB_CONFIG_DIR="${GLAB_CONFIG_DIR:-$HOME/.config/glab-cli}"
+mkdir -p "$HOME" "$GLAB_CONFIG_DIR"
+
+case "$GITLAB_BASE_URL" in
+  https://*) protocol=https ;;
+  http://*) protocol=http ;;
+  *) echo "Unsupported GITLAB_BASE_URL protocol" >&2; exit 1 ;;
+esac
+
+auth_log=/tmp/glab-auth.log
+# The Spec HOME is persistent. Always refresh the stored credential so replacing
+# GITLAB_TOKEN takes effect on the next Run even while the previous token remains valid.
+if ! printf '%s' "$GITLAB_TOKEN" | glab auth login \
+    --hostname "$GITLAB_HOST" \
+    --stdin \
+    --git-protocol "$protocol" \
+    --api-protocol "$protocol" \
+    >"$auth_log" 2>&1; then
+  sed 's/token:.*/token: [redacted]/' "$auth_log" >&2
+  exit 1
+fi
+
+if ! glab auth status --hostname "$GITLAB_HOST" >"$auth_log" 2>&1; then
+  sed 's/token:.*/token: [redacted]/' "$auth_log" >&2
+  exit 1
+fi
+printf 'gitlab=%s authenticated\n' "$GITLAB_HOST"
+
+# Let ordinary Git commands reuse glab's authenticated host configuration.
+# The token remains in glab's config and is never embedded in a remote URL.
+git config --global credential.helper '!glab auth git-credential'
+
+email_host=$(printf '%s' "$GITLAB_HOST" | tr ':/' '-')
+git config --global user.name "${AGENT_GIT_NAME:-code_agent}"
+git config --global user.email "${AGENT_GIT_EMAIL:-code_agent@noreply.${email_host}}"
+
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && [ -n "${GITLAB_FEATURE_BRANCH:-}" ]; then
+  current_branch=$(git branch --show-current)
+  if [ "$current_branch" != "$GITLAB_FEATURE_BRANCH" ]; then
+    if git show-ref --verify --quiet "refs/heads/$GITLAB_FEATURE_BRANCH"; then
+      git switch "$GITLAB_FEATURE_BRANCH"
+    elif git show-ref --verify --quiet "refs/remotes/origin/$GITLAB_FEATURE_BRANCH"; then
+      git switch --track "origin/$GITLAB_FEATURE_BRANCH"
+    else
+      git switch -c "$GITLAB_FEATURE_BRANCH"
+    fi
+  fi
+fi
+
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  printf 'repository=%s\n' "$(git remote get-url origin)"
+  printf 'branch=%s\n' "$(git branch --show-current)"
+else
+  printf 'repository=not_initialized\n'
+fi

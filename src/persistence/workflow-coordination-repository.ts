@@ -8,7 +8,6 @@ import type {
   DeferredItemStatus,
   ProjectConfirmation,
   ProjectDeferredItem,
-  ProjectReport,
 } from "../contracts/workflow.js";
 
 function iso(value: Date | string): string {
@@ -104,7 +103,7 @@ export class PostgresWorkflowCoordinationRepository {
 
   async upsertConfirmation(input: {
     projectId: string;
-    agentForkId: string;
+    agentSeatId: string;
     runId: string;
     key: string;
     phase: string;
@@ -116,11 +115,11 @@ export class PostgresWorkflowCoordinationRepository {
   }): Promise<ProjectConfirmation> {
     const result = await this.pool.query<ConfirmationRow>(
       `INSERT INTO swarm_hive.project_confirmations(
-         project_id, agent_fork_id, run_id, confirmation_key, phase,
+         project_id, agent_seat_id, run_id, confirmation_key, phase,
          question, options, blocking_scope, artifact_url, artifact_revision
        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)
        ON CONFLICT (project_id, confirmation_key) DO UPDATE SET
-         agent_fork_id = excluded.agent_fork_id,
+         agent_seat_id = excluded.agent_seat_id,
          run_id = excluded.run_id,
          phase = excluded.phase,
          question = excluded.question,
@@ -135,7 +134,7 @@ export class PostgresWorkflowCoordinationRepository {
        RETURNING *`,
       [
         input.projectId,
-        input.agentForkId,
+        input.agentSeatId,
         input.runId,
         input.key,
         input.phase,
@@ -240,7 +239,7 @@ export class PostgresWorkflowCoordinationRepository {
 
   async upsertDeferredItem(input: {
     projectId: string;
-    agentForkId: string;
+    agentSeatId: string;
     runId: string;
     key: string;
     phase: string;
@@ -251,11 +250,11 @@ export class PostgresWorkflowCoordinationRepository {
   }): Promise<ProjectDeferredItem> {
     const result = await this.pool.query<DeferredRow>(
       `INSERT INTO swarm_hive.project_deferred_items(
-         project_id, agent_fork_id, run_id, item_key, phase, title,
+         project_id, agent_seat_id, run_id, item_key, phase, title,
          detail, report_policy, evidence
        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
        ON CONFLICT (project_id, item_key) DO UPDATE SET
-         agent_fork_id = excluded.agent_fork_id,
+         agent_seat_id = excluded.agent_seat_id,
          run_id = excluded.run_id,
          phase = excluded.phase,
          title = excluded.title,
@@ -269,7 +268,7 @@ export class PostgresWorkflowCoordinationRepository {
        RETURNING *`,
       [
         input.projectId,
-        input.agentForkId,
+        input.agentSeatId,
         input.runId,
         input.key,
         input.phase,
@@ -315,126 +314,4 @@ export class PostgresWorkflowCoordinationRepository {
     return result.rows[0] ? mapDeferredItem(result.rows[0]) : null;
   }
 
-  async nextReportVersion(projectId: string, phase: string): Promise<number> {
-    const result = await this.pool.query<{ version: number }>(
-      `SELECT coalesce(max(version), 0) + 1 AS version
-         FROM swarm_hive.project_reports
-        WHERE project_id = $1 AND phase = $2`,
-      [projectId, phase],
-    );
-    return Number(result.rows[0]?.version ?? 1);
-  }
-
-  async saveReport(input: {
-    projectId: string;
-    agentForkId: string;
-    runId: string;
-    reportType: string;
-    phase: string;
-    version: number;
-    status: string;
-    conclusion: string;
-    relativePath: string;
-    sha256: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<ProjectReport> {
-    const result = await this.pool.query<{
-      id: string;
-      report_type: string;
-      phase: string;
-      version: number;
-      status: string;
-      conclusion: string;
-      relative_path: string;
-      sha256: string;
-      metadata: unknown;
-      created_at: Date;
-    }>(
-      `INSERT INTO swarm_hive.project_reports(
-         project_id, agent_fork_id, run_id, report_type, phase, version,
-         status, conclusion, relative_path, sha256, metadata
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)
-       RETURNING *`,
-      [
-        input.projectId,
-        input.agentForkId,
-        input.runId,
-        input.reportType,
-        input.phase,
-        input.version,
-        input.status,
-        input.conclusion,
-        input.relativePath,
-        input.sha256,
-        JSON.stringify(input.metadata ?? {}),
-      ],
-    );
-    const row = result.rows[0];
-    if (!row) throw new Error("Report was not saved");
-    return {
-      id: row.id,
-      reportType: row.report_type,
-      phase: row.phase,
-      version: row.version,
-      status: row.status,
-      conclusion: row.conclusion,
-      relativePath: row.relative_path,
-      sha256: row.sha256,
-      metadata: object(row.metadata),
-      createdAt: iso(row.created_at),
-    };
-  }
-
-  async listReports(projectId: string): Promise<ProjectReport[]> {
-    const result = await this.pool.query<{
-      id: string;
-      report_type: string;
-      phase: string;
-      version: number;
-      status: string;
-      conclusion: string;
-      relative_path: string;
-      sha256: string;
-      metadata: unknown;
-      created_at: Date;
-    }>(
-      `SELECT * FROM swarm_hive.project_reports
-        WHERE project_id = $1 ORDER BY created_at DESC, id DESC`,
-      [projectId],
-    );
-    return result.rows.map((row) => ({
-      id: row.id,
-      reportType: row.report_type,
-      phase: row.phase,
-      version: row.version,
-      status: row.status,
-      conclusion: row.conclusion,
-      relativePath: row.relative_path,
-      sha256: row.sha256,
-      metadata: object(row.metadata),
-      createdAt: iso(row.created_at),
-    }));
-  }
-
-  async getReportFileContext(reportId: string): Promise<{
-    projectId: string;
-    specKey: string;
-    relativePath: string;
-  } | null> {
-    const result = await this.pool.query<{
-      project_id: string;
-      spec_key: string;
-      relative_path: string;
-    }>(
-      `SELECT r.project_id, ai.spec_key, r.relative_path
-         FROM swarm_hive.project_reports r
-         JOIN swarm_hive.agent_instances ai ON ai.id = r.agent_instance_id
-        WHERE r.id = $1`,
-      [reportId],
-    );
-    const row = result.rows[0];
-    return row
-      ? { projectId: row.project_id, specKey: row.spec_key, relativePath: row.relative_path }
-      : null;
-  }
 }

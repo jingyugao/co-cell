@@ -15,8 +15,10 @@ describe("loadAgentSpec", () => {
     expect(spec.manifest.sandbox.dockerfile).toBe("sandbox/Dockerfile");
     expect(spec.manifest.prompt).toBe("prompt.txt");
     expect(spec.manifest.memory).toBe("memory.txt");
+    expect(spec.manifest.defaultResponsibility).toContain("代码开发");
     expect(spec.prompt).not.toContain("{{");
-    expect(spec.prompt).toContain("confirmation_list");
+    expect(spec.prompt).toContain("task_list");
+    expect(spec.prompt).toContain("project_publish");
     expect(spec.prompt).not.toContain("{{requirement_json}}");
     expect(spec.memorySeed).toContain("example-data");
     expect(spec.memorySeed).toContain("Meegle");
@@ -35,7 +37,7 @@ describe("loadAgentSpec", () => {
     expect(launcher).toContain("buildProjectTaskPrompt(context.sourceUrl)");
     expect(launcher).toContain("spec.prompt");
     expect(launcher).toContain("getAgentSessionMemory(context.sessionId)");
-    expect(launcher).not.toContain("role: context.role");
+    expect(launcher).toContain("context.responsibility");
   });
 
   test("uses the dedicated coding Agent Git identity", async () => {

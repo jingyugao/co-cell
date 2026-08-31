@@ -21,10 +21,15 @@ export interface ProjectSummary {
   externalUrl: string | null;
   name: string | null;
   status: ProjectStatus;
-  agentInstance: {
+  coordinatorSeat: {
     id: string;
-    status: AgentInstanceStatus;
-    specKey: string;
+    responsibility: string;
+    agentInstance: {
+      id: string;
+      status: AgentInstanceStatus;
+      specKey: string;
+      instanceKey: string;
+    };
   } | null;
   currentRun: {
     id: string;
@@ -60,17 +65,23 @@ export interface ProjectWorkbench {
     completedRuns: number;
     successRate: number | null;
   };
-  primaryAgentFork: {
+  coordinatorSeat: {
     id: string;
-    agentInstanceId: string;
-    sessionId: string;
-    role: string;
-    specKey: string;
-    specVersion: number;
-    status: AgentInstanceStatus;
+    responsibility: string;
     workspaceKey: string;
-    threadId: string;
-    lastActiveAt: string | null;
+    agentInstance: {
+      id: string;
+      instanceKey: string;
+      specKey: string;
+      specVersion: number;
+      status: AgentInstanceStatus;
+      homeKey: string;
+      lastActiveAt: string | null;
+    };
+    session: {
+      id: string;
+      threadId: string;
+    };
   } | null;
   currentRun: {
     id: string;
@@ -197,6 +208,7 @@ export interface AgentSpecSummary {
   id: string;
   name: string;
   version: number;
+  defaultResponsibility: string;
   memory: string;
   sandbox: { dockerfile: string; image: string };
   environmentExample: string;
@@ -209,14 +221,14 @@ export interface AgentSpecsResponse {
 export interface AgentSpecUsage {
   statistics: {
     instances: number;
-    activeRequirements: number;
-    runningInstances: number;
+    activeSeats: number;
+    runningSeats: number;
   };
-  activeRequirements: Array<{
-    forkId: string;
-    role: string;
-    isPrimary: boolean;
-    boundAt: string;
+  activeSeats: Array<{
+    seatId: string;
+    responsibility: string;
+    isCoordinator: boolean;
+    assignedAt: string;
     project: {
       id: string;
       name: string | null;
@@ -225,11 +237,13 @@ export interface AgentSpecUsage {
     };
     agentInstance: {
       id: string;
+      instanceKey: string;
       specVersion: number;
       status: AgentInstanceStatus;
-      workspaceKey: string;
+      homeKey: string;
       lastActiveAt: string | null;
     };
+    workspaceKey: string;
     currentRun: {
       id: string;
       status: RunStatus;
@@ -240,6 +254,11 @@ export interface AgentSpecUsage {
 
 export interface AgentSpecOverviewResponse extends AgentSpecUsage {
   spec: AgentSpecSummary;
+  definition: {
+    prompt: string;
+    memory: string;
+  };
+  instances: AgentInstanceDetail[];
 }
 
 export interface AgentInstanceDetail {
@@ -247,17 +266,18 @@ export interface AgentInstanceDetail {
     id: string;
     specKey: string;
     specVersion: number;
+    instanceKey: string;
     status: AgentInstanceStatus;
-    workspaceKey: string;
+    homeKey: string;
     lastActiveAt: string | null;
     createdAt: string;
   };
-  forks: Array<{
+  seats: Array<{
     id: string;
-    role: string;
-    isPrimary: boolean;
+    responsibility: string;
+    isCoordinator: boolean;
     workspaceKey: string;
-    boundAt: string;
+    assignedAt: string;
     project: {
       id: string;
       source: string;
@@ -276,6 +296,23 @@ export interface AgentInstanceDetail {
       taskSummary: string | null;
       startedAt: string | null;
     } | null;
+  }>;
+  tasks: Array<{
+    id: string;
+    title: string;
+    status: "pending" | "assigned" | "running" | "blocked" | "completed" | "failed" | "cancelled";
+    blockedReason: string | null;
+    result: string | null;
+    updatedAt: string;
+    seat: {
+      id: string;
+      responsibility: string;
+    };
+    project: {
+      id: string;
+      name: string | null;
+      externalProjectId: string;
+    };
   }>;
   recentRuns: ProjectRunListItem[];
 }

@@ -5,6 +5,7 @@ export interface AgentSpecManifest {
   id: string;
   name: string;
   version: number;
+  defaultResponsibility: string;
   prompt: string;
   memory: string;
   sandbox: {
@@ -36,6 +37,8 @@ function parseManifest(value: unknown): AgentSpecManifest {
     typeof manifest.name !== "string" ||
     !manifest.name.trim() ||
     !Number.isInteger(manifest.version) ||
+    typeof manifest.defaultResponsibility !== "string" ||
+    !manifest.defaultResponsibility.trim() ||
     typeof manifest.prompt !== "string" ||
     !manifest.prompt.trim() ||
     typeof manifest.memory !== "string" ||

@@ -12,7 +12,7 @@
     "typecheck": "tsc --noEmit",
     "typecheck:web": "tsc --noEmit -p web/tsconfig.json",
     "test": "vitest run",
-    "test:postgres": "vitest run test/postgres-checkpointer.integration.test.ts test/business-database.integration.test.ts test/workbench-api.integration.test.ts test/requirement-workflow.integration.test.ts --reporter=verbose",
+    "test:postgres": "vitest run test/postgres-checkpointer.integration.test.ts test/business-database.integration.test.ts test/workbench-api.integration.test.ts test/project-workflow.integration.test.ts --reporter=verbose",
     "web:dev": "vite --config web/vite.config.ts",
     "web:build": "pnpm typecheck:web && vite build --config web/vite.config.ts",
     "web:preview": "vite preview --config web/vite.config.ts"

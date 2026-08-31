@@ -22,7 +22,7 @@ export function createAgentMemorySnapshot(content: string): Pick<AgentMemorySnap
   };
 }
 
-/** Initialize and read the writable memory shared by all Forks of one Instance. */
+/** Initialize and read the writable memory shared by all Seats of one Instance. */
 export async function loadAgentMemory(
   instanceHome: string,
   seedContent: string,

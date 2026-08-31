@@ -34,7 +34,7 @@ export interface ProjectEventInteractionResult {
 
 interface InteractionActor {
   projectId: string;
-  agentForkId: string;
+  agentSeatId: string;
   runId: string;
   inboxEventId: string;
 }
@@ -139,6 +139,15 @@ export class PostgresProjectEventInteractions {
       );
       throw new Error(`Unable to reply to external event: ${message}`);
     }
+  }
+
+  async replyIfSupported(
+    input: InteractionActor & { content: string },
+  ): Promise<ProjectEventInteractionResult | null> {
+    const context = await this.loadContext(input);
+    const supported = (this.adapters.get(context.source) ?? [])
+      .some((candidate) => candidate.supports(context));
+    return supported ? this.reply(input) : null;
   }
 
   async defer(input: InteractionActor & { reason: string }): Promise<ProjectEventInteractionResult> {
@@ -248,10 +257,10 @@ export class PostgresProjectEventInteractions {
           AND run.project_id = event.project_id
          JOIN swarm_hive.agent_sessions session
            ON session.id = run.agent_session_id
-          AND session.agent_fork_id = $3
+          AND session.agent_seat_id = $3
         WHERE event.id = $1
           AND event.project_id = $2`,
-      [input.inboxEventId, input.projectId, input.agentForkId, input.runId],
+      [input.inboxEventId, input.projectId, input.agentSeatId, input.runId],
     );
     const row = query.rows[0];
     if (!row) throw new Error("Inbox event is not available to this project Agent run");
@@ -288,7 +297,7 @@ export class PostgresProjectEventInteractions {
   ): Promise<{ row: InteractionRow; inserted: boolean }> {
     const query = await this.pool.query<InteractionRow>(
       `INSERT INTO swarm_hive.event_interactions(
-         inbox_event_id, project_id, agent_fork_id, run_id,
+         inbox_event_id, project_id, agent_seat_id, run_id,
          action, content, status, processed_at
        ) VALUES ($1, $2, $3, $4, $5, $6, $7,
                  CASE WHEN $7 = 'deferred' THEN now() ELSE NULL END)
@@ -298,7 +307,7 @@ export class PostgresProjectEventInteractions {
       [
         input.inboxEventId,
         input.projectId,
-        input.agentForkId,
+        input.agentSeatId,
         input.runId,
         action,
         content,

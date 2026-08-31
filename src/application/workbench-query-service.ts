@@ -1,6 +1,3 @@
-import { readFile, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
-
 import type {
   ProjectListResponse,
   ProjectWorkbench,
@@ -21,7 +18,6 @@ import {
   PostgresWorkbenchRepository,
 } from "../persistence/workbench-repository.js";
 import { InvalidRequestError, NotFoundError } from "./errors.js";
-import { workspaceSlug } from "../sandbox/factory.js";
 
 export interface SandboxRuntimeStatus {
   status: "online" | "offline" | "unknown";
@@ -43,10 +39,11 @@ export interface WorkbenchQueries {
   listRuns(options: { limit: number; cursor?: string }): Promise<GlobalRunsResponse>;
   listAllInboxEvents(options: { limit: number; cursor?: string }): Promise<GlobalInboxEventsResponse>;
   getAgentSpecUsage(specKey: string): Promise<AgentSpecUsage>;
+  listAgentInstancesBySpec(specKey: string): Promise<AgentInstanceDetail[]>;
   getAgentInstance(agentInstanceId: string): Promise<AgentInstanceDetail>;
+  getAgentSeat(agentSeatId: string): Promise<AgentInstanceDetail>;
   getAgentConversation(agentSessionId: string): Promise<AgentConversationResponse>;
   getRunEvents(runId: string, afterSequence: number, limit: number): Promise<RunEventsResponse>;
-  getReportMarkdown(reportId: string): Promise<{ content: string; filename: string }>;
 }
 
 export class WorkbenchQueryService implements WorkbenchQueries {
@@ -54,7 +51,6 @@ export class WorkbenchQueryService implements WorkbenchQueries {
     private readonly repository: PostgresWorkbenchRepository,
     private readonly sandboxHealth: SandboxHealthProvider,
     private readonly conversationReader?: AgentConversationReader,
-    private readonly workspaceRoot = ".swarm-hive/workspaces",
   ) {}
 
   ping(): Promise<void> {
@@ -92,6 +88,12 @@ export class WorkbenchQueryService implements WorkbenchQueries {
     return result;
   }
 
+  async getAgentSeat(agentSeatId: string): Promise<AgentInstanceDetail> {
+    const result = await this.repository.getAgentSeatDetail(agentSeatId);
+    if (!result) throw new NotFoundError("Agent Seat");
+    return result;
+  }
+
   async getAgentConversation(agentSessionId: string): Promise<AgentConversationResponse> {
     const threadId = await this.repository.getAgentSessionThreadId(agentSessionId);
     if (!threadId) throw new NotFoundError("Agent Session");
@@ -114,34 +116,6 @@ export class WorkbenchQueryService implements WorkbenchQueries {
     const run = await this.repository.getRun(runId);
     if (!run) throw new NotFoundError("Run");
     return run;
-  }
-
-  async getReportMarkdown(reportId: string): Promise<{ content: string; filename: string }> {
-    const context = await this.repository.getReportFileContext(reportId);
-    if (!context) throw new NotFoundError("Report");
-    if (
-      isAbsolute(context.relativePath) ||
-      !context.relativePath.startsWith(".swarm-hive/reports/")
-    ) {
-      throw new Error("Report path is invalid");
-    }
-    const projectRoot = await realpath(resolve(
-      this.workspaceRoot,
-      "specs",
-      workspaceSlug(context.specKey),
-      "home",
-      "projects",
-      workspaceSlug(context.projectId),
-    ));
-    const path = await realpath(resolve(projectRoot, context.relativePath));
-    const relativeToProject = relative(projectRoot, path);
-    if (relativeToProject.startsWith("..") || isAbsolute(relativeToProject)) {
-      throw new Error("Report path escapes the project workspace");
-    }
-    return {
-      content: await readFile(path, "utf8"),
-      filename: context.relativePath.split("/").at(-1) ?? "report.md",
-    };
   }
 
   async listProjectRuns(
@@ -190,6 +164,10 @@ export class WorkbenchQueryService implements WorkbenchQueries {
 
   getAgentSpecUsage(specKey: string): Promise<AgentSpecUsage> {
     return this.repository.getAgentSpecUsage(specKey);
+  }
+
+  listAgentInstancesBySpec(specKey: string): Promise<AgentInstanceDetail[]> {
+    return this.repository.listAgentInstanceDetailsBySpec(specKey);
   }
 
   private decodeCursor(cursor?: string) {

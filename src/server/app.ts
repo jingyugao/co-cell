@@ -14,13 +14,15 @@ import {
   NotFoundError,
 } from "../application/errors.js";
 import type { WorkbenchQueries } from "../application/workbench-query-service.js";
-import type { RequirementWorkflow } from "../application/requirement-workflow-service.js";
+import type { ProjectWorkflow } from "../application/project-workflow-service.js";
 import type { AgentSpecCatalog } from "./agent-spec-catalog.js";
+import type { PostgresProjectCollaborationRepository } from "../persistence/project-collaboration-repository.js";
 
 export interface CreateAppOptions {
   workbench: WorkbenchQueries;
   specCatalog: AgentSpecCatalog;
-  requirements?: RequirementWorkflow;
+  projectWorkflow?: ProjectWorkflow;
+  collaboration?: PostgresProjectCollaborationRepository;
   staticRoot?: string;
   enableRequestLogger?: boolean;
 }
@@ -46,17 +48,18 @@ const workItemPreviewSchema = z.object({
 const assignmentSchema = z.object({
   url: z.string().url().max(2_000),
   specKey: specKeySchema,
-  role: z.string().trim().min(1).max(100),
+  responsibility: z.string().trim().max(100).default(""),
+  isCoordinator: z.boolean().optional(),
 });
 const resumeRunSchema = z.object({
   message: z.string().trim().min(1).max(20_000),
 });
 
-function requirements(options: CreateAppOptions): RequirementWorkflow {
-  if (!options.requirements) {
-    throw new ApplicationError("Requirement workflow is not configured", "not_configured", 503);
+function projectWorkflow(options: CreateAppOptions): ProjectWorkflow {
+  if (!options.projectWorkflow) {
+    throw new ApplicationError("Project workflow is not configured", "not_configured", 503);
   }
-  return options.requirements;
+  return options.projectWorkflow;
 }
 
 function validatedId(value: string, label: string): string {
@@ -92,6 +95,22 @@ export function createApp(options: CreateAppOptions): Hono {
     return context.json(await options.workbench.listProjects(parsed.data));
   });
 
+  app.get("/api/v1/projects/:projectId/tasks", async (context) => {
+    if (!options.collaboration) {
+      throw new ApplicationError("Project collaboration is not configured", "not_configured", 503);
+    }
+    const projectId = validatedId(context.req.param("projectId"), "projectId");
+    return context.json({ items: await options.collaboration.listTasks({ projectId }) });
+  });
+
+  app.get("/api/v1/projects/:projectId/publications", async (context) => {
+    if (!options.collaboration) {
+      throw new ApplicationError("Project collaboration is not configured", "not_configured", 503);
+    }
+    const projectId = validatedId(context.req.param("projectId"), "projectId");
+    return context.json({ items: await options.collaboration.listPublications(projectId) });
+  });
+
   app.get("/api/v1/runs", async (context) => {
     const parsed = paginatedListQuerySchema.safeParse(context.req.query());
     if (!parsed.success) throw new InvalidRequestError("Invalid Run list query");
@@ -113,37 +132,53 @@ export function createApp(options: CreateAppOptions): Hono {
     if (!parsed.success) throw new InvalidRequestError("specKey is invalid");
     const spec = await options.specCatalog.get(parsed.data);
     if (!spec) throw new NotFoundError("Agent Spec");
-    const usage = await options.workbench.getAgentSpecUsage(parsed.data);
-    return context.json({ spec, ...usage });
+    const [usage, instances, definition] = await Promise.all([
+      options.workbench.getAgentSpecUsage(parsed.data),
+      options.workbench.listAgentInstancesBySpec(parsed.data),
+      options.specCatalog.getDefinition?.(parsed.data) ?? Promise.resolve(null),
+    ]);
+    return context.json({
+      spec,
+      ...usage,
+      instances,
+      definition: definition ?? { prompt: "", memory: "" },
+    });
   });
 
   app.post("/api/v1/feishu-project/work-items/preview", async (context) => {
     const parsed = workItemPreviewSchema.safeParse(await context.req.json().catch(() => null));
     if (!parsed.success) throw new InvalidRequestError("A valid Feishu work item URL is required");
-    return context.json(await requirements(options).preview(parsed.data.url));
+    return context.json(await projectWorkflow(options).preview(parsed.data.url));
   });
 
-  app.post("/api/v1/agent-forks", async (context) => {
+  app.post("/api/v1/agent-seats", async (context) => {
     const parsed = assignmentSchema.safeParse(await context.req.json().catch(() => null));
-    if (!parsed.success) throw new InvalidRequestError("Agent Fork is invalid");
-    return context.json(await requirements(options).fork(parsed.data), 201);
+    if (!parsed.success) throw new InvalidRequestError("Agent Seat is invalid");
+    return context.json(await projectWorkflow(options).assignSeat(parsed.data), 201);
   });
 
-  app.post("/api/v1/agent-forks/:forkId/runs", async (context) => {
-    const forkId = validatedId(context.req.param("forkId"), "forkId");
-    return context.json(await requirements(options).start(forkId), 202);
+  app.post("/api/v1/agent-seats/:seatId/runs", async (context) => {
+    const seatId = validatedId(context.req.param("seatId"), "seatId");
+    return context.json(await projectWorkflow(options).start(seatId), 202);
   });
 
   app.post("/api/v1/runs/:runId/cancel", async (context) => {
     const runId = validatedId(context.req.param("runId"), "runId");
-    return context.json(await requirements(options).cancel(runId));
+    return context.json(await projectWorkflow(options).cancel(runId));
   });
 
   app.post("/api/v1/runs/:runId/resume", async (context) => {
     const runId = validatedId(context.req.param("runId"), "runId");
     const parsed = resumeRunSchema.safeParse(await context.req.json().catch(() => null));
     if (!parsed.success) throw new InvalidRequestError("A valid Agent message is required");
-    return context.json(await requirements(options).resume(runId, parsed.data), 202);
+    return context.json(await projectWorkflow(options).resume(runId, parsed.data), 202);
+  });
+
+  app.post("/api/v1/projects/:projectId/messages", async (context) => {
+    const projectId = validatedId(context.req.param("projectId"), "projectId");
+    const parsed = resumeRunSchema.safeParse(await context.req.json().catch(() => null));
+    if (!parsed.success) throw new InvalidRequestError("A valid project message is required");
+    return context.json(await projectWorkflow(options).message(projectId, parsed.data), 202);
   });
 
   app.get("/api/v1/projects/:projectId/workbench", async (context) => {
@@ -186,20 +221,20 @@ export function createApp(options: CreateAppOptions): Hono {
     return context.json(await options.workbench.getAgentInstance(agentInstanceId));
   });
 
+  app.get("/api/v1/agent-seats/:agentSeatId", async (context) => {
+    const agentSeatId = validatedId(
+      context.req.param("agentSeatId"),
+      "agentSeatId",
+    );
+    return context.json(await options.workbench.getAgentSeat(agentSeatId));
+  });
+
   app.get("/api/v1/agent-sessions/:agentSessionId/conversation", async (context) => {
     const agentSessionId = validatedId(
       context.req.param("agentSessionId"),
       "agentSessionId",
     );
     return context.json(await options.workbench.getAgentConversation(agentSessionId));
-  });
-
-  app.get("/api/v1/reports/:reportId", async (context) => {
-    const reportId = validatedId(context.req.param("reportId"), "reportId");
-    const report = await options.workbench.getReportMarkdown(reportId);
-    context.header("content-type", "text/markdown; charset=utf-8");
-    context.header("content-disposition", `inline; filename="${report.filename}"`);
-    return context.body(report.content);
   });
 
   app.get("/api/v1/runs/:runId", async (context) => {

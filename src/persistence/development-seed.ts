@@ -74,12 +74,12 @@ export async function seedWorkbenchTestData(connectionString: string): Promise<s
 
     const agent = await client.query<{ id: string }>(
       `INSERT INTO swarm_hive.agent_instances(
-         spec_key, spec_version, instance_key, workspace_key, status, last_active_at
+         spec_key, spec_version, instance_key, home_key, status, last_active_at
        ) VALUES (
-         'software-engineer', 1, 'software-engineer',
-         'test-workbench-primary', 'active', now()
+         'software-engineer', 1, 'default',
+         'software-engineer:default', 'active', now()
        )
-       ON CONFLICT (spec_key) DO UPDATE
+       ON CONFLICT (spec_key, instance_key) DO UPDATE
          SET spec_version = excluded.spec_version,
              status = excluded.status,
              last_active_at = excluded.last_active_at
@@ -88,38 +88,31 @@ export async function seedWorkbenchTestData(connectionString: string): Promise<s
     const agentInstanceId = agent.rows[0]?.id;
     if (!agentInstanceId) throw new Error("Development Agent Instance was not created");
 
-    const fork = await client.query<{ id: string }>(
-      `INSERT INTO swarm_hive.agent_forks(
-         project_id, agent_instance_id, workspace_key
-       ) SELECT $1, $2, 'test-workbench-primary'
+    const seat = await client.query<{ id: string }>(
+      `INSERT INTO swarm_hive.agent_seats(
+         project_id, agent_instance_id, responsibility, is_coordinator, workspace_key
+       ) SELECT $1, $2, 'backend-module-a', true, 'test-workbench-seat'
        WHERE NOT EXISTS (
-         SELECT 1 FROM swarm_hive.agent_forks
-          WHERE project_id = $1 AND unbound_at IS NULL AND is_primary
+         SELECT 1 FROM swarm_hive.agent_seats
+          WHERE project_id = $1 AND released_at IS NULL AND is_coordinator
        )
        RETURNING id`,
       [projectId, agentInstanceId],
     );
-    await client.query(
-      `UPDATE swarm_hive.agent_forks
-          SET role = 'backend-module-a'
-        WHERE project_id = $1 AND agent_instance_id = $2 AND unbound_at IS NULL`,
-      [projectId, agentInstanceId],
-    );
-
-    const forkId = fork.rows[0]?.id ?? (
+    const seatId = seat.rows[0]?.id ?? (
       await client.query<{ id: string }>(
-        `SELECT id FROM swarm_hive.agent_forks
-          WHERE project_id = $1 AND unbound_at IS NULL AND is_primary`,
+        `SELECT id FROM swarm_hive.agent_seats
+          WHERE project_id = $1 AND released_at IS NULL AND is_coordinator`,
         [projectId],
       )
     ).rows[0]?.id;
-    if (!forkId) throw new Error("Development Agent Fork was not created");
+    if (!seatId) throw new Error("Development Agent Seat was not created");
     const session = await client.query<{ id: string }>(
-      `INSERT INTO swarm_hive.agent_sessions(agent_fork_id, thread_id, last_active_at)
-       VALUES ($1, 'test-workbench-primary', now())
+      `INSERT INTO swarm_hive.agent_sessions(agent_seat_id, thread_id, last_active_at)
+       VALUES ($1, 'test-workbench-coordinator', now())
        ON CONFLICT (thread_id) DO UPDATE SET last_active_at = excluded.last_active_at
        RETURNING id`,
-      [forkId],
+      [seatId],
     );
     const agentSessionId = session.rows[0]?.id;
     if (!agentSessionId) throw new Error("Development Agent Session was not created");

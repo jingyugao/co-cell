@@ -3,7 +3,7 @@ import { describe, expect, test, vi } from "vitest";
 import {
   feishuDocumentResource,
   PostgresProjectEventBus,
-  SingleAgentProjectEventDispatcher,
+  CoordinatorProjectEventDispatcher,
 } from "../src/events/project-event-bus.js";
 
 describe("project event bus", () => {
@@ -22,14 +22,14 @@ describe("project event bus", () => {
       });
   });
 
-  test("routes each delivered project to its single active Agent run", async () => {
+  test("routes each delivered project to its Coordinator run", async () => {
     const findDispatchTarget = vi.fn(async (projectId: string) =>
       projectId === "project-without-agent"
         ? null
-        : { projectId, runId: `run-${projectId}`, agentInstanceId: `agent-${projectId}` }
+        : { projectId, runId: `run-${projectId}`, seatId: `seat-${projectId}` }
     );
     const notify = vi.fn();
-    const dispatcher = new SingleAgentProjectEventDispatcher(
+    const dispatcher = new CoordinatorProjectEventDispatcher(
       { findDispatchTarget },
       { notify },
     );
@@ -40,23 +40,25 @@ describe("project event bus", () => {
     expect(notify.mock.calls).toEqual([["run-project-1"], ["run-project-2"]]);
   });
 
-  test("allows a failed Run to be selected for event resume", async () => {
-    const query = vi.fn(async (_sql: string) => ({
-      rows: [{
-        project_id: "project-1",
-        run_id: "failed-run",
-        agent_instance_id: "agent-1",
-      }],
-    }));
+  test("does not select failed Runs for event delivery", async () => {
+    const query = vi.fn(async (_sql: string) => ({ rows: [] }));
     const bus = new PostgresProjectEventBus({ query } as never);
 
-    await expect(bus.findDispatchTarget("project-1")).resolves.toEqual({
-      projectId: "project-1",
-      runId: "failed-run",
-      agentInstanceId: "agent-1",
-    });
+    await expect(bus.findDispatchTarget("project-1")).resolves.toBeNull();
     const sql = String(query.mock.calls[0]?.[0]);
-    expect(sql).toContain("'failed'");
+    expect(sql).not.toContain("'failed'");
     expect(sql).toContain("instance.status = 'active'");
+    expect(sql).toContain("seat.is_coordinator");
+  });
+
+  test("only lets the Coordinator claim project events unless a Seat is targeted", async () => {
+    const query = vi.fn(async (_sql: string) => ({ rows: [] }));
+    const bus = new PostgresProjectEventBus({ query } as never);
+
+    await bus.claimPendingEvents("run-1");
+
+    const sql = String(query.mock.calls.at(-1)?.[0]);
+    expect(sql).toContain("event.target_agent_seat_id = seat.id");
+    expect(sql).toContain("event.target_agent_seat_id IS NULL AND seat.is_coordinator");
   });
 });

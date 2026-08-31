@@ -6,19 +6,20 @@ import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 
 import type { WorkbenchQueries } from "../src/application/workbench-query-service.js";
-import type { RequirementWorkflow } from "../src/application/requirement-workflow-service.js";
+import type { ProjectWorkflow } from "../src/application/project-workflow-service.js";
 import { NotFoundError } from "../src/application/errors.js";
 import type { AgentInstanceDetail, AgentSpecSummary, ProjectWorkbench, RunDetail } from "../src/contracts/workbench.js";
 import { createApp } from "../src/server/app.js";
 
 const projectId = randomUUID();
 const runId = randomUUID();
-const forkId = randomUUID();
+const seatId = randomUUID();
 const agentInstanceId = randomUUID();
 const softwareEngineerSpec: AgentSpecSummary = {
   id: "software-engineer",
   name: "Software Engineer",
   version: 1,
+  defaultResponsibility: "代码开发与交付",
   memory: "memory.txt",
   sandbox: { dockerfile: "sandbox/Dockerfile", image: "swarm-hive:latest" },
   environmentExample: ".env.example",
@@ -34,7 +35,7 @@ const workbenchResponse: ProjectWorkbench = {
     updatedAt: "2026-08-20T12:00:00.000Z",
   },
   statistics: { activeRuns: 1, totalRuns: 1, completedRuns: 0, successRate: null },
-  primaryAgentFork: null,
+  coordinatorSeat: null,
   currentRun: null,
   recentRuns: [],
   latestInboxEvent: null,
@@ -50,21 +51,39 @@ function queries(overrides: Partial<WorkbenchQueries> = {}): WorkbenchQueries {
     listRuns: vi.fn(async () => ({ items: [], nextCursor: null })),
     listAllInboxEvents: vi.fn(async () => ({ items: [], nextCursor: null })),
     getAgentSpecUsage: vi.fn(async () => ({
-      statistics: { instances: 0, activeRequirements: 0, runningInstances: 0 },
-      activeRequirements: [],
+      statistics: { instances: 0, activeSeats: 0, runningSeats: 0 },
+      activeSeats: [],
     })),
+    listAgentInstancesBySpec: vi.fn(async () => []),
     getProjectWorkbench: vi.fn(async () => workbenchResponse),
     getAgentInstance: vi.fn(async (): Promise<AgentInstanceDetail> => ({
       agentInstance: {
         id: randomUUID(),
         specKey: "software-engineer",
         specVersion: 1,
+        instanceKey: "default",
         status: "active",
-        workspaceKey: "workspace",
+        homeKey: "software-engineer:default",
         lastActiveAt: null,
         createdAt: "2026-08-20T12:00:00.000Z",
       },
-      forks: [],
+      seats: [],
+      tasks: [],
+      recentRuns: [],
+    })),
+    getAgentSeat: vi.fn(async (): Promise<AgentInstanceDetail> => ({
+      agentInstance: {
+        id: randomUUID(),
+        specKey: "software-engineer",
+        specVersion: 1,
+        instanceKey: "default",
+        status: "active",
+        homeKey: "software-engineer:default",
+        lastActiveAt: null,
+        createdAt: "2026-08-20T12:00:00.000Z",
+      },
+      seats: [],
+      tasks: [],
       recentRuns: [],
     })),
     getAgentConversation: vi.fn(async () => ({
@@ -72,7 +91,6 @@ function queries(overrides: Partial<WorkbenchQueries> = {}): WorkbenchQueries {
       checkpointId: null,
       messages: [],
     })),
-    getReportMarkdown: vi.fn(async () => ({ content: "# Report\n", filename: "0001.md" })),
     getRun: vi.fn(async (): Promise<RunDetail> => ({
       id: runId,
       projectId,
@@ -171,7 +189,7 @@ describe("Hono server app", () => {
         enableRequestLogger: false,
       });
       const pageResponse = await app.request(
-        `/projects/${projectId}/agents/${agentInstanceId}`,
+        `/projects/${projectId}/agent-seats/${seatId}`,
       );
       expect(pageResponse.status).toBe(200);
       expect(pageResponse.headers.get("content-type")).toContain("text/html");
@@ -194,12 +212,14 @@ describe("Hono server app", () => {
         id: agentInstanceId,
         specKey: "software-engineer",
         specVersion: 1,
+        instanceKey: "default",
         status: "active",
-        workspaceKey: "workspace",
+        homeKey: "software-engineer:default",
         lastActiveAt: null,
         createdAt: "2026-08-20T12:00:00.000Z",
       },
-      forks: [],
+      seats: [],
+      tasks: [],
       recentRuns: [],
     }));
     const app = createApp({
@@ -212,6 +232,34 @@ describe("Hono server app", () => {
     expect(await response.json()).toMatchObject({ agentInstance: { id: agentInstanceId } });
     expect(getAgentInstance).toHaveBeenCalledWith(agentInstanceId);
     expect((await app.request("/api/v1/agent-instances/not-a-uuid")).status).toBe(400);
+  });
+
+  test("serves and validates the Agent Seat detail route", async () => {
+    const getAgentSeat = vi.fn(async (): Promise<AgentInstanceDetail> => ({
+      agentInstance: {
+        id: agentInstanceId,
+        specKey: "software-engineer",
+        specVersion: 1,
+        instanceKey: "default",
+        status: "active",
+        homeKey: "software-engineer:default",
+        lastActiveAt: null,
+        createdAt: "2026-08-20T12:00:00.000Z",
+      },
+      seats: [],
+      tasks: [],
+      recentRuns: [],
+    }));
+    const app = createApp({
+      workbench: queries({ getAgentSeat }),
+      specCatalog,
+      enableRequestLogger: false,
+    });
+    const response = await app.request(`/api/v1/agent-seats/${seatId}`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ agentInstance: { id: agentInstanceId } });
+    expect(getAgentSeat).toHaveBeenCalledWith(seatId);
+    expect((await app.request("/api/v1/agent-seats/not-a-uuid")).status).toBe(400);
   });
 
   test("serves an Agent Instance conversation", async () => {
@@ -239,34 +287,20 @@ describe("Hono server app", () => {
     expect(getAgentConversation).toHaveBeenCalledWith(agentInstanceId);
   });
 
-  test("serves a published Markdown report", async () => {
-    const reportId = randomUUID();
-    const app = createApp({
-      workbench: queries({
-        getReportMarkdown: vi.fn(async () => ({
-          content: "# 阶段汇报\n",
-          filename: "0001.md",
-        })),
-      }),
-      specCatalog,
-      enableRequestLogger: false,
-    });
-    const response = await app.request(`/api/v1/reports/${reportId}`);
-    expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toContain("text/markdown");
-    expect(await response.text()).toBe("# 阶段汇报\n");
-  });
-
-  test("serves an Agent Spec with each active requirement association", async () => {
+  test("serves an Agent Spec with each active Seat", async () => {
     const getAgentSpecUsage = vi.fn(async () => ({
-      statistics: { instances: 2, activeRequirements: 2, runningInstances: 1 },
-      activeRequirements: [],
+      statistics: { instances: 2, activeSeats: 2, runningSeats: 1 },
+      activeSeats: [],
     }));
     const app = createApp({
-      workbench: queries({ getAgentSpecUsage }),
+      workbench: queries({
+        getAgentSpecUsage,
+        listAgentInstancesBySpec: vi.fn(async () => []),
+      }),
       specCatalog: {
         list: vi.fn(async () => ({ items: [softwareEngineerSpec] })),
         get: vi.fn(async (key: string) => key === softwareEngineerSpec.id ? softwareEngineerSpec : null),
+        getDefinition: vi.fn(async () => ({ prompt: "Build software.", memory: "Use uv." })),
       },
       enableRequestLogger: false,
     });
@@ -274,7 +308,9 @@ describe("Hono server app", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
       spec: { id: "software-engineer" },
-      statistics: { instances: 2, activeRequirements: 2 },
+      statistics: { instances: 2, activeSeats: 2 },
+      definition: { prompt: "Build software.", memory: "Use uv." },
+      instances: [],
     });
     expect(getAgentSpecUsage).toHaveBeenCalledWith("software-engineer");
     expect((await app.request("/api/v1/agent-specs/unknown")).status).toBe(404);
@@ -294,21 +330,23 @@ describe("Hono server app", () => {
       currentNodes: [],
       fields: [],
       updatedAt: null,
-      forks: [],
+      seats: [],
     }));
-    const fork = vi.fn(async () => ({
+    const assignSeat = vi.fn(async () => ({
       projectId,
-      forkId,
-      role: "backend-a",
+      seatId,
+      responsibility: "backend-a",
+      isCoordinator: true,
+      workspaceKey: "seat:seat-id",
       agentInstance: {
         id: randomUUID(),
         specKey: "software-engineer",
         specVersion: 1,
+        instanceKey: "default",
         status: "active" as const,
       },
       session: {
         id: randomUUID(),
-        workspaceKey: "workspace",
         threadId: "thread",
         status: "active" as const,
       },
@@ -318,7 +356,7 @@ describe("Hono server app", () => {
       runId,
       projectId,
       agentInstanceId: randomUUID(),
-      forkId,
+      seatId,
       sessionId: randomUUID(),
       status: "queued" as const,
     }));
@@ -328,11 +366,12 @@ describe("Hono server app", () => {
       status: "cancelled" as const,
     }));
     const resume = vi.fn(async () => ({ runId, status: "running" as const }));
-    const requirements: RequirementWorkflow = { preview, fork, start, resume, cancel };
+    const message = vi.fn(async () => ({ projectId, runId, status: "notified" as const }));
+    const projectWorkflow: ProjectWorkflow = { preview, assignSeat, start, resume, cancel, message };
     const app = createApp({
       workbench: queries(),
       specCatalog,
-      requirements,
+      projectWorkflow,
       enableRequestLogger: false,
     });
     const sourceUrl = "https://project.feishu.cn/example-project/story/detail/1234567890";
@@ -345,25 +384,37 @@ describe("Hono server app", () => {
     expect(await previewResponse.json()).toMatchObject({ title: "实时需求" });
     expect(preview).toHaveBeenCalledWith(sourceUrl);
 
-    const assignmentResponse = await app.request("/api/v1/agent-forks", {
+    const assignmentResponse = await app.request("/api/v1/agent-seats", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         url: sourceUrl,
         specKey: "software-engineer",
-        role: "backend-a",
+        responsibility: "backend-a",
       }),
     });
     expect(assignmentResponse.status).toBe(201);
-    expect(await assignmentResponse.json()).toMatchObject({ forkId });
-    expect(fork).toHaveBeenCalledOnce();
+    expect(await assignmentResponse.json()).toMatchObject({ seatId });
+    expect(assignSeat).toHaveBeenCalledOnce();
 
-    const runResponse = await app.request(`/api/v1/agent-forks/${forkId}/runs`, {
+    const blankResponsibilityResponse = await app.request("/api/v1/agent-seats", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: sourceUrl, specKey: "software-engineer" }),
+    });
+    expect(blankResponsibilityResponse.status).toBe(201);
+    expect(assignSeat).toHaveBeenLastCalledWith({
+      url: sourceUrl,
+      specKey: "software-engineer",
+      responsibility: "",
+    });
+
+    const runResponse = await app.request(`/api/v1/agent-seats/${seatId}/runs`, {
       method: "POST",
     });
     expect(runResponse.status).toBe(202);
     expect(await runResponse.json()).toMatchObject({ runId, status: "queued" });
-    expect(start).toHaveBeenCalledWith(forkId);
+    expect(start).toHaveBeenCalledWith(seatId);
 
     const cancelResponse = await app.request(`/api/v1/runs/${runId}/cancel`, {
       method: "POST",
@@ -384,6 +435,15 @@ describe("Hono server app", () => {
     expect(resume).toHaveBeenCalledWith(runId, {
       message: "通过方案",
     });
+
+    const messageResponse = await app.request(`/api/v1/projects/${projectId}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "请汇报当前项目状态" }),
+    });
+    expect(messageResponse.status).toBe(202);
+    expect(await messageResponse.json()).toMatchObject({ projectId, runId, status: "notified" });
+    expect(message).toHaveBeenCalledWith(projectId, { message: "请汇报当前项目状态" });
 
     const legacyResumeResponse = await app.request(`/api/v1/runs/${runId}/resume`, {
       method: "POST",

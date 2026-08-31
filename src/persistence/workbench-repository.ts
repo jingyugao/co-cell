@@ -19,17 +19,16 @@ import type {
   RunStatus,
 } from "../contracts/workbench.js";
 import type {
-  AgentForkResult,
+  AgentSeatResult,
   CancelAgentRunResult,
   StartAgentRunResult,
-} from "../contracts/requirements.js";
+} from "../contracts/projects.js";
 import { ConflictError } from "../application/errors.js";
-import { PostgresWorkflowCoordinationRepository } from "./workflow-coordination-repository.js";
 
 export interface AgentRunExecutionContext {
   runId: string;
   projectId: string;
-  forkId: string;
+  seatId: string;
   sessionId: string;
   sourceUrl: string;
   source: string;
@@ -39,7 +38,8 @@ export interface AgentRunExecutionContext {
   agentInstanceId: string;
   specKey: string;
   specVersion: number;
-  role: string;
+  responsibility: string;
+  isCoordinator: boolean;
   threadId: string;
   workspaceKey: string;
 }
@@ -116,13 +116,14 @@ export class PostgresWorkbenchRepository {
       id: string;
       spec_key: string;
       spec_version: number;
+      instance_key: string;
       status: AgentInstanceDetail["agentInstance"]["status"];
-      workspace_key: string;
+      home_key: string;
       last_active_at: Date | null;
       created_at: Date;
     }>(
-      `SELECT ai.id, ai.spec_key, ai.spec_version, ai.status,
-              ai.workspace_key, ai.last_active_at, ai.created_at
+      `SELECT ai.id, ai.spec_key, ai.spec_version, ai.instance_key, ai.status,
+              ai.home_key, ai.last_active_at, ai.created_at
          FROM swarm_hive.agent_instances ai
         WHERE ai.id = $1`,
       [agentInstanceId],
@@ -130,18 +131,18 @@ export class PostgresWorkbenchRepository {
     const row = instance.rows[0];
     if (!row) return null;
 
-    const forks = await this.pool.query<{
+    const seats = await this.pool.query<{
       id: string;
-      role: string;
-      is_primary: boolean;
+      responsibility: string;
+      is_coordinator: boolean;
       workspace_key: string;
-      bound_at: Date;
+      assigned_at: Date;
       project_id: string;
       source: string;
       external_project_id: string;
       external_url: string | null;
       session_id: string;
-      session_status: AgentInstanceDetail["forks"][number]["session"]["status"];
+      session_status: AgentInstanceDetail["seats"][number]["session"]["status"];
       thread_id: string;
       session_last_active_at: Date | null;
       run_id: string | null;
@@ -149,17 +150,17 @@ export class PostgresWorkbenchRepository {
       task_summary: string | null;
       started_at: Date | null;
     }>(
-      `SELECT fork.id, fork.role, fork.is_primary, fork.workspace_key,
-              fork.bound_at, project.id AS project_id, project.source,
+      `SELECT seat.id, seat.responsibility, seat.is_coordinator, seat.workspace_key,
+              seat.assigned_at, project.id AS project_id, project.source,
               project.external_project_id, project.external_url,
               session.id AS session_id, session.status AS session_status,
               session.thread_id, session.last_active_at AS session_last_active_at,
               active_run.id AS run_id, active_run.status AS run_status,
               active_run.task_summary, active_run.started_at
-         FROM swarm_hive.agent_forks fork
-         JOIN swarm_hive.projects project ON project.id = fork.project_id
+         FROM swarm_hive.agent_seats seat
+         JOIN swarm_hive.projects project ON project.id = seat.project_id
          JOIN swarm_hive.agent_sessions session
-           ON session.agent_fork_id = fork.id
+           ON session.agent_seat_id = seat.id
           AND session.status IN ('active', 'waiting')
          LEFT JOIN LATERAL (
            SELECT run.id, run.status, run.task_summary, run.started_at
@@ -168,8 +169,8 @@ export class PostgresWorkbenchRepository {
               AND run.status IN ('queued', 'running', 'waiting_user')
             ORDER BY run.created_at DESC LIMIT 1
          ) active_run ON true
-        WHERE fork.agent_instance_id = $1 AND fork.unbound_at IS NULL
-        ORDER BY fork.bound_at DESC`,
+        WHERE seat.agent_instance_id = $1 AND seat.released_at IS NULL
+        ORDER BY seat.assigned_at DESC`,
       [agentInstanceId],
     );
 
@@ -199,6 +200,31 @@ export class PostgresWorkbenchRepository {
         LIMIT 50`,
       [agentInstanceId],
     );
+    const tasks = await this.pool.query<{
+      id: string;
+      title: string;
+      status: AgentInstanceDetail["tasks"][number]["status"];
+      blocked_reason: string | null;
+      result: string | null;
+      updated_at: Date;
+      seat_id: string;
+      responsibility: string;
+      project_id: string;
+      project_name: string | null;
+      external_project_id: string;
+    }>(
+      `SELECT task.id, task.title, task.status, task.blocked_reason, task.result,
+              task.updated_at, seat.id AS seat_id, seat.responsibility,
+              project.id AS project_id, project.name AS project_name,
+              project.external_project_id
+         FROM swarm_hive.project_tasks task
+         JOIN swarm_hive.agent_seats seat ON seat.id = task.assignee_agent_seat_id
+         JOIN swarm_hive.projects project ON project.id = task.project_id
+        WHERE seat.agent_instance_id = $1
+        ORDER BY task.updated_at DESC, task.id DESC
+        LIMIT 50`,
+      [agentInstanceId],
+    );
     const recentRuns: ProjectRunListItem[] = runs.rows.map((run) => ({
       id: run.id,
       status: run.status,
@@ -218,42 +244,80 @@ export class PostgresWorkbenchRepository {
         id: row.id,
         specKey: row.spec_key,
         specVersion: row.spec_version,
+        instanceKey: row.instance_key,
         status: row.status,
-        workspaceKey: row.workspace_key,
+        homeKey: row.home_key,
         lastActiveAt: row.last_active_at ? iso(row.last_active_at) : null,
         createdAt: iso(row.created_at),
       },
-      forks: forks.rows.map((fork) => ({
-        id: fork.id,
-        role: fork.role,
-        isPrimary: fork.is_primary,
-        workspaceKey: fork.workspace_key,
-        boundAt: iso(fork.bound_at),
+      seats: seats.rows.map((seat) => ({
+        id: seat.id,
+        responsibility: seat.responsibility,
+        isCoordinator: seat.is_coordinator,
+        workspaceKey: seat.workspace_key,
+        assignedAt: iso(seat.assigned_at),
         project: {
-          id: fork.project_id,
-          source: fork.source,
-          externalProjectId: fork.external_project_id,
-          externalUrl: fork.external_url,
+          id: seat.project_id,
+          source: seat.source,
+          externalProjectId: seat.external_project_id,
+          externalUrl: seat.external_url,
         },
         session: {
-          id: fork.session_id,
-          status: fork.session_status,
-          threadId: fork.thread_id,
-          lastActiveAt: fork.session_last_active_at
-            ? iso(fork.session_last_active_at)
+          id: seat.session_id,
+          status: seat.session_status,
+          threadId: seat.thread_id,
+          lastActiveAt: seat.session_last_active_at
+            ? iso(seat.session_last_active_at)
             : null,
         },
-        currentRun: fork.run_id && fork.run_status
+        currentRun: seat.run_id && seat.run_status
           ? {
-              id: fork.run_id,
-              status: fork.run_status,
-              taskSummary: fork.task_summary,
-              startedAt: fork.started_at ? iso(fork.started_at) : null,
+              id: seat.run_id,
+              status: seat.run_status,
+              taskSummary: seat.task_summary,
+              startedAt: seat.started_at ? iso(seat.started_at) : null,
             }
           : null,
       })),
+      tasks: tasks.rows.map((task) => ({
+        id: task.id,
+        title: task.title,
+        status: task.status,
+        blockedReason: task.blocked_reason,
+        result: task.result,
+        updatedAt: iso(task.updated_at),
+        seat: { id: task.seat_id, responsibility: task.responsibility },
+        project: {
+          id: task.project_id,
+          name: task.project_name,
+          externalProjectId: task.external_project_id,
+        },
+      })),
       recentRuns,
     };
+  }
+
+  async listAgentInstanceDetailsBySpec(specKey: string): Promise<AgentInstanceDetail[]> {
+    const result = await this.pool.query<{ id: string }>(
+      `SELECT id
+         FROM swarm_hive.agent_instances
+        WHERE spec_key = $1
+        ORDER BY created_at ASC, id ASC`,
+      [specKey],
+    );
+    const details = await Promise.all(result.rows.map((row) => this.getAgentInstanceDetail(row.id)));
+    return details.filter((detail): detail is AgentInstanceDetail => detail !== null);
+  }
+
+  async getAgentSeatDetail(agentSeatId: string): Promise<AgentInstanceDetail | null> {
+    const result = await this.pool.query<{ agent_instance_id: string }>(
+      `SELECT agent_instance_id
+         FROM swarm_hive.agent_seats
+        WHERE id = $1 AND released_at IS NULL`,
+      [agentSeatId],
+    );
+    const agentInstanceId = result.rows[0]?.agent_instance_id;
+    return agentInstanceId ? this.getAgentInstanceDetail(agentInstanceId) : null;
   }
 
   async getAgentSessionThreadId(agentSessionId: string): Promise<string | null> {
@@ -298,22 +362,27 @@ export class PostgresWorkbenchRepository {
       name: string | null;
       status: ProjectSummary["status"];
       updated_at: Date;
+      agent_seat_id: string | null;
+      responsibility: string | null;
       agent_instance_id: string | null;
-      agent_instance_status: NonNullable<ProjectSummary["agentInstance"]>["status"] | null;
+      agent_instance_status:
+        NonNullable<ProjectSummary["coordinatorSeat"]>["agentInstance"]["status"] | null;
       spec_key: string | null;
+      instance_key: string | null;
       run_id: string | null;
       run_status: NonNullable<ProjectSummary["currentRun"]>["status"] | null;
       task_summary: string | null;
     }>(
       `SELECT p.id, p.source, p.external_project_id, p.external_url,
               p.name, p.status, p.updated_at,
+              seat.id AS agent_seat_id, seat.responsibility,
               ai.id AS agent_instance_id, ai.status AS agent_instance_status,
-              ai.spec_key, active_run.id AS run_id,
+              ai.spec_key, ai.instance_key, active_run.id AS run_id,
               active_run.status AS run_status, active_run.task_summary
          FROM swarm_hive.projects p
-         LEFT JOIN swarm_hive.agent_forks pai
-           ON pai.project_id = p.id AND pai.unbound_at IS NULL AND pai.is_primary
-         LEFT JOIN swarm_hive.agent_instances ai ON ai.id = pai.agent_instance_id
+         LEFT JOIN swarm_hive.agent_seats seat
+           ON seat.project_id = p.id AND seat.released_at IS NULL AND seat.is_coordinator
+         LEFT JOIN swarm_hive.agent_instances ai ON ai.id = seat.agent_instance_id
          LEFT JOIN LATERAL (
            SELECT r.id, r.status, r.task_summary
              FROM swarm_hive.agent_runs r
@@ -337,12 +406,18 @@ export class PostgresWorkbenchRepository {
       externalUrl: row.external_url,
       name: row.name,
       status: row.status,
-      agentInstance:
-        row.agent_instance_id && row.agent_instance_status && row.spec_key
+      coordinatorSeat:
+        row.agent_seat_id && row.responsibility && row.agent_instance_id &&
+        row.agent_instance_status && row.spec_key && row.instance_key
           ? {
-              id: row.agent_instance_id,
-              status: row.agent_instance_status,
-              specKey: row.spec_key,
+              id: row.agent_seat_id,
+              responsibility: row.responsibility,
+              agentInstance: {
+                id: row.agent_instance_id,
+                status: row.agent_instance_status,
+                specKey: row.spec_key,
+                instanceKey: row.instance_key,
+              },
             }
           : null,
       currentRun:
@@ -390,23 +465,27 @@ export class PostgresWorkbenchRepository {
         id: string;
         spec_key: string;
         spec_version: number;
+        instance_key: string;
+        home_key: string;
         agent_instance_id: string;
         session_id: string;
-        role: string;
-        status: NonNullable<ProjectWorkbench["primaryAgentFork"]>["status"];
+        responsibility: string;
+        status:
+          NonNullable<ProjectWorkbench["coordinatorSeat"]>["agentInstance"]["status"];
         workspace_key: string;
         thread_id: string;
         last_active_at: Date | null;
       }>(
-        `SELECT pai.id, ai.id AS agent_instance_id, session.id AS session_id,
-                pai.role, ai.spec_key, ai.spec_version, ai.status,
-                pai.workspace_key, session.thread_id, ai.last_active_at
-           FROM swarm_hive.agent_forks pai
-           JOIN swarm_hive.agent_instances ai ON ai.id = pai.agent_instance_id
+        `SELECT seat.id, ai.id AS agent_instance_id, session.id AS session_id,
+                seat.responsibility, ai.spec_key, ai.spec_version,
+                ai.instance_key, ai.home_key, ai.status,
+                seat.workspace_key, session.thread_id, ai.last_active_at
+           FROM swarm_hive.agent_seats seat
+           JOIN swarm_hive.agent_instances ai ON ai.id = seat.agent_instance_id
            JOIN swarm_hive.agent_sessions session
-             ON session.agent_fork_id = pai.id
+             ON session.agent_seat_id = seat.id
             AND session.status IN ('active', 'waiting')
-          WHERE pai.project_id = $1 AND pai.unbound_at IS NULL AND pai.is_primary
+          WHERE seat.project_id = $1 AND seat.released_at IS NULL AND seat.is_coordinator
           LIMIT 1`,
         [projectId],
       );
@@ -517,18 +596,26 @@ export class PostgresWorkbenchRepository {
               ? null
               : Number((Number(statistics.succeeded_runs) / completedRuns).toFixed(4)),
         },
-        primaryAgentFork: instanceRow
+        coordinatorSeat: instanceRow
           ? {
               id: instanceRow.id,
-              agentInstanceId: instanceRow.agent_instance_id,
-              sessionId: instanceRow.session_id,
-              role: instanceRow.role,
-              specKey: instanceRow.spec_key,
-              specVersion: instanceRow.spec_version,
-              status: instanceRow.status,
+              responsibility: instanceRow.responsibility,
               workspaceKey: instanceRow.workspace_key,
-              threadId: instanceRow.thread_id,
-              lastActiveAt: instanceRow.last_active_at ? iso(instanceRow.last_active_at) : null,
+              agentInstance: {
+                id: instanceRow.agent_instance_id,
+                instanceKey: instanceRow.instance_key,
+                specKey: instanceRow.spec_key,
+                specVersion: instanceRow.spec_version,
+                status: instanceRow.status,
+                homeKey: instanceRow.home_key,
+                lastActiveAt: instanceRow.last_active_at
+                  ? iso(instanceRow.last_active_at)
+                  : null,
+              },
+              session: {
+                id: instanceRow.session_id,
+                threadId: instanceRow.thread_id,
+              },
             }
           : null,
         currentRun: currentRunRow
@@ -902,76 +989,75 @@ export class PostgresWorkbenchRepository {
   }
 
   async getAgentSpecUsage(specKey: string): Promise<AgentSpecUsage> {
-    const [statisticsResult, requirementsResult] = await Promise.all([
-      this.pool.query<{ instances: string; running_instances: string }>(
-        `SELECT count(*)::text AS instances,
-                count(*) FILTER (WHERE EXISTS (
-                  SELECT 1 FROM swarm_hive.agent_runs run
-                   WHERE run.agent_instance_id = instance.id
-                     AND run.status = 'running'
-                ))::text AS running_instances
+    const [statisticsResult, seatsResult] = await Promise.all([
+      this.pool.query<{ instances: string }>(
+        `SELECT count(*)::text AS instances
            FROM swarm_hive.agent_instances instance
           WHERE instance.spec_key = $1`,
         [specKey],
       ),
       this.pool.query<{
-        association_id: string;
-        role: string;
-        is_primary: boolean;
-        bound_at: Date;
+        seat_id: string;
+        responsibility: string;
+        is_coordinator: boolean;
+        assigned_at: Date;
         project_id: string;
         project_name: string | null;
         external_project_id: string;
-        project_status: AgentSpecUsage["activeRequirements"][number]["project"]["status"];
+        project_status: AgentSpecUsage["activeSeats"][number]["project"]["status"];
         instance_id: string;
+        instance_key: string;
         spec_version: number;
-        instance_status: AgentSpecUsage["activeRequirements"][number]["agentInstance"]["status"];
+        instance_status: AgentSpecUsage["activeSeats"][number]["agentInstance"]["status"];
+        home_key: string;
         workspace_key: string;
         last_active_at: Date | null;
         run_id: string | null;
-        run_status: NonNullable<AgentSpecUsage["activeRequirements"][number]["currentRun"]>["status"] | null;
+        run_status: NonNullable<AgentSpecUsage["activeSeats"][number]["currentRun"]>["status"] | null;
         task_summary: string | null;
       }>(
-        `SELECT pai.id AS association_id, pai.role, pai.is_primary, pai.bound_at,
+        `SELECT seat.id AS seat_id, seat.responsibility, seat.is_coordinator, seat.assigned_at,
                 p.id AS project_id, p.name AS project_name,
                 p.external_project_id, p.status AS project_status,
-                ai.id AS instance_id, ai.spec_version, ai.status AS instance_status,
-                pai.workspace_key, ai.last_active_at,
+                ai.id AS instance_id, ai.instance_key, ai.spec_version,
+                ai.status AS instance_status, ai.home_key,
+                seat.workspace_key, ai.last_active_at,
                 active_run.id AS run_id, active_run.status AS run_status,
                 active_run.task_summary
            FROM swarm_hive.agent_instances ai
-           JOIN swarm_hive.agent_forks pai
-             ON pai.agent_instance_id = ai.id AND pai.unbound_at IS NULL
+           JOIN swarm_hive.agent_seats seat
+             ON seat.agent_instance_id = ai.id AND seat.released_at IS NULL
            JOIN swarm_hive.projects p
-             ON p.id = pai.project_id AND p.status = 'active'
+             ON p.id = seat.project_id AND p.status = 'active'
+           JOIN swarm_hive.agent_sessions session
+             ON session.agent_seat_id = seat.id
+            AND session.status IN ('active', 'waiting')
            LEFT JOIN LATERAL (
              SELECT r.id, r.status, r.task_summary
                FROM swarm_hive.agent_runs r
-              WHERE r.agent_instance_id = ai.id
-                AND r.project_id = p.id
+              WHERE r.agent_session_id = session.id
                 AND r.status IN ('queued', 'running', 'waiting_user')
               ORDER BY r.created_at DESC LIMIT 1
            ) active_run ON true
           WHERE ai.spec_key = $1
-          ORDER BY p.updated_at DESC, pai.is_primary DESC, pai.bound_at ASC`,
+          ORDER BY p.updated_at DESC, seat.is_coordinator DESC, seat.assigned_at ASC`,
         [specKey],
       ),
     ]);
     const statistics = statisticsResult.rows[0] ?? {
       instances: "0",
-      running_instances: "0",
     };
     return {
       statistics: {
         instances: Number(statistics.instances),
-        activeRequirements: requirementsResult.rows.length,
-        runningInstances: Number(statistics.running_instances),
+        activeSeats: seatsResult.rows.length,
+        runningSeats: seatsResult.rows.filter((row) => row.run_status === "running").length,
       },
-      activeRequirements: requirementsResult.rows.map((row) => ({
-        forkId: row.association_id,
-        role: row.role,
-        isPrimary: row.is_primary,
-        boundAt: iso(row.bound_at),
+      activeSeats: seatsResult.rows.map((row) => ({
+        seatId: row.seat_id,
+        responsibility: row.responsibility,
+        isCoordinator: row.is_coordinator,
+        assignedAt: iso(row.assigned_at),
         project: {
           id: row.project_id,
           name: row.project_name,
@@ -980,11 +1066,13 @@ export class PostgresWorkbenchRepository {
         },
         agentInstance: {
           id: row.instance_id,
+          instanceKey: row.instance_key,
           specVersion: row.spec_version,
           status: row.instance_status,
-          workspaceKey: row.workspace_key,
+          homeKey: row.home_key,
           lastActiveAt: row.last_active_at ? iso(row.last_active_at) : null,
         },
+        workspaceKey: row.workspace_key,
         currentRun:
           row.run_id && row.run_status
             ? {
@@ -997,20 +1085,20 @@ export class PostgresWorkbenchRepository {
     };
   }
 
-  async createAgentFork(input: {
+  async createAgentSeat(input: {
     sourceUrl: string;
     externalProjectKey: string;
     externalWorkItemType: string;
     externalWorkItemId: string;
     specKey: string;
     specVersion: number;
-    role: string;
-    threadId: string;
-    workspaceKey: string;
-  }): Promise<AgentForkResult> {
+    responsibility: string;
+    isCoordinator?: boolean;
+  }): Promise<AgentSeatResult> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      const isCoordinator = input.isCoordinator ?? true;
       const project = await client.query<{ id: string }>(
         `INSERT INTO swarm_hive.projects(
            source, external_project_id, external_url, external_project_key,
@@ -1034,59 +1122,74 @@ export class PostgresWorkbenchRepository {
         "SELECT id FROM swarm_hive.projects WHERE id = $1 FOR UPDATE",
         [projectId],
       );
-      const activeAssignment = await client.query<{ id: string }>(
-        `SELECT id
-           FROM swarm_hive.agent_forks
-          WHERE project_id = $1 AND unbound_at IS NULL
+      const existingCoordinator = await client.query<{ id: string }>(
+        `SELECT id FROM swarm_hive.agent_seats
+          WHERE project_id = $1 AND released_at IS NULL AND is_coordinator
           LIMIT 1`,
         [projectId],
       );
-      if (activeAssignment.rowCount) {
-        throw new ConflictError("This requirement already has an active Agent");
+      if (!isCoordinator && existingCoordinator.rows.length === 0) {
+        throw new ConflictError("The first Agent Seat in a Project must be the Coordinator");
       }
-      const instance = await client.query<{ id: string }>(
+      const instanceKey = "default";
+      const homeKey = `${input.specKey}:${instanceKey}`;
+      const instance = await client.query<{ id: string; status: AgentSeatResult["agentInstance"]["status"] }>(
         `INSERT INTO swarm_hive.agent_instances(
-           spec_key, spec_version, instance_key, workspace_key, status
-         ) VALUES ($1, $2, $1, $1, 'active')
-         ON CONFLICT (spec_key) DO UPDATE
+           spec_key, spec_version, instance_key, home_key, status
+         ) VALUES ($1, $2, $3, $4, 'active')
+         ON CONFLICT (spec_key, instance_key) DO UPDATE
            SET spec_version = excluded.spec_version
-         RETURNING id`,
-        [input.specKey, input.specVersion],
+         RETURNING id, status`,
+        [input.specKey, input.specVersion, instanceKey, homeKey],
       );
       const agentInstanceId = instance.rows[0]?.id;
       if (!agentInstanceId) throw new Error("Agent Instance was not created");
-      const fork = await client.query<{ id: string }>(
-        `INSERT INTO swarm_hive.agent_forks(
-           project_id, agent_instance_id, role, is_primary, workspace_key
-         ) VALUES ($1, $2, $3, true, $4)
+      if (instance.rows[0]?.status === "disabled") {
+        throw new ConflictError("Agent Instance is disabled");
+      }
+      if (isCoordinator) {
+        await client.query(
+          `UPDATE swarm_hive.agent_seats SET is_coordinator = false, updated_at = now()
+            WHERE project_id = $1 AND released_at IS NULL AND is_coordinator`,
+          [projectId],
+        );
+      }
+      const seatId = randomUUID();
+      const workspaceKey = `seat:${seatId}`;
+      const threadId = `agent-seat:${seatId}`;
+      const seat = await client.query<{ id: string }>(
+        `INSERT INTO swarm_hive.agent_seats(
+           id, project_id, agent_instance_id, responsibility, is_coordinator, workspace_key
+         ) VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING id`,
-        [projectId, agentInstanceId, input.role, input.workspaceKey],
+        [seatId, projectId, agentInstanceId, input.responsibility, isCoordinator, workspaceKey],
       );
-      const forkId = fork.rows[0]?.id;
-      if (!forkId) throw new Error("Agent Fork was not created");
+      if (!seat.rows[0]?.id) throw new Error("Agent Seat was not created");
       const session = await client.query<{ id: string }>(
-        `INSERT INTO swarm_hive.agent_sessions(agent_fork_id, thread_id)
+        `INSERT INTO swarm_hive.agent_sessions(agent_seat_id, thread_id)
          VALUES ($1, $2)
          RETURNING id`,
-        [forkId, input.threadId],
+        [seatId, threadId],
       );
       const sessionId = session.rows[0]?.id;
       if (!sessionId) throw new Error("Agent Session was not created");
       await client.query("COMMIT");
       return {
         projectId,
-        forkId,
-        role: input.role,
+        seatId,
+        responsibility: input.responsibility,
+        isCoordinator,
+        workspaceKey,
         agentInstance: {
           id: agentInstanceId,
           specKey: input.specKey,
           specVersion: input.specVersion,
+          instanceKey,
           status: "active",
         },
         session: {
           id: sessionId,
-          threadId: input.threadId,
-          workspaceKey: input.workspaceKey,
+          threadId,
           status: "active",
         },
         currentRun: null,
@@ -1099,46 +1202,47 @@ export class PostgresWorkbenchRepository {
     }
   }
 
-  async listAgentForks(input: {
+  async listAgentSeats(input: {
     externalProjectKey: string;
     externalWorkItemType: string;
     externalWorkItemId: string;
-  }): Promise<AgentForkResult[]> {
+  }): Promise<AgentSeatResult[]> {
     const result = await this.pool.query<{
       project_id: string;
-      fork_id: string;
+      seat_id: string;
       session_id: string;
       agent_instance_id: string;
       spec_key: string;
       spec_version: number;
-      role: string;
+      instance_key: string;
+      responsibility: string;
+      is_coordinator: boolean;
       workspace_key: string;
       thread_id: string;
-      status: AgentForkResult["agentInstance"]["status"];
-      session_status: AgentForkResult["session"]["status"];
+      status: AgentSeatResult["agentInstance"]["status"];
+      session_status: AgentSeatResult["session"]["status"];
       run_id: string | null;
-      run_status: NonNullable<AgentForkResult["currentRun"]>["status"] | null;
+      run_status: NonNullable<AgentSeatResult["currentRun"]>["status"] | null;
       task_summary: string | null;
     }>(
-      `SELECT p.id AS project_id, pai.id AS fork_id, session.id AS session_id,
-              ai.id AS agent_instance_id, ai.spec_key, ai.spec_version,
-              pai.role,
-              pai.workspace_key, session.thread_id, session.status AS session_status,
+      `SELECT p.id AS project_id, seat.id AS seat_id, session.id AS session_id,
+              ai.id AS agent_instance_id, ai.spec_key, ai.spec_version, ai.instance_key,
+              seat.responsibility, seat.is_coordinator,
+              seat.workspace_key, session.thread_id, session.status AS session_status,
               ai.status,
               active_run.id AS run_id, active_run.status AS run_status,
               active_run.task_summary
          FROM swarm_hive.projects p
-         JOIN swarm_hive.agent_forks pai
-           ON pai.project_id = p.id AND pai.unbound_at IS NULL
-         JOIN swarm_hive.agent_instances ai ON ai.id = pai.agent_instance_id
+         JOIN swarm_hive.agent_seats seat
+           ON seat.project_id = p.id AND seat.released_at IS NULL
+         JOIN swarm_hive.agent_instances ai ON ai.id = seat.agent_instance_id
          JOIN swarm_hive.agent_sessions session
-           ON session.agent_fork_id = pai.id
+           ON session.agent_seat_id = seat.id
           AND session.status IN ('active', 'waiting')
          LEFT JOIN LATERAL (
            SELECT r.id, r.status, r.task_summary
              FROM swarm_hive.agent_runs r
-            WHERE r.project_id = p.id
-              AND r.agent_instance_id = ai.id
+            WHERE r.agent_session_id = session.id
               AND r.status IN ('queued', 'running', 'waiting_user')
             ORDER BY r.created_at DESC LIMIT 1
          ) active_run ON true
@@ -1146,23 +1250,25 @@ export class PostgresWorkbenchRepository {
           AND p.external_project_key = $1
           AND p.external_work_item_type = $2
           AND p.external_project_id = $3
-        ORDER BY pai.bound_at ASC`,
+        ORDER BY seat.assigned_at ASC`,
       [input.externalProjectKey, input.externalWorkItemType, input.externalWorkItemId],
     );
     return result.rows.map((row) => ({
         projectId: row.project_id,
-        forkId: row.fork_id,
-        role: row.role,
+        seatId: row.seat_id,
+        responsibility: row.responsibility,
+        isCoordinator: row.is_coordinator,
+        workspaceKey: row.workspace_key,
         agentInstance: {
           id: row.agent_instance_id,
           specKey: row.spec_key,
           specVersion: row.spec_version,
+          instanceKey: row.instance_key,
           status: row.status,
         },
         session: {
           id: row.session_id,
           threadId: row.thread_id,
-          workspaceKey: row.workspace_key,
           status: row.session_status,
         },
         currentRun: row.run_id && row.run_status
@@ -1171,31 +1277,347 @@ export class PostgresWorkbenchRepository {
       }));
   }
 
-  async createAgentRun(forkId: string): Promise<StartAgentRunResult> {
+  async getCoordinatorSeat(projectId: string): Promise<{
+    seatId: string;
+    agentInstanceId: string;
+  } | null> {
+    const result = await this.pool.query<{
+      seat_id: string;
+      agent_instance_id: string;
+    }>(
+      `SELECT seat.id AS seat_id, seat.agent_instance_id
+         FROM swarm_hive.agent_seats seat
+         JOIN swarm_hive.agent_instances instance ON instance.id = seat.agent_instance_id
+        WHERE seat.project_id = $1 AND seat.released_at IS NULL
+          AND seat.is_coordinator AND instance.status = 'active'
+        LIMIT 1`,
+      [projectId],
+    );
+    const row = result.rows[0];
+    return row ? { seatId: row.seat_id, agentInstanceId: row.agent_instance_id } : null;
+  }
+
+  async listProjectAgentSeats(projectId: string): Promise<Array<{
+    seatId: string;
+    specKey: string;
+    responsibility: string;
+    isCoordinator: boolean;
+    status: string;
+  }>> {
+    const result = await this.pool.query<{
+      seat_id: string;
+      spec_key: string;
+      responsibility: string;
+      is_coordinator: boolean;
+      status: string;
+    }>(
+      `SELECT seat.id AS seat_id, instance.spec_key, seat.responsibility, seat.is_coordinator,
+              instance.status
+         FROM swarm_hive.agent_seats seat
+         JOIN swarm_hive.agent_instances instance ON instance.id = seat.agent_instance_id
+        WHERE seat.project_id = $1 AND seat.released_at IS NULL
+        ORDER BY seat.is_coordinator DESC, seat.assigned_at`,
+      [projectId],
+    );
+    return result.rows.map((row) => ({
+      seatId: row.seat_id,
+      specKey: row.spec_key,
+      responsibility: row.responsibility,
+      isCoordinator: row.is_coordinator,
+      status: row.status,
+    }));
+  }
+
+  async getProjectToolContext(projectId: string, agentSeatId: string): Promise<{
+    project: {
+      id: string;
+      source: string;
+      sourceUrl: string | null;
+      externalProjectId: string;
+      status: string;
+    };
+    seat: {
+      id: string;
+      specKey: string;
+      responsibility: string;
+      isCoordinator: boolean;
+    };
+  } | null> {
+    const result = await this.pool.query<{
+      project_id: string;
+      source: string;
+      external_url: string | null;
+      external_project_id: string;
+      project_status: string;
+      seat_id: string;
+      spec_key: string;
+      responsibility: string;
+      is_coordinator: boolean;
+    }>(
+      `SELECT project.id AS project_id, project.source, project.external_url,
+              project.external_project_id, project.status AS project_status,
+              seat.id AS seat_id, instance.spec_key, seat.responsibility,
+              seat.is_coordinator
+         FROM swarm_hive.projects project
+         JOIN swarm_hive.agent_seats seat ON seat.project_id = project.id
+         JOIN swarm_hive.agent_instances instance ON instance.id = seat.agent_instance_id
+        WHERE project.id = $1 AND seat.id = $2 AND seat.released_at IS NULL`,
+      [projectId, agentSeatId],
+    );
+    const row = result.rows[0];
+    return row ? {
+      project: {
+        id: row.project_id,
+        source: row.source,
+        sourceUrl: row.external_url,
+        externalProjectId: row.external_project_id,
+        status: row.project_status,
+      },
+      seat: {
+        id: row.seat_id,
+        specKey: row.spec_key,
+        responsibility: row.responsibility,
+        isCoordinator: row.is_coordinator,
+      },
+    } : null;
+  }
+
+  async bindProjectAgentSeat(input: {
+    projectId: string;
+    requestedBySeatId: string;
+    specKey: string;
+    specVersion: number;
+    responsibility: string;
+  }): Promise<AgentSeatResult> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const assignment = await client.query<{
+      const project = await client.query<{ id: string }>(
+        `SELECT project.id
+           FROM swarm_hive.projects project
+           JOIN swarm_hive.agent_seats requester
+             ON requester.project_id = project.id
+            AND requester.id = $2
+            AND requester.released_at IS NULL
+            AND requester.is_coordinator
+          WHERE project.id = $1 AND project.status = 'active'
+          FOR UPDATE OF project`,
+        [input.projectId, input.requestedBySeatId],
+      );
+      if (!project.rows[0]) {
+        throw new ConflictError("Only the active Project Coordinator can bind an Agent");
+      }
+      const instanceKey = "default";
+      const instance = await client.query<{
+        id: string;
+        status: AgentSeatResult["agentInstance"]["status"];
+      }>(
+        `INSERT INTO swarm_hive.agent_instances(
+           spec_key, spec_version, instance_key, home_key, status
+         ) VALUES ($1, $2, $3, $4, 'active')
+         ON CONFLICT (spec_key, instance_key) DO UPDATE
+           SET spec_version = excluded.spec_version
+         RETURNING id, status`,
+        [input.specKey, input.specVersion, instanceKey, `${input.specKey}:${instanceKey}`],
+      );
+      const agentInstance = instance.rows[0];
+      if (!agentInstance) throw new Error("Agent Instance was not created");
+      if (agentInstance.status === "disabled") {
+        throw new ConflictError("Agent Instance is disabled");
+      }
+      const seatId = randomUUID();
+      const workspaceKey = `seat:${seatId}`;
+      await client.query(
+        `INSERT INTO swarm_hive.agent_seats(
+           id, project_id, agent_instance_id, responsibility, is_coordinator, workspace_key
+         ) VALUES ($1, $2, $3, $4, false, $5)`,
+        [seatId, input.projectId, agentInstance.id, input.responsibility, workspaceKey],
+      );
+      const threadId = `agent-seat:${seatId}`;
+      const session = await client.query<{ id: string }>(
+        `INSERT INTO swarm_hive.agent_sessions(agent_seat_id, thread_id)
+         VALUES ($1, $2)
+         RETURNING id`,
+        [seatId, threadId],
+      );
+      const sessionId = session.rows[0]?.id;
+      if (!sessionId) throw new Error("Agent Session was not created");
+      await client.query("COMMIT");
+      return {
+        projectId: input.projectId,
+        seatId,
+        responsibility: input.responsibility,
+        isCoordinator: false,
+        workspaceKey,
+        agentInstance: {
+          id: agentInstance.id,
+          specKey: input.specKey,
+          specVersion: input.specVersion,
+          instanceKey,
+          status: agentInstance.status,
+        },
+        session: { id: sessionId, threadId, status: "active" },
+        currentRun: null,
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async releaseProjectAgentSeat(input: {
+    projectId: string;
+    requestedBySeatId: string;
+    seatId: string;
+    reason: string;
+  }): Promise<{ seatId: string; status: "released"; reason: string }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const target = await client.query<{ is_coordinator: boolean }>(
+        `SELECT target.is_coordinator
+           FROM swarm_hive.agent_seats target
+           JOIN swarm_hive.agent_seats requester
+             ON requester.project_id = target.project_id
+            AND requester.id = $2
+            AND requester.released_at IS NULL
+            AND requester.is_coordinator
+          WHERE target.project_id = $1 AND target.id = $3
+            AND target.released_at IS NULL
+          FOR UPDATE OF target`,
+        [input.projectId, input.requestedBySeatId, input.seatId],
+      );
+      const seat = target.rows[0];
+      if (!seat) {
+        throw new ConflictError("Only the active Project Coordinator can release this Agent Seat");
+      }
+      if (seat.is_coordinator) {
+        throw new ConflictError("The Project Coordinator Seat cannot release itself");
+      }
+      const activeRuns = await client.query(
+        `SELECT 1
+           FROM swarm_hive.agent_runs run
+           JOIN swarm_hive.agent_sessions session ON session.id = run.agent_session_id
+          WHERE session.agent_seat_id = $1
+            AND run.status IN ('queued', 'running', 'waiting_user')
+          LIMIT 1`,
+        [input.seatId],
+      );
+      if (activeRuns.rowCount) {
+        throw new ConflictError("Agent Seat has an active Run");
+      }
+      const unfinishedTasks = await client.query(
+        `SELECT 1
+           FROM swarm_hive.project_tasks task
+          WHERE task.project_id = $1 AND task.assignee_agent_seat_id = $2
+            AND task.status IN ('pending', 'assigned', 'running', 'blocked')
+          LIMIT 1`,
+        [input.projectId, input.seatId],
+      );
+      if (unfinishedTasks.rowCount) {
+        throw new ConflictError("Agent Seat has unfinished Tasks");
+      }
+      await client.query(
+        `UPDATE swarm_hive.agent_sessions
+            SET status = 'closed', closed_at = coalesce(closed_at, now()), updated_at = now()
+          WHERE agent_seat_id = $1 AND status IN ('active', 'waiting')`,
+        [input.seatId],
+      );
+      await client.query(
+        `UPDATE swarm_hive.agent_seats
+            SET released_at = now(), updated_at = now()
+          WHERE id = $1`,
+        [input.seatId],
+      );
+      await client.query("COMMIT");
+      return { seatId: input.seatId, status: "released", reason: input.reason };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async createAgentRun(
+    seatId: string,
+    options: {
+      taskId?: string;
+      sessionMode?: "continue" | "fresh";
+    } = {},
+  ): Promise<StartAgentRunResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const seatRecord = await client.query<{
         project_id: string;
         agent_instance_id: string;
         work_item_id: string;
-        instance_status: AgentForkResult["agentInstance"]["status"];
+        instance_status: AgentSeatResult["agentInstance"]["status"];
       }>(
-        `SELECT pai.project_id, pai.agent_instance_id,
+        `SELECT seat.project_id, seat.agent_instance_id,
                 p.external_project_id AS work_item_id,
                 ai.status AS instance_status
-           FROM swarm_hive.agent_forks pai
-           JOIN swarm_hive.projects p ON p.id = pai.project_id
-           JOIN swarm_hive.agent_instances ai ON ai.id = pai.agent_instance_id
-          WHERE pai.id = $1 AND pai.unbound_at IS NULL
-          FOR UPDATE OF pai, ai`,
-        [forkId],
+           FROM swarm_hive.agent_seats seat
+           JOIN swarm_hive.projects p ON p.id = seat.project_id
+           JOIN swarm_hive.agent_instances ai ON ai.id = seat.agent_instance_id
+          WHERE seat.id = $1 AND seat.released_at IS NULL
+          FOR UPDATE OF seat, ai`,
+        [seatId],
       );
-      const row = assignment.rows[0];
-      if (!row) throw new Error("Agent Fork was not found");
+      const row = seatRecord.rows[0];
+      if (!row) throw new Error("Agent Seat was not found");
       if (row.instance_status === "disabled") {
         throw new ConflictError("Agent Instance is disabled");
       }
+      const currentSession = await client.query<{ id: string }>(
+        `SELECT id
+           FROM swarm_hive.agent_sessions
+          WHERE agent_seat_id = $1 AND status IN ('active', 'waiting')
+          ORDER BY created_at DESC
+          LIMIT 1
+          FOR UPDATE`,
+        [seatId],
+      );
+      let sessionId = currentSession.rows[0]?.id;
+      if (sessionId) {
+        const previousRun = await client.query<{ status: RunStatus }>(
+          `SELECT status
+             FROM swarm_hive.agent_runs
+            WHERE agent_session_id = $1
+            ORDER BY created_at DESC
+            LIMIT 1`,
+          [sessionId],
+        );
+        const previousStatus = previousRun.rows[0]?.status;
+        if (previousStatus && ["queued", "running", "waiting_user"].includes(previousStatus)) {
+          throw new ConflictError("Agent Seat already has an active Run");
+        }
+        if (
+          previousStatus &&
+          (options.sessionMode === "fresh" || previousStatus === "failed")
+        ) {
+          await client.query(
+            `UPDATE swarm_hive.agent_sessions
+                SET status = 'closed', closed_at = now()
+              WHERE id = $1`,
+            [sessionId],
+          );
+          sessionId = undefined;
+        }
+      }
+      if (!sessionId) {
+        const session = await client.query<{ id: string }>(
+          `INSERT INTO swarm_hive.agent_sessions(agent_seat_id, thread_id)
+           VALUES ($1, $2)
+           RETURNING id`,
+          [seatId, `agent-seat:${seatId}:${randomUUID()}`],
+        );
+        sessionId = session.rows[0]?.id;
+      }
+      if (!sessionId) throw new Error("Agent Session was not created");
       const event = await client.query<{ id: string }>(
         `INSERT INTO swarm_hive.inbox_events(
            source, external_event_id, project_id, event_type, status, processed_at
@@ -1206,19 +1628,20 @@ export class PostgresWorkbenchRepository {
       const run = await client.query<{ id: string; session_id: string }>(
         `INSERT INTO swarm_hive.agent_runs(
            project_id, agent_instance_id, agent_session_id,
-           trigger_event_id, status, task_summary
-         ) SELECT $1, $2, session.id, $3, 'queued', $4
-             FROM swarm_hive.agent_sessions session
-            WHERE session.agent_fork_id = $5
-              AND session.status IN ('active', 'waiting')
-            ORDER BY session.created_at DESC LIMIT 1
+           trigger_event_id, status, task_summary, task_id
+         ) SELECT $1, $2, $5, $3, 'queued', $4, $6
+            WHERE ($6::uuid IS NULL OR EXISTS (
+                SELECT 1 FROM swarm_hive.project_tasks task
+                 WHERE task.id = $6 AND task.project_id = $1
+              ))
          RETURNING id, agent_session_id AS session_id`,
         [
           row.project_id,
           row.agent_instance_id,
           event.rows[0]?.id,
-          `开发飞书需求 ${row.work_item_id}`,
-          forkId,
+          `处理飞书工作项 ${row.work_item_id}`,
+          sessionId,
+          options.taskId ?? null,
         ],
       );
       const runId = run.rows[0]?.id;
@@ -1232,7 +1655,7 @@ export class PostgresWorkbenchRepository {
         runId,
         projectId: row.project_id,
         agentInstanceId: row.agent_instance_id,
-        forkId,
+        seatId,
         sessionId: run.rows[0]!.session_id,
         status: "queued",
       };
@@ -1291,7 +1714,7 @@ export class PostgresWorkbenchRepository {
     const result = await this.pool.query<{
       run_id: string;
       project_id: string;
-      assignment_id: string;
+      seat_id: string;
       session_id: string;
       external_url: string;
       source: string;
@@ -1301,19 +1724,20 @@ export class PostgresWorkbenchRepository {
       agent_instance_id: string;
       spec_key: string;
       spec_version: number;
-      role: string;
+      responsibility: string;
+      is_coordinator: boolean;
       thread_id: string;
       workspace_key: string;
     }>(
-      `SELECT r.id AS run_id, r.project_id, fork.id AS assignment_id,
+      `SELECT r.id AS run_id, r.project_id, seat.id AS seat_id,
               session.id AS session_id,
               p.source, p.external_url, p.external_project_key, p.external_work_item_type,
               p.external_project_id, ai.id AS agent_instance_id,
-              ai.spec_key, ai.spec_version, fork.role,
-              session.thread_id, fork.workspace_key
+              ai.spec_key, ai.spec_version, seat.responsibility, seat.is_coordinator,
+              session.thread_id, seat.workspace_key
          FROM swarm_hive.agent_runs r
          JOIN swarm_hive.agent_sessions session ON session.id = r.agent_session_id
-         JOIN swarm_hive.agent_forks fork ON fork.id = session.agent_fork_id
+         JOIN swarm_hive.agent_seats seat ON seat.id = session.agent_seat_id
          JOIN swarm_hive.agent_instances ai ON ai.id = r.agent_instance_id
          JOIN swarm_hive.projects p ON p.id = r.project_id
         WHERE r.id = $1`,
@@ -1324,7 +1748,7 @@ export class PostgresWorkbenchRepository {
     return {
       runId: row.run_id,
       projectId: row.project_id,
-      forkId: row.assignment_id,
+      seatId: row.seat_id,
       sessionId: row.session_id,
       sourceUrl: row.external_url,
       source: row.source,
@@ -1334,7 +1758,8 @@ export class PostgresWorkbenchRepository {
       agentInstanceId: row.agent_instance_id,
       specKey: row.spec_key,
       specVersion: row.spec_version,
-      role: row.role,
+      responsibility: row.responsibility,
+      isCoordinator: row.is_coordinator,
       threadId: row.thread_id,
       workspaceKey: row.workspace_key,
     };
@@ -1513,11 +1938,6 @@ export class PostgresWorkbenchRepository {
         JSON.stringify(input.data ?? {}),
       ],
     );
-  }
-
-  getReportFileContext(reportId: string) {
-    return new PostgresWorkflowCoordinationRepository(this.pool)
-      .getReportFileContext(reportId);
   }
 
   async runExists(runId: string): Promise<boolean> {

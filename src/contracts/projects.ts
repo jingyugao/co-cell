@@ -21,23 +21,25 @@ export interface FeishuWorkItemPreview {
   }>;
   fields: Array<{ key: string; name: string; value: unknown }>;
   updatedAt: string | null;
-  forks: AgentForkResult[];
+  seats: AgentSeatResult[];
 }
 
-export interface AgentForkResult {
+export interface AgentSeatResult {
   projectId: string;
-  forkId: string;
-  role: string;
+  seatId: string;
+  responsibility: string;
+  isCoordinator: boolean;
+  workspaceKey: string;
   agentInstance: {
     id: string;
     specKey: string;
     specVersion: number;
+    instanceKey: string;
     status: AgentInstanceStatus;
   };
   session: {
     id: string;
     threadId: string;
-    workspaceKey: string;
     status: "active" | "waiting" | "closed";
   };
   currentRun: {
@@ -47,11 +49,17 @@ export interface AgentForkResult {
   } | null;
 }
 
+export interface ProjectMessageResult {
+  projectId: string;
+  runId: string;
+  status: "queued" | "notified";
+}
+
 export interface StartAgentRunResult {
   runId: string;
   projectId: string;
   agentInstanceId: string;
-  forkId: string;
+  seatId: string;
   sessionId: string;
   status: RunStatus;
 }

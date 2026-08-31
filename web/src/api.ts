@@ -11,13 +11,13 @@ import type {
   AgentConversationResponse,
 } from "../../src/contracts/workbench";
 import type {
-  AgentForkResult,
+  AgentSeatResult,
   CancelAgentRunResult,
   FeishuWorkItemPreview,
   StartAgentRunResult,
   ResumeAgentRunInput,
   ResumeAgentRunResult,
-} from "../../src/contracts/requirements";
+} from "../../src/contracts/projects";
 import { readWorkbenchRoute } from "./navigation";
 
 interface ApiErrorBody {
@@ -97,6 +97,12 @@ export function loadAgentInstance(agentInstanceId: string): Promise<AgentInstanc
   );
 }
 
+export function loadAgentSeat(agentSeatId: string): Promise<AgentInstanceDetail> {
+  return getJson<AgentInstanceDetail>(
+    `/api/v1/agent-seats/${encodeURIComponent(agentSeatId)}`,
+  );
+}
+
 export function loadAgentConversation(agentSessionId: string): Promise<AgentConversationResponse> {
   return getJson<AgentConversationResponse>(
     `/api/v1/agent-sessions/${encodeURIComponent(agentSessionId)}/conversation`,
@@ -107,17 +113,18 @@ export function previewFeishuWorkItem(url: string): Promise<FeishuWorkItemPrevie
   return postJson<FeishuWorkItemPreview>("/api/v1/feishu-project/work-items/preview", { url });
 }
 
-export function createAgentFork(input: {
+export function createAgentSeat(input: {
   url: string;
   specKey: string;
-  role: string;
-}): Promise<AgentForkResult> {
-  return postJson<AgentForkResult>("/api/v1/agent-forks", input);
+  responsibility: string;
+  isCoordinator?: boolean;
+}): Promise<AgentSeatResult> {
+  return postJson<AgentSeatResult>("/api/v1/agent-seats", input);
 }
 
-export function startAgentRun(forkId: string): Promise<StartAgentRunResult> {
+export function startAgentRun(seatId: string): Promise<StartAgentRunResult> {
   return postJson<StartAgentRunResult>(
-    `/api/v1/agent-forks/${encodeURIComponent(forkId)}/runs`,
+    `/api/v1/agent-seats/${encodeURIComponent(seatId)}/runs`,
     {},
   );
 }

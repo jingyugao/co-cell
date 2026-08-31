@@ -1,5 +1,9 @@
 import { resolve } from "node:path";
 
+import {
+  loadContextCompressionConfig,
+  type ContextCompressionConfig,
+} from "../agent/context-compression.js";
 import type { SandboxBackend } from "../sandbox/factory.js";
 
 export interface ServerConfig {
@@ -9,6 +13,7 @@ export interface ServerConfig {
   staticRoot: string;
   sandboxName: string;
   specsRoot: string;
+  runtimeSpecKey: string;
   workspaceRoot: string;
   sandboxBackend: SandboxBackend;
   sandboxImage?: string;
@@ -20,6 +25,7 @@ export interface ServerConfig {
   openAIBaseUrl?: string;
   openAIApiKey?: string;
   model?: string;
+  contextCompression: ContextCompressionConfig;
   gitlabBaseUrl?: string;
   gitlabToken?: string;
   gitlabUsername: string;
@@ -73,6 +79,7 @@ export function loadServerConfig(): ServerConfig {
     sandboxName:
       process.env.AGENT_SHARED_SANDBOX_NAME?.trim() || "swarm-hive-dev-sandbox",
     specsRoot: resolve(process.env.AGENT_SPECS_ROOT?.trim() || "agent-specs"),
+    runtimeSpecKey: process.env.AGENT_RUNTIME_SPEC_KEY?.trim() || "software-engineer",
     workspaceRoot: resolve(process.env.AGENT_WORKSPACE_ROOT?.trim() || ".swarm-hive/workspaces"),
     sandboxBackend,
     ...(process.env.AGENT_SANDBOX_IMAGE?.trim()
@@ -86,6 +93,7 @@ export function loadServerConfig(): ServerConfig {
     ...(openAIBaseUrl ? { openAIBaseUrl } : {}),
     ...(openAIApiKey ? { openAIApiKey } : {}),
     ...(process.env.AGENT_MODEL?.trim() ? { model: process.env.AGENT_MODEL.trim() } : {}),
+    contextCompression: loadContextCompressionConfig(),
     ...(gitlabBaseUrl ? { gitlabBaseUrl } : {}),
     ...(gitlabToken ? { gitlabToken } : {}),
     gitlabUsername: process.env.GITLAB_USERNAME?.trim() || "oauth2",

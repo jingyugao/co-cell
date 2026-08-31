@@ -1,19 +1,24 @@
-import { HumanMessage, ToolMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage, RemoveMessage, ToolMessage } from "@langchain/core/messages";
 import { describe, expect, it } from "vitest";
 
 import {
   CODEX_DERIVED_HARNESS_INSTRUCTIONS,
   CODING_AGENT_INSTRUCTIONS,
   CODING_CONTEXT_SUMMARY_PROMPT,
-  CONVERSATION_SUMMARY_KEEP_MESSAGES,
-  CONVERSATION_SUMMARY_TRIGGER_MESSAGES,
-  CONVERSATION_SUMMARY_TRIGGER_TOKENS,
   EFFECTIVELY_UNBOUNDED_RECURSION_LIMIT,
   buildCodingAgentInstructions,
+  createCodingContextCompressionMiddleware,
   isTransientModelError,
   renderMessageContent,
   shouldRequireInitialToolCall,
 } from "../src/agent/coding-agent.js";
+import {
+  CONVERSATION_SUMMARY_KEEP_TOKENS,
+  CONVERSATION_SUMMARY_TRIGGER_MESSAGES,
+  CONVERSATION_SUMMARY_TRIGGER_TOKENS,
+  loadContextCompressionConfig,
+  resolveContextCompressionConfig,
+} from "../src/agent/context-compression.js";
 
 describe("coding agent instructions", () => {
   it("uses only the generic Codex-derived harness instructions by default", () => {
@@ -30,11 +35,59 @@ describe("coding agent instructions", () => {
 
 describe("coding agent context bounds", () => {
   it("uses durable automatic summarization before history becomes unbounded", () => {
-    expect(CONVERSATION_SUMMARY_TRIGGER_TOKENS).toBe(80_000);
-    expect(CONVERSATION_SUMMARY_TRIGGER_MESSAGES).toBe(80);
-    expect(CONVERSATION_SUMMARY_KEEP_MESSAGES).toBe(24);
+    expect(CONVERSATION_SUMMARY_TRIGGER_TOKENS).toBe(40_000);
+    expect(CONVERSATION_SUMMARY_TRIGGER_MESSAGES).toBe(60);
+    expect(CONVERSATION_SUMMARY_KEEP_TOKENS).toBe(12_000);
     expect(CODING_CONTEXT_SUMMARY_PROMPT).toContain("unresolved questions");
     expect(CODING_CONTEXT_SUMMARY_PROMPT).toContain("validation results");
+  });
+
+  it("loads and validates deployment-specific compression bounds", () => {
+    expect(loadContextCompressionConfig({
+      AGENT_CONTEXT_COMPRESSION_TRIGGER_TOKENS: "20000",
+    })).toMatchObject({
+      triggerTokens: 20_000,
+      keepTokens: 6_000,
+      summaryInputTokens: 20_000,
+    });
+    expect(() => resolveContextCompressionConfig({
+      triggerTokens: 10_000,
+      keepTokens: 10_000,
+    })).toThrow("keepTokens must be smaller than triggerTokens");
+  });
+
+  it("replaces old messages with a summary while preserving recent context", async () => {
+    const summaryPrompts: string[] = [];
+    const middleware = createCodingContextCompressionMiddleware({
+      invoke: async (prompt: unknown) => {
+        summaryPrompts.push(String(prompt));
+        return new AIMessage("需求与已验证状态的摘要");
+      },
+    } as never, {
+      triggerTokens: 10,
+      triggerMessages: 99,
+      keepTokens: 8,
+      summaryInputTokens: 20,
+    });
+    const beforeModel = middleware.beforeModel;
+    expect(typeof beforeModel).toBe("function");
+    if (typeof beforeModel !== "function") throw new Error("beforeModel hook is missing");
+    const result = await beforeModel(
+      {
+        messages: [1, 2, 3, 4, 5, 6].map((index) => new HumanMessage({
+          id: `message-${index}`,
+          content: `message ${index} with enough content`,
+        })),
+      } as never,
+      { context: {} } as never,
+    );
+    const messages = (result as { messages: Array<HumanMessage | RemoveMessage> }).messages;
+
+    expect(summaryPrompts).toHaveLength(1);
+    expect(messages[0]).toBeInstanceOf(RemoveMessage);
+    expect(messages[1]?.content).toContain("自动压缩摘要");
+    expect(messages[1]?.content).toContain("需求与已验证状态的摘要");
+    expect(messages.at(-1)?.id).toBe("message-6");
   });
 
   it("does not impose the former 200-step workflow limit", () => {

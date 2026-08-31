@@ -1,0 +1,12 @@
+{
+  "id": "software-engineer",
+  "name": "Software Engineer",
+  "version": 13,
+  "defaultResponsibility": "代码开发、自测、环境验证和 Merge Request 交付",
+  "prompt": "prompt.txt",
+  "memory": "memory.txt",
+  "sandbox": {
+    "dockerfile": "sandbox/Dockerfile",
+    "image": "swarm-hive-sandbox-python:3.12"
+  }
+}

@@ -50,9 +50,9 @@ export class PostgresRunHandoffRepository {
       created_at: Date | string;
     }>(
       `INSERT INTO swarm_hive.agent_run_handoffs(
-         agent_fork_id, source_run_id, content, metadata
+         agent_seat_id, source_run_id, content, metadata
        )
-       SELECT session.agent_fork_id, run.id, $2,
+       SELECT session.agent_seat_id, run.id, $2,
               jsonb_build_object('generator', 'deterministic-v1')
          FROM swarm_hive.agent_runs run
          JOIN swarm_hive.agent_sessions session ON session.id = run.agent_session_id
@@ -109,47 +109,30 @@ export class PostgresRunHandoffRepository {
     const row = run.rows[0];
     if (!row) return null;
     const cutoff = row.finished_at;
-    const [confirmations, deferredItems, reports, events] = await Promise.all([
+    const [tasks, publications, events] = await Promise.all([
       this.pool.query<{
-        confirmation_key: string;
-        phase: string;
+        id: string;
+        title: string;
         status: string;
-        question: string;
-        answer: string | null;
-        artifact_url: string | null;
-        artifact_revision: number | null;
+        assignee_agent_seat_id: string | null;
+        blocked_reason: string | null;
+        result: string | null;
       }>(
-        `SELECT confirmation_key, phase, status, question, answer,
-                artifact_url, artifact_revision
-         FROM swarm_hive.project_confirmations
+        `SELECT id, title, status, assignee_agent_seat_id, blocked_reason, result
+         FROM swarm_hive.project_tasks
           WHERE project_id = $1
             AND ($2::timestamptz IS NULL OR updated_at <= $2)
-          ORDER BY updated_at DESC, id DESC LIMIT 12`,
+          ORDER BY updated_at DESC, id DESC LIMIT 16`,
         [row.project_id, cutoff],
       ),
       this.pool.query<{
-        item_key: string;
-        phase: string;
-        status: string;
-        title: string;
-        detail: string | null;
-      }>(
-        `SELECT item_key, phase, status, title, detail
-         FROM swarm_hive.project_deferred_items
-          WHERE project_id = $1 AND status = 'open'
-            AND ($2::timestamptz IS NULL OR updated_at <= $2)
-          ORDER BY updated_at DESC, id DESC LIMIT 12`,
-        [row.project_id, cutoff],
-      ),
-      this.pool.query<{
-        phase: string;
+        kind: string;
         version: number;
-        status: string;
-        conclusion: string;
+        summary: string;
         relative_path: string;
       }>(
-        `SELECT phase, version, status, conclusion, relative_path
-         FROM swarm_hive.project_reports
+        `SELECT kind, version, summary, relative_path
+         FROM swarm_hive.project_publications
           WHERE project_id = $1
             AND ($2::timestamptz IS NULL OR created_at <= $2)
           ORDER BY created_at DESC, id DESC LIMIT 10`,
@@ -174,27 +157,18 @@ export class PostgresRunHandoffRepository {
       resultSummary: row.result_summary,
       mergeRequestUrl: row.merge_request_url,
       finishedAt: row.finished_at ? row.finished_at.toISOString() : null,
-      confirmations: confirmations.rows.map((item) => ({
-        key: item.confirmation_key,
-        phase: item.phase,
-        status: item.status,
-        question: item.question,
-        answer: item.answer,
-        artifactUrl: item.artifact_url,
-        artifactRevision: item.artifact_revision,
-      })),
-      deferredItems: deferredItems.rows.map((item) => ({
-        key: item.item_key,
-        phase: item.phase,
-        status: item.status,
+      tasks: tasks.rows.map((item) => ({
+        id: item.id,
         title: item.title,
-        detail: item.detail,
-      })),
-      reports: reports.rows.map((item) => ({
-        phase: item.phase,
-        version: item.version,
         status: item.status,
-        conclusion: item.conclusion,
+        assigneeSeatId: item.assignee_agent_seat_id,
+        blockedReason: item.blocked_reason,
+        result: item.result,
+      })),
+      publications: publications.rows.map((item) => ({
+        kind: item.kind,
+        version: item.version,
+        summary: item.summary,
         relativePath: item.relative_path,
       })),
       events: events.rows.map((item) => ({

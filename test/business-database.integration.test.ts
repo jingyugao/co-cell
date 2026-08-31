@@ -29,19 +29,20 @@ describePostgres("business database integration", () => {
       [BUSINESS_DATABASE_SCHEMA],
     );
     expect(tables.rows.map((row) => row.table_name)).toEqual([
-      "agent_forks",
       "agent_instances",
       "agent_run_events",
       "agent_run_handoffs",
       "agent_runs",
+      "agent_seats",
       "agent_sessions",
       "event_interactions",
       "external_events",
       "inbox_events",
       "project_confirmations",
       "project_deferred_items",
-      "project_reports",
+      "project_publications",
       "project_subscriptions",
+      "project_tasks",
       "projects",
     ]);
     const guardIndexes = await pool.query<{ indexname: string }>(
@@ -71,27 +72,27 @@ describePostgres("business database integration", () => {
       );
       const agentInstance = await client.query<{ id: string }>(
         `INSERT INTO swarm_hive.agent_instances(
-           spec_key, spec_version, instance_key, workspace_key
-         ) VALUES ('software-engineer', 1, $1, $2)
+           spec_key, spec_version, instance_key, home_key
+         ) VALUES ($1, 1, 'default', $2)
          RETURNING id`,
-        [`thread-${randomUUID()}`, `workspace-${randomUUID()}`],
+        [`software-engineer-${randomUUID()}`, `home-${randomUUID()}`],
       );
       const projectId = project.rows[0]?.id;
       const agentInstanceId = agentInstance.rows[0]?.id;
       if (!projectId || !agentInstanceId) throw new Error("Test IDs missing");
 
-      const fork = await client.query<{ id: string }>(
-        `INSERT INTO swarm_hive.agent_forks(
-           project_id, agent_instance_id, workspace_key
-         ) VALUES ($1, $2, $3)
+      const seat = await client.query<{ id: string }>(
+        `INSERT INTO swarm_hive.agent_seats(
+           project_id, agent_instance_id, responsibility, is_coordinator, workspace_key
+         ) VALUES ($1, $2, 'implementation', true, $3)
          RETURNING id`,
-        [projectId, agentInstanceId, `fork-${randomUUID()}`],
+        [projectId, agentInstanceId, `seat-${randomUUID()}`],
       );
       const session = await client.query<{ id: string }>(
-        `INSERT INTO swarm_hive.agent_sessions(agent_fork_id, thread_id)
+        `INSERT INTO swarm_hive.agent_sessions(agent_seat_id, thread_id)
          VALUES ($1, $2)
          RETURNING id`,
-        [fork.rows[0]?.id, `thread-${randomUUID()}`],
+        [seat.rows[0]?.id, `thread-${randomUUID()}`],
       );
       const inboxEvent = await client.query<{ id: string }>(
         `INSERT INTO swarm_hive.inbox_events(

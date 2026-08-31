@@ -3,7 +3,7 @@ import * as Lark from "@larksuiteoapi/node-sdk";
 import type {
   PostgresProjectEventBus,
   ProjectEventPublishResult,
-  SingleAgentProjectEventDispatcher,
+  CoordinatorProjectEventDispatcher,
 } from "../events/project-event-bus.js";
 import { feishuDocumentResource } from "../events/project-event-bus.js";
 
@@ -90,7 +90,7 @@ export interface FeishuCommentEventSubscriberOptions {
   appSecret: string;
   eventBus: Pick<PostgresProjectEventBus,
     "recordExternalEvent" | "matchingSubscriptionCount" | "publishExternalEvent">;
-  dispatcher: Pick<SingleAgentProjectEventDispatcher, "dispatch">;
+  dispatcher: Pick<CoordinatorProjectEventDispatcher, "dispatch">;
   reader?: FeishuCommentReader;
   onReady?: () => void;
   onError?: (error: Error, notice?: FeishuCommentNotice) => void;

@@ -2,29 +2,19 @@ const MAX_HANDOFF_CHARS = 16_000;
 const MAX_RESULT_CHARS = 9_000;
 const MAX_DETAIL_CHARS = 600;
 
-export interface RunHandoffConfirmation {
-  key: string;
-  phase: string;
-  status: string;
-  question: string;
-  answer: string | null;
-  artifactUrl: string | null;
-  artifactRevision: number | null;
-}
-
-export interface RunHandoffDeferredItem {
-  key: string;
-  phase: string;
-  status: string;
+export interface RunHandoffTask {
+  id: string;
   title: string;
-  detail: string | null;
+  status: string;
+  assigneeSeatId: string | null;
+  blockedReason: string | null;
+  result: string | null;
 }
 
-export interface RunHandoffReport {
-  phase: string;
+export interface RunHandoffPublication {
+  kind: string;
   version: number;
-  status: string;
-  conclusion: string;
+  summary: string;
   relativePath: string;
 }
 
@@ -41,9 +31,8 @@ export interface RunHandoffSource {
   resultSummary: string | null;
   mergeRequestUrl: string | null;
   finishedAt: string | null;
-  confirmations: RunHandoffConfirmation[];
-  deferredItems: RunHandoffDeferredItem[];
-  reports: RunHandoffReport[];
+  tasks: RunHandoffTask[];
+  publications: RunHandoffPublication[];
   events: RunHandoffEvent[];
 }
 
@@ -59,21 +48,15 @@ function line(label: string, value: string | number | null): string | undefined 
 
 /** Build a bounded, durable navigation summary instead of copying raw chat history. */
 export function buildRunHandoff(source: RunHandoffSource): string {
-  const confirmations = source.confirmations.slice(0, 12).map((item) => [
-    `- \`${item.key}\` · ${item.phase} · ${item.status}`,
-    `  - 问题：${compact(item.question, MAX_DETAIL_CHARS)}`,
-    ...(item.answer ? [`  - 结论：${compact(item.answer, MAX_DETAIL_CHARS)}`] : []),
-    ...(item.artifactUrl
-      ? [`  - 产物：${item.artifactUrl}${item.artifactRevision === null ? "" : ` · revision ${item.artifactRevision}`}`]
-      : []),
+  const tasks = source.tasks.slice(0, 16).map((item) => [
+    `- \`${item.id}\` · ${item.status} · ${item.title}`,
+    ...(item.assigneeSeatId ? [`  - Assignee：${item.assigneeSeatId}`] : []),
+    ...(item.blockedReason ? [`  - 阻塞：${compact(item.blockedReason, MAX_DETAIL_CHARS)}`] : []),
+    ...(item.result ? [`  - 结果：${compact(item.result, MAX_DETAIL_CHARS)}`] : []),
   ].join("\n")).join("\n");
-  const deferred = source.deferredItems.slice(0, 12).map((item) => [
-    `- \`${item.key}\` · ${item.phase} · ${item.status} · ${item.title}`,
-    ...(item.detail ? [`  - ${compact(item.detail, MAX_DETAIL_CHARS)}`] : []),
-  ].join("\n")).join("\n");
-  const reports = source.reports.slice(0, 10).map((item) =>
-    `- ${item.phase} v${item.version} · ${item.status} · ${item.relativePath}\n` +
-    `  - ${compact(item.conclusion, MAX_DETAIL_CHARS)}`
+  const publications = source.publications.slice(0, 10).map((item) =>
+    `- ${item.kind} v${item.version} · ${item.relativePath}\n` +
+    `  - ${compact(item.summary, MAX_DETAIL_CHARS)}`
   ).join("\n");
   const events = source.events.slice(0, 12).map((item) =>
     `- ${item.eventType} · ${item.title}` +
@@ -95,9 +78,8 @@ export function buildRunHandoff(source: RunHandoffSource): string {
     "",
     "## 最终结果摘要",
     compact(source.resultSummary, MAX_RESULT_CHARS) || "（上一次 Run 未生成结果摘要）",
-    ...(confirmations ? ["", "## 确认事项", confirmations] : []),
-    ...(deferred ? ["", "## 暂缓事项", deferred] : []),
-    ...(reports ? ["", "## 最近阶段报告", reports] : []),
+    ...(tasks ? ["", "## 项目任务", tasks] : []),
+    ...(publications ? ["", "## 最近项目发布", publications] : []),
     ...(events ? ["", "## 最近关键时间线", events] : []),
   ];
   return compact(sections.join("\n"), MAX_HANDOFF_CHARS);

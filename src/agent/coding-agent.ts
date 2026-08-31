@@ -1,7 +1,7 @@
 import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
-import { Command, isInterrupted } from "@langchain/langgraph";
+import { Command } from "@langchain/langgraph";
 import {
   createAgent,
   createMiddleware,
@@ -16,13 +16,11 @@ import { createOpenAICompatibleModel } from "../model/chat-openai-compatible.js"
 import type { Sandbox } from "../sandbox/types.js";
 import { findGitLabMergeRequestUrl } from "../integrations/gitlab.js";
 import { BashProcessManager, createBashTool } from "../tools/bash.js";
-import {
-  createRequestUserInputTool,
-  renderRequestUserInput,
-  type RequestUserInput,
-  type RequestUserInputHandler,
-} from "../tools/request-user-input.js";
 import { createViewImageTool } from "../tools/view-image.js";
+import {
+  resolveContextCompressionConfig,
+  type ContextCompressionConfig,
+} from "./context-compression.js";
 
 /**
  * Harness behavior adapted from OpenAI Codex's default base instructions:
@@ -58,8 +56,9 @@ Task execution:
 - Preserve unrelated user changes. Do not reset, overwrite, delete, commit, create
   branches, or push unless the user explicitly requests that action.
 - Use view_image when visual inspection of a local image is material.
-- Use request_user_input only when a missing decision materially changes the result,
-  permissions are insufficient, or progress is genuinely blocked.
+- When external decisions are needed, finish all independent work, record the
+  reviewed questions in the project, publish them through the project workflow,
+  and complete the current run instead of waiting inside the model call.
 
 Validation:
 - Validate from the narrowest relevant checks outward: targeted tests first, then
@@ -82,11 +81,6 @@ Escalation and completion:
  */
 export const EFFECTIVELY_UNBOUNDED_RECURSION_LIMIT = Number.MAX_SAFE_INTEGER;
 
-export const CONVERSATION_SUMMARY_TRIGGER_TOKENS = 80_000;
-export const CONVERSATION_SUMMARY_TRIGGER_MESSAGES = 80;
-export const CONVERSATION_SUMMARY_KEEP_MESSAGES = 24;
-export const CONVERSATION_SUMMARY_INPUT_TOKENS = 60_000;
-
 export const CODING_CONTEXT_SUMMARY_PROMPT = `
 Summarize the coding Agent conversation for continued autonomous execution.
 Preserve concrete requirements, user decisions, unresolved questions, repository
@@ -102,6 +96,27 @@ complete. Respond only with the summary.
 {messages}
 </messages>
 `.trim();
+
+type SummarizationModel = Parameters<typeof summarizationMiddleware>[0]["model"];
+
+/** Build durable compaction that replaces old state with a summary plus recent context. */
+export function createCodingContextCompressionMiddleware(
+  model: SummarizationModel,
+  overrides: Partial<ContextCompressionConfig> = {},
+) {
+  const config = resolveContextCompressionConfig(overrides);
+  return summarizationMiddleware({
+    model,
+    trigger: [
+      { tokens: config.triggerTokens },
+      { messages: config.triggerMessages },
+    ],
+    keep: { tokens: config.keepTokens },
+    trimTokensToSummarize: config.summaryInputTokens,
+    summaryPrompt: CODING_CONTEXT_SUMMARY_PROMPT,
+    summaryPrefix: "以下是此前研发对话的自动压缩摘要：",
+  });
+}
 
 export function buildCodingAgentInstructions(
   additionalInstructions: readonly string[] = [],
@@ -195,7 +210,7 @@ export interface CodingTask {
   workspace: string;
   /** New user input. Omit only when resuming an interrupted/failed checkpoint. */
   prompt?: string;
-  /** Unstructured human message used to resume a request_user_input interrupt. */
+  /** Optional input used only when resuming a legacy interrupted checkpoint. */
   resume?: { message: string } | true;
   /** Optional externally managed execution sandbox. Defaults to local execution. */
   sandbox?: Sandbox;
@@ -209,11 +224,14 @@ export interface CodingTask {
   checkpointer?: BaseCheckpointSaver;
   /** Fail the run unless the final response contains a GitLab MR URL. */
   requireMergeRequest?: boolean;
-  requestUserInput: RequestUserInputHandler;
   /** Host- or deployment-specific developer instructions appended after the base. */
   additionalInstructions?: readonly string[];
+  /** Automatic durable context summarization bounds. */
+  contextCompression?: Partial<ContextCompressionConfig>;
   /** Project-scoped durable workflow tools supplied by the control plane. */
   workflowTools?: readonly StructuredToolInterface[];
+  /** Enable general shell execution. Coordinators should use project tools instead. */
+  enableShell?: boolean;
   /** Durable external events checked before every model call. */
   externalEvents?: {
     claim(): Promise<Array<{ id: string; content: string }>>;
@@ -233,7 +251,7 @@ export interface CodingTaskResult {
   messages: unknown[];
   todos: Todo[];
   mergeRequestUrl?: string;
-  userInputRequest?: RequestUserInput;
+  processedExternalEventIds: string[];
 }
 
 export function renderMessageContent(content: unknown): string {
@@ -267,11 +285,11 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
   if (task.checkpointer && !task.threadId?.trim()) {
     throw new Error("threadId is required when checkpointing is enabled");
   }
-  const localManager = task.sandbox
-    ? undefined
-    : await BashProcessManager.create({ workspace: task.workspace });
-  const executor = task.sandbox ?? localManager;
-  if (!executor) throw new Error("No sandbox executor is available");
+  const shellEnabled = task.enableShell !== false;
+  const localManager = shellEnabled && !task.sandbox
+    ? await BashProcessManager.create({ workspace: task.workspace })
+    : undefined;
+  const executor = shellEnabled ? task.sandbox ?? localManager : undefined;
   const claimedExternalEventIds = new Set<string>();
   try {
     const instructions = buildCodingAgentInstructions(task.additionalInstructions);
@@ -303,25 +321,14 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
       name: "coding-agent",
       model,
       tools: [
-        createBashTool(executor),
+        ...(executor ? [createBashTool(executor)] : []),
         viewImage,
-        createRequestUserInputTool(task.requestUserInput),
         ...(task.workflowTools ?? []),
       ],
       middleware: [
         requireInitialToolCallMiddleware,
         ...(externalEventMiddleware ? [externalEventMiddleware] : []),
-        summarizationMiddleware({
-          model,
-          trigger: [
-            { tokens: CONVERSATION_SUMMARY_TRIGGER_TOKENS },
-            { messages: CONVERSATION_SUMMARY_TRIGGER_MESSAGES },
-          ],
-          keep: { messages: CONVERSATION_SUMMARY_KEEP_MESSAGES },
-          trimTokensToSummarize: CONVERSATION_SUMMARY_INPUT_TOKENS,
-          summaryPrompt: CODING_CONTEXT_SUMMARY_PROMPT,
-          summaryPrefix: "以下是此前研发对话的自动压缩摘要：",
-        }),
+        createCodingContextCompressionMiddleware(model, task.contextCompression),
         modelRetryMiddleware({
           maxRetries: 5,
           initialDelayMs: 2_000,
@@ -375,17 +382,6 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
     }
     const messages = result.messages ?? [];
     const todos = (result as unknown as { todos?: Todo[] }).todos ?? [];
-    if (isInterrupted<RequestUserInput>(result)) {
-      const request = result.__interrupt__[0]?.value;
-      return {
-        finalResponse: request
-          ? renderRequestUserInput(request)
-          : "Agent 正在等待人工确认。",
-        messages,
-        todos,
-        ...(request ? { userInputRequest: request } : {}),
-      };
-    }
     const finalMessage = [...messages]
       .reverse()
       .find((message): message is AIMessage => message instanceof AIMessage);
@@ -402,6 +398,7 @@ export async function runCodingTask(task: CodingTask): Promise<CodingTaskResult>
       finalResponse,
       messages,
       todos,
+      processedExternalEventIds: [...claimedExternalEventIds],
       ...(mergeRequest ? { mergeRequestUrl: mergeRequest.url } : {}),
     };
   } finally {

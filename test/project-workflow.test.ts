@@ -2,8 +2,8 @@ import { describe, expect, test, vi } from "vitest";
 
 import {
   McpFeishuWorkItemSource,
-  RequirementWorkflowService,
-} from "../src/application/requirement-workflow-service.js";
+  ProjectWorkflowService,
+} from "../src/application/project-workflow-service.js";
 import type { PostgresWorkbenchRepository } from "../src/persistence/workbench-repository.js";
 
 const sourceUrl = "https://project.feishu.cn/example-project/story/detail/1234567890";
@@ -24,7 +24,7 @@ function rawWorkItem() {
   };
 }
 
-describe("Requirement workflow", () => {
+describe("Project workflow", () => {
   test("normalizes live MCP data without persistence", async () => {
     const load = vi.fn(async () => rawWorkItem());
     const source = new McpFeishuWorkItemSource(load);
@@ -41,26 +41,28 @@ describe("Requirement workflow", () => {
 
   test("reads Feishu again before saving only an Agent assignment", async () => {
     const source = new McpFeishuWorkItemSource(async () => rawWorkItem());
-    const createAgentFork = vi.fn(async (input) => ({
+    const createAgentSeat = vi.fn(async (input) => ({
       projectId: "project-id",
-      forkId: "fork-id",
-      role: input.role,
+      seatId: "seat-id",
+      responsibility: input.responsibility,
+      isCoordinator: input.isCoordinator ?? true,
+      workspaceKey: "seat:seat-id",
       agentInstance: {
         id: "instance-id",
         specKey: input.specKey,
         specVersion: input.specVersion,
+        instanceKey: "default",
         status: "active" as const,
       },
       session: {
         id: "session-id",
-        workspaceKey: input.workspaceKey,
-        threadId: input.threadId,
+        threadId: "agent-seat:seat-id",
         status: "active" as const,
       },
       currentRun: null,
     }));
-    const repository = { createAgentFork } as unknown as PostgresWorkbenchRepository;
-    const service = new RequirementWorkflowService(
+    const repository = { createAgentSeat } as unknown as PostgresWorkbenchRepository;
+    const service = new ProjectWorkflowService(
       source,
       repository,
       {
@@ -69,6 +71,7 @@ describe("Requirement workflow", () => {
           id: "software-engineer",
           name: "Software Engineer",
           version: 1,
+          defaultResponsibility: "代码开发与交付",
           memory: "memory.txt",
           sandbox: { dockerfile: "sandbox/Dockerfile", image: "image" },
           environmentExample: ".env.example",
@@ -85,19 +88,19 @@ describe("Requirement workflow", () => {
         })),
       },
     );
-    await service.fork({
+    await service.assignSeat({
       url: sourceUrl,
       specKey: "software-engineer",
-      role: "backend-a",
+      responsibility: "backend-a",
     });
-    expect(createAgentFork).toHaveBeenCalledWith(expect.objectContaining({
+    expect(createAgentSeat).toHaveBeenCalledWith(expect.objectContaining({
       sourceUrl,
       externalProjectKey: "space-key",
       externalWorkItemType: "story",
       externalWorkItemId: "1234567890",
-      role: "backend-a",
+      responsibility: "backend-a",
     }));
-    const persisted = createAgentFork.mock.calls[0]?.[0];
+    const persisted = createAgentSeat.mock.calls[0]?.[0];
     expect(persisted).not.toHaveProperty("title");
     expect(persisted).not.toHaveProperty("fields");
     expect(persisted).not.toHaveProperty("status");

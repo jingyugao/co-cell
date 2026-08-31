@@ -20,53 +20,52 @@ CREATE UNIQUE INDEX uq_projects_external_work_item_reference
   )
   WHERE external_project_key IS NOT NULL AND external_work_item_type IS NOT NULL;
 
--- A durable, singleton realization of an Agent Spec. An Instance owns shared
--- runtime state and memory; it is not bound to a project or conversation.
+-- A durable realization of an Agent Spec. The default Instance is the current
+-- singleton, while the composite key leaves room for named Instances later.
 CREATE TABLE swarm_hive.agent_instances (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  spec_key text NOT NULL UNIQUE,
+  spec_key text NOT NULL,
   spec_version integer NOT NULL CHECK (spec_version > 0),
-  instance_key text NOT NULL UNIQUE,
-  workspace_key text NOT NULL UNIQUE,
-  -- Compatibility cache for observability only. Conversation ownership lives
-  -- in agent_sessions; execution code must not use this column for routing.
-  thread_id text,
+  instance_key text NOT NULL DEFAULT 'default',
+  home_key text NOT NULL UNIQUE,
   status text NOT NULL DEFAULT 'active'
     CHECK (status IN ('active', 'disabled')),
   metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
   last_active_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (spec_key, instance_key)
 );
 
--- A project-scoped branch of a singleton Agent Instance.
-CREATE TABLE swarm_hive.agent_forks (
+-- A project-scoped responsibility occupied by an Agent Instance. The same
+-- Instance may occupy multiple Seats in one Project.
+CREATE TABLE swarm_hive.agent_seats (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id uuid NOT NULL REFERENCES swarm_hive.projects(id) ON DELETE CASCADE,
   agent_instance_id uuid NOT NULL
     REFERENCES swarm_hive.agent_instances(id) ON DELETE RESTRICT,
-  role text NOT NULL DEFAULT 'primary',
-  is_primary boolean NOT NULL DEFAULT true,
+  responsibility text NOT NULL CHECK (length(btrim(responsibility)) > 0),
+  is_coordinator boolean NOT NULL DEFAULT false,
   workspace_key text NOT NULL UNIQUE,
-  bound_at timestamptz NOT NULL DEFAULT now(),
-  unbound_at timestamptz,
+  assigned_at timestamptz NOT NULL DEFAULT now(),
+  released_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  CHECK (unbound_at IS NULL OR unbound_at >= bound_at)
+  CHECK (released_at IS NULL OR released_at >= assigned_at)
 );
 
-CREATE UNIQUE INDEX uq_agent_forks_active_primary_project
-  ON swarm_hive.agent_forks(project_id)
-  WHERE unbound_at IS NULL AND is_primary;
+CREATE UNIQUE INDEX uq_agent_seats_active_coordinator_project
+  ON swarm_hive.agent_seats(project_id)
+  WHERE released_at IS NULL AND is_coordinator;
 
-CREATE INDEX ix_agent_forks_instance
-  ON swarm_hive.agent_forks(agent_instance_id, created_at DESC);
+CREATE INDEX ix_agent_seats_instance
+  ON swarm_hive.agent_seats(agent_instance_id, created_at DESC);
 
--- A continuous conversation owned by a Fork. Runs activate a Session; they do
+-- A continuous conversation owned by a Seat. Runs activate a Session; they do
 -- not own or replace its checkpoint thread.
 CREATE TABLE swarm_hive.agent_sessions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  agent_fork_id uuid NOT NULL REFERENCES swarm_hive.agent_forks(id) ON DELETE CASCADE,
+  agent_seat_id uuid NOT NULL REFERENCES swarm_hive.agent_seats(id) ON DELETE CASCADE,
   thread_id text NOT NULL UNIQUE,
   status text NOT NULL DEFAULT 'active'
     CHECK (status IN ('active', 'waiting', 'closed')),
@@ -81,8 +80,8 @@ CREATE TABLE swarm_hive.agent_sessions (
   CHECK ((memory_snapshot IS NULL) = (memory_sha256 IS NULL))
 );
 
-CREATE UNIQUE INDEX uq_agent_sessions_open_fork
-  ON swarm_hive.agent_sessions(agent_fork_id)
+CREATE UNIQUE INDEX uq_agent_sessions_open_seat
+  ON swarm_hive.agent_sessions(agent_seat_id)
   WHERE status IN ('active', 'waiting');
 
 CREATE TABLE swarm_hive.external_events (
@@ -107,6 +106,7 @@ CREATE TABLE swarm_hive.inbox_events (
   external_event_id text NOT NULL,
   external_event_record_id uuid REFERENCES swarm_hive.external_events(id) ON DELETE RESTRICT,
   project_id uuid REFERENCES swarm_hive.projects(id) ON DELETE SET NULL,
+  target_agent_seat_id uuid REFERENCES swarm_hive.agent_seats(id) ON DELETE SET NULL,
   event_type text NOT NULL,
   payload jsonb NOT NULL DEFAULT '{}'::jsonb,
   subscription_ids uuid[] NOT NULL DEFAULT '{}',
@@ -128,10 +128,14 @@ CREATE INDEX ix_inbox_events_pending
 CREATE INDEX ix_inbox_events_project
   ON swarm_hive.inbox_events(project_id, received_at DESC);
 
+CREATE INDEX ix_inbox_events_target_agent_seat
+  ON swarm_hive.inbox_events(target_agent_seat_id, received_at)
+  WHERE target_agent_seat_id IS NOT NULL AND status IN ('pending', 'failed');
+
 CREATE TABLE swarm_hive.agent_runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   -- Immutable routing snapshots keep operational queries cheap while the
-  -- authoritative ownership chain remains Session -> Fork -> Instance/Project.
+  -- authoritative ownership chain remains Session -> Seat -> Instance/Project.
   project_id uuid NOT NULL REFERENCES swarm_hive.projects(id) ON DELETE RESTRICT,
   agent_instance_id uuid NOT NULL REFERENCES swarm_hive.agent_instances(id) ON DELETE RESTRICT,
   agent_session_id uuid NOT NULL
@@ -188,10 +192,49 @@ CREATE TABLE swarm_hive.agent_run_events (
 CREATE INDEX ix_agent_run_events_timeline
   ON swarm_hive.agent_run_events(agent_run_id, sequence_no);
 
+CREATE TABLE swarm_hive.project_tasks (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES swarm_hive.projects(id) ON DELETE CASCADE,
+  parent_task_id uuid REFERENCES swarm_hive.project_tasks(id) ON DELETE SET NULL,
+  created_by_agent_seat_id uuid NOT NULL
+    REFERENCES swarm_hive.agent_seats(id) ON DELETE RESTRICT,
+  assignee_agent_seat_id uuid REFERENCES swarm_hive.agent_seats(id) ON DELETE SET NULL,
+  created_by_run_id uuid REFERENCES swarm_hive.agent_runs(id) ON DELETE SET NULL,
+  title text NOT NULL CHECK (length(btrim(title)) > 0),
+  description text NOT NULL DEFAULT '',
+  acceptance_criteria text NOT NULL DEFAULT '',
+  status text NOT NULL DEFAULT 'pending'
+    CHECK (status IN (
+      'pending', 'assigned', 'running', 'blocked', 'completed', 'failed', 'cancelled'
+    )),
+  blocked_reason text,
+  result text,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  CHECK (status <> 'blocked' OR blocked_reason IS NOT NULL),
+  CHECK (completed_at IS NULL OR status IN ('completed', 'cancelled'))
+);
+
+CREATE INDEX ix_project_tasks_project_status
+  ON swarm_hive.project_tasks(project_id, status, created_at);
+
+CREATE INDEX ix_project_tasks_assignee
+  ON swarm_hive.project_tasks(assignee_agent_seat_id, status, updated_at DESC)
+  WHERE assignee_agent_seat_id IS NOT NULL;
+
+ALTER TABLE swarm_hive.agent_runs
+  ADD COLUMN task_id uuid REFERENCES swarm_hive.project_tasks(id) ON DELETE SET NULL;
+
+CREATE INDEX ix_agent_runs_task
+  ON swarm_hive.agent_runs(task_id, created_at DESC)
+  WHERE task_id IS NOT NULL;
+
 CREATE TABLE swarm_hive.project_confirmations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id uuid NOT NULL REFERENCES swarm_hive.projects(id) ON DELETE CASCADE,
-  agent_fork_id uuid NOT NULL REFERENCES swarm_hive.agent_forks(id) ON DELETE RESTRICT,
+  agent_seat_id uuid NOT NULL REFERENCES swarm_hive.agent_seats(id) ON DELETE RESTRICT,
   run_id uuid REFERENCES swarm_hive.agent_runs(id) ON DELETE SET NULL,
   confirmation_key text NOT NULL,
   phase text NOT NULL,
@@ -223,7 +266,7 @@ CREATE INDEX ix_project_confirmations_artifact_watch
 CREATE TABLE swarm_hive.project_deferred_items (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id uuid NOT NULL REFERENCES swarm_hive.projects(id) ON DELETE CASCADE,
-  agent_fork_id uuid NOT NULL REFERENCES swarm_hive.agent_forks(id) ON DELETE RESTRICT,
+  agent_seat_id uuid NOT NULL REFERENCES swarm_hive.agent_seats(id) ON DELETE RESTRICT,
   run_id uuid REFERENCES swarm_hive.agent_runs(id) ON DELETE SET NULL,
   item_key text NOT NULL,
   phase text NOT NULL,
@@ -244,26 +287,24 @@ CREATE INDEX ix_project_deferred_items_open
   ON swarm_hive.project_deferred_items(project_id, created_at)
   WHERE status = 'open';
 
-CREATE TABLE swarm_hive.project_reports (
+CREATE TABLE swarm_hive.project_publications (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id uuid NOT NULL REFERENCES swarm_hive.projects(id) ON DELETE CASCADE,
-  agent_fork_id uuid NOT NULL REFERENCES swarm_hive.agent_forks(id) ON DELETE RESTRICT,
+  agent_seat_id uuid NOT NULL REFERENCES swarm_hive.agent_seats(id) ON DELETE RESTRICT,
   run_id uuid REFERENCES swarm_hive.agent_runs(id) ON DELETE SET NULL,
-  report_type text NOT NULL,
-  phase text NOT NULL,
-  version integer NOT NULL CHECK (version > 0),
-  status text NOT NULL,
-  conclusion text NOT NULL,
+  task_id uuid REFERENCES swarm_hive.project_tasks(id) ON DELETE SET NULL,
+  kind text NOT NULL CHECK (kind IN ('questions', 'progress', 'phase_result', 'final')),
+  summary text NOT NULL CHECK (length(btrim(summary)) > 0),
   relative_path text NOT NULL,
   sha256 text NOT NULL,
-  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  version integer NOT NULL CHECK (version > 0),
   created_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (project_id, phase, version),
-  UNIQUE (project_id, relative_path)
+  UNIQUE (project_id, relative_path, sha256),
+  UNIQUE (project_id, kind, version)
 );
 
-CREATE INDEX ix_project_reports_latest
-  ON swarm_hive.project_reports(project_id, phase, version DESC);
+CREATE INDEX ix_project_publications_latest
+  ON swarm_hive.project_publications(project_id, kind, version DESC);
 
 CREATE TABLE swarm_hive.project_subscriptions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -292,7 +333,7 @@ CREATE TABLE swarm_hive.event_interactions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   inbox_event_id uuid NOT NULL REFERENCES swarm_hive.inbox_events(id) ON DELETE CASCADE,
   project_id uuid NOT NULL REFERENCES swarm_hive.projects(id) ON DELETE CASCADE,
-  agent_fork_id uuid NOT NULL REFERENCES swarm_hive.agent_forks(id) ON DELETE RESTRICT,
+  agent_seat_id uuid NOT NULL REFERENCES swarm_hive.agent_seats(id) ON DELETE RESTRICT,
   run_id uuid NOT NULL REFERENCES swarm_hive.agent_runs(id) ON DELETE RESTRICT,
   action text NOT NULL CHECK (action IN ('reply', 'defer')),
   content text NOT NULL,
@@ -316,7 +357,7 @@ CREATE INDEX ix_event_interactions_run
 
 CREATE TABLE swarm_hive.agent_run_handoffs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  agent_fork_id uuid NOT NULL REFERENCES swarm_hive.agent_forks(id) ON DELETE CASCADE,
+  agent_seat_id uuid NOT NULL REFERENCES swarm_hive.agent_seats(id) ON DELETE CASCADE,
   source_run_id uuid NOT NULL UNIQUE REFERENCES swarm_hive.agent_runs(id) ON DELETE CASCADE,
   content text NOT NULL CHECK (length(btrim(content)) > 0),
   metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -325,7 +366,7 @@ CREATE TABLE swarm_hive.agent_run_handoffs (
 );
 
 CREATE INDEX ix_agent_run_handoffs_previous
-  ON swarm_hive.agent_run_handoffs(agent_fork_id, created_at DESC);
+  ON swarm_hive.agent_run_handoffs(agent_seat_id, created_at DESC);
 
 CREATE OR REPLACE FUNCTION swarm_hive.set_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$
@@ -339,8 +380,8 @@ DO $$
 DECLARE table_name text;
 BEGIN
   FOREACH table_name IN ARRAY ARRAY[
-    'projects', 'agent_instances', 'agent_forks', 'agent_sessions',
-    'external_events', 'inbox_events', 'agent_runs',
+    'projects', 'agent_instances', 'agent_seats', 'agent_sessions',
+    'external_events', 'inbox_events', 'agent_runs', 'project_tasks',
     'project_confirmations', 'project_deferred_items', 'project_subscriptions',
     'event_interactions', 'agent_run_handoffs'
   ] LOOP

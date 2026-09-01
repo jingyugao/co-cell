@@ -29,6 +29,7 @@ export interface TaskSandboxOptions {
   mounts?: readonly SandboxMount[];
   initializers?: readonly SandboxInitializer[];
   sharedContainerName?: string;
+  dindImage?: string;
 }
 
 export interface AgentSeatWorkspaceAllocation {
@@ -210,12 +211,18 @@ export async function createTaskSandbox(
       ...options.env,
       HOME: agentHome,
       GLAB_CONFIG_DIR: `${agentHome}/.config/glab-cli`,
+      ...(options.dindImage
+        ? { DOCKER_HOST: "tcp://docker-daemon:2375" }
+        : {}),
     };
     provider = new SharedDockerSandboxProvider({
       hostWorkspaceRoot: workspaceRoot,
       containerWorkspaceRoot,
       containerName: options.sharedContainerName,
       user,
+      ...(options.dindImage
+        ? { dockerSidecar: { image: options.dindImage } }
+        : {}),
     });
   } else {
     provider = new DockerSandboxProvider({

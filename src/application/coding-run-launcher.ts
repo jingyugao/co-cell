@@ -1,10 +1,10 @@
 import { resolve } from "node:path";
+import type { BaseCheckpointSaver } from "@langchain/langgraph";
 
 import { runCodingTask } from "../agent/coding-agent.js";
 import type { ContextCompressionConfig } from "../agent/context-compression.js";
 import type { ExternalAgentEvent } from "../contracts/workflow.js";
 import { createProjectTools } from "../tools/project/index.js";
-import { createPostgresCheckpointer } from "../persistence/postgres-checkpointer.js";
 import type { PostgresWorkbenchRepository } from "../persistence/workbench-repository.js";
 import type { PostgresProjectCollaborationRepository } from "../persistence/project-collaboration-repository.js";
 import type { PostgresProjectEventBus } from "../events/project-event-bus.js";
@@ -37,7 +37,8 @@ export interface CodingRunLauncherOptions {
   eventBus: PostgresProjectEventBus;
   eventInteractions: PostgresProjectEventInteractions;
   handoffRepository: PostgresRunHandoffRepository;
-  databaseUrl: string;
+  /** Service-owned checkpoint saver. Its pool outlives every individual Run. */
+  checkpointer: BaseCheckpointSaver;
   specsRoot: string;
   listAgentSpecs(): Promise<Array<{
     id: string;
@@ -50,6 +51,7 @@ export interface CodingRunLauncherOptions {
   sandboxBackend: SandboxBackend;
   sandboxImage?: string;
   sandboxNetwork: string;
+  dindImage?: string;
   sharedSandboxName: string;
   openAIBaseUrl?: string;
   openAIApiKey?: string;
@@ -77,6 +79,20 @@ export function buildProjectTaskPrompt(
   sourceUrl: string,
 ): string {
   return `当前项目：\n\n- 项目来源地址：${sourceUrl}`;
+}
+
+export function buildSessionRunPrompt(input: {
+  sourceUrl: string;
+  isFirstRunInSession: boolean;
+  handoff?: string | null;
+}): string {
+  if (input.isFirstRunInSession) {
+    return appendRunHandoffToPrompt(
+      buildProjectTaskPrompt(input.sourceUrl),
+      input.handoff,
+    );
+  }
+  return "当前 Agent Session 已有项目上下文。请调用 project_get 和 task_list，处理当前分配的项目工作。";
 }
 
 export function buildExternalEventsPrompt(events: readonly ExternalAgentEvent[]): string {
@@ -257,6 +273,7 @@ export class CodingRunLauncher implements AgentRunLauncher {
       image: this.options.sandboxImage,
       network: this.options.sandboxNetwork,
       sharedContainerName: `${this.options.sharedSandboxName}-${allocation.agentSeatSlug}`,
+      dindImage: this.options.dindImage,
       env: {
         GITLAB_BASE_URL: this.options.gitlabBaseUrl!,
         GITLAB_HOST: gitlabHost,
@@ -349,10 +366,6 @@ export class CodingRunLauncher implements AgentRunLauncher {
         instanceMemory,
       );
     }
-    const checkpoint = await createPostgresCheckpointer({
-      connectionString: this.options.databaseUrl,
-      schema: process.env.AGENT_CHECKPOINT_SCHEMA,
-    });
     const workflowTools = createProjectTools({
       repository: this.options.collaborationRepository,
       projectId: context.projectId,
@@ -484,19 +497,22 @@ export class CodingRunLauncher implements AgentRunLauncher {
             : "Agent 开始处理需求",
         detail: eventActivation
           ? "Agent 将处理已进入项目 Inbox 的消息，并核对项目文件和 Task 状态"
-          : "控制面仅提供飞书 Project 地址；Agent 将使用 Sandbox 内的 Meegle 和 Lark CLI 自主读取最新需求",
+          : context.isFirstRunInSession
+            ? "控制面仅在 Session 首轮提供飞书 Project 地址；Agent 将自主读取最新需求"
+            : "Agent Session 已有项目上下文；Agent 将查询项目 Task 和实时状态继续工作",
         data: { state: "running", progressPercent: 5 },
       });
       let nextResume = resumeInput;
-      const previousHandoff = !resumeInput && !eventActivation
+      const previousHandoff = !resumeInput && !eventActivation && context.isFirstRunInSession
         ? await this.options.handoffRepository.getOrCreatePreviousForRun(runId)
         : null;
       let nextPrompt = eventActivation
         ? "项目 Inbox 中有新的外部事件。请检查并处理事件、待确认事项和当前工作流状态。"
-        : appendRunHandoffToPrompt(
-            buildProjectTaskPrompt(context.sourceUrl),
-            previousHandoff?.content,
-          );
+        : buildSessionRunPrompt({
+            sourceUrl: context.sourceUrl,
+            isFirstRunInSession: context.isFirstRunInSession,
+            handoff: previousHandoff?.content,
+          });
       let lastResponse = "";
       const processedExternalEventIds = new Set<string>();
       let mergeRequestUrl: string | undefined;
@@ -508,7 +524,7 @@ export class CodingRunLauncher implements AgentRunLauncher {
           prompt: nextPrompt,
           threadId: context.threadId,
           runId,
-          checkpointer: checkpoint.checkpointer,
+          checkpointer: this.options.checkpointer,
           ...(nextResume ? { resume: nextResume } : {}),
           model: this.options.model,
           contextCompression: this.options.contextCompression,
@@ -577,7 +593,6 @@ export class CodingRunLauncher implements AgentRunLauncher {
         });
       }
     } finally {
-      await checkpoint.close();
       await sandbox?.destroy();
     }
   }

@@ -34,7 +34,8 @@ describe("loadAgentSpec", () => {
     );
 
     expect(launcher).not.toContain("this.options.source.get");
-    expect(launcher).toContain("buildProjectTaskPrompt(context.sourceUrl)");
+    expect(launcher).toContain("buildSessionRunPrompt({");
+    expect(launcher).toContain("isFirstRunInSession: context.isFirstRunInSession");
     expect(launcher).toContain("spec.prompt");
     expect(launcher).toContain("getAgentSessionMemory(context.sessionId)");
     expect(launcher).toContain("context.responsibility");

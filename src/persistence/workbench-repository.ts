@@ -42,6 +42,7 @@ export interface AgentRunExecutionContext {
   isCoordinator: boolean;
   threadId: string;
   workspaceKey: string;
+  isFirstRunInSession: boolean;
 }
 
 export interface AgentSessionMemorySnapshot {
@@ -1595,10 +1596,7 @@ export class PostgresWorkbenchRepository {
         if (previousStatus && ["queued", "running", "waiting_user"].includes(previousStatus)) {
           throw new ConflictError("Agent Seat already has an active Run");
         }
-        if (
-          previousStatus &&
-          (options.sessionMode === "fresh" || previousStatus === "failed")
-        ) {
+        if (previousStatus && options.sessionMode === "fresh") {
           await client.query(
             `UPDATE swarm_hive.agent_sessions
                 SET status = 'closed', closed_at = now()
@@ -1728,13 +1726,20 @@ export class PostgresWorkbenchRepository {
       is_coordinator: boolean;
       thread_id: string;
       workspace_key: string;
+      is_first_run_in_session: boolean;
     }>(
       `SELECT r.id AS run_id, r.project_id, seat.id AS seat_id,
               session.id AS session_id,
               p.source, p.external_url, p.external_project_key, p.external_work_item_type,
               p.external_project_id, ai.id AS agent_instance_id,
               ai.spec_key, ai.spec_version, seat.responsibility, seat.is_coordinator,
-              session.thread_id, seat.workspace_key
+              session.thread_id, seat.workspace_key,
+              NOT EXISTS (
+                SELECT 1
+                  FROM swarm_hive.agent_runs previous
+                 WHERE previous.agent_session_id = r.agent_session_id
+                   AND (previous.created_at, previous.id) < (r.created_at, r.id)
+              ) AS is_first_run_in_session
          FROM swarm_hive.agent_runs r
          JOIN swarm_hive.agent_sessions session ON session.id = r.agent_session_id
          JOIN swarm_hive.agent_seats seat ON seat.id = session.agent_seat_id
@@ -1762,6 +1767,7 @@ export class PostgresWorkbenchRepository {
       isCoordinator: row.is_coordinator,
       threadId: row.thread_id,
       workspaceKey: row.workspace_key,
+      isFirstRunInSession: row.is_first_run_in_session,
     };
   }
 
@@ -1826,12 +1832,20 @@ export class PostgresWorkbenchRepository {
                 finished_at = CASE WHEN $2 IN ('succeeded','failed') THEN now() ELSE NULL END
           WHERE id = $1
             AND status IN ('queued', 'running', 'waiting_user')
-          RETURNING agent_instance_id, agent_session_id
+          RETURNING agent_instance_id, agent_session_id, task_id
        ), updated_session AS (
          UPDATE swarm_hive.agent_sessions session
             SET status = CASE WHEN $2 = 'waiting_user' THEN 'waiting' ELSE 'active' END,
                 last_active_at = now()
           WHERE session.id = (SELECT agent_session_id FROM updated_run)
+          RETURNING id
+       ), requeued_task AS (
+         UPDATE swarm_hive.project_tasks task
+            SET status = 'assigned', blocked_reason = NULL,
+                completed_at = NULL, updated_at = now()
+          WHERE $2 = 'failed'
+            AND task.id = (SELECT task_id FROM updated_run)
+            AND task.status = 'running'
           RETURNING id
        )
        UPDATE swarm_hive.agent_instances

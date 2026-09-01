@@ -13,6 +13,7 @@ import { PostgresWorkbenchRepository } from "../persistence/workbench-repository
 import { PostgresProjectCollaborationRepository } from "../persistence/project-collaboration-repository.js";
 import { PostgresAgentConversationReader } from "../persistence/checkpoint-conversation-reader.js";
 import { PostgresRunHandoffRepository } from "../persistence/run-handoff-repository.js";
+import { createPostgresCheckpointer } from "../persistence/postgres-checkpointer.js";
 import { FeishuCommentEventSubscriber } from "../integrations/feishu-comment-events.js";
 import {
   PostgresProjectEventBus,
@@ -28,6 +29,10 @@ import { FilesystemAgentSpecCatalog } from "./agent-spec-catalog.js";
 const config = loadServerConfig();
 await migrateBusinessDatabase({ connectionString: config.databaseUrl });
 const database = createBusinessDatabase(config.databaseUrl);
+const checkpoint = await createPostgresCheckpointer({
+  connectionString: config.databaseUrl,
+  schema: process.env.AGENT_CHECKPOINT_SCHEMA,
+});
 const repository = new PostgresWorkbenchRepository(database.pool);
 const collaborationRepository = new PostgresProjectCollaborationRepository(database.pool);
 const handoffRepository = new PostgresRunHandoffRepository(database.pool);
@@ -54,7 +59,7 @@ const runLauncher = new CodingRunLauncher({
   eventBus,
   eventInteractions,
   handoffRepository,
-  databaseUrl: config.databaseUrl,
+  checkpointer: checkpoint.checkpointer,
   specsRoot: config.specsRoot,
   listAgentSpecs: async () => (await specCatalog.list()).items.map((spec) => ({
     id: spec.id,
@@ -67,6 +72,7 @@ const runLauncher = new CodingRunLauncher({
   sandboxBackend: config.sandboxBackend,
   sandboxImage: config.sandboxImage,
   sandboxNetwork: config.sandboxNetwork,
+  dindImage: config.dindImage,
   sharedSandboxName: config.sandboxName,
   openAIBaseUrl: config.openAIBaseUrl,
   openAIApiKey: config.openAIApiKey,
@@ -147,6 +153,7 @@ async function stop(signal: string): Promise<void> {
   commentEvents?.stop();
   server.close();
   await conversationReader.close();
+  await checkpoint.close();
   await database.close();
 }
 

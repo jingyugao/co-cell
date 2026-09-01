@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, posix } from "node:path";
 
@@ -24,10 +25,40 @@ interface DockerInspect {
   };
   State?: { Running?: boolean };
   Mounts?: Array<{ Source?: string; Destination?: string; RW?: boolean }>;
+  NetworkSettings?: { Networks?: Record<string, unknown> };
 }
 
 function wait(milliseconds: number): Promise<void> {
   return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+}
+
+class StaleSharedSandboxError extends Error {}
+
+function mountFingerprint(
+  hostRoot: string,
+  containerWorkspaceRoot: string,
+  mounts: readonly { source: string; target: string; readOnly?: boolean }[],
+): string {
+  const configuration = [
+    { source: hostRoot, target: containerWorkspaceRoot, readOnly: false },
+    ...mounts.map((mount) => ({
+      source: mount.source,
+      target: mount.target,
+      readOnly: mount.readOnly === true,
+    })),
+  ].sort((left, right) => left.target.localeCompare(right.target));
+  return createHash("sha256").update(JSON.stringify(configuration)).digest("hex");
+}
+
+async function sameRealPath(left: string | undefined, right: string): Promise<boolean> {
+  if (!left) return false;
+  try {
+    return await realpath(left) === right;
+  } catch {
+    // Docker Desktop exposes bind sources created through the Docker socket as
+    // VM-internal /run/desktop paths which are not visible in the controller.
+    return false;
+  }
 }
 
 export interface SharedDockerSandboxProviderOptions {
@@ -37,6 +68,9 @@ export interface SharedDockerSandboxProviderOptions {
   commandRunner?: DockerCommandRunner;
   shell?: string;
   user?: string;
+  dockerSidecar?: {
+    image: string;
+  };
 }
 
 function assertDockerSuccess(
@@ -104,6 +138,18 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
     return this.options.containerWorkspaceRoot ?? "/agent-workspaces";
   }
 
+  private get dockerContainerName(): string {
+    return `${this.containerName}-docker`;
+  }
+
+  private get dockerNetworkName(): string {
+    return `${this.containerName}-network`;
+  }
+
+  private get dockerDataVolumeName(): string {
+    return `${this.containerName}-docker-data`;
+  }
+
   private ensureContainer(spec: SandboxSpec): Promise<void> {
     this.ensurePromise ??= this.ensureContainerOnce(spec).catch((error) => {
       this.ensurePromise = undefined;
@@ -114,10 +160,20 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
 
   private async ensureContainerOnce(spec: SandboxSpec): Promise<void> {
     const hostRoot = await realpath(this.options.hostWorkspaceRoot);
+    if (this.options.dockerSidecar) {
+      await this.ensureDockerNetwork();
+      await this.ensureDockerSidecar(hostRoot);
+    }
     const inspectResult = await this.runner.run(["inspect", this.containerName]);
     if (inspectResult.exitCode === 0) {
-      await this.useExistingContainer(inspectResult.stdout, hostRoot, spec);
-      return;
+      try {
+        await this.useExistingContainer(inspectResult.stdout, hostRoot, spec);
+        return;
+      } catch (error) {
+        if (!(error instanceof StaleSharedSandboxError)) throw error;
+        const removed = await this.runner.run(["rm", "-f", this.containerName]);
+        assertDockerSuccess(removed, "docker replace stale shared sandbox");
+      }
     }
 
     const createArgs = [
@@ -126,8 +182,16 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
       this.containerName,
       "--label",
       "swarm-hive.shared-sandbox=true",
+      "--label",
+      `swarm-hive.workspace-root=${hostRoot}`,
+      "--label",
+      `swarm-hive.mounts-fingerprint=${mountFingerprint(
+        hostRoot,
+        this.containerWorkspaceRoot,
+        spec.mounts ?? [],
+      )}`,
       "--network",
-      spec.networkProfile,
+      this.options.dockerSidecar ? this.dockerNetworkName : spec.networkProfile,
       "--user",
       this.options.user ?? "10001:10001",
       "--mount",
@@ -165,6 +229,118 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
     assertDockerSuccess(startResult, "docker start shared sandbox");
   }
 
+  private async ensureDockerNetwork(): Promise<void> {
+    const inspect = await this.runner.run(["network", "inspect", this.dockerNetworkName]);
+    if (inspect.exitCode === 0) return;
+    const created = await this.runner.run([
+      "network",
+      "create",
+      "--label",
+      "swarm-hive.dind-network=true",
+      this.dockerNetworkName,
+    ]);
+    if (created.exitCode !== 0) {
+      const racedInspect = await this.runner.run(["network", "inspect", this.dockerNetworkName]);
+      if (racedInspect.exitCode !== 0) {
+        assertDockerSuccess(created, "docker create Agent DinD network");
+      }
+    }
+  }
+
+  private async ensureDockerSidecar(hostRoot: string): Promise<void> {
+    const inspect = await this.runner.run(["inspect", this.dockerContainerName]);
+    if (inspect.exitCode === 0) {
+      const inspected = JSON.parse(inspect.stdout) as DockerInspect[];
+      const container = inspected[0];
+      if (!container) throw new Error("docker inspect returned no Agent DinD container");
+      if (container.Config?.Labels?.["swarm-hive.dind-sidecar"] !== "true") {
+        throw new Error(
+          `Container ${this.dockerContainerName} exists but is not managed by SwarmHive`,
+        );
+      }
+      if (container.Config.Image !== this.options.dockerSidecar?.image) {
+        throw new Error(
+          `Agent DinD ${this.dockerContainerName} uses image ${container.Config.Image ?? "unknown"}; expected ${this.options.dockerSidecar?.image}. Recreate it before starting agents.`,
+        );
+      }
+      const workspaceMount = container.Mounts?.find(
+        (candidate) => candidate.Destination === this.containerWorkspaceRoot,
+      );
+      const labeledWorkspaceRoot = container.Config?.Labels?.["swarm-hive.workspace-root"];
+      if (
+        !workspaceMount ||
+        (labeledWorkspaceRoot !== undefined && labeledWorkspaceRoot !== hostRoot)
+      ) {
+        throw new Error(
+          `Agent DinD ${this.dockerContainerName} is mounted to a different workspace root`,
+        );
+      }
+      if (!container.NetworkSettings?.Networks?.[this.dockerNetworkName]) {
+        const connected = await this.runner.run([
+          "network",
+          "connect",
+          "--alias",
+          "docker-daemon",
+          this.dockerNetworkName,
+          this.dockerContainerName,
+        ]);
+        assertDockerSuccess(connected, "docker connect Agent DinD network");
+      }
+      if (!container.State?.Running) {
+        const started = await this.runner.run(["start", this.dockerContainerName]);
+        assertDockerSuccess(started, "docker start Agent DinD");
+      }
+      await this.waitForDockerSidecar();
+      return;
+    }
+
+    const created = await this.runner.run([
+      "create",
+      "--name",
+      this.dockerContainerName,
+      "--label",
+      "swarm-hive.dind-sidecar=true",
+      "--label",
+      `swarm-hive.workspace-root=${hostRoot}`,
+      "--privileged",
+      "--restart",
+      "unless-stopped",
+      "--network",
+      this.dockerNetworkName,
+      "--network-alias",
+      "docker-daemon",
+      "--env",
+      "DOCKER_TLS_CERTDIR=",
+      "--mount",
+      `type=volume,src=${this.dockerDataVolumeName},dst=/var/lib/docker`,
+      "--mount",
+      `type=bind,src=${hostRoot},dst=${this.containerWorkspaceRoot}`,
+      this.options.dockerSidecar!.image,
+    ]);
+    assertDockerSuccess(created, "docker create Agent DinD");
+    const started = await this.runner.run(["start", this.dockerContainerName]);
+    assertDockerSuccess(started, "docker start Agent DinD");
+    await this.waitForDockerSidecar();
+  }
+
+  private async waitForDockerSidecar(): Promise<void> {
+    let lastError = "Docker daemon did not become ready";
+    for (let attempt = 1; attempt <= 60; attempt += 1) {
+      const result = await this.runner.run([
+        "exec",
+        this.dockerContainerName,
+        "docker",
+        "info",
+        "--format",
+        "{{.ServerVersion}}",
+      ]);
+      if (result.exitCode === 0) return;
+      lastError = result.stderr.trim() || result.stdout.trim() || lastError;
+      await wait(Math.min(attempt * 100, 1_000));
+    }
+    throw new Error(`Agent DinD ${this.dockerContainerName} is not ready: ${lastError}`);
+  }
+
   private async useExistingContainer(
     inspectOutput: string,
     hostRoot: string,
@@ -179,16 +355,49 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
       );
     }
     if (container.Config.Image !== spec.image) {
-      throw new Error(
+      throw new StaleSharedSandboxError(
         `Shared sandbox ${this.containerName} uses image ${container.Config.Image ?? "unknown"}; expected ${spec.image}. Recreate it before starting agents.`,
       );
+    }
+    if (
+      this.options.dockerSidecar &&
+      !container.NetworkSettings?.Networks?.[this.dockerNetworkName]
+    ) {
+      const connected = await this.runner.run([
+        "network",
+        "connect",
+        this.dockerNetworkName,
+        this.containerName,
+      ]);
+      assertDockerSuccess(connected, "docker connect shared sandbox to Agent DinD network");
     }
     const mount = container.Mounts?.find(
       (candidate) => candidate.Destination === this.containerWorkspaceRoot,
     );
-    if (!mount || (await realpath(mount.Source ?? "")) !== hostRoot) {
-      throw new Error(
+    const labeledWorkspaceRoot = container.Config?.Labels?.["swarm-hive.workspace-root"];
+    if (
+      !mount ||
+      (labeledWorkspaceRoot
+        ? labeledWorkspaceRoot !== hostRoot
+        : !(await sameRealPath(mount.Source, hostRoot)))
+    ) {
+      throw new StaleSharedSandboxError(
         `Shared sandbox ${this.containerName} is mounted to a different workspace root`,
+      );
+    }
+    const expectedMountFingerprint = mountFingerprint(
+      hostRoot,
+      this.containerWorkspaceRoot,
+      spec.mounts ?? [],
+    );
+    const labeledMountFingerprint =
+      container.Config?.Labels?.["swarm-hive.mounts-fingerprint"];
+    if (
+      labeledMountFingerprint !== undefined &&
+      labeledMountFingerprint !== expectedMountFingerprint
+    ) {
+      throw new StaleSharedSandboxError(
+        `Shared sandbox ${this.containerName} uses stale mounts`,
       );
     }
     for (const required of spec.mounts ?? []) {
@@ -197,10 +406,11 @@ export class SharedDockerSandboxProvider implements SandboxProvider {
       );
       if (
         !configured ||
-        (await realpath(configured.Source ?? "")) !== await realpath(required.source) ||
+        (labeledMountFingerprint === undefined &&
+          !(await sameRealPath(configured.Source, await realpath(required.source)))) ||
         (required.readOnly === true && configured.RW !== false)
       ) {
-        throw new Error(
+        throw new StaleSharedSandboxError(
           `Shared sandbox ${this.containerName} is missing required mount ${required.target}. Recreate it before starting agents.`,
         );
       }

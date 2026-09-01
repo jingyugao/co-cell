@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import {
   buildExternalEventsPrompt,
   buildProjectTaskPrompt,
+  buildSessionRunPrompt,
 } from "../src/application/coding-run-launcher.js";
 import {
   appendRunHandoffToPrompt,
@@ -19,6 +20,29 @@ describe("Coding Run task prompt", () => {
       "当前项目：\n\n" +
       "- 项目来源地址：https://project.feishu.cn/example/story/detail/123",
     );
+  });
+
+  test("only injects project context and handoff on the first Run in a Session", () => {
+    expect(buildSessionRunPrompt({
+      sourceUrl: "https://project.feishu.cn/example/story/detail/123",
+      isFirstRunInSession: true,
+      handoff: "# 上一次 Agent Run 交接摘要\n\n上一 Session 的结果",
+    })).toContain("项目来源地址：https://project.feishu.cn/example/story/detail/123");
+    expect(buildSessionRunPrompt({
+      sourceUrl: "https://project.feishu.cn/example/story/detail/123",
+      isFirstRunInSession: true,
+      handoff: "# 上一次 Agent Run 交接摘要\n\n上一 Session 的结果",
+    })).toContain("上一 Session 的结果");
+
+    const continued = buildSessionRunPrompt({
+      sourceUrl: "https://project.feishu.cn/example/story/detail/123",
+      isFirstRunInSession: false,
+      handoff: "不应再次注入",
+    });
+    expect(continued).toContain("已有项目上下文");
+    expect(continued).not.toContain("项目来源地址");
+    expect(continued).not.toContain("上一次 Agent Run 交接摘要");
+    expect(continued).not.toContain("不应再次注入");
   });
 
   test("renders external feedback as untrusted Agent input", () => {

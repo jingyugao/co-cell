@@ -18,6 +18,7 @@ export interface ServerConfig {
   sandboxBackend: SandboxBackend;
   sandboxImage?: string;
   sandboxNetwork: string;
+  dindImage?: string;
   feishuProjectMcpUrl: string;
   feishuProjectMcpToken: string;
   larkAppId?: string;
@@ -86,6 +87,9 @@ export function loadServerConfig(): ServerConfig {
       ? { sandboxImage: process.env.AGENT_SANDBOX_IMAGE.trim() }
       : {}),
     sandboxNetwork: process.env.AGENT_SANDBOX_NETWORK?.trim() || "bridge",
+    ...(process.env.AGENT_DIND_ENABLED?.trim().toLowerCase() === "false"
+      ? {}
+      : { dindImage: process.env.AGENT_DIND_IMAGE?.trim() || "docker:29-dind" }),
     feishuProjectMcpUrl,
     feishuProjectMcpToken,
     ...(larkAppId ? { larkAppId } : {}),

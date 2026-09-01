@@ -28,7 +28,10 @@ class FakeRunner implements DockerCommandRunner {
 
   async run(args: readonly string[]): Promise<DockerCommandResult> {
     this.calls.push([...args]);
-    if (args[0] === "inspect") {
+    if (
+      args[0] === "inspect" ||
+      (args[0] === "network" && args[1] === "inspect")
+    ) {
       return { stdout: "", stderr: "not found", exitCode: 1 };
     }
     return { stdout: "shared-container\n", stderr: "", exitCode: 0 };
@@ -39,6 +42,32 @@ class FakeRunner implements DockerCommandRunner {
     const child = new FakeChild();
     this.children.push(child);
     return child as unknown as ChildProcessWithoutNullStreams;
+  }
+}
+
+class StaleSandboxRunner extends FakeRunner {
+  override async run(args: readonly string[]): Promise<DockerCommandResult> {
+    this.calls.push([...args]);
+    if (args[0] === "inspect") {
+      return {
+        stdout: JSON.stringify([{
+          Config: {
+            Image: "swarm-hive-sandbox-python:3.12",
+            Labels: { "swarm-hive.shared-sandbox": "true" },
+          },
+          State: { Running: true },
+          Mounts: [{
+            Source: process.cwd(),
+            Destination: "/home/agent",
+            RW: true,
+          }],
+          NetworkSettings: { Networks: { bridge: {} } },
+        }]),
+        stderr: "",
+        exitCode: 0,
+      };
+    }
+    return { stdout: "shared-container\n", stderr: "", exitCode: 0 };
   }
 }
 
@@ -96,6 +125,69 @@ describe("SharedDockerSandboxProvider", () => {
     await sandbox.destroy();
     expect(runner.calls.some((call) => call[0] === "rm")).toBe(false);
     await expect(provider.get(sandbox.id)).resolves.toBeUndefined();
+  });
+
+  test("creates a private persistent DinD sidecar when enabled", async () => {
+    const runner = new FakeRunner();
+    const provider = new SharedDockerSandboxProvider({
+      hostWorkspaceRoot: process.cwd(),
+      containerWorkspaceRoot: "/home/agent/projects/project-1001",
+      containerName: "swarm-hive-test-dind",
+      commandRunner: runner,
+      dockerSidecar: { image: "docker:29-dind" },
+    });
+
+    const sandbox = await provider.create(spec());
+    const networkCreate = runner.calls.find(
+      (call) => call[0] === "network" && call[1] === "create",
+    ) ?? [];
+    expect(networkCreate).toContain("swarm-hive-test-dind-network");
+
+    const sidecarCreate = runner.calls.find(
+      (call) => call[0] === "create" && call.includes("swarm-hive.dind-sidecar=true"),
+    ) ?? [];
+    expect(sidecarCreate).toContain("--privileged");
+    expect(sidecarCreate).toContain("docker:29-dind");
+    expect(sidecarCreate).toContain(
+      "type=volume,src=swarm-hive-test-dind-docker-data,dst=/var/lib/docker",
+    );
+    expect(sidecarCreate).toContain(
+      `type=bind,src=${process.cwd()},dst=/home/agent/projects/project-1001`,
+    );
+
+    const sandboxCreate = runner.calls.find(
+      (call) => call[0] === "create" && call.includes("swarm-hive.shared-sandbox=true"),
+    ) ?? [];
+    expect(sandboxCreate).toContain("swarm-hive-test-dind-network");
+    expect(runner.calls).toContainEqual([
+      "exec",
+      "swarm-hive-test-dind-docker",
+      "docker",
+      "info",
+      "--format",
+      "{{.ServerVersion}}",
+    ]);
+    await sandbox.destroy();
+  });
+
+  test("replaces a managed shared sandbox when persistent mounts are stale", async () => {
+    const runner = new StaleSandboxRunner();
+    const provider = new SharedDockerSandboxProvider({
+      hostWorkspaceRoot: process.cwd(),
+      containerWorkspaceRoot: "/home/agent",
+      containerName: "swarm-hive-test-stale",
+      commandRunner: runner,
+    });
+
+    await provider.create(spec());
+
+    expect(runner.calls).toContainEqual(["rm", "-f", "swarm-hive-test-stale"]);
+    const replacement = runner.calls.find(
+      (call) => call[0] === "create" && call.includes("swarm-hive.shared-sandbox=true"),
+    ) ?? [];
+    expect(
+      replacement.some((value) => value.startsWith("swarm-hive.mounts-fingerprint=")),
+    ).toBe(true);
   });
 
   test("rejects commands outside the assigned Agent directory", async () => {

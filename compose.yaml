@@ -7,11 +7,13 @@ services:
     image: swarm-hive-control:local
     environment:
       AGENT_SANDBOX: ${AGENT_SANDBOX:-shared-docker}
-      AGENT_SPEC_DIR: ${AGENT_SPEC_DIR:-/app/agent-specs/software-engineer}
-      AGENT_SPECS_ROOT: ${AGENT_SPECS_ROOT:-/app/agent-specs}
+      AGENT_SPEC_DIR: ${AGENT_SPEC_DIR:-${PWD}/agent-specs/software-engineer}
+      AGENT_SPECS_ROOT: ${AGENT_SPECS_ROOT:-${PWD}/agent-specs}
       AGENT_SANDBOX_IMAGE: ${AGENT_SANDBOX_IMAGE:-swarm-hive-sandbox-python:3.12}
       AGENT_SHARED_SANDBOX_NAME: ${AGENT_SHARED_SANDBOX_NAME:-swarm-hive-dev-sandbox}
       AGENT_SANDBOX_NETWORK: ${AGENT_SANDBOX_NETWORK:-none}
+      AGENT_DIND_ENABLED: ${AGENT_DIND_ENABLED:-true}
+      AGENT_DIND_IMAGE: ${AGENT_DIND_IMAGE:-docker:29-dind}
       AGENT_WORKSPACE_ROOT: ${AGENT_WORKSPACE_ROOT:-/srv/agent-workspaces}
       AGENT_KUBECONFIG: ${AGENT_KUBECONFIG:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -22,7 +24,9 @@ services:
       LARK_APP_SECRET: ${LARK_APP_SECRET:-}
       AGENT_CHECKPOINT_DATABASE_URL: ${AGENT_CHECKPOINT_DATABASE_URL:-}
       AGENT_CHECKPOINT_SCHEMA: ${AGENT_CHECKPOINT_SCHEMA:-public}
-      AGENT_DATABASE_URL: ${AGENT_DATABASE_URL:-}
+      # Containers reach the bundled database through Compose DNS. Override
+      # AGENT_CONTAINER_DATABASE_URL when using an external PostgreSQL service.
+      AGENT_DATABASE_URL: ${AGENT_CONTAINER_DATABASE_URL:-postgresql://agent:REDACTED_PASSWORD@checkpoint-postgres:5432/swarm_hive}
       AGENT_SERVER_HOST: 0.0.0.0
       AGENT_SERVER_PORT: 3000
       GITLAB_BASE_URL: ${GITLAB_BASE_URL:-}
@@ -34,6 +38,10 @@ services:
       # Keep the same absolute path on host and in this container. The host
       # Docker daemon resolves bind-mount source paths in the host namespace.
       - ${AGENT_WORKSPACE_ROOT:-/srv/agent-workspaces}:${AGENT_WORKSPACE_ROOT:-/srv/agent-workspaces}
+      - ${AGENT_SPECS_ROOT:-${PWD}/agent-specs}:${AGENT_SPECS_ROOT:-${PWD}/agent-specs}:ro
+      # The controller validates this file before asking the host daemon to
+      # mount it read-only into an Agent Sandbox. Both sides need the same path.
+      - ${AGENT_KUBECONFIG:-/dev/null}:${AGENT_KUBECONFIG:-/etc/swarm-hive/kubeconfig-disabled}:ro
     ports:
       - 127.0.0.1:${AGENT_SERVER_PORT:-3000}:3000
 

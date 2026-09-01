@@ -22,10 +22,14 @@ export class PostgresRunHandoffRepository {
     const previous = await this.pool.query<{ id: string }>(
       `SELECT previous.id
          FROM swarm_hive.agent_runs current
+         JOIN swarm_hive.agent_sessions current_session
+           ON current_session.id = current.agent_session_id
          JOIN LATERAL (
            SELECT candidate.id
              FROM swarm_hive.agent_runs candidate
-            WHERE candidate.agent_session_id = current.agent_session_id
+             JOIN swarm_hive.agent_sessions candidate_session
+               ON candidate_session.id = candidate.agent_session_id
+            WHERE candidate_session.agent_seat_id = current_session.agent_seat_id
               AND (candidate.created_at, candidate.id) < (current.created_at, current.id)
               AND candidate.status IN ('succeeded', 'failed', 'cancelled')
             ORDER BY candidate.created_at DESC, candidate.id DESC

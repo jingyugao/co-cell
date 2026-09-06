@@ -1,0 +1,20 @@
+[Unit]
+Description=E2B api (local development)
+PartOf=e2b.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/example/Code/swarm-hive/data/e2b
+EnvironmentFile=/home/example/Code/swarm-hive/data/e2b/config/api.env
+ExecStartPre=/bin/bash /home/example/Code/swarm-hive/scripts/e2b-wait-dependencies.sh api
+ExecStart=/home/example/Code/swarm-hive/data/e2b/bin/api --port 13000
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=90
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=e2b.target

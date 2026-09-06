@@ -1,4 +1,7 @@
 .swarm-hive
+backup
+data
+agent-specs
 .env
 .git
 coverage

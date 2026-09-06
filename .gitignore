@@ -1,10 +1,13 @@
 node_modules/
+/backup/
 dist/
 .env
 .swarm-hive/
+agent-specs/
 agent-specs/**/.credentials/
 agent-specs/**/.env
 tmp/
+/data/
 coverage/
 *.log
 *.tsbuildinfo

@@ -5,6 +5,7 @@ export default defineConfig({
     exclude: [
       ...configDefaults.exclude,
       ".swarm-hive/**",
+      "backup/**",
     ],
   },
 });

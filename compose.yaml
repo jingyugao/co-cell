@@ -1,75 +1,21 @@
-name: swarm-hive
-
+name: swarm-hive-native
 services:
-  agent-control:
-    build:
-      context: .
-    image: swarm-hive-control:local
+  native-control:
+    build: .
+    image: swarm-hive-native:local
+    network_mode: host
+    env_file: .env
     environment:
-      AGENT_SANDBOX: ${AGENT_SANDBOX:-shared-docker}
-      AGENT_SPEC_DIR: ${AGENT_SPEC_DIR:-${PWD}/agent-specs/software-engineer}
-      AGENT_SPECS_ROOT: ${AGENT_SPECS_ROOT:-${PWD}/agent-specs}
-      AGENT_SANDBOX_IMAGE: ${AGENT_SANDBOX_IMAGE:-swarm-hive-sandbox-python:3.12}
-      AGENT_SHARED_SANDBOX_NAME: ${AGENT_SHARED_SANDBOX_NAME:-swarm-hive-dev-sandbox}
-      AGENT_SANDBOX_NETWORK: ${AGENT_SANDBOX_NETWORK:-none}
-      AGENT_DIND_ENABLED: ${AGENT_DIND_ENABLED:-true}
-      AGENT_DIND_IMAGE: ${AGENT_DIND_IMAGE:-docker:29-dind}
-      AGENT_WORKSPACE_ROOT: ${AGENT_WORKSPACE_ROOT:-/srv/agent-workspaces}
-      AGENT_KUBECONFIG: ${AGENT_KUBECONFIG:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-      FeishuProjectMcpUrl: ${FeishuProjectMcpUrl:-${FEISHU_PROJECT_MCP_URL:-}}
-      FeishuProjectMcpToken: ${FeishuProjectMcpToken:-${FEISHU_PROJECT_MCP_TOKEN:-}}
-      LARK_APP_ID: ${LARK_APP_ID:-}
-      LARK_APP_SECRET: ${LARK_APP_SECRET:-}
-      AGENT_CHECKPOINT_DATABASE_URL: ${AGENT_CHECKPOINT_DATABASE_URL:-}
-      AGENT_CHECKPOINT_SCHEMA: ${AGENT_CHECKPOINT_SCHEMA:-public}
-      # Containers reach the bundled database through Compose DNS. Override
-      # AGENT_CONTAINER_DATABASE_URL when using an external PostgreSQL service.
-      AGENT_DATABASE_URL: ${AGENT_CONTAINER_DATABASE_URL:-postgresql://agent:REDACTED_PASSWORD@checkpoint-postgres:5432/swarm_hive}
-      AGENT_SERVER_HOST: 0.0.0.0
-      AGENT_SERVER_PORT: 3000
-      GITLAB_BASE_URL: ${GITLAB_BASE_URL:-}
-      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
-      GITLAB_USERNAME: ${GITLAB_USERNAME:-oauth2}
-      GITLAB_FEATURE_BRANCH: ${GITLAB_FEATURE_BRANCH:-}
+      AGENT_SERVER_HOST: 127.0.0.1
+      AGENT_SERVER_PORT: ${AGENT_SERVER_PORT:-3000}
+      AGENT_WEB_ROOT: /app/dist/web
+      NATIVE_DATA_DIR: /app/data/native
+      E2B_API_KEY_FILE: /app/data/e2b/api-key
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      # Keep the same absolute path on host and in this container. The host
-      # Docker daemon resolves bind-mount source paths in the host namespace.
-      - ${AGENT_WORKSPACE_ROOT:-/srv/agent-workspaces}:${AGENT_WORKSPACE_ROOT:-/srv/agent-workspaces}
-      - ${AGENT_SPECS_ROOT:-${PWD}/agent-specs}:${AGENT_SPECS_ROOT:-${PWD}/agent-specs}:ro
-      # The controller validates this file before asking the host daemon to
-      # mount it read-only into an Agent Sandbox. Both sides need the same path.
-      - ${AGENT_KUBECONFIG:-/dev/null}:${AGENT_KUBECONFIG:-/etc/swarm-hive/kubeconfig-disabled}:ro
-    ports:
-      - 127.0.0.1:${AGENT_SERVER_PORT:-3000}:3000
-
-  sandbox-python-image:
-    profiles: ["images"]
-    build:
-      context: .
-      dockerfile: ${AGENT_SANDBOX_DOCKERFILE:-agent-specs/software-engineer/sandbox/Dockerfile}
-    image: ${AGENT_SANDBOX_IMAGE:-swarm-hive-sandbox-python:3.12}
-    command: ["true"]
-
-  checkpoint-postgres:
-    profiles: ["persistence"]
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_DB: ${AGENT_POSTGRES_DB:-swarm_hive}
-      POSTGRES_USER: ${AGENT_POSTGRES_USER:-agent}
-      POSTGRES_PASSWORD: ${AGENT_POSTGRES_PASSWORD:-REDACTED_PASSWORD}
-    ports:
-      - 127.0.0.1:${AGENT_POSTGRES_PORT:-55432}:5432
-    volumes:
-      - swarm-hive-postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 2s
-      timeout: 3s
-      retries: 20
-
-volumes:
-  swarm-hive-postgres-data:
-    name: swarm-hive-postgres-data
+      - ./data/native:/app/data/native
+      - ./data/e2b/api-key:/app/data/e2b/api-key:ro
+      - ${CODEX_AUTH_JSON_PATH:-/dev/null}:${CODEX_AUTH_JSON_PATH:-/etc/codex-auth-disabled}:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]

@@ -1,0 +1,34 @@
+.raw-tools-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 7px 9px; font-size: 11px; white-space: nowrap; border: 1px solid #dfe5d4; border-radius: 6px; color: #62704f; }
+.raw-tools-toggle:hover, .raw-tools-toggle[aria-pressed=true] { background: #e8eedf; color: #405b2e; border-color: #bfcfae; }
+.raw-tools-panel { width: min(560px, 46vw); min-width: 360px; flex-shrink: 0; border-left: 1px solid #e0e5d7; background: #f8f9f3; display: flex; flex-direction: column; min-height: 0; }
+.raw-tools-heading { display: flex; align-items: center; gap: 9px; padding: 17px 18px; border-bottom: 1px solid #e0e5d7; flex-shrink: 0; }
+.raw-tools-heading h2 { font-size: 13px; font-weight: 600; margin: 0 auto 0 0; }
+.raw-tools-heading > button:not(.icon-button) { font-size: 11px; color: #677653; padding: 5px; }
+.raw-tools-content { overflow: auto; padding: 17px; min-height: 0; }
+.raw-tools-source { font-size: 11px; color: #6d795e; line-height: 1.8; margin-bottom: 17px; }
+.raw-tools-source strong { color: #435136; font-weight: 500; font-size: 12px; }
+.raw-tools-source p { margin: 6px 0; }
+.raw-tools-source > span { font-size: 10px; color: #929b87; }
+.raw-tools-thread { font-size: 10px; overflow-wrap: anywhere; }
+.raw-tools-empty { display: flex; justify-content: center; align-items: center; gap: 8px; font-size: 12px; line-height: 1.9; text-align: center; padding: 45px 17px; color: #89967a; }
+.raw-tool-exchange { border: 1px solid #dfe5d6; border-radius: 8px; background: #fcfdf9; overflow: hidden; margin-bottom: 12px; }
+.raw-tool-exchange > summary { display: flex; align-items: center; gap: 8px; list-style: none; cursor: pointer; padding: 12px; }
+.raw-tool-exchange > summary::-webkit-details-marker { display: none; }
+.raw-tool-exchange > summary strong { font-family: ui-monospace, monospace; font-size: 12px; font-weight: 500; overflow-wrap: anywhere; min-width: 0; }
+.raw-tool-chevron { color: #8d9a7d; transition: transform .15s; font-size: 18px; line-height: 1; }
+.raw-tool-exchange[open] > summary .raw-tool-chevron { transform: rotate(90deg); }
+.raw-tool-output-status { margin-left: auto; white-space: nowrap; color: #89967a; font-size: 10px; }
+.raw-tool-exchange-body { padding: 0 12px 12px; }
+.raw-tool-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; color: #929b87; font-size: 10px; line-height: 1.7; overflow-wrap: anywhere; margin-bottom: 10px; }
+.raw-tool-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+.raw-tool-toolbar [role=group] { display: flex; flex-wrap: wrap; gap: 4px; }
+.raw-tool-toolbar button, .raw-tool-record-heading button, .raw-tool-retry { background: #fff; border: 1px solid #dfe5d4; border-radius: 5px; padding: 6px 8px; font-size: 10px; }
+.raw-tool-toolbar button[aria-pressed=true] { background: #e8eedf; border-color: #bfcfae; color: #405b2e; }
+.raw-tool-note { color: #839074; font-size: 10px; line-height: 1.8; margin: 10px 0 7px; overflow-wrap: anywhere; }
+.raw-tool-exchange pre { margin: 8px 0 0; padding: 12px; white-space: pre; overflow: auto; max-height: 500px; background: #f1f4ea; border: 1px solid #e0e5d7; border-radius: 6px; font-size: 11px; line-height: 1.8; color: #4e6040; tab-size: 2; user-select: text; }
+.raw-tool-record { margin-top: 12px; }
+.raw-tool-record-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; color: #839074; font-size: 10px; }
+.raw-tool-retry { display: block; margin-top: 8px; }
+@media (max-width: 1150px) { .topbar-actions { gap: 10px; } .raw-tools-panel { width: 450px; } }
+@media (max-width: 1050px) { .raw-tools-panel { position: absolute; top: 70px; right: 0; bottom: 0; z-index: 6; width: min(560px, 100%); box-shadow: -8px 0 25px #33441b16; } }
+@media (max-width: 700px) { .raw-tools-panel { top: 58px; width: 100%; min-width: 0; } .raw-tools-content { padding: 13px; } .raw-tools-heading { padding: 13px 16px; } .raw-tools-toggle { padding: 6px; font-size: 10px; } .raw-tools-toggle svg { display: none; } .topbar-actions { gap: 4px; } }

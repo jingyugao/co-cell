@@ -1,0 +1,29 @@
+.tool-card .tool-inspector {
+  border-top: 1px solid #e4e7dc;
+  background: #f8faf3;
+}
+.tool-card .tool-inspector > summary {
+  display: list-item;
+  list-style: disclosure-closed inside;
+  color: #657452;
+  padding: 10px 13px;
+  font-size: 11px;
+}
+.tool-card .tool-inspector[open] > summary { list-style-type: disclosure-open; }
+.tool-inspector-body { padding: 0 12px 12px; }
+.tool-inspector-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  font-size: 10px;
+  color: #7d876f;
+  overflow-wrap: anywhere;
+  margin: 3px 0 10px;
+}
+.tool-inspector-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.tool-inspector-toolbar [role=group] { display: flex; flex-wrap: wrap; gap: 4px; }
+.tool-inspector-toolbar button { padding: 6px 9px; border: 1px solid #dfe5d4; border-radius: 5px; font-size: 11px; background: #fff; }
+.tool-inspector-toolbar button[aria-pressed=true] { color: #405b2e; background: #e8eedf; border-color: #bfcfae; }
+.tool-inspector-note, .tool-inspector-empty { font-size: 11px; color: #7d876f; line-height: 1.7; margin: 9px 0 0; }
+.tool-inspector-note:empty { display: none; }
+.tool-card .tool-inspector pre { margin-top: 9px; border: 1px solid #e0e5d7; border-radius: 6px; max-height: 420px; font-size: 11px; user-select: text; }

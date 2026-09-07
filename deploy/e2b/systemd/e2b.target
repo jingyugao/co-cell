@@ -1,6 +1,0 @@
-[Unit]
-Description=E2B user services (API and proxy)
-Wants=e2b-api.service e2b-proxy.service
-
-[Install]
-WantedBy=default.target

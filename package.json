@@ -1,40 +1,41 @@
 {
-  "name": "swarm-hive",
+  "name": "codex-web-demo",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "scripts": {
-    "check": "pnpm typecheck && pnpm typecheck:web && pnpm test",
-    "server": "node --env-file=.env --import tsx src/server/main.ts",
-    "typecheck": "tsc --noEmit",
-    "typecheck:web": "tsc --noEmit -p web/tsconfig.json",
-    "test": "vitest run",
-    "web:dev": "vite --config web/vite.config.ts",
-    "web:build": "pnpm typecheck:web && vite build --config web/vite.config.ts",
-    "web:preview": "vite preview --config web/vite.config.ts"
-  },
   "engines": {
-    "node": ">=20"
-  },
-  "dependencies": {
-    "@hono/node-server": "^2.1.1",
-    "@openai/codex-sdk": "0.153.4",
-    "e2b": "2.46.1",
-    "hono": "^4.13.3",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "zod": "^4.4.3"
-  },
-  "devDependencies": {
-    "@types/node": "^24.10.1",
-    "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.4",
-    "@vitejs/plugin-react": "^6.1.0",
-    "tsx": "^4.20.6",
-    "typescript": "^5.9.3",
-    "vite": "^8.2.2",
-    "vitest": "^4.0.18"
+    "node": ">=22.12.0"
   },
   "packageManager": "pnpm@10.33.4",
-  "pnpm": {}
+  "scripts": {
+    "dev": "tsx server/index.ts",
+    "build": "tsc --noEmit && vite build",
+    "start": "NODE_ENV=production tsx server/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "capture:http": "tsx server/capture-demo.ts",
+    "credentials:import": "tsx server/import-connections.ts",
+    "e2b:build": "node scripts/e2b/build-template.mjs && node scripts/e2b/verify-template.mjs",
+    "kubernetes:configure": "tsx server/provision-kubernetes-readonly.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.1",
+    "@openai/codex-sdk": "0.153.4",
+    "e2b": "2.46.1",
+    "hono": "4.13.3",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.1.0",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3",
+    "vite": "8.2.2"
+  }
 }

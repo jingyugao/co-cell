@@ -90,7 +90,7 @@ export interface AppConfig {
   sdkVersion: string;
   auth: 'api-key' | 'local-codex';
   approvalPolicy: 'never';
-  capabilities: { interactiveApprovals: false; tokenDeltas: false };
+  capabilities: { interactiveApprovals: false; tokenDeltas: false; sandboxPreviews?: boolean };
 }
 export interface GitChange { path: string; status: string }
 export interface Changes { branch: string; files: GitChange[]; diff: string; error?: string }

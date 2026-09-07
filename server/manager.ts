@@ -535,6 +535,31 @@ export class SessionManager {
 
   async waitForIdle(id: string) { await this.active.get(id)?.done; }
 
+  async preview(projectId: string, href: string) {
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    let url: URL;
+    try { url = new URL(href); } catch { throw new HttpError(400, '预览链接无效'); }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password
+      || !['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '[::]'].includes(url.hostname.toLowerCase())) {
+      throw new HttpError(400, '仅支持沙箱内 localhost 服务的 HTTP/HTTPS 链接');
+    }
+    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, '服务端口无效');
+    const project = this.projectLookup(projectId);
+    if (project.executionMode !== 'e2b' || !this.e2b) throw new HttpError(400, '此项目不使用 E2B 沙箱');
+    if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先启动服务');
+    const release = this.projectOperation(project.id);
+    const owner: Session = { id: project.id, projectId: project.id, title: project.name, threadId: null,
+      settings: { ...this.defaults, executionMode: 'e2b', workingDirectory: project.workingDirectory },
+      sandbox: structuredClone(project.sandbox), status: 'idle', turns: [], createdAt: project.createdAt, updatedAt: project.updatedAt };
+    try {
+      const origin = await this.e2b.preview(owner, port);
+      const target = new URL(origin);
+      target.pathname = url.pathname; target.search = url.search; target.hash = url.hash;
+      return target.href;
+    } finally { release(); }
+  }
+
   async changes(id: string) {
     const session = this.lookup(id);
     if (session.settings.executionMode !== 'e2b') return getChanges(session.settings.workingDirectory);

@@ -45,6 +45,12 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
     return c.json({ error: '服务器处理失败，请查看服务端日志' }, 500);
   });
 
+  app.get('/api/projects/:id/preview', async c => {
+    const href = c.req.query('url');
+    if (!href || href.length > 8192) throw new HttpError(400, '预览链接无效');
+    return c.redirect(await manager.preview(c.req.param('id'), href), 302);
+  });
+
   app.get('/api/config', c => c.json(config));
   app.get('/api/connections', async c => {
     if (!connections) throw new HttpError(503, '连接管理尚未初始化');

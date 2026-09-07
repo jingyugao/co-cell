@@ -13,6 +13,7 @@ export interface E2BRuntime {
   track?(session: Session, onSandbox: (value: NonNullable<Session['sandbox']>) => Promise<void>): void;
   run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: NonNullable<Session['sandbox']>) => Promise<void>): AsyncGenerator<AgentEvent>;
   changes(session: Session): Promise<Changes>;
+  preview(session: Session, port: number): Promise<string>;
   rawTools(session: Session, cursor?: number): Promise<RawToolPage>;
   delete(session: Session): Promise<void>;
   close(): Promise<void>;
@@ -499,6 +500,24 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
     }
     finally { entry.readers--; await this.idle(entry); }
   }
+  async preview(session: Session, port: number): Promise<string> {
+    if (this.closing) throw new Error('E2B 运行时正在关闭');
+    if (!session.sandbox) throw new Error('项目沙箱尚未创建，请先启动服务');
+    const entry = await this.acquire(session, false);
+    entry.readers++;
+    this.touch(entry);
+    try {
+      if (entry.disposed) throw new Error('项目沙箱正在删除');
+      await entry.sandbox.setTimeout(this.timeoutMs);
+      entry.renewedAt = Date.now();
+      const gateway = this.options.connection.sandboxUrl;
+      const url = new URL(gateway ?? `https://${entry.sandbox.getHost(port)}`);
+      url.hostname = entry.sandbox.getHost(port);
+      url.pathname = '/'; url.search = ''; url.hash = '';
+      return url.origin;
+    } finally { entry.readers--; await this.idle(entry); }
+  }
+
   async changes(session: Session): Promise<Changes> {
     if (!session.sandbox) return { branch: '', files: [], diff: '', error: 'E2B 沙箱尚未创建，请先发送一条消息' };
     return this.inspect(session, 'changes', [session.settings.workingDirectory]);

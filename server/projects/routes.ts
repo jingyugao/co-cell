@@ -1,0 +1,19 @@
+import type { Hono } from 'hono';
+import { z } from 'zod';
+import { HttpError } from '../core/errors.js';
+import type { SessionManager } from '../sessions/manager.js';
+
+export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview'>) {
+  app.get('/api/projects/:id/preview', async c => {
+    const href = c.req.query('url');
+    if (!href || href.length > 8192) throw new HttpError(400, '预览链接无效');
+    return c.redirect(await manager.preview(c.req.param('id'), href), 302);
+  });
+
+  const projectSchema = z.object({ name: z.string().trim().min(1).max(100), requirementUrl: z.string().trim().max(4096).url().refine(value => /^https?:\/\//i.test(value), '仅支持 HTTP 或 HTTPS 链接').nullable().optional() }).strict();
+  app.get('/api/projects', c => c.json(manager.listProjects()));
+  app.post('/api/projects', async c => c.json(await manager.createProject(projectSchema.parse(await c.req.json())), 201));
+  app.get('/api/projects/:id', c => c.json(manager.getProject(c.req.param('id'))));
+  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ archived: z.boolean().optional() }).parse(await c.req.json()))));
+  app.delete('/api/projects/:id', async c => { await manager.deleteProject(c.req.param('id')); return c.json({ ok: true }); });
+}

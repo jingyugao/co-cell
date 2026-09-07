@@ -7,13 +7,13 @@ import { Codex } from '@openai/codex-sdk';
 import { getRequestListener } from '@hono/node-server';
 import type { AppConfig, Settings } from '../shared/types.js';
 import { createApp } from './app.js';
-import { SessionManager } from './manager.js';
-import { E2BCodexRuntime } from './e2b.js';
-import { E2BSandboxInventory } from './sandboxes.js';
-import { TemplateManager } from './templates.js';
-import { ConnectionStore } from './connections.js';
-import { RuntimeLog } from './runtime-log.js';
-import { installProductionStatic } from './static-files.js';
+import { SessionManager } from './sessions/manager.js';
+import { E2BCodexRuntime } from './sandboxes/e2b.js';
+import { E2BSandboxInventory } from './sandboxes/inventory.js';
+import { TemplateManager } from './templates/manager.js';
+import { ConnectionStore } from './connections/store.js';
+import { RuntimeLog } from './diagnostics/runtime-log.js';
+import { installProductionStatic } from './http/static-files.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 

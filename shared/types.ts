@@ -1,3 +1,4 @@
+import type { SandboxState } from './sandbox-types.js';
 import type { ThreadEvent, ThreadItem, Usage } from '@openai/codex-sdk';
 
 export type SessionStatus = 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -37,7 +38,7 @@ export interface Project {
   requirementUrl: string | null;
   executionMode: 'e2b' | 'local';
   workingDirectory: string;
-  sandbox?: Session['sandbox'];
+  sandbox?: SandboxState;
   archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -53,7 +54,7 @@ export interface Session {
   createdAt: string;
   updatedAt: string;
   turns: Turn[];
-  sandbox?: { lastActiveAt?: string; id: string; status: 'starting' | 'ready' | 'paused' | 'unavailable'; template: string; workingDirectory: string };
+  sandbox?: SandboxState;
 }
 export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };
 export interface SandboxRecord {

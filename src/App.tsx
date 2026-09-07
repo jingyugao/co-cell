@@ -1,91 +1,22 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import type { ThreadItem } from '@openai/codex-sdk';
-import type { AppConfig, Changes, ProjectSummary, RetryState, Session, SessionSummary, Settings, StreamMessage, Turn } from '../shared/types';
-import { applySdkEvent } from '../shared/session-events';
-import ToolDetails from './ToolDetails';
-import RawToolMessages from './RawToolMessages';
-import SandboxManager from './SandboxManager';
-import ProjectsPage from './ProjectsPage';
-import SharedFilesPage from './SharedFilesPage';
-import TemplatesPage from './TemplatesPage';
-import ConnectionsPage from './ConnectionsPage';
-import Markdown from './Markdown';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { AppConfig, Changes, Session, SessionSummary, Settings } from '../shared/types';
+import { useProjects } from './features/projects/useProjects';
+import { useSessionStream } from './features/chat/useSessionStream';
+import { Icon, Mark } from './components/Icon';
+import { api, errorMessage as message } from './lib/api';
+import ItemView from './features/chat/ItemView';
+import TurnProgress from './features/chat/TurnProgress';
+import SettingsModal from './features/chat/SettingsModal';
+import { effectiveSettings } from './features/chat/settings';
+import RawToolMessages from './features/chat/RawToolMessages';
+import SandboxManager from './features/sandboxes/SandboxManager';
+import ProjectsPage from './features/projects/ProjectsPage';
+import SharedFilesPage from './features/shared-files/SharedFilesPage';
+import TemplatesPage from './features/templates/TemplatesPage';
+import ConnectionsPage from './features/connections/ConnectionsPage';
 
-type IconName = 'plus' | 'chat' | 'folder' | 'chevron' | 'settings' | 'panel' | 'arrow' | 'attach' | 'close' | 'terminal' | 'check' | 'globe' | 'code' | 'branch' | 'stop' | 'menu' | 'refresh' | 'trash';
-const paths: Record<IconName, ReactNode> = {
-  plus: <path d="M12 5v14M5 12h14" />, chat: <path d="M5 4h14a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H8l-5 3V6a2 2 0 0 1 2-2Z" />,
-  folder: <path d="M3 7V5h6l2 2h10v13H3V7Z" />, chevron: <path d="m9 5 7 7-7 7" />, settings: <><path d="M4 7h16M4 17h16" /><circle cx="9" cy="7" r="3" /><circle cx="15" cy="17" r="3" /></>,
-  panel: <><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M15 4v16" /></>, arrow: <path d="M12 19V5m-6 6 6-6 6 6" />, attach: <path d="m9 13 6-6a3 3 0 0 1 4 4l-8 8a5 5 0 0 1-7-7l8-8" />,
-  close: <path d="m6 6 12 12M6 18 18 6" />, terminal: <><path d="m5 7 5 5-5 5M13 17h6" /></>, check: <path d="m5 12 4 4L19 6" />, globe: <><circle cx="12" cy="12" r="9" /><ellipse cx="12" cy="12" rx="4" ry="9" /><path d="M3 12h18" /></>,
-  code: <><path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-14-2 16" /></>, branch: <><circle cx="6" cy="5" r="2" /><circle cx="18" cy="5" r="2" /><circle cx="6" cy="19" r="2" /><path d="M6 7v10m12-10c0 6-12 2-12 8" /></>,
-  stop: <rect x="6" y="6" width="12" height="12" rx="2" />, menu: <path d="M4 6h16M4 12h16M4 18h16" />, refresh: <><path d="M20 8a8 8 0 1 0 0 8M20 3v5h-5" /></>, trash: <><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7m4-7v7" /></>,
-};
-function Icon({ name, size = 18 }: { name: IconName; size?: number }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>; }
-function Mark({ small = false }: { small?: boolean }) { return <span className={`codex-mark ${small ? 'small' : ''}`} aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><path d="m18 10-13 14 13 14M30 10l13 14-13 14M28 6 20 42" stroke="currentColor" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" /></svg></span>; }
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, { ...init, headers: { ...(init?.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), ...init?.headers } });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || `请求失败 (${response.status})`);
-  return body as T;
-}
-const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const basename = (path: string) => path.replace(/[\\/]$/, '').split(/[\\/]/).pop() || '工作目录';
 const statusLabels: Record<Session['status'], string> = { idle: '就绪', running: '执行中', completed: '已完成', failed: '执行失败', cancelled: '已停止' };
-
-function ItemView({ item, turnStatus, projectId }: { item: ThreadItem; turnStatus: Turn['status']; projectId?: string }) {
-  const turnEnded = turnStatus === 'cancelled' || turnStatus === 'failed' || turnStatus === 'completed';
-  const endedLabel = turnStatus === 'cancelled' ? '已停止' : turnStatus === 'failed' ? '已中断' : '已结束';
-  switch (item.type) {
-    case 'agent_message': return <div className="agent-message"><Markdown text={item.text} projectId={projectId} /></div>;
-    case 'reasoning': return <details className="reasoning"><summary><span className="tiny-orbit" />思考摘要<Icon name="chevron" size={12} /></summary><Markdown text={item.text} projectId={projectId} /></details>;
-    case 'command_execution': return <details className={`tool-card ${item.status === 'in_progress' && turnEnded ? 'ended' : item.status}`}><summary><Icon name="terminal" /><span className="tool-label">运行命令</span><code className="command-preview">{item.command}</code><span className="tool-state">{item.status === 'in_progress' ? (turnEnded ? endedLabel : <span className="spinner" />) : item.exit_code === 0 ? <Icon name="check" size={14} /> : `exit ${item.exit_code ?? '—'}`}</span><Icon name="chevron" size={13} /></summary><pre className="terminal-output">$ {item.command}{'\n\n'}{item.aggregated_output || (item.status === 'in_progress' && !turnEnded ? '等待命令输出…' : '（无输出）')}</pre><ToolDetails item={item} /></details>;
-    case 'file_change': return <details className={`tool-card ${item.status}`} open><summary><Icon name="code" /><span>修改了 {item.changes.length} 个文件</span><span className="tool-state">{item.status === 'failed' ? '失败' : <Icon name="check" size={14} />}</span><Icon name="chevron" size={13} /></summary><div className="file-list">{item.changes.map((change, i) => <div key={i}><span className={`file-badge ${change.kind}`}>{change.kind === 'add' ? '+' : change.kind === 'delete' ? '−' : 'M'}</span><code>{change.path}</code></div>)}</div><ToolDetails item={item} /></details>;
-    case 'mcp_tool_call': return <details className={`tool-card ${item.status === 'in_progress' && turnEnded ? 'ended' : item.status}`}><summary><Icon name="code" /><span>{item.server} / {item.tool}</span><span className="tool-state">{item.status === 'in_progress' ? (turnEnded ? endedLabel : <span className="spinner" />) : item.status === 'failed' ? '失败' : <Icon name="check" size={14} />}</span><Icon name="chevron" size={13} /></summary><ToolDetails item={item} /></details>;
-    case 'web_search': return <details className="tool-card"><summary><Icon name="globe" /><span>搜索网页</span><span className="muted">{item.query}</span></summary><ToolDetails item={item} /></details>;
-    case 'todo_list': return <div className="todo-list">{item.items.map((todo, i) => <div key={i} className={todo.completed ? 'done' : ''}><span className="todo-check">{todo.completed && <Icon name="check" size={12} />}</span>{todo.text}</div>)}</div>;
-    case 'error': return <div className="inline-error">{item.message}</div>;
-  }
-  // Native Codex can emit item types before the SDK's TypeScript union includes them.
-  const unknownItem = item as { type: string; status?: string };
-  return <details className="tool-card"><summary><Icon name="code" /><span>{unknownItem.type}</span><span className="tool-state">{unknownItem.status || ''}</span><Icon name="chevron" size={13} /></summary><ToolDetails item={item} /></details>;
-}
-function RetryProgress({ retry }: { retry: RetryState }) {
-  const [now, setNow] = useState(Date.now);
-  useEffect(() => {
-    setNow(Date.now());
-    if (retry.status !== 'waiting') return;
-    const timer = setInterval(() => setNow(Date.now()), 250);
-    return () => clearInterval(timer);
-  }, [retry.nextRetryAt, retry.status]);
-  const deadline = Date.parse(retry.nextRetryAt);
-  const seconds = Number.isFinite(deadline) ? Math.max(0, Math.ceil((deadline - now) / 1000)) : 0;
-  const label = retry.status === 'retrying' ? '正在重试模型请求'
-    : seconds > 0 ? `模型繁忙，${seconds} 秒后重试` : '模型繁忙，等待重试开始';
-  return <div className="working-indicator" role="status"><span className="spinner" />{label}（{retry.attempt}/{retry.maxRetries}）</div>;
-}
-function TurnProgress({ turn }: { turn: Turn }) {
-  if (turn.phase === 'finalizing') return <div className="muted turn-note" role="status">{turn.status === 'completed' ? '回复已完成，正在结束任务…' : '正在结束任务…'}</div>;
-  if (turn.status !== 'running') return null;
-  if (turn.retry) return <RetryProgress retry={turn.retry} />;
-  const commandRunning = turn.items.some(item => item.type === 'command_execution' && item.status === 'in_progress');
-  const toolRunning = turn.items.some(item => item.type === 'mcp_tool_call' && item.status === 'in_progress');
-  const hasReply = turn.items.some(item => item.type === 'agent_message' && item.text.trim());
-  const label = turn.phase === 'starting' ? '正在准备本轮 Codex 任务…'
-    : commandRunning ? '正在执行命令…'
-      : toolRunning ? '正在调用工具…'
-        : !turn.phase ? '正在处理任务…'
-          : hasReply ? '正在继续处理任务…' : '正在生成回复…';
-  return <div className="working-indicator" role="status"><span className="spinner" />{label}</div>;
-}
-function applyStream(current: Session | null, data: StreamMessage): Session | null {
-  if (data.type === 'snapshot' || data.type === 'state') return data.session;
-  if (!current) return current;
-  return applySdkEvent(current, data.turnId, data.event);
-}
-
-function effectiveSettings(settings: Settings): Settings {
-  return settings.executionMode === 'e2b' ? { ...settings, sandboxMode: 'danger-full-access', networkAccessEnabled: true } : settings;
-}
 
 export default function App() {
   type Page = 'chat' | 'sandboxes' | 'projects' | 'files' | 'templates' | 'connections';
@@ -125,17 +56,15 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const refreshConfig = useCallback(() => { void api<AppConfig>('/api/config').then(setConfig).catch(() => {}); }, []);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const { projects, refreshProjects, createProject, updateProject } = useProjects();
   const [selectedProject, setSelectedProject] = useState<string | null>(() => localStorage.getItem('codex-project'));
   const [selected, setSelected] = useState<string | null>(() => localStorage.getItem('codex-session'));
-  const [session, setSession] = useState<Session | null>(null);
   const [draftSettings, setDraftSettings] = useState<Settings | null>(null);
   const [prompt, setPrompt] = useState('');
   const [attachments, setAttachments] = useState<{ path: string; name: string }[]>([]);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [connected, setConnected] = useState(false);
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [changesOpen, setChangesOpen] = useState(false);
@@ -148,6 +77,16 @@ export default function App() {
   const scrollArea = useRef<HTMLDivElement>(null);
   const followOutput = useRef(true);
   const activeId = useRef(selected); activeId.current = selected;
+  const refreshSessions = useCallback(async () => {
+    setSessions(await api<SessionSummary[]>('/api/sessions'));
+  }, []);
+  // Session mutations and runtime state also change project counts/status.
+  const refreshWorkspace = useCallback(async () => {
+    await Promise.all([refreshSessions(), refreshProjects()]);
+  }, [refreshSessions, refreshProjects]);
+  const { session, setSession, connected } = useSessionStream({
+    selected, enabled: !loading, onState: refreshWorkspace, onError: setError,
+  });
   const project = projects.find(item => item.id === selectedProject) ?? null;
   const baseSettings = draftSettings || config?.defaults;
   const storedSettings = session?.settings || (baseSettings && project ? { ...baseSettings, executionMode: project.executionMode, workingDirectory: project.workingDirectory, networkAccessEnabled: draftSettings?.networkAccessEnabled ?? true } : baseSettings);
@@ -157,22 +96,18 @@ export default function App() {
   const running = session?.status === 'running';
   const e2b = settings?.executionMode === 'e2b';
   const localReadOnly = Boolean(config?.e2b?.enabled && settings && !e2b);
-  const refreshSessions = useCallback(async () => {
-    const [list, projectList] = await Promise.all([api<SessionSummary[]>('/api/sessions'), api<ProjectSummary[]>('/api/projects')]);
-    setSessions(list); setProjects(projectList);
-  }, []);
   useEffect(() => {
     if (selectedProject) localStorage.setItem('codex-project', selectedProject); else localStorage.removeItem('codex-project');
   }, [selectedProject]);
   useEffect(() => {
-    const timer = setInterval(() => { if (!document.hidden) void refreshSessions().catch(() => {}); }, 10_000);
+    const timer = setInterval(() => { if (!document.hidden) void refreshWorkspace().catch(() => {}); }, 10_000);
     return () => clearInterval(timer);
-  }, [refreshSessions]);
+  }, [refreshWorkspace]);
 
   useEffect(() => {
     let alive = true;
-    Promise.all([api<AppConfig>('/api/config'), api<SessionSummary[]>('/api/sessions'), api<ProjectSummary[]>('/api/projects')]).then(([nextConfig, list, projectList]) => {
-      if (!alive) return; setConfig(nextConfig); setSessions(list); setProjects(projectList); setError('');
+    Promise.all([api<AppConfig>('/api/config'), api<SessionSummary[]>('/api/sessions'), refreshProjects()]).then(([nextConfig, list, projectList]) => {
+      if (!alive) return; setConfig(nextConfig); setSessions(list); setError('');
       const current = list.find(item => item.id === localStorage.getItem('codex-session') && projectList.some(project => project.id === item.projectId));
       const nextProject = current?.projectId ?? projectList.find(item => item.id === localStorage.getItem('codex-project'))?.id ?? projectList.find(item => !item.archivedAt)?.id ?? projectList[0]?.id ?? null;
       setSelectedProject(nextProject);
@@ -182,25 +117,8 @@ export default function App() {
     return () => { alive = false; };
   }, []);
   useEffect(() => {
-    // Validate the saved selection before subscribing; legacy local sessions
-    // remain stored on the server but must not flash on screen during startup.
-    if (loading) return;
-    setSession(null); setConnected(false); setChanges(null); followOutput.current = true;
-    if (!selected) { localStorage.removeItem('codex-session'); return; }
-    localStorage.setItem('codex-session', selected);
-    let alive = true;
-    const source = new EventSource(`/api/sessions/${selected}/events`);
-    source.onopen = () => { if (alive) setConnected(true); };
-    source.onerror = () => { if (alive) setConnected(false); };
-    source.onmessage = event => {
-      if (!alive) return;
-      try { const data = JSON.parse(event.data) as StreamMessage; setSession(current => applyStream(current, data)); if (data.type === 'state') void refreshSessions().catch(() => {}); }
-      catch { setError('会话事件解析失败，请刷新页面重试。'); }
-    };
-    // The SSE snapshot is authoritative, while this request surfaces missing sessions/errors.
-    api<Session>(`/api/sessions/${selected}`).then(value => { if (alive) setSession(current => current || value); }).catch(err => { if (alive) setError(message(err)); });
-    return () => { alive = false; source.close(); };
-  }, [selected, loading, refreshSessions]);
+    if (!loading) { setChanges(null); followOutput.current = true; }
+  }, [selected, loading]);
   useEffect(() => { if (followOutput.current && scrollArea.current) scrollArea.current.scrollTop = scrollArea.current.scrollHeight; }, [session]);
   useEffect(() => { if (textarea.current) { textarea.current.style.height = 'auto'; textarea.current.style.height = `${Math.min(textarea.current.scrollHeight, 180)}px`; } }, [prompt]);
   const loadChanges = useCallback(async () => {
@@ -219,12 +137,12 @@ export default function App() {
     if (session) return session;
     if (!project) throw new Error('请先创建或选择一个项目');
     const created = await api<Session>('/api/sessions', { method: 'POST', body: JSON.stringify({ projectId: project.id, settings }) });
-    setSelected(created.id); setSession(created); await refreshSessions(); return created;
+    setSelected(created.id); setSession(created); await refreshWorkspace(); return created;
   }
   async function send() {
     if (!prompt.trim() || busy || running || localReadOnly || needsProject || !config || (selected && !session)) return;
     setBusy(true); setError('');
-    try { const current = await ensureSession(); await api(`/api/sessions/${current.id}/turns`, { method: 'POST', body: JSON.stringify({ prompt: prompt.trim(), images: attachments.map(a => a.path) }) }); setPrompt(''); setAttachments([]); followOutput.current = true; await refreshSessions(); }
+    try { const current = await ensureSession(); await api(`/api/sessions/${current.id}/turns`, { method: 'POST', body: JSON.stringify({ prompt: prompt.trim(), images: attachments.map(a => a.path) }) }); setPrompt(''); setAttachments([]); followOutput.current = true; await refreshWorkspace(); }
     catch (err) { setError(message(err)); } finally { setBusy(false); }
   }
   async function stop() { if (!session) return; setBusy(true); try { await api(`/api/sessions/${session.id}/stop`, { method: 'POST' }); } catch (err) { setError(message(err)); } finally { setBusy(false); } }
@@ -240,10 +158,10 @@ export default function App() {
     if (threadId.trim()) { const created = await api<Session>('/api/sessions', { method: 'POST', body: JSON.stringify({ ...(project ? { projectId: project.id } : {}), settings: next, threadId: threadId.trim(), title: title || '导入的 Codex 会话' }) }); selectSession(created.id); setSession(created); }
     else if (session) { const updated = await api<Session>(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify({ settings: next, title: title.trim() || session.title }) }); setSession(updated); }
     else setDraftSettings(next);
-    await refreshSessions(); setSettingsOpen(false);
+    await refreshWorkspace(); setSettingsOpen(false);
   }
   async function deleteSession() {
-    if (!session || running) return; setBusy(true); try { await api(`/api/sessions/${session.id}`, { method: 'DELETE' }); selectSession(null); await refreshSessions(); setSettingsOpen(false); } catch (err) { setError(message(err)); } finally { setBusy(false); }
+    if (!session || running) return; setBusy(true); try { await api(`/api/sessions/${session.id}`, { method: 'DELETE' }); selectSession(null); await refreshWorkspace(); setSettingsOpen(false); } catch (err) { setError(message(err)); } finally { setBusy(false); }
   }
   const tokenTotal = session?.turns.reduce((total, turn) => total + (turn.usage?.input_tokens || 0) + (turn.usage?.output_tokens || 0), 0) || 0;
   const suggestions = e2b ? [ { icon: 'code' as const, title: '创建一个示例项目', text: '在当前 E2B 工作目录创建一个简单的 TypeScript 示例项目，并运行验证。' }, { icon: 'terminal' as const, title: '检查运行环境', text: '检查当前 E2B 环境的工作目录、已安装工具和运行时版本。' }, { icon: 'folder' as const, title: '查看工作区', text: '查看当前 E2B 工作目录的文件，并介绍已有项目；如果目录为空，告诉我。' } ] : [ { icon: 'code' as const, title: '了解这个项目', text: '阅读当前项目，介绍目录结构、技术栈和核心流程。' }, { icon: 'terminal' as const, title: '检查代码质量', text: '检查当前项目的代码，找出潜在 bug，说明原因并提出修复建议。' }, { icon: 'branch' as const, title: '梳理当前改动', text: '查看当前 Git 改动，总结修改内容，并检查是否有遗漏。' } ];
@@ -262,7 +180,7 @@ export default function App() {
       <nav className="session-list" aria-label="任务历史">{visibleSessions.map(item => <button key={item.id} disabled={busy} className={`session-link ${page === 'chat' && selected === item.id ? 'active' : ''}`} onClick={() => selectSession(item.id)}><Icon name="chat" size={15} /><span>{item.title}</span>{item.status === 'running' && <span className="running-dot" />}</button>)}{!loading && !visibleSessions.length && <p className="empty-history">{project ? '此项目还没有会话。' : '创建项目，开始新的工作。'}</p>}</nav>
       <div className="sidebar-footer"><button onClick={() => setSettingsOpen(true)} disabled={!settings || busy}><Icon name="settings" /><span>设置与连接</span></button><div className="runtime-label"><span className={config ? 'connection-dot' : 'offline-dot'} />{config ? `Codex SDK · ${config.sdkVersion}` : '正在连接服务'}<span>TS</span></div></div>
     </aside>
-    {page === 'connections' ? <ConnectionsPage onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} /> : page === 'templates' ? <TemplatesPage onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} onDirtyChange={updateTemplatesDirty} onDefaultChanged={refreshConfig} /> : page === 'files' ? <SharedFilesPage onMenu={() => setSidebar(true)} onDirtyChange={updateFilesDirty} /> : page === 'projects' ? <ProjectsPage projects={projects} config={config} loading={loading} onRefresh={refreshSessions} onOpenProject={openProject} onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} /> : page === 'sandboxes' ? <SandboxManager onOpenProject={openProject} onOpenSession={selectSession} onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} /> : <main className="main-pane">
+    {page === 'connections' ? <ConnectionsPage onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} /> : page === 'templates' ? <TemplatesPage onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} onDirtyChange={updateTemplatesDirty} onDefaultChanged={refreshConfig} /> : page === 'files' ? <SharedFilesPage onMenu={() => setSidebar(true)} onDirtyChange={updateFilesDirty} /> : page === 'projects' ? <ProjectsPage projects={projects} config={config} loading={loading} onRefresh={refreshProjects} onCreate={createProject} onUpdate={updateProject} onOpenProject={openProject} onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} /> : page === 'sandboxes' ? <SandboxManager onOpenProject={openProject} onOpenSession={selectSession} onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} /> : <main className="main-pane">
       <header className="topbar"><button className="icon-button mobile-only" aria-label="打开导航" onClick={() => setSidebar(true)}><Icon name="menu" /></button><div className="breadcrumbs"><span title={project?.name}>{project?.name || (settings ? basename(settings.workingDirectory) : 'Codex')}</span><span className="slash">/</span><strong>{session?.title || '新建会话'}</strong></div><div className="topbar-actions">{e2b && <span className="execution-badge" title="整个 Codex 在 E2B 沙箱内运行">E2B</span>}{session && <span className="connection-label"><span className={connected ? 'connection-dot' : 'offline-dot'} />{connected ? '已连接' : '重新连接中'}</span>}<button className="raw-tools-toggle" aria-pressed={rawToolsOpen} onClick={() => { setRawToolsOpen(value => !value); setChangesOpen(false); }}><Icon name="code" size={15} />原始工具消息</button><button className={`icon-button ${changesOpen ? 'pressed' : ''}`} title="查看工作区改动" aria-label="查看工作区改动" aria-pressed={changesOpen} onClick={() => { setChangesOpen(value => !value); setRawToolsOpen(false); }}><Icon name="panel" /></button></div></header>
       {error && <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" onClick={() => setError('')} aria-label="关闭错误"><Icon name="close" size={15} /></button></div>}
       {project && <div className="project-context"><strong>{project.name}</strong>{project.archivedAt && <span>已归档 · 仍可继续使用</span>}<span>共享项目工作区 · 独立会话上下文</span>{project.requirementUrl ? <a href={project.requirementUrl} target="_blank" rel="noopener noreferrer">飞书需求 ↗</a> : <span>未关联飞书需求</span>}</div>}
@@ -277,33 +195,4 @@ export default function App() {
     </main>}
     {settingsOpen && settings && <SettingsModal project={project} settings={settings} session={session} config={config} onClose={() => setSettingsOpen(false)} onSave={saveSettings} onDelete={deleteSession} />}
   </div>;
-}
-
-function SettingsModal({ project, settings, session, config, onClose, onSave, onDelete }: { project: ProjectSummary | null; settings: Settings; session: Session | null; config: AppConfig | null; onClose: () => void; onSave: (settings: Settings, thread: string, title: string) => Promise<void>; onDelete: () => Promise<void> }) {
-  const [values, setValues] = useState(() => effectiveSettings(settings));
-  const e2b = values.executionMode === 'e2b';
-  const localReadOnly = Boolean(config?.e2b?.enabled && !e2b);
-  const sandbox = project?.sandbox || session?.sandbox;
-  const [title, setTitle] = useState(session?.title || '');
-  const [thread, setThread] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  const dialogRef = useRef<HTMLDivElement>(null);
-  const update = <K extends keyof Settings>(key: K, value: Settings[K]) => setValues(previous => ({ ...previous, [key]: value }));
-  function changeExecutionMode(mode: 'local' | 'e2b') {
-    setValues(previous => effectiveSettings({ ...previous, executionMode: mode, networkAccessEnabled: mode === 'e2b', workingDirectory: mode === 'e2b' ? config?.e2b?.workingDirectory || '/home/user/workspace' : config?.localWorkingDirectory || config?.defaults.workingDirectory || previous.workingDirectory }));
-    setThread('');
-  }
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
-    dialogRef.current?.querySelector<HTMLInputElement>('input')?.focus();
-    function keydown(event: KeyboardEvent) {
-      if (event.key === 'Escape' && !busy) onClose();
-      if (event.key === 'Tab') { const focusable = dialogRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled)'); if (!focusable?.length) return; const first = focusable[0]; const last = focusable[focusable.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } }
-    }
-    document.addEventListener('keydown', keydown); return () => { document.removeEventListener('keydown', keydown); previous?.focus(); };
-  }, [busy, onClose]);
-  async function submit() { setBusy(true); setError(''); try { await onSave(effectiveSettings(values), e2b ? '' : thread, title); } catch (err) { setError(message(err)); } finally { setBusy(false); } }
-  return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget && !busy) onClose(); }}><div className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" ref={dialogRef}><header><div><span className="modal-eyebrow">AGENT CONFIGURATION</span><h2 id="settings-title">设置与连接</h2></div><button className="icon-button" aria-label="关闭设置" disabled={busy} onClick={onClose}><Icon name="close" /></button></header><div className="settings-body"><div className="connection-info"><span className="connection-dot" /><div><strong>Codex TypeScript SDK</strong><span>{config?.auth === 'api-key' ? '使用服务端 API Key' : e2b ? '使用服务端提供的 Codex 登录凭据' : '使用本机 Codex 登录与配置'} · v{config?.sdkVersion}</span></div></div><fieldset disabled={busy || localReadOnly || session?.status === 'running'}>{session && <label>任务名称<input value={title} onChange={event => setTitle(event.target.value)} /></label>}<label>执行环境<select aria-label="执行环境" value={values.executionMode || 'local'} disabled={Boolean(session || project)} onChange={event => changeExecutionMode(event.target.value as 'local' | 'e2b')}><option value="local" disabled={Boolean(config?.e2b?.enabled)}>{config?.e2b?.enabled ? '本机 · 历史只读' : '本机 · 在服务端机器运行 Codex'}</option><option value="e2b" disabled={!config?.e2b?.enabled}>E2B · 整个 Codex 在独立沙箱运行</option></select><small>{localReadOnly ? '已启用 E2B 隔离执行，本机会话仅可查看历史。' : project ? '执行环境由项目决定；项目内所有会话共用同一沙箱。' : session ? '已有会话的执行环境固定。' : config?.e2b?.enabled ? '创建项目后，项目内会话共享一个独立沙箱。' : 'E2B 尚未配置，请先在服务端配置 E2B 连接。'}</small></label>{e2b && <div className="settings-note execution-note">项目内会话共享沙箱和工作区，分别保留对话上下文。新项目不会自动复制本机文件。</div>}<label>{e2b ? 'E2B 工作目录' : '工作目录'}<input disabled={Boolean(project)} value={values.workingDirectory} onChange={event => update('workingDirectory', event.target.value)} placeholder="/path/to/project" /><small>{project ? '工作目录由项目固定，所有会话共享此目录。' : e2b ? 'E2B 沙箱内的绝对路径，Codex 和所有工具在该环境中执行。' : '服务端机器上的绝对路径，Agent 在此目录执行任务。'}</small></label><div className="settings-row"><label>模型<input value={values.model} onChange={event => update('model', event.target.value)} placeholder="留空使用本地默认模型" /></label><label>思考强度<select value={values.modelReasoningEffort} onChange={event => update('modelReasoningEffort', event.target.value as Settings['modelReasoningEffort'])}>{['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent'].map(value => <option key={value}>{value}</option>)}</select></label></div>{e2b ? <label>Codex 在 E2B 内的权限<input aria-label="Codex 在 E2B 内的权限" value="沙箱内完全访问" readOnly /><small>按 AGENTS.md 约定在项目工作区开展任务，可使用沙箱内的其他目录与开发工具。</small></label> : <label>沙箱权限<select value={values.sandboxMode} onChange={event => update('sandboxMode', event.target.value as Settings['sandboxMode'])}><option value="read-only">只读 · 阅读和分析代码</option><option value="workspace-write">工作区可写 · 编辑项目并执行命令</option><option value="danger-full-access">完全访问 · 不使用文件系统沙箱</option></select></label>}<div className="settings-row"><label>网页搜索<select value={values.webSearchMode} onChange={event => update('webSearchMode', event.target.value as Settings['webSearchMode'])}><option value="disabled">关闭</option><option value="cached">缓存搜索</option><option value="live">实时搜索</option></select></label>{e2b ? <label className="network-label">命令网络访问<input aria-label="命令网络访问" value="已开启" readOnly /><small>沙箱内完全访问模式允许命令联网。</small></label> : <label className="network-label">命令网络访问<button className={`toggle ${values.networkAccessEnabled ? 'enabled' : ''}`} type="button" role="switch" disabled={values.sandboxMode !== 'workspace-write'} aria-checked={values.networkAccessEnabled} aria-label="命令网络访问" onClick={() => update('networkAccessEnabled', !values.networkAccessEnabled)}><span /></button><small>仅工作区可写沙箱下生效；完全访问模式不限制网络。</small></label>}</div><div className="settings-note">当前执行策略为 never：需要审批的操作会被拒绝。SDK 暂不提供交互审批和逐 token 文本事件；页面展示 SDK 返回的任务与工具事件。</div><label className="import-label">恢复已有 Codex 会话<span className="optional">可选，将创建新的网页任务</span><input value={thread} disabled={e2b} onChange={event => setThread(event.target.value)} placeholder={e2b ? 'E2B 不支持导入本机线程' : '粘贴 Codex thread ID'} /><small>{e2b ? '新 E2B 任务无法导入本机线程；已有 E2B 任务可直接在历史中继续对话。' : '恢复本机线程上下文。导入前的消息不会复制到网页历史。'}</small></label></fieldset>{e2b && <div className="sandbox-info"><strong>E2B 沙箱</strong>{sandbox ? <><span>状态：{{ starting: '准备中', ready: '可用', paused: '已暂停', unavailable: '不可用' }[sandbox.status]}</span><span>ID：<code>{sandbox.id}</code></span><span>模板：<code>{sandbox.template}</code></span><span>目录：<code>{sandbox.workingDirectory}</code></span></> : <span>首次执行任务时创建 · 模板 {config?.e2b?.template || '默认'}</span>}</div>}{session?.threadId && <div className="thread-id">Thread <code>{session.threadId}</code></div>}{session?.status === 'running' && <div className="settings-note">任务执行中，完成或停止后可修改设置。</div>}{confirmDelete && <div className="settings-note execution-note" role="alert">{project ? '删除此会话的网页历史。项目沙箱、工作区文件和其他会话会保留。' : '删除此会话的网页历史。'}</div>}{error && <div className="inline-error" role="alert">{error}</div>}</div><footer>{session && session.status !== 'running' && <button className="delete-button" disabled={busy} onClick={() => { if (!confirmDelete) { setConfirmDelete(true); return; } setBusy(true); void onDelete().catch(err => setError(message(err))).finally(() => setBusy(false)); }}><Icon name="trash" size={14} />{confirmDelete ? '确认删除会话' : '删除会话'}</button>}<span className="footer-spacer" /><button className="secondary-button" disabled={busy} onClick={onClose}>取消</button><button className="primary-button" disabled={busy || localReadOnly || session?.status === 'running' || !values.workingDirectory.trim()} onClick={() => void submit()}>{busy ? '保存中…' : thread.trim() ? '导入会话' : '保存设置'}</button></footer></div></div>;
 }

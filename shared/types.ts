@@ -52,7 +52,7 @@ export interface Session {
   createdAt: string;
   updatedAt: string;
   turns: Turn[];
-  sandbox?: { id: string; status: 'starting' | 'ready' | 'paused' | 'unavailable'; template: string; workingDirectory: string };
+  sandbox?: { lastActiveAt?: string; id: string; status: 'starting' | 'ready' | 'paused' | 'unavailable'; template: string; workingDirectory: string };
 }
 export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };
 export interface SandboxRecord {

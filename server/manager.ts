@@ -30,7 +30,7 @@ export class SessionManager {
   private projectRevisions = new Map<string, number>();
   private deletingProjects = new Set<string>();
   private projectOperations = new Map<string, number>();
-  private activeProjects = new Map<string, string>();
+  private activeProjects = new Map<string, Set<string>>();
   private sessions = new Map<string, Session>();
   private active = new Map<string, { controller: AbortController; done: Promise<void> }>();
   private subscribers = new Map<string, Set<Subscriber>>();
@@ -113,6 +113,24 @@ export class SessionManager {
       if (changed) await this.save(session);
       this.sessions.set(session.id, session);
     }
+    // Restore idle tracking without connecting to or waking persisted sandboxes.
+    // Projects remain owners even after their last conversation is deleted.
+    for (const project of this.projects.values()) {
+      if (project.executionMode !== 'e2b' || !project.sandbox) continue;
+      const siblings = [...this.sessions.values()].filter(session => session.projectId === project.id)
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      const owner: Session = siblings[0] ? structuredClone(this.hydrate(siblings[0])) : {
+        id: project.id, projectId: project.id, title: project.name, threadId: null,
+        settings: normalizeExecutionSettings({ ...this.defaults, executionMode: project.executionMode, workingDirectory: project.workingDirectory }),
+        sandbox: structuredClone(project.sandbox), status: 'idle', turns: [], createdAt: project.createdAt, updatedAt: project.updatedAt,
+      };
+      if (project.updatedAt > owner.updatedAt) owner.updatedAt = project.updatedAt;
+      this.e2b?.track?.(owner, sandbox => this.updateSandbox(project.id, owner.id, sandbox));
+    }
+    for (const session of this.sessions.values()) {
+      if (session.projectId || session.settings.executionMode !== 'e2b' || !session.sandbox) continue;
+      this.e2b?.track?.(structuredClone(session), sandbox => this.updateSandbox(undefined, session.id, sandbox));
+    }
   }
 
   list(): SessionSummary[] {
@@ -157,7 +175,7 @@ export class SessionManager {
 
   private projectSummary(project: Project): ProjectSummary {
     return structuredClone({ ...project, sessionCount: [...this.sessions.values()].filter(session => session.projectId === project.id).length,
-      activeSessionId: this.activeProjects.get(project.id) ?? null });
+      activeSessionId: this.activeProjects.get(project.id)?.values().next().value ?? null });
   }
 
   getProject(id: string): ProjectSummary { return this.projectSummary(this.projectLookup(id)); }
@@ -394,8 +412,17 @@ export class SessionManager {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     const session = this.lookup(id);
     if (this.active.has(id)) throw new HttpError(409, '当前会话已有任务正在执行');
-    if (session.projectId && this.activeProjects.has(session.projectId)) throw new HttpError(409, '同一项目已有会话正在执行，请等待完成或先停止该任务');
-    if (session.projectId) this.activeProjects.set(session.projectId, id);
+    if (session.projectId) {
+      const activeSessions = this.activeProjects.get(session.projectId) ?? new Set<string>();
+      activeSessions.add(id);
+      this.activeProjects.set(session.projectId, activeSessions);
+    }
+    const releaseProject = () => {
+      if (!session.projectId) return;
+      const activeSessions = this.activeProjects.get(session.projectId);
+      activeSessions?.delete(id);
+      if (!activeSessions?.size) this.activeProjects.delete(session.projectId);
+    };
     const controller = new AbortController();
     const previous = structuredClone(session);
     // Reserve the session synchronously, before validating attachments or saving state.
@@ -419,7 +446,7 @@ export class SessionManager {
       this.publish(id, { type: 'state', session: this.get(id) });
       const running = this.run(session, turn, controller).finally(() => {
         this.active.delete(id);
-        if (session.projectId) this.activeProjects.delete(session.projectId);
+        releaseProject();
         finish();
       });
       // run() handles failures; this catches only final persistence failure and keeps the process alive.
@@ -428,7 +455,7 @@ export class SessionManager {
     } catch (error) {
       this.sessions.set(id, previous);
       this.active.delete(id);
-      if (session.projectId) this.activeProjects.delete(session.projectId);
+      releaseProject();
       finish();
       this.publish(id, { type: 'state', session: this.get(id) });
       throw error;

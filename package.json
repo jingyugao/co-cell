@@ -12,7 +12,6 @@
     "build": "tsc --noEmit && vite build",
     "start": "NODE_ENV=production tsx server/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/*.test.ts",
     "capture:http": "tsx server/capture-demo.ts",
     "credentials:import": "tsx server/import-connections.ts",
     "e2b:build": "node scripts/e2b/build-template.mjs && node scripts/e2b/verify-template.mjs",

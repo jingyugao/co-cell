@@ -67,7 +67,7 @@ export async function importKubernetesCredentials(home: string, command: LocalCo
       clusters.push({ name: entry.name, cluster });
       users.push({ name: entry.name, user: { token } });
       contexts.push({ name: entry.name, context: { cluster: entry.name, user: entry.name, ...(entry.context.namespace ? { namespace: entry.context.namespace } : {}) } });
-      connections.push({ id: `kubernetes:${entry.name}`, type: 'kubernetes', name: entry.name, host: url.host, username: identity, note: '开发者只读 · 集群 RBAC 强制执行。可查资源和日志，禁止资源增删改、Secret、exec 与端口转发。' });
+      connections.push({ id: `kubernetes:${entry.name}`, type: 'kubernetes', name: entry.name, host: url.host, username: identity, note: '开发者只读 · 集群 RBAC 强制执行。可读资源、日志及 ConfigMap/Secret；禁止资源增删改、exec 与端口转发。' });
     }
     const current = input['current-context'] || contexts[0].name;
     if (!contexts.some(entry => entry.name === current)) throw failure();

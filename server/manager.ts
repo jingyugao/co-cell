@@ -30,7 +30,7 @@ export class SessionManager {
   private projectRevisions = new Map<string, number>();
   private deletingProjects = new Set<string>();
   private projectOperations = new Map<string, number>();
-  private activeProjects = new Map<string, string>();
+  private activeProjects = new Map<string, Set<string>>();
   private sessions = new Map<string, Session>();
   private active = new Map<string, { controller: AbortController; done: Promise<void> }>();
   private subscribers = new Map<string, Set<Subscriber>>();
@@ -113,6 +113,24 @@ export class SessionManager {
       if (changed) await this.save(session);
       this.sessions.set(session.id, session);
     }
+    // Restore idle tracking without connecting to or waking persisted sandboxes.
+    // Projects remain owners even after their last conversation is deleted.
+    for (const project of this.projects.values()) {
+      if (project.executionMode !== 'e2b' || !project.sandbox) continue;
+      const siblings = [...this.sessions.values()].filter(session => session.projectId === project.id)
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      const owner: Session = siblings[0] ? structuredClone(this.hydrate(siblings[0])) : {
+        id: project.id, projectId: project.id, title: project.name, threadId: null,
+        settings: normalizeExecutionSettings({ ...this.defaults, executionMode: project.executionMode, workingDirectory: project.workingDirectory }),
+        sandbox: structuredClone(project.sandbox), status: 'idle', turns: [], createdAt: project.createdAt, updatedAt: project.updatedAt,
+      };
+      if (project.updatedAt > owner.updatedAt) owner.updatedAt = project.updatedAt;
+      this.e2b?.track?.(owner, sandbox => this.updateSandbox(project.id, owner.id, sandbox));
+    }
+    for (const session of this.sessions.values()) {
+      if (session.projectId || session.settings.executionMode !== 'e2b' || !session.sandbox) continue;
+      this.e2b?.track?.(structuredClone(session), sandbox => this.updateSandbox(undefined, session.id, sandbox));
+    }
   }
 
   list(): SessionSummary[] {
@@ -156,8 +174,8 @@ export class SessionManager {
   }
 
   private projectSummary(project: Project): ProjectSummary {
-    return structuredClone({ ...project, sessionCount: [...this.sessions.values()].filter(session => session.projectId === project.id).length,
-      activeSessionId: this.activeProjects.get(project.id) ?? null });
+    return structuredClone({ ...project, archivedAt: project.archivedAt ?? null, sessionCount: [...this.sessions.values()].filter(session => session.projectId === project.id).length,
+      activeSessionId: this.activeProjects.get(project.id)?.values().next().value ?? null });
   }
 
   getProject(id: string): ProjectSummary { return this.projectSummary(this.projectLookup(id)); }
@@ -177,23 +195,24 @@ export class SessionManager {
     const valid = await this.validateSettings(settings ?? { ...this.defaults, executionMode: 'e2b', workingDirectory: this.defaults.executionMode === 'e2b' ? this.defaults.workingDirectory : this.e2bWorkingDirectory });
     const now = new Date().toISOString();
     const project: Project = { id: randomUUID(), name: input.name.trim(), requirementUrl: input.requirementUrl ?? null, executionMode: valid.executionMode ?? 'local',
-      workingDirectory: valid.workingDirectory, createdAt: now, updatedAt: now };
+      workingDirectory: valid.workingDirectory, archivedAt: null, createdAt: now, updatedAt: now };
     await this.saveProject(project);
     this.projects.set(project.id, project);
     return this.getProject(project.id);
   }
 
-  async updateProject(id: string, input: { name?: string; requirementUrl?: string | null }): Promise<ProjectSummary> {
+  async updateProject(id: string, input: { name?: string; requirementUrl?: string | null; archived?: boolean }): Promise<ProjectSummary> {
     const project = this.projectLookup(id);
     this.validateProjectInput(input);
     const release = this.projectOperation(id);
-    const previous = { name: project.name, requirementUrl: project.requirementUrl, updatedAt: project.updatedAt };
+    const previous = { name: project.name, requirementUrl: project.requirementUrl, archivedAt: project.archivedAt, updatedAt: project.updatedAt };
     const revision = (this.projectRevisions.get(id) ?? 0) + 1;
     this.projectRevisions.set(id, revision);
     const updatedAt = new Date().toISOString();
     try {
       if (input.name !== undefined) project.name = input.name.trim();
       if (input.requirementUrl !== undefined) project.requirementUrl = input.requirementUrl;
+      if (input.archived !== undefined) project.archivedAt = input.archived ? project.archivedAt ?? updatedAt : null;
       project.updatedAt = updatedAt;
       await this.saveProject(project);
       return this.getProject(id);
@@ -202,6 +221,7 @@ export class SessionManager {
       if (this.projectRevisions.get(id) === revision) {
         project.name = previous.name;
         project.requirementUrl = previous.requirementUrl;
+        project.archivedAt = previous.archivedAt;
         if (project.updatedAt === updatedAt) project.updatedAt = previous.updatedAt;
       }
       throw error;
@@ -394,8 +414,17 @@ export class SessionManager {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     const session = this.lookup(id);
     if (this.active.has(id)) throw new HttpError(409, '当前会话已有任务正在执行');
-    if (session.projectId && this.activeProjects.has(session.projectId)) throw new HttpError(409, '同一项目已有会话正在执行，请等待完成或先停止该任务');
-    if (session.projectId) this.activeProjects.set(session.projectId, id);
+    if (session.projectId) {
+      const activeSessions = this.activeProjects.get(session.projectId) ?? new Set<string>();
+      activeSessions.add(id);
+      this.activeProjects.set(session.projectId, activeSessions);
+    }
+    const releaseProject = () => {
+      if (!session.projectId) return;
+      const activeSessions = this.activeProjects.get(session.projectId);
+      activeSessions?.delete(id);
+      if (!activeSessions?.size) this.activeProjects.delete(session.projectId);
+    };
     const controller = new AbortController();
     const previous = structuredClone(session);
     // Reserve the session synchronously, before validating attachments or saving state.
@@ -419,7 +448,7 @@ export class SessionManager {
       this.publish(id, { type: 'state', session: this.get(id) });
       const running = this.run(session, turn, controller).finally(() => {
         this.active.delete(id);
-        if (session.projectId) this.activeProjects.delete(session.projectId);
+        releaseProject();
         finish();
       });
       // run() handles failures; this catches only final persistence failure and keeps the process alive.
@@ -428,7 +457,7 @@ export class SessionManager {
     } catch (error) {
       this.sessions.set(id, previous);
       this.active.delete(id);
-      if (session.projectId) this.activeProjects.delete(session.projectId);
+      releaseProject();
       finish();
       this.publish(id, { type: 'state', session: this.get(id) });
       throw error;
@@ -507,6 +536,31 @@ export class SessionManager {
   }
 
   async waitForIdle(id: string) { await this.active.get(id)?.done; }
+
+  async preview(projectId: string, href: string) {
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    let url: URL;
+    try { url = new URL(href); } catch { throw new HttpError(400, '预览链接无效'); }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password
+      || !['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '[::]'].includes(url.hostname.toLowerCase())) {
+      throw new HttpError(400, '仅支持沙箱内 localhost 服务的 HTTP/HTTPS 链接');
+    }
+    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, '服务端口无效');
+    const project = this.projectLookup(projectId);
+    if (project.executionMode !== 'e2b' || !this.e2b) throw new HttpError(400, '此项目不使用 E2B 沙箱');
+    if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先启动服务');
+    const release = this.projectOperation(project.id);
+    const owner: Session = { id: project.id, projectId: project.id, title: project.name, threadId: null,
+      settings: { ...this.defaults, executionMode: 'e2b', workingDirectory: project.workingDirectory },
+      sandbox: structuredClone(project.sandbox), status: 'idle', turns: [], createdAt: project.createdAt, updatedAt: project.updatedAt };
+    try {
+      const origin = await this.e2b.preview(owner, port);
+      const target = new URL(origin);
+      target.pathname = url.pathname; target.search = url.search; target.hash = url.hash;
+      return target.href;
+    } finally { release(); }
+  }
 
   async changes(id: string) {
     const session = this.lookup(id);

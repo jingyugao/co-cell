@@ -4,7 +4,7 @@ import './ConnectionsPage.css';
 
 type Props = { onMenu: () => void; onBack: () => void };
 const kinds = [
-  { type: 'kubernetes', label: 'Kubernetes', tool: 'kubectl', symbol: '⎈', description: '开发者只读身份：查看资源与日志；集群 RBAC 禁止增删改、Secret、exec 和端口转发。' },
+  { type: 'kubernetes', label: 'Kubernetes', tool: 'kubectl', symbol: '⎈', description: '开发者只读身份：查看资源、日志和 ConfigMap/Secret；集群 RBAC 禁止增删改、exec 和端口转发。' },
   { type: 'glab', label: 'GitLab', tool: 'glab', symbol: '⌘', description: '沿用本机 GitLab 登录，查询仓库、合并请求和流水线。' },
   { type: 'mysql', label: '数据库', tool: 'mysql', symbol: '▤', description: '同步本机数据库连接配置，在沙箱内使用 MySQL 客户端。' },
   { type: 'git', label: 'Git', tool: 'git', symbol: '⑂', description: '同步本机 Git 身份与已导入的仓库认证配置。' },

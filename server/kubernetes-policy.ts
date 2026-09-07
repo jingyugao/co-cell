@@ -11,7 +11,7 @@ export interface DeveloperReadonlyRule {
 }
 type FrozenRule = { readonly [Key in keyof DeveloperReadonlyRule]: readonly string[] };
 const matrix: ReadonlyArray<readonly [string, readonly string[]]> = [
-  ['', ['pods', 'pods/log', 'services', 'endpoints', 'events', 'namespaces', 'persistentvolumeclaims']],
+  ['', ['pods', 'pods/log', 'services', 'endpoints', 'events', 'namespaces', 'persistentvolumeclaims', 'configmaps', 'secrets']],
   ['apps', ['deployments', 'replicasets', 'statefulsets', 'daemonsets']],
   ['batch', ['jobs', 'cronjobs']],
   ['networking.k8s.io', ['ingresses', 'networkpolicies']],

@@ -86,7 +86,7 @@ await manager.init();
 const config: AppConfig = {
   defaults, sdkVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, e2b: { enabled: e2bEnabled, template: e2bTemplate, workingDirectory: e2bWorkingDirectory },
-  approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false },
+  approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true },
 };
 const templates = new TemplateManager({
   initialDefault: e2bTemplate,

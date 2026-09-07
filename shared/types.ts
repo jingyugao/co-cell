@@ -38,6 +38,7 @@ export interface Project {
   executionMode: 'e2b' | 'local';
   workingDirectory: string;
   sandbox?: Session['sandbox'];
+  archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -52,7 +53,7 @@ export interface Session {
   createdAt: string;
   updatedAt: string;
   turns: Turn[];
-  sandbox?: { id: string; status: 'starting' | 'ready' | 'paused' | 'unavailable'; template: string; workingDirectory: string };
+  sandbox?: { lastActiveAt?: string; id: string; status: 'starting' | 'ready' | 'paused' | 'unavailable'; template: string; workingDirectory: string };
 }
 export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };
 export interface SandboxRecord {
@@ -90,7 +91,7 @@ export interface AppConfig {
   sdkVersion: string;
   auth: 'api-key' | 'local-codex';
   approvalPolicy: 'never';
-  capabilities: { interactiveApprovals: false; tokenDeltas: false };
+  capabilities: { interactiveApprovals: false; tokenDeltas: false; sandboxPreviews?: boolean };
 }
 export interface GitChange { path: string; status: string }
 export interface Changes { branch: string; files: GitChange[]; diff: string; error?: string }

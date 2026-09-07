@@ -106,7 +106,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   app.get('/api/projects', c => c.json(manager.listProjects()));
   app.post('/api/projects', async c => c.json(await manager.createProject(projectSchema.parse(await c.req.json())), 201));
   app.get('/api/projects/:id', c => c.json(manager.getProject(c.req.param('id'))));
-  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().parse(await c.req.json()))));
+  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ archived: z.boolean().optional() }).parse(await c.req.json()))));
   app.delete('/api/projects/:id', async c => { await manager.deleteProject(c.req.param('id')); return c.json({ ok: true }); });
   app.get('/api/sessions', c => c.json(manager.list()));
   app.post('/api/sessions', async c => {

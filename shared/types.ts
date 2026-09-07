@@ -38,6 +38,7 @@ export interface Project {
   executionMode: 'e2b' | 'local';
   workingDirectory: string;
   sandbox?: Session['sandbox'];
+  archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }

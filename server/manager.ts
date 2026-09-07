@@ -174,7 +174,7 @@ export class SessionManager {
   }
 
   private projectSummary(project: Project): ProjectSummary {
-    return structuredClone({ ...project, sessionCount: [...this.sessions.values()].filter(session => session.projectId === project.id).length,
+    return structuredClone({ ...project, archivedAt: project.archivedAt ?? null, sessionCount: [...this.sessions.values()].filter(session => session.projectId === project.id).length,
       activeSessionId: this.activeProjects.get(project.id)?.values().next().value ?? null });
   }
 
@@ -195,23 +195,24 @@ export class SessionManager {
     const valid = await this.validateSettings(settings ?? { ...this.defaults, executionMode: 'e2b', workingDirectory: this.defaults.executionMode === 'e2b' ? this.defaults.workingDirectory : this.e2bWorkingDirectory });
     const now = new Date().toISOString();
     const project: Project = { id: randomUUID(), name: input.name.trim(), requirementUrl: input.requirementUrl ?? null, executionMode: valid.executionMode ?? 'local',
-      workingDirectory: valid.workingDirectory, createdAt: now, updatedAt: now };
+      workingDirectory: valid.workingDirectory, archivedAt: null, createdAt: now, updatedAt: now };
     await this.saveProject(project);
     this.projects.set(project.id, project);
     return this.getProject(project.id);
   }
 
-  async updateProject(id: string, input: { name?: string; requirementUrl?: string | null }): Promise<ProjectSummary> {
+  async updateProject(id: string, input: { name?: string; requirementUrl?: string | null; archived?: boolean }): Promise<ProjectSummary> {
     const project = this.projectLookup(id);
     this.validateProjectInput(input);
     const release = this.projectOperation(id);
-    const previous = { name: project.name, requirementUrl: project.requirementUrl, updatedAt: project.updatedAt };
+    const previous = { name: project.name, requirementUrl: project.requirementUrl, archivedAt: project.archivedAt, updatedAt: project.updatedAt };
     const revision = (this.projectRevisions.get(id) ?? 0) + 1;
     this.projectRevisions.set(id, revision);
     const updatedAt = new Date().toISOString();
     try {
       if (input.name !== undefined) project.name = input.name.trim();
       if (input.requirementUrl !== undefined) project.requirementUrl = input.requirementUrl;
+      if (input.archived !== undefined) project.archivedAt = input.archived ? project.archivedAt ?? updatedAt : null;
       project.updatedAt = updatedAt;
       await this.saveProject(project);
       return this.getProject(id);
@@ -220,6 +221,7 @@ export class SessionManager {
       if (this.projectRevisions.get(id) === revision) {
         project.name = previous.name;
         project.requirementUrl = previous.requirementUrl;
+        project.archivedAt = previous.archivedAt;
         if (project.updatedAt === updatedAt) project.updatedAt = previous.updatedAt;
       }
       throw error;

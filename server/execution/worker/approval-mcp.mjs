@@ -4,14 +4,14 @@ import { createInterface } from 'node:readline';
 const tool = {
   name: 'request_user_approval',
   title: '请求用户同意',
-  description: '对需要用户确认的具体操作请求同意并等待页面决定，适用于 SQL 变更、发布、删除资源等。先准备完整可审阅操作，再请求确认。只有返回 approved=true 才获得执行所展示操作的授权；拒绝、取消、超时或错误均不授权。此工具不执行操作，授权仅限本轮所列目标、内容和影响，改变方案须重新请求。',
+  description: '请求用户同意具体操作并等待决定，不限于 SQL。用简短白话说明要做什么、改哪里、有何影响。复杂 SQL 或脚本先保存到项目工作区文件，再附查看链接，不在卡片里粘贴长代码。只有 approved=true 才可执行；内容或目标改变须重新确认。此工具不执行操作。',
   inputSchema: {
     type: 'object', additionalProperties: false,
     properties: {
       title: { type: 'string', minLength: 1, maxLength: 200, description: '简短说明需要用户同意的操作。' },
-      target: { type: 'string', minLength: 1, maxLength: 2000, description: '明确环境、服务、数据库/表或其他目标，不含密码或令牌。' },
-      action: { type: 'string', minLength: 1, maxLength: 32000, description: '完整可审阅的操作内容，例如确切 SQL、命令或变更方案。不要只写“继续操作”，不要包含凭据。' },
-      impact: { type: 'string', minLength: 1, maxLength: 8000, description: '作用范围、预期影响及必要的恢复办法；未知影响应明确说明。' },
+      target: { type: 'string', minLength: 1, maxLength: 2000, description: '一行写明环境和目标，如“生产库 orders 表”。不含凭据。' },
+      action: { type: 'string', minLength: 1, maxLength: 32000, description: '用一两句话说明具体操作。简单 SQL 可直接附上；复杂 SQL/脚本先保存到项目工作区，再用 [查看脚本](/绝对路径/文件.sql) 提供链接，不粘贴长代码。请求后保持文件内容不变，修改须重新确认。' },
+      impact: { type: 'string', minLength: 1, maxLength: 8000, description: '一句话写明影响范围及关键风险，例如“更新 12 行，不删除数据”。未知范围直说，不展开技术细节。' },
     },
     required: ['title', 'target', 'action', 'impact'],
   },

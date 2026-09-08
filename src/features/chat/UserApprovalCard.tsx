@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 import type { UserApproval } from '../../../shared/approval-types';
 import type { Session, Turn } from '../../../shared/types';
 import { api, errorMessage } from '../../lib/api';
+import Markdown, { type MarkdownResources } from './Markdown';
 import './UserApprovalCard.css';
 
 const statusLabels: Record<UserApproval['status'], string> = {
@@ -20,13 +21,13 @@ export function mergeApprovalDecision(current: Session | null, sessionId: string
   } : turn) };
 }
 
-export default function UserApprovalCard({ approval, sessionId, turnId, turnStatus, onResolved }: {
+export default function UserApprovalCard({ approval, sessionId, turnId, turnStatus, onResolved, projectId, workingDirectory, onOpenFile }: {
   approval: UserApproval;
   sessionId: string;
   turnId: string;
   turnStatus: Turn['status'];
   onResolved: (approval: UserApproval) => void;
-}) {
+} & MarkdownResources) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const submitting = useRef(false);
@@ -54,7 +55,7 @@ export default function UserApprovalCard({ approval, sessionId, turnId, turnStat
 
   return <section className={`user-approval-card${pending ? ' pending' : ''}`} aria-label={`操作确认：${approval.title}`} aria-busy={saving}>
     <header><strong>{approval.title}</strong><span role="status">{label}</span></header>
-    <dl><dt>执行目标</dt><dd>{approval.target}</dd><dt>操作内容</dt><dd><pre tabIndex={0} aria-label="待确认的完整操作"><code>{approval.action}</code></pre></dd><dt>影响评估</dt><dd>{approval.impact}</dd></dl>
+    <dl><dt>执行目标</dt><dd>{approval.target}</dd><dt>操作内容</dt><dd><Markdown text={approval.action} projectId={projectId} workingDirectory={workingDirectory} onOpenFile={onOpenFile} /></dd><dt>影响评估</dt><dd>{approval.impact}</dd></dl>
     {pending && <>
       <p className="user-approval-note">同意仅适用于本次展示的目标和操作内容。Agent 正在等待你的决定。</p>
       <div className="user-approval-actions"><button type="button" className="secondary-button" disabled={saving} onClick={() => void decide('rejected')}>拒绝</button><button type="button" className="primary-button" disabled={saving} onClick={() => void decide('approved')}>同意执行</button>{saving && <span role="status">正在保存决定…</span>}</div>

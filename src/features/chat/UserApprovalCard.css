@@ -1,0 +1,14 @@
+.user-approval-card{border:1px solid #dfe3d5;border-radius:10px;background:#f8f9f3;margin:16px 0;padding:16px;overflow-wrap:anywhere}
+.user-approval-card.pending{border-color:#b58a36;background:#fffbef;box-shadow:inset 3px 0 #b58a36}
+.user-approval-card>header{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.user-approval-card>header strong{font-size:13px;font-weight:600}
+.user-approval-card>header span{font-size:11px;color:#6c755d}
+.user-approval-card.pending>header span{color:#8b6019;font-weight:600}
+.user-approval-card dl{margin:15px 0}
+.user-approval-card dt{font-size:11px;color:#7a816e;margin-top:12px}
+.user-approval-card dd{margin:5px 0 0;font-size:12px;line-height:1.8;white-space:pre-wrap}
+.user-approval-card pre{margin:0;padding:12px;border:1px solid #e4dfd0;border-radius:6px;background:#fffefa;overflow:auto;max-height:440px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.8}
+.user-approval-note{font-size:11px;color:#7d765f;line-height:1.8;margin:12px 0}
+.user-approval-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.user-approval-actions>span,.user-approval-time{font-size:10px;color:#828873}
+.user-approval-time{display:block;margin-top:12px}

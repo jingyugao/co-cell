@@ -3,6 +3,7 @@ import { pathToFileURL } from 'node:url';
 import { Codex } from '@openai/codex-sdk';
 import { startDiagnosticProxy } from './diagnostic-proxy.mjs';
 import { startImprovementBridge } from './improvement-bridge.mjs';
+import { startApprovalBridge } from './approval-bridge.mjs';
 
 const headerEntries = headers => headers instanceof Headers ? [...headers.entries()] : Object.entries(headers ?? {});
 function singleHeader(headers, name) {
@@ -97,6 +98,7 @@ process.on('SIGTERM', stop);
 process.on('SIGINT', stop);
 let diagnosticProxy;
 let improvementBridge;
+let approvalBridge;
 let retry;
 const emitRetry = value => process.stdout.write(JSON.stringify({ type: 'runtime.retry', retry: value }) + '\n');
 const onDiagnostic = diagnostic => {
@@ -133,11 +135,20 @@ try {
       emit: event => process.stdout.write(JSON.stringify(event) + '\n'),
     });
   }
+  if (input.approvalReplyDirectory) {
+    approvalBridge = await startApprovalBridge({
+      replyDirectory: input.approvalReplyDirectory, signal: controller.signal,
+      emit: event => process.stdout.write(JSON.stringify(event) + '\n'),
+    });
+  }
   const codex = new Codex({
     apiKey: process.env.CODEX_API_KEY,
     config: { ...extra, ...proxy, model_providers: { ...extra.model_providers, ...proxy.model_providers },
-      ...(improvementBridge ? {
-        mcp_servers: { ...extra.mcp_servers, swarm_improvements: improvementBridge.config },
+      ...((improvementBridge || approvalBridge) ? {
+        mcp_servers: { ...extra.mcp_servers,
+          ...(improvementBridge ? { swarm_improvements: improvementBridge.config } : {}),
+          ...(approvalBridge ? { swarm_approvals: approvalBridge.config } : {}),
+        },
       } : {}),
     },
     configOverrides: [...(input.configOverrides ?? []), ...(input.baseUrl ? [
@@ -170,7 +181,7 @@ try {
   process.stderr.write(message + '\n');
   process.exitCode = controller.signal.aborted ? 130 : 1;
 } finally {
-  try { await Promise.all([diagnosticProxy?.close(), improvementBridge?.close()]); }
+  try { await Promise.all([diagnosticProxy?.close(), improvementBridge?.close(), approvalBridge?.close()]); }
   finally {
     if (retry) { retry = undefined; emitRetry(null); }
     process.removeListener('SIGTERM', stop);

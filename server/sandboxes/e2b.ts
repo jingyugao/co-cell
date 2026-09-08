@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
 import { Sandbox, type CommandHandle, type ConnectionOpts } from 'e2b';
 import type { AgentEvent } from '../../shared/types.js';
+import type { RequestUserApproval } from '../../shared/approval-types.js';
 import type { Changes, RawToolPage, Session, Turn } from '../../shared/types.js';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
 import { CONNECTION_ROOT, type ConnectionStore } from '../connections/store.js';
@@ -23,7 +24,7 @@ export interface SandboxSnapshotArchive {
 
 export interface E2BRuntime {
   track?(session: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): void;
-  run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
+  run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval): AsyncGenerator<AgentEvent>;
   changes(session: WorkspaceTarget): Promise<Changes>;
   preview(session: WorkspaceTarget, port: number): Promise<string>;
   file(session: WorkspaceTarget, path: string): Promise<WorkspaceFileResult>;
@@ -421,7 +422,7 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
     });
   }
 
-  async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: Entry['notify']): AsyncGenerator<AgentEvent> {
+  async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: Entry['notify'], onApproval?: RequestUserApproval): AsyncGenerator<AgentEvent> {
     if (this.closing) throw new Error('E2B 运行时正在关闭');
     if (!this.options.apiKey) throw new Error('E2B 模式需要 CODEX_API_KEY 或 OPENAI_API_KEY');
     checkAbort(signal);
@@ -433,6 +434,8 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
     let inputPath: string | undefined;
     let improvementReplyDirectory: string | undefined;
     const improvementRequests = new Map<string, Promise<void>>();
+    let approvalReplyDirectory: string | undefined;
+    const approvalRequests = new Map<string, { controller: AbortController; done: Promise<void> }>();
     let renewal: ReturnType<typeof setInterval> | undefined;
     let renewing = false;
     const lease = new AbortController();
@@ -477,7 +480,7 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
         }
         entry.sharedDocPaths = currentPaths;
         await this.writeAtomic(entry, `${CODEX_HOME}/AGENTS.md`, sharedAgents, executionSignal);
-        for (const name of ['e2b-worker.mjs', 'e2b-inspect.mjs', 'diagnostic-proxy.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs']) {
+        for (const name of ['e2b-worker.mjs', 'e2b-inspect.mjs', 'diagnostic-proxy.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
           checkAbort(executionSignal);
           await this.writeAtomic(entry, `${RUNTIME}/${name}`, await readFile(new URL(`../execution/worker/${name}`, import.meta.url), 'utf8'), executionSignal);
         }
@@ -498,13 +501,17 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
         improvementReplyDirectory = `${RUNTIME}/improvement-replies-${randomUUID()}`;
         await this.command(entry, `mkdir -m 700 ${quote(improvementReplyDirectory)}`, executionSignal);
       }
+      if (onApproval) {
+        approvalReplyDirectory = `${RUNTIME}/approval-replies-${randomUUID()}`;
+        await this.command(entry, `mkdir -m 700 ${quote(approvalReplyDirectory)}`, executionSignal);
+      }
       checkAbort(executionSignal);
       await entry.sandbox.files.write(inputPath, JSON.stringify({
         threadId: session.threadId, prompt: turn.prompt, images, settings: session.settings,
         connectionDirectories: Object.keys(connectionEnvs).length ? [CONNECTION_ROOT, ...('MEEGLE_HOST' in connectionEnvs ? ['/home/user/.meegle'] : []), ...('KUBECONFIG' in connectionEnvs ? ['/home/user/.kube'] : [])] : [],
         baseUrl: this.options.baseUrl, proxyKind: this.options.proxyKind,
         modelConfig: this.options.modelConfig, configOverrides: this.options.configOverrides,
-        improvementReplyDirectory,
+        improvementReplyDirectory, approvalReplyDirectory,
       }), { user: 'user', signal: executionSignal });
       await this.state(entry, 'ready');
       const queue: AgentEvent[] = [];
@@ -522,7 +529,29 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
             if (!line.trim()) continue;
             try {
               const event = JSON.parse(line);
-              if (event.type === 'runtime.improvement_proposal') {
+              if (event.type === 'runtime.user_approval_cancelled') {
+                approvalRequests.get(event.requestId)?.controller.abort();
+              } else if (event.type === 'runtime.user_approval_request') {
+                const requestId = event.requestId;
+                if (!onApproval || !approvalReplyDirectory || executionSignal.aborted
+                  || typeof requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)
+                  || approvalRequests.has(requestId)) continue;
+                const controller = new AbortController();
+                const approvalSignal = AbortSignal.any([executionSignal, controller.signal]);
+                const replyPath = `${approvalReplyDirectory}/${requestId}.json`;
+                const request = (async () => {
+                  let reply;
+                  try {
+                    if (approvalRequests.size >= 20) throw new Error('Too many approvals');
+                    const approval = await onApproval(requestId, event.input, approvalSignal);
+                    reply = { ok: true, approval };
+                  } catch { reply = { ok: false, error: '未获得用户同意，请检查请求内容或等待状态。不得执行该操作。' }; }
+                  if (!approvalSignal.aborted) await this.writeAtomic(entry, replyPath, JSON.stringify(reply), approvalSignal);
+                })().catch(() => {
+                  void this.options.logger?.write({ event: 'approval.receipt_failed', sessionId: session.id, turnId: turn.id, requestId });
+                });
+                approvalRequests.set(requestId, { controller, done: request });
+              } else if (event.type === 'runtime.improvement_proposal') {
                 const requestId = event.requestId;
                 if (!this.options.submitImprovement || !improvementReplyDirectory || executionSignal.aborted
                   || typeof requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)
@@ -573,7 +602,9 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
       } finally { await operation; await this.options.logger?.flush(); }
     } finally {
       clearInterval(renewal);
-      await Promise.allSettled(improvementRequests.values());
+      for (const request of approvalRequests.values()) request.controller.abort();
+      await Promise.allSettled([...improvementRequests.values(), ...[...approvalRequests.values()].map(request => request.done)]);
+      if (approvalReplyDirectory) await entry.sandbox.files.remove(approvalReplyDirectory, { user: 'user' }).catch(() => {});
       if (improvementReplyDirectory) await entry.sandbox.files.remove(improvementReplyDirectory, { user: 'user' }).catch(() => {});
       if (inputPath) await entry.sandbox.files.remove(inputPath, { user: 'user' }).catch(() => {});
       await this.refreshState(entry).catch(error => {

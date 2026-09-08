@@ -4,6 +4,7 @@ import { applyTurnEvent } from '../../shared/session-events.js';
 import { HttpError } from '../core/errors.js';
 import type { E2BRuntime } from '../sandboxes/e2b.js';
 import type { RuntimeLog } from '../diagnostics/runtime-log.js';
+import type { RequestUserApproval } from '../../shared/approval-types.js';
 
 export type CodexClient = Pick<Codex, 'startThread' | 'resumeThread'>;
 
@@ -15,6 +16,8 @@ type TurnExecutionDependencies = {
   publish(message: StreamMessage): void;
   snapshot(): Session;
   updateSandbox(sandbox: NonNullable<Session['sandbox']>): Promise<void>;
+  requestApproval?: RequestUserApproval;
+  closeApprovals?(): Promise<void>;
 };
 
 /** Runs one turn and persists each event before publishing it to subscribers. */
@@ -34,7 +37,7 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
     let events: AsyncGenerator<AgentEvent>;
     if (executionMode === 'e2b') {
       if (!e2b) throw new HttpError(503, 'E2B 未配置，无法运行此沙箱会话');
-      events = e2b.run(session, turn, controller.signal, sandbox => updateSandbox(sandbox));
+      events = e2b.run(session, turn, controller.signal, sandbox => updateSandbox(sandbox), dependencies.requestApproval);
     } else {
       const thread: Thread = session.threadId ? client.resumeThread(session.threadId, options) : client.startThread(options);
       const input: Input = turn.images.length ? [{ type: 'text', text: turn.prompt }, ...turn.images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
@@ -66,6 +69,11 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
     turn.status = controller.signal.aborted ? 'cancelled' : 'failed';
     if (!controller.signal.aborted) turn.error = terminalFailure ?? (error instanceof Error ? error.message : String(error));
   } finally {
+    try { await dependencies.closeApprovals?.(); }
+    catch (error) {
+      turn.status = controller.signal.aborted ? 'cancelled' : 'failed';
+      turn.error = error instanceof Error ? error.message : String(error);
+    }
     if (controller.signal.aborted && turn.status === 'running') turn.status = 'cancelled';
     turn.completedAt = new Date().toISOString();
     delete turn.phase;

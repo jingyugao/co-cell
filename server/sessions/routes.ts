@@ -53,6 +53,9 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
     await manager.stop(c.req.param('id'));
     return c.json({ ok: true });
   });
+  app.post('/api/sessions/:id/turns/:turnId/approvals/:approvalId', async c => {
+    return c.json(await manager.resolveApproval(c.req.param('id'), c.req.param('turnId'), c.req.param('approvalId'), await c.req.json()));
+  });
   app.get('/api/sessions/:id/events', c => {
     const id = c.req.param('id');
     manager.get(id);

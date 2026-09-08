@@ -1,4 +1,5 @@
 import type { SandboxState } from './sandbox-types.js';
+import type { UserApproval } from './approval-types.js';
 import type { ThreadEvent, ThreadItem, Usage } from '@openai/codex-sdk';
 
 export type SessionStatus = 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -31,6 +32,7 @@ export interface Turn {
   startedAt: string;
   completedAt?: string;
   retry?: RetryState;
+  approvals?: UserApproval[];
 }
 export interface Project {
   id: string;

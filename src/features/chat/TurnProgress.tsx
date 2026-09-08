@@ -18,6 +18,7 @@ function RetryProgress({ retry }: { retry: RetryState }) {
 export default function TurnProgress({ turn }: { turn: Turn }) {
   if (turn.phase === 'finalizing') return <div className="muted turn-note" role="status">{turn.status === 'completed' ? '回复已完成，正在结束任务…' : '正在结束任务…'}</div>;
   if (turn.status !== 'running') return null;
+  if (turn.approvals?.some(approval => approval.status === 'pending')) return <div className="working-indicator" role="status">等待你确认操作，请在确认卡片中选择同意执行或拒绝。</div>;
   if (turn.retry) return <RetryProgress retry={turn.retry} />;
   const commandRunning = turn.items.some(item => item.type === 'command_execution' && item.status === 'in_progress');
   const toolRunning = turn.items.some(item => item.type === 'mcp_tool_call' && item.status === 'in_progress');

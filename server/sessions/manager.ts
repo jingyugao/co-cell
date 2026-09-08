@@ -12,6 +12,7 @@ import { ProjectService, type ProjectInput, type ProjectUpdate } from '../projec
 import { AtomicJsonWriter } from '../storage/atomic-json.js';
 import { runTurn, type CodexClient } from '../execution/runner.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
+import { ApprovalRequests, approvalDecisionSchema, cancelPersistedApprovals } from '../approvals/requests.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -27,7 +28,7 @@ function normalizeExecutionSettings(settings: Settings): Settings {
 export class SessionManager {
   private projects: ProjectService;
   private sessions = new Map<string, Session>();
-  private active = new Map<string, { controller: AbortController; done: Promise<void> }>();
+  private active = new Map<string, { controller: AbortController; done: Promise<void>; turnId?: string; approvals?: ApprovalRequests }>();
   private subscribers = new Map<string, Set<Subscriber>>();
   private writer = new AtomicJsonWriter();
   private deleting = new Set<string>();
@@ -72,6 +73,7 @@ export class SessionManager {
         changed = true;
       }
       for (const turn of session.turns) {
+        if (cancelPersistedApprovals(turn)) changed = true;
         if (turn.retry !== undefined) {
           delete turn.retry;
           changed = true;
@@ -318,7 +320,9 @@ export class SessionManager {
     const previous = structuredClone(session);
     // Reserve the session synchronously, before validating attachments or saving state.
     let finish!: () => void;
-    const execution = { controller, done: new Promise<void>(resolve => { finish = resolve; }) };
+    const execution: { controller: AbortController; done: Promise<void>; turnId?: string; approvals?: ApprovalRequests } = {
+      controller, done: new Promise<void>(resolve => { finish = resolve; }),
+    };
     this.active.set(id, execution);
     try {
       session.settings = normalizeExecutionSettings(session.settings);
@@ -329,6 +333,13 @@ export class SessionManager {
         if (!path.startsWith(imageRoot)) throw new HttpError(400, '只能使用此会话上传的图片');
       }
       const turn: Turn = { id: randomUUID(), prompt, images, status: 'running', phase: 'starting', items: [], startedAt: new Date().toISOString() };
+      execution.turnId = turn.id;
+      const approvals = new ApprovalRequests(turn, controller.signal, async () => {
+        session.updatedAt = new Date().toISOString();
+        await this.save(session);
+        this.publish(id, { type: 'state', session: this.get(id) });
+      });
+      execution.approvals = approvals;
       session.turns.push(turn);
       session.status = 'running';
       session.updatedAt = turn.startedAt;
@@ -339,6 +350,7 @@ export class SessionManager {
         client: this.client, e2b: this.e2b, logger: this.logger,
         save: () => this.save(session), publish: message => this.publish(id, message), snapshot: () => this.get(id),
         updateSandbox: sandbox => this.updateSandbox(session.projectId, id, sandbox),
+        requestApproval: approvals.request, closeApprovals: () => approvals.close(),
       }).finally(() => {
         this.active.delete(id);
         releaseProject();
@@ -348,6 +360,7 @@ export class SessionManager {
       void running.catch(error => console.error('Session persistence failed:', error instanceof Error ? error.message : 'unknown error'));
       return turn.id;
     } catch (error) {
+      await execution.approvals?.close().catch(() => {});
       this.sessions.set(id, previous);
       this.active.delete(id);
       releaseProject();
@@ -355,6 +368,21 @@ export class SessionManager {
       this.publish(id, { type: 'state', session: this.get(id) });
       throw error;
     }
+  }
+
+  async resolveApproval(id: string, turnId: string, approvalId: string, input: unknown): Promise<Session> {
+    const { decision } = approvalDecisionSchema.parse(input);
+    const session = this.lookup(id);
+    const turn = session.turns.find(item => item.id === turnId);
+    const approval = turn?.approvals?.find(item => item.id === approvalId);
+    if (!turn || !approval) throw new HttpError(404, '确认请求不存在');
+    const execution = this.active.get(id);
+    if (execution?.turnId === turnId && execution.approvals) {
+      await execution.approvals.decide(approvalId, decision);
+    } else if (approval.status !== decision) {
+      throw new HttpError(409, '本轮执行已结束，确认请求已失效');
+    }
+    return this.get(id);
   }
 
   async stop(id: string) {

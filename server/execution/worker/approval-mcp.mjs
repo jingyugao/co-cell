@@ -4,13 +4,13 @@ import { createInterface } from 'node:readline';
 const tool = {
   name: 'request_user_approval',
   title: '请求用户同意',
-  description: '一切线上变更或高危操作都必须先用此工具取得人工同意，所有变更 SQL/DDL 也适用。按实际影响判断，不因环境、工具或执行方式绕过审核；纯只读无副作用查询无需审核。用简短白话说明操作、目标和影响，复杂脚本先保存为项目文件并附查看链接。只有 approved=true 才执行本次内容，内容或目标改变须重新审核。此工具不执行操作。',
+  description: '一切线上变更或高危操作都必须先用此工具取得人工同意，所有变更 SQL/DDL 也适用。按实际影响判断，不因环境、工具或执行方式绕过审核；纯只读无副作用查询无需审核。用简短白话说明操作、目标和影响，复杂脚本先保存为项目文件并附查看链接；多个变更优先合成一个脚本，一次性请求审核。只有 approved=true 才执行本次内容，内容或目标改变须重新审核。此工具不执行操作。',
   inputSchema: {
     type: 'object', additionalProperties: false,
     properties: {
       title: { type: 'string', minLength: 1, maxLength: 200, description: '简短说明需要用户同意的操作。' },
       target: { type: 'string', minLength: 1, maxLength: 2000, description: '一行写明环境和目标，如“生产库 orders 表”。不含凭据。' },
-      action: { type: 'string', minLength: 1, maxLength: 32000, description: '用一两句话说明具体操作。简单 SQL 可直接附上；复杂 SQL/脚本先保存到项目工作区，再用 [查看脚本](/绝对路径/文件.sql) 提供链接，不粘贴长代码。请求后保持文件内容不变，修改须重新确认。' },
+      action: { type: 'string', minLength: 1, maxLength: 32000, description: '用一两句话说明具体操作。同一任务有多个变更时，优先合成有序脚本并一次性送审，说明整批范围。简单 SQL 可直接附上；复杂 SQL/脚本先保存到项目工作区，再用 [查看脚本](/绝对路径/文件.sql) 提供链接，不粘贴长代码。请求后保持文件内容不变，修改须重新确认。' },
       impact: { type: 'string', minLength: 1, maxLength: 8000, description: '一句话写明影响范围及关键风险，例如“更新 12 行，不删除数据”。未知范围直说，不展开技术细节。' },
     },
     required: ['title', 'target', 'action', 'impact'],

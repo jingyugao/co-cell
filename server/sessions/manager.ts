@@ -403,6 +403,16 @@ export class SessionManager {
     try { return await this.e2b.changes(session); } finally { release(); }
   }
 
+  async projectFile(projectId: string, path: string) {
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    const project = this.projects.get(projectId);
+    if (project.executionMode !== 'e2b' || !this.e2b) throw new HttpError(400, '此项目不使用 E2B 沙箱');
+    if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先发送一条消息');
+    const release = this.projects.acquire(project.id);
+    try { return await this.e2b.file(this.projectWorkspace(project), path); }
+    finally { release(); }
+  }
+
   async rawTools(id: string, cursor: number, localReader: RawToolReader) {
     const session = this.lookup(id);
     if (session.settings.executionMode !== 'e2b') return localReader.read(session.threadId, cursor);

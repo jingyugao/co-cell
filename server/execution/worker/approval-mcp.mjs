@@ -4,7 +4,7 @@ import { createInterface } from 'node:readline';
 const tool = {
   name: 'request_user_approval',
   title: '请求用户同意',
-  description: '所有线上变更及任何环境的变更 SQL/DDL，必须先通过此工具获得同意。包括 Apollo 配置修改、发布、回滚及部署、重启、扩缩容等，内部 API/脚本也不例外；用户说“改一下”不代替确认。纯只读查询不需要。用简短白话说明要做什么、改哪里、有何影响。复杂 SQL 或脚本先保存到项目工作区文件，再附查看链接，不在卡片里粘贴长代码。只有 approved=true 才可执行；内容或目标改变须重新确认。此工具不执行操作。',
+  description: '一切线上变更或高危操作都必须先用此工具取得人工同意，所有变更 SQL/DDL 也适用。按实际影响判断，不因环境、工具或执行方式绕过审核；纯只读无副作用查询无需审核。用简短白话说明操作、目标和影响，复杂脚本先保存为项目文件并附查看链接。只有 approved=true 才执行本次内容，内容或目标改变须重新审核。此工具不执行操作。',
   inputSchema: {
     type: 'object', additionalProperties: false,
     properties: {

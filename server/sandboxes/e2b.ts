@@ -13,6 +13,7 @@ import type { RuntimeLog } from '../diagnostics/runtime-log.js';
 import type { ImprovementContext, ImprovementReceipt } from '../../shared/improvement-types.js';
 import type { StoredArchive } from './archive-storage.js';
 import { HttpError } from '../core/errors.js';
+import type { ModelProxyKind } from '../execution/model-proxy.js';
 import { parseWorkspaceFile, READ_SANDBOX_FILE_SCRIPT, workspaceFileRequest, type WorkspaceFileResult } from '../workspaces/files.js';
 
 export interface SandboxSnapshotArchive {
@@ -36,6 +37,7 @@ export interface E2BCodexOptions {
   archives?: SandboxSnapshotArchive;
   apiKey: string;
   baseUrl?: string;
+  proxyKind?: ModelProxyKind;
   modelConfig?: Record<string, unknown>;
   configOverrides?: string[];
   sharedDataDirectory?: URL;
@@ -500,7 +502,8 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
       await entry.sandbox.files.write(inputPath, JSON.stringify({
         threadId: session.threadId, prompt: turn.prompt, images, settings: session.settings,
         connectionDirectories: Object.keys(connectionEnvs).length ? [CONNECTION_ROOT, ...('MEEGLE_HOST' in connectionEnvs ? ['/home/user/.meegle'] : []), ...('KUBECONFIG' in connectionEnvs ? ['/home/user/.kube'] : [])] : [],
-        baseUrl: this.options.baseUrl, modelConfig: this.options.modelConfig, configOverrides: this.options.configOverrides,
+        baseUrl: this.options.baseUrl, proxyKind: this.options.proxyKind,
+        modelConfig: this.options.modelConfig, configOverrides: this.options.configOverrides,
         improvementReplyDirectory,
       }), { user: 'user', signal: executionSignal });
       await this.state(entry, 'ready');

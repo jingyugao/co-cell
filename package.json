@@ -14,8 +14,9 @@
     "typecheck": "tsc --noEmit",
     "capture:http": "tsx server/diagnostics/capture-demo.ts",
     "credentials:import": "tsx server/connections/import-local.ts",
+    "cliproxyapi": "node scripts/cliproxyapi/manage.mjs",
     "e2b:build": "node scripts/e2b/build-template.mjs && node scripts/e2b/verify-template.mjs",
-    "kubernetes:configure": "tsx server/connections/provision-kubernetes-readonly.ts"
+    "kubernetes:configure": "node scripts/kubernetes-admin.mjs"
   },
   "dependencies": {
     "@hono/node-server": "2.1.1",

@@ -19,12 +19,14 @@ import { TemplateManager } from './templates/manager.js';
 import { ConnectionStore } from './connections/store.js';
 import { RuntimeLog } from './diagnostics/runtime-log.js';
 import { installProductionStatic } from './http/static-files.js';
+import { modelProxyKind } from './execution/model-proxy.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 
 const port = Number(process.env.PORT || 3000);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be between 1 and 65535');
 const apiKey = process.env.CODEX_API_KEY || process.env.OPENAI_API_KEY;
+const proxyKind = modelProxyKind();
 const sdkConfig = process.env.CODEX_CONFIG_JSON ? JSON.parse(process.env.CODEX_CONFIG_JSON) : {};
 // Built-in provider IDs cannot be overridden in Codex 0.153.4. Register the
 // explicit proxy as a custom Responses provider to control its transport.
@@ -37,6 +39,7 @@ const proxyConfig = process.env.OPENAI_BASE_URL ? {
       wire_api: 'responses',
       supports_websockets: false,
       ...(apiKey ? { env_key: 'CODEX_API_KEY' } : { requires_openai_auth: true }),
+      ...(proxyKind === 'cliproxyapi' ? { request_max_retries: 0, stream_max_retries: 0 } : {}),
     },
   },
 } : {};
@@ -97,7 +100,7 @@ const e2b = e2bEnabled ? new E2BCodexRuntime({
   logger: runtimeLog,
   connection: e2bConnection!,
   template: e2bTemplate, apiKey: apiKey!,
-  baseUrl: process.env.OPENAI_BASE_URL, modelConfig, configOverrides,
+  baseUrl: process.env.OPENAI_BASE_URL, proxyKind, modelConfig, configOverrides,
 }) : undefined;
 const manager = new SessionManager(codex, resolve(process.env.CODEX_WEB_DATA_DIR || '.codex-web'), defaults, e2b, e2bWorkingDirectory, runtimeLog);
 await manager.init();
@@ -133,7 +136,7 @@ const server = createServer((request, response) => {
   else vite.middlewares(request, response);
 });
 server.listen(port, '127.0.0.1', () => {
-  void runtimeLog.write({ event: 'service.started', port, model: defaults.model, executionMode, httpDiagnostics: Boolean(e2bEnabled && process.env.OPENAI_BASE_URL) });
+  void runtimeLog.write({ event: 'service.started', port, model: defaults.model, executionMode, httpDiagnostics: Boolean(e2bEnabled && process.env.OPENAI_BASE_URL), ...(process.env.OPENAI_BASE_URL ? { proxyKind } : {}) });
   console.log(`Codex Web ready at http://localhost:${port}`);
   console.log(`Workspace: ${defaults.workingDirectory}`);
   console.log(`Execution: ${defaults.executionMode}${e2bEnabled ? ` · E2B template ${activeTemplate}` : ''}`);

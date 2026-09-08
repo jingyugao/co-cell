@@ -12,6 +12,8 @@ import { syncSandboxConnections } from '../connections/sandbox-sync.js';
 import type { RuntimeLog } from '../diagnostics/runtime-log.js';
 import type { ImprovementContext, ImprovementReceipt } from '../../shared/improvement-types.js';
 import type { StoredArchive } from './archive-storage.js';
+import { HttpError } from '../core/errors.js';
+import { parseWorkspaceFile, READ_SANDBOX_FILE_SCRIPT, workspaceFileRequest, type WorkspaceFileResult } from '../workspaces/files.js';
 
 export interface SandboxSnapshotArchive {
   archive(sandboxId: string): Promise<StoredArchive>;
@@ -23,6 +25,7 @@ export interface E2BRuntime {
   run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
   changes(session: WorkspaceTarget): Promise<Changes>;
   preview(session: WorkspaceTarget, port: number): Promise<string>;
+  file(session: WorkspaceTarget, path: string): Promise<WorkspaceFileResult>;
   rawTools(session: ThreadWorkspace, cursor?: number): Promise<RawToolPage>;
   delete(session: WorkspaceTarget): Promise<void>;
   close(): Promise<void>;
@@ -617,6 +620,27 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
       url.hostname = entry.sandbox.getHost(port);
       url.pathname = '/'; url.search = ''; url.hash = '';
       return url.origin;
+    } finally { entry.readers--; await this.idle(entry); }
+  }
+
+  async file(session: WorkspaceTarget, path: string): Promise<WorkspaceFileResult> {
+    if (this.closing) throw new HttpError(503, 'E2B 运行时正在关闭');
+    const request = workspaceFileRequest(session.settings.workingDirectory, path);
+    let entry: Entry;
+    try { entry = await this.acquire(session, false); }
+    catch (error) { throw new HttpError(502, this.safeError(error).message); }
+    entry.readers++;
+    this.touch(entry);
+    try {
+      if (entry.disposed) throw new HttpError(409, '项目沙箱正在删除');
+      if (Date.now() - entry.renewedAt > IDLE_SCAN_MS) await this.renew(entry);
+      const encoded = Buffer.from(JSON.stringify(request)).toString('base64');
+      const result = await entry.sandbox.commands.run(`${NODE} --input-type=commonjs -e ${quote(READ_SANDBOX_FILE_SCRIPT)} ${quote(encoded)}`, { user: 'user', timeoutMs: 30_000 });
+      return parseWorkspaceFile(result.stdout);
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      if (/not found|404/i.test(String(error))) await this.refreshState(entry).catch(() => {});
+      throw new HttpError(502, this.safeError(error).message);
     } finally { entry.readers--; await this.idle(entry); }
   }
 

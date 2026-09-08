@@ -92,8 +92,6 @@ export class ConnectionStore {
   private command: LocalCommand;
   private tail: Promise<unknown> = Promise.resolve();
   private meegleRefresh?: Promise<Awaited<ReturnType<typeof readMeegleCredentials>>>;
-  private kubernetesRefresh?: Promise<Awaited<ReturnType<typeof importKubernetesCredentials>>>;
-  private kubernetesRefreshedAt = 0;
   constructor(options: ConnectionStoreOptions = {}) {
     this.directory = options.directory ?? fileURLToPath(new URL('../../data/credentials/', import.meta.url));
     this.keyPath = options.keyPath ?? join(homedir(), '.config/swarm-hive/credentials.key');
@@ -135,17 +133,8 @@ export class ConnectionStore {
     await this.tail;
     let bundle = await this.readBundle();
     if (!bundle) return null;
-    if (bundle.connections.some(item => item.type === 'kubernetes')) {
-      if (bundle.kubernetesPolicy !== KUBERNETES_CREDENTIAL_POLICY) throw new Error('旧 Kubernetes 凭据已停用，请先配置开发调试身份并重新同步');
-      if (!this.kubernetesRefresh || Date.now() - this.kubernetesRefreshedAt > 60_000) {
-        this.kubernetesRefreshedAt = Date.now();
-        this.kubernetesRefresh = importKubernetesCredentials(this.home, this.command).catch(error => { this.kubernetesRefresh = undefined; throw error; });
-      }
-      const current = await this.kubernetesRefresh;
-      if (!current || current.expiresAt < Date.now() + 60_000) { this.kubernetesRefresh = undefined; throw new Error('Kubernetes 开发调试令牌不可用，请重试同步'); }
-      const identity = (items: ConnectionInventory['connections']) => items.filter(item => item.type === 'kubernetes').map(item => `${item.id}:${item.host}`).sort().join('\n');
-      if (identity(current.connections) !== identity(bundle.connections)) throw new Error('本机集群配置已切换，请重新同步凭据');
-      bundle = { ...bundle, cliFiles: { ...bundle.cliFiles, ...current.files } };
+    if (bundle.connections.some(item => item.type === 'kubernetes') && bundle.kubernetesPolicy !== KUBERNETES_CREDENTIAL_POLICY) {
+      throw new Error('请导入专用 Kubernetes 长期凭据');
     }
     if (!bundle.connections.some(item => item.type === 'meegle')) return bundle;
     if (!this.meegleRefresh) {
@@ -172,7 +161,7 @@ export class ConnectionStore {
   importLocal(): Promise<ConnectionInventory> {
     const operation = this.tail.then(async () => {
       const connections: ConnectionInventory['connections'] = [];
-      const kubernetes = await importKubernetesCredentials(this.home, this.command);
+      const kubernetes = await importKubernetesCredentials(this.home);
       if (kubernetes) connections.push(...kubernetes.connections);
       const lark = await importLarkCredentials(this.home);
       if (lark) connections.push(...lark.connections);
@@ -225,7 +214,6 @@ export class ConnectionStore {
         ...(kubernetes ? { kubernetesPolicy: kubernetes.policy } : {}),
         cliFiles: { ...kubernetes?.files, ...lark?.files, ...(meegle ? { 'meegle/config.json': Buffer.from(meegle.configText).toString('base64') } : {}) } };
       this.meegleRefresh = undefined;
-      this.kubernetesRefresh = undefined;
       await mkdir(this.directory, { recursive: true, mode: 0o700 }); await chmod(this.directory, 0o700);
       const nonce = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', await this.key(true), nonce);
       cipher.setAAD(Buffer.from('swarm-hive-connections-v1'));

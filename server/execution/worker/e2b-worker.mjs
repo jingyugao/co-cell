@@ -79,6 +79,13 @@ export function createSameChannelResolver({ upstreamBaseUrl, fetchImpl = fetch, 
   };
 }
 
+/** CLIProxyAPI owns upstream retries; New API needs its channel-pinning resolver. */
+export function createOverloadRetryOptions({ proxyKind = 'new-api', baseUrl }, onDiagnostic) {
+  if (proxyKind === 'cliproxyapi') return false;
+  if (proxyKind !== 'new-api') throw new Error('Unsupported model proxy kind');
+  return { resolveRetryHeaders: createSameChannelResolver({ upstreamBaseUrl: baseUrl, onDiagnostic }) };
+}
+
 // The private input file carries prompts and configuration, never shell arguments.
 async function main() {
 const inputPath = process.argv[2];
@@ -108,7 +115,7 @@ try {
       upstreamBaseUrl: input.baseUrl,
       secrets: [process.env.CODEX_API_KEY].filter(Boolean),
       onEvent: onDiagnostic,
-      overloadRetries: { resolveRetryHeaders: createSameChannelResolver({ upstreamBaseUrl: input.baseUrl, onDiagnostic }) },
+      overloadRetries: createOverloadRetryOptions(input, onDiagnostic),
     });
   }
   const proxy = input.baseUrl ? {

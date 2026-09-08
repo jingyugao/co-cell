@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.18.0"
   },
   "packageManager": "pnpm@10.33.4",
   "scripts": {
@@ -12,10 +12,10 @@
     "build": "tsc --noEmit && vite build",
     "start": "NODE_ENV=production tsx server/index.ts",
     "typecheck": "tsc --noEmit",
-    "capture:http": "tsx server/capture-demo.ts",
-    "credentials:import": "tsx server/import-connections.ts",
+    "capture:http": "tsx server/diagnostics/capture-demo.ts",
+    "credentials:import": "tsx server/connections/import-local.ts",
     "e2b:build": "node scripts/e2b/build-template.mjs && node scripts/e2b/verify-template.mjs",
-    "kubernetes:configure": "tsx server/provision-kubernetes-readonly.ts"
+    "kubernetes:configure": "tsx server/connections/provision-kubernetes-readonly.ts"
   },
   "dependencies": {
     "@hono/node-server": "2.1.1",

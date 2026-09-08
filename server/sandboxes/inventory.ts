@@ -88,23 +88,42 @@ export class E2BSandboxInventory implements SandboxInventoryReader {
     }
     // Derive ownership from our persisted mapping, never from untrusted E2B metadata.
     const owners = new Map(projects.filter(p => p.executionMode === 'e2b' && p.sandbox).map(p => [p.sandbox!.id, p]));
+    const metadata = new Map([...owners.values()].map(project => [project.sandbox!.id, project.sandbox!]));
     const byProject = new Map(projects.map(p => [p.id, p]));
     const associations = new Map<string, NonNullable<SandboxRecord['sessions']>>();
     for (const session of sessions) {
       if (session.settings.executionMode !== 'e2b') continue;
       const sandboxId = (session.projectId ? byProject.get(session.projectId)?.sandbox?.id : undefined) ?? session.sandbox?.id;
       if (!sandboxId) continue;
+      if (!metadata.has(sandboxId) && session.sandbox) metadata.set(sandboxId, session.sandbox);
       const associated = associations.get(sandboxId) ?? [];
       associated.push({ id: session.id, title: session.title, status: session.status });
       associations.set(sandboxId, associated);
     }
+    const records = new Map(inventory.sandboxes.map(sandbox => [sandbox.id, sandbox]));
+    // Archived VMs may no longer exist in E2B; keep their persisted archives visible.
+    for (const sandbox of metadata.values()) {
+      if (records.has(sandbox.id) || !['archiving', 'archived', 'restoring'].includes(sandbox.status)) continue;
+      records.set(sandbox.id, {
+        id: sandbox.id, template: sandbox.template, state: 'unknown', cpuCount: 0, memoryMB: 0,
+        startedAt: '', endAt: '', session: null, metrics: null, metricsStatus: 'unavailable',
+      });
+    }
     return {
       ...inventory,
-      sandboxes: inventory.sandboxes.map(sandbox => {
+      sandboxes: [...records.values()].map(sandbox => {
         const associated = associations.get(sandbox.id) ?? [];
         const project = owners.get(sandbox.id);
+        const saved = metadata.get(sandbox.id);
+        const archivedState = saved?.status === 'archived' || saved?.status === 'archiving' || saved?.status === 'restoring' ? saved.status : undefined;
         return {
           ...sandbox, sessions: associated, session: associated[0] ?? null,
+          state: archivedState ?? sandbox.state,
+          pausedAt: saved?.pausedAt, archive: saved?.archive,
+          ...(archivedState ? {
+            metrics: null, metricsStatus: 'unavailable' as const, metricsSource: undefined,
+            metricsMessage: archivedState === 'archived' ? '文件已压缩保存，使用时自动恢复' : archivedState === 'archiving' ? '正在压缩并保存文件' : '正在从归档恢复文件',
+          } : {}),
           project: project ? { id: project.id, name: project.name, requirementUrl: project.requirementUrl, sessionCount: project.sessionCount } : null,
         };
       }),

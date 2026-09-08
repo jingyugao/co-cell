@@ -1,3 +1,5 @@
+import { installImprovementRoutes } from './improvements/routes.js';
+import type { ImprovementStore } from './improvements/store.js';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
@@ -17,7 +19,7 @@ import { installSharedFilesRoutes } from './shared-files/routes.js';
 import { installSandboxesRoutes } from './sandboxes/routes.js';
 import { installSessionsRoutes } from './sessions/routes.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], rawTools = new RawToolReader(), sandboxes: SandboxInventoryReader = new E2BSandboxInventory(), sharedFiles = new SharedFiles(), templates?: TemplateManager, connections?: ConnectionStore) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], rawTools = new RawToolReader(), sandboxes: SandboxInventoryReader = new E2BSandboxInventory(), sharedFiles = new SharedFiles(), templates?: TemplateManager, connections?: ConnectionStore, improvements?: ImprovementStore) {
   const app = new Hono();
   app.use('/api/*', async (c, next) => {
     const host = c.req.header('host');
@@ -40,6 +42,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   });
 
   app.get('/api/config', c => c.json(config));
+  installImprovementRoutes(app, improvements, manager);
   installProjectsRoutes(app, manager);
   installSessionsRoutes(app, manager, config, rawTools);
   installSandboxesRoutes(app, sandboxes, manager);

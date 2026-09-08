@@ -14,7 +14,7 @@ type Props = {
   onMenu: () => void;
   onBack: () => void;
 };
-const states = { starting: '启动中', ready: '运行中', paused: '已暂停', unavailable: '不可用' };
+const states = { starting: '启动中', ready: '运行中', paused: '已暂停', unavailable: '不可用', archiving: '沙箱归档中', archived: '沙箱已归档', restoring: '沙箱恢复中' };
 const date = (value: string) => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) : '—';
 function ProjectForm({ initial, busy, onSubmit, onCancel }: {
   initial?: ProjectSummary;
@@ -25,6 +25,7 @@ function ProjectForm({ initial, busy, onSubmit, onCancel }: {
   const [name, setName] = useState(initial?.name ?? '');
   const [url, setUrl] = useState(initial?.requirementUrl ?? '');
   const [error, setError] = useState('');
+  const automaticName = !initial && Boolean(url.trim());
   const input = useRef<HTMLInputElement>(null);
   useEffect(() => { input.current?.focus(); }, []);
   return <form className="project-form" aria-label={initial ? `编辑项目 ${initial.name}` : '创建项目'} onKeyDown={event => {
@@ -32,20 +33,20 @@ function ProjectForm({ initial, busy, onSubmit, onCancel }: {
   }} onSubmit={async event => {
     event.preventDefault();
     const trimmedName = name.trim();
-    if (!trimmedName) { setError('请输入项目名称。'); input.current?.focus(); return; }
+    if (!automaticName && !trimmedName) { setError('请输入项目名称。'); input.current?.focus(); return; }
     if (url.trim()) {
       try { const parsed = new URL(url.trim()); if (!['https:', 'http:'].includes(parsed.protocol)) throw new Error(); }
       catch { setError('请输入有效的 HTTP 或 HTTPS 需求链接。'); return; }
     }
     setError('');
-    try { await onSubmit({ name: trimmedName, requirementUrl: url.trim() || null }); }
+    try { await onSubmit({ name: automaticName ? '' : trimmedName, requirementUrl: url.trim() || null }); }
     catch (err) { setError(err instanceof Error ? err.message : '保存失败，请重试。'); }
   }}>
-    <label>项目名称<input ref={input} required maxLength={100} value={name} disabled={busy} placeholder="例如：订单系统改造" onChange={event => setName(event.target.value)} /></label>
+    <label>项目名称<input ref={input} required={!automaticName} maxLength={100} value={automaticName ? '' : name} disabled={busy || automaticName} placeholder={automaticName ? '创建时自动使用飞书需求名称' : '例如：订单系统改造'} onChange={event => setName(event.target.value)} /></label>
     <label>飞书需求链接 <span>选填</span><input type="url" maxLength={4096} value={url} disabled={busy} placeholder="https://…（可以暂时留空）" onChange={event => setUrl(event.target.value)} /></label>
-    {!initial && <p className="project-form-hint">项目内的会话共享同一个沙箱和工作目录，各自保留对话上下文。首次执行任务时创建沙箱。</p>}
+    {!initial && <p className="project-form-hint">填写飞书需求链接后，自动获取需求名称，并在新会话顶部提供技术方案快捷任务，点击后可修改并发送。项目内的会话共享同一个沙箱，首次执行任务时创建。</p>}
     {error && <p className="project-error" role="alert">{error}</p>}
-    <div className="project-form-actions"><button type="button" className="secondary-button" onClick={onCancel} disabled={busy}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? '保存中…' : initial ? '保存修改' : '创建并进入'}</button></div>
+    <div className="project-form-actions"><button type="button" className="secondary-button" onClick={onCancel} disabled={busy}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? automaticName ? '正在读取飞书需求并创建…' : '保存中…' : initial ? '保存修改' : '创建并进入'}</button></div>
   </form>;
 }
 function ProjectCard({ project, onUpdate, onOpenProject, onArchived }: Pick<Props, 'onUpdate' | 'onOpenProject'> & { project: ProjectSummary; onArchived: (name: string, archived: boolean) => void }) {

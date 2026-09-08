@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createDeveloperReadonlyManifests } from './kubernetes-policy.js';
+import { createDeveloperManifests } from './kubernetes-policy.js';
 
 // Explicit administrator CLI only. Web imports/turns never alter cluster RBAC.
 const contexts = process.argv.slice(2);
@@ -15,7 +15,7 @@ const run = (args: string[], input?: string): Promise<string> => new Promise((re
   child.on('close', code => { clearTimeout(timer); code === 0 ? resolve(output) : reject(Error('RBAC 配置失败，请检查宿主集群管理权限')); });
 });
 try {
-  const manifests = createDeveloperReadonlyManifests();
+  const manifests = createDeveloperManifests();
   // Reject pre-existing unmanaged objects with these names. The first deployment
   // from this task used the exact same public manifest without an ownership label.
   for (const context of contexts) {
@@ -35,6 +35,6 @@ try {
     }
     const items = manifests.map(item => ({ ...item, metadata: { ...item.metadata, labels: { 'app.kubernetes.io/managed-by': 'swarm-hive' } } }));
     await run(['--context', context, '--request-timeout=20s', 'apply', '-f', '-'], JSON.stringify({ apiVersion: 'v1', kind: 'List', items }));
-    console.log(`${context}: 开发者只读 RBAC 已配置`);
+    console.log(`${context}: 开发调试 RBAC 已配置（资源只读，允许 exec 和端口转发）`);
   }
 } catch (error) { console.error(error instanceof Error ? error.message : 'RBAC 配置失败'); process.exitCode = 1; }

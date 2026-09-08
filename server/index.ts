@@ -1,3 +1,5 @@
+import { ImprovementStore } from './improvements/store.js';
+import type { ImprovementContext, ImprovementReceipt } from '../shared/improvement-types.js';
 import { createServer } from 'node:http';
 import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
@@ -6,10 +8,13 @@ import { readFile } from 'node:fs/promises';
 import { Codex } from '@openai/codex-sdk';
 import { getRequestListener } from '@hono/node-server';
 import type { AppConfig, Settings } from '../shared/types.js';
+import { DEFAULT_MODEL } from '../shared/models.js';
 import { createApp } from './app.js';
 import { SessionManager } from './sessions/manager.js';
 import { E2BCodexRuntime } from './sandboxes/e2b.js';
 import { E2BSandboxInventory } from './sandboxes/inventory.js';
+import { LocalSandboxArchiveStorage } from './sandboxes/archive-storage.js';
+import { LocalSnapshotArchive } from './sandboxes/local-snapshot-archive.js';
 import { TemplateManager } from './templates/manager.js';
 import { ConnectionStore } from './connections/store.js';
 import { RuntimeLog } from './diagnostics/runtime-log.js';
@@ -54,8 +59,6 @@ if (!e2bApiKey && process.env.E2B_ENABLED !== 'false') {
 const e2bEnabled = process.env.E2B_ENABLED !== 'false' && Boolean(e2bApiKey && apiKey);
 const e2bTemplate = process.env.E2B_TEMPLATE || 'base';
 const e2bWorkingDirectory = process.env.E2B_WORKSPACE || '/home/user/workspace';
-const e2bTimeout = Number(process.env.E2B_TIMEOUT_MS || 1_800_000);
-if (!Number.isInteger(e2bTimeout) || e2bTimeout < 60_000 || e2bTimeout > 86_400_000) throw new Error('E2B_TIMEOUT_MS must be between 60000 and 86400000');
 const executionMode = process.env.CODEX_EXECUTION_MODE || (e2bEnabled ? 'e2b' : 'local');
 if (!['local', 'e2b'].includes(executionMode)) throw new Error('CODEX_EXECUTION_MODE must be local or e2b');
 if (executionMode === 'e2b' && !e2bEnabled) throw new Error('E2B needs its API key and a CODEX_API_KEY / OPENAI_API_KEY for the remote Codex');
@@ -63,7 +66,7 @@ const localWorkingDirectory = resolve(process.env.CODEX_WORKSPACE || process.cwd
 const defaults: Settings = {
   executionMode: executionMode as Settings['executionMode'],
   workingDirectory: executionMode === 'e2b' ? e2bWorkingDirectory : localWorkingDirectory,
-  model: process.env.CODEX_MODEL || '',
+  model: process.env.CODEX_MODEL || DEFAULT_MODEL,
   modelReasoningEffort: 'medium', sandboxMode: executionMode === 'e2b' ? 'danger-full-access' : 'workspace-write',
   webSearchMode: 'cached', networkAccessEnabled: executionMode === 'e2b',
 };
@@ -72,13 +75,28 @@ const e2bConnection = process.env.E2B_ENABLED !== 'false' && e2bApiKey ? {
     sandboxUrl: process.env.E2B_SANDBOX_URL || 'http://127.0.0.1:13002',
     domain: process.env.E2B_DOMAIN || 'localhost', debug: false, requestTimeoutMs: 60_000,
   } : undefined;
+const improvements = new ImprovementStore(process.env.IMPROVEMENTS_DB_PATH ? resolve(process.env.IMPROVEMENTS_DB_PATH) : undefined);
+async function submitImprovement(context: Omit<ImprovementContext, 'projectName'>, input: unknown, requestId: string): Promise<ImprovementReceipt> {
+  const session = manager.get(context.sessionId);
+  if (!session.turns.some(turn => turn.id === context.turnId) || (session.projectId ?? null) !== context.projectId) throw new Error('建议来源会话不匹配');
+  const project = session.projectId ? manager.getProject(session.projectId) : null;
+  return improvements.submit({ ...context, sessionTitle: session.title, projectName: project?.name ?? null }, input, requestId);
+}
 const connections = new ConnectionStore();
 const runtimeLog = new RuntimeLog({ secrets: [apiKey, e2bApiKey].filter((value): value is string => Boolean(value)) });
+const localE2b = e2bConnection && ['localhost', '127.0.0.1', '[::1]'].includes(new URL(e2bConnection.apiUrl!).hostname);
+const archives = localE2b && process.env.E2B_ARCHIVE_ENABLED !== 'false' ? new LocalSnapshotArchive({
+  storage: new LocalSandboxArchiveStorage(resolve(process.env.E2B_ARCHIVE_DIR || 'data/sandbox-archives')),
+  e2bDirectory: resolve(process.env.E2B_LOCAL_DATA_DIR || resolve(homedir(), '.data/e2b')),
+  inspectBinary: resolve(process.env.E2B_INSPECT_BINARY || 'data/tools/inspect-build'),
+}) : undefined;
 const e2b = e2bEnabled ? new E2BCodexRuntime({
   connections,
+  archives,
+  submitImprovement,
   logger: runtimeLog,
   connection: e2bConnection!,
-  template: e2bTemplate, timeoutMs: e2bTimeout, apiKey: apiKey!,
+  template: e2bTemplate, apiKey: apiKey!,
   baseUrl: process.env.OPENAI_BASE_URL, modelConfig, configOverrides,
 }) : undefined;
 const manager = new SessionManager(codex, resolve(process.env.CODEX_WEB_DATA_DIR || '.codex-web'), defaults, e2b, e2bWorkingDirectory, runtimeLog);
@@ -101,7 +119,7 @@ await templates.init();
 const activeTemplate = (await templates.list()).defaultTemplate;
 e2b?.setDefaultTemplate(activeTemplate);
 if (config.e2b) config.e2b.template = activeTemplate;
-const app = createApp(manager, config, [`localhost:${port}`, `127.0.0.1:${port}`], undefined, new E2BSandboxInventory(e2bConnection), undefined, templates, connections);
+const app = createApp(manager, config, [`localhost:${port}`, `127.0.0.1:${port}`], undefined, new E2BSandboxInventory(e2bConnection), undefined, templates, connections, improvements);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') {
   installProductionStatic(app);
@@ -127,6 +145,7 @@ async function shutdown() {
   server.close();
   await templates.close();
   await manager.close();
+  improvements.close();
   await runtimeLog.write({ event: 'service.stopped' });
   await runtimeLog.flush();
   await vite?.close();

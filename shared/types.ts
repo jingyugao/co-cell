@@ -62,7 +62,9 @@ export interface SandboxRecord {
   sessions?: Array<{ id: string; title: string; status: SessionStatus }>;
   id: string;
   template: string;
-  state: 'running' | 'paused' | 'unknown';
+  state: 'running' | 'paused' | 'unknown' | 'archiving' | 'archived' | 'restoring';
+  pausedAt?: string;
+  archive?: SandboxState['archive'];
   cpuCount: number;
   memoryMB: number;
   startedAt: string;

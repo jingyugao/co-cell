@@ -2,11 +2,11 @@ import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { LocalCommand } from './store.js';
 import type { ConnectionInventory } from '../../shared/connection-types.js';
-import { KUBERNETES_DEVELOPER_NAMESPACE as namespace, KUBERNETES_DEVELOPER_SERVICE_ACCOUNT as serviceAccount, KUBERNETES_DEVELOPER_CLUSTER_ROLE as roleName, KUBERNETES_DEVELOPER_CLUSTER_ROLE_BINDING as bindingName, DEVELOPER_READONLY_RULES, validateDeveloperReadonlyRules } from './kubernetes-policy.js';
+import { KUBERNETES_DEVELOPER_NAMESPACE as namespace, KUBERNETES_DEVELOPER_SERVICE_ACCOUNT as serviceAccount, KUBERNETES_DEVELOPER_CLUSTER_ROLE as roleName, KUBERNETES_DEVELOPER_CLUSTER_ROLE_BINDING as bindingName, DEVELOPER_RULES, validateDeveloperRules } from './kubernetes-policy.js';
 
-export const KUBERNETES_CREDENTIAL_POLICY = 'developer-readonly-v1';
+export const KUBERNETES_CREDENTIAL_POLICY = 'developer-debug-v2';
 const identity = `system:serviceaccount:${namespace}:${serviceAccount}`;
-const failure = () => new Error('Kubernetes 只读身份不可用：请检查专用 RBAC 配置；不会回退到宿主高权限凭据');
+const failure = () => new Error('Kubernetes 开发调试身份不可用：请检查专用 RBAC 配置；不会回退到宿主高权限凭据');
 const groups = new Set(['system:authenticated', 'system:serviceaccounts', `system:serviceaccounts:${namespace}`]);
 const discovery = new Set(['/api', '/api/*', '/apis', '/apis/*', '/healthz', '/livez', '/readyz', '/version', '/version/', '/openapi', '/openapi/*', '/.well-known/openid-configuration', '/.well-known/openid-configuration/', '/openid/v1/jwks', '/openid/v1/jwks/']);
 
@@ -19,7 +19,7 @@ export function isSafeInheritedKubernetesRules(rules: unknown): boolean {
     if (!Array.isArray(rule.apiGroups) || !Array.isArray(rule.resources)) return false;
     return rule.apiGroups.every((group: string) => rule.resources.every((resource: string) => rule.verbs.every((verb: string) => {
       if (verb === 'create' && ((group === 'authorization.k8s.io' && ['selfsubjectaccessreviews', 'selfsubjectrulesreviews'].includes(resource)) || (group === 'authentication.k8s.io' && resource === 'selfsubjectreviews'))) return true;
-      return DEVELOPER_READONLY_RULES.some(allowed => (allowed.apiGroups as readonly string[]).includes(group) && (allowed.resources as readonly string[]).includes(resource) && (allowed.verbs as readonly string[]).includes(verb));
+      return DEVELOPER_RULES.some(allowed => (allowed.apiGroups as readonly string[]).includes(group) && (allowed.resources as readonly string[]).includes(resource) && (allowed.verbs as readonly string[]).includes(verb));
     })));
   });
 }
@@ -43,7 +43,7 @@ export async function importKubernetesCredentials(home: string, command: LocalCo
       const base = ['--kubeconfig', path, '--context', entry.name, '--request-timeout=10s'];
       const read = async (args: string[]) => JSON.parse(await command('kubectl', [...base, ...args, '-o', 'json']));
       const role = await read(['get', 'clusterrole', roleName]);
-      if (role.aggregationRule || !validateDeveloperReadonlyRules(role.rules)) throw failure();
+      if (role.aggregationRule || !validateDeveloperRules(role.rules)) throw failure();
       const binding = await read(['get', 'clusterrolebinding', bindingName]);
       if (binding.roleRef?.kind !== 'ClusterRole' || binding.roleRef?.name !== roleName || binding.roleRef?.apiGroup !== 'rbac.authorization.k8s.io' || binding.subjects?.length !== 1 || binding.subjects[0].kind !== 'ServiceAccount' || binding.subjects[0].name !== serviceAccount || binding.subjects[0].namespace !== namespace) throw failure();
       const allBindings = [...(await read(['get', 'clusterrolebindings'])).items, ...(await read(['get', 'rolebindings', '--all-namespaces'])).items];
@@ -67,7 +67,7 @@ export async function importKubernetesCredentials(home: string, command: LocalCo
       clusters.push({ name: entry.name, cluster });
       users.push({ name: entry.name, user: { token } });
       contexts.push({ name: entry.name, context: { cluster: entry.name, user: entry.name, ...(entry.context.namespace ? { namespace: entry.context.namespace } : {}) } });
-      connections.push({ id: `kubernetes:${entry.name}`, type: 'kubernetes', name: entry.name, host: url.host, username: identity, note: '开发者只读 · 集群 RBAC 强制执行。可读资源、日志及 ConfigMap/Secret；禁止资源增删改、exec 与端口转发。' });
+      connections.push({ id: `kubernetes:${entry.name}`, type: 'kubernetes', name: entry.name, host: url.host, username: identity, note: '开发调试身份：可查看资源、日志和 ConfigMap/Secret，进入已有 Pod 及端口转发；禁止通过 Kubernetes API 创建、删除或修改资源。' });
     }
     const current = input['current-context'] || contexts[0].name;
     if (!contexts.some(entry => entry.name === current)) throw failure();

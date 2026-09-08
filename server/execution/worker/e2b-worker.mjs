@@ -2,6 +2,7 @@ import { readFile, unlink } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { Codex } from '@openai/codex-sdk';
 import { startDiagnosticProxy } from './diagnostic-proxy.mjs';
+import { startImprovementBridge } from './improvement-bridge.mjs';
 
 const headerEntries = headers => headers instanceof Headers ? [...headers.entries()] : Object.entries(headers ?? {});
 function singleHeader(headers, name) {
@@ -88,6 +89,7 @@ const stop = () => controller.abort();
 process.on('SIGTERM', stop);
 process.on('SIGINT', stop);
 let diagnosticProxy;
+let improvementBridge;
 let retry;
 const emitRetry = value => process.stdout.write(JSON.stringify({ type: 'runtime.retry', retry: value }) + '\n');
 const onDiagnostic = diagnostic => {
@@ -118,9 +120,19 @@ try {
     } },
   } : {};
   const extra = input.modelConfig ?? {};
+  if (input.improvementReplyDirectory) {
+    improvementBridge = await startImprovementBridge({
+      replyDirectory: input.improvementReplyDirectory, signal: controller.signal,
+      emit: event => process.stdout.write(JSON.stringify(event) + '\n'),
+    });
+  }
   const codex = new Codex({
     apiKey: process.env.CODEX_API_KEY,
-    config: { ...extra, ...proxy, model_providers: { ...extra.model_providers, ...proxy.model_providers } },
+    config: { ...extra, ...proxy, model_providers: { ...extra.model_providers, ...proxy.model_providers },
+      ...(improvementBridge ? {
+        mcp_servers: { ...extra.mcp_servers, swarm_improvements: improvementBridge.config },
+      } : {}),
+    },
     configOverrides: [...(input.configOverrides ?? []), ...(input.baseUrl ? [
       'model_providers.codex_web_proxy.request_max_retries=0',
       'model_providers.codex_web_proxy.stream_max_retries=0',
@@ -151,7 +163,7 @@ try {
   process.stderr.write(message + '\n');
   process.exitCode = controller.signal.aborted ? 130 : 1;
 } finally {
-  try { await diagnosticProxy?.close(); }
+  try { await Promise.all([diagnosticProxy?.close(), improvementBridge?.close()]); }
   finally {
     if (retry) { retry = undefined; emitRetry(null); }
     process.removeListener('SIGTERM', stop);

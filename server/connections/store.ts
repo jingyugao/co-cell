@@ -136,13 +136,13 @@ export class ConnectionStore {
     let bundle = await this.readBundle();
     if (!bundle) return null;
     if (bundle.connections.some(item => item.type === 'kubernetes')) {
-      if (bundle.kubernetesPolicy !== KUBERNETES_CREDENTIAL_POLICY) throw new Error('旧 Kubernetes 凭据已停用，请先配置开发者只读身份并重新同步');
+      if (bundle.kubernetesPolicy !== KUBERNETES_CREDENTIAL_POLICY) throw new Error('旧 Kubernetes 凭据已停用，请先配置开发调试身份并重新同步');
       if (!this.kubernetesRefresh || Date.now() - this.kubernetesRefreshedAt > 60_000) {
         this.kubernetesRefreshedAt = Date.now();
         this.kubernetesRefresh = importKubernetesCredentials(this.home, this.command).catch(error => { this.kubernetesRefresh = undefined; throw error; });
       }
       const current = await this.kubernetesRefresh;
-      if (!current || current.expiresAt < Date.now() + 60_000) { this.kubernetesRefresh = undefined; throw new Error('Kubernetes 只读令牌不可用，请重试同步'); }
+      if (!current || current.expiresAt < Date.now() + 60_000) { this.kubernetesRefresh = undefined; throw new Error('Kubernetes 开发调试令牌不可用，请重试同步'); }
       const identity = (items: ConnectionInventory['connections']) => items.filter(item => item.type === 'kubernetes').map(item => `${item.id}:${item.host}`).sort().join('\n');
       if (identity(current.connections) !== identity(bundle.connections)) throw new Error('本机集群配置已切换，请重新同步凭据');
       bundle = { ...bundle, cliFiles: { ...bundle.cliFiles, ...current.files } };

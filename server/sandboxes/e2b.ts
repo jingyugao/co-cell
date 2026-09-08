@@ -10,6 +10,13 @@ import { loadAgentDocs } from '../shared-files/agent-docs.js';
 import { CONNECTION_ROOT, type ConnectionStore } from '../connections/store.js';
 import { syncSandboxConnections } from '../connections/sandbox-sync.js';
 import type { RuntimeLog } from '../diagnostics/runtime-log.js';
+import type { ImprovementContext, ImprovementReceipt } from '../../shared/improvement-types.js';
+import type { StoredArchive } from './archive-storage.js';
+
+export interface SandboxSnapshotArchive {
+  archive(sandboxId: string): Promise<StoredArchive>;
+  restore(sandboxId: string, archive: StoredArchive): Promise<void>;
+}
 
 export interface E2BRuntime {
   track?(session: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): void;
@@ -23,7 +30,7 @@ export interface E2BRuntime {
 export interface E2BCodexOptions {
   connection: ConnectionOpts;
   template: string;
-  timeoutMs: number;
+  archives?: SandboxSnapshotArchive;
   apiKey: string;
   baseUrl?: string;
   modelConfig?: Record<string, unknown>;
@@ -31,6 +38,7 @@ export interface E2BCodexOptions {
   sharedDataDirectory?: URL;
   connections?: ConnectionStore;
   logger?: RuntimeLog;
+  submitImprovement?: (context: Omit<ImprovementContext, 'projectName'>, input: unknown, requestId: string) => Promise<ImprovementReceipt>;
 }
 type Entry = {
   sandbox: Sandbox;
@@ -46,9 +54,11 @@ type Entry = {
   initialized?: boolean;
   needsRecovery?: boolean;
   renewedAt: number;
+  leaseLimitReported?: boolean;
 };
 type Tracked = Pick<Entry, 'metadata' | 'notify' | 'lastActiveAt' | 'pausing'>;
-export const IDLE_PAUSE_MS = 60 * 60 * 1000;
+export const SANDBOX_PAUSE_TTL_MS = 24 * 60 * 60 * 1000;
+export const SANDBOX_ARCHIVE_AFTER_MS = 7 * SANDBOX_PAUSE_TTL_MS;
 export const IDLE_SCAN_MS = 60 * 1000;
 const ROOT = '/home/user/.codex-web';
 const RUNTIME = `${ROOT}/runtime`;
@@ -66,12 +76,11 @@ const ownerKey = (session: WorkspaceTarget) => session.projectId ? `project:${se
 export class E2BCodexRuntime implements E2BRuntime {
   private entries = new Map<string, Entry>();
   private connecting = new Map<string, Promise<Entry>>();
-  private pauseSupported = true;
   private closing = false;
   private tracked = new Map<string, Tracked>();
   private sweepTimer: ReturnType<typeof setInterval>;
   private sweeping?: Promise<void>;
-  private get timeoutMs() { return Math.min(IDLE_PAUSE_MS, Math.max(this.options.timeoutMs, 5 * IDLE_SCAN_MS)); }
+  private readonly timeoutMs = SANDBOX_PAUSE_TTL_MS;
   constructor(private options: E2BCodexOptions) {
     this.sweepTimer = setInterval(() => { void this.sweep(); }, IDLE_SCAN_MS);
     this.sweepTimer.unref();
@@ -89,51 +98,101 @@ export class E2BCodexRuntime implements E2BRuntime {
     if (this.closing) return Promise.resolve();
     if (this.sweeping) return this.sweeping;
     this.sweeping = (async () => {
-      for (const entry of this.entries.values()) {
+      for (const [key, entry] of this.entries) {
         if (this.closing) break;
-        if (entry.disposed || entry.pausing || entry.metadata.status !== 'ready') continue;
-        if (!entry.running && !entry.readers && Date.now() - entry.lastActiveAt > IDLE_PAUSE_MS) {
-          await this.pause(entry);
-        } else if (Date.now() - entry.renewedAt >= this.timeoutMs / 3) {
-          // Renew the E2B lease while waiting for the idle deadline, without
-          // changing lastActiveAt. Each lease respects the platform's 1h limit.
-          try {
-            await entry.sandbox.setTimeout(this.timeoutMs);
-            entry.renewedAt = Date.now();
-          } catch (error) { await this.pauseError(entry, error); }
-        }
+        if (entry.disposed || entry.pausing || this.connecting.has(key)) continue;
+        try { await this.scan(entry, key); }
+        catch (error) { await this.pauseError(entry, error); }
       }
       for (const [key, entry] of this.tracked) {
         if (this.closing) break;
-        if (this.connecting.has(key) || entry.pausing || !['ready', 'starting'].includes(entry.metadata.status)) continue;
-        // Static APIs do not resume paused sandboxes. Keep checking restored
-        // owners' leases until they reach the independent idle deadline.
-        entry.pausing = (async () => {
-          try {
-            const remaining = IDLE_PAUSE_MS - (Date.now() - entry.lastActiveAt);
-            if (remaining < 0 && this.pauseSupported) {
-              await Sandbox.pause(entry.metadata.id, this.options.connection);
-              await this.state(entry, 'paused');
-            } else {
-              const info = await Sandbox.getInfo(entry.metadata.id, this.options.connection);
-              if (info.state === 'paused') await this.state(entry, 'paused');
-              else if (info.endAt.getTime() - Date.now() < this.timeoutMs * 2 / 3) {
-                await Sandbox.setTimeout(entry.metadata.id, this.timeoutMs, this.options.connection);
-              }
-            }
-          } catch (error) { await this.pauseError(entry, error); }
-        })();
-        await entry.pausing;
-        entry.pausing = undefined;
+        if (this.connecting.has(key) || entry.pausing) continue;
+        try { await this.scan(entry, key); }
+        catch (error) { await this.pauseError(entry, error); }
       }
     })().catch(error => { void this.options.logger?.write({ event: 'sandbox.idle_scan_failed', message: this.safeError(error).message }); }).finally(() => { this.sweeping = undefined; });
     return this.sweeping;
   }
 
+  private async scan(entry: Tracked, key: string) {
+    if (entry.metadata.status === 'archived') return;
+    if (entry.metadata.status === 'restoring' && entry.metadata.archive) {
+      await this.state(entry, 'archived');
+      return;
+    }
+    // Status inspection is not activity: E2B owns expiry and timeout-pause.
+    const info = await this.refreshState(entry);
+    if (this.connecting.has(key) || entry.pausing) return;
+    if (info.state !== 'paused' || !this.options.archives) return;
+    if ('running' in entry && ((entry as Entry).running || (entry as Entry).readers)) return;
+    const pausedAt = Date.parse(entry.metadata.pausedAt ?? '');
+    if (!Number.isFinite(pausedAt) || Date.now() - pausedAt <= SANDBOX_ARCHIVE_AFTER_MS) return;
+    const previous = { ...entry.metadata };
+    entry.pausing = (async () => {
+      try {
+        await this.state(entry, 'archiving');
+        const archive = await this.options.archives!.archive(entry.metadata.id);
+        if ((await Sandbox.getInfo(entry.metadata.id, this.options.connection)).state !== 'paused') {
+          throw new Error('归档期间沙箱已恢复，保留原沙箱并取消归档状态更新');
+        }
+        entry.metadata = { ...entry.metadata, archive };
+        await this.state(entry, 'archived');
+        void this.options.logger?.write({ event: 'sandbox.archived', sandboxId: entry.metadata.id, archiveKey: archive.key, sizeBytes: archive.sizeBytes });
+      } catch (error) {
+        entry.metadata = previous;
+        await this.state(entry, 'paused');
+        throw error;
+      }
+    })();
+    try { await entry.pausing; } finally { entry.pausing = undefined; }
+  }
+
+  private async restoreArchive(entry: Tracked) {
+    if (!['archived', 'restoring'].includes(entry.metadata.status)) return;
+    if (!entry.metadata.archive || !this.options.archives) throw new Error('沙箱已归档，但归档存储未配置或归档记录缺失');
+    try {
+      await this.state(entry, 'restoring');
+      await this.options.archives.restore(entry.metadata.id, entry.metadata.archive);
+      await this.state(entry, 'paused');
+      void this.options.logger?.write({ event: 'sandbox.archive_restored', sandboxId: entry.metadata.id, archiveKey: entry.metadata.archive.key });
+    } catch (error) {
+      await this.state(entry, 'archived');
+      throw new Error(`沙箱归档恢复失败：${this.safeError(error).message}`);
+    }
+  }
+
   private async pauseError(entry: Tracked, error: unknown) {
-    if (/not found|404/i.test(String(error))) await this.state(entry, 'unavailable');
-    else if (/405|501|not implemented|not supported/i.test(String(error))) this.pauseSupported = false;
-    void this.options.logger?.write({ event: 'sandbox.idle_pause_failed', sandboxId: entry.metadata.id, message: this.safeError(error).message });
+    if (/not found|404/i.test(String(error))) await this.refreshState(entry).catch(() => {});
+    void this.options.logger?.write({ event: 'sandbox.lifecycle_error', sandboxId: entry.metadata.id, message: this.safeError(error).message });
+  }
+
+  private async refreshState(entry: Tracked) {
+    try {
+      const info = await Sandbox.getInfo(entry.metadata.id, this.options.connection);
+      if (info.state === 'paused' && 'sandbox' in entry) (entry as Entry).needsRecovery = true;
+      const status = info.state === 'paused' ? 'paused' : entry.metadata.status === 'starting' ? 'starting' : 'ready';
+      if (status !== entry.metadata.status || (status === 'paused' && !entry.metadata.pausedAt)) await this.state(entry, status);
+      return info;
+    } catch (error) {
+      // A command-endpoint 404 may only mean paused. Only the management API
+      // can tell us that the sandbox itself is missing.
+      if (/not found|404/i.test(String(error)) && entry.metadata.status !== 'unavailable') await this.state(entry, 'unavailable');
+      throw error;
+    }
+  }
+
+  private async renew(entry: Entry, signal?: AbortSignal) {
+    await entry.sandbox.setTimeout(this.timeoutMs, { signal });
+    const info = await this.refreshState(entry);
+    if (info.state === 'paused') throw new Error('E2B 沙箱已被平台暂停，请重新发送消息恢复');
+    entry.renewedAt = Date.now();
+    const capped = info.endAt.getTime() < entry.renewedAt + this.timeoutMs - 5_000;
+    if (capped && !entry.leaseLimitReported) {
+      void this.options.logger?.write({ event: 'sandbox.lease_capped', sandboxId: entry.metadata.id,
+        startedAt: info.startedAt.toISOString(), expiresAt: info.endAt.toISOString(), requestedTimeoutMs: this.timeoutMs,
+        message: '平台单次运行时长上限截断了续期，请调整 E2B 平台限制' });
+    }
+    entry.leaseLimitReported = capped;
   }
 
   setDefaultTemplate(template: string) { this.options.template = template; }
@@ -150,9 +209,12 @@ export class E2BCodexRuntime implements E2BRuntime {
       : `E2B 沙箱 ${id} 连接失败，请重试。${detail}`);
   }
   private async state(entry: Tracked, status: SandboxState['status']) {
+    const previous = entry.metadata.status;
     entry.metadata = { ...entry.metadata, status };
+    if (status === 'paused') entry.metadata.pausedAt ??= new Date().toISOString();
+    else if (status === 'ready' || status === 'starting') delete entry.metadata.pausedAt;
     await entry.notify?.({ ...entry.metadata });
-    if (status === 'paused') void this.options.logger?.write({ event: 'sandbox.idle_paused', sandboxId: entry.metadata.id, lastActiveAt: entry.metadata.lastActiveAt });
+    if (previous !== status) void this.options.logger?.write({ event: 'sandbox.state_changed', sandboxId: entry.metadata.id, previous, status });
   }
   private touch(entry: Entry) {
     entry.lastActiveAt = Date.now();
@@ -160,17 +222,11 @@ export class E2BCodexRuntime implements E2BRuntime {
   }
   private async idle(entry: Entry) {
     this.touch(entry);
+    if (!entry.disposed && entry.metadata.status === 'ready') {
+      // End of use gets a full day as well. Do not extend idle sandboxes during scans.
+      await this.renew(entry).catch(error => this.pauseError(entry, error));
+    }
     if (!entry.disposed && !entry.running && !entry.readers) await this.state(entry, entry.metadata.status);
-  }
-  private async pause(entry: Entry) {
-    if (entry.disposed || entry.running || entry.readers || !this.pauseSupported || entry.metadata.status !== 'ready' || entry.pausing || Date.now() - entry.lastActiveAt <= IDLE_PAUSE_MS) return;
-    entry.pausing = (async () => {
-      try {
-        await entry.sandbox.pause();
-        await this.state(entry, 'paused');
-      } catch (error) { await this.pauseError(entry, error); }
-    })();
-    try { await entry.pausing; } finally { entry.pausing = undefined; }
   }
   private async acquire(session: WorkspaceTarget, create: boolean, notify?: Entry['notify']): Promise<Entry> {
     const key = ownerKey(session);
@@ -184,6 +240,7 @@ export class E2BCodexRuntime implements E2BRuntime {
       const tracked = this.tracked.get(key);
       await tracked?.pausing;
       if (tracked) {
+        await this.restoreArchive(tracked);
         session.sandbox = { ...tracked.metadata };
         notify ??= tracked.notify;
       }
@@ -193,8 +250,13 @@ export class E2BCodexRuntime implements E2BRuntime {
         this.touch(entry);
         await entry.pausing;
         if (notify) entry.notify = notify;
-        if (entry.metadata.status !== 'paused' && entry.metadata.status !== 'unavailable') return entry;
+        await this.restoreArchive(entry);
         try {
+          // The platform can pause a sandbox at its maximum lifetime even while
+          // lease renewals return success. Cached readiness is not authoritative.
+          const info = await this.refreshState(entry);
+          if (info.state !== 'paused' && !entry.needsRecovery) return entry;
+          if (entry.running || entry.readers) throw new Error('沙箱连接已中断，正在结束旧任务，请稍后重试');
           entry.sandbox = await Sandbox.connect(entry.metadata.id, { ...this.options.connection, timeoutMs: this.timeoutMs });
           entry.renewedAt = Date.now();
           if (entry.needsRecovery) await this.recover(entry);
@@ -204,6 +266,11 @@ export class E2BCodexRuntime implements E2BRuntime {
           await this.state(entry, 'unavailable');
           throw this.connectionError(entry.metadata.id, error);
         }
+      }
+      if (session.sandbox && ['archived', 'restoring'].includes(session.sandbox.status)) {
+        const archived = { metadata: session.sandbox, notify, lastActiveAt: Date.now() };
+        await this.restoreArchive(archived);
+        session.sandbox = archived.metadata;
       }
       if (!session.sandbox && !create) throw new Error('E2B 沙箱尚未创建，请先发送一条消息');
       // Capture once: activating a default while create awaits must not relabel it.
@@ -228,7 +295,7 @@ export class E2BCodexRuntime implements E2BRuntime {
       }
       entry = {
         sandbox, readers: 0, running: 0, lastActiveAt: Date.now(), notify, renewedAt: Date.now(), initialized: false, needsRecovery: Boolean(session.sandbox),
-        metadata: { id: sandbox.sandboxId, status: session.sandbox ? 'ready' : 'starting', template: session.sandbox?.template ?? template, workingDirectory: session.settings.workingDirectory },
+        metadata: { ...(session.sandbox?.archive ? { archive: session.sandbox.archive } : {}), id: sandbox.sandboxId, status: session.sandbox ? 'ready' : 'starting', template: session.sandbox?.template ?? template, workingDirectory: session.settings.workingDirectory },
       };
       this.touch(entry);
       this.entries.set(key, entry);
@@ -359,6 +426,8 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
     entry.running++;
     this.touch(entry);
     let inputPath: string | undefined;
+    let improvementReplyDirectory: string | undefined;
+    const improvementRequests = new Map<string, Promise<void>>();
     let renewal: ReturnType<typeof setInterval> | undefined;
     let renewing = false;
     const lease = new AbortController();
@@ -366,12 +435,11 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
     let leaseError: Error | undefined;
     try {
       checkAbort(signal);
-      await entry.sandbox.setTimeout(this.timeoutMs, { signal: executionSignal });
-      entry.renewedAt = Date.now();
+      await this.renew(entry, executionSignal);
       renewal = setInterval(() => {
         if (renewing) return;
         renewing = true;
-        void entry.sandbox.setTimeout(this.timeoutMs).then(() => { entry.renewedAt = Date.now(); }).catch(error => {
+        void this.renew(entry).catch(error => {
           leaseError = new Error(`E2B 沙箱续期失败：${this.safeError(error).message}`);
           lease.abort();
         }).finally(() => { renewing = false; });
@@ -404,7 +472,7 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
         }
         entry.sharedDocPaths = currentPaths;
         await this.writeAtomic(entry, `${CODEX_HOME}/AGENTS.md`, sharedAgents, executionSignal);
-        for (const name of ['e2b-worker.mjs', 'e2b-inspect.mjs', 'diagnostic-proxy.mjs']) {
+        for (const name of ['e2b-worker.mjs', 'e2b-inspect.mjs', 'diagnostic-proxy.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs']) {
           checkAbort(executionSignal);
           await this.writeAtomic(entry, `${RUNTIME}/${name}`, await readFile(new URL(`../execution/worker/${name}`, import.meta.url), 'utf8'), executionSignal);
         }
@@ -419,11 +487,18 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
         images.push(destination);
       }
       inputPath = `${RUNTIME}/input-${randomUUID()}.json`;
+      if (this.options.submitImprovement) {
+        // Host chooses an isolated, opaque directory; tool arguments never select
+        // context IDs or filesystem paths, including when sibling turns run.
+        improvementReplyDirectory = `${RUNTIME}/improvement-replies-${randomUUID()}`;
+        await this.command(entry, `mkdir -m 700 ${quote(improvementReplyDirectory)}`, executionSignal);
+      }
       checkAbort(executionSignal);
       await entry.sandbox.files.write(inputPath, JSON.stringify({
         threadId: session.threadId, prompt: turn.prompt, images, settings: session.settings,
         connectionDirectories: Object.keys(connectionEnvs).length ? [CONNECTION_ROOT, ...('MEEGLE_HOST' in connectionEnvs ? ['/home/user/.meegle'] : []), ...('KUBECONFIG' in connectionEnvs ? ['/home/user/.kube'] : [])] : [],
         baseUrl: this.options.baseUrl, modelConfig: this.options.modelConfig, configOverrides: this.options.configOverrides,
+        improvementReplyDirectory,
       }), { user: 'user', signal: executionSignal });
       await this.state(entry, 'ready');
       const queue: AgentEvent[] = [];
@@ -441,7 +516,30 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
             if (!line.trim()) continue;
             try {
               const event = JSON.parse(line);
-              if (event.type === 'runtime.diagnostic') {
+              if (event.type === 'runtime.improvement_proposal') {
+                const requestId = event.requestId;
+                if (!this.options.submitImprovement || !improvementReplyDirectory || executionSignal.aborted
+                  || typeof requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)
+                  || improvementRequests.has(requestId)) continue;
+                const replyPath = `${improvementReplyDirectory}/${requestId}.json`;
+                const submit = this.options.submitImprovement;
+                const request = (async () => {
+                  let reply;
+                  try {
+                    const receipt = await submit({ projectId: session.projectId ?? null, sessionId: session.id,
+                      sessionTitle: session.title, turnId: turn.id, sandboxId: entry.metadata.id }, event.input, requestId);
+                    reply = { ok: true, receipt };
+                  } catch {
+                    // Never send DB internals or connection credentials to Codex.
+                    reply = { ok: false, error: '建议未能保存，请检查五个字段均为有效文本后重试。' };
+                    void this.options.logger?.write({ event: 'improvement.save_failed', sessionId: session.id, turnId: turn.id, requestId });
+                  }
+                  if (!executionSignal.aborted) await this.writeAtomic(entry, replyPath, JSON.stringify(reply), executionSignal);
+                })().catch(() => {
+                  void this.options.logger?.write({ event: 'improvement.receipt_failed', sessionId: session.id, turnId: turn.id, requestId });
+                });
+                improvementRequests.set(requestId, request);
+              } else if (event.type === 'runtime.diagnostic') {
                 // Diagnostics are not SDK events and never contain prompt/tool bodies.
                 const allowed = ['event', 'requestId', 'method', 'path', 'upstream', 'status', 'httpStatus', 'durationMs', 'requestBytes', 'responseBytes', 'model', 'inputItems', 'responseId', 'upstreamRequestId', 'requestIds', 'error', 'message', 'code', 'terminalEvent', 'terminationReason', 'reason', 'incompleteReason', 'transportComplete', 'contentType', 'contentEncoding', 'sseEvents', 'parseError', 'clientAborted', 'requestAttempt', 'attempt', 'maxRetries', 'delayMs', 'nextRetryAt', 'channelId'];
                 const diagnostic = event.diagnostic;
@@ -469,7 +567,12 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
       } finally { await operation; await this.options.logger?.flush(); }
     } finally {
       clearInterval(renewal);
+      await Promise.allSettled(improvementRequests.values());
+      if (improvementReplyDirectory) await entry.sandbox.files.remove(improvementReplyDirectory, { user: 'user' }).catch(() => {});
       if (inputPath) await entry.sandbox.files.remove(inputPath, { user: 'user' }).catch(() => {});
+      await this.refreshState(entry).catch(error => {
+        void this.options.logger?.write({ event: 'sandbox.state_check_failed', sandboxId: entry.metadata.id, message: this.safeError(error).message });
+      });
       entry.running--;
       if (entry.metadata.status === 'starting') await this.state(entry, 'ready');
       await this.idle(entry);
@@ -484,8 +587,7 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
       if (entry.disposed) throw new Error('E2B 项目沙箱正在删除');
       if (!entry.initialized) throw new Error('E2B Codex 尚未完成初始化，请等待当前任务启动后重试');
       if (Date.now() - entry.renewedAt > IDLE_SCAN_MS) {
-        await entry.sandbox.setTimeout(this.timeoutMs);
-        entry.renewedAt = Date.now();
+        await this.renew(entry);
       }
       const result = await entry.sandbox.commands.run(`${NODE} ${quote(`${RUNTIME}/e2b-inspect.mjs`)} ${quote(mode)} ${args.map(quote).join(' ')}`, { user: 'user', timeoutMs: 30_000 });
       return JSON.parse(result.stdout) as T;
@@ -496,7 +598,7 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
         try { detail = JSON.parse(stdout); } catch { /* Retain the transport error. */ }
         if (typeof detail?.error === 'string') throw this.safeError(detail.error);
       }
-      if (/not found|404/i.test(String(error))) await this.state(entry, 'unavailable');
+      if (/not found|404/i.test(String(error))) await this.refreshState(entry).catch(() => {});
       throw this.safeError(error);
     }
     finally { entry.readers--; await this.idle(entry); }
@@ -509,8 +611,7 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
     this.touch(entry);
     try {
       if (entry.disposed) throw new Error('项目沙箱正在删除');
-      await entry.sandbox.setTimeout(this.timeoutMs);
-      entry.renewedAt = Date.now();
+      await this.renew(entry);
       const gateway = this.options.connection.sandboxUrl;
       const url = new URL(gateway ?? `https://${entry.sandbox.getHost(port)}`);
       url.hostname = entry.sandbox.getHost(port);

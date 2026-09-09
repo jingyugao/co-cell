@@ -7,6 +7,8 @@ export function applyTurnEvent(turn: Turn, event: AgentEvent): Turn {
       if (event.retry === null) return { ...turn, retry: undefined };
       if (turn.status === 'completed' || turn.status === 'cancelled') return turn;
       return { ...turn, status: 'running', phase: 'running', error: undefined, retry: { ...event.retry } };
+    case 'runtime.context_usage':
+      return { ...turn, contextUsage: [...(turn.contextUsage ?? []), { ...event.contextUsage }] };
     case 'turn.started':
       return { ...turn, status: 'running', phase: 'running', retry: undefined };
     case 'item.started': case 'item.updated': case 'item.completed': {
@@ -35,6 +37,7 @@ export function applySdkEvent(session: Session, turnId: string, event: AgentEven
   return {
     ...session,
     ...(event.type === 'thread.started' ? { threadId: event.thread_id } : {}),
+    ...(event.type === 'runtime.context_usage' ? { contextUsage: { ...event.contextUsage } } : {}),
     turns: session.turns.map(turn => turn.id === turnId ? applyTurnEvent(turn, event) : turn),
   };
 }

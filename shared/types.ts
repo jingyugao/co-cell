@@ -10,7 +10,17 @@ export interface RetryState {
   nextRetryAt: string;
   status: 'waiting' | 'retrying';
 }
-export type AgentEvent = ThreadEvent | { type: 'runtime.retry'; retry: RetryState | null };
+/** Actual input size of the most recent model request, as reported by Responses. */
+export interface ContextUsage {
+  model?: string;
+  inputTokens: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  observedAt: string;
+}
+export type AgentEvent = ThreadEvent
+  | { type: 'runtime.retry'; retry: RetryState | null }
+  | { type: 'runtime.context_usage'; contextUsage: ContextUsage };
 export interface Settings {
   executionMode?: 'local' | 'e2b';
   workingDirectory: string;
@@ -33,6 +43,8 @@ export interface Turn {
   completedAt?: string;
   /** Timestamp for each streamed SDK item, keyed by item id. */
   itemTimestamps?: Record<string, string>;
+  /** One entry for each completed model request in this turn. */
+  contextUsage?: ContextUsage[];
   retry?: RetryState;
   approvals?: UserApproval[];
   /** Durable reference to a Codex worker that runs inside an E2B sandbox. */
@@ -74,6 +86,8 @@ export interface Session {
   createdAt: string;
   updatedAt: string;
   turns: Turn[];
+  /** Most recently observed model context length. */
+  contextUsage?: ContextUsage;
   sandbox?: SandboxState;
 }
 export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };

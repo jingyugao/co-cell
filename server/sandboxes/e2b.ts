@@ -452,7 +452,7 @@ export class E2BCodexRuntime implements E2BRuntime {
               improvementTasks.set(requestId, task);
             }
           } else if (event.type === 'runtime.diagnostic') {
-            const allowed = ['event', 'requestId', 'method', 'path', 'upstream', 'status', 'httpStatus', 'durationMs', 'requestBytes', 'responseBytes', 'model', 'inputItems', 'responseId', 'upstreamRequestId', 'requestIds', 'error', 'message', 'code', 'terminalEvent', 'terminationReason', 'reason', 'incompleteReason', 'transportComplete', 'contentType', 'contentEncoding', 'sseEvents', 'parseError', 'clientAborted', 'requestAttempt', 'attempt', 'maxRetries', 'delayMs', 'nextRetryAt', 'channelId'];
+            const allowed = ['event', 'requestId', 'method', 'path', 'upstream', 'status', 'httpStatus', 'durationMs', 'requestBytes', 'responseBytes', 'model', 'inputItems', 'responseId', 'upstreamRequestId', 'requestIds', 'error', 'message', 'code', 'terminalEvent', 'terminationReason', 'reason', 'incompleteReason', 'transportComplete', 'contentType', 'contentEncoding', 'sseEvents', 'parseError', 'clientAborted', 'requestAttempt', 'attempt', 'maxRetries', 'delayMs', 'nextRetryAt', 'channelId', 'inputTokens', 'cachedInputTokens', 'outputTokens'];
             const diagnostic = event.diagnostic;
             if (diagnostic && typeof diagnostic === 'object') {
               const fields = Object.fromEntries(allowed.filter(key => key in diagnostic).map(key => [key, diagnostic[key]]));
@@ -460,6 +460,23 @@ export class E2BCodexRuntime implements E2BRuntime {
                 ...fields, source: 'e2b-proxy', sessionId: session.id, projectId: session.projectId,
                 turnId: turn.id, threadId: session.threadId, sandboxId: entry.metadata.id, model: session.settings.model
               });
+              const inputTokens = diagnostic.inputTokens;
+              const cachedInputTokens = diagnostic.cachedInputTokens;
+              const outputTokens = diagnostic.outputTokens;
+              if (diagnostic.event === 'api.completed' && typeof inputTokens === 'number' && Number.isSafeInteger(inputTokens) && inputTokens >= 0) {
+                yield {
+                  type: 'runtime.context_usage',
+                  contextUsage: {
+                    model: session.settings.model,
+                    inputTokens,
+                    ...(typeof cachedInputTokens === 'number' && Number.isSafeInteger(cachedInputTokens) && cachedInputTokens >= 0
+                      ? { cachedInputTokens } : {}),
+                    ...(typeof outputTokens === 'number' && Number.isSafeInteger(outputTokens) && outputTokens >= 0
+                      ? { outputTokens } : {}),
+                    observedAt: new Date().toISOString(),
+                  },
+                };
+              }
             }
           } else if (!event.type.startsWith('runtime.worker_')) {
             yield event as unknown as AgentEvent;

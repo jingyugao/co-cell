@@ -54,6 +54,7 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
       if (event.type === 'turn.failed') terminalFailure = event.error.message.trim() ? event.error.message : undefined;
       else if (event.type === 'turn.started' || event.type === 'turn.completed') terminalFailure = undefined;
       if (event.type === 'thread.started') session.threadId = event.thread_id;
+      if (event.type === 'runtime.context_usage') session.contextUsage = { ...event.contextUsage };
       Object.assign(turn, applyTurnEvent(turn, event));
       if (event.type === 'error') log('sdk.error', { error: event.message });
       else if (event.type === 'turn.failed') log('turn.failed', { error: event.error.message });

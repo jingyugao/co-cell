@@ -4,6 +4,18 @@ import { randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 
 const HOP = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
+function usageFields(usage) {
+  if (!usage || typeof usage !== 'object') return {};
+  const inputTokens = usage.input_tokens;
+  if (!Number.isSafeInteger(inputTokens) || inputTokens < 0) return {};
+  const cachedInputTokens = usage.cached_input_tokens;
+  const outputTokens = usage.output_tokens;
+  return {
+    inputTokens,
+    ...(Number.isSafeInteger(cachedInputTokens) && cachedInputTokens >= 0 ? { cachedInputTokens } : {}),
+    ...(Number.isSafeInteger(outputTokens) && outputTokens >= 0 ? { outputTokens } : {}),
+  };
+}
 function forwardedHeaders(headers) {
   const excluded = new Set([...HOP, ...String(headers.connection ?? '').toLowerCase().split(',').map(value => value.trim())]);
   return Object.fromEntries(Object.entries(headers).filter(([key]) => !excluded.has(key.toLowerCase())));
@@ -159,7 +171,7 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
             const id = object.response?.id ?? object.id;
             if (typeof id === 'string' && /^resp_[A-Za-z0-9_-]{1,160}$/.test(id)) responseId = redact(id);
             if (!terminal && ['response.completed', 'response.failed', 'response.incomplete', 'error'].includes(type)) {
-              terminal = { type, error: object.error ?? object.response?.error ?? (type === 'error' ? object : undefined), incompleteReason: object.response?.incomplete_details?.reason,
+              terminal = { type, error: object.error ?? object.response?.error ?? (type === 'error' ? object : undefined), incompleteReason: object.response?.incomplete_details?.reason, usage: object.response?.usage ?? object.usage,
                 frame: `event: ${type}\n${data.split('\n').map(value => `data: ${value}`).join('\n')}\n\n` };
             }
           } catch { malformed = true; }
@@ -219,7 +231,7 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
             event('api.retrying', { attempt: retries, maxRetries: OVERLOAD_RETRY_DELAYS_MS.length, code });
             begin(body); return;
           }
-          if (terminal?.type === 'response.completed') event('api.completed', { requestAttempt });
+          if (terminal?.type === 'response.completed') event('api.completed', { requestAttempt, ...usageFields(terminal.usage) });
           if (!passthrough && isSse && !terminal && !malformed) event('api.error', { error: { type: 'stream_error', code: 'eof_before_terminal' }, requestAttempt });
           const reason = terminal?.type ?? (passthrough || malformed ? 'unobserved' : isSse ? 'eof_before_terminal' : 'http_end');
           // Mark the business result before delivery: Codex may disconnect as
@@ -349,7 +361,7 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
         if (['response.completed', 'response.failed', 'response.incomplete', 'error'].includes(type)) {
           terminal = true;
           terminalReason = type;
-          if (type === 'response.completed') event('api.completed');
+          if (type === 'response.completed') event('api.completed', usageFields(object.response?.usage ?? object.usage));
           else {
             const error = object.error ?? object.response?.error ?? (type === 'error' ? object : undefined);
             const details = object.response?.incomplete_details;

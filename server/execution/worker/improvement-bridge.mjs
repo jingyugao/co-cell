@@ -36,7 +36,7 @@ export async function startImprovementBridge({ replyDirectory, signal, emit }) {
       active.add(requestId);
       registered = true;
       waitSignal.throwIfAborted();
-      emit({ type: 'runtime.improvement_proposal', requestId, input: parsed.input });
+      await emit({ type: 'runtime.improvement_proposal', requestId, input: parsed.input });
       const path = `${replyDirectory}/${requestId}.json`;
       while (true) {
         waitSignal.throwIfAborted();

@@ -2,7 +2,7 @@ import type { Codex, Input, Thread, ThreadOptions } from '@openai/codex-sdk';
 import type { AgentEvent, Session, StreamMessage, Turn } from '../../shared/types.js';
 import { applyTurnEvent } from '../../shared/session-events.js';
 import { HttpError } from '../core/errors.js';
-import type { E2BRuntime } from '../sandboxes/e2b.js';
+import { TurnLaunchCancelled, TurnObserverDetached, type E2BRuntime } from '../sandboxes/e2b.js';
 import type { RuntimeLog } from '../diagnostics/runtime-log.js';
 import type { RequestUserApproval } from '../../shared/approval-types.js';
 
@@ -18,12 +18,15 @@ type TurnExecutionDependencies = {
   updateSandbox(sandbox: NonNullable<Session['sandbox']>): Promise<void>;
   requestApproval?: RequestUserApproval;
   closeApprovals?(): Promise<void>;
+  detachApprovals?(): Promise<void>;
+  recovering?: boolean;
 };
 
 /** Runs one turn and persists each event before publishing it to subscribers. */
 export async function runTurn(session: Session, turn: Turn, controller: AbortController, dependencies: TurnExecutionDependencies) {
   const { client, e2b, logger, save, publish, snapshot, updateSandbox } = dependencies;
   let terminalFailure: string | undefined;
+  let detached = false;
   const started = Date.now();
   const log = (event: string, extra: Record<string, unknown> = {}) => {
     void logger?.write({ event, sessionId: session.id, projectId: session.projectId, turnId: turn.id,
@@ -37,13 +40,14 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
     let events: AsyncGenerator<AgentEvent>;
     if (executionMode === 'e2b') {
       if (!e2b) throw new HttpError(503, 'E2B 未配置，无法运行此沙箱会话');
-      events = e2b.run(session, turn, controller.signal, sandbox => updateSandbox(sandbox), dependencies.requestApproval);
+      const observe = dependencies.recovering ? e2b.recover.bind(e2b) : e2b.run.bind(e2b);
+      events = observe(session, turn, controller.signal, sandbox => updateSandbox(sandbox), dependencies.requestApproval, save);
     } else {
       const thread: Thread = session.threadId ? client.resumeThread(session.threadId, options) : client.startThread(options);
       const input: Input = turn.images.length ? [{ type: 'text', text: turn.prompt }, ...turn.images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
       ({ events } = await thread.runStreamed(input, { signal: controller.signal }));
     }
-    let terminal = false;
+    let terminal = Boolean(dependencies.recovering && (turn.status === 'completed' || turn.status === 'failed'));
     for await (const event of events) {
       // The CLI can emit the actual failure before throwing a generic nonzero
       // exit error. Only retain a terminal failure, never a recovered retry.
@@ -66,9 +70,27 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
     }
     if (!terminal) throw new Error(turn.error || 'Codex 事件流提前结束，未收到完成事件');
   } catch (error) {
-    turn.status = controller.signal.aborted ? 'cancelled' : 'failed';
-    if (!controller.signal.aborted) turn.error = terminalFailure ?? (error instanceof Error ? error.message : String(error));
+    if (error instanceof TurnObserverDetached) {
+      detached = true;
+    } else if (error instanceof TurnLaunchCancelled) {
+      turn.status = 'cancelled';
+      turn.error = '服务正在升级，本轮尚未启动 Codex，可重新发送消息。';
+    } else {
+      turn.status = controller.signal.aborted ? 'cancelled' : 'failed';
+      if (!controller.signal.aborted) turn.error = terminalFailure ?? (error instanceof Error ? error.message : String(error));
+    }
   } finally {
+    if (detached) {
+      await dependencies.detachApprovals?.();
+      turn.phase = 'recovering';
+      if (turn.execution) turn.execution.state = 'detached';
+      session.status = 'running';
+      session.updatedAt = new Date().toISOString();
+      log('turn.observer_detached', { durationMs: Date.now() - started });
+      await save();
+      publish({ type: 'state', session: snapshot() });
+      return;
+    }
     try { await dependencies.closeApprovals?.(); }
     catch (error) {
       turn.status = controller.signal.aborted ? 'cancelled' : 'failed';
@@ -78,6 +100,7 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
     turn.completedAt = new Date().toISOString();
     delete turn.phase;
     delete turn.retry;
+    if (turn.execution) turn.execution.state = 'terminal';
     session.status = turn.status;
     session.updatedAt = turn.completedAt;
     log('turn.finished', { status: turn.status, durationMs: Date.now() - started, error: turn.error });

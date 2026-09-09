@@ -16,6 +16,13 @@ import { ApprovalRequests, approvalDecisionSchema, cancelPersistedApprovals } fr
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
+type ActiveExecution = {
+  controller: AbortController;
+  done: Promise<void>;
+  turnId?: string;
+  approvals?: ApprovalRequests;
+  finish(): void;
+};
 
 function normalizeExecutionSettings(settings: Settings): Settings {
   // E2B is the isolation boundary; Codex inside it uses guidance rather than
@@ -28,7 +35,7 @@ function normalizeExecutionSettings(settings: Settings): Settings {
 export class SessionManager {
   private projects: ProjectService;
   private sessions = new Map<string, Session>();
-  private active = new Map<string, { controller: AbortController; done: Promise<void>; turnId?: string; approvals?: ApprovalRequests }>();
+  private active = new Map<string, ActiveExecution>();
   private subscribers = new Map<string, Set<Subscriber>>();
   private writer = new AtomicJsonWriter();
   private deleting = new Set<string>();
@@ -73,12 +80,12 @@ export class SessionManager {
         changed = true;
       }
       for (const turn of session.turns) {
-        if (cancelPersistedApprovals(turn)) changed = true;
+        if (!this.canRecover(session, turn) && cancelPersistedApprovals(turn)) changed = true;
         if (turn.retry !== undefined) {
           delete turn.retry;
           changed = true;
         }
-        if (turn.status !== 'running' && turn.phase !== undefined) {
+        if (!this.canRecover(session, turn) && turn.status !== 'running' && turn.phase !== undefined) {
           delete turn.phase;
           changed = true;
         }
@@ -88,16 +95,21 @@ export class SessionManager {
           changed = true;
         }
       }
-      if (session.status === 'running') {
+      if (session.status === 'running' || session.turns.some(turn => turn.status === 'running' || this.canRecover(session, turn))) {
         changed = true;
-        session.status = session.turns.some(turn => turn.status === 'running')
-          ? 'cancelled' : session.turns.at(-1)?.status ?? 'cancelled';
-        for (const turn of session.turns.filter(t => t.status === 'running')) {
+        for (const turn of session.turns.filter(t => t.status === 'running' || this.canRecover(session, t))) {
+          if (this.canRecover(session, turn)) {
+            turn.phase = 'recovering';
+            continue;
+          }
           turn.status = 'cancelled';
+          if (turn.execution) turn.execution.state = 'terminal';
           delete turn.phase;
           turn.error = '服务已重启，本轮执行已中断。可以发送消息继续原会话。';
           turn.completedAt = new Date().toISOString();
         }
+        session.status = session.turns.some(turn => turn.status === 'running' || this.canRecover(session, turn))
+          ? 'running' : session.turns.at(-1)?.status ?? 'cancelled';
       }
       if (changed) await this.save(session);
       this.sessions.set(session.id, session);
@@ -116,6 +128,48 @@ export class SessionManager {
       if (session.projectId || session.settings.executionMode !== 'e2b' || !session.sandbox) continue;
       this.e2b?.track?.(structuredClone(session), sandbox => this.updateSandbox(undefined, session.id, sandbox));
     }
+    for (const session of this.sessions.values()) {
+      const turn = session.turns.find(turn => this.canRecover(session, turn));
+      if (turn) this.executeTurn(session, turn, this.reserveTurn(session), true);
+    }
+  }
+
+  private canRecover(session: Session, turn: Turn): boolean {
+    return Boolean(this.e2b && session.settings.executionMode === 'e2b' && session.sandbox
+      && turn.execution?.kind === 'e2b-worker' && turn.execution.protocolVersion === 1 && turn.execution.state !== 'terminal');
+  }
+
+  private reserveTurn(session: Session): ActiveExecution {
+    const releaseProject = this.projects.startSession(session.projectId, session.id);
+    let resolveDone!: () => void;
+    const execution: ActiveExecution = {
+      controller: new AbortController(), done: new Promise<void>(resolve => { resolveDone = resolve; }),
+      finish: () => {
+        if (this.active.get(session.id) === execution) this.active.delete(session.id);
+        releaseProject();
+        resolveDone();
+      },
+    };
+    this.active.set(session.id, execution);
+    return execution;
+  }
+
+  private executeTurn(session: Session, turn: Turn, execution: ActiveExecution, recovering = false) {
+    const id = session.id;
+    execution.turnId = turn.id;
+    const approvals = new ApprovalRequests(turn, execution.controller.signal, async () => {
+      session.updatedAt = new Date().toISOString();
+      await this.save(session);
+      this.publish(id, { type: 'state', session: this.get(id) });
+    });
+    execution.approvals = approvals;
+    const running = runTurn(session, turn, execution.controller, {
+      client: this.client, e2b: this.e2b, logger: this.logger, recovering,
+      save: () => this.save(session), publish: message => this.publish(id, message), snapshot: () => this.get(id),
+      updateSandbox: sandbox => this.updateSandbox(session.projectId, id, sandbox),
+      requestApproval: approvals.request, closeApprovals: () => approvals.close(), detachApprovals: () => approvals.detach(),
+    }).finally(execution.finish);
+    void running.catch(error => console.error('Session persistence failed:', error instanceof Error ? error.message : 'unknown error'));
   }
 
   list(): SessionSummary[] {
@@ -314,16 +368,10 @@ export class SessionManager {
   async startTurn(id: string, prompt: string, images: string[] = []): Promise<string> {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     const session = this.lookup(id);
-    if (this.active.has(id)) throw new HttpError(409, '当前会话已有任务正在执行');
-    const releaseProject = this.projects.startSession(session.projectId, id);
-    const controller = new AbortController();
+    if (this.active.has(id) || session.turns.some(turn => turn.status === 'running')) throw new HttpError(409, '当前会话已有任务正在执行');
     const previous = structuredClone(session);
     // Reserve the session synchronously, before validating attachments or saving state.
-    let finish!: () => void;
-    const execution: { controller: AbortController; done: Promise<void>; turnId?: string; approvals?: ApprovalRequests } = {
-      controller, done: new Promise<void>(resolve => { finish = resolve; }),
-    };
-    this.active.set(id, execution);
+    const execution = this.reserveTurn(session);
     try {
       session.settings = normalizeExecutionSettings(session.settings);
       const imageRoot = resolve(this.dataDirectory, 'images', id) + sep;
@@ -333,38 +381,22 @@ export class SessionManager {
         if (!path.startsWith(imageRoot)) throw new HttpError(400, '只能使用此会话上传的图片');
       }
       const turn: Turn = { id: randomUUID(), prompt, images, status: 'running', phase: 'starting', items: [], startedAt: new Date().toISOString() };
+      if (session.settings.executionMode === 'e2b') turn.execution = {
+        kind: 'e2b-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'launching',
+      };
       execution.turnId = turn.id;
-      const approvals = new ApprovalRequests(turn, controller.signal, async () => {
-        session.updatedAt = new Date().toISOString();
-        await this.save(session);
-        this.publish(id, { type: 'state', session: this.get(id) });
-      });
-      execution.approvals = approvals;
       session.turns.push(turn);
       session.status = 'running';
       session.updatedAt = turn.startedAt;
       if (session.title === '新任务') session.title = prompt.slice(0, 60);
       await this.save(session);
       this.publish(id, { type: 'state', session: this.get(id) });
-      const running = runTurn(session, turn, controller, {
-        client: this.client, e2b: this.e2b, logger: this.logger,
-        save: () => this.save(session), publish: message => this.publish(id, message), snapshot: () => this.get(id),
-        updateSandbox: sandbox => this.updateSandbox(session.projectId, id, sandbox),
-        requestApproval: approvals.request, closeApprovals: () => approvals.close(),
-      }).finally(() => {
-        this.active.delete(id);
-        releaseProject();
-        finish();
-      });
-      // run() handles failures; this catches only final persistence failure and keeps the process alive.
-      void running.catch(error => console.error('Session persistence failed:', error instanceof Error ? error.message : 'unknown error'));
+      this.executeTurn(session, turn, execution);
       return turn.id;
     } catch (error) {
       await execution.approvals?.close().catch(() => {});
       this.sessions.set(id, previous);
-      this.active.delete(id);
-      releaseProject();
-      finish();
+      execution.finish();
       this.publish(id, { type: 'state', session: this.get(id) });
       throw error;
     }
@@ -451,7 +483,16 @@ export class SessionManager {
 
   async close() {
     this.closing = true;
-    for (const execution of this.active.values()) execution.controller.abort();
+    const detachments: Promise<void>[] = [];
+    for (const [id, execution] of this.active) {
+      const session = this.sessions.get(id);
+      const turn = session?.turns.find(turn => turn.id === execution.turnId);
+      if (session?.settings.executionMode === 'e2b' && turn?.execution?.kind === 'e2b-worker' && this.e2b) {
+        this.e2b.detach(turn);
+        if (execution.approvals) detachments.push(execution.approvals.detach());
+      } else execution.controller.abort();
+    }
+    await Promise.allSettled(detachments);
     await Promise.allSettled([...this.active.values()].map(execution => execution.done));
     try {
       await this.e2b?.close();

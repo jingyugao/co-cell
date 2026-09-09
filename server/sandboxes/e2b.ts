@@ -24,7 +24,9 @@ export interface SandboxSnapshotArchive {
 
 export interface E2BRuntime {
   track?(session: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): void;
-  run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval): AsyncGenerator<AgentEvent>;
+  run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent>;
+  recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent>;
+  detach(turn: Turn): void;
   changes(session: WorkspaceTarget): Promise<Changes>;
   preview(session: WorkspaceTarget, port: number): Promise<string>;
   file(session: WorkspaceTarget, path: string): Promise<WorkspaceFileResult>;
@@ -58,11 +60,20 @@ type Entry = {
   pausing?: Promise<void>;
   disposed?: boolean;
   initialized?: boolean;
-  needsRecovery?: boolean;
   renewedAt: number;
   leaseLimitReported?: boolean;
 };
 type Tracked = Pick<Entry, 'metadata' | 'notify' | 'lastActiveAt' | 'pausing'>;
+type WorkerEnvelope = { v: 1; workerId: string; turnId: string; seq: number; event: Record<string, unknown> };
+type WorkerState = { protocolVersion: 1; workerId: string; sessionId: string; turnId: string; pid: number;
+  status: 'running' | 'completed' | 'failed' | 'cancelled'; threadId: string | null; lastSeq: number; error?: string };
+type WorkerEvent = Record<string, unknown> & { type: string; requestId?: string; input?: unknown; diagnostic?: Record<string, unknown> };
+export class TurnObserverDetached extends Error {
+  constructor() { super('Web observer detached'); this.name = 'TurnObserverDetached'; }
+}
+export class TurnLaunchCancelled extends Error {
+  constructor() { super('Web shut down before the worker was launched'); this.name = 'TurnLaunchCancelled'; }
+}
 export const SANDBOX_PAUSE_TTL_MS = 24 * 60 * 60 * 1000;
 export const SANDBOX_ARCHIVE_AFTER_MS = 7 * SANDBOX_PAUSE_TTL_MS;
 export const IDLE_SCAN_MS = 60 * 1000;
@@ -76,6 +87,7 @@ const SHARED_DOCS = `${CODEX_HOME}/docs`;
 const NODE = '"$(if test -x /opt/codex-runtime/bin/node; then echo /opt/codex-runtime/bin/node; else command -v node; fi)"';
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const checkAbort = (signal: AbortSignal) => { if (signal.aborted) throw new DOMException('任务已停止', 'AbortError'); };
+const transportFailure = (error: unknown) => /timeout|timed out|network|fetch failed|ECONN|EAI_AGAIN|ENOTFOUND|socket|5\d\d|429|unavailable|transport/i.test(String(error));
 const ownerKey = (session: WorkspaceTarget) => session.projectId ? `project:${session.projectId}` : `session:${session.id}`;
 
 /** Owns one remote Codex installation and workspace per project; threads stay session-specific. */
@@ -86,6 +98,9 @@ export class E2BCodexRuntime implements E2BRuntime {
   private tracked = new Map<string, Tracked>();
   private sweepTimer: ReturnType<typeof setInterval>;
   private sweeping?: Promise<void>;
+  private observers = new Map<string, AbortController>();
+  private detachRequests = new Set<string>();
+  private preparations = new Map<string, AbortController>();
   private readonly timeoutMs = SANDBOX_PAUSE_TTL_MS;
   constructor(private options: E2BCodexOptions) {
     this.sweepTimer = setInterval(() => { void this.sweep(); }, IDLE_SCAN_MS);
@@ -175,7 +190,6 @@ export class E2BCodexRuntime implements E2BRuntime {
   private async refreshState(entry: Tracked) {
     try {
       const info = await Sandbox.getInfo(entry.metadata.id, this.options.connection);
-      if (info.state === 'paused' && 'sandbox' in entry) (entry as Entry).needsRecovery = true;
       const status = info.state === 'paused' ? 'paused' : entry.metadata.status === 'starting' ? 'starting' : 'ready';
       if (status !== entry.metadata.status || (status === 'paused' && !entry.metadata.pausedAt)) await this.state(entry, status);
       return info;
@@ -261,11 +275,11 @@ export class E2BCodexRuntime implements E2BRuntime {
           // The platform can pause a sandbox at its maximum lifetime even while
           // lease renewals return success. Cached readiness is not authoritative.
           const info = await this.refreshState(entry);
-          if (info.state !== 'paused' && !entry.needsRecovery) return entry;
+          if (info.state !== 'paused') return entry;
           if (entry.running || entry.readers) throw new Error('沙箱连接已中断，正在结束旧任务，请稍后重试');
           entry.sandbox = await Sandbox.connect(entry.metadata.id, { ...this.options.connection, timeoutMs: this.timeoutMs });
           entry.renewedAt = Date.now();
-          if (entry.needsRecovery) await this.recover(entry);
+          entry.initialized = await entry.sandbox.files.exists(`${RUNTIME}/e2b-inspect.mjs`, { user: 'user' });
           await this.state(entry, 'ready');
           return entry;
         } catch (error) {
@@ -300,13 +314,13 @@ export class E2BCodexRuntime implements E2BRuntime {
         throw this.safeError(error);
       }
       entry = {
-        sandbox, readers: 0, running: 0, lastActiveAt: Date.now(), notify, renewedAt: Date.now(), initialized: false, needsRecovery: Boolean(session.sandbox),
+        sandbox, readers: 0, running: 0, lastActiveAt: Date.now(), notify, renewedAt: Date.now(), initialized: false,
         metadata: { ...(session.sandbox?.archive ? { archive: session.sandbox.archive } : {}), id: sandbox.sandboxId, status: session.sandbox ? 'ready' : 'starting', template: session.sandbox?.template ?? template, workingDirectory: session.settings.workingDirectory },
       };
       this.touch(entry);
       this.entries.set(key, entry);
       this.tracked.delete(key);
-      if (session.sandbox) await this.recover(entry);
+      if (session.sandbox) entry.initialized = await entry.sandbox.files.exists(`${RUNTIME}/e2b-inspect.mjs`, { user: 'user' });
       await notify?.({ ...entry.metadata });
       return entry;
     })();
@@ -314,36 +328,181 @@ export class E2BCodexRuntime implements E2BRuntime {
     try { return await operation; } finally { this.connecting.delete(key); }
   }
 
-  private async recover(entry: Entry) {
-    // A backend crash can leave a worker in a memory snapshot. Reap only this
-    // runtime's marked processes when attaching after a restart, before another
-    // turn can run. Check command lines as well, so a stale PID cannot target an
-    // unrelated process after a filesystem-only sandbox reboot.
-    const script = `
-const fs=require('node:fs'),cp=require('node:child_process');
-const markers=fs.readdirSync('/tmp').filter(name=>/^codex-web-[a-f0-9-]{36}\\.pid$/.test(name)).map(name=>'/tmp/'+name);
-const roots=[];
-for(const marker of markers){
-  let pid,command='';
-  try{pid=Number(fs.readFileSync(marker,'utf8').trim());if(Number.isInteger(pid)&&pid>1)command=fs.readFileSync('/proc/'+pid+'/cmdline','utf8')}catch{}
-  if(command.includes(${JSON.stringify(RUNTIME)})||command.includes('@openai/codex-sdk'))roots.push(pid);
-}
-const rows=cp.execFileSync('ps',['-e','-o','pid=,ppid='],{encoding:'utf8'}).trim().split('\\n').map(s=>s.trim().split(/\\s+/).map(Number));
-const targets=new Set(roots);let changed=true;
-while(changed){changed=false;for(const [pid,ppid] of rows)if(targets.has(ppid)&&!targets.has(pid)){targets.add(pid);changed=true}}
-const kill=(pid,signal)=>{try{process.kill(pid,signal)}catch{}};
-for(const root of roots)kill(-root,'SIGTERM');for(const pid of targets)kill(pid,'SIGTERM');
-const finish=()=>{for(const root of roots)kill(-root,'SIGKILL');for(const pid of targets)kill(pid,'SIGKILL');for(const marker of markers)try{fs.unlinkSync(marker)}catch{}};
-if(roots.length)setTimeout(finish,1200);else finish();`;
-    try {
-      await entry.sandbox.commands.run(`${NODE} -e ${quote(script)}`, { user: 'user', timeoutMs: 10_000 });
-      // A new session has no thread yet, but its project's helper may already exist.
-      entry.initialized = await entry.sandbox.files.exists(`${RUNTIME}/e2b-inspect.mjs`, { user: 'user' });
-      entry.needsRecovery = false;
+  private runDirectory(turn: Turn) {
+    if (!/^[0-9a-f-]{36}$/i.test(turn.id) || !turn.execution || !/^[0-9a-f-]{36}$/i.test(turn.execution.workerId)) {
+      throw new Error('E2B worker identity is invalid');
     }
-    catch (error) {
-      await this.state(entry, 'unavailable');
-      throw new Error(`无法清理 E2B 中断任务，请重试恢复沙箱：${this.safeError(error).message}`);
+    return `${RUNTIME}/turns/${turn.id}/${turn.execution.workerId}`;
+  }
+
+  private async readWorkerState(entry: Entry, turn: Turn): Promise<WorkerState | undefined> {
+    try { return JSON.parse(await entry.sandbox.files.read(`${this.runDirectory(turn)}/state.json`, { user: 'user' })); }
+    catch (error) { if ((error as Error).message.includes('404') || /not found/i.test(String(error))) return undefined; throw error; }
+  }
+
+  private async readWorkerEvents(entry: Entry, turn: Turn): Promise<WorkerEnvelope[]> {
+    let contents: string;
+    try { contents = await entry.sandbox.files.read(`${this.runDirectory(turn)}/events.jsonl`, { user: 'user' }); }
+    catch (error) { if ((error as Error).message.includes('404') || /not found/i.test(String(error))) return []; throw error; }
+    const lines = contents.split('\n');
+    const result: WorkerEnvelope[] = [];
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index];
+      if (!line.trim()) continue;
+      let envelope: WorkerEnvelope;
+      try {
+        envelope = JSON.parse(line) as WorkerEnvelope;
+      } catch {
+        // Only an incomplete trailing append is recoverable.
+        if (index !== lines.length - 1) throw new Error('E2B worker journal contains an invalid event');
+        continue;
+      }
+      if (envelope.v !== 1 || envelope.workerId !== turn.execution?.workerId || envelope.turnId !== turn.id
+        || !Number.isSafeInteger(envelope.seq) || envelope.seq !== result.length + 1
+        || !envelope.event || typeof envelope.event.type !== 'string') throw new Error('E2B worker journal contains an invalid envelope');
+      result.push(envelope);
+    }
+    return result;
+  }
+
+  private async observeRead<T>(read: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    while (true) {
+      signal.throwIfAborted();
+      try { return await read(); }
+      catch (error) {
+        // A lost Web-to-E2B connection says nothing about whether the remote
+        // worker is alive. Keep its turn reserved until observation recovers.
+        if (!transportFailure(error)) throw error;
+        await new Promise<void>((resolve, reject) => {
+          const done = () => { signal.removeEventListener('abort', abort); resolve(); };
+          const timer = setTimeout(done, 1000);
+          const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(signal.reason); };
+          signal.addEventListener('abort', abort, { once: true });
+          if (signal.aborted) abort();
+        });
+      }
+    }
+  }
+
+  private async *observeWorker(entry: Entry, session: Session, turn: Turn, signal: AbortSignal,
+    onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
+    const detached = new AbortController();
+    this.observers.set(turn.id, detached);
+    if (this.detachRequests.has(turn.id)) detached.abort(new TurnObserverDetached());
+    const observerSignal = AbortSignal.any([signal, detached.signal]);
+    const approvalTasks = new Map<string, Promise<void>>();
+    const improvementTasks = new Map<string, Promise<void>>();
+    let idleSince = 0;
+    let deadSince = 0;
+    let lastHealthCheck = 0;
+    try {
+      while (true) {
+        if (detached.signal.aborted) throw new TurnObserverDetached();
+        signal.throwIfAborted();
+        const envelopes = await this.observeRead(() => this.readWorkerEvents(entry, turn), observerSignal);
+        const cancelledApprovals = new Set(envelopes.filter(value => value.event.type === 'runtime.user_approval_cancelled')
+          .map(value => value.event.requestId));
+        let advanced = false;
+        for (const envelope of envelopes) {
+          if (detached.signal.aborted) throw new TurnObserverDetached();
+          signal.throwIfAborted();
+          const event = envelope.event as WorkerEvent;
+          const applied = envelope.seq <= (turn.execution?.lastAppliedSeq ?? 0);
+          const control = event.type === 'runtime.user_approval_request' || event.type === 'runtime.improvement_proposal';
+          // The UI cursor does not acknowledge delivery of a control reply. Replay
+          // those requests after a Web crash, using their durable business IDs.
+          if (applied && !control) continue;
+          if (!applied && envelope.seq !== (turn.execution?.lastAppliedSeq ?? 0) + 1) throw new Error('E2B worker journal has an event gap');
+          if (event.type === 'runtime.user_approval_request') {
+            const requestId = event.requestId;
+            if (requestId && !/^[0-9a-f-]{36}$/i.test(requestId)) throw new Error('Invalid worker approval request ID');
+            if (onApproval && requestId && !cancelledApprovals.has(requestId) && !approvalTasks.has(requestId)) {
+              const task = (async () => {
+                let reply;
+                try { reply = { ok: true, approval: await onApproval(requestId, event.input, signal) }; }
+                catch {
+                  if (detached.signal.aborted) return;
+                  reply = { ok: false, error: '未获得用户同意，请检查请求内容或等待状态。不得执行该操作。' };
+                }
+                observerSignal.throwIfAborted();
+                await this.writeAtomic(entry, `${this.runDirectory(turn)}/approvals/${requestId}.json`, JSON.stringify(reply), observerSignal);
+              })().catch(() => { approvalTasks.delete(requestId); });
+              approvalTasks.set(requestId, task);
+            }
+          } else if (event.type === 'runtime.improvement_proposal') {
+            const requestId = event.requestId;
+            if (requestId && !/^[0-9a-f-]{36}$/i.test(requestId)) throw new Error('Invalid worker improvement request ID');
+            if (requestId && this.options.submitImprovement && !improvementTasks.has(requestId)) {
+              const task = (async () => {
+                let reply;
+                try {
+                  const receipt = await this.options.submitImprovement!({ projectId: session.projectId ?? null,
+                    sessionId: session.id, sessionTitle: session.title, turnId: turn.id, sandboxId: entry.metadata.id }, event.input, requestId);
+                  reply = { ok: true, receipt };
+                } catch { reply = { ok: false, error: '建议未能保存，请检查五个字段均为有效文本后重试。' }; }
+                observerSignal.throwIfAborted();
+                await this.writeAtomic(entry, `${this.runDirectory(turn)}/improvements/${requestId}.json`, JSON.stringify(reply), observerSignal);
+              })().catch(() => { improvementTasks.delete(requestId); });
+              improvementTasks.set(requestId, task);
+            }
+          } else if (event.type === 'runtime.diagnostic') {
+            const allowed = ['event', 'requestId', 'method', 'path', 'upstream', 'status', 'httpStatus', 'durationMs', 'requestBytes', 'responseBytes', 'model', 'inputItems', 'responseId', 'upstreamRequestId', 'requestIds', 'error', 'message', 'code', 'terminalEvent', 'terminationReason', 'reason', 'incompleteReason', 'transportComplete', 'contentType', 'contentEncoding', 'sseEvents', 'parseError', 'clientAborted', 'requestAttempt', 'attempt', 'maxRetries', 'delayMs', 'nextRetryAt', 'channelId'];
+            const diagnostic = event.diagnostic;
+            if (diagnostic && typeof diagnostic === 'object') {
+              const fields = Object.fromEntries(allowed.filter(key => key in diagnostic).map(key => [key, diagnostic[key]]));
+              void this.options.logger?.write({ ...fields, source: 'e2b-proxy', sessionId: session.id, projectId: session.projectId,
+                turnId: turn.id, threadId: session.threadId, sandboxId: entry.metadata.id, model: session.settings.model });
+            }
+          } else if (!event.type.startsWith('runtime.worker_')) {
+            yield event as unknown as AgentEvent;
+          }
+          if (!applied) {
+            // The consumer must apply and persist the yielded event before a
+            // concurrent save can expose its cursor. Replaying an already
+            // saved SDK item is idempotent; skipping an unapplied item is not.
+            if (turn.execution) turn.execution.lastAppliedSeq = envelope.seq;
+            await onExecution?.();
+            advanced = true;
+          }
+        }
+        const state = await this.observeRead(() => this.readWorkerState(entry, turn), observerSignal);
+        if (state && (state.workerId !== turn.execution?.workerId || state.turnId !== turn.id || state.sessionId !== session.id
+          || state.protocolVersion !== 1 || !Number.isSafeInteger(state.lastSeq) || state.lastSeq < 0
+          || !Number.isSafeInteger(state.pid) || state.pid <= 1)) {
+          throw new Error('E2B worker state does not match this turn');
+        }
+        // The worker can finish between our journal read and state read. Drain
+        // the final committed sequence before acting on its terminal state.
+        const drained = state && (turn.execution?.lastAppliedSeq ?? 0) >= state.lastSeq;
+        if (drained && state.status === 'completed') return;
+        if (drained && state.status === 'failed') throw this.safeError(state.error || 'E2B Codex worker failed');
+        if (drained && state.status === 'cancelled') throw new DOMException('任务已停止', 'AbortError');
+        if (state?.status === 'running' && Date.now() - lastHealthCheck >= 5_000) {
+          lastHealthCheck = Date.now();
+          const alive = await entry.sandbox.commands.run(`kill -0 ${state.pid}`, { user: 'user', timeoutMs: 5_000 })
+            .then(() => true, error => (error as { exitCode?: number }).exitCode === 1 ? false : undefined);
+          if (alive !== false) deadSince = 0;
+          else if (!deadSince) deadSince = Date.now();
+          else if (Date.now() - deadSince >= 2_000) throw new Error('E2B Codex worker exited without a terminal event');
+        }
+        if (advanced) idleSince = 0;
+        else idleSince ||= Date.now();
+        if (!state && idleSince && Date.now() - idleSince > 30_000) throw new Error('E2B Codex worker state missing');
+        await new Promise<void>((resolve, reject) => {
+          const done = () => { observerSignal.removeEventListener('abort', abort); resolve(); };
+          const timer = setTimeout(done, 250);
+          const abort = () => { clearTimeout(timer); observerSignal.removeEventListener('abort', abort); reject(observerSignal.reason); };
+          observerSignal.addEventListener('abort', abort, { once: true });
+          if (observerSignal.aborted) abort();
+        }).catch(error => { if (detached.signal.aborted) throw new TurnObserverDetached(); throw error; });
+      }
+    } catch (error) {
+      if (detached.signal.aborted) throw new TurnObserverDetached();
+      if (signal.aborted || error instanceof DOMException && error.name === 'AbortError') throw error;
+      throw this.safeError(error);
+    } finally {
+      if (this.observers.get(turn.id) === detached) this.observers.delete(turn.id);
+      this.detachRequests.delete(turn.id);
     }
   }
 
@@ -422,7 +581,9 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
     });
   }
 
-  async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: Entry['notify'], onApproval?: RequestUserApproval): AsyncGenerator<AgentEvent> {
+  async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: Entry['notify'], onApproval?: RequestUserApproval,
+    onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
+    if (this.detachRequests.delete(turn.id)) throw new TurnLaunchCancelled();
     if (this.closing) throw new Error('E2B 运行时正在关闭');
     if (!this.options.apiKey) throw new Error('E2B 模式需要 CODEX_API_KEY 或 OPENAI_API_KEY');
     checkAbort(signal);
@@ -432,17 +593,17 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
     entry.running++;
     this.touch(entry);
     let inputPath: string | undefined;
-    let improvementReplyDirectory: string | undefined;
-    const improvementRequests = new Map<string, Promise<void>>();
-    let approvalReplyDirectory: string | undefined;
-    const approvalRequests = new Map<string, { controller: AbortController; done: Promise<void> }>();
+    let handle: CommandHandle | undefined;
     let renewal: ReturnType<typeof setInterval> | undefined;
     let renewing = false;
     const lease = new AbortController();
-    const executionSignal = AbortSignal.any([signal, lease.signal]);
+    const preparation = new AbortController();
+    this.preparations.set(turn.id, preparation);
+    if (this.detachRequests.has(turn.id)) preparation.abort();
+    const executionSignal = AbortSignal.any([signal, lease.signal, preparation.signal]);
     let leaseError: Error | undefined;
     try {
-      checkAbort(signal);
+      checkAbort(executionSignal);
       await this.renew(entry, executionSignal);
       renewal = setInterval(() => {
         if (renewing) return;
@@ -494,119 +655,59 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
         await entry.sandbox.files.write(destination, new Uint8Array(await readFile(path)).buffer, { user: 'user', signal: executionSignal });
         images.push(destination);
       }
-      inputPath = `${RUNTIME}/input-${randomUUID()}.json`;
-      if (this.options.submitImprovement) {
-        // Host chooses an isolated, opaque directory; tool arguments never select
-        // context IDs or filesystem paths, including when sibling turns run.
-        improvementReplyDirectory = `${RUNTIME}/improvement-replies-${randomUUID()}`;
-        await this.command(entry, `mkdir -m 700 ${quote(improvementReplyDirectory)}`, executionSignal);
+      const runDirectory = this.runDirectory(turn);
+      const bundleDirectory = `${runDirectory}/bundle`;
+      const approvalReplyDirectory = `${runDirectory}/approvals`;
+      const improvementReplyDirectory = `${runDirectory}/improvements`;
+      await this.command(entry, `mkdir -p ${quote(bundleDirectory)} ${quote(approvalReplyDirectory)} ${quote(improvementReplyDirectory)}`, executionSignal);
+      for (const name of ['e2b-worker.mjs', 'diagnostic-proxy.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
+        await this.command(entry, `cp ${quote(`${RUNTIME}/${name}`)} ${quote(`${bundleDirectory}/${name}`)}`, executionSignal);
       }
-      if (onApproval) {
-        approvalReplyDirectory = `${RUNTIME}/approval-replies-${randomUUID()}`;
-        await this.command(entry, `mkdir -m 700 ${quote(approvalReplyDirectory)}`, executionSignal);
-      }
+      inputPath = `${runDirectory}/input.json`;
       checkAbort(executionSignal);
       await entry.sandbox.files.write(inputPath, JSON.stringify({
+        workerId: turn.execution!.workerId, sessionId: session.id, turnId: turn.id, runDirectory,
         threadId: session.threadId, prompt: turn.prompt, images, settings: session.settings,
         connectionDirectories: Object.keys(connectionEnvs).length ? [CONNECTION_ROOT, ...('MEEGLE_HOST' in connectionEnvs ? ['/home/user/.meegle'] : []), ...('KUBECONFIG' in connectionEnvs ? ['/home/user/.kube'] : [])] : [],
         baseUrl: this.options.baseUrl, proxyKind: this.options.proxyKind,
         modelConfig: this.options.modelConfig, configOverrides: this.options.configOverrides,
-        improvementReplyDirectory, approvalReplyDirectory,
+        improvementReplyDirectory: this.options.submitImprovement ? improvementReplyDirectory : undefined,
+        approvalReplyDirectory: onApproval ? approvalReplyDirectory : undefined,
       }), { user: 'user', signal: executionSignal });
       await this.state(entry, 'ready');
-      const queue: AgentEvent[] = [];
-      let wake: (() => void) | undefined;
-      let buffer = '', stderr = '', done = false, failure: unknown;
-      const operation = this.command(entry, `${NODE} ${quote(`${RUNTIME}/e2b-worker.mjs`)} ${quote(inputPath)}`, executionSignal, {
-        timeoutMs: 0,
-        envs: { ...connectionEnvs, CODEX_API_KEY: this.options.apiKey, CODEX_HOME },
-        onStderr: chunk => { stderr = (stderr + chunk).slice(-16_384); },
-        onStdout: chunk => {
-          buffer += chunk;
-          let end: number;
-          while ((end = buffer.indexOf('\n')) >= 0) {
-            const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
-            if (!line.trim()) continue;
-            try {
-              const event = JSON.parse(line);
-              if (event.type === 'runtime.user_approval_cancelled') {
-                approvalRequests.get(event.requestId)?.controller.abort();
-              } else if (event.type === 'runtime.user_approval_request') {
-                const requestId = event.requestId;
-                if (!onApproval || !approvalReplyDirectory || executionSignal.aborted
-                  || typeof requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)
-                  || approvalRequests.has(requestId)) continue;
-                const controller = new AbortController();
-                const approvalSignal = AbortSignal.any([executionSignal, controller.signal]);
-                const replyPath = `${approvalReplyDirectory}/${requestId}.json`;
-                const request = (async () => {
-                  let reply;
-                  try {
-                    if (approvalRequests.size >= 20) throw new Error('Too many approvals');
-                    const approval = await onApproval(requestId, event.input, approvalSignal);
-                    reply = { ok: true, approval };
-                  } catch { reply = { ok: false, error: '未获得用户同意，请检查请求内容或等待状态。不得执行该操作。' }; }
-                  if (!approvalSignal.aborted) await this.writeAtomic(entry, replyPath, JSON.stringify(reply), approvalSignal);
-                })().catch(() => {
-                  void this.options.logger?.write({ event: 'approval.receipt_failed', sessionId: session.id, turnId: turn.id, requestId });
-                });
-                approvalRequests.set(requestId, { controller, done: request });
-              } else if (event.type === 'runtime.improvement_proposal') {
-                const requestId = event.requestId;
-                if (!this.options.submitImprovement || !improvementReplyDirectory || executionSignal.aborted
-                  || typeof requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)
-                  || improvementRequests.has(requestId)) continue;
-                const replyPath = `${improvementReplyDirectory}/${requestId}.json`;
-                const submit = this.options.submitImprovement;
-                const request = (async () => {
-                  let reply;
-                  try {
-                    const receipt = await submit({ projectId: session.projectId ?? null, sessionId: session.id,
-                      sessionTitle: session.title, turnId: turn.id, sandboxId: entry.metadata.id }, event.input, requestId);
-                    reply = { ok: true, receipt };
-                  } catch {
-                    // Never send DB internals or connection credentials to Codex.
-                    reply = { ok: false, error: '建议未能保存，请检查五个字段均为有效文本后重试。' };
-                    void this.options.logger?.write({ event: 'improvement.save_failed', sessionId: session.id, turnId: turn.id, requestId });
-                  }
-                  if (!executionSignal.aborted) await this.writeAtomic(entry, replyPath, JSON.stringify(reply), executionSignal);
-                })().catch(() => {
-                  void this.options.logger?.write({ event: 'improvement.receipt_failed', sessionId: session.id, turnId: turn.id, requestId });
-                });
-                improvementRequests.set(requestId, request);
-              } else if (event.type === 'runtime.diagnostic') {
-                // Diagnostics are not SDK events and never contain prompt/tool bodies.
-                const allowed = ['event', 'requestId', 'method', 'path', 'upstream', 'status', 'httpStatus', 'durationMs', 'requestBytes', 'responseBytes', 'model', 'inputItems', 'responseId', 'upstreamRequestId', 'requestIds', 'error', 'message', 'code', 'terminalEvent', 'terminationReason', 'reason', 'incompleteReason', 'transportComplete', 'contentType', 'contentEncoding', 'sseEvents', 'parseError', 'clientAborted', 'requestAttempt', 'attempt', 'maxRetries', 'delayMs', 'nextRetryAt', 'channelId'];
-                const diagnostic = event.diagnostic;
-                if (diagnostic && typeof diagnostic === 'object') {
-                  const fields = Object.fromEntries(allowed.filter(key => key in diagnostic).map(key => [key, diagnostic[key]]));
-                  void this.options.logger?.write({ ...fields, source: 'e2b-proxy', sessionId: session.id, projectId: session.projectId, turnId: turn.id,
-                    threadId: session.threadId, sandboxId: entry.metadata.id, model: session.settings.model });
-                }
-              } else queue.push(event as AgentEvent);
-            }
-            catch { failure = new Error('E2B Codex 返回了无效的事件 JSON'); }
-          }
-          wake?.();
-        },
-      }).catch(error => { failure = error; }).finally(() => { done = true; wake?.(); });
+      const marker = `${runDirectory}/worker.pid`;
+      const body = `umask 077; echo $$ > ${quote(marker)}; exec ${NODE} ${quote(`${bundleDirectory}/e2b-worker.mjs`)} ${quote(inputPath)}`;
+      checkAbort(executionSignal);
+      // Once the launch request is sent, its outcome may already be remote.
+      // Shutdown must wait for its identity and then detach the observer.
+      this.preparations.delete(turn.id);
       try {
-        while (!done || queue.length) {
-          if (queue.length) { yield queue.shift()!; continue; }
-          await new Promise<void>(resolve => { wake = resolve; });
-          wake = undefined;
-        }
-        if (leaseError) throw leaseError;
-        if (failure) throw this.safeError(stderr ? `${(failure as Error).message}\n${stderr}` : failure);
-        if (buffer.trim()) throw new Error('E2B Codex 事件流在完整 JSON 行之前断开');
-      } finally { await operation; await this.options.logger?.flush(); }
+        handle = await entry.sandbox.commands.run(`setsid sh -c ${quote(body)}`, {
+          user: 'user', background: true,
+          timeoutMs: 0,
+          envs: { ...connectionEnvs, CODEX_API_KEY: this.options.apiKey, CODEX_HOME },
+        });
+      } catch (error) {
+        // A timed-out launch may already have started remotely. Observe the
+        // preassigned run directory; never send the launch request twice.
+        if (!transportFailure(error)) throw error;
+      }
+      turn.execution!.commandPid = handle?.pid;
+      turn.execution!.sandboxId = entry.metadata.id;
+      turn.execution!.state = 'running';
+      await onExecution?.();
+      for await (const event of this.observeWorker(entry, session, turn, signal, onApproval, onExecution)) yield event;
+      if (leaseError) throw leaseError;
+    } catch (error) {
+      if (preparation.signal.aborted) throw new TurnLaunchCancelled();
+      if (error instanceof TurnObserverDetached || signal.aborted) throw error;
+      throw this.safeError(error);
     } finally {
+      this.preparations.delete(turn.id);
+      this.detachRequests.delete(turn.id);
       clearInterval(renewal);
-      for (const request of approvalRequests.values()) request.controller.abort();
-      await Promise.allSettled([...improvementRequests.values(), ...[...approvalRequests.values()].map(request => request.done)]);
-      if (approvalReplyDirectory) await entry.sandbox.files.remove(approvalReplyDirectory, { user: 'user' }).catch(() => {});
-      if (improvementReplyDirectory) await entry.sandbox.files.remove(improvementReplyDirectory, { user: 'user' }).catch(() => {});
-      if (inputPath) await entry.sandbox.files.remove(inputPath, { user: 'user' }).catch(() => {});
+      if (signal.aborted) await this.terminateWorker(entry, turn, handle);
+      else await handle?.disconnect().catch(() => {});
       await this.refreshState(entry).catch(error => {
         void this.options.logger?.write({ event: 'sandbox.state_check_failed', sandboxId: entry.metadata.id, message: this.safeError(error).message });
       });
@@ -614,6 +715,67 @@ if(roots.length)setTimeout(finish,1200);else finish();`;
       if (entry.metadata.status === 'starting') await this.state(entry, 'ready');
       await this.idle(entry);
     }
+  }
+
+  async *recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: Entry['notify'], onApproval?: RequestUserApproval,
+    onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
+    if (!turn.execution || !session.sandbox || (turn.execution.sandboxId && turn.execution.sandboxId !== session.sandbox.id)) {
+      throw new Error('E2B worker recovery information is incomplete');
+    }
+    const reconnect = new AbortController();
+    this.observers.set(turn.id, reconnect);
+    if (this.detachRequests.has(turn.id)) reconnect.abort(new TurnObserverDetached());
+    let entry: Entry;
+    try {
+      const reconnectSignal = AbortSignal.any([signal, reconnect.signal]);
+      entry = await this.observeRead(() => this.acquire(session, false, onSandbox), reconnectSignal);
+      await this.observeRead(() => this.renew(entry, reconnectSignal), reconnectSignal);
+    } catch (error) {
+      if (reconnect.signal.aborted) throw new TurnObserverDetached();
+      if (signal.aborted) {
+        const connected = this.entries.get(ownerKey(session));
+        if (connected) await this.terminateWorker(connected, turn);
+        throw new DOMException('任务已停止', 'AbortError');
+      }
+      throw this.safeError(error);
+    } finally {
+      if (this.observers.get(turn.id) === reconnect) this.observers.delete(turn.id);
+    }
+    entry.running++;
+    this.touch(entry);
+    let renewal: ReturnType<typeof setInterval> | undefined;
+    let renewing = false;
+    try {
+      renewal = setInterval(() => {
+        if (renewing) return;
+        renewing = true;
+        void this.renew(entry).catch(error => this.pauseError(entry, error)).finally(() => { renewing = false; });
+      }, Math.max(1000, Math.min(60_000, this.timeoutMs / 3)));
+      renewal.unref();
+      turn.execution.sandboxId = entry.metadata.id;
+      turn.execution.state = 'running';
+      await onExecution?.();
+      for await (const event of this.observeWorker(entry, session, turn, signal, onApproval, onExecution)) yield event;
+    } finally {
+      clearInterval(renewal);
+      if (signal.aborted) await this.terminateWorker(entry, turn);
+      entry.running--;
+      await this.idle(entry);
+    }
+  }
+
+  detach(turn: Turn) {
+    if (turn.execution) turn.execution.state = 'detached';
+    this.detachRequests.add(turn.id);
+    this.preparations.get(turn.id)?.abort();
+    this.observers.get(turn.id)?.abort(new TurnObserverDetached());
+  }
+
+  private async terminateWorker(entry: Entry, turn: Turn, handle?: CommandHandle) {
+    const marker = `${this.runDirectory(turn)}/worker.pid`;
+    const script = `const fs=require('node:fs'),cp=require('node:child_process');let root;try{root=Number(fs.readFileSync(${JSON.stringify(marker)},'utf8').trim())}catch{};if(Number.isInteger(root)&&root>1){const rows=cp.execFileSync('ps',['-e','-o','pid=,ppid='],{encoding:'utf8'}).trim().split('\\n').map(s=>s.trim().split(/\\s+/).map(Number));const targets=new Set([root]);let changed=true;while(changed){changed=false;for(const [pid,ppid] of rows)if(targets.has(ppid)&&!targets.has(pid)){targets.add(pid);changed=true}}const kill=(pid,sig)=>{try{process.kill(pid,sig)}catch{}};kill(-root,'SIGTERM');for(const pid of targets)kill(pid,'SIGTERM')}`;
+    await entry.sandbox.commands.run(`${NODE} -e ${quote(script)}`, { user: 'user', timeoutMs: 10_000 }).catch(() => {});
+    await handle?.kill().catch(() => false);
   }
 
   private async inspect<T>(session: WorkspaceTarget, mode: string, args: string[]): Promise<T> {

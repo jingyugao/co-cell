@@ -97,6 +97,36 @@ test('legacy running turns are cancelled on restart instead of resubmitted', asy
   }
 });
 
+test('session archive timestamps are persisted and legacy records are backfilled', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hive-session-archive-'));
+  const manager = new SessionManager({} as CodexClient, directory, defaults);
+  const restarted = new SessionManager({} as CodexClient, directory, defaults);
+  try {
+    await manager.init();
+    const session = await manager.create({ settings: { executionMode: 'local', workingDirectory: process.cwd() } });
+    assert.equal(session.startedAt, session.createdAt);
+    assert.equal(session.archivedAt, null);
+
+    const archived = await manager.update(session.id, { archived: true });
+    assert.ok(archived.archivedAt);
+    assert.equal(archived.startedAt, session.createdAt);
+    assert.equal((await manager.update(session.id, { archived: false })).archivedAt, null);
+
+    const legacy = JSON.parse(await readFile(join(directory, `${session.id}.json`), 'utf8')) as Record<string, unknown>;
+    delete legacy.startedAt;
+    delete legacy.archivedAt;
+    await writeFile(join(directory, `${session.id}.json`), JSON.stringify(legacy));
+    await manager.close();
+    await restarted.init();
+    const migrated = restarted.get(session.id);
+    assert.equal(migrated.startedAt, session.createdAt);
+    assert.equal(migrated.archivedAt, null);
+  } finally {
+    await manager.close(); await restarted.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('restart drains a worker whose SDK terminal event was already persisted before Web exit', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'hive-finalizing-'));
   let recoveries = 0;

@@ -8,8 +8,9 @@ services:
       NODE_ENV: production
       PORT: 3001
       HOST: 0.0.0.0
-    ports:
-      - "3001:3001"
+      E2B_API_KEY_FILE: /run/secrets/e2b_api_key
+    network_mode: host
     volumes:
       - ./.codex-web:/app/.codex-web
       - ./data:/app/data
+      - ${E2B_API_KEY_FILE:-/home/example/.data/e2b/config/api-key}:/run/secrets/e2b_api_key:ro

@@ -396,7 +396,7 @@ export class SessionManager {
         try { path = await realpath(image); } catch { throw new HttpError(400, '图片附件不存在，请重新上传'); }
         if (!path.startsWith(imageRoot)) throw new HttpError(400, '只能使用此会话上传的图片');
       }
-      const turn: Turn = { id: randomUUID(), prompt, images, status: 'running', phase: 'starting', items: [], startedAt: new Date().toISOString() };
+      const turn: Turn = { id: randomUUID(), prompt, images, status: 'running', phase: 'starting', items: [], itemTimestamps: {}, startedAt: new Date().toISOString() };
       if (session.settings.executionMode === 'e2b') turn.execution = {
         kind: 'e2b-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'launching',
       };

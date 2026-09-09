@@ -15,7 +15,7 @@ import type { ImprovementContext, ImprovementReceipt } from '../../shared/improv
 import type { StoredArchive } from './archive-storage.js';
 import { HttpError } from '../core/errors.js';
 import type { ModelProxyKind } from '../execution/model-proxy.js';
-import { parseWorkspaceFile, READ_SANDBOX_FILE_SCRIPT, workspaceFileRequest, type WorkspaceFileResult } from '../workspaces/files.js';
+import { parseWorkspaceFile, READ_SANDBOX_FILE_SCRIPT, workspaceFileRequest, type WorkspaceFileResult, type WorkspaceFileReadOptions } from '../workspaces/files.js';
 
 export interface SandboxSnapshotArchive {
   archive(sandboxId: string): Promise<StoredArchive>;
@@ -29,7 +29,7 @@ export interface E2BRuntime {
   detach(turn: Turn): void;
   changes(session: WorkspaceTarget): Promise<Changes>;
   preview(session: WorkspaceTarget, port: number): Promise<string>;
-  file(session: WorkspaceTarget, path: string): Promise<WorkspaceFileResult>;
+  file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
   rawTools(session: ThreadWorkspace, cursor?: number): Promise<RawToolPage>;
   delete(session: WorkspaceTarget): Promise<void>;
   close(): Promise<void>;
@@ -819,9 +819,9 @@ export class E2BCodexRuntime implements E2BRuntime {
     } finally { entry.readers--; await this.idle(entry); }
   }
 
-  async file(session: WorkspaceTarget, path: string): Promise<WorkspaceFileResult> {
+  async file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult> {
     if (this.closing) throw new HttpError(503, 'E2B 运行时正在关闭');
-    const request = workspaceFileRequest(session.settings.workingDirectory, path);
+    const request = workspaceFileRequest(session.settings.workingDirectory, path, options);
     let entry: Entry;
     try { entry = await this.acquire(session, false); }
     catch (error) { throw new HttpError(502, this.safeError(error).message); }

@@ -1,4 +1,4 @@
-import { readFile, unlink } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { Codex } from '@openai/codex-sdk';
 import { startDiagnosticProxy } from './diagnostic-proxy.mjs';
@@ -92,6 +92,42 @@ async function main() {
 const inputPath = process.argv[2];
 const input = JSON.parse(await readFile(inputPath, 'utf8'));
 await unlink(inputPath);
+const runDirectory = input.runDirectory;
+const journalPath = `${runDirectory}/events.jsonl`;
+const statePath = `${runDirectory}/state.json`;
+let sequence = 0;
+let actualThreadId = input.threadId ?? null;
+let lifecycle = 'running';
+let terminalError;
+let journalError;
+let publishing = Promise.resolve();
+await mkdir(runDirectory, { recursive: true, mode: 0o700 });
+await writeFile(journalPath, '', { mode: 0o600 });
+async function writeState() {
+  const temporary = `${statePath}.${process.pid}.tmp`;
+  await writeFile(temporary, JSON.stringify({
+    protocolVersion: 1, workerId: input.workerId, sessionId: input.sessionId,
+    turnId: input.turnId, pid: process.pid, status: lifecycle,
+    threadId: actualThreadId, lastSeq: sequence, error: terminalError,
+    updatedAt: new Date().toISOString(),
+  }), { mode: 0o600 });
+  await rename(temporary, statePath);
+}
+function publish(event) {
+  const operation = publishing.then(async () => {
+    if (journalError) throw journalError;
+    if (event.type === 'thread.started') actualThreadId = event.thread_id;
+    if (event.type === 'turn.completed') lifecycle = 'completed';
+    else if (event.type === 'turn.failed') { lifecycle = 'failed'; terminalError = event.error?.message; }
+    const envelope = { v: 1, workerId: input.workerId, turnId: input.turnId,
+      seq: sequence + 1, at: new Date().toISOString(), event };
+    await appendFile(journalPath, `${JSON.stringify(envelope)}\n`, { mode: 0o600 });
+    sequence = envelope.seq;
+    await writeState();
+  });
+  publishing = operation.catch(error => { journalError ??= error; controller.abort(); });
+  return operation;
+}
 const controller = new AbortController();
 const stop = () => controller.abort();
 process.on('SIGTERM', stop);
@@ -100,18 +136,19 @@ let diagnosticProxy;
 let improvementBridge;
 let approvalBridge;
 let retry;
-const emitRetry = value => process.stdout.write(JSON.stringify({ type: 'runtime.retry', retry: value }) + '\n');
+const emitRetry = value => publish({ type: 'runtime.retry', retry: value });
 const onDiagnostic = diagnostic => {
-  process.stdout.write(JSON.stringify({ type: 'runtime.diagnostic', diagnostic }) + '\n');
+  void publish({ type: 'runtime.diagnostic', diagnostic }).catch(() => {});
   if (diagnostic.event === 'api.retry' || diagnostic.event === 'api.retrying') {
     retry = { attempt: diagnostic.attempt, maxRetries: diagnostic.maxRetries,
       delayMs: diagnostic.delayMs ?? retry?.delayMs ?? 0,
       nextRetryAt: diagnostic.nextRetryAt ?? retry?.nextRetryAt ?? new Date().toISOString(),
       status: diagnostic.event === 'api.retry' ? 'waiting' : 'retrying' };
-    emitRetry(retry);
-  } else if (diagnostic.event === 'api.end' && retry) { retry = undefined; emitRetry(null); }
+    void emitRetry(retry).catch(() => {});
+  } else if (diagnostic.event === 'api.end' && retry) { retry = undefined; void emitRetry(null).catch(() => {}); }
 };
 try {
+  await publish({ type: 'runtime.worker_started' });
   if (input.baseUrl) {
     diagnosticProxy = await startDiagnosticProxy({
       upstreamBaseUrl: input.baseUrl,
@@ -132,13 +169,13 @@ try {
   if (input.improvementReplyDirectory) {
     improvementBridge = await startImprovementBridge({
       replyDirectory: input.improvementReplyDirectory, signal: controller.signal,
-      emit: event => process.stdout.write(JSON.stringify(event) + '\n'),
+      emit: publish,
     });
   }
   if (input.approvalReplyDirectory) {
     approvalBridge = await startApprovalBridge({
       replyDirectory: input.approvalReplyDirectory, signal: controller.signal,
-      emit: event => process.stdout.write(JSON.stringify(event) + '\n'),
+      emit: publish,
     });
   }
   const codex = new Codex({
@@ -174,16 +211,24 @@ try {
     ? [{ type: 'text', text: input.prompt }, ...input.images.map(path => ({ type: 'local_image', path }))]
     : input.prompt;
   const { events } = await thread.runStreamed(prompt, { signal: controller.signal });
-  for await (const event of events) process.stdout.write(JSON.stringify(event) + '\n');
+  for await (const event of events) await publish(event);
+  await publishing;
+  if (!['completed', 'failed'].includes(lifecycle)) throw new Error('Codex event stream ended without a terminal event');
 } catch (error) {
-  let message = error instanceof Error ? error.message : String(error);
+  const cause = journalError ?? error;
+  let message = cause instanceof Error ? cause.message : String(cause);
   if (process.env.CODEX_API_KEY) message = message.replaceAll(process.env.CODEX_API_KEY, '[REDACTED]');
-  process.stderr.write(message + '\n');
+  message = message.slice(0, 16_384);
+  lifecycle = controller.signal.aborted && !journalError ? 'cancelled' : 'failed';
+  terminalError = message;
+  await publish({ type: controller.signal.aborted ? 'runtime.worker_cancelled' : 'runtime.worker_failed', message }).catch(() => {});
   process.exitCode = controller.signal.aborted ? 130 : 1;
 } finally {
   try { await Promise.all([diagnosticProxy?.close(), improvementBridge?.close(), approvalBridge?.close()]); }
   finally {
-    if (retry) { retry = undefined; emitRetry(null); }
+    if (retry) { retry = undefined; await emitRetry(null).catch(() => {}); }
+    await publishing;
+    await writeState().catch(() => {});
     process.removeListener('SIGTERM', stop);
     process.removeListener('SIGINT', stop);
   }

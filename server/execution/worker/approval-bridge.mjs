@@ -33,7 +33,7 @@ export async function startApprovalBridge({ replyDirectory, signal, emit }) {
       if (active.has(requestId) || active.size >= 10) throw Error('Too many approval requests');
       active.add(requestId); registered = true;
       waitSignal.throwIfAborted();
-      emit({ type: 'runtime.user_approval_request', requestId, input: parsed.input });
+      await emit({ type: 'runtime.user_approval_request', requestId, input: parsed.input });
       const path = `${replyDirectory}/${requestId}.json`;
       while (true) {
         waitSignal.throwIfAborted();
@@ -53,7 +53,7 @@ export async function startApprovalBridge({ replyDirectory, signal, emit }) {
     } finally {
       if (registered) {
         active.delete(requestId);
-        if (!received) emit({ type: 'runtime.user_approval_cancelled', requestId });
+        if (!received) await emit({ type: 'runtime.user_approval_cancelled', requestId });
       }
     }
   });

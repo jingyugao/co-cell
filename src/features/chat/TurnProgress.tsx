@@ -23,7 +23,8 @@ export default function TurnProgress({ turn }: { turn: Turn }) {
   const commandRunning = turn.items.some(item => item.type === 'command_execution' && item.status === 'in_progress');
   const toolRunning = turn.items.some(item => item.type === 'mcp_tool_call' && item.status === 'in_progress');
   const hasReply = turn.items.some(item => item.type === 'agent_message' && item.text.trim());
-  const label = turn.phase === 'starting' ? '正在准备本轮 Codex 任务…'
+  const label = turn.phase === 'recovering' ? '正在重新连接运行中的任务…'
+    : turn.phase === 'starting' ? '正在准备本轮 Codex 任务…'
     : commandRunning ? '正在执行命令…'
       : toolRunning ? '正在调用工具…'
         : !turn.phase ? '正在处理任务…'

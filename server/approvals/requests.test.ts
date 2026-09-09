@@ -28,7 +28,7 @@ test('only a persisted explicit decision releases a waiter; duplicate decision i
     assert.equal(durable?.approvals?.[0].status, decision);
     await requests.decide(id, decision);
     await assert.rejects(requests.decide(id, decision === 'approved' ? 'rejected' : 'approved'), /已处理/);
-    await assert.rejects(requests.request(id, input, new AbortController().signal), /已使用/);
+    assert.equal((await requests.request(id, input, new AbortController().signal)).status, decision);
     await requests.close();
   }
 });
@@ -127,10 +127,115 @@ test('manager binds decisions to session and turn, cancels on stop and persists 
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
-test('restart preserves recorded decisions while cancelling every pending request', () => {
+test('unrecoverable turn preserves recorded decisions while cancelling every pending request', () => {
   const turn = makeTurn();
   turn.approvals = ['approved', 'pending', 'rejected'].map(status => ({ ...input, id: randomUUID(), status, createdAt: new Date().toISOString() })) as UserApproval[];
   assert.equal(cancelPersistedApprovals(turn), true);
   assert.deepEqual(turn.approvals.map(approval => approval.status), ['approved', 'cancelled', 'rejected']);
   assert.equal(cancelPersistedApprovals(turn), false);
+});
+
+test('concurrent replay registers one approval and rejects reuse with different arguments', async () => {
+  const turn = makeTurn();
+  const controller = new AbortController();
+  let writes = 0;
+  const requests = new ApprovalRequests(turn, controller.signal, async () => { writes++; });
+  const id = randomUUID();
+  const first = requests.request(id, input, controller.signal);
+  const second = requests.request(id, input, controller.signal);
+  await assert.rejects(requests.request(id, { ...input, action: 'different' }, controller.signal), /其他内容/);
+  assert.equal(turn.approvals?.length, 1);
+  assert.equal(writes, 1);
+  await requests.decide(id, 'approved');
+  assert.equal((await first).status, 'approved');
+  assert.deepEqual(await first, await second);
+  await requests.close();
+});
+
+test('detach preserves pending approval for a restarted observer and early user decision', async () => {
+  for (const decideBeforeReplay of [false, true]) {
+    const turn = makeTurn();
+    const signal = new AbortController().signal;
+    let durable = structuredClone(turn);
+    const persist = async () => { durable = structuredClone(turn); };
+    const old = new ApprovalRequests(turn, signal, persist);
+    const id = randomUUID();
+    const oldWaiting = old.request(id, input, signal);
+    const detached = assert.rejects(oldWaiting, /detached/);
+    await tick();
+    await old.detach();
+    await detached;
+    assert.equal(durable.approvals?.[0].status, 'pending');
+    const recovered = new ApprovalRequests(turn, signal, persist);
+    if (decideBeforeReplay) await recovered.decide(id, 'approved');
+    const waiting = recovered.request(id, input, signal);
+    if (!decideBeforeReplay) await recovered.decide(id, 'approved');
+    assert.equal((await waiting).status, 'approved');
+    assert.equal(durable.approvals?.[0].status, 'approved');
+    assert.equal(turn.approvals?.length, 1);
+    await recovered.close();
+  }
+});
+
+test('detach during decision persistence retains the explicit decision', async () => {
+  const turn = makeTurn();
+  const signal = new AbortController().signal;
+  let release!: () => void;
+  let saving!: () => void;
+  const started = new Promise<void>(resolve => { saving = resolve; });
+  const requests = new ApprovalRequests(turn, signal, async () => {
+    if (turn.approvals?.[0].status === 'approved') {
+      saving();
+      await new Promise<void>(resolve => { release = resolve; });
+    }
+  });
+  const id = randomUUID();
+  const waiting = requests.request(id, input, signal);
+  await tick();
+  const decision = requests.decide(id, 'approved');
+  await started;
+  const detached = requests.detach();
+  release();
+  await decision;
+  await detached;
+  assert.equal((await waiting).status, 'approved');
+  assert.equal(turn.approvals?.[0].status, 'approved');
+});
+
+test('detach during initial persistence preserves pending status even with a queued timeout', async () => {
+  const turn = makeTurn();
+  const signal = new AbortController().signal;
+  let release!: () => void;
+  let saving!: () => void;
+  const started = new Promise<void>(resolve => { saving = resolve; });
+  let writes = 0;
+  const requests = new ApprovalRequests(turn, signal, async () => {
+    writes++;
+    saving();
+    await new Promise<void>(resolve => { release = resolve; });
+  }, 1);
+  const waiting = requests.request(randomUUID(), input, signal);
+  const rejected = assert.rejects(waiting, /detached/);
+  await started;
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const detached = requests.detach();
+  release();
+  await detached;
+  await rejected;
+  assert.equal(turn.approvals?.[0].status, 'pending');
+  assert.equal(writes, 1);
+});
+
+test('recovery retains the original approval deadline and stop cancels unreplayed requests', async () => {
+  const turn = makeTurn();
+  const id = randomUUID();
+  turn.approvals = [{ ...input, id, status: 'pending', createdAt: new Date(Date.now() - 60_000).toISOString() }];
+  const signal = new AbortController().signal;
+  const requests = new ApprovalRequests(turn, signal, async () => {}, 100);
+  await assert.rejects(requests.decide(id, 'approved'), /过期/);
+  assert.equal((await requests.request(id, input, signal)).status, 'expired');
+  const pendingId = randomUUID();
+  turn.approvals.push({ ...input, id: pendingId, status: 'pending', createdAt: new Date().toISOString() });
+  await requests.close();
+  assert.equal(turn.approvals[1].status, 'cancelled');
 });

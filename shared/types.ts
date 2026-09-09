@@ -25,7 +25,7 @@ export interface Turn {
   prompt: string;
   images: string[];
   status: SessionStatus;
-  phase?: 'starting' | 'running' | 'finalizing';
+  phase?: 'starting' | 'recovering' | 'running' | 'finalizing';
   items: ThreadItem[];
   usage?: Usage;
   error?: string;
@@ -33,6 +33,16 @@ export interface Turn {
   completedAt?: string;
   retry?: RetryState;
   approvals?: UserApproval[];
+  /** Durable reference to a Codex worker that runs inside an E2B sandbox. */
+  execution?: {
+    kind: 'e2b-worker';
+    protocolVersion: 1;
+    workerId: string;
+    sandboxId?: string;
+    commandPid?: number;
+    lastAppliedSeq: number;
+    state: 'launching' | 'running' | 'detached' | 'terminal';
+  };
 }
 export interface Project {
   id: string;

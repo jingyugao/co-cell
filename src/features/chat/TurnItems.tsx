@@ -21,7 +21,7 @@ export default function TurnItems({ turn, sessionId, onApprovalResolved, ...reso
     {turn.items.map(item => {
       const approval = matches.get(item.id);
       return approval ? <Fragment key={item.id}>{renderApproval(approval)}<ToolDetails item={item} /></Fragment>
-        : <ItemView key={item.id} item={item} turnStatus={turn.status} {...resources} />;
+        : <ItemView key={item.id} item={item} turnStatus={turn.status} timestamp={turn.itemTimestamps?.[item.id] || turn.startedAt} {...resources} />;
     })}
     {/* A request can arrive before its SDK item. Keep it actionable without inventing a match. */}
     {unmatched.map(renderApproval)}

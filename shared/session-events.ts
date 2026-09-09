@@ -13,7 +13,12 @@ export function applyTurnEvent(turn: Turn, event: AgentEvent): Turn {
       const items = [...turn.items];
       const index = items.findIndex(item => item.id === event.item.id);
       if (index === -1) items.push(event.item); else items[index] = event.item;
-      return { ...turn, items, phase: turn.phase === 'finalizing' ? 'finalizing' : 'running' };
+      // SDK items do not currently expose a stable timestamp. Capture the
+      // first time we observe each item so the UI can display when that
+      // message/tool segment started without mutating the SDK item shape.
+      const itemTimestamps = { ...(turn.itemTimestamps ?? {}) };
+      if (!itemTimestamps[event.item.id]) itemTimestamps[event.item.id] = new Date().toISOString();
+      return { ...turn, items, itemTimestamps, phase: turn.phase === 'finalizing' ? 'finalizing' : 'running' };
     }
     case 'turn.completed':
       return { ...turn, status: 'completed', phase: 'finalizing', usage: event.usage, error: undefined, retry: undefined };

@@ -31,6 +31,8 @@ export interface Turn {
   error?: string;
   startedAt: string;
   completedAt?: string;
+  /** Timestamp for each streamed SDK item, keyed by item id. */
+  itemTimestamps?: Record<string, string>;
   retry?: RetryState;
   approvals?: UserApproval[];
   /** Durable reference to a Codex worker that runs inside an E2B sandbox. */

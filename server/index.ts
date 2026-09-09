@@ -135,7 +135,7 @@ const server = createServer((request, response) => {
   if (request.url?.startsWith('/api/') || !vite) void listener(request, response);
   else vite.middlewares(request, response);
 });
-server.listen(port, '127.0.0.1', () => {
+server.listen(port, process.env.HOST || '127.0.0.1', () => {
   void runtimeLog.write({ event: 'service.started', port, model: defaults.model, executionMode, httpDiagnostics: Boolean(e2bEnabled && process.env.OPENAI_BASE_URL), ...(process.env.OPENAI_BASE_URL ? { proxyKind } : {}) });
   console.log(`Codex Web ready at http://localhost:${port}`);
   console.log(`Workspace: ${defaults.workingDirectory}`);

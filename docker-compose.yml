@@ -1,0 +1,15 @@
+services:
+  swarm-hive:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      HOST: 0.0.0.0
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./.codex-web:/app/.codex-web
+      - ./data:/app/data

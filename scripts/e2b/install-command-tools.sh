@@ -15,25 +15,28 @@ glab_version=1.116.0
 lark_version=1.0.89
 meegle_version=1.0.20
 kubectl_version=v1.35.1
+tmux_package=tmux
 mysql_ready=false
 glab_ready=false
 lark_ready=false
 meegle_ready=false
 kubectl_ready=false
+tmux_ready=false
 if [[ $(dpkg-query -W -f='${Version}' mysql-community-client 2>/dev/null || true) == "$mysql_version" ]] && command -v mysql >/dev/null; then mysql_ready=true; fi
 if command -v glab >/dev/null && glab --version | head -n 1 | grep -Eq '^glab( version)? v?1\.116\.0([ (]|$)'; then glab_ready=true; fi
 if command -v lark-cli >/dev/null && [[ $(lark-cli --version) == "lark-cli version $lark_version" ]]; then lark_ready=true; fi
 if command -v meegle >/dev/null && [[ $(meegle --version) == "$meegle_version" ]]; then meegle_ready=true; fi
 if command -v kubectl >/dev/null && kubectl version --client -o json 2>/dev/null | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v1\.35\.1"'; then kubectl_ready=true; fi
-if "$mysql_ready" && "$glab_ready" && "$lark_ready" && "$meegle_ready" && "$kubectl_ready" && command -v git >/dev/null; then
+if command -v tmux >/dev/null; then tmux_ready=true; fi
+if "$mysql_ready" && "$glab_ready" && "$lark_ready" && "$meegle_ready" && "$kubectl_ready" && "$tmux_ready" && command -v git >/dev/null; then
   echo 'Command tools already installed'
   exit 0
 fi
 
 export DEBIAN_FRONTEND=noninteractive
-if ! "$mysql_ready" || ! command -v curl >/dev/null || ! command -v git >/dev/null; then
+if ! "$mysql_ready" || ! "$tmux_ready" || ! command -v curl >/dev/null || ! command -v git >/dev/null; then
   apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl git
+  apt-get install -y --no-install-recommends ca-certificates curl git "$tmux_package"
 fi
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
@@ -101,6 +104,7 @@ mysql_config_editor --version
 lark-cli --version
 meegle --version
 kubectl version --client -o json
+tmux -V
 # Exercise only help: never connect to a database or read a login-path here.
 mysql --no-defaults --help | grep -F -- '--login-path'
 glab auth git-credential --help >/dev/null

@@ -66,6 +66,7 @@ try {
   assert.equal(kubectl.clientVersion.platform, 'linux/amd64');
   await command('Lark document and comment commands', 'lark-cli docs --help >/dev/null && lark-cli drive +list-comments --help >/dev/null && lark-cli drive +add-comment --help >/dev/null', '/home/user');
   await command('Meegle command discovery', 'meegle --help >/dev/null && meegle inspect --help >/dev/null', '/home/user');
+  await command('tmux', 'tmux -V', '/home/user');
   const root = '/home/user/workspace/template-verification';
   await command('create fixtures', `mkdir -p ${quote(root)} ${manifest.go.map((v) => quote(`${root}/go-${v}`)).join(' ')} ${quote(`${root}/web`)}`);
   if (manifest.php) {

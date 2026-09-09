@@ -8,6 +8,7 @@ services:
       NODE_ENV: production
       PORT: 3001
       HOST: 0.0.0.0
+      MEEGLE_HOST: project.feishu.cn
       E2B_API_KEY_FILE: /run/secrets/e2b_api_key
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -15,5 +16,6 @@ services:
       - ./.codex-web:/app/.codex-web
       - ./data:/app/data
       - ${E2B_API_KEY_FILE:-/home/example/.data/e2b/config/api-key}:/run/secrets/e2b_api_key:ro
+      - ${MEEGLE_HOME:-/home/example/.meegle}:/root/.meegle:ro
     ports:
       - "3001:3001"

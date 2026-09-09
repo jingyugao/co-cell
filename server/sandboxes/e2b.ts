@@ -65,8 +65,10 @@ type Entry = {
 };
 type Tracked = Pick<Entry, 'metadata' | 'notify' | 'lastActiveAt' | 'pausing'>;
 type WorkerEnvelope = { v: 1; workerId: string; turnId: string; seq: number; event: Record<string, unknown> };
-type WorkerState = { protocolVersion: 1; workerId: string; sessionId: string; turnId: string; pid: number;
-  status: 'running' | 'completed' | 'failed' | 'cancelled'; threadId: string | null; lastSeq: number; error?: string };
+type WorkerState = {
+  protocolVersion: 1; workerId: string; sessionId: string; turnId: string; pid: number;
+  status: 'running' | 'completed' | 'failed' | 'cancelled'; threadId: string | null; lastSeq: number; error?: string
+};
 type WorkerEvent = Record<string, unknown> & { type: string; requestId?: string; input?: unknown; diagnostic?: Record<string, unknown> };
 export class TurnObserverDetached extends Error {
   constructor() { super('Web observer detached'); this.name = 'TurnObserverDetached'; }
@@ -183,7 +185,7 @@ export class E2BCodexRuntime implements E2BRuntime {
   }
 
   private async pauseError(entry: Tracked, error: unknown) {
-    if (/not found|404/i.test(String(error))) await this.refreshState(entry).catch(() => {});
+    if (/not found|404/i.test(String(error))) await this.refreshState(entry).catch(() => { });
     void this.options.logger?.write({ event: 'sandbox.lifecycle_error', sandboxId: entry.metadata.id, message: this.safeError(error).message });
   }
 
@@ -208,9 +210,11 @@ export class E2BCodexRuntime implements E2BRuntime {
     entry.renewedAt = Date.now();
     const capped = info.endAt.getTime() < entry.renewedAt + this.timeoutMs - 5_000;
     if (capped && !entry.leaseLimitReported) {
-      void this.options.logger?.write({ event: 'sandbox.lease_capped', sandboxId: entry.metadata.id,
+      void this.options.logger?.write({
+        event: 'sandbox.lease_capped', sandboxId: entry.metadata.id,
         startedAt: info.startedAt.toISOString(), expiresAt: info.endAt.toISOString(), requestedTimeoutMs: this.timeoutMs,
-        message: '平台单次运行时长上限截断了续期，请调整 E2B 平台限制' });
+        message: '平台单次运行时长上限截断了续期，请调整 E2B 平台限制'
+      });
     }
     entry.leaseLimitReported = capped;
   }
@@ -436,8 +440,10 @@ export class E2BCodexRuntime implements E2BRuntime {
               const task = (async () => {
                 let reply;
                 try {
-                  const receipt = await this.options.submitImprovement!({ projectId: session.projectId ?? null,
-                    sessionId: session.id, sessionTitle: session.title, turnId: turn.id, sandboxId: entry.metadata.id }, event.input, requestId);
+                  const receipt = await this.options.submitImprovement!({
+                    projectId: session.projectId ?? null,
+                    sessionId: session.id, sessionTitle: session.title, turnId: turn.id, sandboxId: entry.metadata.id
+                  }, event.input, requestId);
                   reply = { ok: true, receipt };
                 } catch { reply = { ok: false, error: '建议未能保存，请检查五个字段均为有效文本后重试。' }; }
                 observerSignal.throwIfAborted();
@@ -450,8 +456,10 @@ export class E2BCodexRuntime implements E2BRuntime {
             const diagnostic = event.diagnostic;
             if (diagnostic && typeof diagnostic === 'object') {
               const fields = Object.fromEntries(allowed.filter(key => key in diagnostic).map(key => [key, diagnostic[key]]));
-              void this.options.logger?.write({ ...fields, source: 'e2b-proxy', sessionId: session.id, projectId: session.projectId,
-                turnId: turn.id, threadId: session.threadId, sandboxId: entry.metadata.id, model: session.settings.model });
+              void this.options.logger?.write({
+                ...fields, source: 'e2b-proxy', sessionId: session.id, projectId: session.projectId,
+                turnId: turn.id, threadId: session.threadId, sandboxId: entry.metadata.id, model: session.settings.model
+              });
             }
           } else if (!event.type.startsWith('runtime.worker_')) {
             yield event as unknown as AgentEvent;
@@ -549,9 +557,9 @@ export class E2BCodexRuntime implements E2BRuntime {
       throw this.safeError(error);
     } finally {
       signal.removeEventListener('abort', stop);
-      await stopping?.catch(() => {});
+      await stopping?.catch(() => { });
       // Marker cleanup is bounded and does not affect any other process group.
-      await entry.sandbox.files.remove(marker, { user: 'user' }).catch(() => {});
+      await entry.sandbox.files.remove(marker, { user: 'user' }).catch(() => { });
     }
   }
 
@@ -560,7 +568,7 @@ export class E2BCodexRuntime implements E2BRuntime {
     try {
       await entry.sandbox.files.write(staging, content, { user: 'user', signal });
       await entry.sandbox.files.rename(staging, path, { user: 'user', signal });
-    } finally { await entry.sandbox.files.remove(staging, { user: 'user' }).catch(() => {}); }
+    } finally { await entry.sandbox.files.remove(staging, { user: 'user' }).catch(() => { }); }
   }
 
   // Serialize application-owned installation/sync only. Codex workers run concurrently.
@@ -571,7 +579,7 @@ export class E2BCodexRuntime implements E2BRuntime {
       started = true;
       return action();
     });
-    entry.preparing = operation.then(() => {}, () => {});
+    entry.preparing = operation.then(() => { }, () => { });
     // Cancelling a queued turn must not wait for another turn's installation.
     return new Promise<T>((resolve, reject) => {
       const abort = () => { if (!started) reject(new DOMException('任务已停止', 'AbortError')); };
@@ -707,7 +715,7 @@ export class E2BCodexRuntime implements E2BRuntime {
       this.detachRequests.delete(turn.id);
       clearInterval(renewal);
       if (signal.aborted) await this.terminateWorker(entry, turn, handle);
-      else await handle?.disconnect().catch(() => {});
+      else await handle?.disconnect().catch(() => { });
       await this.refreshState(entry).catch(error => {
         void this.options.logger?.write({ event: 'sandbox.state_check_failed', sandboxId: entry.metadata.id, message: this.safeError(error).message });
       });
@@ -774,7 +782,7 @@ export class E2BCodexRuntime implements E2BRuntime {
   private async terminateWorker(entry: Entry, turn: Turn, handle?: CommandHandle) {
     const marker = `${this.runDirectory(turn)}/worker.pid`;
     const script = `const fs=require('node:fs'),cp=require('node:child_process');let root;try{root=Number(fs.readFileSync(${JSON.stringify(marker)},'utf8').trim())}catch{};if(Number.isInteger(root)&&root>1){const rows=cp.execFileSync('ps',['-e','-o','pid=,ppid='],{encoding:'utf8'}).trim().split('\\n').map(s=>s.trim().split(/\\s+/).map(Number));const targets=new Set([root]);let changed=true;while(changed){changed=false;for(const [pid,ppid] of rows)if(targets.has(ppid)&&!targets.has(pid)){targets.add(pid);changed=true}}const kill=(pid,sig)=>{try{process.kill(pid,sig)}catch{}};kill(-root,'SIGTERM');for(const pid of targets)kill(pid,'SIGTERM')}`;
-    await entry.sandbox.commands.run(`${NODE} -e ${quote(script)}`, { user: 'user', timeoutMs: 10_000 }).catch(() => {});
+    await entry.sandbox.commands.run(`${NODE} -e ${quote(script)}`, { user: 'user', timeoutMs: 10_000 }).catch(() => { });
     await handle?.kill().catch(() => false);
   }
 
@@ -797,7 +805,7 @@ export class E2BCodexRuntime implements E2BRuntime {
         try { detail = JSON.parse(stdout); } catch { /* Retain the transport error. */ }
         if (typeof detail?.error === 'string') throw this.safeError(detail.error);
       }
-      if (/not found|404/i.test(String(error))) await this.refreshState(entry).catch(() => {});
+      if (/not found|404/i.test(String(error))) await this.refreshState(entry).catch(() => { });
       throw this.safeError(error);
     }
     finally { entry.readers--; await this.idle(entry); }
@@ -835,7 +843,7 @@ export class E2BCodexRuntime implements E2BRuntime {
       return parseWorkspaceFile(result.stdout);
     } catch (error) {
       if (error instanceof HttpError) throw error;
-      if (/not found|404/i.test(String(error))) await this.refreshState(entry).catch(() => {});
+      if (/not found|404/i.test(String(error))) await this.refreshState(entry).catch(() => { });
       throw new HttpError(502, this.safeError(error).message);
     } finally { entry.readers--; await this.idle(entry); }
   }

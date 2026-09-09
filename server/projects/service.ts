@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { Project, Settings } from '../../shared/types.js';
 import { HttpError } from '../core/errors.js';
 import { AtomicJsonWriter } from '../storage/atomic-json.js';
-import { readRequirementInfo } from './requirements.js';
+import { readRequirementName } from './requirements.js';
 
 export type ProjectInput = { name?: string; requirementUrl?: string | null };
 export type ProjectUpdate = Partial<ProjectInput> & { archived?: boolean };
@@ -19,7 +19,7 @@ export class ProjectService {
   private writer = new AtomicJsonWriter();
   private directory: string;
 
-  constructor(dataDirectory: string, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo) { this.directory = join(dataDirectory, 'projects'); }
+  constructor(dataDirectory: string, private requirementName: (url: string) => Promise<string> = readRequirementName) { this.directory = join(dataDirectory, 'projects'); }
 
   async init() {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
@@ -84,12 +84,11 @@ export class ProjectService {
     // A bound project's name is authoritative requirement metadata, fetched before any state is saved.
     const requirementUrl = input.requirementUrl?.trim() || null;
     this.validate({ requirementUrl });
-    const info = requirementUrl ? await this.requirementInfo(requirementUrl) : null;
-    const name = info?.name ?? input.name?.trim();
+    const name = requirementUrl ? await this.requirementName(requirementUrl) : input.name?.trim();
     if (!name) throw new HttpError(400, '请输入项目名称或绑定飞书需求');
     this.validate({ name });
     const now = new Date().toISOString();
-    const project: Project = { id: randomUUID(), name, requirementUrl, ...(info ? { requirementStatus: info.status } : {}),
+    const project: Project = { id: randomUUID(), name, requirementUrl,
       executionMode: settings.executionMode ?? 'local', workingDirectory: settings.workingDirectory,
       archivedAt: null, createdAt: now, updatedAt: now };
     await this.import(project);

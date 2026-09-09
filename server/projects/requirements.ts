@@ -20,16 +20,10 @@ const projectsSchema = z.object({
 const detailSchema = z.object({ work_item_attribute: z.object({
   work_item_id: z.string(), work_item_name: z.string().trim().min(1),
   owned_project: z.object({ key: z.string() }),
-  status: z.union([z.string(), z.object({ name: z.string().optional(), value: z.string().optional() })]).optional(),
 }) });
-export type RequirementInfo = { name: string; status: string | null };
 
 /** Read requirement metadata using the host's logged-in Meegle CLI, never a URL fetch or shell. */
 export async function readRequirementName(url: string, run: Command = command): Promise<string> {
-  return (await readRequirementInfo(url, run)).name;
-}
-
-export async function readRequirementInfo(url: string, run: Command = command): Promise<RequirementInfo> {
   async function read<T>(args: string[], schema: z.ZodType<T>, failure: string): Promise<T> {
     try { return schema.parse(JSON.parse(await run([...args, '--format', 'json']))); }
     // CLI errors may contain credentials or remote content; only expose our stage-specific message.
@@ -39,13 +33,13 @@ export async function readRequirementInfo(url: string, run: Command = command): 
   if (decoded.url_kind !== 'workitem_detail' || !decoded.simple_name || !decoded.work_item_id) {
     throw new HttpError(400, '请填写飞书项目的具体需求详情链接，不能使用空间首页、列表或文档链接');
   }
-  const authStatus = await read(['auth', 'status'], statusSchema, '无法检查飞书项目登录状态，请检查本机 Meegle 登录及网络后重试');
-  if (!authStatus.authenticated) throw new HttpError(409, '飞书项目尚未登录或登录已失效，请先在本机完成 Meegle 登录');
+  const status = await read(['auth', 'status'], statusSchema, '无法检查飞书项目登录状态，请检查本机 Meegle 登录及网络后重试');
+  if (!status.authenticated) throw new HttpError(409, '飞书项目尚未登录或登录已失效，请先在本机完成 Meegle 登录');
   const hostname = (value: string) => {
     try { return new URL(value.includes('://') ? value : `https://${value}`).host.toLowerCase(); }
     catch { return ''; }
   };
-  if (!authStatus.host || !hostname(authStatus.host) || hostname(authStatus.host) !== hostname(decoded.host)) {
+  if (!status.host || !hostname(status.host) || hostname(status.host) !== hostname(decoded.host)) {
     throw new HttpError(400, '需求链接的站点与当前 Meegle 登录站点不一致，请检查链接或切换登录站点');
   }
   const projects = await read(['project', 'search', '--project-key', decoded.simple_name], projectsSchema,
@@ -56,13 +50,11 @@ export async function readRequirementInfo(url: string, run: Command = command): 
   }
   const projectKey = matches[0].project_key;
   const detail = await read(['workitem', 'get', '--project-key', projectKey, '--work-item-id', decoded.work_item_id,
-    '--select', 'work_item_attribute.work_item_id,work_item_attribute.work_item_name,work_item_attribute.owned_project.key,work_item_attribute.status'], detailSchema,
+    '--select', 'work_item_attribute.work_item_id,work_item_attribute.work_item_name,work_item_attribute.owned_project.key'], detailSchema,
   '读取飞书需求名称失败，请确认需求存在且当前账号有权限，并检查登录状态及网络后重试');
   if (detail.work_item_attribute.work_item_id !== decoded.work_item_id || detail.work_item_attribute.owned_project.key !== projectKey) {
     throw new HttpError(502, '飞书返回的需求与链接不匹配，请检查链接后重试');
   }
   // Project names are limited to 100 UTF-16 code units; avoid cutting a surrogate pair.
-  const name = detail.work_item_attribute.work_item_name.slice(0, 100).replace(/[\uD800-\uDBFF]$/u, '');
-  const itemStatus = detail.work_item_attribute.status;
-  return { name, status: typeof itemStatus === 'string' ? itemStatus : itemStatus?.name || itemStatus?.value || null };
+  return detail.work_item_attribute.work_item_name.slice(0, 100).replace(/[\uD800-\uDBFF]$/u, '');
 }

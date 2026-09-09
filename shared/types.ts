@@ -63,6 +63,10 @@ export interface Session {
   title: string;
   settings: Settings;
   status: SessionStatus;
+  /** When the session was created. Kept separately from updates to support archive history. */
+  startedAt: string;
+  /** Null while the session remains active; set when it is moved to the archive. */
+  archivedAt: string | null;
   createdAt: string;
   updatedAt: string;
   turns: Turn[];

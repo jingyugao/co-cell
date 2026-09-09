@@ -7,7 +7,7 @@ import { E2BCodexRuntime, TurnLaunchCancelled, TurnObserverDetached } from './e2
 function fixture() {
   const turn: Turn = { id: randomUUID(), prompt: 'test', images: [], items: [], status: 'running', startedAt: new Date().toISOString(),
     execution: { kind: 'e2b-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'running' } };
-  const session: Session = { id: randomUUID(), title: 'test', threadId: null, status: 'running', createdAt: turn.startedAt,
+  const session: Session = { id: randomUUID(), title: 'test', threadId: null, status: 'running', startedAt: turn.startedAt, archivedAt: null, createdAt: turn.startedAt,
     updatedAt: turn.startedAt, turns: [turn], sandbox: { id: 'test-sandbox', status: 'ready', template: 'test', workingDirectory: '/tmp' },
     settings: { executionMode: 'e2b', workingDirectory: '/tmp', model: 'test', modelReasoningEffort: 'low',
       sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: false } };

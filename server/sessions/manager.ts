@@ -56,6 +56,16 @@ export class SessionManager {
         throw new Error(`Invalid session state: ${name}`);
       }
       let changed = false;
+      // Session archives were introduced after the initial JSON format. Use the
+      // original creation time for records that predate the explicit start time.
+      if (!session.startedAt) {
+        session.startedAt = session.createdAt;
+        changed = true;
+      }
+      if (session.archivedAt === undefined) {
+        session.archivedAt = null;
+        changed = true;
+      }
       if (!session.projectId && session.settings.executionMode === 'e2b') {
         // Persist the project first. If interrupted, deterministic IDs make migration repeatable.
         if (!this.projects.find(session.id)) {
@@ -286,16 +296,19 @@ export class SessionManager {
         release = this.projects.acquire(project.id);
       }
       const now = new Date().toISOString();
-      const session: Session = { id: randomUUID(), ...(project ? { projectId: project.id, ...(project.sandbox ? { sandbox: structuredClone(project.sandbox) } : {}) } : {}), threadId: input.threadId ?? null, title: input.title ?? '新任务', settings, status: 'idle', createdAt: now, updatedAt: now, turns: [] };
+      const session: Session = { id: randomUUID(), ...(project ? { projectId: project.id, ...(project.sandbox ? { sandbox: structuredClone(project.sandbox) } : {}) } : {}), threadId: input.threadId ?? null, title: input.title ?? '新任务', settings, status: 'idle', startedAt: now, archivedAt: null, createdAt: now, updatedAt: now, turns: [] };
       await this.save(session);
       this.sessions.set(session.id, session);
       return this.get(session.id);
     } finally { release(); }
   }
 
-  async update(id: string, input: { title?: string; settings?: Partial<Settings> }): Promise<Session> {
+  async update(id: string, input: { title?: string; settings?: Partial<Settings>; archived?: boolean }): Promise<Session> {
     const session = this.lookup(id);
     if (this.active.has(id)) throw new HttpError(409, '请先停止当前任务再修改会话');
+    if (input.archived && (session.status === 'running' || session.turns.some(turn => turn.status === 'running'))) {
+      throw new HttpError(409, '请先停止当前任务再归档会话');
+    }
     if (input.settings?.executionMode && input.settings.executionMode !== (session.settings.executionMode || 'local')) throw new HttpError(400, '已有会话不能切换执行环境，请新建任务');
     if (session.projectId && input.settings?.workingDirectory && posix.normalize(input.settings.workingDirectory) !== session.settings.workingDirectory) throw new HttpError(400, '项目会话不能修改工作目录');
     const settings = input.settings ? await this.validateSettings({ ...session.settings, ...input.settings }) : normalizeExecutionSettings(session.settings);
@@ -304,6 +317,7 @@ export class SessionManager {
     if (this.active.has(id)) throw new HttpError(409, '任务正在执行');
     session.settings = settings;
     if (input.title !== undefined) session.title = input.title;
+    if (input.archived !== undefined) session.archivedAt = input.archived ? session.archivedAt ?? new Date().toISOString() : null;
     session.updatedAt = new Date().toISOString();
     await this.save(session);
     this.publish(id, { type: 'state', session: this.get(id) });
@@ -369,6 +383,7 @@ export class SessionManager {
   async startTurn(id: string, prompt: string, images: string[] = []): Promise<string> {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     const session = this.lookup(id);
+    if (session.archivedAt) throw new HttpError(409, '会话已归档，请先恢复后再发送消息');
     if (this.active.has(id) || session.turns.some(turn => turn.status === 'running')) throw new HttpError(409, '当前会话已有任务正在执行');
     const previous = structuredClone(session);
     // Reserve the session synchronously, before validating attachments or saving state.

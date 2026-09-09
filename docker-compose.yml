@@ -9,8 +9,11 @@ services:
       PORT: 3001
       HOST: 0.0.0.0
       E2B_API_KEY_FILE: /run/secrets/e2b_api_key
-    network_mode: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./.codex-web:/app/.codex-web
       - ./data:/app/data
       - ${E2B_API_KEY_FILE:-/home/example/.data/e2b/config/api-key}:/run/secrets/e2b_api_key:ro
+    ports:
+      - "3001:3001"

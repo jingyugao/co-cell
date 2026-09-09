@@ -4,6 +4,7 @@ import { join, resolve, sep, posix } from 'node:path';
 import type { Project, ProjectSummary, Session, SessionSummary, Settings, StreamMessage, Turn } from '../../shared/types.js';
 import type { E2BRuntime } from '../sandboxes/e2b.js';
 import { getChanges } from '../workspaces/git.js';
+import type { WorkspaceFileReadOptions } from '../workspaces/files.js';
 import type { RawToolReader } from '../execution/raw-tools.js';
 import type { RuntimeLog } from '../diagnostics/runtime-log.js';
 
@@ -463,13 +464,13 @@ export class SessionManager {
     try { return await this.e2b.changes(session); } finally { release(); }
   }
 
-  async projectFile(projectId: string, path: string) {
+  async projectFile(projectId: string, path: string, options?: WorkspaceFileReadOptions) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     const project = this.projects.get(projectId);
     if (project.executionMode !== 'e2b' || !this.e2b) throw new HttpError(400, '此项目不使用 E2B 沙箱');
     if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先发送一条消息');
     const release = this.projects.acquire(project.id);
-    try { return await this.e2b.file(this.projectWorkspace(project), path); }
+    try { return await this.e2b.file(this.projectWorkspace(project), path, options); }
     finally { release(); }
   }
 

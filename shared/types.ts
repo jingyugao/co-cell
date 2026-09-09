@@ -50,6 +50,8 @@ export interface Project {
   id: string;
   name: string;
   requirementUrl: string | null;
+  /** Current status of the linked Feishu (Meegle) work item, when available. */
+  requirementStatus?: string | null;
   executionMode: 'e2b' | 'local';
   workingDirectory: string;
   sandbox?: SandboxState;

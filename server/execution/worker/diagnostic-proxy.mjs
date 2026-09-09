@@ -8,10 +8,21 @@ function usageFields(usage) {
   if (!usage || typeof usage !== 'object') return {};
   const inputTokens = usage.input_tokens;
   if (!Number.isSafeInteger(inputTokens) || inputTokens < 0) return {};
-  const cachedInputTokens = usage.cached_input_tokens;
+  const validCount = value => Number.isSafeInteger(value) && value >= 0;
+  const nestedCached = usage.input_tokens_details?.cached_tokens;
+  const cachedInputTokens = validCount(nestedCached) ? nestedCached : usage.cached_input_tokens;
   const outputTokens = usage.output_tokens;
+  const rawUsage = Object.fromEntries(['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens']
+    .filter(key => validCount(usage[key])).map(key => [key, usage[key]]));
+  for (const key of ['input_tokens_details', 'output_tokens_details']) {
+    const details = usage[key];
+    if (details && typeof details === 'object' && !Array.isArray(details)) {
+      rawUsage[key] = Object.fromEntries(Object.entries(details).filter(([name, value]) => /^[a-z_]{1,80}$/.test(name) && validCount(value)));
+    }
+  }
   return {
     inputTokens,
+    rawUsage,
     ...(Number.isSafeInteger(cachedInputTokens) && cachedInputTokens >= 0 ? { cachedInputTokens } : {}),
     ...(Number.isSafeInteger(outputTokens) && outputTokens >= 0 ? { outputTokens } : {}),
   };
@@ -194,7 +205,8 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
             try {
               const object = JSON.parse(Buffer.concat(chunks).toString('utf8'));
               jsonError = object.error;
-              if (!terminal && ['completed', 'failed', 'incomplete'].includes(object.status)) terminal = { type: `response.${object.status}`, error: object.error };
+              if (typeof object.id === 'string' && /^resp_[A-Za-z0-9_-]{1,160}$/.test(object.id)) responseId = redact(object.id);
+              if (!terminal && ['completed', 'failed', 'incomplete'].includes(object.status)) terminal = { type: `response.${object.status}`, error: object.error, usage: object.usage };
             } catch { malformed = true; }
           }
           const error = terminal?.error ?? jsonError;
@@ -231,7 +243,7 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
             event('api.retrying', { attempt: retries, maxRetries: OVERLOAD_RETRY_DELAYS_MS.length, code });
             begin(body); return;
           }
-          if (terminal?.type === 'response.completed') event('api.completed', { requestAttempt, ...usageFields(terminal.usage) });
+          if (terminal?.type === 'response.completed') event('api.completed', { requestAttempt, requestIds, ...usageFields(terminal.usage) });
           if (!passthrough && isSse && !terminal && !malformed) event('api.error', { error: { type: 'stream_error', code: 'eof_before_terminal' }, requestAttempt });
           const reason = terminal?.type ?? (passthrough || malformed ? 'unobserved' : isSse ? 'eof_before_terminal' : 'http_end');
           // Mark the business result before delivery: Codex may disconnect as
@@ -361,7 +373,7 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
         if (['response.completed', 'response.failed', 'response.incomplete', 'error'].includes(type)) {
           terminal = true;
           terminalReason = type;
-          if (type === 'response.completed') event('api.completed', usageFields(object.response?.usage ?? object.usage));
+          if (type === 'response.completed') event('api.completed', { requestIds, ...usageFields(object.response?.usage ?? object.usage) });
           else {
             const error = object.error ?? object.response?.error ?? (type === 'error' ? object : undefined);
             const details = object.response?.incomplete_details;

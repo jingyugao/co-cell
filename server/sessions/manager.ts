@@ -14,6 +14,8 @@ import { AtomicJsonWriter } from '../storage/atomic-json.js';
 import { runTurn, type CodexClient } from '../execution/runner.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { ApprovalRequests, approvalDecisionSchema, cancelPersistedApprovals } from '../approvals/requests.js';
+import { readNativeHistory } from '../execution/native-history.mjs';
+import { estimateNativeBlocks } from '../execution/block-estimates.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -42,6 +44,7 @@ export class SessionManager {
   private deleting = new Set<string>();
   private uploads = new Map<string, Set<Promise<string>>>();
   private closing = false;
+  private historyReads = new Map<string, Promise<void>>();
 
   constructor(private client: CodexClient, public readonly dataDirectory: string, public readonly defaults: Settings, private e2b?: E2BRuntime, private e2bWorkingDirectory = '/home/user/workspace', private logger?: RuntimeLog) { this.projects = new ProjectService(dataDirectory); }
 
@@ -110,6 +113,8 @@ export class SessionManager {
         changed = true;
         for (const turn of session.turns.filter(t => t.status === 'running' || this.canRecover(session, t))) {
           if (this.canRecover(session, turn)) {
+            // Message bodies are reconstructed by replaying the sandbox journal.
+            if (!turn.items.length && !turn.prompt && turn.execution) turn.execution.lastAppliedSeq = 0;
             turn.phase = 'recovering';
             continue;
           }
@@ -189,6 +194,40 @@ export class SessionManager {
   }
 
   get(id: string): Session { return structuredClone(this.lookup(id)); }
+  async read(id: string): Promise<Session> {
+    let pending = this.historyReads.get(id);
+    if (!pending) {
+      pending = this.loadNativeHistory(id).finally(() => { this.historyReads.delete(id); });
+      this.historyReads.set(id, pending);
+    }
+    await pending;
+    return this.get(id);
+  }
+
+  private async loadNativeHistory(id: string) {
+    const session = this.lookup(id);
+    const native = estimateNativeBlocks(!session.threadId ? [] : session.settings.executionMode === 'e2b'
+      ? await this.e2b!.history(session) : await readNativeHistory(session.threadId));
+    const previous = session.turns;
+    const liveId = this.active.get(id)?.turnId;
+    const mapped = native.map(turn => {
+      const stored = previous.find(old => old.id === turn.id || old.nativeTurnId === turn.id || (Date.parse(turn.startedAt) >= Date.parse(old.startedAt)
+        && Date.parse(turn.startedAt) <= Date.parse(old.completedAt ?? new Date().toISOString())));
+      if (!stored) return turn;
+      if (stored.id === liveId) { stored.nativeTurnId = turn.id; if (!stored.prompt) stored.prompt = turn.prompt; return stored; }
+      return { ...turn, id: stored.id, nativeTurnId: turn.id, sdkUsage: stored.sdkUsage,
+        contextUsage: turn.contextUsage?.map(call => {
+          const old = stored.contextUsage?.find(value => call.responseId && value.responseId === call.responseId);
+          return old ? { ...old, ...call } : call;
+        }) };
+    });
+    const live = previous.find(turn => turn.id === liveId);
+    if (live && !mapped.some(turn => turn.id === live.id)) mapped.push(live);
+    session.turns = mapped;
+    session.status = live ? live.status : mapped.at(-1)?.status ?? 'idle';
+    session.contextUsage = mapped.flatMap(turn => turn.contextUsage ?? []).at(-1);
+    await this.save(session);
+  }
   private lookup(id: string): Session {
     if (this.deleting.has(id)) throw new HttpError(409, '会话正在删除');
     const session = this.sessions.get(id);
@@ -359,7 +398,16 @@ export class SessionManager {
   }
 
   private save(session: Session): Promise<void> {
-    return this.writer.write(session.id, join(this.dataDirectory, `${session.id}.json`), session);
+    // Persist execution locators and numeric billing evidence, never a second message history.
+    const turns = session.turns.map(turn => ({
+      id: turn.id, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
+      execution: turn.execution, codexAccepted: turn.codexAccepted,
+      approvals: turn.execution?.state !== 'terminal' ? turn.approvals : undefined,
+      prompt: '', images: [], items: [], usage: turn.usage, sdkUsage: turn.sdkUsage,
+      contextUsage: turn.contextUsage?.map(({ blockEstimates, blockTokenizer, blockTexts, ...call }) => call),
+    }));
+    const { blockEstimates, blockTokenizer, blockTexts, ...contextUsage } = session.contextUsage ?? {};
+    return this.writer.write(session.id, join(this.dataDirectory, `${session.id}.json`), { ...session, contextUsage: session.contextUsage ? contextUsage : undefined, turns });
   }
 
   async uploadImage(id: string, content: Uint8Array, extension: string): Promise<string> {
@@ -396,7 +444,7 @@ export class SessionManager {
         try { path = await realpath(image); } catch { throw new HttpError(400, '图片附件不存在，请重新上传'); }
         if (!path.startsWith(imageRoot)) throw new HttpError(400, '只能使用此会话上传的图片');
       }
-      const turn: Turn = { id: randomUUID(), prompt, images, status: 'running', phase: 'starting', items: [], itemTimestamps: {}, startedAt: new Date().toISOString() };
+      const turn: Turn = { id: randomUUID(), prompt, images, codexAccepted: false, status: 'running', phase: 'starting', items: [], itemTimestamps: {}, startedAt: new Date().toISOString() };
       if (session.settings.executionMode === 'e2b') turn.execution = {
         kind: 'e2b-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'launching',
       };

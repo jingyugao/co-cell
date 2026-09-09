@@ -97,5 +97,10 @@ async function changes() {
     return { branch: branch.trim(), files, diff };
   } catch (error) { return { branch: '', files: [], diff: '', error: error.message }; }
 }
-try { process.stdout.write(JSON.stringify(await (mode === 'raw' ? raw() : changes())) + '\n'); }
+try {
+  const result = mode === 'history'
+    ? await (await import('./native-history.mjs')).readNativeHistory(value, home)
+    : await (mode === 'raw' ? raw() : changes());
+  process.stdout.write(JSON.stringify(result) + '\n');
+}
 catch (error) { process.stdout.write(JSON.stringify({ error: error.message }) + '\n'); process.exitCode = 1; }

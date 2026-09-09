@@ -12,6 +12,28 @@ export interface RetryState {
 }
 /** Actual input size of the most recent model request, as reported by Responses. */
 export interface ContextUsage {
+  outputItemIds?: string[];
+  /** Transient native-reader input; removed before returning/persisting estimates. */
+  blockTexts?: Array<{ id: string; label: string; text: string; turnId?: string; direction: 'input' | 'output' }>;
+  /** Local text tokenizer estimates; not provider-attributed message usage. */
+  blockEstimates?: import('./block-costs').BlockEstimate[];
+  blockTokenizer?: string;
+  requestId?: string;
+  responseId?: string;
+  requestIds?: Record<string, string>;
+  requestAttempt?: number;
+  source?: 'responses' | 'rollout';
+  /** Numeric token counters retained from the provider for later recalculation. */
+  rawUsage?: {
+    input_tokens?: number;
+    cached_input_tokens?: number;
+    cache_write_input_tokens?: number;
+    output_tokens?: number;
+    reasoning_output_tokens?: number;
+    total_tokens?: number;
+    input_tokens_details?: Record<string, number>;
+    output_tokens_details?: Record<string, number>;
+  };
   model?: string;
   inputTokens: number;
   cachedInputTokens?: number;
@@ -31,6 +53,9 @@ export interface Settings {
   networkAccessEnabled: boolean;
 }
 export interface Turn {
+  nativeTurnId?: string;
+  /** Confirmed by the SDK turn.started event, not by saving a web submission. */
+  codexAccepted?: boolean;
   id: string;
   prompt: string;
   images: string[];
@@ -38,6 +63,8 @@ export interface Turn {
   phase?: 'starting' | 'recovering' | 'running' | 'finalizing';
   items: ThreadItem[];
   usage?: Usage;
+  /** Original SDK usage before normalization to per-request token totals. */
+  sdkUsage?: Usage;
   error?: string;
   startedAt: string;
   completedAt?: string;

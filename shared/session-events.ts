@@ -1,4 +1,5 @@
 import type { AgentEvent, Session, Turn } from './types.js';
+import { sumRequestUsage } from './usage.js';
 
 /** Apply SDK lifecycle events consistently in persistent state and the browser. */
 export function applyTurnEvent(turn: Turn, event: AgentEvent): Turn {
@@ -7,10 +8,16 @@ export function applyTurnEvent(turn: Turn, event: AgentEvent): Turn {
       if (event.retry === null) return { ...turn, retry: undefined };
       if (turn.status === 'completed' || turn.status === 'cancelled') return turn;
       return { ...turn, status: 'running', phase: 'running', error: undefined, retry: { ...event.retry } };
-    case 'runtime.context_usage':
-      return { ...turn, contextUsage: [...(turn.contextUsage ?? []), { ...event.contextUsage }] };
+    case 'runtime.context_usage': {
+      const call = event.contextUsage;
+      const calls = [...(turn.contextUsage ?? [])];
+      const index = calls.findIndex(previous => call.responseId ? previous.responseId === call.responseId
+        : call.requestId ? previous.requestId === call.requestId : false);
+      if (index >= 0) calls[index] = { ...call }; else calls.push({ ...call });
+      return { ...turn, contextUsage: calls, usage: sumRequestUsage(calls) };
+    }
     case 'turn.started':
-      return { ...turn, status: 'running', phase: 'running', retry: undefined };
+      return { ...turn, codexAccepted: true, status: 'running', phase: 'running', retry: undefined };
     case 'item.started': case 'item.updated': case 'item.completed': {
       const items = [...turn.items];
       const index = items.findIndex(item => item.id === event.item.id);
@@ -23,7 +30,7 @@ export function applyTurnEvent(turn: Turn, event: AgentEvent): Turn {
       return { ...turn, items, itemTimestamps, phase: turn.phase === 'finalizing' ? 'finalizing' : 'running' };
     }
     case 'turn.completed':
-      return { ...turn, status: 'completed', phase: 'finalizing', usage: event.usage, error: undefined, retry: undefined };
+      return { ...turn, status: 'completed', phase: 'finalizing', sdkUsage: event.usage, usage: sumRequestUsage(turn.contextUsage), error: undefined, retry: undefined };
     case 'turn.failed':
       return { ...turn, status: 'failed', phase: 'finalizing', error: event.error.message, retry: undefined };
     case 'error':

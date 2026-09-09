@@ -9,6 +9,16 @@ function applyStream(current: Session | null, data: StreamMessage): Session | nu
   return applySdkEvent(current, data.turnId, data.event);
 }
 
+function preserveTransientFailures(canonical: Session, current: Session | null): Session {
+  if (!current || current.id !== canonical.id) return canonical;
+  const missing = current.turns.filter(turn =>
+    (turn.status === 'failed' || turn.status === 'cancelled')
+    && !canonical.turns.some(other => other.id === turn.id
+      || (turn.nativeTurnId && (other.id === turn.nativeTurnId || other.nativeTurnId === turn.nativeTurnId))));
+  if (!missing.length) return canonical;
+  return { ...canonical, turns: [...canonical.turns, ...missing].sort((a, b) => a.startedAt.localeCompare(b.startedAt)) };
+}
+
 export function useSessionStream({ selected, enabled, onState, onError }: {
   selected: string | null;
   enabled: boolean;
@@ -24,6 +34,7 @@ export function useSessionStream({ selected, enabled, onState, onError }: {
     if (!selected) { localStorage.removeItem('codex-session'); return; }
     localStorage.setItem('codex-session', selected);
     let alive = true;
+    let revision = 0;
     const source = new EventSource(`/api/sessions/${selected}/events`);
     source.onopen = () => { if (alive) setConnected(true); };
     source.onerror = () => { if (alive) setConnected(false); };
@@ -31,8 +42,22 @@ export function useSessionStream({ selected, enabled, onState, onError }: {
       if (!alive) return;
       try {
         const data = JSON.parse(event.data) as StreamMessage;
-        setSession(current => applyStream(current, data));
+        const eventRevision = ++revision;
+        let applied: Session | null = null;
+        setSession(current => {
+          applied = data.type === 'state' ? preserveTransientFailures(data.session, current) : applyStream(current, data);
+          return applied;
+        });
         if (data.type === 'state') void onState().catch(() => {});
+        if (data.type === 'state' && data.session.status !== 'running') {
+          // Native history now includes the completed call and its block costs.
+          // Keep a failed local submission visible until a real page reload.
+          void api<Session>(`/api/sessions/${selected}`).then(value => {
+            if (!alive || revision !== eventRevision) return;
+            setSession(current => alive && revision === eventRevision && current === applied
+              ? preserveTransientFailures(value, current) : current);
+          }).catch(error => { if (alive && revision === eventRevision) onError(errorMessage(error)); });
+        }
       } catch { onError('会话事件解析失败，请刷新页面重试。'); }
     };
     // The SSE snapshot is authoritative; this request also exposes missing sessions.

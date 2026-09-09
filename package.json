@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit",
     "capture:http": "tsx server/diagnostics/capture-demo.ts",
     "credentials:import": "tsx server/connections/import-local.ts",
+    "credentials:migrate": "tsx server/connections/migrate-credentials.ts",
     "cliproxyapi": "node scripts/cliproxyapi/manage.mjs",
     "e2b:build": "node scripts/e2b/build-template.mjs && node scripts/e2b/verify-template.mjs",
     "kubernetes:configure": "node scripts/kubernetes-admin.mjs"
@@ -23,6 +24,7 @@
     "@openai/codex-sdk": "0.153.4",
     "e2b": "2.46.1",
     "hono": "4.13.3",
+    "js-tiktoken": "1.0.21",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-markdown": "10.1.0",

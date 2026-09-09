@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process';
-import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseEnv } from 'node:util';
 import type { ConnectionInventory } from '../../shared/connection-types.js';
 import { HttpError } from '../core/errors.js';
 import { importLarkCredentials } from './lark-credentials.js';
@@ -84,40 +85,37 @@ function glabUser(yaml: string, host: string) {
   }
   return '';
 }
-export interface ConnectionStoreOptions { directory?: string; keyPath?: string; home?: string; command?: LocalCommand }
+export interface ConnectionStoreOptions { directory?: string; home?: string; command?: LocalCommand }
 export class ConnectionStore {
   private directory: string;
-  private keyPath: string;
   private home: string;
   private command: LocalCommand;
   private tail: Promise<unknown> = Promise.resolve();
   private meegleRefresh?: Promise<Awaited<ReturnType<typeof readMeegleCredentials>>>;
   constructor(options: ConnectionStoreOptions = {}) {
     this.directory = options.directory ?? fileURLToPath(new URL('../../data/credentials/', import.meta.url));
-    this.keyPath = options.keyPath ?? join(homedir(), '.config/swarm-hive/credentials.key');
     this.home = options.home ?? homedir(); this.command = options.command ?? localCommand;
   }
-  private async key(create = false) {
-    if (create) {
-      await mkdir(dirname(this.keyPath), { recursive: true, mode: 0o700 });
-      try { await writeFile(this.keyPath, randomBytes(32), { mode: 0o600, flag: 'wx' }); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-    }
-    const info = await lstat(this.keyPath);
-    if (!info.isFile() || info.isSymbolicLink()) throw new Error('凭据加密密钥文件无效');
-    await chmod(this.keyPath, 0o600);
-    const key = await readFile(this.keyPath); if (key.length !== 32) throw new Error('凭据加密密钥长度无效'); return key;
-  }
   async readBundle(): Promise<ConnectionBundle | null> {
-    let input: Buffer;
-    try { input = await readFile(join(this.directory, 'store.enc')); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw new HttpError(500, '无法读取凭据存储'); }
+    let input: string;
+    try { input = await readFile(join(this.directory, '.env'), 'utf8'); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new HttpError(500, '无法读取凭据存储');
+      try { await readFile(join(this.directory, 'store.enc')); }
+      catch (legacyError) {
+        if ((legacyError as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw new HttpError(500, '无法读取旧凭据存储');
+      }
+      throw new HttpError(500, '请在宿主机运行 pnpm credentials:migrate，将旧凭据迁移至 .env');
+    }
     try {
-      if (input.subarray(0, 4).toString() !== 'SWC1') throw Error('format');
-      const decipher = createDecipheriv('aes-256-gcm', await this.key(), input.subarray(4, 16));
-      decipher.setAAD(Buffer.from('swarm-hive-connections-v1')); decipher.setAuthTag(input.subarray(16, 32));
-      return JSON.parse(Buffer.concat([decipher.update(input.subarray(32)), decipher.final()]).toString());
-    } catch { throw new HttpError(500, '凭据无法解密，请检查宿主密钥文件'); }
+      const json = parseEnv(input).SWARM_HIVE_CONNECTIONS_JSON;
+      if (!json) throw Error('format');
+      const bundle = JSON.parse(json);
+      if (!bundle || typeof bundle.importedAt !== 'string' || !Array.isArray(bundle.connections)
+        || ['glabConfig', 'gitCredentials', 'gitConfig'].some(key => typeof bundle[key] !== 'string')) throw Error('format');
+      return bundle;
+    } catch { throw new HttpError(500, '凭据 .env 格式无效'); }
   }
   async list(): Promise<ConnectionInventory> {
     await this.tail;
@@ -214,15 +212,18 @@ export class ConnectionStore {
         ...(kubernetes ? { kubernetesPolicy: kubernetes.policy } : {}),
         cliFiles: { ...kubernetes?.files, ...lark?.files, ...(meegle ? { 'meegle/config.json': Buffer.from(meegle.configText).toString('base64') } : {}) } };
       this.meegleRefresh = undefined;
-      await mkdir(this.directory, { recursive: true, mode: 0o700 }); await chmod(this.directory, 0o700);
-      const nonce = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', await this.key(true), nonce);
-      cipher.setAAD(Buffer.from('swarm-hive-connections-v1'));
-      const encrypted = Buffer.concat([cipher.update(JSON.stringify(bundle)), cipher.final()]);
-      const data = Buffer.concat([Buffer.from('SWC1'), nonce, cipher.getAuthTag(), encrypted]);
-      const temp = join(this.directory, `store-${randomUUID()}.tmp`);
-      await writeFile(temp, data, { mode: 0o600, flag: 'wx' }); await rename(temp, join(this.directory, 'store.enc'));
+      await writeConnectionBundle(this.directory, bundle);
       return { configured: true, importedAt: bundle.importedAt, scope: 'all-projects' as const, connections };
     });
     this.tail = operation.catch(() => {}); return operation;
   }
+}
+
+export async function writeConnectionBundle(directory: string, bundle: ConnectionBundle) {
+  await mkdir(directory, { recursive: true, mode: 0o700 }); await chmod(directory, 0o700);
+  // JSON escapes newlines; escape apostrophes so dotenv single quotes are lossless.
+  const json = JSON.stringify(bundle).replaceAll("'", '\\u0027');
+  const temp = join(directory, `store-${randomUUID()}.tmp`);
+  await writeFile(temp, `SWARM_HIVE_CONNECTIONS_JSON='${json}'\n`, { mode: 0o600, flag: 'wx' });
+  await rename(temp, join(directory, '.env'));
 }

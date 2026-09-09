@@ -14,7 +14,7 @@ export const MODEL_TOKEN_RATES: Readonly<Record<string, ModelTokenRates>> = {
 
 export function estimateTokenCostUsd(model: string | undefined, usage: { inputTokens: number; cachedInputTokens?: number; outputTokens?: number }): number | null {
   const rates = model ? MODEL_TOKEN_RATES[model] : undefined;
-  if (!rates || usage.outputTokens === undefined) return null;
+  if (!rates || usage.outputTokens === undefined || usage.cachedInputTokens === undefined) return null;
   const cached = Math.min(Math.max(usage.cachedInputTokens ?? 0, 0), usage.inputTokens);
   return ((usage.inputTokens - cached) * rates.inputUsdPerMillion + cached * rates.cachedInputUsdPerMillion + usage.outputTokens * rates.outputUsdPerMillion) / 1_000_000;
 }

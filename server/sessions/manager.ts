@@ -250,6 +250,9 @@ export class SessionManager {
       }
       if (stored.id === liveId) { stored.nativeTurnId = turn.id; if (!stored.prompt) stored.prompt = turn.prompt; return stored; }
       return { ...turn, id: stored.id, nativeTurnId: turn.id, sdkUsage: stored.sdkUsage,
+        // SDK failures can include transport/observer errors absent from the
+        // rollout. Reading history must not turn a durable failure into success.
+        ...(stored.status === 'failed' ? { status: stored.status, error: stored.error ?? turn.error } : {}),
         contextUsage: turn.contextUsage?.map(call => {
           const old = stored.contextUsage?.find(value => call.responseId && value.responseId === call.responseId);
           return old ? { ...old, ...call } : call;
@@ -435,7 +438,7 @@ export class SessionManager {
     // Persist execution locators and numeric billing evidence, never a second message history.
     const turns = session.turns.map(turn => ({
       id: turn.id, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
-      execution: turn.execution, codexAccepted: turn.codexAccepted,
+      execution: turn.execution, codexAccepted: turn.codexAccepted, error: turn.error,
       approvals: turn.execution?.state !== 'terminal' ? turn.approvals : undefined,
       prompt: '', images: [], items: [], usage: turn.usage, sdkUsage: turn.sdkUsage,
       contextUsage: turn.contextUsage?.map(({ blockEstimates, blockTokenizer, blockTexts, ...call }) => call),

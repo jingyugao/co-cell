@@ -150,9 +150,11 @@ export function parseNativeHistory(source, includeBlocks = false) {
       turn.usage = usage(Object.fromEntries(Object.keys(u).map(key => [key, (turn.usage?.[key] ?? 0) + u[key]])));
     }
     if (record.type === 'event_msg' && ['task_complete', 'turn_aborted', 'task_failed'].includes(p.type)) {
-      turn.status = p.type === 'task_complete' ? 'completed' : p.type === 'turn_aborted' ? 'cancelled' : 'failed';
+      // Recent Codex rollouts terminate failed requests with task_complete
+      // plus an error payload, even though the SDK emits turn.failed.
+      turn.status = p.type === 'turn_aborted' ? 'cancelled' : p.type === 'task_failed' || p.error != null ? 'failed' : 'completed';
       turn.completedAt = timestamp;
-      if (p.type === 'task_failed') turn.error = p.message ?? p.error ?? 'Codex 任务失败';
+      if (turn.status === 'failed') turn.error = p.message ?? (typeof p.error === 'string' ? p.error : p.error?.message) ?? 'Codex 任务失败';
       if (p.last_agent_message && !turn.items.some(item => item.type === 'agent_message' && item.text === p.last_agent_message)) upsert(turn, { id: `native-final-${turn.id}`, type: 'agent_message', text: p.last_agent_message }, timestamp);
     }
   }

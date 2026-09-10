@@ -21,3 +21,29 @@ services:
       - ${MEEGLE_HOME:-/home/example/.meegle}:/root/.meegle
     ports:
       - "3001:3001"
+  litellm:
+    profiles: [litellm]
+    image: ghcr.io/berriai/litellm:v1.100.0
+    restart: unless-stopped
+    user: ${LITELLM_UID:-1000}:${LITELLM_GID:-1000}
+    entrypoint: ["python", "/config/start.py"]
+    command: ["--config", "/config/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
+    env_file:
+      - ${LITELLM_DATA_DIR:-./data/litellm}/proxy.env
+    environment:
+      HOME: /tmp
+      CHATGPT_TOKEN_DIR: /auths
+      CHATGPT_DEFAULT_INSTRUCTIONS: " "
+      LITELLM_LOG: ERROR
+      LITELLM_TELEMETRY: "False"
+    ports:
+      - "${LITELLM_LISTEN:-127.0.0.1}:8317:4000"
+    volumes:
+      - ${LITELLM_DATA_DIR:-./data/litellm}/config.yaml:/config/config.yaml:ro
+      - ./scripts/litellm/start.py:/config/start.py:ro
+      - ${LITELLM_DATA_DIR:-./data/litellm}/auths:/auths:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

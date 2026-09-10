@@ -39,7 +39,7 @@ const proxyConfig = process.env.OPENAI_BASE_URL ? {
       wire_api: 'responses',
       supports_websockets: false,
       ...(apiKey ? { env_key: 'CODEX_API_KEY' } : { requires_openai_auth: true }),
-      ...(proxyKind === 'cliproxyapi' ? { request_max_retries: 0, stream_max_retries: 0 } : {}),
+      ...(proxyKind === 'cliproxyapi' || proxyKind === 'litellm' ? { request_max_retries: 0, stream_max_retries: 0 } : {}),
     },
   },
 } : {};

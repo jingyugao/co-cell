@@ -80,9 +80,9 @@ export function createSameChannelResolver({ upstreamBaseUrl, fetchImpl = fetch, 
   };
 }
 
-/** CLIProxyAPI owns upstream retries; New API needs its channel-pinning resolver. */
+/** Only New API uses application retries with its channel-pinning resolver. */
 export function createOverloadRetryOptions({ proxyKind = 'new-api', baseUrl }, onDiagnostic) {
-  if (proxyKind === 'cliproxyapi') return false;
+  if (proxyKind === 'cliproxyapi' || proxyKind === 'litellm') return false;
   if (proxyKind !== 'new-api') throw new Error('Unsupported model proxy kind');
   return { resolveRetryHeaders: createSameChannelResolver({ upstreamBaseUrl: baseUrl, onDiagnostic }) };
 }

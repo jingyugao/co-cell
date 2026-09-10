@@ -61,7 +61,7 @@ export default function ConnectionsPage({ onMenu, onBack }: Props) {
       {error && <p className="connections-error" role="alert">{error}</p>}
       {message && <p className="connections-message" role="status">{message}</p>}
       <section className="connections-overview" aria-label="凭据同步状态" aria-busy={loading}>
-        <div className="connections-storage"><span className="connections-lock" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" /></svg></span><div><span>凭据存储</span><strong>{loading ? '正在读取…' : inventory?.configured ? '已加密保存' : inventory ? '尚未同步' : '暂未读取到配置'}</strong><p>{inventory?.importedAt ? `最近同步 ${date(inventory.importedAt)}` : '同步后持久化保存在当前服务中。'}</p></div></div>
+        <div className="connections-storage"><span className="connections-lock" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" /></svg></span><div><span>凭据存储</span><strong>{loading ? '正在读取…' : inventory?.configured ? '已明文保存至 .env' : inventory ? '尚未同步' : '暂未读取到配置'}</strong><p>{inventory?.importedAt ? `最近同步 ${date(inventory.importedAt)}` : '同步后以明文持久化保存在当前服务的 .env 文件中。'}</p></div></div>
         <div className="connections-scope"><span>使用范围</span><strong>所有项目沙箱</strong><p>下一轮任务生效，包含已有沙箱。</p></div>
         <div className="connections-count"><strong>{inventory?.connections.length ?? '—'}</strong><span>项连接配置</span></div>
       </section>

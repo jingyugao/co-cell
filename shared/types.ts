@@ -10,7 +10,40 @@ export interface RetryState {
   nextRetryAt: string;
   status: 'waiting' | 'retrying';
 }
-export type AgentEvent = ThreadEvent | { type: 'runtime.retry'; retry: RetryState | null };
+/** Actual input size of the most recent model request, as reported by Responses. */
+export interface ContextUsage {
+  segment?: number;
+  outputItemIds?: string[];
+  /** Transient native-reader input; removed before returning/persisting estimates. */
+  blockTexts?: Array<{ id: string; label: string; text: string; turnId?: string; direction: 'input' | 'output' }>;
+  /** Local text tokenizer estimates; not provider-attributed message usage. */
+  blockEstimates?: import('./block-costs').BlockEstimate[];
+  blockTokenizer?: string;
+  requestId?: string;
+  responseId?: string;
+  requestIds?: Record<string, string>;
+  requestAttempt?: number;
+  source?: 'responses' | 'rollout';
+  /** Numeric token counters retained from the provider for later recalculation. */
+  rawUsage?: {
+    input_tokens?: number;
+    cached_input_tokens?: number;
+    cache_write_input_tokens?: number;
+    output_tokens?: number;
+    reasoning_output_tokens?: number;
+    total_tokens?: number;
+    input_tokens_details?: Record<string, number>;
+    output_tokens_details?: Record<string, number>;
+  };
+  model?: string;
+  inputTokens: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  observedAt: string;
+}
+export type AgentEvent = ThreadEvent
+  | { type: 'runtime.retry'; retry: RetryState | null }
+  | { type: 'runtime.context_usage'; contextUsage: ContextUsage };
 export interface Settings {
   executionMode?: 'local' | 'e2b';
   workingDirectory: string;
@@ -21,6 +54,11 @@ export interface Settings {
   networkAccessEnabled: boolean;
 }
 export interface Turn {
+  segment?: number;
+  compactions?: Array<{ segment: number; timestamp: string; beforeItemIndex: number }>;
+  nativeTurnId?: string;
+  /** Confirmed by the SDK turn.started event, not by saving a web submission. */
+  codexAccepted?: boolean;
   id: string;
   prompt: string;
   images: string[];
@@ -28,11 +66,15 @@ export interface Turn {
   phase?: 'starting' | 'recovering' | 'running' | 'finalizing';
   items: ThreadItem[];
   usage?: Usage;
+  /** Original SDK usage before normalization to per-request token totals. */
+  sdkUsage?: Usage;
   error?: string;
   startedAt: string;
   completedAt?: string;
   /** Timestamp for each streamed SDK item, keyed by item id. */
   itemTimestamps?: Record<string, string>;
+  /** One entry for each completed model request in this turn. */
+  contextUsage?: ContextUsage[];
   retry?: RetryState;
   approvals?: UserApproval[];
   /** Durable reference to a Codex worker that runs inside an E2B sandbox. */
@@ -74,6 +116,8 @@ export interface Session {
   createdAt: string;
   updatedAt: string;
   turns: Turn[];
+  /** Most recently observed model context length. */
+  contextUsage?: ContextUsage;
   sandbox?: SandboxState;
 }
 export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };

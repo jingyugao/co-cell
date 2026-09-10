@@ -32,7 +32,8 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
     if (input.settings?.executionMode) requireAllowedExecution(input.settings.executionMode);
     return c.json(await manager.create(input), 201);
   });
-  app.get('/api/sessions/:id', c => c.json(manager.get(c.req.param('id'))));
+  app.get('/api/sessions/:id', async c => c.json(await manager.read(c.req.param('id'))));
+  app.get('/api/sessions/:id/billing', async c => c.json(await manager.billing(c.req.param('id'))));
   app.patch('/api/sessions/:id', async c => {
     const input = z.object({ title: z.string().trim().min(1).max(100).optional(), settings: settingsSchema.optional(), archived: z.boolean().optional() }).strict().parse(await c.req.json());
     requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);
@@ -56,9 +57,9 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   app.post('/api/sessions/:id/turns/:turnId/approvals/:approvalId', async c => {
     return c.json(await manager.resolveApproval(c.req.param('id'), c.req.param('turnId'), c.req.param('approvalId'), await c.req.json()));
   });
-  app.get('/api/sessions/:id/events', c => {
+  app.get('/api/sessions/:id/events', async c => {
     const id = c.req.param('id');
-    manager.get(id);
+    await manager.read(id);
     return streamSSE(c, async stream => {
       let queue: Promise<void> = Promise.resolve();
       let closed = false;

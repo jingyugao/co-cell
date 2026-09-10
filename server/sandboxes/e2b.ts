@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
 import { Sandbox, type CommandHandle, type ConnectionOpts } from 'e2b';
-import type { AgentEvent } from '../../shared/types.js';
+import type { AgentEvent, ContextUsage } from '../../shared/types.js';
 import type { RequestUserApproval } from '../../shared/approval-types.js';
 import type { Changes, RawToolPage, Session, Turn } from '../../shared/types.js';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
@@ -31,6 +31,7 @@ export interface E2BRuntime {
   preview(session: WorkspaceTarget, port: number): Promise<string>;
   file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
   rawTools(session: ThreadWorkspace, cursor?: number): Promise<RawToolPage>;
+  history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<Turn[]>;
   delete(session: WorkspaceTarget): Promise<void>;
   close(): Promise<void>;
 }
@@ -452,7 +453,7 @@ export class E2BCodexRuntime implements E2BRuntime {
               improvementTasks.set(requestId, task);
             }
           } else if (event.type === 'runtime.diagnostic') {
-            const allowed = ['event', 'requestId', 'method', 'path', 'upstream', 'status', 'httpStatus', 'durationMs', 'requestBytes', 'responseBytes', 'model', 'inputItems', 'responseId', 'upstreamRequestId', 'requestIds', 'error', 'message', 'code', 'terminalEvent', 'terminationReason', 'reason', 'incompleteReason', 'transportComplete', 'contentType', 'contentEncoding', 'sseEvents', 'parseError', 'clientAborted', 'requestAttempt', 'attempt', 'maxRetries', 'delayMs', 'nextRetryAt', 'channelId'];
+            const allowed = ['event', 'requestId', 'method', 'path', 'upstream', 'status', 'httpStatus', 'durationMs', 'requestBytes', 'responseBytes', 'model', 'inputItems', 'responseId', 'upstreamRequestId', 'requestIds', 'error', 'message', 'code', 'terminalEvent', 'terminationReason', 'reason', 'incompleteReason', 'transportComplete', 'contentType', 'contentEncoding', 'sseEvents', 'parseError', 'clientAborted', 'requestAttempt', 'attempt', 'maxRetries', 'delayMs', 'nextRetryAt', 'channelId', 'inputTokens', 'cachedInputTokens', 'outputTokens', 'rawUsage'];
             const diagnostic = event.diagnostic;
             if (diagnostic && typeof diagnostic === 'object') {
               const fields = Object.fromEntries(allowed.filter(key => key in diagnostic).map(key => [key, diagnostic[key]]));
@@ -460,6 +461,32 @@ export class E2BCodexRuntime implements E2BRuntime {
                 ...fields, source: 'e2b-proxy', sessionId: session.id, projectId: session.projectId,
                 turnId: turn.id, threadId: session.threadId, sandboxId: entry.metadata.id, model: session.settings.model
               });
+              const inputTokens = diagnostic.inputTokens;
+              const cachedInputTokens = diagnostic.cachedInputTokens;
+              const outputTokens = diagnostic.outputTokens;
+              if (diagnostic.event === 'api.completed' && typeof inputTokens === 'number' && Number.isSafeInteger(inputTokens) && inputTokens >= 0) {
+                yield {
+                  type: 'runtime.context_usage',
+                  contextUsage: {
+                    model: session.settings.model,
+                    source: 'responses',
+                    ...(typeof diagnostic.requestId === 'string' ? { requestId: diagnostic.requestId } : {}),
+                    ...(typeof diagnostic.responseId === 'string' ? { responseId: diagnostic.responseId } : {}),
+                    ...(typeof diagnostic.requestAttempt === 'number' && Number.isSafeInteger(diagnostic.requestAttempt) && diagnostic.requestAttempt > 0
+                      ? { requestAttempt: diagnostic.requestAttempt } : {}),
+                    ...(diagnostic.requestIds && typeof diagnostic.requestIds === 'object'
+                      ? { requestIds: Object.fromEntries(Object.entries(diagnostic.requestIds).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) } : {}),
+                    ...(diagnostic.rawUsage && typeof diagnostic.rawUsage === 'object'
+                      ? { rawUsage: diagnostic.rawUsage as ContextUsage['rawUsage'] } : {}),
+                    inputTokens,
+                    ...(typeof cachedInputTokens === 'number' && Number.isSafeInteger(cachedInputTokens) && cachedInputTokens >= 0
+                      ? { cachedInputTokens } : {}),
+                    ...(typeof outputTokens === 'number' && Number.isSafeInteger(outputTokens) && outputTokens >= 0
+                      ? { outputTokens } : {}),
+                    observedAt: new Date().toISOString(),
+                  },
+                };
+              }
             }
           } else if (!event.type.startsWith('runtime.worker_')) {
             yield event as unknown as AgentEvent;
@@ -760,6 +787,11 @@ export class E2BCodexRuntime implements E2BRuntime {
         void this.renew(entry).catch(error => this.pauseError(entry, error)).finally(() => { renewing = false; });
       }, Math.max(1000, Math.min(60_000, this.timeoutMs / 3)));
       renewal.unref();
+      if (!turn.prompt) {
+        const input = JSON.parse(await entry.sandbox.files.read(`${this.runDirectory(turn)}/input.json`, { user: 'user', signal }));
+        turn.prompt = typeof input.prompt === 'string' ? input.prompt : '';
+        turn.images = Array.isArray(input.images) ? input.images.filter((path: unknown) => typeof path === 'string') : [];
+      }
       turn.execution.sandboxId = entry.metadata.id;
       turn.execution.state = 'running';
       await onExecution?.();
@@ -793,6 +825,12 @@ export class E2BCodexRuntime implements E2BRuntime {
     try {
       if (entry.disposed) throw new Error('E2B 项目沙箱正在删除');
       if (!entry.initialized) throw new Error('E2B Codex 尚未完成初始化，请等待当前任务启动后重试');
+      if (mode === 'history' || mode === 'billing') {
+        // Upgrade the reader independently of worker/model startup for existing threads.
+        const signal = AbortSignal.timeout(30_000);
+        await this.writeAtomic(entry, `${RUNTIME}/native-history.mjs`, await readFile(new URL('../execution/native-history.mjs', import.meta.url), 'utf8'), signal);
+        await this.writeAtomic(entry, `${RUNTIME}/e2b-inspect.mjs`, await readFile(new URL('../execution/worker/e2b-inspect.mjs', import.meta.url), 'utf8'), signal);
+      }
       if (Date.now() - entry.renewedAt > IDLE_SCAN_MS) {
         await this.renew(entry);
       }
@@ -860,6 +898,11 @@ export class E2BCodexRuntime implements E2BRuntime {
     };
     const page = await this.inspect<RawToolPage>(session, 'raw', [session.threadId, String(cursor)]);
     return { ...page, location: 'e2b', sandboxId: session.sandbox.id };
+  }
+  async history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<Turn[]> {
+    if (!session.threadId) return [];
+    if (!session.sandbox) throw new Error('Codex 会话对应的沙箱不可用');
+    return this.inspect<Turn[]>(session, includeBlocks ? 'billing' : 'history', [session.threadId]);
   }
   async delete(session: WorkspaceTarget) {
     const key = ownerKey(session);

@@ -16,7 +16,7 @@ export interface MeegleCredentialOptions {
   now?: () => number;
 }
 export interface MeegleCredentials {
-  /** Private: persist encrypted or send through a sandbox file API only. */
+  /** Private: persist in the credential store or send through a sandbox file API only. */
   configText: string;
   metadata: { profile: string; host: string; authenticated: true; expiresAt?: string };
 }
@@ -70,7 +70,10 @@ export async function readMeegleCredentials(options: MeegleCredentialOptions): P
     // Official auth status resolves expiration, refreshes under the CLI's file
     // lock and validates the token server-side. Read the credential file AFTER it.
     const status = JSON.parse(await options.command('meegle', ['--profile', profile, 'auth', 'status', '--format', 'json']));
-    if (status.authenticated !== true || hostName(status.host) !== host) throw failure();
+    if (status.authenticated !== true) {
+      throw new MeegleAuthenticationError('Meegle 登录已失效，请重新登录；使用 OAuth 自动刷新时请移除 MEEGLE_USER_ACCESS_TOKEN 和配置中的 user_access_token');
+    }
+    if (hostName(status.host) !== host) throw failure();
     let accessToken = env.MEEGLE_USER_ACCESS_TOKEN || expanded(source.user_access_token, env);
     let expiresAt: string | undefined;
     if (!accessToken) {
@@ -100,5 +103,7 @@ export async function readMeegleCredentials(options: MeegleCredentialOptions): P
       configText: JSON.stringify({ current: profile, profiles: { [profile]: exported } }, null, 2),
       metadata: { profile, host, authenticated: true, ...(expiresAt ? { expiresAt } : {}) },
     };
-  } catch { throw failure(); }
+  } catch (error) { if (error instanceof MeegleAuthenticationError) throw error; throw failure(); }
 }
+
+class MeegleAuthenticationError extends Error {}

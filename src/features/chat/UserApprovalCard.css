@@ -10,5 +10,7 @@
 .user-approval-card pre{margin:0;padding:12px;border:1px solid #e4dfd0;border-radius:6px;background:#fffefa;overflow:auto;max-height:440px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.8}
 .user-approval-note{font-size:11px;color:#7d765f;line-height:1.8;margin:12px 0}
 .user-approval-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.user-approval-feedback{display:flex;flex-direction:column;gap:6px;margin:12px 0;font-size:11px;color:#7a816e}
+.user-approval-feedback textarea{box-sizing:border-box;width:100%;resize:vertical;border:1px solid #d7dcca;border-radius:6px;background:#fffefa;padding:8px;font:inherit;color:#333;line-height:1.6}
 .user-approval-actions>span,.user-approval-time{font-size:10px;color:#828873}
 .user-approval-time{display:block;margin-top:12px}

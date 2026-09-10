@@ -10,5 +10,7 @@ export interface UserApproval extends UserApprovalInput {
   status: 'pending' | 'approved' | 'rejected' | 'cancelled' | 'expired';
   createdAt: string;
   resolvedAt?: string;
+  /** Optional feedback supplied when the user declines the proposed action. */
+  rejectionReason?: string;
 }
 export type RequestUserApproval = (requestId: string, input: unknown, signal: AbortSignal) => Promise<UserApproval>;

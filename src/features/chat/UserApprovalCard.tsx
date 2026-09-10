@@ -34,6 +34,8 @@ export default function UserApprovalCard({ approval, sessionId, turnId, turnStat
 } & MarkdownResources) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectionReason, setRejectionReason] = useState('');
   const submitting = useRef(false);
   const pending = approval.status === 'pending' && turnStatus === 'running';
   const label = approval.status === 'pending' && !pending ? '任务已结束，确认请求已失效' : statusLabels[approval.status];
@@ -44,7 +46,7 @@ export default function UserApprovalCard({ approval, sessionId, turnId, turnStat
     setSaving(true); setError('');
     try {
       const session = await api<Session>(`/api/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/approvals/${encodeURIComponent(approval.id)}`, {
-        method: 'POST', body: JSON.stringify({ decision }),
+        method: 'POST', body: JSON.stringify(decision === 'rejected' ? { decision, rejectionReason } : { decision }),
       });
       const resolved = session.turns.find(turn => turn.id === turnId)?.approvals?.find(item => item.id === approval.id);
       if (!resolved || resolved.status === 'pending') throw new Error('尚未收到确认结果，请重试。');
@@ -62,9 +64,11 @@ export default function UserApprovalCard({ approval, sessionId, turnId, turnStat
     <UserApprovalDetails approval={approval} projectId={projectId} workingDirectory={workingDirectory} onOpenFile={onOpenFile} />
     {pending && <>
       <p className="user-approval-note">同意仅适用于本次展示的目标和操作内容。Agent 正在等待你的决定。</p>
-      <div className="user-approval-actions"><button type="button" className="secondary-button" disabled={saving} onClick={() => void decide('rejected')}>拒绝</button><button type="button" className="primary-button" disabled={saving} onClick={() => void decide('approved')}>同意执行</button>{saving && <span role="status">正在保存决定…</span>}</div>
+      {rejecting && <label className="user-approval-feedback">拒绝原因或建议（将告知 Agent，可选）<textarea value={rejectionReason} maxLength={4000} disabled={saving} rows={3} autoFocus placeholder="例如：先在 UAT 验证，并附上回滚方案" onChange={event => setRejectionReason(event.target.value)} /></label>}
+      <div className="user-approval-actions">{rejecting ? <><button type="button" className="secondary-button" disabled={saving} onClick={() => { setRejecting(false); setRejectionReason(''); }}>取消</button><button type="button" className="secondary-button" disabled={saving} onClick={() => void decide('rejected')}>确认拒绝</button></> : <button type="button" className="secondary-button" disabled={saving} onClick={() => setRejecting(true)}>拒绝</button>}<button type="button" className="primary-button" disabled={saving} onClick={() => void decide('approved')}>同意执行</button>{saving && <span role="status">正在保存决定…</span>}</div>
     </>}
     {approval.status === 'approved' && <p className="user-approval-note">已授权执行；实际执行结果见后续工具记录。</p>}
+    {approval.status === 'rejected' && approval.rejectionReason && <p className="user-approval-note">拒绝原因／建议：{approval.rejectionReason}</p>}
     {approval.resolvedAt && <time className="user-approval-time" dateTime={approval.resolvedAt}>{new Date(approval.resolvedAt).toLocaleString()}</time>}
     {error && pending && <div className="inline-error" role="alert">{error}</div>}
   </section>;

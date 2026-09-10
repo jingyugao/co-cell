@@ -9,8 +9,15 @@ const inputSchema = z.object({
   action: z.string().min(1).max(32_000).refine(value => value.trim().length > 0),
   impact: z.string().trim().min(1).max(8000),
 }).strict();
-export const approvalDecisionSchema = z.object({ decision: z.enum(['approved', 'rejected']) }).strict();
-type Decision = z.infer<typeof approvalDecisionSchema>['decision'];
+export const approvalDecisionSchema = z.object({
+  decision: z.enum(['approved', 'rejected']),
+  rejectionReason: z.string().trim().max(4_000).optional(),
+}).strict().superRefine((value, context) => {
+  if (value.decision === 'approved' && value.rejectionReason) {
+    context.addIssue({ code: 'custom', message: '同意操作不能附带拒绝原因', path: ['rejectionReason'] });
+  }
+});
+type Decision = z.infer<typeof approvalDecisionSchema>;
 type Entry = {
   approval: UserApproval;
   result: Promise<UserApproval>;
@@ -100,7 +107,8 @@ export class ApprovalRequests {
     return result;
   };
 
-  async decide(id: string, decision: Decision): Promise<void> {
+  async decide(id: string, input: Decision): Promise<void> {
+    const { decision, rejectionReason } = input;
     await this.serialize(async () => {
       const approval = this.turn.approvals?.find(item => item.id === id);
       if (!approval) throw new HttpError(404, '确认请求不存在');
@@ -117,6 +125,7 @@ export class ApprovalRequests {
         await this.settle(entry, 'expired');
         throw new HttpError(409, '确认请求已过期，请重新发起');
       }
+      if (decision === 'rejected' && rejectionReason) approval.rejectionReason = rejectionReason;
       await this.settle(entry, decision);
       if ((approval as UserApproval).status !== decision) throw new HttpError(409, '本轮执行已结束，确认请求已失效');
     });

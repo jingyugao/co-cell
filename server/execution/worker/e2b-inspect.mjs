@@ -98,8 +98,8 @@ async function changes() {
   } catch (error) { return { branch: '', files: [], diff: '', error: error.message }; }
 }
 try {
-  const result = mode === 'history'
-    ? await (await import('./native-history.mjs')).readNativeHistory(value, home)
+  const result = (mode === 'history' || mode === 'billing')
+    ? await (await import('./native-history.mjs')).readNativeHistory(value, home, mode === 'billing')
     : await (mode === 'raw' ? raw() : changes());
   process.stdout.write(JSON.stringify(result) + '\n');
 }

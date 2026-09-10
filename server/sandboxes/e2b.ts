@@ -31,7 +31,7 @@ export interface E2BRuntime {
   preview(session: WorkspaceTarget, port: number): Promise<string>;
   file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
   rawTools(session: ThreadWorkspace, cursor?: number): Promise<RawToolPage>;
-  history(session: ThreadWorkspace): Promise<Turn[]>;
+  history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<Turn[]>;
   delete(session: WorkspaceTarget): Promise<void>;
   close(): Promise<void>;
 }
@@ -825,7 +825,7 @@ export class E2BCodexRuntime implements E2BRuntime {
     try {
       if (entry.disposed) throw new Error('E2B 项目沙箱正在删除');
       if (!entry.initialized) throw new Error('E2B Codex 尚未完成初始化，请等待当前任务启动后重试');
-      if (mode === 'history') {
+      if (mode === 'history' || mode === 'billing') {
         // Upgrade the reader independently of worker/model startup for existing threads.
         const signal = AbortSignal.timeout(30_000);
         await this.writeAtomic(entry, `${RUNTIME}/native-history.mjs`, await readFile(new URL('../execution/native-history.mjs', import.meta.url), 'utf8'), signal);
@@ -899,10 +899,10 @@ export class E2BCodexRuntime implements E2BRuntime {
     const page = await this.inspect<RawToolPage>(session, 'raw', [session.threadId, String(cursor)]);
     return { ...page, location: 'e2b', sandboxId: session.sandbox.id };
   }
-  async history(session: ThreadWorkspace): Promise<Turn[]> {
+  async history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<Turn[]> {
     if (!session.threadId) return [];
     if (!session.sandbox) throw new Error('Codex 会话对应的沙箱不可用');
-    return this.inspect<Turn[]>(session, 'history', [session.threadId]);
+    return this.inspect<Turn[]>(session, includeBlocks ? 'billing' : 'history', [session.threadId]);
   }
   async delete(session: WorkspaceTarget) {
     const key = ownerKey(session);

@@ -8,11 +8,13 @@ const text = content => typeof content === 'string' ? content : (Array.isArray(c
 const usage = value => Object.fromEntries(['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'].map(key => [key, Number(value?.[key] ?? 0)]));
 
 /** Project only Codex's persisted events; platform submissions are never inputs. */
-export function parseNativeHistory(source) {
+export function parseNativeHistory(source, includeBlocks = false) {
   const turns = [], byId = new Map(), confirmed = new Set(), responses = new Set();
   let current, model;
+  let segment = 0;
   const blocks = [], pendingOutputs = new Set();
   let firstOutput;
+  let outputItemIds = [];
   const upsert = (turn, item, timestamp) => {
     const index = turn.items.findIndex(existing => existing.id === item.id);
     if (index < 0) turn.items.push(item); else turn.items[index] = item;
@@ -23,8 +25,27 @@ export function parseNativeHistory(source) {
     let record;
     try { record = JSON.parse(line); } catch { throw new Error(`Codex 会话记录第 ${index + 1} 行损坏`); }
     const p = record.payload ?? {}, timestamp = record.timestamp ?? new Date(0).toISOString();
+    if (record.type === 'compacted') {
+      segment++;
+      blocks.length = 0; outputItemIds = []; pendingOutputs.clear(); firstOutput = undefined;
+      const replacement = Array.isArray(p.replacement_history) ? p.replacement_history : [];
+      // Without replacement_history, only the stored summary is known. Do not
+      // carry old messages forward or guess the provider's retained tail.
+      const contents = replacement.length ? replacement : p.message ? [{ type: 'message', role: 'user', content: [{ text: p.message }] }] : [];
+      for (const [position, item] of contents.entries()) {
+        const visible = item.type === 'message' ? text(item.content)
+          : item.type === 'reasoning' ? text(item.summary ?? item.content)
+          : JSON.stringify(Object.fromEntries(['name', 'arguments', 'input', 'output'].filter(key => item[key] !== undefined).map(key => [key, item[key]])));
+        blocks.push({ id: `compact-${segment}-${position}`, label: `${item.role ?? item.type} · ${visible.slice(0, 60)}`, text: visible, turnId: current?.id });
+      }
+      if (current) {
+        current.compactions ??= [];
+        current.compactions.push({ segment, timestamp, beforeItemIndex: current.items.length });
+      }
+      continue;
+    }
     if (record.type === 'session_meta' && p.base_instructions?.text) blocks.push({ id: 'base', label: '基础指令', text: p.base_instructions.text });
-    if (record.type === 'response_item') {
+    if (includeBlocks && record.type === 'response_item') {
       const generated = (p.type === 'message' && p.role === 'assistant') || ['function_call', 'custom_tool_call', 'reasoning'].includes(p.type);
       // Retain only visible content; encrypted reasoning is not plaintext tokens.
       const visible = p.type === 'message' ? text(p.content)
@@ -34,11 +55,12 @@ export function parseNativeHistory(source) {
       if (generated) { firstOutput ??= blocks.length; pendingOutputs.add(block.id); }
       blocks.push(block);
     }
+    if (record.type === 'response_item' && ((p.type === 'message' && p.role === 'assistant') || ['function_call', 'custom_tool_call', 'reasoning'].includes(p.type))) outputItemIds.push(p.call_id ?? p.id ?? `native-item-${index}`);
     if (record.type === 'turn_context') model = p.model ?? model;
     if (record.type === 'event_msg' && p.type === 'task_started') {
       current = byId.get(p.turn_id);
       if (!current) {
-        current = { id: p.turn_id ?? `native-${index}`, prompt: '', images: [], status: 'running', codexAccepted: true, items: [], itemTimestamps: {}, startedAt: timestamp };
+        current = { id: p.turn_id ?? `native-${index}`, prompt: '', images: [], status: 'running', segment, codexAccepted: true, items: [], itemTimestamps: {}, startedAt: timestamp };
         turns.push(current); byId.set(current.id, current);
       }
       continue;
@@ -102,7 +124,8 @@ export function parseNativeHistory(source) {
         ? [{ ...block, direction: 'input' }] : pendingOutputs.has(block.id) ? [{ ...block, direction: 'output' }] : []);
       firstOutput = undefined; pendingOutputs.clear();
       turn.contextUsage ??= [];
-      turn.contextUsage.push({ source: 'rollout', outputItemIds: blockTexts.filter(block => block.direction === 'output').map(block => block.itemId).filter(Boolean), blockTexts, responseId: p.response_id, model, rawUsage: p.usage, inputTokens: u.input_tokens, cachedInputTokens: u.cached_input_tokens, outputTokens: u.output_tokens, observedAt: timestamp });
+      turn.contextUsage.push({ source: 'rollout', segment, outputItemIds, ...(includeBlocks ? { blockTexts } : {}), responseId: p.response_id, model, rawUsage: p.usage, inputTokens: u.input_tokens, cachedInputTokens: u.cached_input_tokens, outputTokens: u.output_tokens, observedAt: timestamp });
+      outputItemIds = [];
       turn.usage = usage(Object.fromEntries(Object.keys(u).map(key => [key, (turn.usage?.[key] ?? 0) + u[key]])));
     }
     if (record.type === 'event_msg' && ['task_complete', 'turn_aborted', 'task_failed'].includes(p.type)) {
@@ -115,7 +138,7 @@ export function parseNativeHistory(source) {
   return turns.filter(turn => turn.prompt || confirmed.has(turn.id));
 }
 
-export async function readNativeHistory(threadId, codexHome = process.env.CODEX_HOME || join(homedir(), '.codex')) {
+export async function readNativeHistory(threadId, codexHome = process.env.CODEX_HOME || join(homedir(), '.codex'), includeBlocks = false) {
   if (!threadId) return [];
   if (!/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(threadId)) throw new Error('Codex thread ID 格式错误');
   let visited = 0;
@@ -154,7 +177,7 @@ export async function readNativeHistory(threadId, codexHome = process.env.CODEX_
         const source = buffer.subarray(0, end + 1).toString('utf8');
         const metadata = JSON.parse(source.slice(0, source.indexOf('\n')));
         if (metadata.type !== 'session_meta' || metadata.payload?.id !== threadId) throw new Error('Codex 会话记录与 thread 不匹配');
-        return parseNativeHistory(source);
+        return parseNativeHistory(source, includeBlocks);
       } finally { await file.close(); }
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }

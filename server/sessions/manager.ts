@@ -15,7 +15,7 @@ import { runTurn, type CodexClient } from '../execution/runner.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { ApprovalRequests, approvalDecisionSchema, cancelPersistedApprovals } from '../approvals/requests.js';
 import { readNativeHistory } from '../execution/native-history.mjs';
-import { estimateNativeBlocks } from '../execution/block-estimates.js';
+import { estimateNativeBlocksAsync } from '../execution/block-estimates.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -45,6 +45,7 @@ export class SessionManager {
   private uploads = new Map<string, Set<Promise<string>>>();
   private closing = false;
   private historyReads = new Map<string, Promise<void>>();
+  private billingReads = new Map<string, Promise<Turn[]>>();
 
   constructor(private client: CodexClient, public readonly dataDirectory: string, public readonly defaults: Settings, private e2b?: E2BRuntime, private e2bWorkingDirectory = '/home/user/workspace', private logger?: RuntimeLog) { this.projects = new ProjectService(dataDirectory); }
 
@@ -204,10 +205,26 @@ export class SessionManager {
     return this.get(id);
   }
 
+  async billing(id: string): Promise<Turn[]> {
+    const pending = this.billingReads.get(id);
+    if (pending) return pending;
+    const operation = this.calculateBilling(id).finally(() => { this.billingReads.delete(id); });
+    this.billingReads.set(id, operation);
+    return operation;
+  }
+
+  private async calculateBilling(id: string): Promise<Turn[]> {
+    const session = this.get(id);
+    if (!session.threadId) return [];
+    const native = session.settings.executionMode === 'e2b'
+      ? await this.e2b!.history(session, true) : await readNativeHistory(session.threadId, undefined, true);
+    return estimateNativeBlocksAsync(native);
+  }
+
   private async loadNativeHistory(id: string) {
     const session = this.lookup(id);
-    const native = estimateNativeBlocks(!session.threadId ? [] : session.settings.executionMode === 'e2b'
-      ? await this.e2b!.history(session) : await readNativeHistory(session.threadId));
+    const native = !session.threadId ? [] : session.settings.executionMode === 'e2b'
+      ? await this.e2b!.history(session) : await readNativeHistory(session.threadId);
     const previous = session.turns;
     const liveId = this.active.get(id)?.turnId;
     const mapped = native.map(turn => {

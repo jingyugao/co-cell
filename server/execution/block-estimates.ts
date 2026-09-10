@@ -1,21 +1,13 @@
-import { getEncoding } from 'js-tiktoken';
+import { Worker } from 'node:worker_threads';
 import type { Turn } from '../../shared/types.js';
-const encoding = getEncoding('o200k_base');
 
-/** Derived on read from native history; no platform block ledger is required. */
-export function estimateNativeBlocks(turns: Turn[]): Turn[] {
-  const counts = new Map<string, number>();
-  return turns.map(turn => ({ ...turn, contextUsage: turn.contextUsage?.map(call => {
-    const { blockTexts, ...usage } = call;
-    if (!blockTexts) return usage;
-    return { ...usage, blockTokenizer: 'js-tiktoken/o200k_base@1.0.21',
-      blockEstimates: blockTexts.map(block => {
-        let tokens = counts.get(block.id);
-        if (tokens === undefined) { tokens = encoding.encode(block.text, [], []).length; counts.set(block.id, tokens); }
-        return { id: block.id, label: block.label, turnId: block.turnId,
-          inputTokens: block.direction === 'input' ? tokens : 0,
-          outputTokens: block.direction === 'output' ? tokens : 0 };
-      }),
-    };
-  }) }));
+/** CPU-heavy tokenization runs outside the HTTP/SSE event loop. */
+export function estimateNativeBlocksAsync(turns: Turn[]): Promise<Turn[]> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./block-estimates-worker.mjs', import.meta.url), { workerData: turns });
+    const timer = setTimeout(() => { void worker.terminate(); reject(new Error('计费计算超时')); }, 60_000);
+    worker.once('message', result => { clearTimeout(timer); resolve(result); void worker.terminate(); });
+    worker.once('error', error => { clearTimeout(timer); reject(error); });
+    worker.once('exit', code => { clearTimeout(timer); if (code !== 0) reject(new Error('计费计算进程已退出')); });
+  });
 }

@@ -12,6 +12,7 @@ export interface RetryState {
 }
 /** Actual input size of the most recent model request, as reported by Responses. */
 export interface ContextUsage {
+  segment?: number;
   outputItemIds?: string[];
   /** Transient native-reader input; removed before returning/persisting estimates. */
   blockTexts?: Array<{ id: string; label: string; text: string; turnId?: string; direction: 'input' | 'output' }>;
@@ -53,6 +54,8 @@ export interface Settings {
   networkAccessEnabled: boolean;
 }
 export interface Turn {
+  segment?: number;
+  compactions?: Array<{ segment: number; timestamp: string; beforeItemIndex: number }>;
   nativeTurnId?: string;
   /** Confirmed by the SDK turn.started event, not by saving a web submission. */
   codexAccepted?: boolean;

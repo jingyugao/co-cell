@@ -7,9 +7,6 @@ dist/
 data/
 # Keep project documentation; captures and local verification files stay local.
 /tmp/*
-!/tmp/docs/
-/tmp/docs/apply_patch_*
-/tmp/docs/example-backend-demo.md
 /scripts/e2b/preview-example-backend.mjs
 /scripts/e2b/configure-local-disk.sh
 
@@ -17,3 +14,4 @@ coverage/
 *.tsbuildinfo
 *.log
 .DS_Store
+./tmp

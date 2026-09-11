@@ -106,6 +106,8 @@ export interface Session {
   projectId?: string;
   id: string;
   threadId: string | null;
+  /** Verified relative location of the Codex rollout, refreshed when it moves. */
+  nativeHistoryPath?: string;
   title: string;
   settings: Settings;
   status: SessionStatus;

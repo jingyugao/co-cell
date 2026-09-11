@@ -4,7 +4,7 @@ import { join, sep } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 const exec = promisify(execFile);
-const [mode, value, rawCursor] = process.argv.slice(2);
+const [mode, value, rawCursor, startedAt, nativeHistoryPath] = process.argv.slice(2);
 const home = '/home/user/.codex';
 const maxBytes = 8 * 1024 * 1024;
 async function raw() {
@@ -99,7 +99,7 @@ async function changes() {
 }
 try {
   const result = (mode === 'history' || mode === 'billing')
-    ? await (await import('./native-history.mjs')).readNativeHistory(value, home, mode === 'billing')
+    ? await (await import('./native-history.mjs')).readNativeHistory(value, home, mode === 'billing', startedAt, nativeHistoryPath)
     : await (mode === 'raw' ? raw() : changes());
   process.stdout.write(JSON.stringify(result) + '\n');
 }

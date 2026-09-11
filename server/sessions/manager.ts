@@ -202,13 +202,30 @@ export class SessionManager {
 
   get(id: string): Session { return structuredClone(this.lookup(id)); }
   async read(id: string): Promise<Session> {
+    // The persisted session is the availability path for the chat UI. Native
+    // rollout history lives in E2B and can be slow for long-running threads;
+    // refresh it in the background instead of turning a transient inspection
+    // timeout into a blank conversation.
+    this.lookup(id);
+    this.refreshNativeHistory(id);
+    return this.get(id);
+  }
+
+  private refreshNativeHistory(id: string) {
     let pending = this.historyReads.get(id);
     if (!pending) {
-      pending = this.loadNativeHistory(id).finally(() => { this.historyReads.delete(id); });
+      pending = this.loadNativeHistory(id)
+        .then(() => {
+          if (!this.deleting.has(id)) this.publish(id, { type: 'state', session: this.get(id) });
+        })
+        .catch(error => {
+          // The durable snapshot remains usable when E2B's bounded inspection
+          // request times out. A later page visit can retry the refresh.
+          console.error('Native history refresh failed:', error instanceof Error ? error.message : 'unknown error');
+        })
+        .finally(() => { this.historyReads.delete(id); });
       this.historyReads.set(id, pending);
     }
-    await pending;
-    return this.get(id);
   }
 
   async billing(id: string): Promise<Turn[]> {
@@ -223,8 +240,12 @@ export class SessionManager {
     const session = this.get(id);
     if (!session.threadId) return [];
     const native = session.settings.executionMode === 'e2b'
-      ? await this.e2b!.history(session, true) : await readNativeHistory(session.threadId, undefined, true);
-    const estimated = await estimateNativeBlocksAsync(native);
+      ? await this.e2b!.history(session, true) : await readNativeHistory(session.threadId, undefined, true, session.startedAt, session.nativeHistoryPath);
+    if (native.path && native.path !== session.nativeHistoryPath) {
+      session.nativeHistoryPath = native.path;
+      await this.save(session);
+    }
+    const estimated = await estimateNativeBlocksAsync(native.turns);
     // The billing rail consumes IDs and context usage only. Returning the
     // complete transcript here duplicates every command/MCP result alongside
     // the already-loaded conversation, which made opening a long session
@@ -234,11 +255,19 @@ export class SessionManager {
 
   private async loadNativeHistory(id: string) {
     const session = this.lookup(id);
-    const native = !session.threadId ? [] : session.settings.executionMode === 'e2b'
-      ? await this.e2b!.history(session) : await readNativeHistory(session.threadId);
+    const native = !session.threadId ? { turns: [] } : session.settings.executionMode === 'e2b'
+      ? await this.e2b!.history(session) : await readNativeHistory(session.threadId, undefined, false, session.startedAt, session.nativeHistoryPath);
+    if (native.path && native.path !== session.nativeHistoryPath) session.nativeHistoryPath = native.path;
     const previous = session.turns;
+    // A partial or empty rollout response must never erase the durable UI
+    // snapshot. This can happen while Codex is compacting or E2B interrupts
+    // inspection after the reader has opened the file.
+    if (!native.turns.length && previous.length) {
+      await this.save(session);
+      return;
+    }
     const liveId = this.active.get(id)?.turnId;
-    const mapped = native.map(turn => {
+    const mapped = native.turns.map(turn => {
       const stored = previous.find(old => old.id === turn.id || old.nativeTurnId === turn.id || (Date.parse(turn.startedAt) >= Date.parse(old.startedAt)
         && Date.parse(turn.startedAt) <= Date.parse(old.completedAt ?? new Date().toISOString())));
       if (!stored) return turn;

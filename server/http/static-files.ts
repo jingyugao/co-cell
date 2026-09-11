@@ -22,15 +22,11 @@ export function installProductionStatic(app: Hono, directory = resolve('dist')) 
   app.get('*', async c => {
     let path: string;
     try { path = decodeURIComponent(c.req.path); } catch { return c.notFound(); }
-    const destination = c.req.header('Sec-Fetch-Dest');
-    const acceptsHtml = (c.req.header('Accept') ?? '').split(',').some(value => {
-      const [mime, ...parameters] = value.trim().toLowerCase().split(';');
-      return mime === 'text/html' && !parameters.some(parameter => /^\s*q\s*=\s*0(?:\.0*)?\s*$/.test(parameter));
-    });
-    // Only browser document navigation gets the SPA shell. Missing bundles,
-    // styles, images and API endpoints must retain an actual 404 response.
+    // API endpoints and paths with a file extension must retain an actual
+    // 404 response. Extensionless paths are client-side routes; serve the SPA
+    // shell even when a reverse proxy or a direct curl omits browser headers.
     if (path === '/api' || path.startsWith('/api/') || path === '/assets' || path.startsWith('/assets/')
-      || extname(path) || !acceptsHtml || (destination && !['document', 'iframe'].includes(destination))) return c.notFound();
+      || extname(path)) return c.notFound();
     c.header('Cache-Control', 'no-store');
     c.header('X-Content-Type-Options', 'nosniff');
     return c.html(await readFile(resolve(root, 'index.html'), 'utf8'));

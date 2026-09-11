@@ -23,11 +23,12 @@ test('only a persisted explicit decision releases a waiter; duplicate decision i
     const waiting = requests.request(id, input, new AbortController().signal);
     await tick();
     assert.equal(durable?.approvals?.[0].status, 'pending');
-    await requests.decide(id, decision);
+    await requests.decide(id, { decision, ...(decision === 'rejected' ? { rejectionReason: '请先验证' } : {}) });
     assert.equal((await waiting).status, decision);
     assert.equal(durable?.approvals?.[0].status, decision);
-    await requests.decide(id, decision);
-    await assert.rejects(requests.decide(id, decision === 'approved' ? 'rejected' : 'approved'), /已处理/);
+    if (decision === 'rejected') assert.equal(durable?.approvals?.[0].rejectionReason, '请先验证');
+    await requests.decide(id, { decision });
+    await assert.rejects(requests.decide(id, { decision: decision === 'approved' ? 'rejected' : 'approved' }), /已处理/);
     assert.equal((await requests.request(id, input, new AbortController().signal)).status, decision);
     await requests.close();
   }
@@ -48,7 +49,7 @@ test('abort during decision persistence never releases approval', async () => {
   const id = randomUUID();
   const waiting = requests.request(id, input, controller.signal);
   await tick();
-  const decision = requests.decide(id, 'approved');
+  const decision = requests.decide(id, { decision: 'approved' });
   await savingApproval;
   controller.abort();
   release();
@@ -70,7 +71,7 @@ test('timeout, worker termination and invalid model-supplied approval all fail c
     if (mode === 'timeout') await new Promise(resolve => setTimeout(resolve, 20));
     else await requests.close();
     assert.equal((await waiting).status, mode === 'timeout' ? 'expired' : 'cancelled');
-    await assert.rejects(requests.decide(id, 'approved'), /已处理/);
+    await assert.rejects(requests.decide(id, { decision: 'approved' }), /已处理/);
     await requests.close();
   }
 });
@@ -84,7 +85,7 @@ test('persistence failure cannot acknowledge approval', async () => {
   const waiting = requests.request(id, input, new AbortController().signal);
   const rejected = assert.rejects(waiting, /disk failed/);
   await tick();
-  await assert.rejects(requests.decide(id, 'approved'), /disk failed/);
+  await assert.rejects(requests.decide(id, { decision: 'approved' }), /disk failed/);
   await rejected;
   assert.equal(turn.approvals?.[0].status, 'cancelled');
   await requests.close();
@@ -146,7 +147,7 @@ test('concurrent replay registers one approval and rejects reuse with different 
   await assert.rejects(requests.request(id, { ...input, action: 'different' }, controller.signal), /其他内容/);
   assert.equal(turn.approvals?.length, 1);
   assert.equal(writes, 1);
-  await requests.decide(id, 'approved');
+  await requests.decide(id, { decision: 'approved' });
   assert.equal((await first).status, 'approved');
   assert.deepEqual(await first, await second);
   await requests.close();
@@ -167,9 +168,9 @@ test('detach preserves pending approval for a restarted observer and early user 
     await detached;
     assert.equal(durable.approvals?.[0].status, 'pending');
     const recovered = new ApprovalRequests(turn, signal, persist);
-    if (decideBeforeReplay) await recovered.decide(id, 'approved');
+    if (decideBeforeReplay) await recovered.decide(id, { decision: 'approved' });
     const waiting = recovered.request(id, input, signal);
-    if (!decideBeforeReplay) await recovered.decide(id, 'approved');
+    if (!decideBeforeReplay) await recovered.decide(id, { decision: 'approved' });
     assert.equal((await waiting).status, 'approved');
     assert.equal(durable.approvals?.[0].status, 'approved');
     assert.equal(turn.approvals?.length, 1);
@@ -192,7 +193,7 @@ test('detach during decision persistence retains the explicit decision', async (
   const id = randomUUID();
   const waiting = requests.request(id, input, signal);
   await tick();
-  const decision = requests.decide(id, 'approved');
+  const decision = requests.decide(id, { decision: 'approved' });
   await started;
   const detached = requests.detach();
   release();
@@ -232,7 +233,7 @@ test('recovery retains the original approval deadline and stop cancels unreplaye
   turn.approvals = [{ ...input, id, status: 'pending', createdAt: new Date(Date.now() - 60_000).toISOString() }];
   const signal = new AbortController().signal;
   const requests = new ApprovalRequests(turn, signal, async () => {}, 100);
-  await assert.rejects(requests.decide(id, 'approved'), /过期/);
+  await assert.rejects(requests.decide(id, { decision: 'approved' }), /过期/);
   assert.equal((await requests.request(id, input, signal)).status, 'expired');
   const pendingId = randomUUID();
   turn.approvals.push({ ...input, id: pendingId, status: 'pending', createdAt: new Date().toISOString() });

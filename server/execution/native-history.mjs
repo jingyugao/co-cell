@@ -4,6 +4,12 @@ import { homedir } from 'node:os';
 import { join, sep } from 'node:path';
 
 const MAX_BYTES = 64 * 1024 * 1024;
+// Billing attributes every response to the history visible at that point. A
+// long thread therefore repeats the same blocks for many responses. Keep the
+// inspection payload bounded: aggregate turn totals remain exact, while costs
+// for blocks beyond this limit are reported as unassigned by the UI.
+const MAX_BILLING_BLOCKS = 1_000;
+const MAX_BILLING_TEXT_BYTES = 1 * 1024 * 1024;
 const text = content => typeof content === 'string' ? content : (Array.isArray(content) ? content.map(part => part.text ?? '').join('\n') : '');
 const usage = value => Object.fromEntries(['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'].map(key => [key, Number(value?.[key] ?? 0)]));
 
@@ -13,6 +19,8 @@ export function parseNativeHistory(source, includeBlocks = false) {
   let current, model;
   let segment = 0;
   const blocks = [], pendingOutputs = new Set();
+  let billingBlocks = 0;
+  let billingTextBytes = 0;
   let firstOutput;
   let outputItemIds = [];
   const upsert = (turn, item, timestamp) => {
@@ -124,14 +132,29 @@ export function parseNativeHistory(source, includeBlocks = false) {
         ? [{ ...block, direction: 'input' }] : pendingOutputs.has(block.id) ? [{ ...block, direction: 'output' }] : []);
       firstOutput = undefined; pendingOutputs.clear();
       turn.contextUsage ??= [];
-      turn.contextUsage.push({ source: 'rollout', segment, outputItemIds, ...(includeBlocks ? { blockTexts } : {}), responseId: p.response_id, model, rawUsage: p.usage, inputTokens: u.input_tokens, cachedInputTokens: u.cached_input_tokens, outputTokens: u.output_tokens, observedAt: timestamp });
+      // `blockTexts` is intentionally bounded. Without this, every later
+      // token-usage record embeds all earlier context again and a multi-turn
+      // conversation can turn a few MB of history into GBs of worker copies.
+      const retainedBlocks = [];
+      if (includeBlocks && billingBlocks < MAX_BILLING_BLOCKS && billingTextBytes < MAX_BILLING_TEXT_BYTES) {
+        for (const block of blockTexts) {
+          const bytes = Buffer.byteLength(block.text);
+          if (billingBlocks + retainedBlocks.length >= MAX_BILLING_BLOCKS || billingTextBytes + bytes > MAX_BILLING_TEXT_BYTES) continue;
+          retainedBlocks.push(block);
+          billingTextBytes += bytes;
+        }
+      }
+      billingBlocks += retainedBlocks?.length ?? 0;
+      turn.contextUsage.push({ source: 'rollout', segment, outputItemIds, ...(retainedBlocks.length ? { blockTexts: retainedBlocks } : {}), responseId: p.response_id, model, rawUsage: p.usage, inputTokens: u.input_tokens, cachedInputTokens: u.cached_input_tokens, outputTokens: u.output_tokens, observedAt: timestamp });
       outputItemIds = [];
       turn.usage = usage(Object.fromEntries(Object.keys(u).map(key => [key, (turn.usage?.[key] ?? 0) + u[key]])));
     }
     if (record.type === 'event_msg' && ['task_complete', 'turn_aborted', 'task_failed'].includes(p.type)) {
-      turn.status = p.type === 'task_complete' ? 'completed' : p.type === 'turn_aborted' ? 'cancelled' : 'failed';
+      // Recent Codex rollouts terminate failed requests with task_complete
+      // plus an error payload, even though the SDK emits turn.failed.
+      turn.status = p.type === 'turn_aborted' ? 'cancelled' : p.type === 'task_failed' || p.error != null ? 'failed' : 'completed';
       turn.completedAt = timestamp;
-      if (p.type === 'task_failed') turn.error = p.message ?? p.error ?? 'Codex 任务失败';
+      if (turn.status === 'failed') turn.error = p.message ?? (typeof p.error === 'string' ? p.error : p.error?.message) ?? 'Codex 任务失败';
       if (p.last_agent_message && !turn.items.some(item => item.type === 'agent_message' && item.text === p.last_agent_message)) upsert(turn, { id: `native-final-${turn.id}`, type: 'agent_message', text: p.last_agent_message }, timestamp);
     }
   }

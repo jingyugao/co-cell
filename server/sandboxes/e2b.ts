@@ -77,8 +77,10 @@ export class TurnObserverDetached extends Error {
 export class TurnLaunchCancelled extends Error {
   constructor() { super('Web shut down before the worker was launched'); this.name = 'TurnLaunchCancelled'; }
 }
-export const SANDBOX_PAUSE_TTL_MS = 24 * 60 * 60 * 1000;
-export const SANDBOX_ARCHIVE_AFTER_MS = 7 * SANDBOX_PAUSE_TTL_MS;
+export const SANDBOX_PAUSE_TTL_MS = 3 * 60 * 60 * 1000;
+// Archive retention is independent of the running lease: shortening the
+// idle pause timeout must not cause sandboxes to archive sooner.
+export const SANDBOX_ARCHIVE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 export const IDLE_SCAN_MS = 60 * 1000;
 const ROOT = '/home/user/.codex-web';
 const RUNTIME = `${ROOT}/runtime`;
@@ -248,7 +250,7 @@ export class E2BCodexRuntime implements E2BRuntime {
   private async idle(entry: Entry) {
     this.touch(entry);
     if (!entry.disposed && entry.metadata.status === 'ready') {
-      // End of use gets a full day as well. Do not extend idle sandboxes during scans.
+      // End of use gets the full idle lease as well. Do not extend idle sandboxes during scans.
       await this.renew(entry).catch(error => this.pauseError(entry, error));
     }
     if (!entry.disposed && !entry.running && !entry.readers) await this.state(entry, entry.metadata.status);

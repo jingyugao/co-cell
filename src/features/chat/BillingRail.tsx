@@ -15,13 +15,18 @@ export default function BillingRail({ turns, sessionId, selectedBlockId, onSelec
   const revision = turns.map(turn => `${turn.id}:${turn.status}:${turn.contextUsage?.length ?? 0}`).join('|');
   useEffect(() => {
     const controller = new AbortController();
-    setDetails([]); setLoading(true); setError(false);
-    fetch(`/api/sessions/${sessionId}/billing`, { signal: controller.signal })
-      .then(response => { if (!response.ok) throw Error('billing'); return response.json(); })
-      .then(value => { if (!controller.signal.aborted) setDetails(value); })
-      .catch(() => { if (!controller.signal.aborted) setError(true); })
-      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
-    return () => controller.abort();
+    // The transcript is the primary content. Let it paint before the optional,
+    // potentially expensive attribution pass starts; a stream update or route
+    // change cancels the pending/read request.
+    const timer = window.setTimeout(() => {
+      setDetails([]); setLoading(true); setError(false);
+      fetch(`/api/sessions/${sessionId}/billing`, { signal: controller.signal })
+        .then(response => { if (!response.ok) throw Error('billing'); return response.json(); })
+        .then(value => { if (!controller.signal.aborted) setDetails(value); })
+        .catch(() => { if (!controller.signal.aborted) setError(true); })
+        .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    }, 750);
+    return () => { window.clearTimeout(timer); controller.abort(); };
   }, [sessionId, revision]);
   const mapped = details.map(turn => ({ ...turn, nativeTurnId: turn.id,
     id: turns.find(value => (value.nativeTurnId ?? value.id) === turn.id)?.id ?? turn.id }));

@@ -95,6 +95,12 @@ export class SessionManager {
         changed = true;
       }
       for (const turn of session.turns) {
+        if (turn.status === 'running' && !turn.execution) {
+          turn.status = 'cancelled';
+          turn.error = '服务重启时发现本轮没有可恢复的执行任务，已标记为已停止。';
+          turn.completedAt = new Date().toISOString();
+          changed = true;
+        }
         if (!this.canRecover(session, turn) && cancelPersistedApprovals(turn)) changed = true;
         if (turn.retry !== undefined) {
           delete turn.retry;
@@ -218,7 +224,12 @@ export class SessionManager {
     if (!session.threadId) return [];
     const native = session.settings.executionMode === 'e2b'
       ? await this.e2b!.history(session, true) : await readNativeHistory(session.threadId, undefined, true);
-    return estimateNativeBlocksAsync(native);
+    const estimated = await estimateNativeBlocksAsync(native);
+    // The billing rail consumes IDs and context usage only. Returning the
+    // complete transcript here duplicates every command/MCP result alongside
+    // the already-loaded conversation, which made opening a long session
+    // allocate and transfer tens of MB unnecessarily.
+    return estimated.map(turn => ({ ...turn, prompt: '', images: [], items: [] }));
   }
 
   private async loadNativeHistory(id: string) {
@@ -231,8 +242,17 @@ export class SessionManager {
       const stored = previous.find(old => old.id === turn.id || old.nativeTurnId === turn.id || (Date.parse(turn.startedAt) >= Date.parse(old.startedAt)
         && Date.parse(turn.startedAt) <= Date.parse(old.completedAt ?? new Date().toISOString())));
       if (!stored) return turn;
+      // Do not let a stale/incomplete remote history resurrect a turn that
+      // Web has already durably finalized (for example after manual recovery
+      // of an orphaned execution).
+      if (stored.status !== 'running' && turn.status === 'running') {
+        return { ...stored, nativeTurnId: turn.id };
+      }
       if (stored.id === liveId) { stored.nativeTurnId = turn.id; if (!stored.prompt) stored.prompt = turn.prompt; return stored; }
       return { ...turn, id: stored.id, nativeTurnId: turn.id, sdkUsage: stored.sdkUsage,
+        // SDK failures can include transport/observer errors absent from the
+        // rollout. Reading history must not turn a durable failure into success.
+        ...(stored.status === 'failed' ? { status: stored.status, error: stored.error ?? turn.error } : {}),
         contextUsage: turn.contextUsage?.map(call => {
           const old = stored.contextUsage?.find(value => call.responseId && value.responseId === call.responseId);
           return old ? { ...old, ...call } : call;
@@ -418,7 +438,7 @@ export class SessionManager {
     // Persist execution locators and numeric billing evidence, never a second message history.
     const turns = session.turns.map(turn => ({
       id: turn.id, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
-      execution: turn.execution, codexAccepted: turn.codexAccepted,
+      execution: turn.execution, codexAccepted: turn.codexAccepted, error: turn.error,
       approvals: turn.execution?.state !== 'terminal' ? turn.approvals : undefined,
       prompt: '', images: [], items: [], usage: turn.usage, sdkUsage: turn.sdkUsage,
       contextUsage: turn.contextUsage?.map(({ blockEstimates, blockTokenizer, blockTexts, ...call }) => call),
@@ -484,7 +504,7 @@ export class SessionManager {
   }
 
   async resolveApproval(id: string, turnId: string, approvalId: string, input: unknown): Promise<Session> {
-    const { decision } = approvalDecisionSchema.parse(input);
+    const decision = approvalDecisionSchema.parse(input);
     const session = this.lookup(id);
     const turn = session.turns.find(item => item.id === turnId);
     const approval = turn?.approvals?.find(item => item.id === approvalId);
@@ -492,7 +512,7 @@ export class SessionManager {
     const execution = this.active.get(id);
     if (execution?.turnId === turnId && execution.approvals) {
       await execution.approvals.decide(approvalId, decision);
-    } else if (approval.status !== decision) {
+    } else if (approval.status !== decision.decision) {
       throw new HttpError(409, '本轮执行已结束，确认请求已失效');
     }
     return this.get(id);
@@ -501,9 +521,33 @@ export class SessionManager {
   async stop(id: string) {
     this.lookup(id);
     const execution = this.active.get(id);
-    if (!execution) return;
-    execution.controller.abort();
-    await execution.done;
+    if (execution) {
+      execution.controller.abort();
+      await execution.done;
+      return;
+    }
+
+    // A Web restart or an unexpected worker exit can leave a persisted
+    // `running` turn without an in-memory execution to abort.  Refresh the
+    // SDK/E2B history first; if no durable execution remains, converge this
+    // orphaned turn to cancelled so the session can be used again.
+    await this.read(id);
+    if (this.active.has(id)) {
+      const recovered = this.active.get(id)!;
+      recovered.controller.abort();
+      await recovered.done;
+      return;
+    }
+    const session = this.sessions.get(id);
+    const turn = session?.turns.slice().reverse().find(item => item.status === 'running');
+    if (!session || !turn) return;
+    turn.status = 'cancelled';
+    turn.error = '本轮执行已结束，但 Web 未收到终止事件，已将残留状态标记为已停止。';
+    turn.completedAt = new Date().toISOString();
+    session.status = 'cancelled';
+    session.updatedAt = turn.completedAt;
+    await this.save(session);
+    this.publish(id, { type: 'state', session: this.get(id) });
   }
 
   async waitForIdle(id: string) { await this.active.get(id)?.done; }

@@ -211,12 +211,19 @@ try {
     ? [{ type: 'text', text: input.prompt }, ...input.images.map(path => ({ type: 'local_image', path }))]
     : input.prompt;
   const { events } = await thread.runStreamed(prompt, { signal: controller.signal });
-  for await (const event of events) await publish(event);
+  for await (const event of events) {
+    // SDK errors can omit HTTP bodies (notably 429) or stream disconnect causes.
+    // Attach the current request's sanitized diagnostic before journaling it.
+    if (event.type === 'error') event.message = diagnosticProxy?.describeError(event.message) ?? event.message;
+    if (event.type === 'turn.failed') event.error.message = diagnosticProxy?.describeError(event.error.message) ?? event.error.message;
+    await publish(event);
+  }
   await publishing;
   if (!['completed', 'failed'].includes(lifecycle)) throw new Error('Codex event stream ended without a terminal event');
 } catch (error) {
   const cause = journalError ?? error;
   let message = cause instanceof Error ? cause.message : String(cause);
+  if (!journalError && !controller.signal.aborted) message = diagnosticProxy?.describeError(message) ?? message;
   if (process.env.CODEX_API_KEY) message = message.replaceAll(process.env.CODEX_API_KEY, '[REDACTED]');
   message = message.slice(0, 16_384);
   lifecycle = controller.signal.aborted && !journalError ? 'cancelled' : 'failed';

@@ -41,6 +41,7 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
   upstream.pathname = `${upstream.pathname.replace(/\/+$/, '')}/responses`;
   const active = new Set();
   let closing = false;
+  let lastError;
   const redact = value => {
     let text = typeof value === 'string' ? value : '';
     for (const secret of secrets) if (typeof secret === 'string' && secret.length) text = text.split(secret).join('[REDACTED]');
@@ -55,7 +56,19 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
     return Object.fromEntries(['type', 'code', 'message'].flatMap(key => typeof value[key] === 'string' ? [[key, redact(value[key])]] : []));
   };
   const emit = value => {
+    if (value.event === 'api.request' || value.event === 'api.completed') lastError = undefined;
+    if (value.event === 'api.error' && value.error?.type !== 'cancelled') lastError = errorFields(value.error);
     try { Promise.resolve(onEvent(value)).catch(() => {}); } catch { /* Diagnostics must never break transport. */ }
+  };
+  const transportErrorFields = (code, cause) => ({
+    type: 'transport_error', code: redact(code),
+    message: redact(`Model upstream connection failed (${code}): ${cause?.message || code}`),
+  });
+  const sendTransportError = (response, error) => {
+    if (!response.headersSent) {
+      response.writeHead(502, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      response.end(JSON.stringify({ error }));
+    } else response.destroy();
   };
   const handleRetriableRequest = (request, response) => {
     const options = typeof overloadRetries === 'object' ? overloadRetries : {};
@@ -143,14 +156,15 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
       outgoing = (upstream.protocol === 'https:' ? https : http).request(upstream, { method: 'POST', headers });
       const attemptRequest = outgoing;
       let settled = false;
-      const transportError = code => {
+      const transportError = (code, cause) => {
         if (done || settled) return;
         settled = true;
-        event('api.error', { error: { type: 'transport_error', code }, requestAttempt });
+        const error = transportErrorFields(code, cause);
+        event('api.error', { error, requestAttempt });
         finish('transport_error', { transportComplete: false });
-        if (!response.headersSent) response.writeHead(502).end(); else response.destroy();
+        sendTransportError(response, error);
       };
-      attemptRequest.on('error', error => transportError(redact(error.code || 'upstream_error')));
+      attemptRequest.on('error', error => transportError(error.code || 'upstream_error', error));
       attemptRequest.on('response', upstreamResponse => {
         if (done || settled) { upstreamResponse.destroy(); return; }
         incoming = upstreamResponse; status = incoming.statusCode ?? 502;
@@ -340,9 +354,10 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
     response.on('close', () => { if (!response.writableFinished) abort(); });
     outgoing.on('error', error => {
       if (finished) return;
-      if (!terminalReason) event('api.error', { error: { type: 'transport_error', code: redact(error.code || 'upstream_error') } });
+      const details = transportErrorFields(error.code || 'upstream_error', error);
+      if (!terminalReason) event('api.error', { error: details });
       finish(terminalReason ?? 'transport_error', { transportComplete: false });
-      if (!response.headersSent) response.writeHead(502).end(); else response.destroy();
+      sendTransportError(response, details);
     });
     outgoing.on('response', incoming => {
       upstreamResponse = incoming;
@@ -429,7 +444,7 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
       });
       const disconnected = () => {
         if (finished) return;
-        if (!terminalReason) event('api.error', { error: { type: 'transport_error', code: 'upstream_disconnected' } });
+        if (!terminalReason) event('api.error', { error: transportErrorFields('upstream_disconnected') });
         finish(terminalReason ?? 'transport_error', { transportComplete: false }); response.destroy();
       };
       incoming.on('aborted', disconnected);
@@ -441,6 +456,11 @@ export async function startDiagnosticProxy({ upstreamBaseUrl, onEvent, secrets =
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolve(); }); });
   return {
     baseUrl: `http://127.0.0.1:${server.address().port}`,
+    describeError(message) {
+      if (!lastError) return message;
+      const detail = [lastError.code, lastError.message || lastError.type].filter(Boolean).join(': ');
+      return detail && !message.includes(detail) ? `${message}\nUpstream error: ${detail}` : message;
+    },
     async close() {
       closing = true;
       for (const abort of [...active]) abort();

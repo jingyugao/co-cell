@@ -1,7 +1,7 @@
 import { constants } from 'node:fs';
 import { open, readdir, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, sep } from 'node:path';
+import { basename, isAbsolute, join, normalize, relative, sep } from 'node:path';
 
 const MAX_BYTES = 64 * 1024 * 1024;
 // Billing attributes every response to the history visible at that point. A
@@ -161,8 +161,8 @@ export function parseNativeHistory(source, includeBlocks = false) {
   return turns.filter(turn => turn.prompt || confirmed.has(turn.id));
 }
 
-export async function readNativeHistory(threadId, codexHome = process.env.CODEX_HOME || join(homedir(), '.codex'), includeBlocks = false) {
-  if (!threadId) return [];
+export async function readNativeHistory(threadId, codexHome = process.env.CODEX_HOME || join(homedir(), '.codex'), includeBlocks = false, startedAt, knownPath) {
+  if (!threadId) return { turns: [] };
   if (!/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(threadId)) throw new Error('Codex thread ID 格式错误');
   let visited = 0;
   async function visit(directory, depth) {
@@ -175,33 +175,49 @@ export async function readNativeHistory(threadId, codexHome = process.env.CODEX_
       if (found) return found;
     }
   }
+  const home = await realpath(codexHome);
+  const roots = ['sessions', 'archived_sessions'].map(name => join(home, name));
+  const valid = (path) => roots.some(root => path.startsWith(root + sep)) && basename(path).endsWith(`${threadId}.jsonl`);
+  async function read(path) {
+    const resolved = await realpath(path);
+    if (!valid(resolved)) throw new Error('Codex 会话路径无效');
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      if (!valid(await realpath(`/proc/self/fd/${file.fd}`))) throw new Error('Codex 会话路径无效');
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.size > MAX_BYTES) throw new Error('Codex 会话记录超过 64 MB 读取限制');
+      const buffer = Buffer.alloc(stat.size);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset);
+        if (!bytesRead) break;
+        offset += bytesRead;
+      }
+      const end = buffer.subarray(0, offset).lastIndexOf(10);
+      if (end < 0) return { turns: [], path: relative(home, resolved) };
+      const source = buffer.subarray(0, end + 1).toString('utf8');
+      const metadata = JSON.parse(source.slice(0, source.indexOf('\n')));
+      if (metadata.type !== 'session_meta' || metadata.payload?.id !== threadId) throw new Error('Codex 会话记录与 thread 不匹配');
+      return { turns: parseNativeHistory(source, includeBlocks), path: relative(home, resolved) };
+    } finally { await file.close(); }
+  }
+  if (knownPath && !isAbsolute(knownPath) && normalize(knownPath) === knownPath && !knownPath.startsWith(`..${sep}`)) {
+    try { return await read(join(home, knownPath)); }
+    // Cached locations are advisory: Codex may move a rollout to its archive
+    // or rewrite it during compaction. Rediscover it before surfacing failure.
+    catch { /* Fall through to the bounded discovery path. */ }
+  }
+  const date = startedAt && /^\d{4}-\d{2}-\d{2}T/.test(startedAt) ? startedAt.slice(0, 10).split('-') : undefined;
   for (const name of ['sessions', 'archived_sessions']) {
     const root = join(codexHome, name);
     try {
-      const expected = join(await realpath(codexHome), name);
+      const expected = join(home, name);
       if (await realpath(root) !== expected) continue;
-      const path = await visit(root, 4);
+      // Codex stores rollout files under YYYY/MM/DD. Supplying the turn date
+      // avoids recursively statting an ever-growing history tree on E2B.
+      const path = date ? await visit(join(root, ...date), 0) : await visit(root, 4);
       if (!path) continue;
-      if (!(await realpath(path)).startsWith(expected + sep)) throw new Error('Codex 会话路径无效');
-      const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-      try {
-        if (!(await realpath(`/proc/self/fd/${file.fd}`)).startsWith(expected + sep)) throw new Error('Codex 会话路径无效');
-        const stat = await file.stat();
-        if (!stat.isFile() || stat.size > MAX_BYTES) throw new Error('Codex 会话记录超过 64 MB 读取限制');
-        const buffer = Buffer.alloc(stat.size);
-        let offset = 0;
-        while (offset < buffer.length) {
-          const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset);
-          if (!bytesRead) break;
-          offset += bytesRead;
-        }
-        const end = buffer.subarray(0, offset).lastIndexOf(10);
-        if (end < 0) return [];
-        const source = buffer.subarray(0, end + 1).toString('utf8');
-        const metadata = JSON.parse(source.slice(0, source.indexOf('\n')));
-        if (metadata.type !== 'session_meta' || metadata.payload?.id !== threadId) throw new Error('Codex 会话记录与 thread 不匹配');
-        return parseNativeHistory(source, includeBlocks);
-      } finally { await file.close(); }
+      return await read(path);
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   throw new Error('找不到 Codex 原生会话记录');

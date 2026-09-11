@@ -8,4 +8,4 @@ export interface WorkspaceTarget {
   sandbox?: SandboxState;
   updatedAt: string;
 }
-export type ThreadWorkspace = WorkspaceTarget & { threadId: string | null };
+export type ThreadWorkspace = WorkspaceTarget & { threadId: string | null; startedAt?: string; nativeHistoryPath?: string };

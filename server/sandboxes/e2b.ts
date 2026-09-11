@@ -7,6 +7,7 @@ import { Sandbox, type CommandHandle, type ConnectionOpts } from 'e2b';
 import type { AgentEvent, ContextUsage } from '../../shared/types.js';
 import type { RequestUserApproval } from '../../shared/approval-types.js';
 import type { Changes, RawToolPage, Session, Turn } from '../../shared/types.js';
+import type { NativeHistory } from '../execution/native-history.mjs';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
 import { CONNECTION_ROOT, type ConnectionStore } from '../connections/store.js';
 import { syncSandboxConnections } from '../connections/sandbox-sync.js';
@@ -31,7 +32,7 @@ export interface E2BRuntime {
   preview(session: WorkspaceTarget, port: number): Promise<string>;
   file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
   rawTools(session: ThreadWorkspace, cursor?: number): Promise<RawToolPage>;
-  history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<Turn[]>;
+  history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<NativeHistory>;
   delete(session: WorkspaceTarget): Promise<void>;
   close(): Promise<void>;
 }
@@ -836,7 +837,10 @@ export class E2BCodexRuntime implements E2BRuntime {
       if (Date.now() - entry.renewedAt > IDLE_SCAN_MS) {
         await this.renew(entry);
       }
-      const result = await entry.sandbox.commands.run(`${NODE} ${quote(`${RUNTIME}/e2b-inspect.mjs`)} ${quote(mode)} ${args.map(quote).join(' ')}`, { user: 'user', timeoutMs: 30_000 });
+      // Native rollout history is parsed and serialized in the sandbox. Long
+      // conversations can legitimately exceed the ordinary inspection budget.
+      const timeoutMs = mode === 'history' || mode === 'billing' ? 120_000 : 30_000;
+      const result = await entry.sandbox.commands.run(`${NODE} ${quote(`${RUNTIME}/e2b-inspect.mjs`)} ${quote(mode)} ${args.map(quote).join(' ')}`, { user: 'user', timeoutMs });
       return JSON.parse(result.stdout) as T;
     } catch (error) {
       const stdout = (error as { stdout?: string })?.stdout;
@@ -901,10 +905,10 @@ export class E2BCodexRuntime implements E2BRuntime {
     const page = await this.inspect<RawToolPage>(session, 'raw', [session.threadId, String(cursor)]);
     return { ...page, location: 'e2b', sandboxId: session.sandbox.id };
   }
-  async history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<Turn[]> {
-    if (!session.threadId) return [];
+  async history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<NativeHistory> {
+    if (!session.threadId) return { turns: [] };
     if (!session.sandbox) throw new Error('Codex 会话对应的沙箱不可用');
-    return this.inspect<Turn[]>(session, includeBlocks ? 'billing' : 'history', [session.threadId]);
+    return this.inspect<NativeHistory>(session, includeBlocks ? 'billing' : 'history', [session.threadId, '', session.startedAt ?? '', session.nativeHistoryPath ?? '']);
   }
   async delete(session: WorkspaceTarget) {
     const key = ownerKey(session);

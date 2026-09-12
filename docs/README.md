@@ -44,7 +44,7 @@ Web 新会话默认使用 `gpt-6-astra`，输入框旁的模型下拉框支持�
 | `E2B_API_URL` / `E2B_SANDBOX_URL` | E2B API 与沙箱代理地址 |
 | `E2B_TEMPLATE` | 模板管理首次初始化时使用的默认模板 |
 | `E2B_WORKSPACE` | 项目沙箱内的默认工作目录 |
-| `CODEX_WEB_DATA_DIR` | 会话、项目、图片的存储目录，默认 `.codex-web` |
+| `CODEX_WEB_DATA_DIR` | JSON 元数据及旧数据导入目录，默认 `data/web-state` |
 
 E2B 内固定使用 `danger-full-access` 和命令网络访问；工作范围通过共享与项目 `AGENTS.md` 约定。模型、思考强度和网页搜索可按会话调整。底层本地执行的权限配置仍保留，但启用 E2B 时不能通过本机会话继续执行任务。
 
@@ -52,14 +52,15 @@ E2B 内固定使用 `danger-full-access` 和命令网络访问；工作范围通
 
 | 路径 | 内容 |
 | --- | --- |
-| `.codex-web/` 或 `CODEX_WEB_DATA_DIR` | 项目、会话历史及附件 |
+| `data/web-state/` 或 `CODEX_WEB_DATA_DIR` | JSON 项目、会话元数据；配置 `MYSQL_URL` 后使用 MySQL |
+| `data/images/` 或 `CODEX_WEB_IMAGES_DIR` | 上传图片 |
 | `data/AGENTS.md`、`data/docs/` | 各项目沙箱共享的规则和参考文档 |
 | `data/e2b/` | 模板配置、默认版本、构建记录与报告 |
 | `data/credentials/` | 加密连接凭据与验证记录 |
 | `~/.config/swarm-hive/credentials.key` | 凭据解密密钥，须与加密数据一并备份 |
 | `data/logs/` | 有保留期限的运行诊断日志 |
 
-`CODEX_WEB_DATA_DIR` 只改变项目、会话和附件目录，不会迁移 `data/`、凭据密钥或 E2B 服务存储。沙箱工作区与 Codex 原生上下文保存在 E2B 内，不能仅靠 Web 历史恢复。
+`CODEX_WEB_DATA_DIR` 只改变 JSON 元数据与旧数据导入目录，不会迁移 `data/`、凭据密钥或 E2B 服务存储。沙箱工作区与 Codex 原生上下文保存在 E2B 内，不能仅靠 Web 历史恢复。
 
 ## 执行与展示边界
 
@@ -80,23 +81,24 @@ pnpm build
 
 模板验证和 `pnpm capture:http` 会访问实际 E2B 或模型服务。模板构建运行 `pnpm e2b:build`，前置条件和生效方式见 [模板管理](template-management.md)。
 
-代码按功能组织，每个后端模块的 HTTP 接口放在自身的 `routes.ts`，`server/app.ts` 只负责公共中间件和路由装配。
+代码按功能组织，每个后端模块的 HTTP 接口放在自身的 `routes.ts`，`backend/app.ts` 只负责公共中间件和路由装配。
 
 | 目录 | 职责 |
 | --- | --- |
-| `server/projects/` | 项目记录、归档、操作与删除保护 |
-| `server/sessions/` | 会话、历史迁移、订阅与跨模块操作协调 |
-| `server/execution/` | 单轮 Codex 执行、事件处理、原始工具消息；`worker/` 是同步到沙箱的运行脚本 |
-| `server/sandboxes/` | E2B 生命周期、端口预览、资源清单与工作区接口 |
-| `server/templates/`、`connections/`、`shared-files/` | 模板、凭据、共享文档及各自路由 |
-| `server/storage/`、`core/`、`http/`、`diagnostics/`、`workspaces/` | 原子文件写入、公共错误、静态资源、日志诊断、Git 查询 |
-| `src/features/` | projects、chat、sandboxes、templates、connections、shared-files 页面及局部状态 |
-| `src/components/`、`src/lib/` | 公共组件、HTTP 请求 |
-| `shared/` | 前后端协议类型与事件处理函数 |
+| `backend/projects/` | 项目记录、归档、操作与删除保护 |
+| `backend/sessions/` | 会话、历史迁移、订阅与跨模块操作协调 |
+| `backend/execution/` | 单轮 Codex 执行、事件处理、原始工具消息；`worker/` 是同步到沙箱的运行脚本 |
+| `backend/sandboxes/` | E2B 生命周期、端口预览、资源清单与工作区接口 |
+| `backend/templates/`、`connections/`、`shared-files/` | 模板、凭据、共享文档及各自路由 |
+| `backend/storage/`、`core/`、`http/`、`diagnostics/`、`workspaces/` | 原子文件写入、公共错误、静态资源、日志诊断、Git 查询 |
+| `fe/features/` | projects、chat、sandboxes、templates、connections、shared-files 页面及局部状态 |
+| `fe/components/`、`fe/lib/` | 公共组件、HTTP 请求 |
+| `protocol/` | 前后端数据契约、消息与事件类型。 |
+| `util/` | 事件归并、用量汇总、费用估算及模型常量，不依赖 React 或服务端存储。 |
 
 项目记录由 ProjectService 管理，SessionManager 保留会话与沙箱之间的协调入口；执行事件的消费由 runTurn 负责。沙箱的预览、巡检和删除接收 WorkspaceTarget，无需构造空会话。前端 useProjects 管理项目数据，useSessionStream 管理当前会话的 SSE；项目编辑和归档直接应用接口返回值，不重新拉取会话列表。
 
-本次拆分保留 API 路径、持久化格式和沙箱内运行脚本的文件名，已有项目、会话、沙箱映射无需迁移。会话中的 sandbox 兼容快照暂时保留。`server/index.ts` 仍是服务启动入口。
+本次拆分保留 API 路径、持久化格式和沙箱内运行脚本的文件名，已有项目、会话、沙箱映射无需迁移。会话中的 sandbox 兼容快照暂时保留。`backend/index.ts` 仍是服务启动入口。
 
 ## 文档索引
 

@@ -28,7 +28,7 @@
 
 ## 持久化与兼容
 
-默认项目目录为 `.codex-web/projects/`，会话保存在 `.codex-web/` 下；可通过 `CODEX_WEB_DATA_DIR` 改变这一根目录。`project.sandbox` 是映射的权威来源，`session.projectId` 表示归属，`session.sandbox` 为兼容快照。
+未配置 MySQL 时，项目 JSON 默认保存在 `data/web-state/projects/`，会话 JSON 保存在 `data/web-state/`；可通过 `CODEX_WEB_DATA_DIR` 改变这一根目录。配置 `MYSQL_URL` 后使用 MySQL 保存元数据。`project.sandbox` 是映射的权威来源，`session.projectId` 表示归属，`session.sandbox` 为兼容快照。
 
 启动时，未归属项目的旧 E2B 会话会迁移为项目，保留原有沙箱、thread 和目录。项目先持久化，再写入会话归属；重启可重复执行迁移而不创建重复项目。已有项目的沙箱映射优先于会话旧快照。
 

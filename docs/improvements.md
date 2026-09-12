@@ -36,12 +36,12 @@ Web 服务使用 Node.js 内置 SQLite，将建议保存到 `data/improvements.s
 
 ## 代码与接口
 
-- `server/improvements/store.ts`：输入校验、SQLite 数据库、去重和查询。
-- `server/improvements/routes.ts`：`GET /api/improvements` 和 `GET /api/improvements/:id`，沿用 Web 服务的本机访问限制。
-- `server/execution/worker/improvement-mcp.mjs`：工具定义与 stdio MCP 协议。
-- `server/execution/worker/improvement-bridge.mjs`：单轮桥接与等待回执。
-- `server/sandboxes/e2b.ts`：同步工具脚本、消费建议事件、返回数据库回执。
-- `src/features/improvements/`：人工查看页面。
+- `backend/improvements/store.ts`：输入校验、SQLite 数据库、去重和查询。
+- `backend/improvements/routes.ts`：`GET /api/improvements` 和 `GET /api/improvements/:id`，沿用 Web 服务的本机访问限制。
+- `backend/execution/worker/improvement-mcp.mjs`：工具定义与 stdio MCP 协议。
+- `backend/execution/worker/improvement-bridge.mjs`：单轮桥接与等待回执。
+- `backend/sandboxes/e2b.ts`：同步工具脚本、消费建议事件、返回数据库回执。
+- `fe/features/improvements/`：人工查看页面。
 
 列表支持 `q`、`category`、`projectId`、`limit`（默认 30，最多 100）及 `offset`。建议状态初始为 `pending`，页面显示“待处理”。列表另支持 `status` 筛选（不传时返回全部）；页面默认只看待处理，可切换全部状态。来源名称保存提交时的快照。
 

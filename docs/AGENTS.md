@@ -53,24 +53,25 @@ E2B 项目沙箱
 
 | 模块 | 入口及职责 |
 | --- | --- |
-| `server/index.ts` | 读取配置、创建服务依赖、初始化存储、启动 HTTP/Vite、处理退出。 |
-| `server/app.ts` | 公共 Host/Origin 校验、请求大小限制、错误处理和路由装配。业务接口放到各模块。 |
-| `server/projects/` | 项目创建、编辑、归档、删除保护；`requirements.ts` 读取飞书需求名称。 |
-| `server/sessions/` | `manager.ts` 管理会话、运行任务、持久化和订阅；`routes.ts` 提供会话、提交、停止、SSE 等接口。 |
-| `server/execution/` | `runner.ts` 处理单轮执行；`raw-tools.ts` 读取 Codex 原始工具记录。 |
+| `backend/index.ts` | 读取配置、创建服务依赖、初始化存储、启动 HTTP/Vite、处理退出。 |
+| `backend/app.ts` | 公共 Host/Origin 校验、请求大小限制、错误处理和路由装配。业务接口放到各模块。 |
+| `backend/projects/` | 项目创建、编辑、归档、删除保护；`requirements.ts` 读取飞书需求名称。 |
+| `backend/sessions/` | `manager.ts` 管理会话、运行任务、持久化和订阅；`routes.ts` 提供会话、提交、停止、SSE 等接口。 |
+| `backend/execution/` | `runner.ts` 处理单轮执行；`raw-tools.ts` 读取 Codex 原始工具记录。 |
 | `packages/agentcore/` | Codex App Server 运行时适配层：通过 JSON-RPC 启动/恢复线程、执行或中断 turn，归一化 item、用量和状态事件；不负责宿主机路由或持久化。 |
-| `server/execution/worker/` | 同步到沙箱运行的独立 `.mjs` 脚本：调用 agentcore、检查工具、改进建议 MCP 与回执桥接；负责单轮生命周期和事件日志。 |
-| `server/sandboxes/` | `e2b.ts` 管理连接、准备、执行、续期、恢复、文件与端口访问；`inventory.ts` 汇总状态和资源；归档存储接口及本地快照实现独立放置。 |
-| `server/workspaces/` | Git 差异查询；文件路径校验、受限读取、内容类型和大小判断。 |
-| `server/templates/`、`scripts/e2b/` | 模板配置、构建状态和默认版本；实际安装与验证脚本、多语言工具清单。 |
-| `server/connections/` | 本机凭据导入、加密存储、权限校验及沙箱动态同步；不把密钥写入模板或 Git。 |
-| `server/shared-files/` | 管理持久化共享规则与知识库，加载待下发的文档。 |
-| `server/improvements/` | 建议校验、去重、SQLite 迁移、查询、人工状态转换与历史。 |
-| `server/storage/`、`core/`、`http/`、`diagnostics/` | 原子 JSON 写入、公共错误、生产静态文件、运行日志与 HTTP 诊断。 |
-| `shared/` | 前后端共享的数据契约和 SDK 事件归并函数，不依赖 React 或服务端存储。 |
-| `src/App.tsx` | 页面装配、当前项目/会话选择及跨页面状态协调。 |
-| `src/features/` | 按业务划分的页面与局部逻辑；`chat` 管理消息渲染、模型设置和 SSE，`workspace-files` 管理文件预览。其余目录与业务模块对应。 |
-| `src/lib/`、`src/components/` | HTTP 客户端、浏览器路由、资源链接解析及公共 UI 组件。 |
+| `backend/execution/worker/` | 同步到沙箱运行的独立 `.mjs` 脚本：调用 agentcore、检查工具、改进建议 MCP 与回执桥接；负责单轮生命周期和事件日志。 |
+| `backend/sandboxes/` | `e2b.ts` 管理连接、准备、执行、续期、恢复、文件与端口访问；`inventory.ts` 汇总状态和资源；归档存储接口及本地快照实现独立放置。 |
+| `backend/workspaces/` | Git 差异查询；文件路径校验、受限读取、内容类型和大小判断。 |
+| `backend/templates/`、`scripts/e2b/` | 模板配置、构建状态和默认版本；实际安装与验证脚本、多语言工具清单。 |
+| `backend/connections/` | 本机凭据导入、加密存储、权限校验及沙箱动态同步；不把密钥写入模板或 Git。 |
+| `backend/shared-files/` | 管理持久化共享规则与知识库，加载待下发的文档。 |
+| `backend/improvements/` | 建议校验、去重、SQLite 迁移、查询、人工状态转换与历史。 |
+| `backend/storage/`、`core/`、`http/`、`diagnostics/` | 原子 JSON 写入、公共错误、生产静态文件、运行日志与 HTTP 诊断。 |
+| `protocol/` | 前后端数据契约、消息与事件类型。 |
+| `util/` | 事件归并、用量汇总、费用估算及模型常量，不依赖 React 或服务端存储。 |
+| `fe/App.tsx` | 页面装配、当前项目/会话选择及跨页面状态协调。 |
+| `fe/features/` | 按业务划分的页面与局部逻辑；`chat` 管理消息渲染、模型设置和 SSE，`workspace-files` 管理文件预览。其余目录与业务模块对应。 |
+| `fe/lib/`、`fe/components/` | HTTP 客户端、浏览器路由、资源链接解析及公共 UI 组件。 |
 
 ## 关键调用链
 
@@ -86,7 +87,7 @@ E2B 项目沙箱
 
 ### 打开沙箱资源
 
-`src/lib/resource-links.ts` 根据消息所属项目和会话工作目录解析链接；文档中的相对路径以当前文档目录为基准。原消息不改写。外部域名保持外部链接，无法确认的本地地址不自动当作主站路由。
+`fe/lib/resource-links.ts` 根据消息所属项目和会话工作目录解析链接；文档中的相对路径以当前文档目录为基准。原消息不改写。外部域名保持外部链接，无法确认的本地地址不自动当作主站路由。
 
 文件链接落到 `/projects/:id/files?path=...`，后端通过 `/api/projects/:id/files` 读取项目当前沙箱中的文件。权限以服务端项目工作区及明确允许的共享文档目录为准，并检查真实路径和已打开的文件描述符；前端分类不是权限边界。HTML/SVG 不在主页面执行。端口服务复用 `/api/projects/:id/preview`。
 
@@ -111,7 +112,8 @@ E2B 项目沙箱
 
 | 位置 | 数据 |
 | --- | --- |
-| `.codex-web/` 或 `CODEX_WEB_DATA_DIR` | 项目、会话历史及上传附件。 |
+| `data/web-state/` 或 `CODEX_WEB_DATA_DIR` | JSON 项目、会话元数据；配置 `MYSQL_URL` 后使用 MySQL。 |
+| `data/images/` 或 `CODEX_WEB_IMAGES_DIR` | 上传图片。 |
 | `data/improvements.sqlite` | 建议及状态历史，可由 `IMPROVEMENTS_DB_PATH` 调整。 |
 | `data/AGENTS.md`、`data/docs/` | 共享规则与知识库；沙箱文档副本位于 `/home/user/.codex/docs`。 |
 | `data/e2b/templates/` | 模板配置、构建记录、默认版本。 |
@@ -129,7 +131,7 @@ E2B 项目沙箱
 
 ### Docker Compose 运行
 
-仓库根目录的 `docker-compose.yml` 用于构建和运行生产模式的 Web 服务。容器服务名为 `swarm-hive`，宿主机端口默认映射为 `3001`；Compose 会将 `.codex-web/` 和 `data/` 挂载到容器中，并以只读方式挂载 E2B API key 文件。启动前确认 `.env` 和 `E2B_API_KEY_FILE` 指向的文件已配置。
+仓库根目录的 `docker-compose.yml` 用于构建和运行生产模式的 Web 服务。容器服务名为 `swarm-hive`，宿主机端口默认映射为 `3001`；Compose 会将 `data/` 挂载到容器中，并以只读方式挂载 E2B API key 文件。启动前确认 `.env` 和 `E2B_API_KEY_FILE` 指向的文件已配置。
 
 常用命令通过根目录 `Makefile` 执行：
 
@@ -155,6 +157,6 @@ PORT=3001 pnpm start
 
 开发模式由同一个后端挂载 Vite 中间件；生产模式先构建，再启动。应用代码默认端口为 `3000`，仓库 Docker Compose 生产配置固定使用 `3001`；使用 `PORT` 时以实际配置为准。Python 辅助脚本需要环境时使用 `uv`。
 
-修改前沿相关模块的路由、业务服务和数据契约阅读；接口变更同时更新 `shared/` 与页面。按改动验证类型、构建和必要的真实行为，避免为可逆的小改动增加大量永久单元测试；临时验证脚本放 `/tmp`。模板构建、凭据导入和真实模型验证会访问实际环境，不作为普通文档或 UI 修改的例行检查。
+修改前沿相关模块的路由、业务服务和数据契约阅读；接口变更同时更新 `protocol/` 与页面，涉及共享计算时同步更新 `util/`。按改动验证类型、构建和必要的真实行为，避免为可逆的小改动增加大量永久单元测试；临时验证脚本放 `/tmp`。模板构建、凭据导入和真实模型验证会访问实际环境，不作为普通文档或 UI 修改的例行检查。
 
 详细说明按需阅读：`docs/README.md`、`projects.md`、`e2b-integration.md`、`template-management.md`、`workspace-resources.md`、`improvements.md`、`runtime-logging.md`、`http-capture.md`、`model-overload-retries.md`、`kubernetes-access.md`（均位于 `docs/`）。

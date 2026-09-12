@@ -90,7 +90,36 @@ test('legacy running turns are cancelled on restart instead of resubmitted', asy
     await writeFile(join(directory, `${session.id}.json`), JSON.stringify(session));
     await second.init();
     assert.equal(second.get(session.id).status, 'cancelled');
-    assert.match(second.get(session.id).turns[0].error!, /服务已重启/);
+    assert.match(second.get(session.id).turns[0].error!, /没有可恢复的执行任务/);
+  } finally {
+    await first.close(); await second.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a worker for a different sandbox is not registered as a current resource usage on restart', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hive-recovery-mismatch-'));
+  const runtime = { async close() {},
+    trackExecution() { assert.fail('must not reserve a worker belonging to another sandbox'); },
+    async *recover() { assert.fail('must not recover a worker in a different sandbox'); },
+  } as unknown as E2BRuntime;
+  const first = new SessionManager({} as CodexClient, directory, defaults, runtime);
+  const second = new SessionManager({} as CodexClient, directory, defaults, runtime);
+  try {
+    await first.init();
+    const session = await first.create();
+    await first.close();
+    const path = join(directory, 'projects', `${session.projectId}.json`);
+    const project = JSON.parse(await readFile(path, 'utf8'));
+    project.sandbox = { id: 'current-sandbox', status: 'ready', template: 'test', workingDirectory: defaults.workingDirectory };
+    await writeFile(path, JSON.stringify(project));
+    session.status = 'running';
+    session.turns.push({ id: 'old-turn', prompt: 'test', images: [], items: [], status: 'running', startedAt: session.createdAt,
+      execution: { kind: 'e2b-worker', protocolVersion: 1, workerId: 'old-worker', sandboxId: 'old-sandbox', state: 'detached', lastAppliedSeq: 0 } });
+    await writeFile(join(directory, `${session.id}.json`), JSON.stringify(session));
+    await second.init();
+    assert.equal(second.get(session.id).turns[0].status, 'cancelled');
+    assert.equal(second.get(session.id).turns[0].execution?.state, 'terminal');
   } finally {
     await first.close(); await second.close();
     await rm(directory, { recursive: true, force: true });

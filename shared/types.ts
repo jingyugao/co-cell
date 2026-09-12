@@ -86,6 +86,8 @@ export interface Turn {
     workerId: string;
     sandboxId?: string;
     commandPid?: number;
+    /** Keep retrying termination after reconnect/restart until it is confirmed. */
+    stopRequested?: boolean;
     lastAppliedSeq: number;
     state: 'launching' | 'running' | 'detached' | 'terminal';
   };

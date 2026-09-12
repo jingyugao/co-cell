@@ -2,7 +2,7 @@ import type { Codex, Input, Thread, ThreadOptions } from '../../packages/agentco
 import type { AgentEvent, Session, StreamMessage, Turn } from '../../shared/types.js';
 import { applyTurnEvent } from '../../shared/session-events.js';
 import { HttpError } from '../core/errors.js';
-import { TurnLaunchCancelled, TurnObserverDetached, type E2BRuntime } from '../sandboxes/e2b.js';
+import { TurnLaunchCancelled, TurnObserverDetached, TurnTerminationUnconfirmed, type E2BRuntime } from './e2b-runtime.js';
 import type { RuntimeLog } from '../diagnostics/runtime-log.js';
 import type { RequestUserApproval } from '../../shared/approval-types.js';
 
@@ -73,12 +73,15 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
   } catch (error) {
     if (error instanceof TurnObserverDetached) {
       detached = true;
+      if (error instanceof TurnTerminationUnconfirmed) turn.error = error.message;
     } else if (error instanceof TurnLaunchCancelled) {
       turn.status = 'cancelled';
       turn.error = '服务正在升级，本轮尚未启动 Codex，可重新发送消息。';
     } else {
-      turn.status = controller.signal.aborted ? 'cancelled' : 'failed';
-      if (!controller.signal.aborted) turn.error = terminalFailure ?? (error instanceof Error ? error.message : String(error));
+      const cancelled = controller.signal.aborted || (turn.execution?.stopRequested && error instanceof DOMException && error.name === 'AbortError');
+      turn.status = cancelled ? 'cancelled' : 'failed';
+      if (!cancelled) turn.error = terminalFailure ?? (error instanceof Error ? error.message : String(error));
+      else delete turn.error;
     }
   } finally {
     if (detached) {

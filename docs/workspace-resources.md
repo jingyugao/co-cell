@@ -5,7 +5,7 @@ Agent 原始消息保持不变。Markdown 渲染器根据消息所属项目和 `
 | 地址 | 行为 |
 | --- | --- |
 | `/home/user/workspace/tools/qg-proxy/README.md` | 项目文件预览 |
-| `./README.md`、`src/main.go:42` | 相对会话工作目录解析，支持行号 |
+| `./README.md`、`fe/main.go:42` | 相对会话工作目录解析，支持行号 |
 | `file:///home/user/workspace/README.md` | 项目文件预览 |
 | `sandbox:/files/tools/qg-proxy/README.md` | 相对项目工作区解析 |
 | `sandbox:/ports/8000/`、`localhost:8000`、`0.0.0.0:8000` | 既有沙箱端口预览 |

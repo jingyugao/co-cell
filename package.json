@@ -8,13 +8,13 @@
   },
   "packageManager": "pnpm@10.33.4",
   "scripts": {
-    "dev": "tsx server/index.ts",
+    "dev": "tsx backend/index.ts",
     "build": "tsc --noEmit && vite build",
-    "start": "NODE_ENV=production tsx server/index.ts",
+    "start": "NODE_ENV=production tsx backend/index.ts",
     "typecheck": "tsc --noEmit",
-    "capture:http": "tsx server/diagnostics/capture-demo.ts",
-    "credentials:import": "tsx server/connections/import-local.ts",
-    "credentials:migrate": "tsx server/connections/migrate-credentials.ts",
+    "capture:http": "tsx backend/diagnostics/capture-demo.ts",
+    "credentials:import": "tsx backend/connections/import-local.ts",
+    "credentials:migrate": "tsx backend/connections/migrate-credentials.ts",
     "cliproxyapi": "node scripts/cliproxyapi/manage.mjs",
     "e2b:build": "node scripts/e2b/build-template.mjs && node scripts/e2b/verify-template.mjs",
     "kubernetes:configure": "node scripts/kubernetes-admin.mjs"

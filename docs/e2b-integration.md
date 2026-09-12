@@ -83,7 +83,7 @@ E2B 内 Codex 固定为 `danger-full-access`、`approvalPolicy: never`，命令�
 
 ### 归档存储
 
-`server/sandboxes/archive-storage.ts` 定义 `SandboxArchiveStorage` 的 `put/get/delete` 接口。当前实现将 `.tar.gz` 流式写到本地持久化目录，原子落盘并记录大小和 SHA256；恢复下载时先校验，再交给快照适配器。后续 OSS 实现只需替换该接口。
+`backend/sandboxes/archive-storage.ts` 定义 `SandboxArchiveStorage` 的 `put/get/delete` 接口。当前实现将 `.tar.gz` 流式写到本地持久化目录，原子落盘并记录大小和 SHA256；恢复下载时先校验，再交给快照适配器。后续 OSS 实现只需替换该接口。
 
 `LocalSnapshotArchive` 针对本机 E2B：通过只读 SQL 获取快照 build，用 `inspect-build` 找出磁盘与内存的完整依赖图，再通过无网络临时 Docker 容器读取原生快照文件，归档 manifest 和全部依赖层。需要本地 Docker 权限、E2B Compose 的 postgres 服务以及 `bash scripts/e2b/build-archive-inspector.sh` 生成的检查工具。不会启动沙箱内的业务进程。
 

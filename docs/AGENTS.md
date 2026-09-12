@@ -53,24 +53,24 @@ E2B 项目沙箱
 
 | 模块 | 入口及职责 |
 | --- | --- |
-| `server/index.ts` | 读取配置、创建服务依赖、初始化存储、启动 HTTP/Vite、处理退出。 |
-| `server/app.ts` | 公共 Host/Origin 校验、请求大小限制、错误处理和路由装配。业务接口放到各模块。 |
-| `server/projects/` | 项目创建、编辑、归档、删除保护；`requirements.ts` 读取飞书需求名称。 |
-| `server/sessions/` | `manager.ts` 管理会话、运行任务、持久化和订阅；`routes.ts` 提供会话、提交、停止、SSE 等接口。 |
-| `server/execution/` | `runner.ts` 处理单轮执行；`raw-tools.ts` 读取 Codex 原始工具记录。 |
+| `backend/index.ts` | 读取配置、创建服务依赖、初始化存储、启动 HTTP/Vite、处理退出。 |
+| `backend/app.ts` | 公共 Host/Origin 校验、请求大小限制、错误处理和路由装配。业务接口放到各模块。 |
+| `backend/projects/` | 项目创建、编辑、归档、删除保护；`requirements.ts` 读取飞书需求名称。 |
+| `backend/sessions/` | `manager.ts` 管理会话、运行任务、持久化和订阅；`routes.ts` 提供会话、提交、停止、SSE 等接口。 |
+| `backend/execution/` | `runner.ts` 处理单轮执行；`raw-tools.ts` 读取 Codex 原始工具记录。 |
 | `packages/agentcore/` | Codex App Server 运行时适配层：通过 JSON-RPC 启动/恢复线程、执行或中断 turn，归一化 item、用量和状态事件；不负责宿主机路由或持久化。 |
-| `server/execution/worker/` | 同步到沙箱运行的独立 `.mjs` 脚本：调用 agentcore、检查工具、改进建议 MCP 与回执桥接；负责单轮生命周期和事件日志。 |
-| `server/sandboxes/` | `e2b.ts` 管理连接、准备、执行、续期、恢复、文件与端口访问；`inventory.ts` 汇总状态和资源；归档存储接口及本地快照实现独立放置。 |
-| `server/workspaces/` | Git 差异查询；文件路径校验、受限读取、内容类型和大小判断。 |
-| `server/templates/`、`scripts/e2b/` | 模板配置、构建状态和默认版本；实际安装与验证脚本、多语言工具清单。 |
-| `server/connections/` | 本机凭据导入、加密存储、权限校验及沙箱动态同步；不把密钥写入模板或 Git。 |
-| `server/shared-files/` | 管理持久化共享规则与知识库，加载待下发的文档。 |
-| `server/improvements/` | 建议校验、去重、SQLite 迁移、查询、人工状态转换与历史。 |
-| `server/storage/`、`core/`、`http/`、`diagnostics/` | 原子 JSON 写入、公共错误、生产静态文件、运行日志与 HTTP 诊断。 |
+| `backend/execution/worker/` | 同步到沙箱运行的独立 `.mjs` 脚本：调用 agentcore、检查工具、改进建议 MCP 与回执桥接；负责单轮生命周期和事件日志。 |
+| `backend/sandboxes/` | `e2b.ts` 管理连接、准备、执行、续期、恢复、文件与端口访问；`inventory.ts` 汇总状态和资源；归档存储接口及本地快照实现独立放置。 |
+| `backend/workspaces/` | Git 差异查询；文件路径校验、受限读取、内容类型和大小判断。 |
+| `backend/templates/`、`scripts/e2b/` | 模板配置、构建状态和默认版本；实际安装与验证脚本、多语言工具清单。 |
+| `backend/connections/` | 本机凭据导入、加密存储、权限校验及沙箱动态同步；不把密钥写入模板或 Git。 |
+| `backend/shared-files/` | 管理持久化共享规则与知识库，加载待下发的文档。 |
+| `backend/improvements/` | 建议校验、去重、SQLite 迁移、查询、人工状态转换与历史。 |
+| `backend/storage/`、`core/`、`http/`、`diagnostics/` | 原子 JSON 写入、公共错误、生产静态文件、运行日志与 HTTP 诊断。 |
 | `shared/` | 前后端共享的数据契约和 SDK 事件归并函数，不依赖 React 或服务端存储。 |
-| `src/App.tsx` | 页面装配、当前项目/会话选择及跨页面状态协调。 |
-| `src/features/` | 按业务划分的页面与局部逻辑；`chat` 管理消息渲染、模型设置和 SSE，`workspace-files` 管理文件预览。其余目录与业务模块对应。 |
-| `src/lib/`、`src/components/` | HTTP 客户端、浏览器路由、资源链接解析及公共 UI 组件。 |
+| `fe/App.tsx` | 页面装配、当前项目/会话选择及跨页面状态协调。 |
+| `fe/features/` | 按业务划分的页面与局部逻辑；`chat` 管理消息渲染、模型设置和 SSE，`workspace-files` 管理文件预览。其余目录与业务模块对应。 |
+| `fe/lib/`、`fe/components/` | HTTP 客户端、浏览器路由、资源链接解析及公共 UI 组件。 |
 
 ## 关键调用链
 
@@ -86,7 +86,7 @@ E2B 项目沙箱
 
 ### 打开沙箱资源
 
-`src/lib/resource-links.ts` 根据消息所属项目和会话工作目录解析链接；文档中的相对路径以当前文档目录为基准。原消息不改写。外部域名保持外部链接，无法确认的本地地址不自动当作主站路由。
+`fe/lib/resource-links.ts` 根据消息所属项目和会话工作目录解析链接；文档中的相对路径以当前文档目录为基准。原消息不改写。外部域名保持外部链接，无法确认的本地地址不自动当作主站路由。
 
 文件链接落到 `/projects/:id/files?path=...`，后端通过 `/api/projects/:id/files` 读取项目当前沙箱中的文件。权限以服务端项目工作区及明确允许的共享文档目录为准，并检查真实路径和已打开的文件描述符；前端分类不是权限边界。HTML/SVG 不在主页面执行。端口服务复用 `/api/projects/:id/preview`。
 

@@ -12,5 +12,5 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["src", "server", "shared", "packages/sandbox/src", "vite.config.ts"]
+  "include": ["fe", "backend", "shared", "packages/sandbox/src", "vite.config.ts"]
 }

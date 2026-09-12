@@ -80,23 +80,23 @@ pnpm build
 
 模板验证和 `pnpm capture:http` 会访问实际 E2B 或模型服务。模板构建运行 `pnpm e2b:build`，前置条件和生效方式见 [模板管理](template-management.md)。
 
-代码按功能组织，每个后端模块的 HTTP 接口放在自身的 `routes.ts`，`server/app.ts` 只负责公共中间件和路由装配。
+代码按功能组织，每个后端模块的 HTTP 接口放在自身的 `routes.ts`，`backend/app.ts` 只负责公共中间件和路由装配。
 
 | 目录 | 职责 |
 | --- | --- |
-| `server/projects/` | 项目记录、归档、操作与删除保护 |
-| `server/sessions/` | 会话、历史迁移、订阅与跨模块操作协调 |
-| `server/execution/` | 单轮 Codex 执行、事件处理、原始工具消息；`worker/` 是同步到沙箱的运行脚本 |
-| `server/sandboxes/` | E2B 生命周期、端口预览、资源清单与工作区接口 |
-| `server/templates/`、`connections/`、`shared-files/` | 模板、凭据、共享文档及各自路由 |
-| `server/storage/`、`core/`、`http/`、`diagnostics/`、`workspaces/` | 原子文件写入、公共错误、静态资源、日志诊断、Git 查询 |
-| `src/features/` | projects、chat、sandboxes、templates、connections、shared-files 页面及局部状态 |
-| `src/components/`、`src/lib/` | 公共组件、HTTP 请求 |
+| `backend/projects/` | 项目记录、归档、操作与删除保护 |
+| `backend/sessions/` | 会话、历史迁移、订阅与跨模块操作协调 |
+| `backend/execution/` | 单轮 Codex 执行、事件处理、原始工具消息；`worker/` 是同步到沙箱的运行脚本 |
+| `backend/sandboxes/` | E2B 生命周期、端口预览、资源清单与工作区接口 |
+| `backend/templates/`、`connections/`、`shared-files/` | 模板、凭据、共享文档及各自路由 |
+| `backend/storage/`、`core/`、`http/`、`diagnostics/`、`workspaces/` | 原子文件写入、公共错误、静态资源、日志诊断、Git 查询 |
+| `fe/features/` | projects、chat、sandboxes、templates、connections、shared-files 页面及局部状态 |
+| `fe/components/`、`fe/lib/` | 公共组件、HTTP 请求 |
 | `shared/` | 前后端协议类型与事件处理函数 |
 
 项目记录由 ProjectService 管理，SessionManager 保留会话与沙箱之间的协调入口；执行事件的消费由 runTurn 负责。沙箱的预览、巡检和删除接收 WorkspaceTarget，无需构造空会话。前端 useProjects 管理项目数据，useSessionStream 管理当前会话的 SSE；项目编辑和归档直接应用接口返回值，不重新拉取会话列表。
 
-本次拆分保留 API 路径、持久化格式和沙箱内运行脚本的文件名，已有项目、会话、沙箱映射无需迁移。会话中的 sandbox 兼容快照暂时保留。`server/index.ts` 仍是服务启动入口。
+本次拆分保留 API 路径、持久化格式和沙箱内运行脚本的文件名，已有项目、会话、沙箱映射无需迁移。会话中的 sandbox 兼容快照暂时保留。`backend/index.ts` 仍是服务启动入口。
 
 ## 文档索引
 

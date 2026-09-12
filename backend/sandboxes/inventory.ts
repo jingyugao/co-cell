@@ -1,5 +1,5 @@
 import { ApiClient, ConnectionConfig, Sandbox, type ConnectionOpts, type SandboxApiOpts, type SandboxInfo, type SandboxListOpts, type SandboxMetrics, type SandboxMetricsOpts } from 'e2b';
-import type { ProjectSummary, SandboxInventory, SandboxRecord, SessionSummary } from '../../shared/types.js';
+import type { ProjectSummary, SandboxInventory, SandboxRecord, SessionSummary } from '../../protocol/types.js';
 import { HttpError } from '../core/errors.js';
 
 interface InventoryApi {

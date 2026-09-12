@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { ThreadItem } from '../../../shared/agent-protocol';
-import type { UserApproval } from '../../../shared/approval-types';
+import type { ThreadItem } from '../../../protocol/agent-protocol';
+import type { UserApproval } from '../../../protocol/approval-types';
 import { matchApprovalItems } from './approval-items';
 
 const input = { title: '更新配置', target: '测试环境', action: '执行已保存的脚本', impact: '重启一个服务' };

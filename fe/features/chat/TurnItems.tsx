@@ -1,6 +1,6 @@
 import { Fragment } from 'react';
-import type { UserApproval } from '../../../shared/approval-types';
-import type { Turn } from '../../../shared/types';
+import type { UserApproval } from '../../../protocol/approval-types';
+import type { Turn } from '../../../protocol/types';
 import type { MarkdownResources } from './Markdown';
 import ItemView from './ItemView';
 import ToolDetails from './ToolDetails';

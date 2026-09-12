@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { ConnectionInventory } from '../../shared/connection-types.js';
+import type { ConnectionInventory } from '../../protocol/connection-types.js';
 
 export const KUBERNETES_CREDENTIAL_POLICY = 'static-admin-v1';
 

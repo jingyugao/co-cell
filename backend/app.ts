@@ -3,7 +3,7 @@ import type { ImprovementStore } from './improvements/store.js';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
-import type { AppConfig } from '../shared/types.js';
+import type { AppConfig } from '../protocol/types.js';
 import { SessionManager } from './sessions/manager.js';
 import { HttpError } from './core/errors.js';
 import { RawToolReader } from './execution/raw-tools.js';

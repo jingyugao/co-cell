@@ -1,4 +1,4 @@
-import type { Session, Turn } from './types.js';
+import type { Session, Turn } from '../protocol/types.js';
 
 export interface TokenRates {
   inputPerToken: number;

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { AppConfig, ProjectSummary } from '../../../shared/types';
+import type { AppConfig, ProjectSummary } from '../../../protocol/types';
 import type { ProjectValues, ProjectUpdate } from './useProjects';
 import './ProjectsPage.css';
 

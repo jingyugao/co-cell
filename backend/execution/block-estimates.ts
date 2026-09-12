@@ -1,5 +1,5 @@
 import { Worker } from 'node:worker_threads';
-import type { Turn } from '../../shared/types.js';
+import type { Turn } from '../../protocol/types.js';
 
 /** CPU-heavy tokenization runs outside the HTTP/SSE event loop. */
 export function estimateNativeBlocksAsync(turns: Turn[]): Promise<Turn[]> {

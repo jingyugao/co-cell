@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { ImprovementPage, ImprovementProposal, ImprovementStatus } from '../../../shared/improvement-types';
+import type { ImprovementPage, ImprovementProposal, ImprovementStatus } from '../../../protocol/improvement-types';
 import { Icon } from '../../components/Icon';
 import { api, errorMessage } from '../../lib/api';
 import './ImprovementsPage.css';

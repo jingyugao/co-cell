@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { Session, Settings, Turn } from '../../shared/types.js';
+import type { Session, Settings, Turn } from '../../protocol/types.js';
 import { TurnObserverDetached, type E2BRuntime } from '../sandboxes/e2b.js';
 import { SessionManager, type CodexClient } from './manager.js';
 

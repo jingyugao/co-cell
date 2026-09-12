@@ -1,5 +1,5 @@
 import { posix } from 'node:path';
-import type { WorkspaceFile } from '../../shared/workspace-types.js';
+import type { WorkspaceFile } from '../../protocol/workspace-types.js';
 import { HttpError } from '../core/errors.js';
 
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;

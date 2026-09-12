@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
-import type { Session, Turn } from '../../shared/types.js';
+import type { Session, Turn } from '../../protocol/types.js';
 import { E2BCodexRuntime, TurnLaunchCancelled, TurnObserverDetached } from './e2b.js';
 
 function fixture() {

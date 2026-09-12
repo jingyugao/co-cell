@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { E2BSandboxManager, SandboxLease, SandboxRecord } from '@swarm-hive/sandbox';
-import type { SandboxState } from '../../shared/sandbox-types.js';
+import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
 
 export type SaveSandbox = (state: SandboxState) => Promise<void>;

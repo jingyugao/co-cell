@@ -4,7 +4,7 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
-import { IMPROVEMENT_STATUSES, type ImprovementContext, type ImprovementInput, type ImprovementPage, type ImprovementProposal, type ImprovementReceipt, type ImprovementStatus, type ImprovementStatusChange } from '../../shared/improvement-types.js';
+import { IMPROVEMENT_STATUSES, type ImprovementContext, type ImprovementInput, type ImprovementPage, type ImprovementProposal, type ImprovementReceipt, type ImprovementStatus, type ImprovementStatusChange } from '../../protocol/improvement-types.js';
 import { HttpError } from '../core/errors.js';
 
 export const improvementSchema = z.object({

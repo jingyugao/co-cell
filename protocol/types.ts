@@ -10,6 +10,15 @@ export interface RetryState {
   nextRetryAt: string;
   status: 'waiting' | 'retrying';
 }
+export interface BlockEstimate {
+  id: string;
+  label: string;
+  inputTokens: number;
+  outputTokens: number;
+  turnId?: string;
+  itemId?: string;
+}
+
 /** Actual input size of the most recent model request, as reported by Responses. */
 export interface ContextUsage {
   segment?: number;
@@ -17,7 +26,7 @@ export interface ContextUsage {
   /** Transient native-reader input; removed before returning/persisting estimates. */
   blockTexts?: Array<{ id: string; label: string; text: string; turnId?: string; direction: 'input' | 'output' }>;
   /** Local text tokenizer estimates; not provider-attributed message usage. */
-  blockEstimates?: import('./block-costs').BlockEstimate[];
+  blockEstimates?: BlockEstimate[];
   blockTokenizer?: string;
   requestId?: string;
   responseId?: string;

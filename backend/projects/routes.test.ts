@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Hono } from 'hono';
-import type { WorkspaceFile } from '../../shared/workspace-types.js';
+import type { WorkspaceFile } from '../../protocol/workspace-types.js';
 import { MAX_FILE_BYTES, type WorkspaceFileReadOptions, type WorkspaceFileResult } from '../workspaces/files.js';
 import { installProjectsRoutes } from './routes.js';
 

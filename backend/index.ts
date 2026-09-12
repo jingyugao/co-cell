@@ -1,5 +1,5 @@
 import { ImprovementStore } from './improvements/store.js';
-import type { ImprovementContext, ImprovementReceipt } from '../shared/improvement-types.js';
+import type { ImprovementContext, ImprovementReceipt } from '../protocol/improvement-types.js';
 import { createServer } from 'node:http';
 import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
@@ -7,8 +7,8 @@ import { homedir } from 'node:os';
 import { readFile } from 'node:fs/promises';
 import { Codex } from '../packages/agentcore/src/index.mjs';
 import { getRequestListener } from '@hono/node-server';
-import type { AppConfig, Settings } from '../shared/types.js';
-import { DEFAULT_MODEL } from '../shared/models.js';
+import type { AppConfig, Settings } from '../protocol/types.js';
+import { DEFAULT_MODEL } from '../util/models.js';
 import { createApp } from './app.js';
 import { SessionManager } from './sessions/manager.js';
 import { E2BCodexRuntime } from './execution/e2b-runtime.js';

@@ -1,4 +1,4 @@
-import type { ProjectSummary, SessionSummary } from '../../shared/types';
+import type { ProjectSummary, SessionSummary } from '../../protocol/types';
 
 export type Page = 'chat' | 'sandboxes' | 'projects' | 'files' | 'templates' | 'connections' | 'improvements';
 export type Selection = { sessionId: string | null; projectId: string | null };

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import type { Project } from '../../../shared/types';
-import type { WorkspaceFile } from '../../../shared/workspace-types';
+import type { Project } from '../../../protocol/types';
+import type { WorkspaceFile } from '../../../protocol/workspace-types';
 import { api, errorMessage } from '../../lib/api';
 import { fileContentUrl, fileViewUrl } from '../../lib/resource-links';
 import Markdown, { type FileSelection } from '../chat/Markdown';

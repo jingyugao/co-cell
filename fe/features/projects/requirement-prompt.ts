@@ -1,4 +1,4 @@
-import type { ProjectSummary } from '../../../shared/types';
+import type { ProjectSummary } from '../../../protocol/types';
 
 export function requirementPrompt(project: Pick<ProjectSummary, 'name' | 'requirementUrl'> | null): string {
   if (!project?.requirementUrl) return '';

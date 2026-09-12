@@ -4,7 +4,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import type { TemplateBuild, TemplateDefinition, TemplateInventory, TemplateManifest } from '../../shared/template-types.js';
+import type { TemplateBuild, TemplateDefinition, TemplateInventory, TemplateManifest } from '../../protocol/template-types.js';
 import { HttpError } from '../core/errors.js';
 
 const pinned = z.string().max(64).regex(/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9][a-zA-Z0-9.-]*)?$/);

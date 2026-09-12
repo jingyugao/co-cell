@@ -1,7 +1,7 @@
-import type { ThreadItem } from '../../../shared/agent-protocol';
+import type { ThreadItem } from '../../../protocol/agent-protocol';
 import type { ReactNode } from 'react';
-import type { Turn } from '../../../shared/types';
-import type { UserApprovalInput } from '../../../shared/approval-types';
+import type { Turn } from '../../../protocol/types';
+import type { UserApprovalInput } from '../../../protocol/approval-types';
 import { Icon } from '../../components/Icon';
 import Markdown, { MarkdownLink, type MarkdownResources } from './Markdown';
 import ToolDetails from './ToolDetails';

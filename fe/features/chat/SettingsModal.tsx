@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import type { AppConfig, ProjectSummary, Settings, Session } from '../../../shared/types';
+import type { AppConfig, ProjectSummary, Settings, Session } from '../../../protocol/types';
 import { Icon } from '../../components/Icon';
 import { errorMessage as message } from '../../lib/api';
 import { effectiveSettings } from './settings';
-import { MODEL_OPTIONS } from '../../../shared/models';
+import { MODEL_OPTIONS } from '../../../util/models';
 
 export default function SettingsModal({ project, settings, session, config, onClose, onSave, onDelete }: { project: ProjectSummary | null; settings: Settings; session: Session | null; config: AppConfig | null; onClose: () => void; onSave: (settings: Settings, thread: string, title: string) => Promise<void>; onDelete: () => Promise<void> }) {
   const [values, setValues] = useState(() => effectiveSettings(settings));

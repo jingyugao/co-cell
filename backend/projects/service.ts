@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { Project, Settings } from '../../shared/types.js';
+import type { Project, Settings } from '../../protocol/types.js';
 import { HttpError } from '../core/errors.js';
 import { AtomicJsonWriter } from '../storage/atomic-json.js';
 import type { WebStateStore } from '../storage/web-state.js';

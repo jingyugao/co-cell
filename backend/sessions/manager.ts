@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
-import type { Project, ProjectSummary, Session, SessionSummary, Settings, StreamMessage, Turn } from '../../shared/types.js';
+import type { Project, ProjectSummary, Session, SessionSummary, Settings, StreamMessage, Turn } from '../../protocol/types.js';
 import type { E2BRuntime } from '../execution/e2b-runtime.js';
 import { getChanges } from '../workspaces/git.js';
 import type { WorkspaceFileReadOptions } from '../workspaces/files.js';

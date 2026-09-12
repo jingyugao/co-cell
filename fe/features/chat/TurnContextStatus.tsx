@@ -1,4 +1,4 @@
-import type { Turn } from '../../../shared/types';
+import type { Turn } from '../../../protocol/types';
 
 export default function TurnContextStatus({ turn }: { turn: Turn }) {
   // Historical failures without an SDK receipt must remain unknown.

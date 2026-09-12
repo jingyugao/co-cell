@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { MODEL_OPTIONS } from '../../../shared/models';
+import { MODEL_OPTIONS } from '../../../util/models';
 import { errorMessage } from '../../lib/api';
 import './ModelPicker.css';
 

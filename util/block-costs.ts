@@ -1,14 +1,5 @@
-import type { Turn } from './types';
+import type { Turn } from '../protocol/types';
 import { MODEL_TOKEN_RATES, estimateTokenCostUsd } from './model-costs';
-
-export interface BlockEstimate {
-  id: string;
-  label: string;
-  inputTokens: number;
-  outputTokens: number;
-  turnId?: string;
-  itemId?: string;
-}
 
 /** Allocate aggregate cached usage proportionally: its block boundary is unknown. */
 export function sessionBlockCosts(turns: Turn[]) {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { RawToolMessage, RawToolPage } from '../../../shared/types';
+import type { RawToolMessage, RawToolPage } from '../../../protocol/types';
 import './RawToolMessages.css';
 
 type ToolExchange = { key: string; call?: RawToolMessage; outputs: RawToolMessage[] };

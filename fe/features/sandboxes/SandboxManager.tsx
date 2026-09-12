@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { SandboxInventory, SandboxRecord } from '../../../shared/types';
+import type { SandboxInventory, SandboxRecord } from '../../../protocol/types';
 import './SandboxManager.css';
 
 const states = { running: '运行中', paused: '已暂停', archiving: '归档中', archived: '已归档', restoring: '恢复中', unknown: '未知' };

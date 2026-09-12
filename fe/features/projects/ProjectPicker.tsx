@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef } from 'react';
-import type { ProjectSummary } from '../../../shared/types';
+import type { ProjectSummary } from '../../../protocol/types';
 import { Icon } from '../../components/Icon';
 import './ProjectPicker.css';
 

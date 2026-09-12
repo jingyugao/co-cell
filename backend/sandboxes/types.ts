@@ -1,4 +1,4 @@
-import type { SandboxState } from '../../shared/sandbox-types.js';
+import type { SandboxState } from '../../protocol/sandbox-types.js';
 
 /** Enough context to address a workspace without fabricating a conversation. */
 export interface WorkspaceTarget {

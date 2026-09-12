@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ConnectionInventory } from '../../../shared/connection-types';
+import type { ConnectionInventory } from '../../../protocol/connection-types';
 import './ConnectionsPage.css';
 
 type Props = { onMenu: () => void; onBack: () => void };

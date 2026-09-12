@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { open, readdir, realpath, type FileHandle } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join, sep } from 'node:path';
-import type { RawToolMessage, RawToolPage, RawToolPayload } from '../../shared/types.js';
+import type { RawToolMessage, RawToolPage, RawToolPayload } from '../../protocol/types.js';
 import { HttpError } from '../core/errors.js';
 
 const TOOL_TYPES = new Set(['custom_tool_call', 'function_call', 'custom_tool_call_output', 'function_call_output']);

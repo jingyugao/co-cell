@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import type { UserApproval, RequestUserApproval } from '../../shared/approval-types.js';
-import type { Turn } from '../../shared/types.js';
+import type { UserApproval, RequestUserApproval } from '../../protocol/approval-types.js';
+import type { Turn } from '../../protocol/types.js';
 import { HttpError } from '../core/errors.js';
 
 const inputSchema = z.object({

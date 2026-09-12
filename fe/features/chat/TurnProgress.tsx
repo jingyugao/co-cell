@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { RetryState, Turn } from '../../../shared/types';
+import type { RetryState, Turn } from '../../../protocol/types';
 
 function RetryProgress({ retry }: { retry: RetryState }) {
   const [now, setNow] = useState(Date.now);

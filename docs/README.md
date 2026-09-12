@@ -92,7 +92,8 @@ pnpm build
 | `backend/storage/`、`core/`、`http/`、`diagnostics/`、`workspaces/` | 原子文件写入、公共错误、静态资源、日志诊断、Git 查询 |
 | `fe/features/` | projects、chat、sandboxes、templates、connections、shared-files 页面及局部状态 |
 | `fe/components/`、`fe/lib/` | 公共组件、HTTP 请求 |
-| `shared/` | 前后端协议类型与事件处理函数 |
+| `protocol/` | 前后端数据契约、消息与事件类型。 |
+| `util/` | 事件归并、用量汇总、费用估算及模型常量，不依赖 React 或服务端存储。 |
 
 项目记录由 ProjectService 管理，SessionManager 保留会话与沙箱之间的协调入口；执行事件的消费由 runTurn 负责。沙箱的预览、巡检和删除接收 WorkspaceTarget，无需构造空会话。前端 useProjects 管理项目数据，useSessionStream 管理当前会话的 SSE；项目编辑和归档直接应用接口返回值，不重新拉取会话列表。
 

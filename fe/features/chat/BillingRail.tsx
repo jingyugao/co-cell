@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useState } from 'react';
-import type { Turn } from '../../../shared/types';
-import { sessionBlockCosts } from '../../../shared/block-costs';
-import { estimateTokenCostUsd } from '../../../shared/model-costs';
+import type { Turn } from '../../../protocol/types';
+import { sessionBlockCosts } from '../../../util/block-costs';
+import { estimateTokenCostUsd } from '../../../util/model-costs';
 import './BillingRail.css';
 
 const money = (value: number | null) => value === null ? '未知' : `$${value.toFixed(7)}`;

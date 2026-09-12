@@ -67,7 +67,8 @@ E2B 项目沙箱
 | `backend/shared-files/` | 管理持久化共享规则与知识库，加载待下发的文档。 |
 | `backend/improvements/` | 建议校验、去重、SQLite 迁移、查询、人工状态转换与历史。 |
 | `backend/storage/`、`core/`、`http/`、`diagnostics/` | 原子 JSON 写入、公共错误、生产静态文件、运行日志与 HTTP 诊断。 |
-| `shared/` | 前后端共享的数据契约和 SDK 事件归并函数，不依赖 React 或服务端存储。 |
+| `protocol/` | 前后端数据契约、消息与事件类型。 |
+| `util/` | 事件归并、用量汇总、费用估算及模型常量，不依赖 React 或服务端存储。 |
 | `fe/App.tsx` | 页面装配、当前项目/会话选择及跨页面状态协调。 |
 | `fe/features/` | 按业务划分的页面与局部逻辑；`chat` 管理消息渲染、模型设置和 SSE，`workspace-files` 管理文件预览。其余目录与业务模块对应。 |
 | `fe/lib/`、`fe/components/` | HTTP 客户端、浏览器路由、资源链接解析及公共 UI 组件。 |
@@ -155,6 +156,6 @@ PORT=3001 pnpm start
 
 开发模式由同一个后端挂载 Vite 中间件；生产模式先构建，再启动。应用代码默认端口为 `3000`，仓库 Docker Compose 生产配置固定使用 `3001`；使用 `PORT` 时以实际配置为准。Python 辅助脚本需要环境时使用 `uv`。
 
-修改前沿相关模块的路由、业务服务和数据契约阅读；接口变更同时更新 `shared/` 与页面。按改动验证类型、构建和必要的真实行为，避免为可逆的小改动增加大量永久单元测试；临时验证脚本放 `/tmp`。模板构建、凭据导入和真实模型验证会访问实际环境，不作为普通文档或 UI 修改的例行检查。
+修改前沿相关模块的路由、业务服务和数据契约阅读；接口变更同时更新 `protocol/` 与页面，涉及共享计算时同步更新 `util/`。按改动验证类型、构建和必要的真实行为，避免为可逆的小改动增加大量永久单元测试；临时验证脚本放 `/tmp`。模板构建、凭据导入和真实模型验证会访问实际环境，不作为普通文档或 UI 修改的例行检查。
 
 详细说明按需阅读：`docs/README.md`、`projects.md`、`e2b-integration.md`、`template-management.md`、`workspace-resources.md`、`improvements.md`、`runtime-logging.md`、`http-capture.md`、`model-overload-retries.md`、`kubernetes-access.md`（均位于 `docs/`）。

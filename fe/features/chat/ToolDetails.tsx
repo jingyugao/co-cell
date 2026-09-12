@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { ThreadItem } from '../../../shared/agent-protocol';
+import type { ThreadItem } from '../../../protocol/agent-protocol';
 import './ToolDetails.css';
 
 type View = 'input' | 'output' | 'raw';

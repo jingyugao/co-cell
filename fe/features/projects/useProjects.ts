@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import type { ProjectSummary } from '../../../shared/types';
+import type { ProjectSummary } from '../../../protocol/types';
 import { api } from '../../lib/api';
 
 export type ProjectValues = { name: string; requirementUrl: string | null };

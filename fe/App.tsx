@@ -1,13 +1,13 @@
 import TurnContextStatus from './features/chat/TurnContextStatus';
 import BillingRail from './features/chat/BillingRail';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { AppConfig, Changes, Session, SessionSummary, Settings } from '../shared/types';
+import type { AppConfig, Changes, Session, SessionSummary, Settings } from '../protocol/types';
 import { useProjects } from './features/projects/useProjects';
 import { useSessionStream } from './features/chat/useSessionStream';
 import { usePromptDraft } from './features/chat/usePromptDraft';
 import { requirementPrompt } from './features/projects/requirement-prompt';
 import ModelPicker from './features/chat/ModelPicker';
-import { DEFAULT_MODEL } from '../shared/models';
+import { DEFAULT_MODEL } from '../util/models';
 import { Icon, Mark } from './components/Icon';
 import { api, errorMessage as message } from './lib/api';
 import { readRoute, resolveSelection, routeUrl, type Page, type Selection } from './lib/navigation';

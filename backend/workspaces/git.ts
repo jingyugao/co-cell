@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { Changes, GitChange } from '../../shared/types.js';
+import type { Changes, GitChange } from '../../protocol/types.js';
 
 const exec = promisify(execFile);
 export async function getChanges(directory: string): Promise<Changes> {

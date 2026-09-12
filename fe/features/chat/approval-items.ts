@@ -1,5 +1,5 @@
-import type { ThreadItem } from '../../../shared/agent-protocol';
-import type { UserApproval } from '../../../shared/approval-types';
+import type { ThreadItem } from '../../../protocol/agent-protocol';
+import type { UserApproval } from '../../../protocol/approval-types';
 
 const object = (value: unknown): Record<string, unknown> | undefined =>
   value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;

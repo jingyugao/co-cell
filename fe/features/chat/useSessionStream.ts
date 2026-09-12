@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import type { Session, StreamMessage } from '../../../shared/types';
-import { applySdkEvent } from '../../../shared/session-events';
+import type { Session, StreamMessage } from '../../../protocol/types';
+import { applySdkEvent } from '../../../util/session-events';
 import { api, errorMessage } from '../../lib/api';
 
 function applyStream(current: Session | null, data: StreamMessage): Session | null {

@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
-import type { UserApproval, UserApprovalInput } from '../../../shared/approval-types';
-import type { Session, Turn } from '../../../shared/types';
+import type { UserApproval, UserApprovalInput } from '../../../protocol/approval-types';
+import type { Session, Turn } from '../../../protocol/types';
 import { api, errorMessage } from '../../lib/api';
 import Markdown, { type MarkdownResources } from './Markdown';
 import './UserApprovalCard.css';

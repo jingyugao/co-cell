@@ -1,4 +1,4 @@
-import type { AgentEvent, Session, Turn } from './types.js';
+import type { AgentEvent, Session, Turn } from '../protocol/types.js';
 import { sumRequestUsage } from './usage.js';
 
 /** Apply agent lifecycle events consistently in persistent state and the browser. */

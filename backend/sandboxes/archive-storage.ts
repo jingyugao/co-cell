@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
-import type { SandboxArchive } from '../../shared/sandbox-types.js';
+import type { SandboxArchive } from '../../protocol/sandbox-types.js';
 
 export type StoredArchive = SandboxArchive;
 

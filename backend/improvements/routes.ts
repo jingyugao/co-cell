@@ -4,7 +4,7 @@ import { HttpError } from '../core/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import type { ImprovementStore } from './store.js';
 import { improvementStatusSchema } from './store.js';
-import { IMPROVEMENT_STATUSES } from '../../shared/improvement-types.js';
+import { IMPROVEMENT_STATUSES } from '../../protocol/improvement-types.js';
 
 const querySchema = z.object({
   q: z.string().trim().max(200).optional(),

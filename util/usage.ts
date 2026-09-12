@@ -1,5 +1,5 @@
-import type { Usage } from './agent-protocol.js';
-import type { ContextUsage } from './types.js';
+import type { Usage } from '../protocol/agent-protocol.js';
+import type { ContextUsage } from '../protocol/types.js';
 
 /** Only complete per-request observations can be summed as turn usage. */
 export function sumRequestUsage(calls: ContextUsage[] | undefined): Usage | undefined {

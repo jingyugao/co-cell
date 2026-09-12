@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
-import type { ConnectionInventory } from '../../shared/connection-types.js';
+import type { ConnectionInventory } from '../../protocol/connection-types.js';
 import { HttpError } from '../core/errors.js';
 import { importLarkCredentials } from './lark-credentials.js';
 import { readMeegleCredentials } from './meegle-credentials.js';

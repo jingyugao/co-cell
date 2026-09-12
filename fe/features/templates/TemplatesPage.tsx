@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { TemplateBuild, TemplateDefinition, TemplateInventory, TemplateManifest } from '../../../shared/template-types';
+import type { TemplateBuild, TemplateDefinition, TemplateInventory, TemplateManifest } from '../../../protocol/template-types';
 import initialManifest from '../../../scripts/e2b/toolchains.json';
 import './TemplatesPage.css';
 

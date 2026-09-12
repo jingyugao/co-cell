@@ -187,8 +187,8 @@ const alive = () => child.pid && child.exitCode === null && child.signalCode ===
   assert.equal(await command('pnpm in repository Node override', 'mise exec -- pnpm --version', webDirectory), manifest.pnpm);
   assert.equal(await command('pnpm subprocess uses repository Node', 'mise exec -- pnpm exec node --version', webDirectory), `v${projectNode}`);
   assert.equal(await command('isolated Codex Node', 'mise exec -- /opt/codex-runtime/bin/node --version', webDirectory), `v${manifest.defaults.node}`);
-  const sdkScript = `const root='/home/user/.codex-web/runtime/node_modules/@openai/codex-sdk'; const pkg=require(root+'/package.json'); if(pkg.version!==${JSON.stringify(manifest.codexSdk)}) throw Error('SDK version mismatch'); import(root+'/dist/index.js').then(m=>{if(typeof m.Codex!=='function')throw Error('Codex export unavailable'); console.log(pkg.version)})`;
-  assert.equal(await command('preinstalled Codex SDK with isolated Node', `mise exec -- /opt/codex-runtime/bin/node -e ${quote(sdkScript)}`, webDirectory), manifest.codexSdk);
+  assert.equal(await command('Codex App Server CLI', '/opt/codex-runtime/bin/node /home/user/.codex-web/runtime/node_modules/@openai/codex/bin/codex.js --version', webDirectory), `codex-cli ${manifest.codexCli}`);
+  await command('Codex App Server protocol', '/opt/codex-runtime/bin/node /home/user/.codex-web/runtime/node_modules/@openai/codex/bin/codex.js app-server --help', webDirectory);
   assert.equal(await command('pnpm', 'pnpm --version', '/home/user'), manifest.pnpm);
   await command('Go installed sizes in KiB', `du -k -s ${manifest.go.map((version) => quote(`/home/user/.local/share/mise/installs/go/${version}`)).join(' ')}`, '/home/user');
   await command('toolchain totals in KiB', 'du -k -s /home/user/.local/share/mise/installs/go /home/user/.local/share/mise/installs/node /home/user/.local/share/uv/python /opt/codex-runtime', '/home/user');

@@ -1,0 +1,30 @@
+{
+  "name": "@swarm-hive/agentcore",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.mjs",
+  "types": "src/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.mts",
+      "import": "./src/index.mjs"
+    },
+    "./client": {
+      "types": "./src/client.d.mts",
+      "import": "./src/client.mjs"
+    },
+    "./runtime": "./src/runtime/server.mjs"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.mjs tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

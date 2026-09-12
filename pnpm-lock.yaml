@@ -11,9 +11,15 @@ importers:
       '@hono/node-server':
         specifier: 2.1.1
         version: 2.1.1(hono@4.13.3)
-      '@openai/codex-sdk':
+      '@openai/codex':
         specifier: 0.153.4
         version: 0.153.4
+      '@swarm-hive/agentcore':
+        specifier: file:packages/agentcore
+        version: file:packages/agentcore
+      '@swarm-hive/agentcore-e2b':
+        specifier: file:packages/agentcore-e2b
+        version: file:packages/agentcore-e2b(e2b@2.46.1)
       e2b:
         specifier: 2.46.1
         version: 2.46.1
@@ -243,10 +249,6 @@ packages:
     resolution: {integrity: sha512-wgm9Ehl2jpeqP3zw/7mo3kRHFp5MEDhqAdwy1fTGkHAwnkGOVsgpvQhL8B5n1qlb01jV3n/bI0ZfZp5lWA1k4w==}
     engines: {node: '>=18.0.0'}
 
-  '@openai/codex-sdk@0.153.4':
-    resolution: {integrity: sha512-z0rN8WMQxwEHYHpDJyKHZwNNUtM/1pdnxmKopIJ3qMCZyyDestaIhSGDZ0v0RSjm+REujcFyNd95oWs78zWgRg==}
-    engines: {node: '>=18'}
-
   '@openai/codex@0.153.4':
     resolution: {integrity: sha512-wbHDmit7S/YvBGVX1DQmk13xtWblZ2cApeJ/pB7xDZ10Cna+DZc5ij7f0F4OxdsXN4FW1oLT48OpogUI1+8Y2w==}
     engines: {node: '>=16'}
@@ -389,6 +391,16 @@ packages:
 
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
+
+  '@swarm-hive/agentcore-e2b@file:packages/agentcore-e2b':
+    resolution: {directory: packages/agentcore-e2b, type: directory}
+    engines: {node: '>=22.18.0'}
+    peerDependencies:
+      e2b: ^2.46.1
+
+  '@swarm-hive/agentcore@file:packages/agentcore':
+    resolution: {directory: packages/agentcore, type: directory}
+    engines: {node: '>=22'}
 
   '@types/debug@4.1.13':
     resolution: {integrity: sha512-KSVgmQmzMwPlmtljOomayoR89W4FynCAi3E8PPs7vmDVPe84hT+vGPKkJfThkmXs0x0jAaa9U8uW8bbfyS2fWw==}
@@ -1119,10 +1131,6 @@ snapshots:
     dependencies:
       minipass: 7.1.3
 
-  '@openai/codex-sdk@0.153.4':
-    dependencies:
-      '@openai/codex': 0.153.4
-
   '@openai/codex@0.153.4':
     optionalDependencies:
       '@openai/codex-darwin-arm64': '@openai/codex@0.153.4-darwin-arm64'
@@ -1198,6 +1206,13 @@ snapshots:
     optional: true
 
   '@rolldown/pluginutils@1.0.1': {}
+
+  '@swarm-hive/agentcore-e2b@file:packages/agentcore-e2b(e2b@2.46.1)':
+    dependencies:
+      '@swarm-hive/agentcore': file:packages/agentcore
+      e2b: 2.46.1
+
+  '@swarm-hive/agentcore@file:packages/agentcore': {}
 
   '@types/debug@4.1.13':
     dependencies:

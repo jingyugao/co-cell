@@ -21,7 +21,6 @@
   },
   "dependencies": {
     "@hono/node-server": "2.1.1",
-    "@openai/codex-sdk": "0.153.4",
     "e2b": "2.46.1",
     "hono": "4.13.3",
     "js-tiktoken": "1.0.21",
@@ -29,7 +28,10 @@
     "react-dom": "19.2.8",
     "react-markdown": "10.1.0",
     "remark-gfm": "4.0.1",
-    "zod": "4.4.3"
+    "zod": "4.4.3",
+    "@openai/codex": "0.153.4",
+    "@swarm-hive/agentcore": "file:packages/agentcore",
+    "@swarm-hive/agentcore-e2b": "file:packages/agentcore-e2b"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

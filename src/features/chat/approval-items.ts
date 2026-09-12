@@ -1,4 +1,4 @@
-import type { ThreadItem } from '@openai/codex-sdk';
+import type { ThreadItem } from '../../../shared/agent-protocol';
 import type { UserApproval } from '../../../shared/approval-types';
 
 const object = (value: unknown): Record<string, unknown> | undefined =>

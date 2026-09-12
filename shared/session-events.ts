@@ -1,7 +1,7 @@
 import type { AgentEvent, Session, Turn } from './types.js';
 import { sumRequestUsage } from './usage.js';
 
-/** Apply SDK lifecycle events consistently in persistent state and the browser. */
+/** Apply agent lifecycle events consistently in persistent state and the browser. */
 export function applyTurnEvent(turn: Turn, event: AgentEvent): Turn {
   switch (event.type) {
     case 'runtime.retry':
@@ -17,14 +17,14 @@ export function applyTurnEvent(turn: Turn, event: AgentEvent): Turn {
       return { ...turn, contextUsage: calls, usage: sumRequestUsage(calls) };
     }
     case 'turn.started':
-      return { ...turn, codexAccepted: true, status: 'running', phase: 'running', retry: undefined };
+      return { ...turn, ...(event.turn_id ? { nativeTurnId: event.turn_id } : {}), codexAccepted: true, status: 'running', phase: 'running', retry: undefined };
     case 'item.started': case 'item.updated': case 'item.completed': {
       const items = [...turn.items];
       const index = items.findIndex(item => item.id === event.item.id);
       if (index === -1) items.push(event.item); else items[index] = event.item;
-      // SDK items do not currently expose a stable timestamp. Capture the
+      // Presentation items do not expose a stable timestamp. Capture the
       // first time we observe each item so the UI can display when that
-      // message/tool segment started without mutating the SDK item shape.
+      // message/tool segment started without mutating the item shape.
       const itemTimestamps = { ...(turn.itemTimestamps ?? {}) };
       if (!itemTimestamps[event.item.id]) itemTimestamps[event.item.id] = new Date().toISOString();
       return { ...turn, items, itemTimestamps, phase: turn.phase === 'finalizing' ? 'finalizing' : 'running' };

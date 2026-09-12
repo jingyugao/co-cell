@@ -12,7 +12,7 @@
     "build": "tsc --noEmit && vite build",
     "start": "NODE_ENV=production tsx backend/index.ts",
     "typecheck": "tsc --noEmit",
-    "capture:http": "tsx backend/diagnostics/capture-demo.ts",
+    "capture:http": "tsx backend/infra/diagnostics/capture-demo.ts",
     "credentials:import": "tsx backend/connections/import-local.ts",
     "credentials:migrate": "tsx backend/connections/migrate-credentials.ts",
     "cliproxyapi": "node scripts/cliproxyapi/manage.mjs",

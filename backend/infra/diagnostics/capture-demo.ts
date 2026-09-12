@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { brotliDecompressSync, gunzipSync, inflateSync, zstdDecompressSync } from 'node:zlib';
-import { Codex } from '../../packages/agentcore/src/index.mjs';
+import { Codex } from '../../../packages/agentcore/src/index.mjs';
 import { startHttpCapture } from './http-capture.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }

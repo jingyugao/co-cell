@@ -19,10 +19,10 @@ import { LocalSandboxArchiveStorage } from './sandboxes/archive-storage.js';
 import { LocalSnapshotArchive } from './sandboxes/local-snapshot-archive.js';
 import { TemplateManager } from './templates/manager.js';
 import { ConnectionStore } from './connections/store.js';
-import { RuntimeLog } from './diagnostics/runtime-log.js';
-import { installProductionStatic } from './http/static-files.js';
+import { RuntimeLog } from './infra/diagnostics/runtime-log.js';
+import { installProductionStatic } from './infra/http/static-files.js';
 import { modelProxyKind } from './execution/model-proxy.js';
-import { createWebStateStore } from './storage/web-state.js';
+import { createWebStateStore } from './infra/storage/web-state.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 

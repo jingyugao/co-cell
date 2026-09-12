@@ -90,7 +90,8 @@ pnpm build
 | `backend/execution/` | 单轮 Codex 执行、事件处理、原始工具消息；`worker/` 是同步到沙箱的运行脚本 |
 | `backend/sandboxes/` | E2B 生命周期、端口预览、资源清单与工作区接口 |
 | `backend/templates/`、`connections/`、`shared-files/` | 模板、凭据、共享文档及各自路由 |
-| `backend/storage/`、`core/`、`http/`、`diagnostics/`、`workspaces/` | 原子文件写入、公共错误、静态资源、日志诊断、Git 查询 |
+| `backend/infra/` | 持久化、静态资源服务、运行日志及诊断等技术支撑 |
+| `backend/workspaces/` | 项目工作区文件访问、下载、路径权限和 Git 查询 |
 | `fe/features/` | projects、chat、sandboxes、templates、connections、shared-files 页面及局部状态 |
 | `fe/components/`、`fe/lib/` | 公共组件、HTTP 请求 |
 | `protocol/` | 前后端数据契约、消息与事件类型。 |

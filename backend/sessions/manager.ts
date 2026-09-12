@@ -6,12 +6,12 @@ import type { E2BRuntime } from '../execution/e2b-runtime.js';
 import { getChanges } from '../workspaces/git.js';
 import type { WorkspaceFileReadOptions } from '../workspaces/files.js';
 import type { RawToolReader } from '../execution/raw-tools.js';
-import type { RuntimeLog } from '../diagnostics/runtime-log.js';
+import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 
 import { HttpError } from '../../util/errors.js';
 import { ProjectService, type ProjectInput, type ProjectUpdate } from '../projects/service.js';
-import { AtomicJsonWriter } from '../storage/atomic-json.js';
-import { createWebStateStore, type WebStateStore } from '../storage/web-state.js';
+import { AtomicJsonWriter } from '../infra/storage/atomic-json.js';
+import { createWebStateStore, type WebStateStore } from '../infra/storage/web-state.js';
 import { runTurn, type CodexClient } from '../execution/runner.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { ApprovalRequests, approvalDecisionSchema, cancelPersistedApprovals } from '../approvals/requests.js';

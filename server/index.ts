@@ -20,6 +20,7 @@ import { ConnectionStore } from './connections/store.js';
 import { RuntimeLog } from './diagnostics/runtime-log.js';
 import { installProductionStatic } from './http/static-files.js';
 import { modelProxyKind } from './execution/model-proxy.js';
+import { createWebStateStore } from './storage/web-state.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 
@@ -102,7 +103,9 @@ const e2b = e2bEnabled ? new E2BCodexRuntime({
   template: e2bTemplate, apiKey: apiKey!,
   baseUrl: process.env.OPENAI_BASE_URL, proxyKind, modelConfig, configOverrides,
 }) : undefined;
-const manager = new SessionManager(codex, resolve(process.env.CODEX_WEB_DATA_DIR || '.codex-web'), defaults, e2b, e2bWorkingDirectory, runtimeLog);
+const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || '.codex-web');
+const manager = new SessionManager(codex, webDataDirectory, defaults, e2b, e2bWorkingDirectory, runtimeLog,
+  createWebStateStore(webDataDirectory, process.env.MYSQL_URL));
 await manager.init();
 const config: AppConfig = {
   defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',

@@ -32,6 +32,7 @@ services:
       MEEGLE_HOST: project.feishu.cn
       USER: ${MEEGLE_AUTH_USER:-root}
       E2B_API_KEY_FILE: /run/secrets/e2b_api_key
+      MYSQL_URL: mysql://${MYSQL_USER:-swarm_hive}:${MYSQL_PASSWORD:-change-me-before-production}@mysql:3306/${MYSQL_DATABASE:-swarm_hive}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

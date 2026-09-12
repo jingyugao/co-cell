@@ -1,9 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
 import type { Project, Settings } from '../../shared/types.js';
 import { HttpError } from '../core/errors.js';
 import { AtomicJsonWriter } from '../storage/atomic-json.js';
+import type { WebStateStore } from '../storage/web-state.js';
 import { readRequirementInfo } from './requirements.js';
 
 export type ProjectInput = { name?: string; requirementUrl?: string | null };
@@ -17,16 +16,11 @@ export class ProjectService {
   private operations = new Map<string, number>();
   private activeSessions = new Map<string, Set<string>>();
   private writer = new AtomicJsonWriter();
-  private directory: string;
-
-  constructor(dataDirectory: string, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo) { this.directory = join(dataDirectory, 'projects'); }
+  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo) {}
 
   async init() {
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    for (const name of await readdir(this.directory)) {
-      if (!/^[\da-f-]{36}\.json$/.test(name)) continue;
-      const project = JSON.parse(await readFile(join(this.directory, name), 'utf8')) as Project;
-      if (name !== `${project.id}.json` || !project.name || !project.workingDirectory) throw new Error(`Invalid project state: ${name}`);
+    for (const project of await this.state.listProjects()) {
+      if (!project.id || !project.name || !project.workingDirectory) throw new Error(`Invalid project state: ${project.id}`);
       this.records.set(project.id, project);
     }
   }
@@ -141,7 +135,7 @@ export class ProjectService {
     try {
       await this.writer.wait(id);
       await removeDependents(project);
-      await rm(join(this.directory, `${id}.json`));
+      await this.state.deleteProject(id);
       this.records.delete(id);
       this.revisions.delete(id);
       this.writer.forget(id);
@@ -149,7 +143,7 @@ export class ProjectService {
   }
 
   private save(project: Project): Promise<void> {
-    return this.writer.write(project.id, join(this.directory, `${project.id}.json`), project);
+    return this.writer.run(project.id, () => this.state.saveProject(project));
   }
   async close(): Promise<void> { await this.writer.drain(); }
 }

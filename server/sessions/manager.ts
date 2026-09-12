@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
 import type { Project, ProjectSummary, Session, SessionSummary, Settings, StreamMessage, Turn } from '../../shared/types.js';
 import type { E2BRuntime } from '../sandboxes/e2b.js';
@@ -11,6 +11,7 @@ import type { RuntimeLog } from '../diagnostics/runtime-log.js';
 import { HttpError } from '../core/errors.js';
 import { ProjectService, type ProjectInput, type ProjectUpdate } from '../projects/service.js';
 import { AtomicJsonWriter } from '../storage/atomic-json.js';
+import { createWebStateStore, type WebStateStore } from '../storage/web-state.js';
 import { runTurn, type CodexClient } from '../execution/runner.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { ApprovalRequests, approvalDecisionSchema, cancelPersistedApprovals } from '../approvals/requests.js';
@@ -47,17 +48,16 @@ export class SessionManager {
   private historyReads = new Map<string, Promise<void>>();
   private billingReads = new Map<string, Promise<Turn[]>>();
 
-  constructor(private client: CodexClient, public readonly dataDirectory: string, public readonly defaults: Settings, private e2b?: E2BRuntime, private e2bWorkingDirectory = '/home/user/workspace', private logger?: RuntimeLog) { this.projects = new ProjectService(dataDirectory); }
+  constructor(private client: CodexClient, public readonly dataDirectory: string, public readonly defaults: Settings, private e2b?: E2BRuntime, private e2bWorkingDirectory = '/home/user/workspace', private logger?: RuntimeLog, private state: WebStateStore = createWebStateStore(dataDirectory)) { this.projects = new ProjectService(state); }
 
   async init() {
     await mkdir(this.dataDirectory, { recursive: true, mode: 0o700 });
+    await this.state.init();
     await this.projects.init();
-    for (const name of await readdir(this.dataDirectory)) {
-      if (!/^[\da-f-]{36}\.json$/.test(name)) continue;
+    for (const session of await this.state.listSessions()) {
       // Invalid state is reported rather than silently overwriting someone's history.
-      const session = JSON.parse(await readFile(join(this.dataDirectory, name), 'utf8')) as Session;
-      if (name !== `${session.id}.json` || !Array.isArray(session.turns) || !session.settings) {
-        throw new Error(`Invalid session state: ${name}`);
+      if (!session.id || !Array.isArray(session.turns) || !session.settings) {
+        throw new Error(`Invalid session state: ${session.id}`);
       }
       let changed = false;
       // Session archives were introduced after the initial JSON format. Use the
@@ -343,7 +343,7 @@ export class SessionManager {
 
   private async removeSession(id: string) {
     await this.writer.wait(id);
-    await rm(join(this.dataDirectory, `${id}.json`), { force: true });
+    await this.state.deleteSession(id);
     await rm(join(this.dataDirectory, 'images', id), { recursive: true, force: true });
     this.sessions.delete(id);
     this.subscribers.delete(id);
@@ -472,8 +472,11 @@ export class SessionManager {
       prompt: '', images: [], items: [], usage: turn.usage, sdkUsage: turn.sdkUsage,
       contextUsage: turn.contextUsage?.map(({ blockEstimates, blockTokenizer, blockTexts, ...call }) => call),
     }));
-    const { blockEstimates, blockTokenizer, blockTexts, ...contextUsage } = session.contextUsage ?? {};
-    return this.writer.write(session.id, join(this.dataDirectory, `${session.id}.json`), { ...session, contextUsage: session.contextUsage ? contextUsage : undefined, turns });
+    const contextUsage = session.contextUsage && (() => {
+      const { blockEstimates, blockTokenizer, blockTexts, ...value } = session.contextUsage;
+      return value;
+    })();
+    return this.writer.run(session.id, () => this.state.saveSession({ ...session, contextUsage: contextUsage || undefined, turns }));
   }
 
   async uploadImage(id: string, content: Uint8Array, extension: string): Promise<string> {
@@ -651,6 +654,7 @@ export class SessionManager {
     try {
       await this.e2b?.close();
       await Promise.all([this.writer.drain(), this.projects.close()]);
+      await this.state.close();
     } finally { await this.logger?.flush(); }
   }
 }

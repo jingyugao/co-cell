@@ -5,11 +5,14 @@ export class AtomicJsonWriter {
   private pending = new Map<string, Promise<void>>();
 
   write(key: string, file: string, value: unknown): Promise<void> {
-    const serialized = JSON.stringify(value);
-    const operation = (this.pending.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+    return this.run(key, async () => {
+      const serialized = JSON.stringify(value);
       await writeFile(`${file}.tmp`, serialized, { mode: 0o600 });
       await rename(`${file}.tmp`, file);
     });
+  }
+  run(key: string, action: () => Promise<void>): Promise<void> {
+    const operation = (this.pending.get(key) ?? Promise.resolve()).catch(() => {}).then(action);
     this.pending.set(key, operation);
     return operation;
   }

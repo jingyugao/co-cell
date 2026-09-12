@@ -8,6 +8,7 @@ interface InventoryApi {
 }
 export interface SandboxInventoryReader {
   read(sessions: SessionSummary[], projects?: ProjectSummary[]): Promise<SandboxInventory>;
+  invalidate?(): Promise<void>;
 }
 interface LiveMetricsReader {
   read(id: string, signal: AbortSignal): Promise<SandboxMetrics | null>;
@@ -68,8 +69,8 @@ function applyMetrics(sandbox: SandboxRecord, latest: SandboxMetrics, source: 'e
 
 /** Read-only inventory and guarded live sampling; viewing the page must not wake paused VMs. */
 export class E2BSandboxInventory implements SandboxInventoryReader {
-  private cached?: SandboxInventory;
-  private refresh?: Promise<SandboxInventory>;
+  private cached?: { inventory: SandboxInventory; platformSandboxIds: Set<string> };
+  private refresh?: Promise<{ inventory: SandboxInventory; platformSandboxIds: Set<string> }>;
 
   constructor(
     private readonly connection?: ConnectionOpts,
@@ -77,24 +78,34 @@ export class E2BSandboxInventory implements SandboxInventoryReader {
     private readonly liveMetrics: LiveMetricsReader | undefined = connection && api === Sandbox ? new EnvdMetricsReader(connection) : undefined,
   ) {}
 
+  async invalidate() {
+    await this.refresh?.catch(() => {});
+    this.cached = undefined;
+  }
+
   async read(sessions: SessionSummary[], projects: ProjectSummary[] = []): Promise<SandboxInventory> {
     if (!this.connection) return { enabled: false, fetchedAt: new Date().toISOString(), sandboxes: [] };
-    let inventory = this.cached;
-    if (!inventory || Date.now() - Date.parse(inventory.fetchedAt) >= 5_000) {
+    let snapshot = this.cached;
+    if (!snapshot || Date.now() - Date.parse(snapshot.inventory.fetchedAt) >= 5_000) {
       if (!this.refresh) {
         this.refresh = this.fetch().then(result => { this.cached = result; return result; }).finally(() => { this.refresh = undefined; });
       }
-      inventory = await this.refresh;
+      snapshot = await this.refresh;
     }
+    const { inventory, platformSandboxIds } = snapshot;
     // Derive ownership from our persisted mapping, never from untrusted E2B metadata.
     const owners = new Map(projects.filter(p => p.executionMode === 'e2b' && p.sandbox).map(p => [p.sandbox!.id, p]));
+    const reserved = new Set(projects.flatMap(project => project.sandboxUpgrade && project.sandboxUpgrade.phase !== 'failed' && project.sandboxUpgrade.target
+      ? [project.sandboxUpgrade.target.id] : []));
     const metadata = new Map([...owners.values()].map(project => [project.sandbox!.id, project.sandbox!]));
     const byProject = new Map(projects.map(p => [p.id, p]));
     const associations = new Map<string, NonNullable<SandboxRecord['sessions']>>();
+    const legacyOwned = new Set<string>();
     for (const session of sessions) {
       if (session.settings.executionMode !== 'e2b') continue;
-      const sandboxId = (session.projectId ? byProject.get(session.projectId)?.sandbox?.id : undefined) ?? session.sandbox?.id;
+      const sandboxId = session.projectId ? byProject.get(session.projectId)?.sandbox?.id : session.sandbox?.id;
       if (!sandboxId) continue;
+      if (!session.projectId) legacyOwned.add(sandboxId);
       if (!metadata.has(sandboxId) && session.sandbox) metadata.set(sandboxId, session.sandbox);
       const associated = associations.get(sandboxId) ?? [];
       associated.push({ id: session.id, title: session.title, status: session.status });
@@ -125,12 +136,13 @@ export class E2BSandboxInventory implements SandboxInventoryReader {
             metricsMessage: archivedState === 'archived' ? '文件已压缩保存，使用时自动恢复' : archivedState === 'archiving' ? '正在压缩并保存文件' : '正在从归档恢复文件',
           } : {}),
           project: project ? { id: project.id, name: project.name, requirementUrl: project.requirementUrl, sessionCount: project.sessionCount } : null,
+          dangling: platformSandboxIds.has(sandbox.id) && !project && !legacyOwned.has(sandbox.id) && !reserved.has(sandbox.id),
         };
       }),
     };
   }
 
-  private async fetch(): Promise<SandboxInventory> {
+  private async fetch(): Promise<{ inventory: SandboxInventory; platformSandboxIds: Set<string> }> {
     const deadline = AbortSignal.timeout(15_000);
     const info = new Map<string, SandboxInfo>();
     try {
@@ -143,6 +155,7 @@ export class E2BSandboxInventory implements SandboxInventoryReader {
       // SDK errors may contain upstream response bodies, addresses or credentials.
       throw new HttpError(503, '无法读取 E2B 沙箱列表，请检查 E2B 服务及访问配置后重试');
     }
+    const platformSandboxIds = new Set([...info.values()].filter(sandbox => sandbox.metadata?.app === 'codex-web').map(sandbox => sandbox.sandboxId));
     const sandboxes: SandboxRecord[] = [...info.values()].map(sandbox => ({
       id: sandbox.sandboxId,
       template: sandbox.name || sandbox.templateId,
@@ -191,6 +204,6 @@ export class E2BSandboxInventory implements SandboxInventoryReader {
     };
     await Promise.all(Array.from({ length: Math.min(4, sandboxes.length) }, worker));
     sandboxes.sort((a, b) => b.startedAt.localeCompare(a.startedAt) || a.id.localeCompare(b.id));
-    return { enabled: true, fetchedAt: new Date().toISOString(), sandboxes };
+    return { inventory: { enabled: true, fetchedAt: new Date().toISOString(), sandboxes }, platformSandboxIds };
   }
 }

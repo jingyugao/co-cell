@@ -88,3 +88,22 @@ test('raw PNG previews preserve inline image content and MIME type', async () =>
   assert.ok(Buffer.from(await response.arrayBuffer()).equals(contents));
   assert.deepEqual(calls, [undefined]);
 });
+
+test('reclaim endpoint starts the guarded backup and sandbox reclaim operation', async () => {
+  const calls: string[] = [];
+  const app = new Hono();
+  installProjectsRoutes(app, {
+    reclaimProjectSandbox: async (projectId: string) => {
+      calls.push(projectId);
+      return { id: projectId, sandboxUpgrade: { kind: 'reclaim', phase: 'archiving' } } as never;
+    },
+  } as unknown as Parameters<typeof installProjectsRoutes>[1]);
+
+  const response = await app.request('/api/projects/project-to-reclaim/sandbox/reclaim', { method: 'POST' });
+  assert.equal(response.status, 202);
+  assert.deepEqual(calls, ['project-to-reclaim']);
+  assert.deepEqual(await response.json(), {
+    id: 'project-to-reclaim',
+    sandboxUpgrade: { kind: 'reclaim', phase: 'archiving' },
+  });
+});

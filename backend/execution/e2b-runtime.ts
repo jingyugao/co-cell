@@ -1,8 +1,9 @@
-import type { SandboxState } from '../../protocol/sandbox-types.js';
+import type { SandboxState, SandboxDataArchive } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget, ThreadWorkspace } from '../sandboxes/types.js';
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { basename, extname, posix } from 'node:path';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { basename, extname, join, posix } from 'node:path';
+import { tmpdir } from 'node:os';
 import type { Sandbox, CommandHandle, ConnectionOpts } from 'e2b';
 import { E2BSandboxManager, type SandboxLease, type SandboxRecord, type SandboxSnapshotArchive } from '@swarm-hive/sandbox';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
@@ -18,6 +19,8 @@ import type { ImprovementContext, ImprovementReceipt } from '../../protocol/impr
 import { HttpError } from '../../util/errors.js';
 import type { ModelProxyKind } from './model-proxy.js';
 import { parseWorkspaceFile, READ_SANDBOX_FILE_SCRIPT, workspaceFileRequest, type WorkspaceFileResult, type WorkspaceFileReadOptions } from '../workspaces/files.js';
+import { archiveSandbox, restoreSandbox, deleteDanglingSandbox, pauseDanglingSandbox, type SandboxRestoreOptions } from './sandbox-upgrade.js';
+import { LocalSandboxArchiveStorage, type SandboxArchiveStorage } from '../sandboxes/archive-storage.js';
 
 export type { SandboxSnapshotArchive } from '@swarm-hive/sandbox';
 
@@ -33,6 +36,13 @@ export interface E2BRuntime {
   rawTools(session: ThreadWorkspace, cursor?: number): Promise<RawToolPage>;
   history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<NativeHistory>;
   delete(session: WorkspaceTarget): Promise<void>;
+  archiveSandbox?(target: WorkspaceTarget, threadIds: string[], onSandbox: SaveSandbox): Promise<SandboxDataArchive>;
+  restoreSandbox?(target: WorkspaceTarget, archive: SandboxDataArchive, options: SandboxRestoreOptions): Promise<void>;
+  detachSandbox?(target: WorkspaceTarget): Promise<void>;
+  verifyDataArchive?(archive: SandboxDataArchive): Promise<void>;
+  deleteDataArchive?(archive: SandboxDataArchive): Promise<void>;
+  pauseDanglingSandbox?(sandboxId: string, provenance?: SandboxDataArchive): Promise<void>;
+  deleteDanglingSandbox?(sandboxId: string, provenance?: SandboxDataArchive): Promise<void>;
   close(): Promise<void>;
 }
 export interface E2BCodexOptions {
@@ -40,6 +50,7 @@ export interface E2BCodexOptions {
   sandboxes?: ProjectSandboxes;
   template: string;
   archives?: SandboxSnapshotArchive;
+  dataArchives?: SandboxArchiveStorage;
   apiKey: string;
   baseUrl?: string;
   proxyKind?: ModelProxyKind;
@@ -87,6 +98,14 @@ const RUNTIME = `${ROOT}/runtime`;
 const CODEX_HOME = '/home/user/.codex';
 const SHARED_DATA = new URL('../../data/', import.meta.url);
 const SHARED_DOCS = `${CODEX_HOME}/docs`;
+const SANDBOX_PERSISTENCE_GUIDANCE = `# Sandbox persistence
+
+The platform may replace or reclaim this project's sandbox. It persists the project workspace and Codex conversation context, then restores them into a new sandbox.
+
+- Keep durable code, files, and business data inside the project workspace.
+- Operating-system packages, global installations, running processes, terminals, and port services are not preserved.
+- Declare dependencies in manifests and lockfiles, and keep repeatable setup and startup scripts in the workspace so the environment can be rebuilt.
+- Platform-managed credentials, shared rules, and shared documents are synchronized again after restoration; do not copy secrets into the repository.`;
 // Keep control processes independent of a project's Node selection. Legacy base
 // sandboxes retain their existing interpreter until moved to the dev template.
 const NODE = '"$(if test -x /opt/codex-runtime/bin/node; then echo /opt/codex-runtime/bin/node; else command -v node; fi)"';
@@ -102,8 +121,11 @@ export class E2BCodexRuntime implements E2BRuntime {
   private detachRequests = new Set<string>();
   private preparations = new Map<string, AbortController>();
   private readonly sandboxes: ProjectSandboxes;
+  private readonly dataArchives: SandboxArchiveStorage;
+  private upgrading = new Set<string>();
 
   constructor(private options: E2BCodexOptions) {
+    this.dataArchives = options.dataArchives ?? new LocalSandboxArchiveStorage(new URL('../../data/sandbox-data-archives/', import.meta.url));
     this.sandboxes = options.sandboxes ?? new ProjectSandboxes(new E2BSandboxManager({
       connection: options.connection, archives: options.archives, logger: options.logger,
     }), options.template);
@@ -125,6 +147,7 @@ export class E2BCodexRuntime implements E2BRuntime {
 
   private async acquire(target: WorkspaceTarget, create: boolean, notify?: SaveSandbox, usageId?: string, signal?: AbortSignal): Promise<Entry> {
     if (this.closing) throw new Error('E2B 运行时正在关闭');
+    if (this.upgrading.has(target.projectId ?? target.id)) throw new HttpError(409, '项目沙箱正在升级，请稍后重试');
     const lease = await this.sandboxes.acquire(target, { create, save: notify, usageId, signal });
     let preparation = this.runtimePreparations.get(lease.record.id);
     if (!preparation) {
@@ -425,6 +448,46 @@ export class E2BCodexRuntime implements E2BRuntime {
     });
   }
 
+  private async prepareEnvironment(target: WorkspaceTarget, entry: Entry, executionSignal: AbortSignal) {
+    return this.prepare(entry, executionSignal, async () => {
+      // Read on every turn, including resumed threads. Global guidance applies
+      // across Git roots without replacing any project-owned AGENTS.md.
+      const sharedData = this.options.sharedDataDirectory ?? SHARED_DATA;
+      const sharedAgents = await readFile(new URL('AGENTS.md', sharedData), 'utf8').catch(error => {
+        if (error.code === 'ENOENT') return ''; // Deleting global rules clears the remote copy next turn.
+        throw error;
+      });
+      const sharedDocs = await loadAgentDocs(new URL('docs/', sharedData));
+      await this.command(entry, `sh -c ${quote(`mkdir -p ${quote(RUNTIME)} ${quote(`${RUNTIME}/agentcore`)} ${quote(`${ROOT}/images`)} /home/user/.codex ${quote(target.settings.workingDirectory)} && chmod 700 ${quote(ROOT)} /home/user/.codex && cd ${quote(RUNTIME)} && if ! ${NODE} -e 'if(require("./node_modules/@openai/codex/package.json").version!=="0.153.4")process.exit(1)' >/dev/null 2>&1; then npm install --no-audit --no-fund --save-exact @openai/codex@0.153.4; fi`)}`, executionSignal, { timeoutMs: 300_000 });
+      const connectionEnvs = this.options.connections ? await syncSandboxConnections(entry.sandbox, this.options.connections, executionSignal) : {};
+      checkAbort(executionSignal);
+      // Clear a legacy mirror only on the first preparation, before any worker
+      // starts. Subsequent turns update files atomically while siblings run.
+      const docDirectories = new Set([SHARED_DOCS, ...sharedDocs.map(file => posix.dirname(`${SHARED_DOCS}/${file.path}`))]);
+      const clearLegacy = entry.preparation.sharedDocPaths ? '' : `rm -rf ${quote(SHARED_DOCS)} ${quote(`${ROOT}/docs`)} && `;
+      await this.command(entry, `sh -c ${quote(`${clearLegacy}mkdir -p ${[...docDirectories].map(quote).join(' ')}`)}`, executionSignal);
+      for (const file of sharedDocs) {
+        checkAbort(executionSignal);
+        await this.writeAtomic(entry, `${SHARED_DOCS}/${file.path}`, file.contents, executionSignal);
+      }
+      const currentPaths = new Set(sharedDocs.map(file => file.path));
+      for (const path of entry.preparation.sharedDocPaths ?? []) {
+        if (!currentPaths.has(path)) await entry.sandbox.files.remove(`${SHARED_DOCS}/${path}`, { user: 'user', signal: executionSignal });
+      }
+      entry.preparation.sharedDocPaths = currentPaths;
+      const managedAgents = [sharedAgents.trim(), SANDBOX_PERSISTENCE_GUIDANCE].filter(Boolean).join('\n\n') + '\n';
+      await this.writeAtomic(entry, `${CODEX_HOME}/AGENTS.md`, managedAgents, executionSignal);
+      for (const name of ['e2b-worker.mjs', 'e2b-inspect.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
+        checkAbort(executionSignal);
+        await this.writeAtomic(entry, `${RUNTIME}/${name}`, await readFile(new URL(`../execution/worker/${name}`, import.meta.url), 'utf8'), executionSignal);
+      }
+      await this.writeAtomic(entry, `${RUNTIME}/agentcore/index.mjs`,
+        await readFile(new URL('../../packages/agentcore/src/index.mjs', import.meta.url), 'utf8'), executionSignal);
+      entry.preparation.initialized = true;
+      return connectionEnvs;
+    });
+  }
+
   async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, onApproval?: RequestUserApproval,
     onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
     if (this.detachRequests.delete(turn.id)) throw new TurnLaunchCancelled();
@@ -445,42 +508,7 @@ export class E2BCodexRuntime implements E2BRuntime {
       const entry = acquired = await this.acquire(session, true, onSandbox, turn.execution?.workerId ?? turn.id, acquireSignal);
       const executionSignal = AbortSignal.any([signal, entry.lease.signal, preparation.signal]);
       checkAbort(executionSignal);
-      const connectionEnvs = await this.prepare(entry, executionSignal, async () => {
-        // Read on every turn, including resumed threads. Global guidance applies
-        // across Git roots without replacing any project-owned AGENTS.md.
-        const sharedData = this.options.sharedDataDirectory ?? SHARED_DATA;
-        const sharedAgents = await readFile(new URL('AGENTS.md', sharedData), 'utf8').catch(error => {
-          if (error.code === 'ENOENT') return ''; // Deleting global rules clears the remote copy next turn.
-          throw error;
-        });
-        const sharedDocs = await loadAgentDocs(new URL('docs/', sharedData));
-        await this.command(entry, `sh -c ${quote(`mkdir -p ${quote(RUNTIME)} ${quote(`${RUNTIME}/agentcore`)} ${quote(`${ROOT}/images`)} /home/user/.codex ${quote(session.settings.workingDirectory)} && chmod 700 ${quote(ROOT)} /home/user/.codex && cd ${quote(RUNTIME)} && if ! ${NODE} -e 'if(require("./node_modules/@openai/codex/package.json").version!=="0.153.4")process.exit(1)' >/dev/null 2>&1; then npm install --no-audit --no-fund --save-exact @openai/codex@0.153.4; fi`)}`, executionSignal, { timeoutMs: 300_000 });
-        const connectionEnvs = this.options.connections ? await syncSandboxConnections(entry.sandbox, this.options.connections, executionSignal) : {};
-        checkAbort(executionSignal);
-        // Clear a legacy mirror only on the first preparation, before any worker
-        // starts. Subsequent turns update files atomically while siblings run.
-        const docDirectories = new Set([SHARED_DOCS, ...sharedDocs.map(file => posix.dirname(`${SHARED_DOCS}/${file.path}`))]);
-        const clearLegacy = entry.preparation.sharedDocPaths ? '' : `rm -rf ${quote(SHARED_DOCS)} ${quote(`${ROOT}/docs`)} && `;
-        await this.command(entry, `sh -c ${quote(`${clearLegacy}mkdir -p ${[...docDirectories].map(quote).join(' ')}`)}`, executionSignal);
-        for (const file of sharedDocs) {
-          checkAbort(executionSignal);
-          await this.writeAtomic(entry, `${SHARED_DOCS}/${file.path}`, file.contents, executionSignal);
-        }
-        const currentPaths = new Set(sharedDocs.map(file => file.path));
-        for (const path of entry.preparation.sharedDocPaths ?? []) {
-          if (!currentPaths.has(path)) await entry.sandbox.files.remove(`${SHARED_DOCS}/${path}`, { user: 'user', signal: executionSignal });
-        }
-        entry.preparation.sharedDocPaths = currentPaths;
-        await this.writeAtomic(entry, `${CODEX_HOME}/AGENTS.md`, sharedAgents, executionSignal);
-        for (const name of ['e2b-worker.mjs', 'e2b-inspect.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
-          checkAbort(executionSignal);
-          await this.writeAtomic(entry, `${RUNTIME}/${name}`, await readFile(new URL(`../execution/worker/${name}`, import.meta.url), 'utf8'), executionSignal);
-        }
-        await this.writeAtomic(entry, `${RUNTIME}/agentcore/index.mjs`,
-          await readFile(new URL('../../packages/agentcore/src/index.mjs', import.meta.url), 'utf8'), executionSignal);
-        entry.preparation.initialized = true;
-        return connectionEnvs;
-      });
+      const connectionEnvs = await this.prepareEnvironment(session, entry, executionSignal);
       const images: string[] = [];
       for (const path of turn.images) {
         checkAbort(executionSignal);
@@ -749,6 +777,76 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
   async delete(session: WorkspaceTarget) {
     await this.sandboxes.delete(session);
     if (session.sandbox) this.runtimePreparations.delete(session.sandbox.id);
+  }
+
+  async detachSandbox(target: WorkspaceTarget) {
+    const sandboxId = target.sandbox?.id;
+    await this.sandboxes.detach(target);
+    if (sandboxId) this.runtimePreparations.delete(sandboxId);
+  }
+
+  async archiveSandbox(target: WorkspaceTarget, threadIds: string[], onSandbox: SaveSandbox) {
+    const key = target.projectId ?? target.id;
+    if (this.closing || this.upgrading.has(key)) throw new HttpError(409, '沙箱正在维护');
+    this.upgrading.add(key);
+    try { return await archiveSandbox(target, threadIds, onSandbox, this.sandboxes, this.dataArchives); }
+    catch (error) { throw this.safeError(error); }
+    finally { this.upgrading.delete(key); }
+  }
+
+  async restoreSandbox(target: WorkspaceTarget, archive: SandboxDataArchive, options: SandboxRestoreOptions) {
+    const key = target.projectId ?? target.id;
+    if (this.closing || this.upgrading.has(key)) throw new HttpError(409, '沙箱正在维护');
+    this.upgrading.add(key);
+    try {
+      await restoreSandbox(target, archive, options, this.sandboxes, this.options.connection, this.dataArchives, async (lease, signal) => {
+        const entry: Entry = { sandbox: lease.sandbox, metadata: lease.record, lease, preparation: {} };
+        const envs = await this.prepareEnvironment(target, entry, signal);
+        // Resume each original thread without starting a model turn. This checks
+        // the actual App Server index/rollout compatibility of the new template.
+        const script = `import { CodexAppServerClient, appServerArgs } from ${JSON.stringify(`${RUNTIME}/agentcore/index.mjs`)};
+let client;
+try {
+  client = await CodexAppServerClient.spawn({ command: ${JSON.stringify(`${RUNTIME}/node_modules/.bin/codex`)}, args: appServerArgs(${JSON.stringify(this.options.modelConfig ?? {})}, ${JSON.stringify(this.options.configOverrides ?? [])}), cwd: ${JSON.stringify(target.settings.workingDirectory)} });
+  for (const threadId of ${JSON.stringify(archive.threadIds)}) {
+    const response = await client.request('thread/resume', { threadId, cwd: ${JSON.stringify(target.settings.workingDirectory)}, approvalPolicy: 'never', sandbox: 'danger-full-access' });
+    if (response.thread.id !== threadId) throw new Error('Thread identity mismatch');
+  }
+} catch (error) { console.error(error.message); process.exitCode = 1; }
+finally { await client?.close(); }`;
+        try {
+          await lease.sandbox.commands.run(`${NODE} --input-type=module -e ${quote(script)}`, {
+            user: 'user', signal, timeoutMs: 120_000,
+            envs: { ...envs, CODEX_API_KEY: this.options.apiKey, CODEX_HOME },
+          });
+        } catch (error) {
+          const stderr = (error as { stderr?: string }).stderr;
+          const detail = stderr?.trim().split('\n').at(-1)?.slice(0, 300);
+          const fallback = target.sandbox ? '已保留原沙箱' : '新沙箱未绑定到项目';
+          throw new Error(`新沙箱无法恢复已有 Codex 对话，${fallback}${detail ? `：${detail}` : ''}`);
+        }
+        this.runtimePreparations.set(lease.record.id, entry.preparation);
+      });
+    } catch (error) { throw this.safeError(error); }
+    finally { this.upgrading.delete(key); }
+  }
+
+  async deleteDataArchive(archive: SandboxDataArchive) { await this.dataArchives.delete(archive); }
+
+  async verifyDataArchive(archive: SandboxDataArchive) {
+    const directory = await mkdtemp(join(tmpdir(), 'swarm-hive-archive-verify-'));
+    try { await this.dataArchives.get(archive, join(directory, 'archive.tar.gz')); }
+    finally { await rm(directory, { recursive: true, force: true }); }
+  }
+
+  async pauseDanglingSandbox(sandboxId: string, provenance?: SandboxDataArchive) {
+    try { await pauseDanglingSandbox(sandboxId, this.options.connection, provenance); }
+    catch (error) { throw this.safeError(error); }
+  }
+
+  async deleteDanglingSandbox(sandboxId: string, provenance?: SandboxDataArchive) {
+    try { await deleteDanglingSandbox(sandboxId, this.options.connection, provenance); }
+    catch (error) { throw this.safeError(error); }
   }
 
   async close() {

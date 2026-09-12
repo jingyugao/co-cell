@@ -127,6 +127,125 @@ export class E2BSandboxManager {
     return entry ? cloneRecord(entry.record) : undefined;
   }
 
+  /**
+   * Bind a previously untracked resource to an already-created sandbox.
+   *
+   * Persistence succeeds before the local binding becomes visible. This method
+   * never creates, connects, pauses, or kills the remote sandbox.
+   */
+  async bind(resourceKey: string, record: SandboxRecord, persist: PersistSandboxRecord): Promise<void> {
+    this.assertOpen();
+    assertResourceKey(resourceKey);
+    this.validateRecord(record);
+    await this.lock(resourceKey, async () => {
+      this.assertOpen();
+      const current = this.entries.get(resourceKey);
+      if (current) {
+        throw new SandboxManagerError(
+          'conflict',
+          `Sandbox resource ${resourceKey} is already bound to ${current.record.id}`,
+        );
+      }
+      try {
+        await persist(cloneRecord(record));
+      } catch (error) {
+        throw new SandboxPersistenceError(resourceKey, error);
+      }
+      this.entries.set(resourceKey, this.entry(record, persist));
+      this.log({ event: 'sandbox.bound', resourceKey, sandboxId: record.id });
+    });
+  }
+
+  /**
+   * Remove an idle local binding without changing the remote sandbox.
+   *
+   * A missing binding is already detached and therefore succeeds. Pending state
+   * for a present binding is flushed before its handles are invalidated.
+   */
+  async untrack(resourceKey: string, expectedSandboxId: string): Promise<void> {
+    this.assertOpen();
+    assertResourceKey(resourceKey);
+    if (!expectedSandboxId.trim()) {
+      throw new SandboxManagerError('invalid', 'Expected sandbox ID is required');
+    }
+    await this.lock(resourceKey, async () => {
+      this.assertOpen();
+      const current = this.entries.get(resourceKey);
+      if (!current) return;
+      if (current.record.id !== expectedSandboxId) {
+        throw new SandboxManagerError(
+          'conflict',
+          `Sandbox resource ${resourceKey} is bound to ${current.record.id}, not ${expectedSandboxId}`,
+        );
+      }
+      this.assertIdle(resourceKey, current);
+      if (current.persistencePending) await this.persist(resourceKey, current);
+
+      this.entries.delete(resourceKey);
+      current.sandbox = undefined;
+      current.invalidation.abort(new SandboxManagerError(
+        'not_accessible',
+        `Sandbox resource ${resourceKey} was untracked`,
+      ));
+      this.log({ event: 'sandbox.untracked', resourceKey, sandboxId: current.record.id });
+    });
+  }
+
+  /**
+   * Replace an idle resource binding after the caller has prepared a new sandbox.
+   *
+   * The existing persistence callback remains authoritative. Any pending write for
+   * the old record is retried first, then the replacement is persisted before the
+   * in-memory binding changes. A failed write therefore leaves the old binding and
+   * its handles valid, and the caller may retry this operation. This never pauses
+   * or kills either sandbox.
+   */
+  async replace(resourceKey: string, expectedSandboxId: string, replacement: SandboxRecord): Promise<void> {
+    this.assertOpen();
+    assertResourceKey(resourceKey);
+    if (!expectedSandboxId.trim()) {
+      throw new SandboxManagerError('invalid', 'Expected sandbox ID is required');
+    }
+    this.validateRecord(replacement);
+    await this.lock(resourceKey, async () => {
+      this.assertOpen();
+      const current = this.required(resourceKey);
+      if (current.record.id !== expectedSandboxId) {
+        throw new SandboxManagerError(
+          'conflict',
+          `Sandbox resource ${resourceKey} is bound to ${current.record.id}, not ${expectedSandboxId}`,
+        );
+      }
+      if (replacement.id === current.record.id) {
+        throw new SandboxManagerError(
+          'conflict',
+          `Replacement sandbox for resource ${resourceKey} must have a different ID`,
+        );
+      }
+      this.assertIdle(resourceKey, current);
+
+      // Do not supersede state which the application has not persisted yet.
+      if (current.persistencePending) await this.persist(resourceKey, current);
+
+      const next = this.entry(replacement, current.persist);
+      try {
+        await current.persist(cloneRecord(next.record));
+      } catch (error) {
+        throw new SandboxPersistenceError(resourceKey, error);
+      }
+
+      current.invalidation.abort(new SandboxManagerError(
+        'not_accessible',
+        `Sandbox resource ${resourceKey} was replaced by ${replacement.id}`,
+      ));
+      this.entries.set(resourceKey, next);
+      this.log({
+        event: 'sandbox.replaced', resourceKey,
+        previousSandboxId: current.record.id, sandboxId: replacement.id,
+      });
+    });
+  }
+
   async acquire(resourceKey: string, options: AcquireSandboxOptions): Promise<SandboxLease> {
     this.assertOpen();
     assertResourceKey(resourceKey);

@@ -4,7 +4,11 @@ import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { workspaceDownload } from '../workspaces/download.js';
 
-export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile'>) {
+export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile' | 'upgradeProjectSandbox' | 'archiveProjectSandbox' | 'restoreProjectSandbox' | 'reclaimProjectSandbox'>) {
+  app.post('/api/projects/:id/sandbox/upgrade', async c => c.json(await manager.upgradeProjectSandbox(c.req.param('id')), 202));
+  app.post('/api/projects/:id/sandbox/archive', async c => c.json(await manager.archiveProjectSandbox(c.req.param('id')), 202));
+  app.post('/api/projects/:id/sandbox/restore', async c => c.json(await manager.restoreProjectSandbox(c.req.param('id')), 202));
+  app.post('/api/projects/:id/sandbox/reclaim', async c => c.json(await manager.reclaimProjectSandbox(c.req.param('id')), 202));
   app.get('/api/projects/:id/files', async c => {
     const path = c.req.query('path');
     if (!path) throw new HttpError(400, '缺少文件路径');

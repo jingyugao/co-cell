@@ -103,6 +103,7 @@ const e2b = e2bEnabled ? new E2BCodexRuntime({
   sandboxes: projectSandboxes,
   connections,
   archives,
+  dataArchives: new LocalSandboxArchiveStorage(resolve(process.env.E2B_DATA_ARCHIVE_DIR || 'data/sandbox-data-archives')),
   submitImprovement,
   logger: runtimeLog,
   connection: e2bConnection!,
@@ -111,12 +112,26 @@ const e2b = e2bEnabled ? new E2BCodexRuntime({
 }) : undefined;
 const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || 'data/web-state');
 const webImagesDirectory = resolve(process.env.CODEX_WEB_IMAGES_DIR || 'data/images');
+const idleReclaimAfterMs = Number(process.env.E2B_IDLE_RECLAIM_AFTER_MS ?? 7 * 24 * 60 * 60 * 1000);
+const oldSandboxRetentionMs = Number(process.env.E2B_OLD_SANDBOX_RETENTION_MS ?? 24 * 60 * 60 * 1000);
+const lifecycleScanIntervalMs = process.env.E2B_LIFECYCLE_SCAN_INTERVAL_MS === undefined
+  ? undefined : Number(process.env.E2B_LIFECYCLE_SCAN_INTERVAL_MS);
+if (!Number.isFinite(idleReclaimAfterMs) || idleReclaimAfterMs < 0) throw new Error('E2B_IDLE_RECLAIM_AFTER_MS must be a non-negative finite number');
+if (!Number.isFinite(oldSandboxRetentionMs) || oldSandboxRetentionMs < 0) throw new Error('E2B_OLD_SANDBOX_RETENTION_MS must be a non-negative finite number');
+if (lifecycleScanIntervalMs !== undefined && (!Number.isFinite(lifecycleScanIntervalMs) || lifecycleScanIntervalMs <= 0)) throw new Error('E2B_LIFECYCLE_SCAN_INTERVAL_MS must be a positive finite number');
 const manager = new SessionManager(codex, webDataDirectory, defaults, e2b, e2bWorkingDirectory, runtimeLog,
-  createWebStateStore(webDataDirectory, process.env.MYSQL_URL), webImagesDirectory);
+  createWebStateStore(webDataDirectory, process.env.MYSQL_URL), webImagesDirectory, {
+    directory: resolve(process.env.E2B_CLEANUP_DIR || 'data/sandbox-cleanups'),
+    idleReclaimAfterMs, retentionMs: oldSandboxRetentionMs,
+    ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
+  });
 await manager.init();
 const config: AppConfig = {
   defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
-  localWorkingDirectory, e2b: { enabled: e2bEnabled, template: e2bTemplate, workingDirectory: e2bWorkingDirectory },
+  localWorkingDirectory, e2b: {
+    enabled: e2bEnabled, template: e2bTemplate, workingDirectory: e2bWorkingDirectory,
+    idleReclaimAfterMs, oldSandboxRetentionMs,
+  },
   approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true },
 };
 const templates = new TemplateManager({

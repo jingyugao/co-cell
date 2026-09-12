@@ -310,6 +310,236 @@ test('a failed create persistence does not create a replacement sandbox', async 
   await manager.close();
 });
 
+test('replace persists through the original callback before switching and invalidates the old handle', async () => {
+  const fake = fixture('running');
+  const saved: SandboxRecord[] = [];
+  const persist = async (value: SandboxRecord) => { saved.push(value); };
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), persist);
+  const oldLease = await manager.acquire('resource', { usageId: 'turn-1' });
+  await oldLease.release();
+
+  const replacement = { ...record('paused'), id: 'sandbox-2', template: 'template-2' };
+  await manager.replace('resource', 'sandbox-1', replacement);
+
+  assert.deepEqual(manager.peek('resource'), replacement);
+  assert.deepEqual(saved.at(-1), replacement);
+  assert.equal(oldLease.signal.aborted, true);
+  assert.equal(fake.counts.kill, 0);
+  await manager.close();
+});
+
+test('replace rejects active and detached usages', async () => {
+  const fake = fixture('running');
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), async () => {});
+  const lease = await manager.acquire('resource', { usageId: 'turn-1' });
+  const replacement = { ...record('paused'), id: 'sandbox-2' };
+
+  await assert.rejects(manager.replace('resource', 'sandbox-1', replacement), SandboxBusyError);
+  await lease.release({ detached: true });
+  await assert.rejects(manager.replace('resource', 'sandbox-1', replacement), SandboxBusyError);
+  assert.equal(manager.peek('resource')?.id, 'sandbox-1');
+  await manager.close();
+});
+
+test('replace validates the expected sandbox ID under the resource lock', async () => {
+  const fake = fixture('paused');
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record(), async () => {});
+
+  await assert.rejects(
+    manager.replace('resource', 'stale-sandbox', { ...record(), id: 'sandbox-2' }),
+    /bound to sandbox-1, not stale-sandbox/,
+  );
+  assert.equal(manager.peek('resource')?.id, 'sandbox-1');
+  await manager.close();
+});
+
+test('failed replacement persistence leaves the old binding valid and can be retried', async () => {
+  const fake = fixture('running');
+  let failReplacement = true;
+  const persist = async (value: SandboxRecord) => {
+    if (value.id === 'sandbox-2' && failReplacement) throw new Error('disk full');
+  };
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), persist);
+  const oldLease = await manager.acquire('resource', { usageId: 'turn-1' });
+  await oldLease.release();
+  const replacement = { ...record('paused'), id: 'sandbox-2' };
+
+  await assert.rejects(manager.replace('resource', 'sandbox-1', replacement), SandboxPersistenceError);
+  assert.equal(manager.peek('resource')?.id, 'sandbox-1');
+  assert.equal(oldLease.signal.aborted, false);
+
+  failReplacement = false;
+  await manager.replace('resource', 'sandbox-1', replacement);
+  assert.equal(manager.peek('resource')?.id, 'sandbox-2');
+  assert.equal(oldLease.signal.aborted, true);
+  await manager.close();
+});
+
+test('replace flushes pending old state before persisting the replacement', async () => {
+  const fake = fixture('running');
+  const savedIds: string[] = [];
+  let failFirstSave = true;
+  const persist = async (value: SandboxRecord) => {
+    savedIds.push(value.id);
+    if (failFirstSave) {
+      failFirstSave = false;
+      throw new Error('temporary storage failure');
+    }
+  };
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), persist);
+  await assert.rejects(manager.acquire('resource', { usageId: 'turn-1' }), SandboxPersistenceError);
+
+  await manager.replace('resource', 'sandbox-1', { ...record('paused'), id: 'sandbox-2' });
+  assert.deepEqual(savedIds, ['sandbox-1', 'sandbox-1', 'sandbox-2']);
+  assert.equal(manager.peek('resource')?.id, 'sandbox-2');
+  await manager.close();
+});
+
+test('replace does not persist a replacement while old state is still pending', async () => {
+  const fake = fixture('running');
+  const attemptedIds: string[] = [];
+  const persist = async (value: SandboxRecord) => {
+    attemptedIds.push(value.id);
+    throw new Error('storage unavailable');
+  };
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), persist);
+  await assert.rejects(manager.acquire('resource', { usageId: 'turn-1' }), SandboxPersistenceError);
+
+  await assert.rejects(
+    manager.replace('resource', 'sandbox-1', { ...record('paused'), id: 'sandbox-2' }),
+    SandboxPersistenceError,
+  );
+  assert.deepEqual(attemptedIds, ['sandbox-1', 'sandbox-1']);
+  assert.equal(manager.peek('resource')?.id, 'sandbox-1');
+  await manager.close();
+});
+
+test('concurrent replacements serialize and only the expected binding wins', async () => {
+  const fake = fixture('paused');
+  let unblock!: () => void;
+  const blocked = new Promise<void>(resolve => { unblock = resolve; });
+  let replacementSaveStarted!: () => void;
+  const saveStarted = new Promise<void>(resolve => { replacementSaveStarted = resolve; });
+  const persistedIds: string[] = [];
+  const persist = async (value: SandboxRecord) => {
+    persistedIds.push(value.id);
+    if (value.id === 'sandbox-2') {
+      replacementSaveStarted();
+      await blocked;
+    }
+  };
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record(), persist);
+  const first = manager.replace('resource', 'sandbox-1', { ...record(), id: 'sandbox-2' });
+  await saveStarted;
+  const second = manager.replace('resource', 'sandbox-1', { ...record(), id: 'sandbox-3' });
+  unblock();
+
+  await first;
+  await assert.rejects(second, /bound to sandbox-2, not sandbox-1/);
+  assert.deepEqual(persistedIds, ['sandbox-2']);
+  assert.equal(manager.peek('resource')?.id, 'sandbox-2');
+  await manager.close();
+});
+
+test('untrack removes an idle binding without killing the sandbox and is idempotent', async () => {
+  const fake = fixture('running');
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), async () => {});
+  const lease = await manager.acquire('resource', { usageId: 'turn-1' });
+  await lease.release();
+
+  await manager.untrack('resource', 'sandbox-1');
+  await manager.untrack('resource', 'sandbox-1');
+
+  assert.equal(manager.peek('resource'), undefined);
+  assert.equal(lease.signal.aborted, true);
+  assert.equal(fake.counts.kill, 0);
+  assert.equal(fake.counts.pause, 0);
+  await manager.close();
+});
+
+test('untrack validates the expected sandbox and rejects active or detached usage', async () => {
+  const fake = fixture('running');
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), async () => {});
+
+  await assert.rejects(manager.untrack('resource', 'stale-sandbox'), /bound to sandbox-1, not stale-sandbox/);
+  const lease = await manager.acquire('resource', { usageId: 'turn-1' });
+  await assert.rejects(manager.untrack('resource', 'sandbox-1'), SandboxBusyError);
+  await lease.release({ detached: true });
+  await assert.rejects(manager.untrack('resource', 'sandbox-1'), SandboxBusyError);
+  assert.equal(manager.peek('resource')?.id, 'sandbox-1');
+  await manager.close();
+});
+
+test('untrack flushes pending state before removing the binding', async () => {
+  const fake = fixture('running');
+  let saves = 0;
+  const persist = async () => {
+    saves += 1;
+    if (saves === 1) throw new Error('temporary storage failure');
+  };
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), persist);
+  await assert.rejects(manager.acquire('resource', { usageId: 'turn-1' }), SandboxPersistenceError);
+
+  await manager.untrack('resource', 'sandbox-1');
+
+  assert.equal(saves, 2);
+  assert.equal(manager.peek('resource'), undefined);
+  await manager.close();
+});
+
+test('bind persists before exposing a record and can be retried after persistence failure', async () => {
+  const fake = fixture('paused');
+  let fail = true;
+  const saved: SandboxRecord[] = [];
+  const persist = async (value: SandboxRecord) => {
+    saved.push(value);
+    if (fail) throw new Error('disk full');
+  };
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  const replacement = { ...record('paused'), id: 'sandbox-2', template: 'template-2' };
+
+  await assert.rejects(manager.bind('resource', replacement, persist), SandboxPersistenceError);
+  assert.equal(manager.peek('resource'), undefined);
+  fail = false;
+  await manager.bind('resource', replacement, persist);
+
+  assert.deepEqual(manager.peek('resource'), replacement);
+  assert.deepEqual(saved, [replacement, replacement]);
+  assert.equal(fake.counts.create, 0);
+  assert.equal(fake.counts.connect, 0);
+  await manager.close();
+});
+
+test('concurrent binds serialize and only one binding succeeds', async () => {
+  const fake = fixture('paused');
+  let unblock!: () => void;
+  const blocked = new Promise<void>(resolve => { unblock = resolve; });
+  let announceSave!: () => void;
+  const saving = new Promise<void>(resolve => { announceSave = resolve; });
+  const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });
+  const firstRecord = { ...record('paused'), id: 'sandbox-2' };
+  const secondRecord = { ...record('paused'), id: 'sandbox-3' };
+  const first = manager.bind('resource', firstRecord, async () => { announceSave(); await blocked; });
+  await saving;
+  const second = manager.bind('resource', secondRecord, async () => {});
+  unblock();
+
+  await first;
+  await assert.rejects(second, /already bound to sandbox-2/);
+  assert.equal(manager.peek('resource')?.id, 'sandbox-2');
+  await manager.close();
+});
+
 test('close does not pause or kill remote sandboxes', async () => {
   const fake = fixture('running');
   const manager = new E2BSandboxManager({ provider: fake.provider, connection: {}, policy: { scanIntervalMs: 60_000 } });

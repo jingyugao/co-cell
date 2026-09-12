@@ -110,6 +110,17 @@ export interface Project {
   executionMode: 'e2b' | 'local';
   workingDirectory: string;
   sandbox?: SandboxState;
+  sandboxDataArchive?: import('./sandbox-types.js').SandboxDataArchive;
+  sandboxReclaimedAt?: string;
+  sandboxUpgrade?: {
+    id: string;
+    kind?: 'upgrade' | 'archive' | 'restore' | 'reclaim';
+    source?: SandboxState;
+    target?: SandboxState;
+    phase: 'archiving' | 'preparing' | 'restoring' | 'verifying' | 'failed';
+    startedAt: string;
+    error?: string;
+  };
   archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -137,6 +148,9 @@ export interface Session {
 }
 export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };
 export interface SandboxRecord {
+  /** Platform-created sandbox without a current binding or in-flight reservation. */
+  dangling?: boolean;
+  cleanup?: import('./sandbox-types.js').SandboxCleanupRecord;
   project?: { id: string; name: string; requirementUrl: string | null; sessionCount: number } | null;
   sessions?: Array<{ id: string; title: string; status: SessionStatus }>;
   id: string;
@@ -168,7 +182,13 @@ export interface SandboxInventory {
 }
 export interface AppConfig {
   localWorkingDirectory?: string;
-  e2b?: { enabled: boolean; template: string; workingDirectory: string };
+  e2b?: {
+    enabled: boolean;
+    template: string;
+    workingDirectory: string;
+    idleReclaimAfterMs?: number;
+    oldSandboxRetentionMs?: number;
+  };
   defaults: Settings;
   codexVersion: string;
   auth: 'api-key' | 'local-codex';

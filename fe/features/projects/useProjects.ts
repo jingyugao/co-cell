@@ -23,6 +23,15 @@ export function useProjects() {
   const updateProject = useCallback(async (id: string, values: ProjectUpdate) => storeProject(
     await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(values) }),
   ), [storeProject]);
+  const upgradeSandbox = useCallback(async (id: string) => storeProject(
+    await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/upgrade`, { method: 'POST' }),
+  ), [storeProject]);
+  const archiveSandbox = useCallback(async (id: string) => storeProject(
+    await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/archive`, { method: 'POST' }),
+  ), [storeProject]);
+  const restoreSandbox = useCallback(async (id: string) => storeProject(
+    await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/restore`, { method: 'POST' }),
+  ), [storeProject]);
 
-  return { projects, refreshProjects, createProject, updateProject };
+  return { projects, refreshProjects, createProject, updateProject, upgradeSandbox, archiveSandbox, restoreSandbox };
 }

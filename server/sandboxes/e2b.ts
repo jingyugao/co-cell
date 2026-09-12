@@ -232,8 +232,10 @@ export class E2BCodexRuntime implements E2BRuntime {
   }
   private connectionError(id: string, error: unknown) {
     const detail = this.safeError(error).message;
-    return new Error(/404|not found/i.test(detail)
-      ? `E2B 沙箱 ${id} 不存在或已过期。${detail}`
+    return new Error(/paused sandbox .* not found/i.test(detail)
+      ? `E2B 沙箱 ${id} 的暂停快照无法恢复；请修复 E2B 原生状态库与快照映射，不要创建新沙箱覆盖原工作区。${detail}`
+      : /404|not found/i.test(detail)
+      ? `E2B 沙箱 ${id} 的管理记录不存在或当前凭据无权访问。${detail}`
       : `E2B 沙箱 ${id} 连接失败，请重试。${detail}`);
   }
   private async state(entry: Tracked, status: SandboxState['status']) {

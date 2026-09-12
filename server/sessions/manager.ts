@@ -267,7 +267,10 @@ export class SessionManager {
       return;
     }
     const liveId = this.active.get(id)?.turnId;
-    const mapped = native.turns.map(turn => {
+    // A failed native turn is historical execution state, not a chat message.
+    // The browser separately shows a submission failure from its current page
+    // when it cannot connect before Codex accepts the turn.
+    const mapped = native.turns.filter(turn => turn.status !== 'failed').map(turn => {
       const stored = previous.find(old => old.id === turn.id || old.nativeTurnId === turn.id || (Date.parse(turn.startedAt) >= Date.parse(old.startedAt)
         && Date.parse(turn.startedAt) <= Date.parse(old.completedAt ?? new Date().toISOString())));
       if (!stored) return turn;
@@ -279,9 +282,6 @@ export class SessionManager {
       }
       if (stored.id === liveId) { stored.nativeTurnId = turn.id; if (!stored.prompt) stored.prompt = turn.prompt; return stored; }
       return { ...turn, id: stored.id, nativeTurnId: turn.id, sdkUsage: stored.sdkUsage,
-        // SDK failures can include transport/observer errors absent from the
-        // rollout. Reading history must not turn a durable failure into success.
-        ...(stored.status === 'failed' ? { status: stored.status, error: stored.error ?? turn.error } : {}),
         contextUsage: turn.contextUsage?.map(call => {
           const old = stored.contextUsage?.find(value => call.responseId && value.responseId === call.responseId);
           return old ? { ...old, ...call } : call;

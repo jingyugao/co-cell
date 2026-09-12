@@ -23,7 +23,6 @@
     "@hono/node-server": "2.1.1",
     "@openai/codex": "0.153.4",
     "@swarm-hive/agentcore": "file:packages/agentcore",
-    "@swarm-hive/agentcore-e2b": "file:packages/agentcore-e2b",
     "@swarm-hive/sandbox": "file:packages/sandbox",
     "e2b": "2.46.1",
     "hono": "4.13.3",

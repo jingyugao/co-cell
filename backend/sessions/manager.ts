@@ -1,8 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
 import type { Project, ProjectSummary, Session, SessionSummary, Settings, StreamMessage, Turn } from '../../protocol/types.js';
 import type { E2BRuntime } from '../execution/e2b-runtime.js';
+import { ProjectSandboxUpgrades, type SandboxDataOperation } from '../projects/sandbox-upgrades.js';
+import { SandboxCleanupService } from '../sandboxes/cleanup.js';
+import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { getChanges } from '../workspaces/git.js';
 import type { WorkspaceFileReadOptions } from '../workspaces/files.js';
 import type { RawToolReader } from '../execution/raw-tools.js';
@@ -36,8 +39,20 @@ function normalizeExecutionSettings(settings: Settings): Settings {
     : settings;
 }
 
+export interface SandboxLifecycleOptions {
+  directory?: string;
+  idleReclaimAfterMs?: number;
+  retentionMs?: number;
+  scanIntervalMs?: number;
+  now?: () => number;
+}
 export class SessionManager {
+  private cleanup?: SandboxCleanupService;
+  private lifecycle?: SandboxLifecycleService;
+  private restoring = new Map<string, Promise<void>>();
   private projects: ProjectService;
+  private sandboxUpgrades: ProjectSandboxUpgrades;
+  private danglingDeletions = new Map<string, Promise<void>>();
   private sessions = new Map<string, Session>();
   private active = new Map<string, ActiveExecution>();
   private subscribers = new Map<string, Set<Subscriber>>();
@@ -57,7 +72,42 @@ export class SessionManager {
     private logger?: RuntimeLog,
     private state: WebStateStore = createWebStateStore(dataDirectory),
     private readonly imagesDirectory = join(dataDirectory, 'images'),
-  ) { this.projects = new ProjectService(state); }
+    lifecycleOptions: SandboxLifecycleOptions = {},
+  ) {
+    this.projects = new ProjectService(state);
+    if (e2b?.pauseDanglingSandbox && e2b.deleteDanglingSandbox && e2b.verifyDataArchive && e2b.detachSandbox) {
+      this.cleanup = new SandboxCleanupService({
+        ...lifecycleOptions, directory: lifecycleOptions.directory ?? join(dataDirectory, 'sandbox-cleanups'),
+        isReferenced: id => this.isSandboxReferenced(id) || this.danglingDeletions.has(id),
+        pause: (id, record) => e2b.pauseDanglingSandbox!(id, record.archive),
+        remove: (id, record) => e2b.deleteDanglingSandbox!(id, record.archive),
+        verifyArchive: archive => e2b.verifyDataArchive!(archive),
+        releaseArchive: async archive => {
+          if (this.projects.list().some(project => project.sandboxDataArchive?.key === archive.key)) return;
+          await e2b.deleteDataArchive?.(archive);
+        },
+      });
+      this.lifecycle = new SandboxLifecycleService({
+        ...lifecycleOptions,
+        listProjects: () => this.projects.list(),
+        reclaim: async id => {
+          await this.startSandboxDataOperation(id, 'reclaim');
+          await this.sandboxUpgrades.wait(id);
+        },
+      });
+    }
+    this.sandboxUpgrades = new ProjectSandboxUpgrades(this.projects, e2b, {
+      cleanup: this.cleanup,
+      onReclaimed: async id => {
+        for (const session of this.sessions.values()) {
+          if (session.projectId !== id) continue;
+          delete session.sandbox;
+          await this.save(session);
+          this.publish(session.id, { type: 'state', session: this.get(session.id) });
+        }
+      },
+    });
+  }
 
   async init() {
     await this.state.init();
@@ -163,9 +213,18 @@ export class SessionManager {
       const turn = session.turns.find(turn => this.canRecover(session, turn));
       return turn ? [{ session, turn }] : [];
     });
+    await this.cleanup?.init();
+    for (const project of this.projects.list()) {
+      const operation = project.sandboxUpgrade;
+      if (operation?.phase === 'failed' && operation.target && operation.target.id !== project.sandbox?.id) {
+        await this.cleanup?.schedule(operation.target.id, 'failed_restore');
+      }
+    }
     // Register remote use before connection/recovery yields to lifecycle scans.
     for (const { session, turn } of recoverable) this.e2b?.trackExecution?.(session, turn);
     for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
+    this.cleanup?.start();
+    this.lifecycle?.start();
   }
 
   private canRecover(session: Session, turn: Turn): boolean {
@@ -224,6 +283,8 @@ export class SessionManager {
   }
 
   private refreshNativeHistory(id: string) {
+    const projectId = this.sessions.get(id)?.projectId;
+    if (projectId && (this.projects.isMaintaining(projectId) || !this.projects.get(projectId).sandbox)) return;
     let pending = this.historyReads.get(id);
     if (!pending) {
       pending = this.loadNativeHistory(id)
@@ -251,8 +312,9 @@ export class SessionManager {
   private async calculateBilling(id: string): Promise<Turn[]> {
     const session = this.get(id);
     if (!session.threadId) return [];
+    if (session.settings.executionMode === 'e2b' && !session.sandbox) return session.turns.map(turn => ({ ...turn, prompt: '', images: [], items: [] }));
     const native = session.settings.executionMode === 'e2b'
-      ? await this.e2b!.history(session, true) : await readNativeHistory(session.threadId, undefined, true, session.startedAt, session.nativeHistoryPath);
+      ? await this.readSandboxHistory(session, true) : await readNativeHistory(session.threadId, undefined, true, session.startedAt, session.nativeHistoryPath);
     if (native.path && native.path !== session.nativeHistoryPath) {
       session.nativeHistoryPath = native.path;
       await this.save(session);
@@ -265,10 +327,16 @@ export class SessionManager {
     return estimated.map(turn => ({ ...turn, prompt: '', images: [], items: [] }));
   }
 
+  private async readSandboxHistory(session: Session, includeBlocks = false) {
+    const release = this.projects.acquire(session.projectId);
+    try { return await this.e2b!.history(session, includeBlocks); }
+    finally { release(); }
+  }
+
   private async loadNativeHistory(id: string) {
     const session = this.lookup(id);
     const native = !session.threadId ? { turns: [] } : session.settings.executionMode === 'e2b'
-      ? await this.e2b!.history(session) : await readNativeHistory(session.threadId, undefined, false, session.startedAt, session.nativeHistoryPath);
+      ? await this.readSandboxHistory(session) : await readNativeHistory(session.threadId, undefined, false, session.startedAt, session.nativeHistoryPath);
     if (native.path && native.path !== session.nativeHistoryPath) session.nativeHistoryPath = native.path;
     const previous = session.turns;
     // A partial or empty rollout response must never erase the durable UI
@@ -341,7 +409,93 @@ export class SessionManager {
     return this.projectSummary(await this.projects.update(id, input));
   }
 
+  async upgradeProjectSandbox(id: string): Promise<ProjectSummary> {
+    return this.startSandboxDataOperation(id, 'upgrade');
+  }
+
+  async archiveProjectSandbox(id: string): Promise<ProjectSummary> {
+    return this.startSandboxDataOperation(id, 'archive');
+  }
+
+  async restoreProjectSandbox(id: string): Promise<ProjectSummary> {
+    return this.startSandboxDataOperation(id, 'restore');
+  }
+
+  async reclaimProjectSandbox(id: string): Promise<ProjectSummary> {
+    return this.startSandboxDataOperation(id, 'reclaim');
+  }
+
+  private async startSandboxDataOperation(id: string, kind: SandboxDataOperation): Promise<ProjectSummary> {
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    const sessions = [...this.sessions.values()].filter(session => session.projectId === id);
+    if (sessions.some(session => this.active.has(session.id) || session.turns.some(turn => turn.status === 'running'
+      || Boolean(turn.execution && turn.execution.state !== 'terminal')))) {
+      throw new HttpError(409, '项目仍有执行中或未确认结束的任务，请先等待任务结束');
+    }
+    const checkpoint = createHash('sha256').update(JSON.stringify(sessions.filter(session => session.threadId || session.turns.length).map(session => ({
+      id: session.id, threadId: session.threadId,
+      turns: session.turns.map(turn => ({ id: turn.id, status: turn.status })),
+    })).sort((a, b) => a.id.localeCompare(b.id)))).digest('hex');
+    await this.sandboxUpgrades.start(id, kind, [...new Set(sessions.flatMap(session => session.threadId ? [session.threadId] : []))], checkpoint,
+      sandbox => this.updateSandbox(id, id, sandbox));
+    return this.getProject(id);
+  }
+
+  private isSandboxReferenced(sandboxId: string): boolean {
+    return this.projects.list().some(project => project.sandbox?.id === sandboxId
+      || (project.sandboxUpgrade?.phase !== 'failed' && project.sandboxUpgrade?.target?.id === sandboxId))
+      || [...this.sessions.values()].some(session =>
+        (!session.projectId && session.sandbox?.id === sandboxId)
+        || session.turns.some(turn => turn.execution?.sandboxId === sandboxId && turn.execution.state !== 'terminal'));
+  }
+
+  async listSandboxCleanups() { return this.cleanup?.list() ?? []; }
+
+  async sweepSandboxLifecycle() {
+    await this.lifecycle?.sweep();
+    await this.cleanup?.sweep();
+  }
+
+  private async ensureProjectSandbox(id: string): Promise<void> {
+    const pending = this.restoring.get(id);
+    if (pending) return pending;
+    const project = this.projects.get(id);
+    if (!this.projects.isMaintaining(id) && (project.sandbox || !project.sandboxDataArchive)) return;
+    const operation = (async () => {
+      // A request can arrive during reclaim, before or after its durable
+      // unbinding. Finish that operation, then decide whether restoration is needed.
+      await this.sandboxUpgrades.wait(id);
+      const current = this.projects.get(id);
+      if (current.sandbox || !current.sandboxDataArchive) return;
+      await this.startSandboxDataOperation(id, 'restore');
+      await this.sandboxUpgrades.wait(id);
+      const restored = this.projects.get(id);
+      if (!restored.sandbox) throw new HttpError(503, restored.sandboxUpgrade?.error ?? '沙箱复原尚未完成，请重试');
+    })();
+    this.restoring.set(id, operation);
+    try { await operation; }
+    finally { this.restoring.delete(id); }
+  }
+
+  async deleteDanglingSandbox(sandboxId: string): Promise<void> {
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sandboxId)) throw new HttpError(400, '沙箱 ID 无效');
+    if (!this.e2b?.deleteDanglingSandbox) throw new HttpError(503, 'E2B 未配置');
+    if (this.danglingDeletions.has(sandboxId)) throw new HttpError(409, '此沙箱正在删除');
+    if (this.isSandboxReferenced(sandboxId)) {
+      throw new HttpError(409, '该沙箱仍被项目、会话或复原操作使用，不能删除');
+    }
+    // New bindings only use freshly created IDs. With no await before this
+    // reservation, a detached old environment cannot become a restore target.
+    const operation = this.e2b.deleteDanglingSandbox(sandboxId);
+    this.danglingDeletions.set(sandboxId, operation);
+    try { await operation; await this.cleanup?.deleted(sandboxId); }
+    finally { this.danglingDeletions.delete(sandboxId); }
+  }
+
   async deleteProject(id: string) {
+    const archive = this.projects.get(id).sandboxDataArchive;
+    if (archive && !this.e2b?.deleteDataArchive) throw new HttpError(503, '数据归档存储未配置，无法清理项目备份');
     await this.projects.delete(id, async project => {
       const sessions = [...this.sessions.values()].filter(session => session.projectId === id);
       for (const session of sessions) await Promise.allSettled([...(this.uploads.get(session.id) ?? [])]);
@@ -351,6 +505,10 @@ export class SessionManager {
       }
       for (const session of sessions) await this.removeSession(session.id);
     });
+    if (archive) {
+      if (this.cleanup) await this.cleanup.queueArchiveRelease(archive);
+      else await this.e2b!.deleteDataArchive!(archive);
+    }
   }
 
   private async removeSession(id: string) {
@@ -365,11 +523,18 @@ export class SessionManager {
 
   private async updateSandbox(projectId: string | undefined, sessionId: string, sandbox: NonNullable<Session['sandbox']>) {
     if (projectId) {
+      const replacing = this.projects.find(projectId)?.sandbox?.id !== sandbox.id;
       if (!await this.projects.updateSandbox(projectId, sandbox)) return;
       for (const sibling of this.sessions.values()) {
         if (sibling.projectId !== projectId || this.deleting.has(sibling.id)) continue;
         sibling.sandbox = structuredClone(sandbox);
-        await this.save(sibling);
+        try { await this.save(sibling); }
+        catch (error) {
+          if (!replacing) throw error;
+          // The authoritative project cutover is already durable. Hydration and
+          // startup repair session snapshots; don't roll the runtime binding back.
+          console.error('Session sandbox snapshot save failed after upgrade:', sibling.id);
+        }
         if (!this.projects.isDeleting(projectId) && !this.deleting.has(sibling.id)) this.publish(sibling.id, { type: 'state', session: this.get(sibling.id) });
       }
     } else {
@@ -512,7 +677,13 @@ export class SessionManager {
 
   async startTurn(id: string, prompt: string, images: string[] = []): Promise<string> {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
-    const session = this.lookup(id);
+    let session = this.lookup(id);
+    if (session.projectId && (this.projects.isMaintaining(session.projectId)
+      || (!this.projects.get(session.projectId).sandbox && this.projects.get(session.projectId).sandboxDataArchive))) {
+      await this.ensureProjectSandbox(session.projectId);
+      if (this.closing) throw new HttpError(503, '服务正在关闭');
+      session = this.lookup(id);
+    }
     if (session.archivedAt) throw new HttpError(409, '会话已归档，请先恢复后再发送消息');
     if (this.active.has(id) || session.turns.some(turn => turn.status === 'running')) throw new HttpError(409, '当前会话已有任务正在执行');
     const previous = structuredClone(session);
@@ -632,6 +803,7 @@ export class SessionManager {
     }
     const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, '服务端口无效');
+    await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
     if (project.executionMode !== 'e2b' || !this.e2b) throw new HttpError(400, '此项目不使用 E2B 沙箱');
     if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先启动服务');
@@ -646,6 +818,8 @@ export class SessionManager {
   }
 
   async changes(id: string) {
+    const projectId = this.lookup(id).projectId;
+    if (projectId) await this.ensureProjectSandbox(projectId);
     const session = this.lookup(id);
     if (session.settings.executionMode !== 'e2b') return getChanges(session.settings.workingDirectory);
     if (!this.e2b) throw new HttpError(503, 'E2B 未配置');
@@ -655,6 +829,7 @@ export class SessionManager {
 
   async projectFile(projectId: string, path: string, options?: WorkspaceFileReadOptions) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
+    await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
     if (project.executionMode !== 'e2b' || !this.e2b) throw new HttpError(400, '此项目不使用 E2B 沙箱');
     if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先发送一条消息');
@@ -664,6 +839,8 @@ export class SessionManager {
   }
 
   async rawTools(id: string, cursor: number, localReader: RawToolReader) {
+    const projectId = this.lookup(id).projectId;
+    if (projectId) await this.ensureProjectSandbox(projectId);
     const session = this.lookup(id);
     if (session.settings.executionMode !== 'e2b') return localReader.read(session.threadId, cursor);
     if (!this.e2b) throw new HttpError(503, 'E2B 未配置');
@@ -673,6 +850,11 @@ export class SessionManager {
 
   async close() {
     this.closing = true;
+    await this.lifecycle?.close();
+    await Promise.allSettled(this.restoring.values());
+    await this.sandboxUpgrades.close();
+    await this.cleanup?.close();
+    await Promise.allSettled(this.danglingDeletions.values());
     const detachments: Promise<void>[] = [];
     for (const [id, execution] of this.active) {
       const session = this.sessions.get(id);

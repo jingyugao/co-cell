@@ -33,3 +33,4 @@ export interface ThreadOptions {
 }
 export class Codex { constructor(options?: CodexOptions); startThread(options?: ThreadOptions): Thread; resumeThread(id: string, options?: ThreadOptions): Thread; close(): Promise<void>; }
 export class Thread { readonly id: string | null; runStreamed(input: Input, options?: { signal?: AbortSignal; outputSchema?: unknown }): Promise<{ events: AsyncGenerator<AgentEvent> }>; }
+export function appServerArgs(config?: Record<string, unknown>, configOverrides?: string[]): string[];

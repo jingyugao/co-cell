@@ -19,6 +19,26 @@ export class ProjectSandboxes {
   constructor(readonly manager: E2BSandboxManager, private template: string) {}
 
   setDefaultTemplate(template: string) { this.template = template; }
+  getDefaultTemplate() { return this.template; }
+
+  async replace(target: WorkspaceTarget, replacement: SandboxState) {
+    const binding = this.track(target);
+    const { workingDirectory: _directory, ...record } = replacement;
+    if (target.sandbox) {
+      await this.manager.replace(resourceKey(target), target.sandbox.id, record);
+    } else {
+      if (!binding.save) throw new Error('项目沙箱的持久化入口尚未配置');
+      await this.manager.bind(resourceKey(target), record, binding.persist);
+    }
+    target.sandbox = structuredClone(replacement);
+  }
+
+  /** Detach the project binding while leaving its remote sandbox running. */
+  async detach(target: WorkspaceTarget) {
+    if (!target.sandbox) return;
+    this.track(target);
+    await this.manager.untrack(resourceKey(target), target.sandbox.id);
+  }
 
   private project(record: SandboxRecord, workingDirectory: string): SandboxState {
     return {
@@ -33,6 +53,9 @@ export class ProjectSandboxes {
   track(target: WorkspaceTarget, save?: SaveSandbox) {
     const key = resourceKey(target);
     const tracked = this.manager.peek(key);
+    if (!target.sandbox && tracked) {
+      throw new Error('项目已无沙箱引用，但运行时仍跟踪旧沙箱，请先完成解绑');
+    }
     if (target.sandbox && tracked && target.sandbox.id !== tracked.id) {
       throw new Error('项目沙箱引用不一致，请重新加载项目后重试');
     }

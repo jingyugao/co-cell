@@ -176,6 +176,11 @@ function overrides(config, prefix = '') {
   });
 }
 
+/** Share identical provider/configuration arguments with maintenance probes. */
+export function appServerArgs(config, configOverrides = []) {
+  return ['app-server', ...[...overrides(config), ...configOverrides].flatMap(value => ['-c', value])];
+}
+
 /** Small execution facade over App Server, independent of @openai/codex-sdk. */
 export class Codex {
   constructor(options = {}) { this.options = options; this.clients = new Set(); }
@@ -194,7 +199,7 @@ export class Thread {
     try {
       signal?.throwIfAborted();
       const config = this.codex.options;
-      const args = ['app-server', ...[...overrides(config.config), ...(config.configOverrides ?? [])].flatMap(value => ['-c', value])];
+      const args = appServerArgs(config.config, config.configOverrides);
       client = await CodexAppServerClient.spawn({ command: config.codexPathOverride, args, cwd: this.options.workingDirectory,
         env: { ...(config.env ?? process.env), ...(config.apiKey ? { CODEX_API_KEY: config.apiKey } : {}), ...(config.baseUrl ? { OPENAI_BASE_URL: config.baseUrl } : {}) } });
       this.codex.clients.add(client);

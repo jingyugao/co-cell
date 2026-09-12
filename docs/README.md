@@ -44,7 +44,7 @@ Web 新会话默认使用 `gpt-6-astra`，输入框旁的模型下拉框支持�
 | `E2B_API_URL` / `E2B_SANDBOX_URL` | E2B API 与沙箱代理地址 |
 | `E2B_TEMPLATE` | 模板管理首次初始化时使用的默认模板 |
 | `E2B_WORKSPACE` | 项目沙箱内的默认工作目录 |
-| `CODEX_WEB_DATA_DIR` | 会话、项目、图片的存储目录，默认 `.codex-web` |
+| `CODEX_WEB_DATA_DIR` | JSON 元数据及旧数据导入目录，默认 `data/web-state` |
 
 E2B 内固定使用 `danger-full-access` 和命令网络访问；工作范围通过共享与项目 `AGENTS.md` 约定。模型、思考强度和网页搜索可按会话调整。底层本地执行的权限配置仍保留，但启用 E2B 时不能通过本机会话继续执行任务。
 
@@ -52,14 +52,15 @@ E2B 内固定使用 `danger-full-access` 和命令网络访问；工作范围通
 
 | 路径 | 内容 |
 | --- | --- |
-| `.codex-web/` 或 `CODEX_WEB_DATA_DIR` | 项目、会话历史及附件 |
+| `data/web-state/` 或 `CODEX_WEB_DATA_DIR` | JSON 项目、会话元数据；配置 `MYSQL_URL` 后使用 MySQL |
+| `data/images/` 或 `CODEX_WEB_IMAGES_DIR` | 上传图片 |
 | `data/AGENTS.md`、`data/docs/` | 各项目沙箱共享的规则和参考文档 |
 | `data/e2b/` | 模板配置、默认版本、构建记录与报告 |
 | `data/credentials/` | 加密连接凭据与验证记录 |
 | `~/.config/swarm-hive/credentials.key` | 凭据解密密钥，须与加密数据一并备份 |
 | `data/logs/` | 有保留期限的运行诊断日志 |
 
-`CODEX_WEB_DATA_DIR` 只改变项目、会话和附件目录，不会迁移 `data/`、凭据密钥或 E2B 服务存储。沙箱工作区与 Codex 原生上下文保存在 E2B 内，不能仅靠 Web 历史恢复。
+`CODEX_WEB_DATA_DIR` 只改变 JSON 元数据与旧数据导入目录，不会迁移 `data/`、凭据密钥或 E2B 服务存储。沙箱工作区与 Codex 原生上下文保存在 E2B 内，不能仅靠 Web 历史恢复。
 
 ## 执行与展示边界
 

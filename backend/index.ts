@@ -109,7 +109,7 @@ const e2b = e2bEnabled ? new E2BCodexRuntime({
   template: e2bTemplate, apiKey: apiKey!,
   baseUrl: process.env.OPENAI_BASE_URL, proxyKind, modelConfig, configOverrides,
 }) : undefined;
-const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || '.codex-web');
+const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || 'data/web-state');
 const webImagesDirectory = resolve(process.env.CODEX_WEB_IMAGES_DIR || 'data/images');
 const manager = new SessionManager(codex, webDataDirectory, defaults, e2b, e2bWorkingDirectory, runtimeLog,
   createWebStateStore(webDataDirectory, process.env.MYSQL_URL), webImagesDirectory);

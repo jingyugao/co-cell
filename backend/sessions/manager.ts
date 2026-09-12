@@ -60,7 +60,6 @@ export class SessionManager {
   ) { this.projects = new ProjectService(state); }
 
   async init() {
-    await mkdir(this.dataDirectory, { recursive: true, mode: 0o700 });
     await this.state.init();
     await this.projects.init();
     for (const session of await this.state.listSessions()) {

@@ -112,7 +112,8 @@ E2B 项目沙箱
 
 | 位置 | 数据 |
 | --- | --- |
-| `.codex-web/` 或 `CODEX_WEB_DATA_DIR` | 项目、会话历史及上传附件。 |
+| `data/web-state/` 或 `CODEX_WEB_DATA_DIR` | JSON 项目、会话元数据；配置 `MYSQL_URL` 后使用 MySQL。 |
+| `data/images/` 或 `CODEX_WEB_IMAGES_DIR` | 上传图片。 |
 | `data/improvements.sqlite` | 建议及状态历史，可由 `IMPROVEMENTS_DB_PATH` 调整。 |
 | `data/AGENTS.md`、`data/docs/` | 共享规则与知识库；沙箱文档副本位于 `/home/user/.codex/docs`。 |
 | `data/e2b/templates/` | 模板配置、构建记录、默认版本。 |
@@ -130,7 +131,7 @@ E2B 项目沙箱
 
 ### Docker Compose 运行
 
-仓库根目录的 `docker-compose.yml` 用于构建和运行生产模式的 Web 服务。容器服务名为 `swarm-hive`，宿主机端口默认映射为 `3001`；Compose 会将 `.codex-web/` 和 `data/` 挂载到容器中，并以只读方式挂载 E2B API key 文件。启动前确认 `.env` 和 `E2B_API_KEY_FILE` 指向的文件已配置。
+仓库根目录的 `docker-compose.yml` 用于构建和运行生产模式的 Web 服务。容器服务名为 `swarm-hive`，宿主机端口默认映射为 `3001`；Compose 会将 `data/` 挂载到容器中，并以只读方式挂载 E2B API key 文件。启动前确认 `.env` 和 `E2B_API_KEY_FILE` 指向的文件已配置。
 
 常用命令通过根目录 `Makefile` 执行：
 

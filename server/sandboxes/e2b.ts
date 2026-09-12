@@ -679,7 +679,7 @@ export class E2BCodexRuntime implements E2BRuntime {
         }
         entry.sharedDocPaths = currentPaths;
         await this.writeAtomic(entry, `${CODEX_HOME}/AGENTS.md`, sharedAgents, executionSignal);
-        for (const name of ['e2b-worker.mjs', 'e2b-inspect.mjs', 'diagnostic-proxy.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
+        for (const name of ['e2b-worker.mjs', 'e2b-inspect.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
           checkAbort(executionSignal);
           await this.writeAtomic(entry, `${RUNTIME}/${name}`, await readFile(new URL(`../execution/worker/${name}`, import.meta.url), 'utf8'), executionSignal);
         }
@@ -700,7 +700,7 @@ export class E2BCodexRuntime implements E2BRuntime {
       const approvalReplyDirectory = `${runDirectory}/approvals`;
       const improvementReplyDirectory = `${runDirectory}/improvements`;
       await this.command(entry, `mkdir -p ${quote(bundleDirectory)} ${quote(`${bundleDirectory}/agentcore`)} ${quote(approvalReplyDirectory)} ${quote(improvementReplyDirectory)}`, executionSignal);
-      for (const name of ['e2b-worker.mjs', 'diagnostic-proxy.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
+      for (const name of ['e2b-worker.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
         await this.command(entry, `cp ${quote(`${RUNTIME}/${name}`)} ${quote(`${bundleDirectory}/${name}`)}`, executionSignal);
       }
       await this.command(entry, `cp ${quote(`${RUNTIME}/agentcore/index.mjs`)} ${quote(`${bundleDirectory}/agentcore/index.mjs`)}`, executionSignal);

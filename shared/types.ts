@@ -59,6 +59,8 @@ export interface Turn {
   nativeTurnId?: string;
   /** Confirmed by the App Server turn.started event, not by saving a web submission. */
   codexAccepted?: boolean;
+  /** Browser-only failure observed by the currently open page. Never persisted. */
+  clientFailure?: true;
   id: string;
   prompt: string;
   images: string[];

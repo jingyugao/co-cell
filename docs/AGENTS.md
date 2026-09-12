@@ -26,13 +26,13 @@ swarm-hive 是基于 Codex TypeScript SDK 的 Web 编码工作台。用户按项
             │ E2B API、命令输出、文件操作
             ▼
 E2B 项目沙箱
-    ├─ e2b-worker.mjs → Codex SDK → Codex CLI → 模型与工具循环
+    ├─ e2b-worker.mjs → agentcore → Codex App Server → 模型与工具循环
     ├─ 项目工作区、业务代码、开发工具、业务服务
     ├─ ~/.codex：Codex 原生上下文及共享文档副本
     └─ ~/.codex-web/runtime：平台 worker、SDK 与配套脚本
 ```
 
-当前接入使用 `startThread` / `resumeThread` 和 `runStreamed`，没有接入 Codex App Server。Web 收到的是 SDK 事件，底层 CLI 自行推进工具调用；不要把前端订阅事件当成能够控制每个模型步骤的暂停点。
+当前通过 `packages/agentcore` 接入 Codex App Server：agentcore 为每个线程启动独立的 `codex app-server` 子进程，使用 JSON-RPC 管理线程和 turn，并把原生通知转换为共享事件。Web 收到的是 worker 归并后的事件；底层 App Server 自行推进工具调用，不要把前端订阅事件当成能够控制每个模型步骤的暂停点。
 
 ## 核心概念与归属
 
@@ -58,7 +58,8 @@ E2B 项目沙箱
 | `server/projects/` | 项目创建、编辑、归档、删除保护；`requirements.ts` 读取飞书需求名称。 |
 | `server/sessions/` | `manager.ts` 管理会话、运行任务、持久化和订阅；`routes.ts` 提供会话、提交、停止、SSE 等接口。 |
 | `server/execution/` | `runner.ts` 处理单轮执行；`raw-tools.ts` 读取 Codex 原始工具记录。 |
-| `server/execution/worker/` | 同步到沙箱运行的独立 `.mjs` 脚本：SDK 调用、模型代理、检查工具、改进建议 MCP 与回执桥接。 |
+| `packages/agentcore/` | Codex App Server 运行时适配层：通过 JSON-RPC 启动/恢复线程、执行或中断 turn，归一化 item、用量和状态事件；不负责宿主机路由或持久化。 |
+| `server/execution/worker/` | 同步到沙箱运行的独立 `.mjs` 脚本：调用 agentcore、检查工具、改进建议 MCP 与回执桥接；负责单轮生命周期和事件日志。 |
 | `server/sandboxes/` | `e2b.ts` 管理连接、准备、执行、续期、恢复、文件与端口访问；`inventory.ts` 汇总状态和资源；归档存储接口及本地快照实现独立放置。 |
 | `server/workspaces/` | Git 差异查询；文件路径校验、受限读取、内容类型和大小判断。 |
 | `server/templates/`、`scripts/e2b/` | 模板配置、构建状态和默认版本；实际安装与验证脚本、多语言工具清单。 |
@@ -78,10 +79,10 @@ E2B 项目沙箱
 1. 页面向 `/api/sessions/:id/turns` 提交消息，`SessionManager.startTurn()` 预留该会话的运行位置并持久化初始状态。
 2. `runTurn()` 根据执行模式调用本地 SDK 或 `E2BCodexRuntime.run()`；日常项目使用 E2B。
 3. E2B runtime 获取项目沙箱，同步 worker、共享文档与凭据，启动该轮 worker。
-4. worker 使用会话 `threadId` 恢复上下文，调用 SDK，将事件以逐行 JSON 输出。
+4. worker 使用会话 `threadId` 恢复上下文，通过 agentcore 启动或连接 Codex App Server，将归一化事件以逐行 JSON 输出。
 5. 宿主机归并事件，先保存会话，再通过 SSE 发布；结束时保存最终状态并释放运行记录。
 
-浏览器断开只取消订阅，不停止任务；重连通过会话快照恢复展示。SDK item、Codex rollout 原始工具消息、模型 HTTP 抓包是不同数据来源，不混用，也不根据文件变更结果臆造原始工具参数。
+浏览器断开只取消订阅，不停止任务；重连通过会话快照恢复展示。agentcore 事件、Codex rollout 原始工具消息、模型 HTTP 抓包是不同数据来源，不混用，也不根据文件变更结果臆造原始工具参数。
 
 ### 打开沙箱资源
 

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { TemplateBuild, TemplateDefinition, TemplateInventory, TemplateManifest } from '../../protocol/template-types.js';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 
 const pinned = z.string().max(64).regex(/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9][a-zA-Z0-9.-]*)?$/);
 const versions = z.array(pinned).min(1).max(20).refine(items => new Set(items).size === items.length, '版本不能重复');

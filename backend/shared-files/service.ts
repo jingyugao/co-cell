@@ -3,7 +3,7 @@ import { constants } from 'node:fs';
 import { link, lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 
 const LIMIT = 1024 * 1024;
 const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT';

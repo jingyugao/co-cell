@@ -1,4 +1,4 @@
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 import type { WorkspaceFileReadOptions, WorkspaceFileResult } from './files.js';
 
 const CHUNK_BYTES = 1024 * 1024;

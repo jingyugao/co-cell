@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { UserApproval, RequestUserApproval } from '../../protocol/approval-types.js';
 import type { Turn } from '../../protocol/types.js';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 
 const inputSchema = z.object({
   title: z.string().trim().min(1).max(200),

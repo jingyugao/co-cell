@@ -5,7 +5,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
 import type { AppConfig } from '../protocol/types.js';
 import { SessionManager } from './sessions/manager.js';
-import { HttpError } from './core/errors.js';
+import { HttpError } from '../util/errors.js';
 import { RawToolReader } from './execution/raw-tools.js';
 import { E2BSandboxInventory, type SandboxInventoryReader } from './sandboxes/inventory.js';
 import { SharedFiles } from './shared-files/service.js';

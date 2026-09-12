@@ -13,9 +13,9 @@ import type { NativeHistory } from './native-history.mjs';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
 import { CONNECTION_ROOT, type ConnectionStore } from '../connections/store.js';
 import { syncSandboxConnections } from '../connections/sandbox-sync.js';
-import type { RuntimeLog } from '../diagnostics/runtime-log.js';
+import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 import type { ImprovementContext, ImprovementReceipt } from '../../protocol/improvement-types.js';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 import type { ModelProxyKind } from './model-proxy.js';
 import { parseWorkspaceFile, READ_SANDBOX_FILE_SCRIPT, workspaceFileRequest, type WorkspaceFileResult, type WorkspaceFileReadOptions } from '../workspaces/files.js';
 

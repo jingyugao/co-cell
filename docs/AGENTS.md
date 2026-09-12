@@ -66,9 +66,9 @@ E2B 项目沙箱
 | `backend/connections/` | 本机凭据导入、加密存储、权限校验及沙箱动态同步；不把密钥写入模板或 Git。 |
 | `backend/shared-files/` | 管理持久化共享规则与知识库，加载待下发的文档。 |
 | `backend/improvements/` | 建议校验、去重、SQLite 迁移、查询、人工状态转换与历史。 |
-| `backend/storage/`、`core/`、`http/`、`diagnostics/` | 原子 JSON 写入、公共错误、生产静态文件、运行日志与 HTTP 诊断。 |
+| `backend/infra/` | 技术支撑：`storage/` 实现 JSON/MySQL 持久化，`http/` 提供生产静态文件，`diagnostics/` 管理日志与 HTTP 诊断。 |
 | `protocol/` | 前后端数据契约、消息与事件类型。 |
-| `util/` | 事件归并、用量汇总、费用估算及模型常量，不依赖 React 或服务端存储。 |
+| `util/` | 公共错误类、事件归并、用量汇总、费用估算及模型常量，不依赖 React 或服务端存储。 |
 | `fe/App.tsx` | 页面装配、当前项目/会话选择及跨页面状态协调。 |
 | `fe/features/` | 按业务划分的页面与局部逻辑；`chat` 管理消息渲染、模型设置和 SSE，`workspace-files` 管理文件预览。其余目录与业务模块对应。 |
 | `fe/lib/`、`fe/components/` | HTTP 客户端、浏览器路由、资源链接解析及公共 UI 组件。 |

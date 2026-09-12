@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import { IMPROVEMENT_STATUSES, type ImprovementContext, type ImprovementInput, type ImprovementPage, type ImprovementProposal, type ImprovementReceipt, type ImprovementStatus, type ImprovementStatusChange } from '../../protocol/improvement-types.js';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 
 export const improvementSchema = z.object({
   category: z.string().trim().min(1).max(120),

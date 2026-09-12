@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { z } from 'zod';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 
 const exec = promisify(execFile);
 type Command = (args: string[]) => Promise<string>;

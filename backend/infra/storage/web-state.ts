@@ -1,7 +1,7 @@
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
-import type { Project, Session } from '../../protocol/types.js';
+import type { Project, Session } from '../../../protocol/types.js';
 
 export interface WebStateStore {
   init(): Promise<void>; listProjects(): Promise<Project[]>; listSessions(): Promise<Session[]>;

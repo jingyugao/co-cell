@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 import { streamSSE } from 'hono/streaming';
 import type { AppConfig, StreamMessage } from '../../protocol/types.js';
 import type { SessionManager } from './manager.js';

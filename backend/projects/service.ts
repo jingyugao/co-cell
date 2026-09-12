@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type { Project, Settings } from '../../protocol/types.js';
-import { HttpError } from '../core/errors.js';
-import { AtomicJsonWriter } from '../storage/atomic-json.js';
-import type { WebStateStore } from '../storage/web-state.js';
+import { HttpError } from '../../util/errors.js';
+import { AtomicJsonWriter } from '../infra/storage/atomic-json.js';
+import type { WebStateStore } from '../infra/storage/web-state.js';
 import { readRequirementInfo } from './requirements.js';
 
 export type ProjectInput = { name?: string; requirementUrl?: string | null };

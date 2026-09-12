@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
 import type { ConnectionInventory } from '../../protocol/connection-types.js';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 import { importLarkCredentials } from './lark-credentials.js';
 import { readMeegleCredentials } from './meegle-credentials.js';
 import { importKubernetesCredentials, KUBERNETES_CREDENTIAL_POLICY } from './kubernetes-credentials.js';

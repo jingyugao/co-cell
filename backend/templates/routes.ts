@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 import { templateManifestSchema, type TemplateManager } from './manager.js';
 
 export function installTemplatesRoutes(app: Hono, templates?: TemplateManager) {

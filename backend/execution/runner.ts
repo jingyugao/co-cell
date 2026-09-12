@@ -1,9 +1,9 @@
 import type { Codex, Input, Thread, ThreadOptions } from '../../packages/agentcore/src/index.mjs';
 import type { AgentEvent, Session, StreamMessage, Turn } from '../../protocol/types.js';
 import { applyTurnEvent } from '../../util/session-events.js';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 import { TurnLaunchCancelled, TurnObserverDetached, TurnTerminationUnconfirmed, type E2BRuntime } from './e2b-runtime.js';
-import type { RuntimeLog } from '../diagnostics/runtime-log.js';
+import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 import type { RequestUserApproval } from '../../protocol/approval-types.js';
 
 export type CodexClient = Pick<Codex, 'startThread' | 'resumeThread'>;

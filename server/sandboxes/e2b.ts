@@ -661,7 +661,7 @@ export class E2BCodexRuntime implements E2BRuntime {
           throw error;
         });
         const sharedDocs = await loadAgentDocs(new URL('docs/', sharedData));
-        await this.command(entry, `sh -c ${quote(`mkdir -p ${quote(RUNTIME)} ${quote(`${ROOT}/images`)} /home/user/.codex ${quote(session.settings.workingDirectory)} && chmod 700 ${quote(ROOT)} /home/user/.codex && cd ${quote(RUNTIME)} && if ! ${NODE} -e 'if(require("./node_modules/@openai/codex-sdk/package.json").version!=="0.153.4")process.exit(1)' >/dev/null 2>&1; then npm install --no-audit --no-fund --save-exact @openai/codex-sdk@0.153.4; fi`)}`, executionSignal, { timeoutMs: 300_000 });
+        await this.command(entry, `sh -c ${quote(`mkdir -p ${quote(RUNTIME)} ${quote(`${RUNTIME}/agentcore`)} ${quote(`${ROOT}/images`)} /home/user/.codex ${quote(session.settings.workingDirectory)} && chmod 700 ${quote(ROOT)} /home/user/.codex && cd ${quote(RUNTIME)} && if ! ${NODE} -e 'if(require("./node_modules/@openai/codex/package.json").version!=="0.153.4")process.exit(1)' >/dev/null 2>&1; then npm install --no-audit --no-fund --save-exact @openai/codex@0.153.4; fi`)}`, executionSignal, { timeoutMs: 300_000 });
         const connectionEnvs = this.options.connections ? await syncSandboxConnections(entry.sandbox, this.options.connections, executionSignal) : {};
         checkAbort(executionSignal);
         // Clear a legacy mirror only on the first preparation, before any worker
@@ -683,6 +683,8 @@ export class E2BCodexRuntime implements E2BRuntime {
           checkAbort(executionSignal);
           await this.writeAtomic(entry, `${RUNTIME}/${name}`, await readFile(new URL(`../execution/worker/${name}`, import.meta.url), 'utf8'), executionSignal);
         }
+        await this.writeAtomic(entry, `${RUNTIME}/agentcore/index.mjs`,
+          await readFile(new URL('../../packages/agentcore/src/index.mjs', import.meta.url), 'utf8'), executionSignal);
         entry.initialized = true;
         return connectionEnvs;
       });
@@ -697,14 +699,16 @@ export class E2BCodexRuntime implements E2BRuntime {
       const bundleDirectory = `${runDirectory}/bundle`;
       const approvalReplyDirectory = `${runDirectory}/approvals`;
       const improvementReplyDirectory = `${runDirectory}/improvements`;
-      await this.command(entry, `mkdir -p ${quote(bundleDirectory)} ${quote(approvalReplyDirectory)} ${quote(improvementReplyDirectory)}`, executionSignal);
+      await this.command(entry, `mkdir -p ${quote(bundleDirectory)} ${quote(`${bundleDirectory}/agentcore`)} ${quote(approvalReplyDirectory)} ${quote(improvementReplyDirectory)}`, executionSignal);
       for (const name of ['e2b-worker.mjs', 'diagnostic-proxy.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
         await this.command(entry, `cp ${quote(`${RUNTIME}/${name}`)} ${quote(`${bundleDirectory}/${name}`)}`, executionSignal);
       }
+      await this.command(entry, `cp ${quote(`${RUNTIME}/agentcore/index.mjs`)} ${quote(`${bundleDirectory}/agentcore/index.mjs`)}`, executionSignal);
       inputPath = `${runDirectory}/input.json`;
       checkAbort(executionSignal);
       await entry.sandbox.files.write(inputPath, JSON.stringify({
         workerId: turn.execution!.workerId, sessionId: session.id, turnId: turn.id, runDirectory,
+        agentcorePath: `${bundleDirectory}/agentcore/index.mjs`,
         threadId: session.threadId, prompt: turn.prompt, images, settings: session.settings,
         connectionDirectories: Object.keys(connectionEnvs).length ? [CONNECTION_ROOT, ...('MEEGLE_HOST' in connectionEnvs ? ['/home/user/.meegle'] : []), ...('KUBECONFIG' in connectionEnvs ? ['/home/user/.kube'] : [])] : [],
         baseUrl: this.options.baseUrl, proxyKind: this.options.proxyKind,

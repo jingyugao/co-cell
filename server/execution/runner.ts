@@ -1,4 +1,4 @@
-import type { Codex, Input, Thread, ThreadOptions } from '@openai/codex-sdk';
+import type { Codex, Input, Thread, ThreadOptions } from '../../packages/agentcore/src/index.mjs';
 import type { AgentEvent, Session, StreamMessage, Turn } from '../../shared/types.js';
 import { applyTurnEvent } from '../../shared/session-events.js';
 import { HttpError } from '../core/errors.js';

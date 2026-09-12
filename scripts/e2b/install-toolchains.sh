@@ -54,7 +54,7 @@ node_dir=$(mise where "node@$(field defaults.node)")
 install -m 0755 "$node_dir/bin/node" /opt/codex-runtime/bin/node
 export PATH="$node_dir/bin:$PATH"
 cd /home/user/.codex-web/runtime
-npm install --no-audit --no-fund --save-exact "@openai/codex-sdk@$(field codexSdk)"
+npm install --no-audit --no-fund --save-exact "@openai/codex@$(field codexCli)"
 mise reshim
 
 export PATH=/home/user/.local/share/mise/shims:/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin

@@ -5,7 +5,7 @@ import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { readFile } from 'node:fs/promises';
-import { Codex } from '@openai/codex-sdk';
+import { Codex } from '../packages/agentcore/src/index.mjs';
 import { getRequestListener } from '@hono/node-server';
 import type { AppConfig, Settings } from '../shared/types.js';
 import { DEFAULT_MODEL } from '../shared/models.js';
@@ -105,7 +105,7 @@ const e2b = e2bEnabled ? new E2BCodexRuntime({
 const manager = new SessionManager(codex, resolve(process.env.CODEX_WEB_DATA_DIR || '.codex-web'), defaults, e2b, e2bWorkingDirectory, runtimeLog);
 await manager.init();
 const config: AppConfig = {
-  defaults, sdkVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
+  defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, e2b: { enabled: e2bEnabled, template: e2bTemplate, workingDirectory: e2bWorkingDirectory },
   approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true },
 };

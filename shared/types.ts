@@ -1,6 +1,6 @@
 import type { SandboxState } from './sandbox-types.js';
 import type { UserApproval } from './approval-types.js';
-import type { ThreadEvent, ThreadItem, Usage } from '@openai/codex-sdk';
+import type { ThreadEvent, ThreadItem, Usage } from './agent-protocol.js';
 
 export type SessionStatus = 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
 export interface RetryState {
@@ -57,7 +57,7 @@ export interface Turn {
   segment?: number;
   compactions?: Array<{ segment: number; timestamp: string; beforeItemIndex: number }>;
   nativeTurnId?: string;
-  /** Confirmed by the SDK turn.started event, not by saving a web submission. */
+  /** Confirmed by the App Server turn.started event, not by saving a web submission. */
   codexAccepted?: boolean;
   id: string;
   prompt: string;
@@ -66,12 +66,12 @@ export interface Turn {
   phase?: 'starting' | 'recovering' | 'running' | 'finalizing';
   items: ThreadItem[];
   usage?: Usage;
-  /** Original SDK usage before normalization to per-request token totals. */
+  /** Native turn usage before normalization to per-request token totals. */
   sdkUsage?: Usage;
   error?: string;
   startedAt: string;
   completedAt?: string;
-  /** Timestamp for each streamed SDK item, keyed by item id. */
+  /** Timestamp for each streamed item, keyed by item id. */
   itemTimestamps?: Record<string, string>;
   /** One entry for each completed model request in this turn. */
   contextUsage?: ContextUsage[];
@@ -157,7 +157,7 @@ export interface AppConfig {
   localWorkingDirectory?: string;
   e2b?: { enabled: boolean; template: string; workingDirectory: string };
   defaults: Settings;
-  sdkVersion: string;
+  codexVersion: string;
   auth: 'api-key' | 'local-codex';
   approvalPolicy: 'never';
   capabilities: { interactiveApprovals: false; tokenDeltas: false; sandboxPreviews?: boolean };

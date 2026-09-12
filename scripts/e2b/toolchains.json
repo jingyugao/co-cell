@@ -40,7 +40,7 @@
     "sha256": "173d95a0c32d18c896c46ba6fafbf3cf9c14ab74b033f81b76c883ef492a976b"
   },
   "pnpm": "10.33.4",
-  "codexSdk": "0.153.4",
+  "codexCli": "0.153.4",
   "cpuCount": 2,
   "memoryMB": 1024,
   "php": {

@@ -10,7 +10,7 @@ export interface TemplateManifest {
   mise: { version: string; sha256: string };
   uv: { version: string; sha256: string };
   pnpm: string;
-  codexSdk: string;
+  codexCli: string;
   cpuCount: number;
   memoryMB: number;
 }

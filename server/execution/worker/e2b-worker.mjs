@@ -1,6 +1,5 @@
 import { appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
-import { Codex } from '@openai/codex-sdk';
 import { startDiagnosticProxy } from './diagnostic-proxy.mjs';
 import { startImprovementBridge } from './improvement-bridge.mjs';
 import { startApprovalBridge } from './approval-bridge.mjs';
@@ -91,6 +90,9 @@ export function createOverloadRetryOptions({ proxyKind = 'new-api', baseUrl }, o
 async function main() {
 const inputPath = process.argv[2];
 const input = JSON.parse(await readFile(inputPath, 'utf8'));
+const { Codex } = await import(input.agentcorePath
+  ? pathToFileURL(input.agentcorePath).href
+  : new URL('../../../packages/agentcore/src/index.mjs', import.meta.url).href);
 await unlink(inputPath);
 const runDirectory = input.runDirectory;
 const journalPath = `${runDirectory}/events.jsonl`;
@@ -132,6 +134,7 @@ const controller = new AbortController();
 const stop = () => controller.abort();
 process.on('SIGTERM', stop);
 process.on('SIGINT', stop);
+let codex;
 let diagnosticProxy;
 let improvementBridge;
 let approvalBridge;
@@ -178,7 +181,8 @@ try {
       emit: publish,
     });
   }
-  const codex = new Codex({
+  codex = new Codex({
+    codexPathOverride: input.codexPath ?? '/home/user/.codex-web/runtime/node_modules/.bin/codex',
     apiKey: process.env.CODEX_API_KEY,
     config: { ...extra, ...proxy, model_providers: { ...extra.model_providers, ...proxy.model_providers },
       ...((improvementBridge || approvalBridge) ? {
@@ -198,7 +202,7 @@ try {
     workingDirectory: settings.workingDirectory,
     ...(settings.model ? { model: settings.model } : {}),
     modelReasoningEffort: settings.modelReasoningEffort,
-    // The explicit SDK --sandbox option overrides persisted thread settings;
+    // Explicit App Server sandbox policy overrides persisted thread settings;
     // E2B itself is the isolation boundary, including for user-level caches.
     sandboxMode: 'danger-full-access',
     webSearchMode: settings.webSearchMode,
@@ -212,7 +216,7 @@ try {
     : input.prompt;
   const { events } = await thread.runStreamed(prompt, { signal: controller.signal });
   for await (const event of events) {
-    // SDK errors can omit HTTP bodies (notably 429) or stream disconnect causes.
+    // Protocol errors can omit HTTP bodies (notably 429) or stream disconnect causes.
     // Attach the current request's sanitized diagnostic before journaling it.
     if (event.type === 'error') event.message = diagnosticProxy?.describeError(event.message) ?? event.message;
     if (event.type === 'turn.failed') event.error.message = diagnosticProxy?.describeError(event.error.message) ?? event.error.message;
@@ -231,7 +235,10 @@ try {
   await publish({ type: controller.signal.aborted ? 'runtime.worker_cancelled' : 'runtime.worker_failed', message }).catch(() => {});
   process.exitCode = controller.signal.aborted ? 130 : 1;
 } finally {
-  try { await Promise.all([diagnosticProxy?.close(), improvementBridge?.close(), approvalBridge?.close()]); }
+  try {
+    await codex?.close();
+    await Promise.all([diagnosticProxy?.close(), improvementBridge?.close(), approvalBridge?.close()]);
+  }
   finally {
     if (retry) { retry = undefined; await emitRetry(null).catch(() => {}); }
     await publishing;

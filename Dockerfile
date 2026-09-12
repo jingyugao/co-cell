@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
   && corepack enable
 RUN npm install --global @lark-project/meegle@1.0.20
 COPY package.json pnpm-lock.yaml ./
+COPY packages ./packages
 RUN pnpm install --frozen-lockfile
 COPY . .
 RUN pnpm build

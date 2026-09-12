@@ -18,7 +18,7 @@ export const templateManifestSchema = z.object({
   go: versions, node: versions, python: versions,
   php: z.object({ version: z.literal('8.0.30'), composer: binary }).strict().optional(),
   defaults: z.object({ go: pinned, node: pinned, python: pinned }).strict(),
-  mise: binary, uv: binary, pnpm: pinned, codexSdk: z.literal('0.153.4'),
+  mise: binary, uv: binary, pnpm: pinned, codexCli: z.literal('0.153.4'),
   cpuCount: z.number().int().min(1).max(8),
   memoryMB: z.number().int().min(512).max(8192).multipleOf(256),
 }).strict().superRefine((value, ctx) => {

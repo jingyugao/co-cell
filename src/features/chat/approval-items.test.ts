@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { ThreadItem } from '@openai/codex-sdk';
+import type { ThreadItem } from '../../../shared/agent-protocol';
 import type { UserApproval } from '../../../shared/approval-types';
 import { matchApprovalItems } from './approval-items';
 

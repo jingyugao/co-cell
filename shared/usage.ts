@@ -1,4 +1,4 @@
-import type { Usage } from '@openai/codex-sdk';
+import type { Usage } from './agent-protocol.js';
 import type { ContextUsage } from './types.js';
 
 /** Only complete per-request observations can be summed as turn usage. */

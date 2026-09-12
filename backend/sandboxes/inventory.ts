@@ -1,6 +1,6 @@
 import { ApiClient, ConnectionConfig, Sandbox, type ConnectionOpts, type SandboxApiOpts, type SandboxInfo, type SandboxListOpts, type SandboxMetrics, type SandboxMetricsOpts } from 'e2b';
 import type { ProjectSummary, SandboxInventory, SandboxRecord, SessionSummary } from '../../protocol/types.js';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 
 interface InventoryApi {
   list(options: SandboxListOpts): { readonly hasNext: boolean; nextItems(options?: SandboxApiOpts): Promise<SandboxInfo[]> };

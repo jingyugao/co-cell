@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 import type { SharedFiles } from './service.js';
 
 export function installSharedFilesRoutes(app: Hono, sharedFiles: SharedFiles) {

@@ -8,7 +8,7 @@ import type { WorkspaceFileReadOptions } from '../workspaces/files.js';
 import type { RawToolReader } from '../execution/raw-tools.js';
 import type { RuntimeLog } from '../diagnostics/runtime-log.js';
 
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 import { ProjectService, type ProjectInput, type ProjectUpdate } from '../projects/service.js';
 import { AtomicJsonWriter } from '../storage/atomic-json.js';
 import { createWebStateStore, type WebStateStore } from '../storage/web-state.js';

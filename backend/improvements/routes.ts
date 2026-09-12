@@ -1,6 +1,6 @@
 import type { Hono } from 'hono';
 import { z } from 'zod';
-import { HttpError } from '../core/errors.js';
+import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import type { ImprovementStore } from './store.js';
 import { improvementStatusSchema } from './store.js';

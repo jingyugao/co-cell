@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
 import type { Project, ProjectSummary, Session, SessionSummary, Settings, StreamMessage, Turn } from '../../shared/types.js';
-import type { E2BRuntime } from '../sandboxes/e2b.js';
+import type { E2BRuntime } from '../execution/e2b-runtime.js';
 import { getChanges } from '../workspaces/git.js';
 import type { WorkspaceFileReadOptions } from '../workspaces/files.js';
 import type { RawToolReader } from '../execution/raw-tools.js';
@@ -48,7 +48,16 @@ export class SessionManager {
   private historyReads = new Map<string, Promise<void>>();
   private billingReads = new Map<string, Promise<Turn[]>>();
 
-  constructor(private client: CodexClient, public readonly dataDirectory: string, public readonly defaults: Settings, private e2b?: E2BRuntime, private e2bWorkingDirectory = '/home/user/workspace', private logger?: RuntimeLog, private state: WebStateStore = createWebStateStore(dataDirectory)) { this.projects = new ProjectService(state); }
+  constructor(
+    private client: CodexClient,
+    public readonly dataDirectory: string,
+    public readonly defaults: Settings,
+    private e2b?: E2BRuntime,
+    private e2bWorkingDirectory = '/home/user/workspace',
+    private logger?: RuntimeLog,
+    private state: WebStateStore = createWebStateStore(dataDirectory),
+    private readonly imagesDirectory = join(dataDirectory, 'images'),
+  ) { this.projects = new ProjectService(state); }
 
   async init() {
     await mkdir(this.dataDirectory, { recursive: true, mode: 0o700 });
@@ -151,15 +160,19 @@ export class SessionManager {
       if (session.projectId || session.settings.executionMode !== 'e2b' || !session.sandbox) continue;
       this.e2b?.track?.(structuredClone(session), sandbox => this.updateSandbox(undefined, session.id, sandbox));
     }
-    for (const session of this.sessions.values()) {
+    const recoverable = [...this.sessions.values()].flatMap(session => {
       const turn = session.turns.find(turn => this.canRecover(session, turn));
-      if (turn) this.executeTurn(session, turn, this.reserveTurn(session), true);
-    }
+      return turn ? [{ session, turn }] : [];
+    });
+    // Register remote use before connection/recovery yields to lifecycle scans.
+    for (const { session, turn } of recoverable) this.e2b?.trackExecution?.(session, turn);
+    for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
   }
 
   private canRecover(session: Session, turn: Turn): boolean {
     return Boolean(this.e2b && session.settings.executionMode === 'e2b' && session.sandbox
-      && turn.execution?.kind === 'e2b-worker' && turn.execution.protocolVersion === 1 && turn.execution.state !== 'terminal');
+      && turn.execution?.kind === 'e2b-worker' && turn.execution.protocolVersion === 1 && turn.execution.state !== 'terminal'
+      && (!turn.execution.sandboxId || turn.execution.sandboxId === session.sandbox.id));
   }
 
   private reserveTurn(session: Session): ActiveExecution {
@@ -344,7 +357,8 @@ export class SessionManager {
   private async removeSession(id: string) {
     await this.writer.wait(id);
     await this.state.deleteSession(id);
-    await rm(join(this.dataDirectory, 'images', id), { recursive: true, force: true });
+    await Promise.all([...new Set([join(this.imagesDirectory, id), join(this.dataDirectory, 'images', id)])]
+      .map(directory => rm(directory, { recursive: true, force: true })));
     this.sessions.delete(id);
     this.subscribers.delete(id);
     this.writer.forget(id);
@@ -484,7 +498,7 @@ export class SessionManager {
     const uploads = this.uploads.get(id) ?? new Set<Promise<string>>();
     this.uploads.set(id, uploads);
     const operation = (async () => {
-      const directory = join(this.dataDirectory, 'images', id);
+      const directory = resolve(this.imagesDirectory, id);
       await mkdir(directory, { recursive: true, mode: 0o700 });
       const path = join(directory, `${randomUUID()}.${extension}`);
       await writeFile(path, content, { mode: 0o600 });
@@ -507,11 +521,12 @@ export class SessionManager {
     const execution = this.reserveTurn(session);
     try {
       session.settings = normalizeExecutionSettings(session.settings);
-      const imageRoot = resolve(this.dataDirectory, 'images', id) + sep;
+      // Older uploads may still be queued in a browser when storage is moved.
+      const imageRoots = [resolve(this.imagesDirectory, id) + sep, resolve(this.dataDirectory, 'images', id) + sep];
       for (const image of images) {
         let path: string;
         try { path = await realpath(image); } catch { throw new HttpError(400, '图片附件不存在，请重新上传'); }
-        if (!path.startsWith(imageRoot)) throw new HttpError(400, '只能使用此会话上传的图片');
+        if (!imageRoots.some(root => path.startsWith(root))) throw new HttpError(400, '只能使用此会话上传的图片');
       }
       const turn: Turn = { id: randomUUID(), prompt, images, codexAccepted: false, status: 'running', phase: 'starting', items: [], itemTimestamps: {}, startedAt: new Date().toISOString() };
       if (session.settings.executionMode === 'e2b') turn.execution = {
@@ -551,11 +566,30 @@ export class SessionManager {
   }
 
   async stop(id: string) {
-    this.lookup(id);
+    const current = this.lookup(id);
     const execution = this.active.get(id);
     if (execution) {
+      const turn = current.turns.find(turn => turn.id === execution.turnId);
+      if (turn?.execution) {
+        turn.execution.stopRequested = true;
+        await this.save(current);
+      }
       execution.controller.abort();
       await execution.done;
+      return;
+    }
+
+    const pending = current.turns.slice().reverse().find(turn => this.canRecover(current, turn));
+    if (pending?.execution) {
+      const recovery = this.reserveTurn(current);
+      recovery.turnId = pending.id;
+      try {
+        pending.execution.stopRequested = true;
+        await this.save(current);
+        recovery.controller.abort();
+        this.executeTurn(current, pending, recovery, true);
+        await recovery.done;
+      } catch (error) { recovery.finish(); throw error; }
       return;
     }
 

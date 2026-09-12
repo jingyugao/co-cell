@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
+import { runInNewContext } from 'node:vm';
 import type { Session, Turn } from '../../shared/types.js';
 import { E2BCodexRuntime, TurnLaunchCancelled, TurnObserverDetached } from './e2b.js';
 
@@ -15,7 +16,9 @@ function fixture() {
   const envelope = (seq: number, event: Record<string, unknown>) => ({ v: 1 as const, workerId: turn.execution!.workerId, turnId: turn.id, seq, event });
   const state = (lastSeq: number, status: 'running' | 'completed' = 'completed') => ({ protocolVersion: 1 as const,
     workerId: turn.execution!.workerId, sessionId: session.id, turnId: turn.id, pid: 123, status, threadId: null, lastSeq });
-  const entry = { sandbox: { commands: { run: async () => ({}) } }, metadata: session.sandbox, running: 0 } as unknown as Parameters<typeof runtime['observeWorker']>[0];
+  const entry = { sandbox: { commands: { run: async () => ({}) } }, metadata: session.sandbox,
+    preparation: {}, lease: { signal: new AbortController().signal, release: async () => {} },
+  } as unknown as Parameters<typeof runtime['observeWorker']>[0];
   return { runtime, session, turn, entry, envelope, state };
 }
 
@@ -105,9 +108,6 @@ test('detach before run starts never acquires a sandbox or launches a worker', a
 test('detach during preparation cancels only the unlaunched turn', async () => {
   const { runtime, session, turn, entry } = fixture();
   runtime['acquire'] = async () => entry;
-  runtime['renew'] = async () => {};
-  runtime['refreshState'] = async () => ({ state: 'running' }) as never;
-  runtime['idle'] = async () => {};
   let preparing!: () => void;
   const ready = new Promise<void>(resolve => { preparing = resolve; });
   runtime['prepare'] = async (_entry, signal) => {
@@ -147,5 +147,35 @@ test('failed worker state is surfaced without configured secrets', async () => {
   runtime['readWorkerState'] = async () => ({ ...state(0), status: 'failed', error: 'denied secret-api-key' });
   try {
     await assert.rejects(runtime['observeWorker'](entry, session, turn, new AbortController().signal).next(), /denied \[REDACTED\]/);
+  } finally { await runtime.close(); }
+});
+
+test('termination cannot confirm a delayed launch from a missing PID or an unrelated terminal record', async () => {
+  const { runtime, turn, entry } = fixture();
+  let terminalState: Record<string, unknown> | undefined;
+  entry.sandbox.commands.run = (async (command: string) => {
+    const match = / -e '(.*)'$/s.exec(command);
+    assert.ok(match);
+    const script = match[1].replaceAll("'\\''", "'");
+    let stdout = '';
+    await runInNewContext(script, {
+      require: (name: string) => name === 'node:fs' ? {
+        readFileSync: (path: string) => {
+          if (path.endsWith('/state.json') && terminalState) return JSON.stringify(terminalState);
+          throw new Error('ENOENT');
+        },
+      } : { execFileSync: () => assert.fail('no process inspection without a PID') },
+      process: { stdout: { write: (value: string) => { stdout += value; } }, kill: () => assert.fail('no signal without a PID') },
+    });
+    return { stdout, stderr: '', exitCode: 0 };
+  }) as unknown as typeof entry.sandbox.commands.run;
+  try {
+    assert.equal(await runtime['terminateWorker'](entry, turn), false);
+    terminalState = { workerId: turn.execution!.workerId, turnId: turn.id, status: 'running' };
+    assert.equal(await runtime['terminateWorker'](entry, turn), false);
+    terminalState = { ...terminalState, status: 'completed', workerId: randomUUID() };
+    assert.equal(await runtime['terminateWorker'](entry, turn), false);
+    terminalState.workerId = turn.execution!.workerId;
+    assert.equal(await runtime['terminateWorker'](entry, turn), true);
   } finally { await runtime.close(); }
 });

@@ -11,7 +11,9 @@ import type { AppConfig, Settings } from '../shared/types.js';
 import { DEFAULT_MODEL } from '../shared/models.js';
 import { createApp } from './app.js';
 import { SessionManager } from './sessions/manager.js';
-import { E2BCodexRuntime } from './sandboxes/e2b.js';
+import { E2BCodexRuntime } from './execution/e2b-runtime.js';
+import { E2BSandboxManager } from '@swarm-hive/sandbox';
+import { ProjectSandboxes } from './sandboxes/project-sandboxes.js';
 import { E2BSandboxInventory } from './sandboxes/inventory.js';
 import { LocalSandboxArchiveStorage } from './sandboxes/archive-storage.js';
 import { LocalSnapshotArchive } from './sandboxes/local-snapshot-archive.js';
@@ -94,7 +96,11 @@ const archives = localE2b && process.env.E2B_ARCHIVE_ENABLED !== 'false' ? new L
   e2bDirectory: resolve(process.env.E2B_LOCAL_DATA_DIR || resolve(homedir(), '.data/e2b')),
   inspectBinary: resolve(process.env.E2B_INSPECT_BINARY || 'data/tools/inspect-build'),
 }) : undefined;
+// Resource management needs only E2B credentials; Codex configuration is separate.
+const sandboxManager = e2bConnection ? new E2BSandboxManager({ connection: e2bConnection, archives, logger: runtimeLog }) : undefined;
+const projectSandboxes = sandboxManager ? new ProjectSandboxes(sandboxManager, e2bTemplate) : undefined;
 const e2b = e2bEnabled ? new E2BCodexRuntime({
+  sandboxes: projectSandboxes,
   connections,
   archives,
   submitImprovement,
@@ -104,8 +110,9 @@ const e2b = e2bEnabled ? new E2BCodexRuntime({
   baseUrl: process.env.OPENAI_BASE_URL, proxyKind, modelConfig, configOverrides,
 }) : undefined;
 const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || '.codex-web');
+const webImagesDirectory = resolve(process.env.CODEX_WEB_IMAGES_DIR || 'data/images');
 const manager = new SessionManager(codex, webDataDirectory, defaults, e2b, e2bWorkingDirectory, runtimeLog,
-  createWebStateStore(webDataDirectory, process.env.MYSQL_URL));
+  createWebStateStore(webDataDirectory, process.env.MYSQL_URL), webImagesDirectory);
 await manager.init();
 const config: AppConfig = {
   defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
@@ -151,6 +158,7 @@ async function shutdown() {
   server.close();
   await templates.close();
   await manager.close();
+  await sandboxManager?.close();
   improvements.close();
   await runtimeLog.write({ event: 'service.stopped' });
   await runtimeLog.flush();

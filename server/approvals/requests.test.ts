@@ -116,14 +116,15 @@ test('manager binds decisions to session and turn, cancels on stop and persists 
     await assert.rejects(manager.resolveApproval(session.id, turnId, approvalId, { decision: 'approved' }), /失效/);
     const file = join(directory, `${session.id}.json`);
     const persisted = JSON.parse(await readFile(file, 'utf8'));
-    assert.equal(persisted.turns[0].approvals[0].status, 'cancelled');
-    persisted.turns[0].approvals[0].status = 'pending';
+    // Terminal worker records no longer duplicate the native approval history.
+    assert.equal(persisted.turns[0].approvals, undefined);
+    persisted.turns[0].approvals = manager.get(session.id).turns[0].approvals!.map(approval => ({ ...approval, status: 'pending' }));
     await manager.close();
     await writeFile(file, JSON.stringify(persisted));
     const restarted = new SessionManager({} as CodexClient, directory, defaults, runtime);
     await restarted.init();
     assert.equal(restarted.get(session.id).turns[0].approvals![0].status, 'cancelled');
-    assert.equal(JSON.parse(await readFile(file, 'utf8')).turns[0].approvals[0].status, 'cancelled');
+    assert.equal(JSON.parse(await readFile(file, 'utf8')).turns[0].approvals, undefined);
     await restarted.close();
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

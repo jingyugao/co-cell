@@ -54,7 +54,7 @@ export type AgentEvent = ThreadEvent
   | { type: 'runtime.retry'; retry: RetryState | null }
   | { type: 'runtime.context_usage'; contextUsage: ContextUsage };
 export interface Settings {
-  executionMode?: 'local' | 'e2b';
+  executionMode?: 'local' | 'sandbox';
   workingDirectory: string;
   model: string;
   modelReasoningEffort: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'persistent';
@@ -88,9 +88,9 @@ export interface Turn {
   contextUsage?: ContextUsage[];
   retry?: RetryState;
   approvals?: UserApproval[];
-  /** Durable reference to a Codex worker that runs inside an E2B sandbox. */
+  /** Durable reference to a Codex worker that runs inside a Sandbox. */
   execution?: {
-    kind: 'e2b-worker';
+    kind: 'sandbox-worker';
     protocolVersion: 1;
     workerId: string;
     sandboxId?: string;
@@ -101,29 +101,46 @@ export interface Turn {
     state: 'launching' | 'running' | 'detached' | 'terminal';
   };
 }
+export type ProjectStatus = 'active' | 'completed' | 'archived';
+
 export interface Project {
   id: string;
   name: string;
   requirementUrl: string | null;
   /** Current status of the linked Feishu (Meegle) work item, when available. */
   requirementStatus?: string | null;
-  executionMode: 'e2b' | 'local';
+  executionMode: 'sandbox' | 'local';
   workingDirectory: string;
+  /** `archivedAt` is retained for legacy records and archive grouping. */
+  status?: ProjectStatus;
+  completedAt?: string | null;
   sandbox?: SandboxState;
-  sandboxDataArchive?: import('./sandbox-types.js').SandboxDataArchive;
+  /** Timestamp at which project archiving removed the previous sandbox. */
   sandboxReclaimedAt?: string;
-  sandboxUpgrade?: {
-    id: string;
-    kind?: 'upgrade' | 'archive' | 'restore' | 'reclaim';
-    source?: SandboxState;
-    target?: SandboxState;
-    phase: 'archiving' | 'preparing' | 'restoring' | 'verifying' | 'failed';
-    startedAt: string;
-    error?: string;
+  /** Archive containing the workspace and ~/.codex state for rebuilds. */
+  sandboxDataArchive?: {
+    key: string;
+    format: 'codex-workspace-v1';
+    sha256: string;
+    sizeBytes: number;
+    createdAt: string;
+    threadIds: string[];
+    workingDirectory: string;
+    sourceSandboxId: string;
+    sourceProjectId?: string;
+    sourceTemplate?: string;
+    manifestSha256: string;
   };
   archivedAt?: string | null;
+  lifecycleHistory?: ProjectLifecycleRecord[];
   createdAt: string;
   updatedAt: string;
+}
+export interface ProjectLifecycleRecord {
+  id: string;
+  action: 'completed' | 'archived' | 'restored';
+  at: string;
+  sandboxId?: string;
 }
 export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null }
 export interface Session {
@@ -150,14 +167,12 @@ export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };
 export interface SandboxRecord {
   /** Platform-created sandbox without a current binding or in-flight reservation. */
   dangling?: boolean;
-  cleanup?: import('./sandbox-types.js').SandboxCleanupRecord;
   project?: { id: string; name: string; requirementUrl: string | null; sessionCount: number } | null;
   sessions?: Array<{ id: string; title: string; status: SessionStatus }>;
   id: string;
   template: string;
-  state: 'running' | 'paused' | 'unknown' | 'archiving' | 'archived' | 'restoring';
+  state: 'running' | 'paused' | 'unknown';
   pausedAt?: string;
-  archive?: SandboxState['archive'];
   cpuCount: number;
   memoryMB: number;
   startedAt: string;
@@ -172,7 +187,7 @@ export interface SandboxRecord {
     diskTotalBytes: number | null;
   } | null;
   metricsStatus: 'available' | 'paused' | 'unavailable' | 'pending';
-  metricsSource?: 'e2b' | 'envd';
+  metricsSource?: 'docker';
   metricsMessage?: string;
 }
 export interface SandboxInventory {
@@ -182,12 +197,11 @@ export interface SandboxInventory {
 }
 export interface AppConfig {
   localWorkingDirectory?: string;
-  e2b?: {
+  sandbox?: {
     enabled: boolean;
-    template: string;
+    image: string;
     workingDirectory: string;
-    idleReclaimAfterMs?: number;
-    oldSandboxRetentionMs?: number;
+    archivedReclaimAfterMs?: number;
   };
   defaults: Settings;
   codexVersion: string;
@@ -214,7 +228,7 @@ export interface RawToolMessage {
   payload: RawToolPayload;
 }
 export interface RawToolPage {
-  location?: 'local' | 'e2b';
+  location?: 'local' | 'sandbox';
   sandboxId?: string;
   source: 'codex-rollout';
   threadId: string | null;

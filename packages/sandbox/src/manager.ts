@@ -1,8 +1,7 @@
-import { Sandbox, type SandboxInfo } from 'e2b';
 import { SandboxBusyError, SandboxManagerError, SandboxPersistenceError } from './errors.js';
 import type {
   AcquireSandboxOptions,
-  E2BSandboxManagerOptions,
+  SandboxManagerOptions,
   PersistSandboxRecord,
   SandboxLease,
   SandboxObservation,
@@ -11,13 +10,14 @@ import type {
   SandboxProvider,
   SandboxRecord,
   SandboxStatus,
+  SandboxInfo,
+  SandboxHandle,
 } from './types.js';
 
 export const DEFAULT_SANDBOX_POLICY: Readonly<SandboxPolicy> = Object.freeze({
   timeoutMs: 3 * 60 * 60 * 1000,
   renewalIntervalMs: 60 * 1000,
   scanIntervalMs: 60 * 1000,
-  archiveAfterMs: 7 * 24 * 60 * 60 * 1000,
 });
 
 type Usage = { references: number; detached: boolean; purpose?: string };
@@ -26,7 +26,7 @@ type Entry = {
   record: SandboxRecord;
   persist: PersistSandboxRecord;
   persistencePending: boolean;
-  sandbox?: Sandbox;
+  sandbox?: SandboxHandle;
   usages: Map<string, Usage>;
   invalidation: AbortController;
   lastRenewedAt: number;
@@ -34,17 +34,8 @@ type Entry = {
   leaseLimitReported: boolean;
 };
 
-const provider: SandboxProvider = {
-  create: (template, options) => Sandbox.create(template, options),
-  connect: (sandboxId, options) => Sandbox.connect(sandboxId, options),
-  getInfo: (sandboxId, options) => Sandbox.getInfo(sandboxId, options),
-  pause: (sandboxId, options) => Sandbox.pause(sandboxId, options),
-  kill: (sandboxId, options) => Sandbox.kill(sandboxId, options),
-};
-
 const cloneRecord = (record: SandboxRecord): SandboxRecord => ({
   ...record,
-  ...(record.archive ? { archive: { ...record.archive } } : {}),
   ...(record.error ? { error: { ...record.error } } : {}),
 });
 
@@ -57,13 +48,13 @@ const assertUsageId = (usageId: string) => {
 };
 
 /**
- * Process-local lifecycle coordinator for E2B sandboxes.
+ * Process-local lifecycle coordinator for provider-backed sandboxes.
  *
  * The caller owns resource identity and persistence. A single manager must be
  * the writer for a resource; cross-process fencing is intentionally outside
  * this package.
  */
-export class E2BSandboxManager {
+export class SandboxManager {
   private readonly entries = new Map<string, Entry>();
   private readonly locks = new Map<string, Promise<void>>();
   private readonly policy: SandboxPolicy;
@@ -72,14 +63,14 @@ export class E2BSandboxManager {
   private sweeping?: Promise<void>;
   private closed = false;
 
-  constructor(private readonly options: E2BSandboxManagerOptions) {
+  constructor(private readonly options: SandboxManagerOptions) {
     this.policy = { ...DEFAULT_SANDBOX_POLICY, ...options.policy };
     for (const [name, value] of Object.entries(this.policy)) {
       if (!Number.isFinite(value) || value <= 0) {
         throw new SandboxManagerError('invalid', `Sandbox policy ${name} must be positive`);
       }
     }
-    this.provider = options.provider ?? provider;
+    this.provider = options.provider;
     this.timer = setInterval(() => { void this.sweep(); }, this.policy.scanIntervalMs);
     this.timer.unref();
   }
@@ -114,7 +105,7 @@ export class E2BSandboxManager {
     if (entry.record.status === 'deleted') {
       throw new SandboxManagerError('not_accessible', `Sandbox resource ${resourceKey} was deleted`);
     }
-    if (entry.record.operation && ['pausing', 'archiving', 'deleting'].includes(entry.record.operation)) {
+    if (entry.record.operation && ['pausing', 'deleting'].includes(entry.record.operation)) {
       throw new SandboxManagerError('busy', `Sandbox resource ${resourceKey} is being ${entry.record.operation}`);
     }
     const usage = entry.usages.get(usageId);
@@ -326,13 +317,9 @@ export class E2BSandboxManager {
       if (entry.record.status === 'deleted') return this.observation(entry);
       let info: SandboxInfo;
       try {
-        info = await this.provider.getInfo(entry.record.id, this.options.connection);
+        info = await this.provider.getInfo(entry.record.id);
       } catch (error) {
         if (this.notFound(error)) {
-          if (entry.record.status === 'archived' && entry.record.archive) {
-            this.log({ event: 'sandbox.archived_inspect_unavailable', sandboxId: entry.record.id, message: this.safeMessage(error) });
-            return this.observation(entry);
-          }
           await this.change(resourceKey, entry, {
             status: 'unavailable', operation: undefined,
             error: this.errorRecord('not_accessible', error),
@@ -358,10 +345,10 @@ export class E2BSandboxManager {
       if (entry.record.status === 'deleted') {
         throw new SandboxManagerError('not_accessible', `Sandbox resource ${resourceKey} was deleted`);
       }
-      if (entry.record.status === 'archived' || entry.record.status === 'paused') return cloneRecord(entry.record);
+      if (entry.record.status === 'paused') return cloneRecord(entry.record);
       await this.change(resourceKey, entry, { operation: 'pausing' });
       try {
-        await this.provider.pause(entry.record.id, this.options.connection);
+        await this.provider.pause(entry.record.id);
         entry.sandbox = undefined;
         await this.change(resourceKey, entry, {
           status: 'paused', operation: undefined, pausedAt: new Date().toISOString(), error: undefined,
@@ -384,7 +371,7 @@ export class E2BSandboxManager {
       if (entry.record.status === 'deleted') return;
       await this.change(resourceKey, entry, { operation: 'deleting' });
       try {
-        await this.provider.kill(entry.record.id, this.options.connection);
+        await this.provider.kill(entry.record.id);
       } catch (error) {
         if (!this.notFound(error)) {
           await this.recordFailure(resourceKey, entry, 'unavailable', error);
@@ -420,11 +407,10 @@ export class E2BSandboxManager {
     create: NonNullable<AcquireSandboxOptions['create']>,
     persist: PersistSandboxRecord,
   ): Promise<Entry> {
-    if (!create.template.trim()) throw new SandboxManagerError('invalid', 'Sandbox template is required');
-    let sandbox: Sandbox;
+    if (!create.template.trim()) throw new SandboxManagerError('invalid', 'Sandbox image is required');
+    let sandbox: SandboxHandle;
     try {
       sandbox = await this.provider.create(create.template, {
-        ...this.options.connection,
         timeoutMs: this.policy.timeoutMs,
         lifecycle: { onTimeout: 'pause', autoResume: false },
         metadata: create.metadata,
@@ -447,13 +433,10 @@ export class E2BSandboxManager {
     return entry;
   }
 
-  private async connect(resourceKey: string, entry: Entry): Promise<Sandbox> {
-    if (entry.record.status === 'archived' || entry.record.status === 'restoring') {
-      await this.restore(resourceKey, entry);
-    }
+  private async connect(resourceKey: string, entry: Entry): Promise<SandboxHandle> {
     let info: SandboxInfo;
     try {
-      info = await this.provider.getInfo(entry.record.id, this.options.connection);
+      info = await this.provider.getInfo(entry.record.id);
     } catch (error) {
       if (this.notFound(error)) {
         await this.recordFailure(resourceKey, entry, 'not_accessible', error);
@@ -480,7 +463,6 @@ export class E2BSandboxManager {
     await this.change(resourceKey, entry, { operation });
     try {
       const sandbox = await this.provider.connect(entry.record.id, {
-        ...this.options.connection,
         timeoutMs: this.policy.timeoutMs,
       });
       entry.sandbox = sandbox;
@@ -494,29 +476,6 @@ export class E2BSandboxManager {
       const code = this.notFound(error) ? 'not_accessible' : 'unavailable';
       const detail = this.safeMessage(error);
       throw new SandboxManagerError(code, `Sandbox ${entry.record.id} connection failed: ${detail}`, { cause: new Error(detail) });
-    }
-  }
-
-  private async restore(resourceKey: string, entry: Entry): Promise<void> {
-    const archive = entry.record.archive;
-    if (!archive || !this.options.archives) {
-      throw new SandboxManagerError('archive_restore_failed', `Sandbox ${entry.record.id} archive cannot be restored`);
-    }
-    await this.change(resourceKey, entry, { status: 'restoring', operation: 'restoring' });
-    try {
-      await this.options.archives.restore(entry.record.id, archive);
-      await this.change(resourceKey, entry, {
-        status: 'paused', operation: undefined,
-        pausedAt: entry.record.pausedAt ?? new Date().toISOString(), error: undefined,
-      });
-      this.log({ event: 'sandbox.archive_restored', sandboxId: entry.record.id, archiveKey: archive.key });
-    } catch (error) {
-      await this.change(resourceKey, entry, {
-        status: 'archived', operation: undefined,
-        error: this.errorRecord('archive_restore_failed', error),
-      });
-      const detail = this.safeMessage(error);
-      throw new SandboxManagerError('archive_restore_failed', `Sandbox ${entry.record.id} archive restoration failed: ${detail}`, { cause: new Error(detail) });
     }
   }
 
@@ -546,7 +505,7 @@ export class E2BSandboxManager {
     if (entry.renewing) return entry.renewing;
     entry.renewing = (async () => {
       await entry.sandbox!.setTimeout(this.policy.timeoutMs);
-      const info = await this.provider.getInfo(entry.record.id, this.options.connection);
+      const info = await this.provider.getInfo(entry.record.id);
       if (info.state === 'paused') {
         await this.applyObservation(resourceKey, entry, info);
         throw new SandboxManagerError('unavailable', `Sandbox ${entry.record.id} paused during renewal`);
@@ -581,14 +540,9 @@ export class E2BSandboxManager {
               }
               return;
             }
-            if (entry.record.status === 'restoring' && entry.record.archive) {
-              await this.change(resourceKey, entry, { status: 'archived', operation: undefined });
-              return;
-            }
-            if (entry.record.status === 'archived') return;
             let info: SandboxInfo;
             try {
-              info = await this.provider.getInfo(entry.record.id, this.options.connection);
+              info = await this.provider.getInfo(entry.record.id);
             } catch (error) {
               if (this.notFound(error)) {
                 await this.change(resourceKey, entry, {
@@ -599,10 +553,6 @@ export class E2BSandboxManager {
               throw error;
             }
             await this.applyObservation(resourceKey, entry, info);
-            if (info.state !== 'paused' || !this.options.archives) return;
-            const pausedAt = Date.parse(entry.record.pausedAt ?? '');
-            if (!Number.isFinite(pausedAt) || Date.now() - pausedAt <= this.policy.archiveAfterMs) return;
-            await this.archive(resourceKey, entry);
           });
         } catch (error) {
           this.log({ event: 'sandbox.lifecycle_error', resourceKey, message: this.safeMessage(error) });
@@ -612,31 +562,7 @@ export class E2BSandboxManager {
     return this.sweeping;
   }
 
-  private async archive(resourceKey: string, entry: Entry): Promise<void> {
-    this.assertIdle(resourceKey, entry);
-    const previous = cloneRecord(entry.record);
-    await this.change(resourceKey, entry, { status: 'archiving', operation: 'archiving' });
-    try {
-      const archive = await this.options.archives!.archive(entry.record.id);
-      const info = await this.provider.getInfo(entry.record.id, this.options.connection);
-      if (info.state !== 'paused') throw new Error('Sandbox resumed while it was being archived');
-      await this.change(resourceKey, entry, {
-        status: 'archived', operation: undefined, archive, error: undefined,
-      });
-      this.log({ event: 'sandbox.archived', sandboxId: entry.record.id, archiveKey: archive.key, sizeBytes: archive.sizeBytes });
-    } catch (error) {
-      entry.record = {
-        ...previous, status: 'paused', operation: undefined,
-        error: this.errorRecord('unavailable', error),
-      };
-      entry.persistencePending = true;
-      await this.persist(resourceKey, entry);
-      throw error;
-    }
-  }
-
   private async applyObservation(resourceKey: string, entry: Entry, info: SandboxInfo): Promise<void> {
-    if (entry.record.status === 'archived' || entry.record.status === 'restoring') return;
     const status: SandboxStatus = info.state === 'paused' ? 'paused' : 'ready';
     const pausedAt = status === 'paused' ? entry.record.pausedAt ?? new Date().toISOString() : undefined;
     if (entry.record.status !== status || entry.record.pausedAt !== pausedAt || entry.record.operation) {
@@ -735,7 +661,7 @@ export class E2BSandboxManager {
 
   private validateRecord(record: SandboxRecord): void {
     if (!record.id?.trim() || !record.template?.trim()) {
-      throw new SandboxManagerError('invalid', 'Sandbox record ID and template are required');
+      throw new SandboxManagerError('invalid', 'Sandbox record ID and image are required');
     }
   }
 
@@ -745,8 +671,6 @@ export class E2BSandboxManager {
 
   private safeMessage(error: unknown): string {
     let message = error instanceof Error ? error.message : String(error);
-    const secret = this.options.connection.apiKey;
-    if (secret) message = message.replaceAll(secret, '[REDACTED]');
     return message;
   }
 

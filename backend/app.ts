@@ -7,19 +7,17 @@ import type { AppConfig } from '../protocol/types.js';
 import { SessionManager } from './sessions/manager.js';
 import { HttpError } from '../util/errors.js';
 import { RawToolReader } from './execution/raw-tools.js';
-import { E2BSandboxInventory, type SandboxInventoryReader } from './sandboxes/inventory.js';
+import type { SandboxInventoryReader } from './sandboxes/inventory.js';
 import { SharedFiles } from './shared-files/service.js';
-import { type TemplateManager } from './templates/manager.js';
 import type { ConnectionStore } from './connections/store.js';
 
 import { installProjectsRoutes } from './projects/routes.js';
 import { installConnectionsRoutes } from './connections/routes.js';
-import { installTemplatesRoutes } from './templates/routes.js';
 import { installSharedFilesRoutes } from './shared-files/routes.js';
 import { installSandboxesRoutes } from './sandboxes/routes.js';
 import { installSessionsRoutes } from './sessions/routes.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], rawTools = new RawToolReader(), sandboxes: SandboxInventoryReader = new E2BSandboxInventory(), sharedFiles = new SharedFiles(), templates?: TemplateManager, connections?: ConnectionStore, improvements?: ImprovementStore) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], rawTools: RawToolReader = new RawToolReader(), sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, improvements?: ImprovementStore) {
   const app = new Hono();
   app.use('/api/*', async (c, next) => {
     const host = c.req.header('host');
@@ -46,7 +44,6 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   installProjectsRoutes(app, manager);
   installSessionsRoutes(app, manager, config, rawTools);
   installSandboxesRoutes(app, sandboxes, manager);
-  installTemplatesRoutes(app, templates);
   installConnectionsRoutes(app, connections);
   installSharedFilesRoutes(app, sharedFiles);
   app.all('/api/*', c => c.json({ error: '接口不存在' }, 404));

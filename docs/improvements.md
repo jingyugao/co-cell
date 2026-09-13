@@ -1,6 +1,6 @@
 # Agent 改进建议
 
-E2B 项目中的 Codex 可以调用 `submit_improvement_proposal`，将实际工作中发现的改进机会提交给人工查看。分类是自由文本，不设枚举。页面位于 `/#improvements`，支持搜索、分类/项目筛选、分页、展开详情和跳转来源会话。
+Sandbox 项目中的 Codex 可以调用 `submit_improvement_proposal`，将实际工作中发现的改进机会提交给人工查看。分类是自由文本，不设枚举。页面位于 `/#improvements`，支持搜索、分类/项目筛选、分页、展开详情和跳转来源会话。
 
 `submit_optimization` 专门用于知识库和沙箱环境，复用同一参数结构、数据库与查看页面。知识库重点是代码仓库介绍（服务职责、业务边界、跨仓库关系）和业务模块介绍（模块用途、关键流程、业务规则、上下游依赖）；建议需包含事实依据、目标文档位置和可直接收录的正文，避免只罗列入口、版本或简单命令。沙箱建议需来自实际环境阻碍，说明适合平台统一解决的原因、变更及验证方法。分类仍为自由文本，可使用“知识库/代码仓库介绍”“知识库/业务模块介绍”“沙箱环境”。
 
@@ -28,7 +28,7 @@ E2B 项目中的 Codex 可以调用 `submit_improvement_proposal`，将实际工
 
 Web 服务使用 Node.js 内置 SQLite，将建议保存到 `data/improvements.sqlite`。可用 `IMPROVEMENTS_DB_PATH` 指定持久化文件；宿主机需要 Node.js 22.18+。数据库开启 WAL，使用参数化 SQL。运行时数据库及其 WAL 文件在 data 目录中，不提交 Git；在线备份应使用 SQLite 备份机制，或停止服务后再复制完整数据库文件。
 
-传输流程：沙箱内 stdio MCP → 同轮 worker 的 loopback bridge → 现有 E2B 命令事件流 → 宿主机写数据库 → 沙箱中的单轮回执文件 → MCP 成功结果。沙箱无需访问宿主机 HTTP 地址，也不会得到数据库连接或写入身份权限。
+传输流程：沙箱内 stdio MCP → 同轮 worker 的 loopback bridge → 现有 Sandbox 命令事件流 → 宿主机写数据库 → 沙箱中的单轮回执文件 → MCP 成功结果。沙箱无需访问宿主机 HTTP 地址，也不会得到数据库连接或写入身份权限。
 
 每轮 bridge 使用独立 token 和随机回执目录。宿主机校验请求 ID，回执位置和来源身份由宿主机确定；写入完成才返回成功，失败、取消或超时会返回未确认提示。执行结束前等待已接收请求处理完成，再清理回执目录。
 
@@ -40,7 +40,7 @@ Web 服务使用 Node.js 内置 SQLite，将建议保存到 `data/improvements.s
 - `backend/improvements/routes.ts`：`GET /api/improvements` 和 `GET /api/improvements/:id`，沿用 Web 服务的本机访问限制。
 - `backend/execution/worker/improvement-mcp.mjs`：工具定义与 stdio MCP 协议。
 - `backend/execution/worker/improvement-bridge.mjs`：单轮桥接与等待回执。
-- `backend/sandboxes/e2b.ts`：同步工具脚本、消费建议事件、返回数据库回执。
+- `backend/sandboxes/sandbox.ts`：同步工具脚本、消费建议事件、返回数据库回执。
 - `fe/features/improvements/`：人工查看页面。
 
 列表支持 `q`、`category`、`projectId`、`limit`（默认 30，最多 100）及 `offset`。建议状态初始为 `pending`，页面显示“待处理”。列表另支持 `status` 筛选（不传时返回全部）；页面默认只看待处理，可切换全部状态。来源名称保存提交时的快照。

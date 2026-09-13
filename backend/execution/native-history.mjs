@@ -214,7 +214,7 @@ export async function readNativeHistory(threadId, codexHome = process.env.CODEX_
       const expected = join(home, name);
       if (await realpath(root) !== expected) continue;
       // Codex stores rollout files under YYYY/MM/DD. Supplying the turn date
-      // avoids recursively statting an ever-growing history tree on E2B.
+      // avoids recursively statting an ever-growing history tree in a Sandbox.
       const path = date ? await visit(join(root, ...date), 0) : await visit(root, 4);
       if (!path) continue;
       return await read(path);

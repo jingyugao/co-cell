@@ -88,7 +88,7 @@ try {
     ...(settings.model ? { model: settings.model } : {}),
     modelReasoningEffort: settings.modelReasoningEffort,
     // Explicit App Server sandbox policy overrides persisted thread settings;
-    // E2B itself is the isolation boundary, including for user-level caches.
+    // The container is the execution boundary, including for user-level caches.
     sandboxMode: 'danger-full-access',
     webSearchMode: settings.webSearchMode,
     networkAccessEnabled: true,

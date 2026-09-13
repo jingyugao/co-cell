@@ -1,4 +1,12 @@
 services:
+  sandbox-image:
+    build:
+      context: .
+      dockerfile: docker/sandbox/Dockerfile
+    image: ${DOCKER_SANDBOX_IMAGE:-swarm-hive-sandbox:latest}
+    command: ["true"]
+    restart: "no"
+
   mysql:
     image: mysql:8.4
     restart: unless-stopped
@@ -21,6 +29,11 @@ services:
 
   swarm-hive:
     build: .
+    depends_on:
+      sandbox-image:
+        condition: service_completed_successfully
+      mysql:
+        condition: service_healthy
     restart: unless-stopped
     hostname: ${MEEGLE_AUTH_HOSTNAME:-swarm-hive}
     env_file:
@@ -31,13 +44,16 @@ services:
       HOST: 0.0.0.0
       MEEGLE_HOST: project.feishu.cn
       USER: ${MEEGLE_AUTH_USER:-root}
-      E2B_API_KEY_FILE: /run/secrets/e2b_api_key
       MYSQL_URL: mysql://${MYSQL_USER:-swarm_hive}:${MYSQL_PASSWORD:-change-me-before-production}@mysql:3306/${MYSQL_DATABASE:-swarm_hive}
+      DOCKER_SANDBOX_IMAGE: ${DOCKER_SANDBOX_IMAGE:-swarm-hive-sandbox:latest}
+      SANDBOX_WORKSPACE: ${SANDBOX_WORKSPACE:-/home/user/workspace}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data
-      - ${E2B_API_KEY_FILE:-/home/example/.data/e2b/config/api-key}:/run/secrets/e2b_api_key:ro
+      # Docker sandbox mode intentionally has host-level Docker authority.
+      # It is for trusted local deployments only.
+      - /var/run/docker.sock:/var/run/docker.sock
       - ${MEEGLE_HOME:-/home/example/.meegle}:/root/.meegle
     ports:
       - "3001:3001"

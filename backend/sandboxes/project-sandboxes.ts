@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { E2BSandboxManager, SandboxLease, SandboxRecord } from '@swarm-hive/sandbox';
+import type { SandboxManager, SandboxLease, SandboxRecord } from '@swarm-hive/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
 
@@ -12,14 +12,11 @@ type Binding = {
 
 const resourceKey = (target: WorkspaceTarget) => target.projectId ? `project:${target.projectId}` : `session:${target.id}`;
 
-/** Adapts legacy project-owned records without exposing projects to the sandbox package. */
+/** Adapts project-owned records without exposing projects to the sandbox package. */
 export class ProjectSandboxes {
   private bindings = new Map<string, Binding>();
 
-  constructor(readonly manager: E2BSandboxManager, private template: string) {}
-
-  setDefaultTemplate(template: string) { this.template = template; }
-  getDefaultTemplate() { return this.template; }
+  constructor(readonly manager: SandboxManager, private template: string) {}
 
   async replace(target: WorkspaceTarget, replacement: SandboxState) {
     const binding = this.track(target);
@@ -46,7 +43,6 @@ export class ProjectSandboxes {
       status: record.status === 'deleted' ? 'unavailable' : record.status,
       ...(record.lastActiveAt ? { lastActiveAt: record.lastActiveAt } : {}),
       ...(record.pausedAt ? { pausedAt: record.pausedAt } : {}),
-      ...(record.archive ? { archive: structuredClone(record.archive) } : {}),
     };
   }
 
@@ -102,7 +98,10 @@ export class ProjectSandboxes {
       persist: binding.persist,
       ...(options.create ? { create: {
         template: this.template,
-        metadata: { app: 'codex-web', sessionId: target.id, ...(target.projectId ? { projectId: target.projectId } : {}) },
+        metadata: {
+          app: 'codex-web', sessionId: target.id, workingDirectory: target.settings.workingDirectory,
+          ...(target.projectId ? { projectId: target.projectId } : {}),
+        },
       } } : {}),
     });
     target.sandbox = this.project(lease.record, binding.workingDirectory);
@@ -121,8 +120,11 @@ export class ProjectSandboxes {
 
   async delete(target: WorkspaceTarget) {
     this.track(target);
-    if (!this.manager.peek(resourceKey(target))) return;
+    const record = this.manager.peek(resourceKey(target));
+    if (!record) return;
     await this.manager.destroy(resourceKey(target));
+    await this.manager.untrack(resourceKey(target), record.id);
+    this.bindings.delete(resourceKey(target));
   }
 
   async close() { await this.manager.close(); }

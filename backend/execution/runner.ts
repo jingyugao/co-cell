@@ -2,7 +2,7 @@ import type { Codex, Input, Thread, ThreadOptions } from '../../packages/agentco
 import type { AgentEvent, Session, StreamMessage, Turn } from '../../protocol/types.js';
 import { applyTurnEvent } from '../../util/session-events.js';
 import { HttpError } from '../../util/errors.js';
-import { TurnLaunchCancelled, TurnObserverDetached, TurnTerminationUnconfirmed, type E2BRuntime } from './e2b-runtime.js';
+import { TurnLaunchCancelled, TurnObserverDetached, TurnTerminationUnconfirmed, type SandboxRuntime } from './container-runtime.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 import type { RequestUserApproval } from '../../protocol/approval-types.js';
 
@@ -10,7 +10,7 @@ export type CodexClient = Pick<Codex, 'startThread' | 'resumeThread'>;
 
 type TurnExecutionDependencies = {
   client: CodexClient;
-  e2b?: E2BRuntime;
+  sandbox?: SandboxRuntime;
   logger?: RuntimeLog;
   save(): Promise<void>;
   publish(message: StreamMessage): void;
@@ -24,7 +24,7 @@ type TurnExecutionDependencies = {
 
 /** Runs one turn and persists each event before publishing it to subscribers. */
 export async function runTurn(session: Session, turn: Turn, controller: AbortController, dependencies: TurnExecutionDependencies) {
-  const { client, e2b, logger, save, publish, snapshot, updateSandbox } = dependencies;
+  const { client, sandbox, logger, save, publish, snapshot, updateSandbox } = dependencies;
   let terminalFailure: string | undefined;
   let detached = false;
   const started = Date.now();
@@ -38,9 +38,9 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
     const { model, executionMode, ...settings } = session.settings;
     const options: ThreadOptions = { ...settings, ...(model ? { model } : {}), approvalPolicy: 'never', skipGitRepoCheck: true };
     let events: AsyncGenerator<AgentEvent>;
-    if (executionMode === 'e2b') {
-      if (!e2b) throw new HttpError(503, 'E2B 未配置，无法运行此沙箱会话');
-      const observe = dependencies.recovering ? e2b.recover.bind(e2b) : e2b.run.bind(e2b);
+    if (executionMode === 'sandbox') {
+      if (!sandbox) throw new HttpError(503, 'Sandbox 未配置，无法运行此沙箱会话');
+      const observe = dependencies.recovering ? sandbox.recover.bind(sandbox) : sandbox.run.bind(sandbox);
       events = observe(session, turn, controller.signal, sandbox => updateSandbox(sandbox), dependencies.requestApproval, save);
     } else {
       const thread: Thread = session.threadId ? client.resumeThread(session.threadId, options) : client.startThread(options);

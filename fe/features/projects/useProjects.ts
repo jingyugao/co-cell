@@ -1,9 +1,9 @@
 import { useCallback, useState } from 'react';
-import type { ProjectSummary } from '../../../protocol/types';
+import type { ProjectStatus, ProjectSummary } from '../../../protocol/types';
 import { api } from '../../lib/api';
 
 export type ProjectValues = { name: string; requirementUrl: string | null };
-export type ProjectUpdate = Partial<ProjectValues> & { archived?: boolean };
+export type ProjectUpdate = Partial<ProjectValues> & { status?: ProjectStatus };
 
 export function useProjects() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -23,15 +23,9 @@ export function useProjects() {
   const updateProject = useCallback(async (id: string, values: ProjectUpdate) => storeProject(
     await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(values) }),
   ), [storeProject]);
-  const upgradeSandbox = useCallback(async (id: string) => storeProject(
-    await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/upgrade`, { method: 'POST' }),
-  ), [storeProject]);
-  const archiveSandbox = useCallback(async (id: string) => storeProject(
-    await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/archive`, { method: 'POST' }),
-  ), [storeProject]);
-  const restoreSandbox = useCallback(async (id: string) => storeProject(
-    await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/restore`, { method: 'POST' }),
+  const rebuildSandbox = useCallback(async (id: string) => storeProject(
+    await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST' }),
   ), [storeProject]);
 
-  return { projects, refreshProjects, createProject, updateProject, upgradeSandbox, archiveSandbox, restoreSandbox };
+  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox };
 }

@@ -74,6 +74,6 @@ async function main() {
     console.log(`Authenticated model inventory: ${result.data.map(model => model.id).join(', ')}. Upstream generation still needs verification.`);
     return;
   }
-  console.log('Usage: node scripts/litellm/manage.mjs init [E2B_BASE_URL] | up | down | status | check | activate\nLITELLM_LISTEN controls the bind address at init; default 127.0.0.1. Credentials are generated under data/litellm.');
+  console.log('Usage: node scripts/litellm/manage.mjs init [Sandbox_BASE_URL] | up | down | status | check | activate\nLITELLM_LISTEN controls the bind address at init; default 127.0.0.1. Credentials are generated under data/litellm.');
 }
 main().catch(error => { console.error(error.code === 'EEXIST' ? 'Already initialized; existing configuration preserved.' : error.message); process.exitCode = 1; });

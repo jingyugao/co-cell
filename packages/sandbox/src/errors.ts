@@ -6,7 +6,6 @@ export type SandboxErrorCode =
   | 'not_tracked'
   | 'not_accessible'
   | 'unavailable'
-  | 'archive_restore_failed'
   | 'persistence_failed';
 
 export class SandboxManagerError extends Error {

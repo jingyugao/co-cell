@@ -1,11 +1,9 @@
-import type { SandboxState, SandboxDataArchive } from '../../protocol/sandbox-types.js';
+import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget, ThreadWorkspace } from '../sandboxes/types.js';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { basename, extname, join, posix } from 'node:path';
-import { tmpdir } from 'node:os';
-import type { Sandbox, CommandHandle, ConnectionOpts } from 'e2b';
-import { E2BSandboxManager, type SandboxLease, type SandboxRecord, type SandboxSnapshotArchive } from '@swarm-hive/sandbox';
+import { readFile } from 'node:fs/promises';
+import { basename, extname, posix } from 'node:path';
+import type { SandboxCommandHandle, SandboxHandle, SandboxProvider, SandboxLease, SandboxRecord } from '@swarm-hive/sandbox';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import type { AgentEvent, ContextUsage } from '../../protocol/types.js';
 import type { RequestUserApproval } from '../../protocol/approval-types.js';
@@ -19,12 +17,8 @@ import type { ImprovementContext, ImprovementReceipt } from '../../protocol/impr
 import { HttpError } from '../../util/errors.js';
 import type { ModelProxyKind } from './model-proxy.js';
 import { parseWorkspaceFile, READ_SANDBOX_FILE_SCRIPT, workspaceFileRequest, type WorkspaceFileResult, type WorkspaceFileReadOptions } from '../workspaces/files.js';
-import { archiveSandbox, restoreSandbox, deleteDanglingSandbox, pauseDanglingSandbox, type SandboxRestoreOptions } from './sandbox-upgrade.js';
-import { LocalSandboxArchiveStorage, type SandboxArchiveStorage } from '../sandboxes/archive-storage.js';
 
-export type { SandboxSnapshotArchive } from '@swarm-hive/sandbox';
-
-export interface E2BRuntime {
+export interface SandboxRuntime {
   track?(session: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): void;
   trackExecution?(session: Session, turn: Turn): void;
   run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent>;
@@ -36,28 +30,24 @@ export interface E2BRuntime {
   rawTools(session: ThreadWorkspace, cursor?: number): Promise<RawToolPage>;
   history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<NativeHistory>;
   delete(session: WorkspaceTarget): Promise<void>;
-  archiveSandbox?(target: WorkspaceTarget, threadIds: string[], onSandbox: SaveSandbox): Promise<SandboxDataArchive>;
-  restoreSandbox?(target: WorkspaceTarget, archive: SandboxDataArchive, options: SandboxRestoreOptions): Promise<void>;
+  rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
+  restoreArchive?(target: WorkspaceTarget, archivePath: string): Promise<void>;
+  createArchive?(target: WorkspaceTarget, archivePath: string): Promise<{ sizeBytes: number; sha256: string }>;
   detachSandbox?(target: WorkspaceTarget): Promise<void>;
-  verifyDataArchive?(archive: SandboxDataArchive): Promise<void>;
-  deleteDataArchive?(archive: SandboxDataArchive): Promise<void>;
-  pauseDanglingSandbox?(sandboxId: string, provenance?: SandboxDataArchive): Promise<void>;
-  deleteDanglingSandbox?(sandboxId: string, provenance?: SandboxDataArchive): Promise<void>;
+  pauseDanglingSandbox?(sandboxId: string): Promise<void>;
+  deleteDanglingSandbox?(sandboxId: string): Promise<void>;
   close(): Promise<void>;
 }
-export interface E2BCodexOptions {
-  connection: ConnectionOpts;
-  sandboxes?: ProjectSandboxes;
-  template: string;
-  archives?: SandboxSnapshotArchive;
-  dataArchives?: SandboxArchiveStorage;
+export interface ContainerRuntimeOptions {
+  sandboxes: ProjectSandboxes;
+  provider: SandboxProvider;
+  connections?: ConnectionStore;
   apiKey: string;
   baseUrl?: string;
   proxyKind?: ModelProxyKind;
   modelConfig?: Record<string, unknown>;
   configOverrides?: string[];
   sharedDataDirectory?: URL;
-  connections?: ConnectionStore;
   logger?: RuntimeLog;
   submitImprovement?: (context: Omit<ImprovementContext, 'projectName'>, input: unknown, requestId: string) => Promise<ImprovementReceipt>;
 }
@@ -67,7 +57,7 @@ type Preparation = {
   initialized?: boolean;
 };
 type Entry = {
-  sandbox: Sandbox;
+  sandbox: SandboxHandle;
   readonly metadata: SandboxRecord;
   lease: SandboxLease;
   preparation: Preparation;
@@ -100,12 +90,12 @@ const SHARED_DATA = new URL('../../data/', import.meta.url);
 const SHARED_DOCS = `${CODEX_HOME}/docs`;
 const SANDBOX_PERSISTENCE_GUIDANCE = `# Sandbox persistence
 
-The platform may replace or reclaim this project's sandbox. It persists the project workspace and Codex conversation context, then restores them into a new sandbox.
+The project Sandbox is a disposable Docker container. Rebuilding or reclaiming it creates a new empty container; files and Codex conversation context are not restored automatically.
 
 - Keep durable code, files, and business data inside the project workspace.
 - Operating-system packages, global installations, running processes, terminals, and port services are not preserved.
 - Declare dependencies in manifests and lockfiles, and keep repeatable setup and startup scripts in the workspace so the environment can be rebuilt.
-- Platform-managed credentials, shared rules, and shared documents are synchronized again after restoration; do not copy secrets into the repository.`;
+- Platform-managed credentials, shared rules, and shared documents are synchronized when a worker starts; do not copy secrets into the repository.`;
 // Keep control processes independent of a project's Node selection. Legacy base
 // sandboxes retain their existing interpreter until moved to the dev template.
 const NODE = '"$(if test -x /opt/codex-runtime/bin/node; then echo /opt/codex-runtime/bin/node; else command -v node; fi)"';
@@ -114,21 +104,16 @@ const checkAbort = (signal: AbortSignal) => { if (signal.aborted) throw new DOME
 const transportFailure = (error: unknown) => /timeout|timed out|network|fetch failed|ECONN|EAI_AGAIN|ENOTFOUND|socket|5\d\d|429|unavailable|transport/i.test(String(error));
 
 /** Prepares and observes Codex workers using independently managed sandbox leases. */
-export class E2BCodexRuntime implements E2BRuntime {
+export class ContainerCodexRuntime implements SandboxRuntime {
   private closing = false;
   private runtimePreparations = new Map<string, Preparation>();
   private observers = new Map<string, AbortController>();
   private detachRequests = new Set<string>();
   private preparations = new Map<string, AbortController>();
   private readonly sandboxes: ProjectSandboxes;
-  private readonly dataArchives: SandboxArchiveStorage;
-  private upgrading = new Set<string>();
 
-  constructor(private options: E2BCodexOptions) {
-    this.dataArchives = options.dataArchives ?? new LocalSandboxArchiveStorage(new URL('../../data/sandbox-data-archives/', import.meta.url));
-    this.sandboxes = options.sandboxes ?? new ProjectSandboxes(new E2BSandboxManager({
-      connection: options.connection, archives: options.archives, logger: options.logger,
-    }), options.template);
+  constructor(private options: ContainerRuntimeOptions) {
+    this.sandboxes = options.sandboxes;
   }
 
   track(target: WorkspaceTarget, notify: SaveSandbox) { this.sandboxes.track(target, notify); }
@@ -137,17 +122,14 @@ export class E2BCodexRuntime implements E2BRuntime {
       this.sandboxes.holdUsage(session, turn.execution.workerId);
     }
   }
-  setDefaultTemplate(template: string) { this.sandboxes.setDefaultTemplate(template); }
-
   private safeError(error: unknown): Error {
     let message = error instanceof Error ? error.message : String(error);
-    for (const secret of [this.options.apiKey, this.options.connection.apiKey]) if (secret) message = message.replaceAll(secret, '[REDACTED]');
+    if (this.options.apiKey) message = message.replaceAll(this.options.apiKey, '[REDACTED]');
     return new Error(message);
   }
 
   private async acquire(target: WorkspaceTarget, create: boolean, notify?: SaveSandbox, usageId?: string, signal?: AbortSignal): Promise<Entry> {
-    if (this.closing) throw new Error('E2B 运行时正在关闭');
-    if (this.upgrading.has(target.projectId ?? target.id)) throw new HttpError(409, '项目沙箱正在升级，请稍后重试');
+    if (this.closing) throw new Error('Sandbox 运行时正在关闭');
     const lease = await this.sandboxes.acquire(target, { create, save: notify, usageId, signal });
     let preparation = this.runtimePreparations.get(lease.record.id);
     if (!preparation) {
@@ -167,7 +149,7 @@ export class E2BCodexRuntime implements E2BRuntime {
 
   private runDirectory(turn: Turn) {
     if (!/^[0-9a-f-]{36}$/i.test(turn.id) || !turn.execution || !/^[0-9a-f-]{36}$/i.test(turn.execution.workerId)) {
-      throw new Error('E2B worker identity is invalid');
+      throw new Error('Sandbox worker identity is invalid');
     }
     return `${RUNTIME}/turns/${turn.id}/${turn.execution.workerId}`;
   }
@@ -191,12 +173,12 @@ export class E2BCodexRuntime implements E2BRuntime {
         envelope = JSON.parse(line) as WorkerEnvelope;
       } catch {
         // Only an incomplete trailing append is recoverable.
-        if (index !== lines.length - 1) throw new Error('E2B worker journal contains an invalid event');
+        if (index !== lines.length - 1) throw new Error('Sandbox worker journal contains an invalid event');
         continue;
       }
       if (envelope.v !== 1 || envelope.workerId !== turn.execution?.workerId || envelope.turnId !== turn.id
         || !Number.isSafeInteger(envelope.seq) || envelope.seq !== result.length + 1
-        || !envelope.event || typeof envelope.event.type !== 'string') throw new Error('E2B worker journal contains an invalid envelope');
+        || !envelope.event || typeof envelope.event.type !== 'string') throw new Error('Sandbox worker journal contains an invalid envelope');
       result.push(envelope);
     }
     return result;
@@ -207,7 +189,7 @@ export class E2BCodexRuntime implements E2BRuntime {
       signal.throwIfAborted();
       try { return await read(); }
       catch (error) {
-        // A lost Web-to-E2B connection says nothing about whether the remote
+        // A lost Web-to-Sandbox connection says nothing about whether the remote
         // worker is alive. Keep its turn reserved until observation recovers.
         if (!transportFailure(error)) throw error;
         await new Promise<void>((resolve, reject) => {
@@ -249,7 +231,7 @@ export class E2BCodexRuntime implements E2BRuntime {
           // The UI cursor does not acknowledge delivery of a control reply. Replay
           // those requests after a Web crash, using their durable business IDs.
           if (applied && !control) continue;
-          if (!applied && envelope.seq !== (turn.execution?.lastAppliedSeq ?? 0) + 1) throw new Error('E2B worker journal has an event gap');
+          if (!applied && envelope.seq !== (turn.execution?.lastAppliedSeq ?? 0) + 1) throw new Error('Sandbox worker journal has an event gap');
           if (event.type === 'runtime.user_approval_request') {
             const requestId = event.requestId;
             if (requestId && !/^[0-9a-f-]{36}$/i.test(requestId)) throw new Error('Invalid worker approval request ID');
@@ -290,7 +272,7 @@ export class E2BCodexRuntime implements E2BRuntime {
             if (diagnostic && typeof diagnostic === 'object') {
               const fields = Object.fromEntries(allowed.filter(key => key in diagnostic).map(key => [key, diagnostic[key]]));
               void this.options.logger?.write({
-                ...fields, source: 'e2b-proxy', sessionId: session.id, projectId: session.projectId,
+                ...fields, source: 'sandbox-proxy', sessionId: session.id, projectId: session.projectId,
                 turnId: turn.id, threadId: session.threadId, sandboxId: entry.metadata.id, model: session.settings.model
               });
               const inputTokens = diagnostic.inputTokens;
@@ -336,13 +318,13 @@ export class E2BCodexRuntime implements E2BRuntime {
         if (state && (state.workerId !== turn.execution?.workerId || state.turnId !== turn.id || state.sessionId !== session.id
           || state.protocolVersion !== 1 || !Number.isSafeInteger(state.lastSeq) || state.lastSeq < 0
           || !Number.isSafeInteger(state.pid) || state.pid <= 1)) {
-          throw new Error('E2B worker state does not match this turn');
+          throw new Error('Sandbox worker state does not match this turn');
         }
         // The worker can finish between our journal read and state read. Drain
         // the final committed sequence before acting on its terminal state.
         const drained = state && (turn.execution?.lastAppliedSeq ?? 0) >= state.lastSeq;
         if (drained && state.status === 'completed') return;
-        if (drained && state.status === 'failed') throw this.safeError(state.error || 'E2B Codex worker failed');
+        if (drained && state.status === 'failed') throw this.safeError(state.error || 'Sandbox Codex worker failed');
         if (drained && state.status === 'cancelled') throw new DOMException('任务已停止', 'AbortError');
         if (state?.status === 'running' && Date.now() - lastHealthCheck >= 5_000) {
           lastHealthCheck = Date.now();
@@ -350,11 +332,11 @@ export class E2BCodexRuntime implements E2BRuntime {
             .then(() => true, error => (error as { exitCode?: number }).exitCode === 1 ? false : undefined);
           if (alive !== false) deadSince = 0;
           else if (!deadSince) deadSince = Date.now();
-          else if (Date.now() - deadSince >= 2_000) throw new Error('E2B Codex worker exited without a terminal event');
+          else if (Date.now() - deadSince >= 2_000) throw new Error('Sandbox Codex worker exited without a terminal event');
         }
         if (advanced) idleSince = 0;
         else idleSince ||= Date.now();
-        if (!state && idleSince && Date.now() - idleSince > 30_000) throw new Error('E2B Codex worker state missing');
+        if (!state && idleSince && Date.now() - idleSince > 30_000) throw new Error('Sandbox Codex worker state missing');
         await new Promise<void>((resolve, reject) => {
           const done = () => { observerSignal.removeEventListener('abort', abort); resolve(); };
           const timer = setTimeout(done, 250);
@@ -383,7 +365,7 @@ export class E2BCodexRuntime implements E2BRuntime {
     checkAbort(signal);
     const marker = `/tmp/codex-web-${randomUUID()}.pid`;
     const body = `umask 077; echo $$ > ${quote(marker)}; exec ${command}`;
-    let handle: CommandHandle | undefined;
+    let handle: SandboxCommandHandle | undefined;
     let stopping: Promise<void> | undefined;
     const stop = () => {
       if (!handle || stopping) return;
@@ -458,8 +440,10 @@ export class E2BCodexRuntime implements E2BRuntime {
         throw error;
       });
       const sharedDocs = await loadAgentDocs(new URL('docs/', sharedData));
-      await this.command(entry, `sh -c ${quote(`mkdir -p ${quote(RUNTIME)} ${quote(`${RUNTIME}/agentcore`)} ${quote(`${ROOT}/images`)} /home/user/.codex ${quote(target.settings.workingDirectory)} && chmod 700 ${quote(ROOT)} /home/user/.codex && cd ${quote(RUNTIME)} && if ! ${NODE} -e 'if(require("./node_modules/@openai/codex/package.json").version!=="0.153.4")process.exit(1)' >/dev/null 2>&1; then npm install --no-audit --no-fund --save-exact @openai/codex@0.153.4; fi`)}`, executionSignal, { timeoutMs: 300_000 });
-      const connectionEnvs = this.options.connections ? await syncSandboxConnections(entry.sandbox, this.options.connections, executionSignal) : {};
+      await this.command(entry, `sh -c ${quote(`mkdir -p ${quote(RUNTIME)} ${quote(`${RUNTIME}/agentcore`)} ${quote(`${RUNTIME}/node_modules/.bin`)} ${quote(`${ROOT}/images`)} /home/user/.codex ${quote(target.settings.workingDirectory)} && chmod 700 ${quote(ROOT)} /home/user/.codex && if test -x /usr/local/bin/codex; then ln -sfn /usr/local/bin/codex ${quote(`${RUNTIME}/node_modules/.bin/codex`)}; fi && cd ${quote(RUNTIME)} && if ! test -x ${quote(`${RUNTIME}/node_modules/.bin/codex`)}; then npm install --no-audit --no-fund --save-exact @openai/codex@0.153.4; fi`)}`, executionSignal, { timeoutMs: 300_000 });
+      const connectionEnvs = this.options.connections
+        ? await syncSandboxConnections(entry.sandbox, this.options.connections, executionSignal)
+        : {};
       checkAbort(executionSignal);
       // Clear a legacy mirror only on the first preparation, before any worker
       // starts. Subsequent turns update files atomically while siblings run.
@@ -477,7 +461,7 @@ export class E2BCodexRuntime implements E2BRuntime {
       entry.preparation.sharedDocPaths = currentPaths;
       const managedAgents = [sharedAgents.trim(), SANDBOX_PERSISTENCE_GUIDANCE].filter(Boolean).join('\n\n') + '\n';
       await this.writeAtomic(entry, `${CODEX_HOME}/AGENTS.md`, managedAgents, executionSignal);
-      for (const name of ['e2b-worker.mjs', 'e2b-inspect.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
+      for (const name of ['sandbox-worker.mjs', 'sandbox-inspect.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
         checkAbort(executionSignal);
         await this.writeAtomic(entry, `${RUNTIME}/${name}`, await readFile(new URL(`../execution/worker/${name}`, import.meta.url), 'utf8'), executionSignal);
       }
@@ -491,12 +475,12 @@ export class E2BCodexRuntime implements E2BRuntime {
   async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, onApproval?: RequestUserApproval,
     onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
     if (this.detachRequests.delete(turn.id)) throw new TurnLaunchCancelled();
-    if (this.closing) throw new Error('E2B 运行时正在关闭');
-    if (!this.options.apiKey) throw new Error('E2B 模式需要 CODEX_API_KEY 或 OPENAI_API_KEY');
+    if (this.closing) throw new Error('Sandbox 运行时正在关闭');
+    if (!this.options.apiKey) throw new Error('Sandbox 模式需要 CODEX_API_KEY 或 OPENAI_API_KEY');
     checkAbort(signal);
     let acquired: Entry | undefined;
     let inputPath: string | undefined;
-    let handle: CommandHandle | undefined;
+    let handle: SandboxCommandHandle | undefined;
     let failed = false;
     let detached = false;
     let launchRequested = false;
@@ -521,7 +505,7 @@ export class E2BCodexRuntime implements E2BRuntime {
       const approvalReplyDirectory = `${runDirectory}/approvals`;
       const improvementReplyDirectory = `${runDirectory}/improvements`;
       await this.command(entry, `mkdir -p ${quote(bundleDirectory)} ${quote(`${bundleDirectory}/agentcore`)} ${quote(approvalReplyDirectory)} ${quote(improvementReplyDirectory)}`, executionSignal);
-      for (const name of ['e2b-worker.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
+      for (const name of ['sandbox-worker.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
         await this.command(entry, `cp ${quote(`${RUNTIME}/${name}`)} ${quote(`${bundleDirectory}/${name}`)}`, executionSignal);
       }
       await this.command(entry, `cp ${quote(`${RUNTIME}/agentcore/index.mjs`)} ${quote(`${bundleDirectory}/agentcore/index.mjs`)}`, executionSignal);
@@ -538,7 +522,7 @@ export class E2BCodexRuntime implements E2BRuntime {
         approvalReplyDirectory: onApproval ? approvalReplyDirectory : undefined,
       }), { user: 'user', signal: executionSignal });
       const marker = `${runDirectory}/worker.pid`;
-      const body = `umask 077; echo $$ > ${quote(marker)}; exec ${NODE} ${quote(`${bundleDirectory}/e2b-worker.mjs`)} ${quote(inputPath)}`;
+      const body = `umask 077; echo $$ > ${quote(marker)}; exec ${NODE} ${quote(`${bundleDirectory}/sandbox-worker.mjs`)} ${quote(inputPath)}`;
       checkAbort(executionSignal);
       // Once the launch request is sent, its outcome may already be remote.
       // Shutdown must wait for its identity and then detach the observer.
@@ -584,7 +568,7 @@ export class E2BCodexRuntime implements E2BRuntime {
   async *recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, onApproval?: RequestUserApproval,
     onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
     if (!turn.execution || !session.sandbox || (turn.execution.sandboxId && turn.execution.sandboxId !== session.sandbox.id)) {
-      throw new Error('E2B worker recovery information is incomplete');
+      throw new Error('Sandbox worker recovery information is incomplete');
     }
     if (turn.execution.stopRequested) signal = AbortSignal.any([signal, AbortSignal.abort()]);
     this.sandboxes.holdUsage(session, turn.execution.workerId);
@@ -645,7 +629,7 @@ export class E2BCodexRuntime implements E2BRuntime {
     this.observers.get(turn.id)?.abort(new TurnObserverDetached());
   }
 
-  private async terminateWorker(entry: Entry, turn: Turn, handle?: CommandHandle) {
+  private async terminateWorker(entry: Entry, turn: Turn, handle?: SandboxCommandHandle) {
     const marker = `${this.runDirectory(turn)}/worker.pid`;
     const script = `
 const fs = require('node:fs'), cp = require('node:child_process');
@@ -696,18 +680,15 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     const entry = await this.acquire(session, false);
     let failed = false;
     try {
-      entry.preparation.initialized ||= await entry.sandbox.files.exists(`${RUNTIME}/e2b-inspect.mjs`, { user: 'user' });
-      if (!entry.preparation.initialized) throw new Error('E2B Codex 尚未完成初始化，请等待当前任务启动后重试');
-      if (mode === 'history' || mode === 'billing') {
-        // Upgrade the reader independently of worker/model startup for existing threads.
-        const signal = AbortSignal.timeout(30_000);
-        await this.writeAtomic(entry, `${RUNTIME}/native-history.mjs`, await readFile(new URL('../execution/native-history.mjs', import.meta.url), 'utf8'), signal);
-        await this.writeAtomic(entry, `${RUNTIME}/e2b-inspect.mjs`, await readFile(new URL('../execution/worker/e2b-inspect.mjs', import.meta.url), 'utf8'), signal);
-      }
-      // Native rollout history is parsed and serialized in the sandbox. Long
-      // conversations can legitimately exceed the ordinary inspection budget.
+      // History inspection must work for an existing thread before any new
+      // worker has started. Install the tiny App Server inspector on demand;
+      // it does not depend on the worker preparation lifecycle.
+      const inspectSignal = AbortSignal.timeout(30_000);
+      await this.command(entry, `mkdir -p ${quote(`${RUNTIME}/agentcore`)}`, inspectSignal, { timeoutMs: 30_000 });
+      await this.writeAtomic(entry, `${RUNTIME}/sandbox-inspect.mjs`, await readFile(new URL('../execution/worker/sandbox-inspect.mjs', import.meta.url), 'utf8'), inspectSignal);
+      await this.writeAtomic(entry, `${RUNTIME}/agentcore/index.mjs`, await readFile(new URL('../../packages/agentcore/src/index.mjs', import.meta.url), 'utf8'), inspectSignal);
       const timeoutMs = mode === 'history' || mode === 'billing' ? 120_000 : 30_000;
-      const result = await entry.sandbox.commands.run(`${NODE} ${quote(`${RUNTIME}/e2b-inspect.mjs`)} ${quote(mode)} ${args.map(quote).join(' ')}`, { user: 'user', timeoutMs });
+      const result = await entry.sandbox.commands.run(`${NODE} ${quote(`${RUNTIME}/sandbox-inspect.mjs`)} ${quote(mode)} ${args.map(quote).join(' ')}`, { user: 'user', timeoutMs });
       return JSON.parse(result.stdout) as T;
     } catch (error) {
       failed = true;
@@ -723,22 +704,18 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     finally { await this.release(entry, failed); }
   }
   async preview(session: WorkspaceTarget, port: number): Promise<string> {
-    if (this.closing) throw new Error('E2B 运行时正在关闭');
+    if (this.closing) throw new Error('Sandbox 运行时正在关闭');
     if (!session.sandbox) throw new Error('项目沙箱尚未创建，请先启动服务');
     const entry = await this.acquire(session, false);
     let failed = false;
     try {
-      const gateway = this.options.connection.sandboxUrl;
-      const url = new URL(gateway ?? `https://${entry.sandbox.getHost(port)}`);
-      url.hostname = entry.sandbox.getHost(port);
-      url.pathname = '/'; url.search = ''; url.hash = '';
-      return url.origin;
+      return `http://${entry.sandbox.getHost(port)}:${port}`;
     } catch (error) { failed = true; throw error; }
     finally { await this.release(entry, failed); }
   }
 
   async file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult> {
-    if (this.closing) throw new HttpError(503, 'E2B 运行时正在关闭');
+    if (this.closing) throw new HttpError(503, 'Sandbox 运行时正在关闭');
     const request = workspaceFileRequest(session.settings.workingDirectory, path, options);
     let entry: Entry;
     try { entry = await this.acquire(session, false); }
@@ -757,17 +734,17 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
   }
 
   async changes(session: WorkspaceTarget): Promise<Changes> {
-    if (!session.sandbox) return { branch: '', files: [], diff: '', error: 'E2B 沙箱尚未创建，请先发送一条消息' };
+    if (!session.sandbox) return { branch: '', files: [], diff: '', error: 'Sandbox 沙箱尚未创建，请先发送一条消息' };
     return this.inspect(session, 'changes', [session.settings.workingDirectory]);
   }
   async rawTools(session: ThreadWorkspace, cursor = 0): Promise<RawToolPage> {
     if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error('原始消息游标无效');
     if (!session.threadId || !session.sandbox) return {
-      source: 'codex-rollout', location: 'e2b', sandboxId: session.sandbox?.id,
+      source: 'codex-rollout', location: 'sandbox', sandboxId: session.sandbox?.id,
       threadId: session.threadId, availability: 'pending', messages: [], nextCursor: cursor, hasMore: false, skippedLines: 0,
     };
     const page = await this.inspect<RawToolPage>(session, 'raw', [session.threadId, String(cursor)]);
-    return { ...page, location: 'e2b', sandboxId: session.sandbox.id };
+    return { ...page, location: 'sandbox', sandboxId: session.sandbox.id };
   }
   async history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<NativeHistory> {
     if (!session.threadId) return { turns: [] };
@@ -779,74 +756,45 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     if (session.sandbox) this.runtimePreparations.delete(session.sandbox.id);
   }
 
+  async rebuild(target: WorkspaceTarget, onSandbox: SaveSandbox) {
+    const lease = await this.sandboxes.acquire(target, { create: true, save: onSandbox });
+    await lease.release();
+  }
+
+  async restoreArchive(target: WorkspaceTarget, archivePath: string) {
+    const entry = await this.acquire(target, false);
+    try {
+      const content = await readFile(archivePath);
+      const remote = `${RUNTIME}/archives/${randomUUID()}.tar.gz`;
+      await entry.sandbox.files.write(remote, content, { user: 'root' });
+      const result = await entry.sandbox.commands.run(`set -eu; tar -xzf ${quote(remote)} -C /; rm -f ${quote(remote)}`, { user: 'root', timeoutMs: COMMAND_TIMEOUT_MS });
+      if (result && 'exitCode' in result && result.exitCode) throw new Error(result.stderr || '归档恢复失败');
+    } finally { await this.release(entry); }
+  }
+
+  async createArchive(target: WorkspaceTarget, archivePath: string) {
+    if (!target.sandbox) throw new Error('Sandbox 不可用，无法归档');
+    const client = this.options.provider as SandboxProvider & { archive?: (id: string, destination: string) => Promise<{ sizeBytes: number; sha256: string }> };
+    if (!client.archive) throw new Error('Sandbox provider 不支持数据归档');
+    return client.archive(target.sandbox.id, archivePath);
+  }
+
   async detachSandbox(target: WorkspaceTarget) {
     const sandboxId = target.sandbox?.id;
     await this.sandboxes.detach(target);
     if (sandboxId) this.runtimePreparations.delete(sandboxId);
   }
 
-  async archiveSandbox(target: WorkspaceTarget, threadIds: string[], onSandbox: SaveSandbox) {
-    const key = target.projectId ?? target.id;
-    if (this.closing || this.upgrading.has(key)) throw new HttpError(409, '沙箱正在维护');
-    this.upgrading.add(key);
-    try { return await archiveSandbox(target, threadIds, onSandbox, this.sandboxes, this.dataArchives); }
-    catch (error) { throw this.safeError(error); }
-    finally { this.upgrading.delete(key); }
+  async pauseDanglingSandbox(sandboxId: string) {
+    await this.options.provider.pause(sandboxId).catch(error => {
+      if (!/not found|no such container/i.test(String(error))) throw this.safeError(error);
+    });
   }
 
-  async restoreSandbox(target: WorkspaceTarget, archive: SandboxDataArchive, options: SandboxRestoreOptions) {
-    const key = target.projectId ?? target.id;
-    if (this.closing || this.upgrading.has(key)) throw new HttpError(409, '沙箱正在维护');
-    this.upgrading.add(key);
-    try {
-      await restoreSandbox(target, archive, options, this.sandboxes, this.options.connection, this.dataArchives, async (lease, signal) => {
-        const entry: Entry = { sandbox: lease.sandbox, metadata: lease.record, lease, preparation: {} };
-        const envs = await this.prepareEnvironment(target, entry, signal);
-        // Resume each original thread without starting a model turn. This checks
-        // the actual App Server index/rollout compatibility of the new template.
-        const script = `import { CodexAppServerClient, appServerArgs } from ${JSON.stringify(`${RUNTIME}/agentcore/index.mjs`)};
-let client;
-try {
-  client = await CodexAppServerClient.spawn({ command: ${JSON.stringify(`${RUNTIME}/node_modules/.bin/codex`)}, args: appServerArgs(${JSON.stringify(this.options.modelConfig ?? {})}, ${JSON.stringify(this.options.configOverrides ?? [])}), cwd: ${JSON.stringify(target.settings.workingDirectory)} });
-  for (const threadId of ${JSON.stringify(archive.threadIds)}) {
-    const response = await client.request('thread/resume', { threadId, cwd: ${JSON.stringify(target.settings.workingDirectory)}, approvalPolicy: 'never', sandbox: 'danger-full-access' });
-    if (response.thread.id !== threadId) throw new Error('Thread identity mismatch');
-  }
-} catch (error) { console.error(error.message); process.exitCode = 1; }
-finally { await client?.close(); }`;
-        try {
-          await lease.sandbox.commands.run(`${NODE} --input-type=module -e ${quote(script)}`, {
-            user: 'user', signal, timeoutMs: 120_000,
-            envs: { ...envs, CODEX_API_KEY: this.options.apiKey, CODEX_HOME },
-          });
-        } catch (error) {
-          const stderr = (error as { stderr?: string }).stderr;
-          const detail = stderr?.trim().split('\n').at(-1)?.slice(0, 300);
-          const fallback = target.sandbox ? '已保留原沙箱' : '新沙箱未绑定到项目';
-          throw new Error(`新沙箱无法恢复已有 Codex 对话，${fallback}${detail ? `：${detail}` : ''}`);
-        }
-        this.runtimePreparations.set(lease.record.id, entry.preparation);
-      });
-    } catch (error) { throw this.safeError(error); }
-    finally { this.upgrading.delete(key); }
-  }
-
-  async deleteDataArchive(archive: SandboxDataArchive) { await this.dataArchives.delete(archive); }
-
-  async verifyDataArchive(archive: SandboxDataArchive) {
-    const directory = await mkdtemp(join(tmpdir(), 'swarm-hive-archive-verify-'));
-    try { await this.dataArchives.get(archive, join(directory, 'archive.tar.gz')); }
-    finally { await rm(directory, { recursive: true, force: true }); }
-  }
-
-  async pauseDanglingSandbox(sandboxId: string, provenance?: SandboxDataArchive) {
-    try { await pauseDanglingSandbox(sandboxId, this.options.connection, provenance); }
-    catch (error) { throw this.safeError(error); }
-  }
-
-  async deleteDanglingSandbox(sandboxId: string, provenance?: SandboxDataArchive) {
-    try { await deleteDanglingSandbox(sandboxId, this.options.connection, provenance); }
-    catch (error) { throw this.safeError(error); }
+  async deleteDanglingSandbox(sandboxId: string) {
+    await this.options.provider.kill(sandboxId).catch(error => {
+      if (!/not found|no such container/i.test(String(error))) throw this.safeError(error);
+    });
   }
 
   async close() {

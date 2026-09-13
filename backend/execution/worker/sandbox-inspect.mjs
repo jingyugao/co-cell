@@ -4,7 +4,7 @@ import { join, sep } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 const exec = promisify(execFile);
-const [mode, value, rawCursor, startedAt, nativeHistoryPath] = process.argv.slice(2);
+const [mode, value, rawCursor] = process.argv.slice(2);
 const home = '/home/user/.codex';
 const maxBytes = 8 * 1024 * 1024;
 async function raw() {
@@ -97,10 +97,38 @@ async function changes() {
     return { branch: branch.trim(), files, diff };
   } catch (error) { return { branch: '', files: [], diff: '', error: error.message }; }
 }
+async function history(includeBlocks = false) {
+  if (!value) return { turns: [] };
+  const { CodexAppServerClient, AppServerEventAdapter } = await import('./agentcore/index.mjs');
+  const client = await CodexAppServerClient.spawn({ command: process.env.CODEX_BIN ?? 'codex', args: ['app-server'], cwd: process.cwd(), requestTimeoutMs: 120_000 });
+  try {
+    // A fresh App Server process keeps thread metadata lazy. Listing first
+    // loads the persisted thread index so thread/read can resolve an older ID.
+    let cursor;
+    do {
+      const page = await client.request('thread/list', { limit: 100, ...(cursor ? { cursor } : {}) });
+      if ((page.data ?? []).some(thread => thread.id === value)) break;
+      cursor = page.nextCursor;
+    } while (cursor);
+    await client.request('thread/read', { threadId: value });
+    const response = await client.request('thread/turns/list', { threadId: value });
+    const turns = [];
+    for (const rawTurn of response.data ?? []) {
+      const turn = { id: rawTurn.id, prompt: '', images: [], status: rawTurn.status === 'completed' ? 'completed' : rawTurn.status === 'inProgress' ? 'running' : 'failed', items: [], startedAt: new Date((rawTurn.startedAt ?? 0) * 1000).toISOString(), ...(rawTurn.completedAt ? { completedAt: new Date(rawTurn.completedAt * 1000).toISOString() } : {}) };
+      for (const entry of rawTurn.items ?? []) {
+        const item = entry.item ?? entry;
+        if (item.type === 'userMessage') { turn.prompt = (item.content ?? []).filter(part => part.type === 'text').map(part => part.text ?? '').join(''); continue; }
+        const adapter = new AppServerEventAdapter();
+        const converted = adapter.convert(item);
+        if (converted) turn.items.push(converted);
+      }
+      turns.push(turn);
+    }
+    return { turns };
+  } finally { await client.close(); }
+}
 try {
-  const result = (mode === 'history' || mode === 'billing')
-    ? await (await import('./native-history.mjs')).readNativeHistory(value, home, mode === 'billing', startedAt, nativeHistoryPath)
-    : await (mode === 'raw' ? raw() : changes());
+  const result = (mode === 'history' || mode === 'billing') ? await history(mode === 'billing') : await (mode === 'raw' ? raw() : changes());
   process.stdout.write(JSON.stringify(result) + '\n');
 }
 catch (error) { process.stdout.write(JSON.stringify({ error: error.message }) + '\n'); process.exitCode = 1; }

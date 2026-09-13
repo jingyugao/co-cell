@@ -114,7 +114,7 @@ max-retry-interval: 30
     'config.yaml': config,
     'compose.json': `${JSON.stringify(composeConfig, null, 2)}\n`,
     'settings.json': `${JSON.stringify(settings, null, 2)}\n`,
-    'swarm-hive.env': `# Merge these settings into the service environment; this file contains a secret.\n# Loopback URLs work only on this host. E2B needs a reachable URL; use HTTPS outside trusted local networking.\nCODEX_PROXY_KIND=cliproxyapi\nOPENAI_BASE_URL=${settings.baseUrl}\nCODEX_API_KEY=${apiKey}\n`,
+    'swarm-hive.env': `# Merge these settings into the service environment; this file contains a secret.\n# Loopback URLs work only on this host. Sandbox needs a reachable URL; use HTTPS outside trusted local networking.\nCODEX_PROXY_KIND=cliproxyapi\nOPENAI_BASE_URL=${settings.baseUrl}\nCODEX_API_KEY=${apiKey}\n`,
   };
   await Promise.all(Object.entries(files).map(([name, content]) =>
     writeFile(path.join(dataDir, name), content, { mode: 0o600, flag: 'wx' })));
@@ -135,7 +135,7 @@ async function check(settings) {
   if (!Array.isArray(body.data)) throw new Error('CLIProxyAPI returned an invalid model list.');
   console.log(`CLIProxyAPI API authentication succeeded; ${body.data.length} models available.`);
   if (body.data.length === 0) throw new Error('No models available. Complete login first.');
-  console.log('This checks the local API and model inventory; a real streamed turn must verify upstream login and E2B reachability.');
+  console.log('This checks the local API and model inventory; a real streamed turn must verify upstream login and Sandbox reachability.');
 }
 
 async function main() {

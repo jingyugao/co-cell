@@ -6,6 +6,8 @@ import type { Project, Session } from '../../../protocol/types.js';
 export interface WebStateStore {
   init(): Promise<void>; listProjects(): Promise<Project[]>; listSessions(): Promise<Session[]>;
   saveProject(project: Project): Promise<void>; saveSession(session: Session): Promise<void>;
+  recordProjectArchive(projectId: string, archive: NonNullable<Project['sandboxDataArchive']>): Promise<void>;
+  latestProjectArchive(projectId: string): Promise<NonNullable<Project['sandboxDataArchive']> | undefined>;
   deleteProject(id: string): Promise<void>; deleteSession(id: string): Promise<void>; close(): Promise<void>;
 }
 
@@ -22,21 +24,32 @@ export class JsonWebStateStore implements WebStateStore {
   listSessions(): Promise<Session[]> { return this.records<Session>(this.directory); }
   saveProject(project: Project): Promise<void> { return this.write(join(this.projectsDirectory, `${project.id}.json`), project); }
   saveSession(session: Session): Promise<void> { return this.write(join(this.directory, `${session.id}.json`), session); }
+  async recordProjectArchive(_projectId: string, _archive: NonNullable<Project['sandboxDataArchive']>) {}
+  async latestProjectArchive(projectId: string) {
+    return (await this.listProjects()).find(project => project.id === projectId)?.sandboxDataArchive;
+  }
   deleteProject(id: string): Promise<void> { return rm(join(this.projectsDirectory, `${id}.json`), { force: true }); }
   deleteSession(id: string): Promise<void> { return rm(join(this.directory, `${id}.json`), { force: true }); }
   async close() {}
   private async write(file: string, value: unknown) { await writeFile(`${file}.tmp`, JSON.stringify(value), { mode: 0o600 }); await rename(`${file}.tmp`, file); }
 }
 
-/** Web metadata only; E2B storage and sandbox-local ~/.codex are intentionally separate. */
+/** Web metadata and sandbox-local ~/.codex are intentionally separate. */
 export class MySqlWebStateStore implements WebStateStore {
   private pool: Pool;
   constructor(url: string, private legacy: JsonWebStateStore) { this.pool = createPool({ uri: url, connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' }); }
   async init() {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS web_schema_migrations (name VARCHAR(191) PRIMARY KEY, applied_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
-    await this.pool.query(`CREATE TABLE IF NOT EXISTS projects (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL, requirement_url TEXT NULL, execution_mode ENUM('e2b','local') NOT NULL, working_directory TEXT NOT NULL, archived_at DATETIME(3) NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS projects (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL, requirement_url TEXT NULL, execution_mode ENUM('sandbox','local') NOT NULL, working_directory TEXT NOT NULL, archived_at DATETIME(3) NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sessions (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NULL, thread_id VARCHAR(191) NULL, title VARCHAR(255) NOT NULL, status ENUM('idle','running','completed','failed','cancelled') NOT NULL, archived_at DATETIME(3) NULL, started_at DATETIME(3) NOT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL, INDEX sessions_project_updated (project_id, updated_at), CONSTRAINT sessions_project_fk FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
+    // Append-only archive ledger. Deliberately no foreign key: deleting a
+    // project must not delete its archive provenance or physical file.
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS project_sandbox_archives (archive_key VARCHAR(191) PRIMARY KEY, project_id CHAR(36) NOT NULL, source_sandbox_id VARCHAR(191) NOT NULL, format VARCHAR(64) NOT NULL, size_bytes BIGINT UNSIGNED NOT NULL, sha256 CHAR(64) NOT NULL, created_at DATETIME(3) NOT NULL, document JSON NOT NULL, INDEX project_archives_created (project_id, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.importLegacyOnce();
+    // Backfill archive pointers created before the ledger was introduced.
+    for (const project of await this.listProjects()) if (project.sandboxDataArchive) {
+      await this.recordProjectArchive(project.id, project.sandboxDataArchive);
+    }
   }
   private async importLegacyOnce() {
     const [rows] = await this.pool.query<Array<RowDataPacket & { name: string }>>('SELECT name FROM web_schema_migrations WHERE name = ?', ['legacy-json-v1']);
@@ -56,6 +69,17 @@ export class MySqlWebStateStore implements WebStateStore {
   async listSessions(): Promise<Session[]> { const [rows] = await this.pool.query<Array<RowDataPacket & { document: Session | string }>>('SELECT document FROM sessions'); return rows.map(row => this.document<Session>(row.document)); }
   saveProject(project: Project): Promise<void> { return this.saveProjectWith(this.pool, project); }
   saveSession(session: Session): Promise<void> { return this.saveSessionWith(this.pool, session); }
+  async recordProjectArchive(projectId: string, archive: NonNullable<Project['sandboxDataArchive']>) {
+    await this.pool.query(`INSERT IGNORE INTO project_sandbox_archives (archive_key,project_id,source_sandbox_id,format,size_bytes,sha256,created_at,document) VALUES (?,?,?,?,?,?,?,CAST(? AS JSON))`, [
+      archive.key, projectId, archive.sourceSandboxId, archive.format, archive.sizeBytes, archive.sha256,
+      this.mysqlDate(archive.createdAt), JSON.stringify(archive),
+    ]);
+  }
+  async latestProjectArchive(projectId: string) {
+    const [rows] = await this.pool.query<Array<RowDataPacket & { document: NonNullable<Project['sandboxDataArchive']> | string }>>(
+      'SELECT document FROM project_sandbox_archives WHERE project_id = ? ORDER BY created_at DESC, archive_key DESC LIMIT 1', [projectId]);
+    return rows[0] ? this.document<NonNullable<Project['sandboxDataArchive']>>(rows[0].document) : undefined;
+  }
   async deleteProject(id: string) { await this.pool.query('DELETE FROM projects WHERE id = ?', [id]); }
   async deleteSession(id: string) { await this.pool.query('DELETE FROM sessions WHERE id = ?', [id]); }
   async close() { await this.pool.end(); }

@@ -7,7 +7,7 @@ import test from 'node:test';
 import type { RequestUserApproval, UserApproval } from '../../protocol/approval-types.js';
 import type { Settings, Turn } from '../../protocol/types.js';
 import { SessionManager, type CodexClient } from '../sessions/manager.js';
-import type { E2BRuntime } from '../sandboxes/e2b.js';
+import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { ApprovalRequests, cancelPersistedApprovals } from './requests.js';
 
 const input = { title: '确认操作', target: 'uat / database', action: 'UPDATE example SET enabled = 0 WHERE id = 7;', impact: '修改一条记录' };
@@ -91,7 +91,7 @@ test('persistence failure cannot acknowledge approval', async () => {
   await requests.close();
 });
 
-const defaults: Settings = { executionMode: 'e2b', workingDirectory: '/home/user/workspace', model: 'test', modelReasoningEffort: 'low',
+const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/user/workspace', model: 'test', modelReasoningEffort: 'low',
   sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
 
 test('manager binds decisions to session and turn, cancels on stop and persists restart cancellation', async () => {
@@ -100,7 +100,7 @@ test('manager binds decisions to session and turn, cancels on stop and persists 
   const runtime = { async close() {}, async *run(_session: unknown, _turn: unknown, signal: AbortSignal, _sandbox: unknown, approve: RequestUserApproval) {
     result = await approve(randomUUID(), input, signal);
     yield { type: 'turn.completed', usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } };
-  } } as unknown as E2BRuntime;
+  } } as unknown as SandboxRuntime;
   const manager = new SessionManager({} as CodexClient, directory, defaults, runtime);
   try {
     await manager.init();

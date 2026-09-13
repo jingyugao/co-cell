@@ -4,11 +4,9 @@ import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { workspaceDownload } from '../workspaces/download.js';
 
-export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile' | 'upgradeProjectSandbox' | 'archiveProjectSandbox' | 'restoreProjectSandbox' | 'reclaimProjectSandbox'>) {
-  app.post('/api/projects/:id/sandbox/upgrade', async c => c.json(await manager.upgradeProjectSandbox(c.req.param('id')), 202));
-  app.post('/api/projects/:id/sandbox/archive', async c => c.json(await manager.archiveProjectSandbox(c.req.param('id')), 202));
-  app.post('/api/projects/:id/sandbox/restore', async c => c.json(await manager.restoreProjectSandbox(c.req.param('id')), 202));
-  app.post('/api/projects/:id/sandbox/reclaim', async c => c.json(await manager.reclaimProjectSandbox(c.req.param('id')), 202));
+export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile' | 'rebuildProjectSandbox' | 'archiveProjectNow'>) {
+  app.post('/api/projects/:id/archive', async c => c.json(await manager.archiveProjectNow(c.req.param('id')), 202));
+  app.post('/api/projects/:id/sandbox/rebuild', async c => c.json(await manager.rebuildProjectSandbox(c.req.param('id')), 202));
   app.get('/api/projects/:id/files', async c => {
     const path = c.req.query('path');
     if (!path) throw new HttpError(400, '缺少文件路径');
@@ -38,6 +36,6 @@ export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, '
     .refine(input => Boolean(input.name || input.requirementUrl), '请输入项目名称或绑定飞书需求');
   app.post('/api/projects', async c => c.json(await manager.createProject(createSchema.parse(await c.req.json())), 201));
   app.get('/api/projects/:id', c => c.json(manager.getProject(c.req.param('id'))));
-  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ archived: z.boolean().optional() }).parse(await c.req.json()))));
+  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional() }).parse(await c.req.json()))));
   app.delete('/api/projects/:id', async c => { await manager.deleteProject(c.req.param('id')); return c.json({ ok: true }); });
 }

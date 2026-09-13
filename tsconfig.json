@@ -12,5 +12,5 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["fe", "backend", "protocol", "util", "packages/sandbox/src", "vite.config.ts"]
+  "include": ["fe", "backend", "protocol", "util", "packages/sandbox/src", "packages/docker-sandbox/src", "vite.config.ts"]
 }

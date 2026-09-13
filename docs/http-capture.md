@@ -26,7 +26,7 @@ pnpm capture:http --analyze tmp/artifacts/http-capture/<抓包目录>
 pnpm capture:http --serve
 ```
 
-将输出的代理地址配置给该客户端，结束时按 Ctrl+C。代理只监听本机且不处理 WebSocket upgrade，客户端需使用 HTTP Responses。E2B 中的回环地址指向沙箱自身，不能把宿主 `--serve` 输出的回环地址直接配置给 E2B 任务；E2B 日常诊断使用 [运行日志](runtime-logging.md)。
+将输出的代理地址配置给该客户端，结束时按 Ctrl+C。代理只监听本机且不处理 WebSocket upgrade，客户端需使用 HTTP Responses。Sandbox 中的回环地址指向沙箱自身，不能把宿主 `--serve` 输出的回环地址直接配置给 Sandbox 任务；Sandbox 日常诊断使用 [运行日志](runtime-logging.md)。
 
 ## 产物
 

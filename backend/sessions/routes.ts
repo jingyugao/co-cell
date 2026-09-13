@@ -7,7 +7,7 @@ import type { SessionManager } from './manager.js';
 import type { RawToolReader } from '../execution/raw-tools.js';
 
 const settingsSchema = z.object({
-  executionMode: z.enum(['local', 'e2b']),
+  executionMode: z.enum(['local', 'sandbox']),
   workingDirectory: z.string().trim().min(1).max(4096),
   model: z.string().trim().max(200),
   modelReasoningEffort: z.enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent']),
@@ -18,7 +18,7 @@ const settingsSchema = z.object({
 
 export function installSessionsRoutes(app: Hono, manager: SessionManager, config: AppConfig, rawTools: RawToolReader) {
   const requireAllowedExecution = (mode: string | undefined) => {
-    if (config.e2b?.enabled && mode !== 'e2b') throw new HttpError(403, '已启用 E2B 隔离执行，本机会话仅供查看历史；请在 E2B 项目中创建会话');
+    if (config.sandbox?.enabled && mode !== 'sandbox') throw new HttpError(403, '已启用容器执行，本机会话仅供查看历史；请在 Sandbox 项目中创建会话');
   };
   app.get('/api/sessions', c => c.json(manager.list()));
   app.post('/api/sessions', async c => {

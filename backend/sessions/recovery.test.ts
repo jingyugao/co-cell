@@ -4,10 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Session, Settings, Turn } from '../../protocol/types.js';
-import { TurnObserverDetached, type E2BRuntime } from '../sandboxes/e2b.js';
+import { TurnObserverDetached, type SandboxRuntime } from '../execution/container-runtime.js';
 import { SessionManager, type CodexClient } from './manager.js';
 
-const defaults: Settings = { executionMode: 'e2b', workingDirectory: '/home/user/workspace', model: 'test',
+const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/user/workspace', model: 'test',
   modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
 const tick = () => new Promise(resolve => setTimeout(resolve, 5));
 async function until(check: () => boolean) {
@@ -46,7 +46,7 @@ test('Web detach persists the same worker; startup recovers it without submittin
       if (!signal.aborted) throw new TurnObserverDetached();
       throw new DOMException('stopped', 'AbortError');
     },
-  } as unknown as E2BRuntime;
+  } as unknown as SandboxRuntime;
   const first = new SessionManager({} as CodexClient, directory, defaults, runtime);
   const second = new SessionManager({} as CodexClient, directory, defaults, runtime);
   try {
@@ -78,7 +78,7 @@ test('Web detach persists the same worker; startup recovers it without submittin
 
 test('legacy running turns are cancelled on restart instead of resubmitted', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'hive-legacy-'));
-  const runtime = { async close() {}, async *run() { assert.fail('must not resubmit'); }, async *recover() { assert.fail('legacy cannot recover'); } } as unknown as E2BRuntime;
+  const runtime = { async close() {}, async *run() { assert.fail('must not resubmit'); }, async *recover() { assert.fail('legacy cannot recover'); } } as unknown as SandboxRuntime;
   const first = new SessionManager({} as CodexClient, directory, defaults, runtime);
   const second = new SessionManager({} as CodexClient, directory, defaults, runtime);
   try {
@@ -102,7 +102,7 @@ test('a worker for a different sandbox is not registered as a current resource u
   const runtime = { async close() {},
     trackExecution() { assert.fail('must not reserve a worker belonging to another sandbox'); },
     async *recover() { assert.fail('must not recover a worker in a different sandbox'); },
-  } as unknown as E2BRuntime;
+  } as unknown as SandboxRuntime;
   const first = new SessionManager({} as CodexClient, directory, defaults, runtime);
   const second = new SessionManager({} as CodexClient, directory, defaults, runtime);
   try {
@@ -115,7 +115,7 @@ test('a worker for a different sandbox is not registered as a current resource u
     await writeFile(path, JSON.stringify(project));
     session.status = 'running';
     session.turns.push({ id: 'old-turn', prompt: 'test', images: [], items: [], status: 'running', startedAt: session.createdAt,
-      execution: { kind: 'e2b-worker', protocolVersion: 1, workerId: 'old-worker', sandboxId: 'old-sandbox', state: 'detached', lastAppliedSeq: 0 } });
+      execution: { kind: 'sandbox-worker', protocolVersion: 1, workerId: 'old-worker', sandboxId: 'old-sandbox', state: 'detached', lastAppliedSeq: 0 } });
     await writeFile(join(directory, `${session.id}.json`), JSON.stringify(session));
     await second.init();
     assert.equal(second.get(session.id).turns[0].status, 'cancelled');
@@ -159,7 +159,7 @@ test('session archive timestamps are persisted and legacy records are backfilled
 test('restart drains a worker whose SDK terminal event was already persisted before Web exit', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'hive-finalizing-'));
   let recoveries = 0;
-  const runtime = { async close() {}, async *recover() { recoveries++; } } as unknown as E2BRuntime;
+  const runtime = { async close() {}, async *recover() { recoveries++; } } as unknown as SandboxRuntime;
   const first = new SessionManager({} as CodexClient, directory, defaults, runtime);
   const second = new SessionManager({} as CodexClient, directory, defaults, runtime);
   try {
@@ -172,7 +172,7 @@ test('restart drains a worker whose SDK terminal event was already persisted bef
     session.status = 'running';
     session.turns.push({ id: 'finalizing', prompt: 'done', images: [], status: 'completed', phase: 'finalizing',
       items: [], startedAt: session.createdAt,
-      execution: { kind: 'e2b-worker', protocolVersion: 1, workerId: 'worker', lastAppliedSeq: 8, state: 'running' } });
+      execution: { kind: 'sandbox-worker', protocolVersion: 1, workerId: 'worker', lastAppliedSeq: 8, state: 'running' } });
     await writeFile(join(directory, `${session.id}.json`), JSON.stringify(session));
     await second.init();
     await second.waitForIdle(session.id);

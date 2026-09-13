@@ -1,6 +1,5 @@
 #!/bin/bash
 set -euo pipefail
-
 # Public tooling only: no host config or credentials belong in this image layer.
 # These Oracle Debian packages support mysql --login-path / .mylogin.cnf.
 # Package SHA256 values: https://repo.mysql.com/apt/debian/dists/bookworm/mysql-8.0/binary-amd64/Packages

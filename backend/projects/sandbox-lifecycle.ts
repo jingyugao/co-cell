@@ -7,14 +7,14 @@ export interface SandboxLifecycleOptions {
   listProjects: () => Project[];
   /** Resolves only after the reclaim operation has reached a terminal state. */
   reclaim: (projectId: string) => Promise<void>;
-  idleReclaimAfterMs?: number;
+  archivedReclaimAfterMs?: number;
   scanIntervalMs?: number;
   now?: () => number;
 }
 
-/** Periodically asks the project coordinator to reclaim idle E2B environments. */
+/** Archives completed projects after the grace period and deletes their environments. */
 export class SandboxLifecycleService {
-  private readonly idleReclaimAfterMs: number;
+  private readonly archivedReclaimAfterMs: number;
   private readonly scanIntervalMs: number;
   private readonly now: () => number;
   private timer?: ReturnType<typeof setInterval>;
@@ -22,10 +22,10 @@ export class SandboxLifecycleService {
   private closed = false;
 
   constructor(private readonly options: SandboxLifecycleOptions) {
-    this.idleReclaimAfterMs = options.idleReclaimAfterMs ?? 7 * DAY;
+    this.archivedReclaimAfterMs = options.archivedReclaimAfterMs ?? DAY;
     this.scanIntervalMs = options.scanIntervalMs ?? MINUTE;
     this.now = options.now ?? Date.now;
-    if (!Number.isFinite(this.idleReclaimAfterMs) || this.idleReclaimAfterMs < 0) throw new Error('idleReclaimAfterMs must be a non-negative finite number');
+    if (!Number.isFinite(this.archivedReclaimAfterMs) || this.archivedReclaimAfterMs < 0) throw new Error('archivedReclaimAfterMs must be a non-negative finite number');
     if (!Number.isFinite(this.scanIntervalMs) || this.scanIntervalMs <= 0) throw new Error('scanIntervalMs must be a positive finite number');
   }
 
@@ -47,11 +47,11 @@ export class SandboxLifecycleService {
   }
 
   private async runSweep(): Promise<void> {
-    const cutoff = this.now() - this.idleReclaimAfterMs;
+    const cutoff = this.now() - this.archivedReclaimAfterMs;
     const eligible = this.options.listProjects().filter(project => {
-      if (project.executionMode !== 'e2b' || !project.sandbox) return false;
-      const lastActiveAt = project.sandbox.lastActiveAt ?? project.updatedAt;
-      const timestamp = Date.parse(lastActiveAt);
+      if (project.executionMode !== 'sandbox' || !project.sandbox) return false;
+      if (project.status !== 'completed') return false;
+      const timestamp = Date.parse(project.completedAt ?? '');
       return Number.isFinite(timestamp) && timestamp <= cutoff;
     });
     for (const project of eligible) {

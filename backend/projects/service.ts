@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import type { Project, Settings } from '../../protocol/types.js';
+import type { Project, ProjectStatus, Settings } from '../../protocol/types.js';
 import { HttpError } from '../../util/errors.js';
 import { AtomicJsonWriter } from '../infra/storage/atomic-json.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import { readRequirementInfo } from './requirements.js';
 
 export type ProjectInput = { name?: string; requirementUrl?: string | null };
-export type ProjectUpdate = Partial<ProjectInput> & { archived?: boolean };
+export type ProjectUpdate = Partial<ProjectInput> & { status?: ProjectStatus };
 
 /** Owns project records and guards operations against concurrent deletion. */
 export class ProjectService {
@@ -22,18 +22,14 @@ export class ProjectService {
   async init() {
     for (const project of await this.state.listProjects()) {
       if (!project.id || !project.name || !project.workingDirectory) throw new Error(`Invalid project state: ${project.id}`);
+      // Older records used archivedAt as a two-state flag. Keep their archive
+      // timestamp, but make the new lifecycle durable on first startup.
+      let migratedStatus = false;
+      if (!project.status) { project.status = project.archivedAt ? 'archived' : 'active'; migratedStatus = true; }
+      if (project.status === 'completed' && !project.completedAt) { project.completedAt = project.updatedAt; migratedStatus = true; }
+      if (project.status === 'archived' && !project.archivedAt) { project.archivedAt = project.updatedAt; migratedStatus = true; }
       this.records.set(project.id, project);
-      const legacy = project as Project & { retiredSandboxes?: unknown };
-      const hadRetired = Object.hasOwn(legacy, 'retiredSandboxes');
-      delete legacy.retiredSandboxes;
-      // The project document is the commit record. An unfinished copy never
-      // changes its current sandbox. Unbound candidates appear in inventory.
-      if (project.sandboxUpgrade && project.sandboxUpgrade.phase !== 'failed') {
-        const upgrade = project.sandboxUpgrade;
-        upgrade.phase = 'failed';
-        upgrade.error = '服务重启中断了数据归档或复原，当前沙箱保持不变。已完成的归档仍可使用。';
-        await this.save(project);
-      } else if (hadRetired) await this.save(project);
+      if (migratedStatus) await this.save(project);
     }
   }
 
@@ -92,32 +88,30 @@ export class ProjectService {
     return () => { this.maintenance.delete(id); };
   }
 
-  /** Serialize a durable upgrade journal independently of session snapshots. */
-  async saveUpgrade(id: string, upgrade: Project['sandboxUpgrade']): Promise<void> {
+  async archiveAndDetachSandbox(id: string, sourceId?: string): Promise<void> {
     await this.mutateSandboxMetadata(id, project => {
-      project.sandboxUpgrade = structuredClone(upgrade);
-    });
+      if (sourceId && project.sandbox?.id !== sourceId) throw new HttpError(409, '项目 Sandbox 已变化');
+      const at = new Date().toISOString();
+      delete project.sandbox;
+      project.sandboxReclaimedAt = at;
+      project.status = 'archived'; project.completedAt = null; project.archivedAt = at;
+      project.lifecycleHistory = [...(project.lifecycleHistory ?? []), { id: randomUUID(), action: 'archived', at, ...(sourceId ? { sandboxId: sourceId } : {}) }];
+    }, true);
   }
 
   async saveDataArchive(id: string, archive: NonNullable<Project['sandboxDataArchive']>): Promise<void> {
-    await this.mutateSandboxMetadata(id, project => {
-      project.sandboxDataArchive = structuredClone(archive);
-    });
+    // Record first: if the project pointer write fails, the immutable archive
+    // remains discoverable in the ledger. Historical rows are never updated.
+    await this.state.recordProjectArchive(id, archive);
+    await this.mutateSandboxMetadata(id, project => { project.sandboxDataArchive = structuredClone(archive); });
   }
 
-  async reclaimSandbox(id: string, sourceId: string): Promise<void> {
-    await this.mutateSandboxMetadata(id, project => {
-      if (project.sandbox?.id !== sourceId || project.sandboxDataArchive?.sourceSandboxId !== sourceId
-        || project.sandboxUpgrade?.kind !== 'reclaim' || !this.maintenance.has(id)) {
-        throw new HttpError(409, '回收记录与当前沙箱或归档不一致');
-      }
-      delete project.sandbox;
-      delete project.sandboxUpgrade;
-      project.sandboxReclaimedAt = new Date().toISOString();
-    });
+  latestDataArchive(id: string) {
+    this.get(id);
+    return this.state.latestProjectArchive(id);
   }
 
-  private async mutateSandboxMetadata(id: string, mutate: (project: Project) => void) {
+  private async mutateSandboxMetadata(id: string, mutate: (project: Project) => void, commitLifecycle = false) {
     await this.writer.run(id, async () => {
       const current = this.records.get(id);
       if (!current || this.deleting.has(id)) throw new HttpError(409, '项目已删除或正在删除');
@@ -132,8 +126,13 @@ export class ProjectService {
       // reserved its own write while storage was pending.
       current.sandbox = next.sandbox;
       current.sandboxDataArchive = next.sandboxDataArchive;
-      current.sandboxUpgrade = next.sandboxUpgrade;
       current.sandboxReclaimedAt = next.sandboxReclaimedAt;
+      if (commitLifecycle) {
+        current.status = next.status;
+        current.completedAt = next.completedAt;
+        current.archivedAt = next.archivedAt;
+        current.lifecycleHistory = next.lifecycleHistory;
+      }
       current.updatedAt = next.updatedAt;
     });
   }
@@ -158,7 +157,7 @@ export class ProjectService {
     const now = new Date().toISOString();
     const project: Project = { id: randomUUID(), name, requirementUrl, ...(info ? { requirementStatus: info.status } : {}),
       executionMode: settings.executionMode ?? 'local', workingDirectory: settings.workingDirectory,
-      archivedAt: null, createdAt: now, updatedAt: now };
+      status: 'active', completedAt: null, archivedAt: null, createdAt: now, updatedAt: now };
     await this.import(project);
     return this.get(project.id);
   }
@@ -168,14 +167,34 @@ export class ProjectService {
     this.validate(input);
     const project = this.records.get(id)!;
     const release = this.acquire(id);
-    const previous = { name: project.name, requirementUrl: project.requirementUrl, archivedAt: project.archivedAt, updatedAt: project.updatedAt };
+    const previous = {
+      name: project.name, requirementUrl: project.requirementUrl, status: project.status, completedAt: project.completedAt, archivedAt: project.archivedAt,
+      lifecycleHistory: structuredClone(project.lifecycleHistory), updatedAt: project.updatedAt,
+    };
     const revision = (this.revisions.get(id) ?? 0) + 1;
     this.revisions.set(id, revision);
     const updatedAt = new Date().toISOString();
     try {
       if (input.name !== undefined) project.name = input.name.trim();
       if (input.requirementUrl !== undefined) project.requirementUrl = input.requirementUrl;
-      if (input.archived !== undefined) project.archivedAt = input.archived ? project.archivedAt ?? updatedAt : null;
+      const requestedStatus = input.status;
+      if (requestedStatus !== undefined && requestedStatus !== project.status) {
+        const from = project.status;
+        const to = requestedStatus;
+        if (!((from === 'active' && to === 'completed') || (from === 'completed' && to === 'active')
+          || (from === 'archived' && to === 'active' && project.executionMode === 'local'))) {
+          throw new HttpError(409, '项目只能在“使用中”和“已完成”之间切换；归档项目请使用恢复操作');
+        }
+        project.status = to;
+        project.completedAt = to === 'completed' ? updatedAt : null;
+        if (to === 'active') project.archivedAt = null;
+        if (from !== to) {
+          project.lifecycleHistory = [...(project.lifecycleHistory ?? []), {
+            id: randomUUID(), action: to === 'completed' ? 'completed' : 'restored', at: updatedAt,
+            ...(project.sandbox ? { sandboxId: project.sandbox.id } : {}),
+          }];
+        }
+      }
       project.updatedAt = updatedAt;
       await this.save(project);
       return this.get(id);
@@ -184,34 +203,32 @@ export class ProjectService {
       if (this.revisions.get(id) === revision) {
         project.name = previous.name;
         project.requirementUrl = previous.requirementUrl;
+        project.status = previous.status;
+        project.completedAt = previous.completedAt;
         project.archivedAt = previous.archivedAt;
+        project.lifecycleHistory = previous.lifecycleHistory;
         if (project.updatedAt === updatedAt) project.updatedAt = previous.updatedAt;
       }
       throw error;
     } finally { release(); }
   }
 
-  async updateSandbox(id: string, sandbox: NonNullable<Project['sandbox']>): Promise<boolean> {
+  async updateSandbox(id: string, sandbox: NonNullable<Project['sandbox']>, restoreProject = false): Promise<boolean> {
     const project = this.records.get(id);
     if (!project || this.deleting.has(id)) return false;
     await this.mutateSandboxMetadata(id, next => {
-      if (next.sandbox && next.sandbox.id !== sandbox.id) {
-        const upgrade = next.sandboxUpgrade;
-        if (!upgrade || upgrade.source?.id !== next.sandbox.id || upgrade.target?.id !== sandbox.id || upgrade.phase !== 'verifying') {
-          throw new HttpError(409, '沙箱替换没有已验证的升级记录');
-        }
-        delete next.sandboxUpgrade;
-      }
-      if (!next.sandbox && next.sandboxReclaimedAt) {
-        const operation = next.sandboxUpgrade;
-        if (operation?.phase !== 'verifying' || operation.target?.id !== sandbox.id) {
-          throw new HttpError(409, '已回收项目只能绑定经过验证的复原环境');
-        }
-        delete next.sandboxUpgrade;
-      }
       delete next.sandboxReclaimedAt;
       next.sandbox = structuredClone(sandbox);
-    });
+      if (restoreProject && next.status === 'archived') {
+        const at = new Date().toISOString();
+        next.status = 'active';
+        next.completedAt = null;
+        next.archivedAt = null;
+        next.lifecycleHistory = [...(next.lifecycleHistory ?? []), {
+          id: randomUUID(), action: 'restored', at, sandboxId: sandbox.id,
+        }];
+      }
+    }, restoreProject);
     return !this.deleting.has(id);
   }
 

@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
-import type { Sandbox, SandboxInfo } from 'e2b';
-import { E2BSandboxManager, type SandboxProvider } from '@swarm-hive/sandbox';
+import type { SandboxHandle, SandboxInfo } from '@swarm-hive/sandbox';
+import { SandboxManager, type SandboxProvider } from '@swarm-hive/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { Session, Turn } from '../../protocol/types.js';
-import { E2BCodexRuntime, TurnObserverDetached } from '../execution/e2b-runtime.js';
+import { ContainerCodexRuntime, TurnObserverDetached } from '../execution/container-runtime.js';
 import { runTurn } from '../execution/runner.js';
 import { ProjectSandboxes } from './project-sandboxes.js';
 import type { WorkspaceTarget } from './types.js';
@@ -18,7 +18,7 @@ function fixture() {
     setTimeout: async () => { counts.renew++; },
     files: { exists: async () => { assert.fail('workspace reads must not inspect the Codex installation'); } },
     commands: { run: async () => ({ stdout: JSON.stringify({ confirmed: true }) }) },
-  } as unknown as Sandbox;
+  } as unknown as SandboxHandle;
   const provider: SandboxProvider = {
     create: async () => { counts.create++; return sandbox; },
     connect: async () => { counts.connect++; return sandbox; },
@@ -27,7 +27,7 @@ function fixture() {
     kill: async () => { counts.kill++; return true; },
     pause: async () => true,
   };
-  const manager = new E2BSandboxManager({ connection: {}, provider });
+  const manager = new SandboxManager({ provider });
   const projects = new ProjectSandboxes(manager, 'base');
   const target: WorkspaceTarget = { id: randomUUID(), projectId: randomUUID(),
     settings: { workingDirectory: '/home/user/workspace' }, updatedAt: new Date().toISOString() };
@@ -74,7 +74,7 @@ test('workspace file reads use a protected lease without requiring Codex or a mo
     await finished;
     return { exitCode: 0, stderr: '', stdout: JSON.stringify({ path: '/home/user/workspace/result.txt', size: 2, data: Buffer.from('ok').toString('base64') }) };
   }) as unknown as typeof sandbox.commands.run;
-  const runtime = new E2BCodexRuntime({ connection: {}, template: 'base', apiKey: '', sandboxes: projects });
+  const runtime = new ContainerCodexRuntime({ provider: fixture().provider, apiKey: '', sandboxes: projects });
   try {
     const result = runtime.file(target, '/home/user/workspace/result.txt');
     await reading;
@@ -90,13 +90,13 @@ test('workspace file reads use a protected lease without requiring Codex or a mo
 test('detached worker usage remains busy until recovery observes its completion', async () => {
   const { counts, manager, projects, target, record } = fixture();
   const turn: Turn = { id: randomUUID(), prompt: 'test', images: [], items: [], status: 'running', startedAt: target.updatedAt,
-    execution: { kind: 'e2b-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'detached', sandboxId: record.id } };
+    execution: { kind: 'sandbox-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'detached', sandboxId: record.id } };
   const session: Session = { ...target, sandbox: record, title: 'test', threadId: null, status: 'running',
     startedAt: target.updatedAt, createdAt: target.updatedAt, archivedAt: null, turns: [turn],
-    settings: { ...target.settings, executionMode: 'e2b', model: 'test', modelReasoningEffort: 'low',
+    settings: { ...target.settings, executionMode: 'sandbox', model: 'test', modelReasoningEffort: 'low',
       sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: false } };
   const save = async () => {};
-  const runtime = new E2BCodexRuntime({ connection: {}, template: 'base', apiKey: '', sandboxes: projects });
+  const runtime = new ContainerCodexRuntime({ provider: fixture().provider, apiKey: '', sandboxes: projects });
   runtime.track(session, save);
   runtime.trackExecution(session, turn);
   try {
@@ -114,10 +114,10 @@ test('detached worker usage remains busy until recovery observes its completion'
 test('stopping during recovery connection still terminates the original worker and releases its hold', async () => {
   const { sandbox, provider, projects, target, record } = fixture();
   const turn: Turn = { id: randomUUID(), prompt: 'test', images: [], items: [], status: 'running', startedAt: target.updatedAt,
-    execution: { kind: 'e2b-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'detached', sandboxId: record.id } };
+    execution: { kind: 'sandbox-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'detached', sandboxId: record.id } };
   const session: Session = { ...target, sandbox: record, title: 'test', threadId: null, status: 'running',
     startedAt: target.updatedAt, createdAt: target.updatedAt, archivedAt: null, turns: [turn],
-    settings: { ...target.settings, executionMode: 'e2b', model: 'test', modelReasoningEffort: 'low',
+    settings: { ...target.settings, executionMode: 'sandbox', model: 'test', modelReasoningEffort: 'low',
       sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: false } };
   let announceConnection!: () => void;
   let finishConnection!: () => void;
@@ -127,7 +127,7 @@ test('stopping during recovery connection still terminates the original worker a
   let terminations = 0;
   sandbox.commands.run = (async () => { terminations++; return { stdout: JSON.stringify({ confirmed: true }), stderr: '', exitCode: 0 }; }) as unknown as typeof sandbox.commands.run;
   const save = async () => {};
-  const runtime = new E2BCodexRuntime({ connection: {}, template: 'base', apiKey: '', sandboxes: projects });
+  const runtime = new ContainerCodexRuntime({ provider, apiKey: '', sandboxes: projects });
   runtime.track(session, save);
   const controller = new AbortController();
   const recovering = runtime.recover(session, turn, controller.signal, save).next();
@@ -144,19 +144,19 @@ test('stopping during recovery connection still terminates the original worker a
 test('an unconfirmed stop remains durable and restart retries termination without observing or launching work', async () => {
   const first = fixture();
   const turn: Turn = { id: randomUUID(), prompt: 'test', images: [], items: [], status: 'running', startedAt: first.target.updatedAt,
-    execution: { kind: 'e2b-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'detached',
+    execution: { kind: 'sandbox-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'detached',
       sandboxId: first.record.id, stopRequested: true } };
   const session: Session = { ...first.target, sandbox: first.record, title: 'test', threadId: null, status: 'running',
     startedAt: first.target.updatedAt, createdAt: first.target.updatedAt, archivedAt: null, turns: [turn],
-    settings: { ...first.target.settings, executionMode: 'e2b', model: 'test', modelReasoningEffort: 'low',
+    settings: { ...first.target.settings, executionMode: 'sandbox', model: 'test', modelReasoningEffort: 'low',
       sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: false } };
   let persisted = '';
-  const dependencies = (state: Session, runtime: E2BCodexRuntime): TurnExecutionDependencies => ({
-    client: {} as TurnExecutionDependencies['client'], e2b: runtime, recovering: true,
+  const dependencies = (state: Session, runtime: ContainerCodexRuntime): TurnExecutionDependencies => ({
+    client: {} as TurnExecutionDependencies['client'], sandbox: runtime, recovering: true,
     save: async () => { persisted = JSON.stringify(state); }, publish: () => {}, snapshot: () => structuredClone(state),
     updateSandbox: async sandbox => { state.sandbox = sandbox; },
   });
-  const runtime = new E2BCodexRuntime({ connection: {}, template: 'base', apiKey: '', sandboxes: first.projects });
+  const runtime = new ContainerCodexRuntime({ provider: first.provider, apiKey: '', sandboxes: first.projects });
   first.sandbox.commands.run = async () => { throw new Error('transport unavailable'); };
   runtime['observeWorker'] = async function* () { assert.fail('must only retry termination'); };
   try {
@@ -170,7 +170,7 @@ test('an unconfirmed stop remains durable and restart retries termination withou
 
   const restored = JSON.parse(persisted) as Session;
   const second = fixture();
-  const restarted = new E2BCodexRuntime({ connection: {}, template: 'base', apiKey: '', sandboxes: second.projects });
+  const restarted = new ContainerCodexRuntime({ provider: second.provider, apiKey: '', sandboxes: second.projects });
   restarted['observeWorker'] = async function* () { assert.fail('stop intent must survive restart'); };
   try {
     await runTurn(restored, restored.turns[0], new AbortController(), dependencies(restored, restarted));

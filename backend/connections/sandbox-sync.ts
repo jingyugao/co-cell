@@ -1,18 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import type { Sandbox } from 'e2b';
+import type { SandboxHandle } from '@swarm-hive/sandbox';
 import { CONNECTION_ENVS, CONNECTION_ROOT, type ConnectionStore } from './store.js';
 
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
-/** Uses E2B's file API for secrets; no credential values enter shell arguments. */
-export async function syncSandboxConnections(sandbox: Sandbox, store: ConnectionStore, signal: AbortSignal) {
+/** Uses the provider-neutral Sandbox file API for secrets; no credential values enter shell arguments. */
+export async function syncSandboxConnections(sandbox: SandboxHandle, store: ConnectionStore, signal: AbortSignal) {
   const bundle = await store.readRuntimeBundle();
   if (!bundle) return {};
   signal.throwIfAborted();
   const staging = `${CONNECTION_ROOT}/generation-${randomUUID()}`;
   const installer = `/tmp/codex-command-tools-${randomUUID()}.sh`;
-  const installerContents = await readFile(new URL('../../scripts/e2b/install-command-tools.sh', import.meta.url), 'utf8');
+  const installerContents = await readFile(new URL('../../scripts/sandbox/install-command-tools.sh', import.meta.url), 'utf8');
   const { importedAt: _importedAt, ...content } = bundle;
   const glabHosts = bundle.connections.filter(item => item.type === 'glab').map(item => item.host).filter((host): host is string => Boolean(host));
   const envs = { ...CONNECTION_ENVS, ...(glabHosts.length === 1 ? { GITLAB_HOST: `https://${glabHosts[0]}` } : {}),
@@ -74,7 +74,7 @@ export async function syncSandboxConnections(sandbox: Sandbox, store: Connection
       stage = '配置 Kubernetes 凭据';
       await sandbox.commands.run('mkdir -p /home/user/.kube/cache && chmod 700 /home/user/.kube', { user: 'user', signal, timeoutMs: 10_000 });
     }
-    // Login shells launched by E2B and Codex both need the same non-secret paths.
+    // Login shells launched by the Sandbox and Codex both need the same non-secret paths.
     stage = '配置沙箱环境';
     const profile = `if [ "$HOME" = /home/user ]; then\n${Object.entries(envs).map(([name, value]) => `  export ${name}=${quote(value)}`).join('\n')}\nfi\n`;
     await sandbox.files.write('/etc/profile.d/codex-connections.sh', profile, { user: 'root', signal });
@@ -84,7 +84,7 @@ export async function syncSandboxConnections(sandbox: Sandbox, store: Connection
   } catch {
     if (signal.aborted) throw new DOMException('任务已停止', 'AbortError');
     // Remote SDK errors can contain request headers; never forward them to UI.
-    throw new Error(`${stage}失败，请检查 E2B 连接和沙箱模板`);
+    throw new Error(`${stage}失败，请检查 Docker Sandbox 和命令工具镜像`);
   } finally {
     await sandbox.files.remove(installer, { user: 'root' }).catch(() => {});
     if (staged) await sandbox.commands.run(`if test "$(readlink ${quote(`${CONNECTION_ROOT}/current`)})" != ${quote(staging)}; then rm -rf -- ${quote(staging)} ${quote(`${staging}-link`)}; fi`, { user: 'user', timeoutMs: 10_000 }).catch(() => {});

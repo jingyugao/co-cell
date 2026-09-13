@@ -89,21 +89,25 @@ test('raw PNG previews preserve inline image content and MIME type', async () =>
   assert.deepEqual(calls, [undefined]);
 });
 
-test('reclaim endpoint starts the guarded backup and sandbox reclaim operation', async () => {
+test('rebuild endpoint returns the newly bound Sandbox for an archived project', async () => {
   const calls: string[] = [];
   const app = new Hono();
   installProjectsRoutes(app, {
-    reclaimProjectSandbox: async (projectId: string) => {
+    rebuildProjectSandbox: async (projectId: string) => {
       calls.push(projectId);
-      return { id: projectId, sandboxUpgrade: { kind: 'reclaim', phase: 'archiving' } } as never;
+      return { id: projectId, sandbox: { id: 'new-sandbox', status: 'ready' } } as never;
     },
   } as unknown as Parameters<typeof installProjectsRoutes>[1]);
 
-  const response = await app.request('/api/projects/project-to-reclaim/sandbox/reclaim', { method: 'POST' });
+  const response = await app.request('/api/projects/project-to-rebuild/sandbox/rebuild', { method: 'POST' });
   assert.equal(response.status, 202);
-  assert.deepEqual(calls, ['project-to-reclaim']);
+  assert.deepEqual(calls, ['project-to-rebuild']);
   assert.deepEqual(await response.json(), {
-    id: 'project-to-reclaim',
-    sandboxUpgrade: { kind: 'reclaim', phase: 'archiving' },
+    id: 'project-to-rebuild',
+    sandbox: { id: 'new-sandbox', status: 'ready' },
   });
+
+  for (const removed of ['archive', 'restore', 'reclaim']) {
+    assert.equal((await app.request(`/api/projects/project-to-rebuild/sandbox/${removed}`, { method: 'POST' })).status, 404);
+  }
 });

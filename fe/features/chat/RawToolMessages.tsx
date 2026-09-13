@@ -62,7 +62,7 @@ export default function RawToolMessages({ sessionId, onClose }: { sessionId: str
   const [messages, setMessages] = useState<RawToolMessage[]>([]);
   const [availability, setAvailability] = useState<RawToolPage['availability']>('pending');
   const [threadId, setThreadId] = useState<string | null>(null);
-  const [location, setLocation] = useState<'local' | 'e2b'>('local');
+  const [location, setLocation] = useState<'local' | 'sandbox'>('local');
   const [sandboxId, setSandboxId] = useState<string | undefined>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -105,12 +105,12 @@ export default function RawToolMessages({ sessionId, onClose }: { sessionId: str
 
   return <aside className="raw-tools-panel" aria-label="原始工具消息">
     <header className="raw-tools-heading"><h2>原始工具消息</h2><button type="button" disabled={!sessionId} onClick={() => setReload(value => value + 1)} title="从头重新读取会话日志">重新读取</button><button type="button" className="icon-button" aria-label="关闭原始工具消息" onClick={onClose}>✕</button></header>
-    <div className="raw-tools-content"><div className="raw-tools-source"><strong>{location === 'e2b' ? 'Codex E2B 会话记录' : 'Codex 本机会话记录'}</strong><p>展示 Agent 实际发出的工具调用及返回结果：包含 exec 输入代码、函数参数和输出。按 call_id 关联，独立于 页面的执行摘要。</p>{sandboxId && <p className="raw-tools-thread">E2B: <code>{sandboxId}</code></p>}{threadId && <p className="raw-tools-thread">Thread: <code>{threadId}</code></p>}<span>{messages.length} 条消息 · {groups.length} 组调用 / 输出{sessionId && ' · 每 1.5 秒刷新'}</span></div>
+    <div className="raw-tools-content"><div className="raw-tools-source"><strong>{location === 'sandbox' ? 'Codex Sandbox 会话记录' : 'Codex 本机会话记录'}</strong><p>展示 Agent 实际发出的工具调用及返回结果：包含 exec 输入代码、函数参数和输出。按 call_id 关联，独立于 页面的执行摘要。</p>{sandboxId && <p className="raw-tools-thread">Sandbox: <code>{sandboxId}</code></p>}{threadId && <p className="raw-tools-thread">Thread: <code>{threadId}</code></p>}<span>{messages.length} 条消息 · {groups.length} 组调用 / 输出{sessionId && ' · 每 1.5 秒刷新'}</span></div>
       {error && <div className="inline-error" role="alert">{error}<button type="button" className="raw-tool-retry" onClick={() => setReload(value => value + 1)}>重试</button></div>}
       {skippedLines > 0 && <p className="raw-tool-note">有 {skippedLines} 行日志无法解析，已跳过；已读取的工具消息仍可查看。</p>}
       {!sessionId ? <div className="raw-tools-empty">开始任务或选择已有会话后查看原始工具消息。</div>
         : loading && !messages.length ? <div className="raw-tools-empty" role="status"><span className="spinner" />正在读取原始工具消息…</div>
-          : !messages.length && !error ? <div className="raw-tools-empty" role="status">{availability === 'missing' ? (location === 'e2b' ? '未找到此任务的 E2B 会话记录，沙箱或记录可能已不可用。' : '未找到此会话的本机记录。记录可能已移除，或来自其他设备。') : availability === 'pending' ? '正在等待 Codex 会话记录，生成后会自动显示。' : '此会话记录中暂时没有工具调用或工具输出。'}</div> : null}
+          : !messages.length && !error ? <div className="raw-tools-empty" role="status">{availability === 'missing' ? (location === 'sandbox' ? '未找到此任务的 Sandbox 会话记录，沙箱或记录可能已不可用。' : '未找到此会话的本机记录。记录可能已移除，或来自其他设备。') : availability === 'pending' ? '正在等待 Codex 会话记录，生成后会自动显示。' : '此会话记录中暂时没有工具调用或工具输出。'}</div> : null}
       <div className="raw-tools-list">{groups.map((exchange, index) => <ToolExchangeView key={exchange.key} exchange={exchange} initiallyOpen={index === 0} />)}</div>
     </div>
   </aside>;

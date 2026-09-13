@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef } from 'react';
 import type { ProjectSummary } from '../../../protocol/types';
+import { projectDisplayName, projectTypeLabel } from '../../../util/project-types';
 import { Icon } from '../../components/Icon';
 import './ProjectPicker.css';
 
@@ -21,13 +22,13 @@ export default function ProjectPicker({ projects, selected, onSelect }: {
     return () => document.removeEventListener('pointerdown', closeOutside);
   }, []);
   const option = (project: ProjectSummary) => <button key={project.id} type="button"
-    className="project-switcher-option" aria-pressed={project.id === selected} title={project.name}
+    className="project-switcher-option" aria-pressed={project.id === selected} title={projectDisplayName(project)}
     onClick={() => {
       onSelect(project.id);
       if (root.current) root.current.open = false;
       trigger.current?.focus();
     }}>
-    <span>{project.name}</span>{project.id === selected && <Icon name="check" size={14} />}
+    <span>{projectDisplayName(project)}<small>{projectTypeLabel(project.type, project.weekOf)}</small></span>{project.id === selected && <Icon name="check" size={14} />}
   </button>;
   return <details className="project-switcher" ref={root}
     onKeyDown={event => {

@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import type { Project, ProjectStatus, Settings } from '../../protocol/types.js';
+import type { Project, ProjectStatus, ProjectType, Settings } from '../../protocol/types.js';
+import { projectWeekOf } from '../../util/project-types.js';
 import { HttpError } from '../../util/errors.js';
 import { AtomicJsonWriter } from '../infra/storage/atomic-json.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import { readRequirementInfo } from './requirements.js';
 
-export type ProjectInput = { name?: string; requirementUrl?: string | null };
+export type ProjectInput = { name?: string; requirementUrl?: string | null; type?: ProjectType };
 export type ProjectUpdate = Partial<ProjectInput> & { status?: ProjectStatus };
 
 /** Owns project records and guards operations against concurrent deletion. */
@@ -16,8 +17,9 @@ export class ProjectService {
   private operations = new Map<string, number>();
   private activeSessions = new Map<string, Set<string>>();
   private maintenance = new Set<string>();
+  private creatingWeeklyProjects = new Set<string>();
   private writer = new AtomicJsonWriter();
-  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo) {}
+  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo, private now: () => Date = () => new Date()) {}
 
   async init() {
     for (const project of await this.state.listProjects()) {
@@ -28,6 +30,7 @@ export class ProjectService {
       if (!project.status) { project.status = project.archivedAt ? 'archived' : 'active'; migratedStatus = true; }
       if (project.status === 'completed' && !project.completedAt) { project.completedAt = project.updatedAt; migratedStatus = true; }
       if (project.status === 'archived' && !project.archivedAt) { project.archivedAt = project.updatedAt; migratedStatus = true; }
+      if (!project.type) { project.type = project.requirementUrl ? 2 : 1; migratedStatus = true; }
       this.records.set(project.id, project);
       if (migratedStatus) await this.save(project);
     }
@@ -144,28 +147,43 @@ export class ProjectService {
       try { url = new URL(input.requirementUrl); } catch { throw new HttpError(400, '需求链接须为 HTTP 或 HTTPS URL'); }
       if (!['http:', 'https:'].includes(url.protocol) || input.requirementUrl.length > 4096) throw new HttpError(400, '需求链接须为 HTTP 或 HTTPS URL');
     }
+    if (input.type !== undefined && ![1, 2, 3].includes(input.type)) throw new HttpError(400, '项目类型无效');
   }
 
   async create(input: ProjectInput, settings: Settings): Promise<Project> {
     // A bound project's name is authoritative requirement metadata, fetched before any state is saved.
+    const type = input.type ?? (input.requirementUrl ? 2 : 1);
     const requirementUrl = input.requirementUrl?.trim() || null;
-    this.validate({ requirementUrl });
-    const info = requirementUrl ? await this.requirementInfo(requirementUrl) : null;
-    const name = info?.name ?? input.name?.trim();
-    if (!name) throw new HttpError(400, '请输入项目名称或绑定飞书需求');
-    this.validate({ name });
-    const now = new Date().toISOString();
-    const project: Project = { id: randomUUID(), name, requirementUrl, ...(info ? { requirementStatus: info.status } : {}),
-      executionMode: settings.executionMode ?? 'local', workingDirectory: settings.workingDirectory,
-      status: 'active', completedAt: null, archivedAt: null, createdAt: now, updatedAt: now };
-    await this.import(project);
-    return this.get(project.id);
+    this.validate({ requirementUrl, type });
+    if (type === 2 && !requirementUrl) throw new HttpError(400, '飞书项目必须绑定飞书需求');
+    if (type !== 2 && requirementUrl) throw new HttpError(400, '只有飞书项目可以绑定飞书需求');
+    const weekOf = type === 3 ? projectWeekOf(this.now()) : undefined;
+    if (weekOf && (this.creatingWeeklyProjects.has(weekOf) || this.list().some(project => project.type === 3 && project.weekOf === weekOf))) {
+      throw new HttpError(409, '本周项目已存在，每周只能创建一个');
+    }
+    if (weekOf) this.creatingWeeklyProjects.add(weekOf);
+    try {
+      const info = requirementUrl ? await this.requirementInfo(requirementUrl) : null;
+      const name = info?.name ?? input.name?.trim();
+      if (!name) throw new HttpError(400, '请输入项目名称或绑定飞书需求');
+      this.validate({ name });
+      const now = this.now().toISOString();
+      const project: Project = { id: randomUUID(), name, type, ...(weekOf ? { weekOf } : {}), requirementUrl, ...(info ? { requirementStatus: info.status } : {}),
+        executionMode: settings.executionMode ?? 'local', workingDirectory: settings.workingDirectory,
+        status: 'active', completedAt: null, archivedAt: null, createdAt: now, updatedAt: now };
+      await this.import(project);
+      return this.get(project.id);
+    } finally { if (weekOf) this.creatingWeeklyProjects.delete(weekOf); }
   }
 
   async update(id: string, input: ProjectUpdate): Promise<Project> {
     this.get(id);
     this.validate(input);
     const project = this.records.get(id)!;
+    if (input.requirementUrl !== undefined) {
+      if (project.type === 2 && !input.requirementUrl?.trim()) throw new HttpError(400, '飞书项目必须绑定飞书需求');
+      if (project.type !== 2 && input.requirementUrl) throw new HttpError(400, '只有飞书项目可以绑定飞书需求');
+    }
     const release = this.acquire(id);
     const previous = {
       name: project.name, requirementUrl: project.requirementUrl, status: project.status, completedAt: project.completedAt, archivedAt: project.archivedAt,

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { Project, Session } from '../../protocol/types.js';
+import type { Project, Session, Settings } from '../../protocol/types.js';
+import { projectTypeLabel, weeklyProjectDisplayName } from '../../util/project-types.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import { ProjectService } from './service.js';
 
@@ -61,4 +62,29 @@ test('an archived Sandbox project cannot change status directly before rebuild',
   await assert.rejects(service.update(value.id, { status: 'active' }), /归档项目请使用恢复操作/);
   assert.equal(service.get(value.id).archivedAt, value.archivedAt);
   assert.equal(service.get(value.id).lifecycleHistory, undefined);
+});
+
+test('weekly projects are unique per China week and become last-week projects in the following week', async () => {
+  let now = new Date('2026-09-13T10:00:00.000Z'); // Sunday evening in China
+  const service = new ProjectService(new MemoryState([]), async () => ({ name: 'unused', status: null }), () => now);
+  await service.init();
+  const settings = { executionMode: 'sandbox', workingDirectory: '/home/user/workspace' } as Settings;
+
+  const weekly = await service.create({ name: '本周重点', type: 3 }, settings);
+  assert.equal(weekly.weekOf, '2026-09-07');
+  await assert.rejects(service.create({ name: '重复本周项目', type: 3 }, settings), /每周只能创建一个/);
+
+  now = new Date('2026-09-14T10:00:00.000Z');
+  assert.equal(projectTypeLabel(weekly.type, weekly.weekOf, now), '上周项目');
+  assert.equal(weeklyProjectDisplayName(weekly.weekOf, now), '【上周项目】');
+  assert.equal(weeklyProjectDisplayName(weekly.weekOf, new Date('2026-09-28T10:00:00.000Z')), '【9月第2周项目】');
+  const next = await service.create({ name: '下周重点', type: 3 }, settings);
+  assert.equal(next.weekOf, '2026-09-14');
+  assert.equal(projectTypeLabel(next.type, next.weekOf, now), '本周项目');
+});
+
+test('Feishu projects require a requirement link', async () => {
+  const service = new ProjectService(new MemoryState([]));
+  await service.init();
+  await assert.rejects(service.create({ name: 'missing requirement', type: 2 }, { workingDirectory: '/tmp' } as Settings), /必须绑定飞书需求/);
 });

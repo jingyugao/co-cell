@@ -32,7 +32,7 @@ export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, '
 
   const projectSchema = z.object({ name: z.string().trim().min(1).max(100), requirementUrl: z.string().trim().max(4096).url().refine(value => /^https?:\/\//i.test(value), '仅支持 HTTP 或 HTTPS 链接').nullable().optional() }).strict();
   app.get('/api/projects', c => c.json(manager.listProjects()));
-  const createSchema = projectSchema.extend({ name: z.string().trim().max(100).optional() })
+  const createSchema = projectSchema.extend({ name: z.string().trim().max(100).optional(), type: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional() })
     .refine(input => Boolean(input.name || input.requirementUrl), '请输入项目名称或绑定飞书需求');
   app.post('/api/projects', async c => c.json(await manager.createProject(createSchema.parse(await c.req.json())), 201));
   app.get('/api/projects/:id', c => c.json(manager.getProject(c.req.param('id'))));

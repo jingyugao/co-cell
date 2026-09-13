@@ -102,10 +102,16 @@ export interface Turn {
   };
 }
 export type ProjectStatus = 'active' | 'completed' | 'archived';
+/** 1: ordinary, 2: Feishu requirement, 3: weekly project. */
+export type ProjectType = 1 | 2 | 3;
 
 export interface Project {
   id: string;
   name: string;
+  /** Missing values are legacy ordinary projects. */
+  type?: ProjectType;
+  /** Monday in Asia/Shanghai for type 3 projects. */
+  weekOf?: string;
   requirementUrl: string | null;
   /** Current status of the linked Feishu (Meegle) work item, when available. */
   requirementStatus?: string | null;

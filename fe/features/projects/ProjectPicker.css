@@ -7,7 +7,7 @@
 .project-switcher-heading { padding: 8px 6px; font-size: 11px; color: #7d8171; }
 .project-switcher-heading > span { margin-left: 5px; font-size: 10px; }
 .project-switcher-option { display: flex; align-items: center; gap: 6px; width: 100%; padding: 9px 8px; border-radius: 5px; text-align: left; font-size: 12px; }
-.project-switcher-option > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.project-switcher-option > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }.project-switcher-option small{display:block;margin-top:3px;font-size:10px;color:#89967b}
 .project-switcher-option:hover { background: #eeefe7; }
 .project-switcher-option[aria-pressed="true"] { background: #e5e9da; color: #333d27; }
 .project-switcher-empty { margin: 4px 6px 10px; font-size: 11px; color: #8b8d7e; }

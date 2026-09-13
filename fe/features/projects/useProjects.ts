@@ -1,8 +1,8 @@
 import { useCallback, useState } from 'react';
-import type { ProjectStatus, ProjectSummary } from '../../../protocol/types';
+import type { ProjectStatus, ProjectSummary, ProjectType } from '../../../protocol/types';
 import { api } from '../../lib/api';
 
-export type ProjectValues = { name: string; requirementUrl: string | null };
+export type ProjectValues = { name: string; requirementUrl: string | null; type: ProjectType };
 export type ProjectUpdate = Partial<ProjectValues> & { status?: ProjectStatus };
 
 export function useProjects() {

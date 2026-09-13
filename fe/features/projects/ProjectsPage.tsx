@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import type { AppConfig, ProjectSummary } from '../../../protocol/types';
+import type { AppConfig, ProjectSummary, ProjectType } from '../../../protocol/types';
+import { projectDisplayName, projectTypeLabel } from '../../../util/project-types';
 import type { ProjectValues, ProjectUpdate } from './useProjects';
 import { groupArchivedProjectsByWeek } from './project-groups';
 import './ProjectsPage.css';
@@ -25,13 +26,15 @@ const duration = (value: number | undefined, fallback: string) => value == null 
 function ProjectForm({ initial, busy, onSubmit, onCancel }: {
   initial?: ProjectSummary;
   busy: boolean;
-  onSubmit: (values: { name: string; requirementUrl: string | null }) => Promise<void>;
+  onSubmit: (values: ProjectValues) => Promise<void>;
   onCancel: () => void;
 }) {
   const [name, setName] = useState(initial?.name ?? '');
   const [url, setUrl] = useState(initial?.requirementUrl ?? '');
+  const [type, setType] = useState<ProjectType>(initial?.type ?? (initial?.requirementUrl ? 2 : 1));
   const [error, setError] = useState('');
-  const automaticName = !initial && Boolean(url.trim());
+  const feishu = type === 2;
+  const automaticName = !initial && feishu;
   const input = useRef<HTMLInputElement>(null);
   useEffect(() => { input.current?.focus(); }, []);
   return <form className="project-form" aria-label={initial ? `编辑项目 ${initial.name}` : '创建项目'} onKeyDown={event => {
@@ -39,18 +42,20 @@ function ProjectForm({ initial, busy, onSubmit, onCancel }: {
   }} onSubmit={async event => {
     event.preventDefault();
     const trimmedName = name.trim();
-    if (!automaticName && !trimmedName) { setError('请输入项目名称。'); input.current?.focus(); return; }
-    if (url.trim()) {
+    if (!feishu && !trimmedName) { setError('请输入项目名称。'); input.current?.focus(); return; }
+    if (feishu && !url.trim()) { setError('飞书项目必须绑定飞书需求。'); return; }
+    if (feishu && url.trim()) {
       try { const parsed = new URL(url.trim()); if (!['https:', 'http:'].includes(parsed.protocol)) throw new Error(); }
       catch { setError('请输入有效的 HTTP 或 HTTPS 需求链接。'); return; }
     }
     setError('');
-    try { await onSubmit({ name: automaticName ? '' : trimmedName, requirementUrl: url.trim() || null }); }
+    try { await onSubmit({ name: automaticName ? '' : trimmedName, requirementUrl: feishu ? url.trim() : null, type }); }
     catch (err) { setError(err instanceof Error ? err.message : '保存失败，请重试。'); }
   }}>
-    <label>项目名称<input ref={input} required={!automaticName} maxLength={100} value={automaticName ? '' : name} disabled={busy || automaticName} placeholder={automaticName ? '创建时自动使用飞书需求名称' : '例如：订单系统改造'} onChange={event => setName(event.target.value)} /></label>
-    <label>飞书需求链接 <span>选填</span><input type="url" maxLength={4096} value={url} disabled={busy} placeholder="https://…（可以暂时留空）" onChange={event => setUrl(event.target.value)} /></label>
-    {!initial && <p className="project-form-hint">填写飞书需求链接后，自动获取需求名称。项目内的会话共享一个 Sandbox，首次执行任务时创建。</p>}
+    <label>项目类型<select value={type} disabled={busy || Boolean(initial)} onChange={event => { const next = Number(event.target.value) as ProjectType; setType(next); if (!initial && next === 3 && !name.trim()) setName('本周项目'); }}><option value={1}>普通项目</option><option value={2}>飞书项目</option><option value={3}>本周项目</option></select>{initial && <span>项目类型创建后不可修改</span>}</label>
+    <label>项目名称<input ref={input} required={!automaticName} maxLength={100} value={automaticName ? '' : name} disabled={busy || automaticName} placeholder={automaticName ? '自动使用飞书需求名称' : type === 3 ? '例如：本周重点事项' : '例如：订单系统改造'} onChange={event => setName(event.target.value)} /></label>
+    {feishu && <label>飞书需求链接<input type="url" required maxLength={4096} value={url} disabled={busy} placeholder="https://…" onChange={event => setUrl(event.target.value)} /></label>}
+    {!initial && <p className="project-form-hint">飞书项目自动读取需求名称；本周项目每周只能创建一个，下一周会自动显示为上周项目。项目内会话共享一个 Sandbox，首次执行任务时创建。</p>}
     {error && <p className="project-error" role="alert">{error}</p>}
     <div className="project-form-actions"><button type="button" className="secondary-button" onClick={onCancel} disabled={busy}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? automaticName ? '正在读取飞书需求并创建…' : '保存中…' : initial ? '保存修改' : '创建并进入'}</button></div>
   </form>;
@@ -68,6 +73,8 @@ function ProjectCard({ project, onUpdate, onRebuildSandbox, onOpenProject, onSta
   const pending = useRef(false);
   const status = project.status ?? (project.archivedAt ? 'archived' : 'active');
   const archived = status === 'archived';
+  const typeLabel = projectTypeLabel(project.type, project.weekOf);
+  const displayName = projectDisplayName(project);
   const completed = status === 'completed';
   const needsRebuild = archived && project.executionMode === 'sandbox' && !project.sandbox;
   const canRebuild = needsRebuild && !project.sandbox && !project.activeSessionId;
@@ -99,10 +106,10 @@ function ProjectCard({ project, onUpdate, onRebuildSandbox, onOpenProject, onSta
     : archived ? '已归档，需先重建'
     : project.executionMode === 'local' ? '本地运行' : '首次执行任务时创建';
 
-  return <article className={`project-card ${archived ? 'archived' : ''}`} aria-label={project.name}>
-    <div className="project-card-heading"><span className="project-folder" aria-hidden="true">▱</span><div className="project-card-statuses">{archived && <span className="project-archived-badge">已归档</span>}<span className={`project-status ${project.activeSessionId ? 'active' : ''}`}>{project.activeSessionId ? '任务执行中' : project.sandbox ? states[project.sandbox.status] : archived ? '无 Sandbox' : project.executionMode === 'local' ? '本地项目' : '等待首次执行'}</span></div></div>
-    <h2>{openDisabled ? <span className="project-title-disabled">{project.name}</span> : <button className="project-title-button" onClick={() => onOpenProject(project.id)}>{project.name}</button>}</h2>
-    {project.requirementUrl && /^https?:\/\//i.test(project.requirementUrl) ? <div className="project-requirement-wrap"><a className="project-requirement" href={project.requirementUrl} target="_blank" rel="noopener noreferrer" title={project.requirementUrl}>飞书需求 ↗<span>{project.requirementUrl}</span></a>{project.requirementStatus && <p className="project-requirement-status"><span>飞书项目状态</span><strong>{project.requirementStatus}</strong></p>}</div> : <p className="project-unlinked">暂未关联飞书需求</p>}
+  return <article className={`project-card ${archived ? 'archived' : ''}`} aria-label={displayName}>
+    <div className="project-card-heading"><span className="project-folder" aria-hidden="true">▱</span><div className="project-card-statuses"><span className="project-type-badge">{typeLabel}</span>{archived && <span className="project-archived-badge">已归档</span>}<span className={`project-status ${project.activeSessionId ? 'active' : ''}`}>{project.activeSessionId ? '任务执行中' : project.sandbox ? states[project.sandbox.status] : archived ? '无 Sandbox' : project.executionMode === 'local' ? '本地项目' : '等待首次执行'}</span></div></div>
+    <h2>{openDisabled ? <span className="project-title-disabled">{displayName}</span> : <button className="project-title-button" onClick={() => onOpenProject(project.id)}>{displayName}</button>}</h2>
+    {project.requirementUrl && /^https?:\/\//i.test(project.requirementUrl) ? <div className="project-requirement-wrap"><a className="project-requirement" href={project.requirementUrl} target="_blank" rel="noopener noreferrer" title={project.requirementUrl}>飞书需求 ↗<span>{project.requirementUrl}</span></a>{project.requirementStatus && <p className="project-requirement-status"><span>飞书项目状态</span><strong>{project.requirementStatus}</strong></p>}</div> : project.type === 2 ? <p className="project-unlinked">飞书需求待绑定</p> : <p className="project-unlinked">{typeLabel}</p>}
     <dl className="project-details"><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div><div><dt>归档时间</dt><dd>{project.archivedAt ? <time dateTime={project.archivedAt}>{date(project.archivedAt)}</time> : '尚未归档'}</dd></div></dl>
     {editing ? <ProjectForm initial={project} busy={busy} onCancel={stopEditing} onSubmit={async values => {
       setBusy(true);

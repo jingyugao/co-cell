@@ -310,6 +310,9 @@ export class SessionManager {
     // A failed native turn is historical execution state, not a chat message.
     // The browser separately shows a submission failure from its current page
     // when it cannot connect before Codex accepts the turn.
+    // App Server's thread/turns/list currently returns most-recent first,
+    // while the durable UI transcript is chronological. Keep this boundary
+    // explicit so a native-history refresh cannot reverse the conversation.
     const mapped = native.turns.filter(turn => turn.status !== 'failed').map(turn => {
       const stored = previous.find(old => old.id === turn.id || old.nativeTurnId === turn.id || (Date.parse(turn.startedAt) >= Date.parse(old.startedAt)
         && Date.parse(turn.startedAt) <= Date.parse(old.completedAt ?? new Date().toISOString())));
@@ -326,7 +329,7 @@ export class SessionManager {
           const old = stored.contextUsage?.find(value => call.responseId && value.responseId === call.responseId);
           return old ? { ...old, ...call } : call;
         }) };
-    });
+    }).sort((left, right) => left.startedAt.localeCompare(right.startedAt));
     const live = previous.find(turn => turn.id === liveId);
     if (live && !mapped.some(turn => turn.id === live.id)) mapped.push(live);
     session.turns = mapped;
@@ -672,9 +675,8 @@ export class SessionManager {
         if (!imageRoots.some(root => path.startsWith(root))) throw new HttpError(400, '只能使用此会话上传的图片');
       }
       const turn: Turn = { id: randomUUID(), prompt, images, codexAccepted: false, status: 'running', phase: 'starting', items: [], itemTimestamps: {}, startedAt: new Date().toISOString() };
-      if (session.settings.executionMode === 'sandbox') turn.execution = {
-        kind: 'sandbox-worker', protocolVersion: 1, workerId: randomUUID(), lastAppliedSeq: 0, state: 'launching',
-      };
+      // The Sandbox owns a long-lived App Server. Web holds the live RPC
+      // connection, so there is no per-turn worker process to persist.
       execution.turnId = turn.id;
       session.turns.push(turn);
       session.status = 'running';

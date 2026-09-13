@@ -1,7 +1,9 @@
 import { createServer } from 'node:http';
 import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
-import { Codex } from '../packages/agentcore/src/index.mjs';
+import { access, chmod, mkdir, writeFile } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { Codex, appServerArgs } from '../packages/agentcore/src/index.mjs';
 import { getRequestListener } from '@hono/node-server';
 import { SandboxManager } from '@swarm-hive/sandbox';
 import type { AppConfig, Settings } from '../protocol/types.js';
@@ -44,12 +46,23 @@ const defaults: Settings = { executionMode: 'sandbox', workingDirectory: sandbox
   model: process.env.CODEX_MODEL || DEFAULT_MODEL, modelReasoningEffort: 'medium', sandboxMode: 'danger-full-access',
   webSearchMode: 'cached', networkAccessEnabled: true };
 const runtimeLog = new RuntimeLog({ secrets: [apiKey].filter((value): value is string => Boolean(value)) });
-const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BIN || 'docker', 'host');
+const connections = new ConnectionStore();
+await mkdir(connections.sandboxRuntimeDirectory(), { recursive: true, mode: 0o700 });
+const sandboxAppServerToken = resolve(connections.sandboxRuntimeDirectory(), 'app-server-token');
+try { await access(sandboxAppServerToken); } catch {
+  await writeFile(sandboxAppServerToken, randomBytes(32).toString('base64url'), { mode: 0o600 });
+}
+await chmod(sandboxAppServerToken, 0o644);
+const sandboxCredentialsHostDirectory = process.env.SANDBOX_CREDENTIALS_HOST_DIR || resolve(connections.sandboxRuntimeDirectory());
+const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BIN || 'docker', process.env.DOCKER_SANDBOX_NETWORK || 'swarm-hive_default', sandboxCredentialsHostDirectory,
+  process.env.SANDBOX_APP_SERVER_HOST, {
+    ...(apiKey ? { CODEX_API_KEY: apiKey } : {}), ...(process.env.OPENAI_BASE_URL ? { OPENAI_BASE_URL: process.env.OPENAI_BASE_URL } : {}),
+    CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, configOverrides).slice(1)),
+  });
 const provider = dockerSandboxProvider(dockerClient);
 const sandboxManager = new SandboxManager({ provider, logger: runtimeLog });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
 const improvements = new ImprovementStore(process.env.IMPROVEMENTS_DB_PATH ? resolve(process.env.IMPROVEMENTS_DB_PATH) : undefined);
-const connections = new ConnectionStore();
 let manager: SessionManager;
 async function submitImprovement(context: Omit<ImprovementContext, 'projectName'>, input: unknown, requestId: string): Promise<ImprovementReceipt> {
   const session = manager.get(context.sessionId);
@@ -58,7 +71,8 @@ async function submitImprovement(context: Omit<ImprovementContext, 'projectName'
   return improvements.submit({ ...context, sessionTitle: session.title, projectName: project?.name ?? null }, input, requestId);
 }
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, connections, apiKey: apiKey || '', submitImprovement,
-  logger: runtimeLog, baseUrl: process.env.OPENAI_BASE_URL, proxyKind, modelConfig, configOverrides });
+  logger: runtimeLog, baseUrl: process.env.OPENAI_BASE_URL, proxyKind, modelConfig, configOverrides,
+  appServer: id => dockerClient.appServer(id) });
 const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || 'data/web-state');
 const webImagesDirectory = resolve(process.env.CODEX_WEB_IMAGES_DIR || 'data/images');
 const archivedReclaimAfterMs = Number(process.env.SANDBOX_ARCHIVED_RECLAIM_AFTER_MS ?? 24 * 60 * 60 * 1000);

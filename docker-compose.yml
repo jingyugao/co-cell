@@ -36,7 +36,9 @@ services:
       USER: ${MEEGLE_AUTH_USER:-root}
       MYSQL_URL: mysql://${MYSQL_USER:-swarm_hive}:${MYSQL_PASSWORD:-change-me-before-production}@mysql:3306/${MYSQL_DATABASE:-swarm_hive}
       DOCKER_SANDBOX_IMAGE: ${DOCKER_SANDBOX_IMAGE:-swarm-hive-sandbox:latest}
+      DOCKER_SANDBOX_NETWORK: ${DOCKER_SANDBOX_NETWORK:-swarm-hive_default}
       SANDBOX_WORKSPACE: ${SANDBOX_WORKSPACE:-/home/user/workspace}
+      SANDBOX_CREDENTIALS_HOST_DIR: ${SANDBOX_CREDENTIALS_HOST_DIR:-${PWD}/data/credentials/sandbox-runtime}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

@@ -1,92 +1,72 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import type { SandboxHandle } from '@swarm-hive/sandbox';
-import { CONNECTION_ENVS, CONNECTION_ROOT, type ConnectionStore } from './store.js';
+import { chmod, chown, mkdir, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { randomUUID, createHash } from 'node:crypto';
+import { join, dirname } from 'node:path';
+import type { ConnectionStore } from './store.js';
 
-const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-
-/** Uses the provider-neutral Sandbox file API for secrets; no credential values enter shell arguments. */
-export async function syncSandboxConnections(sandbox: SandboxHandle, store: ConnectionStore, signal: AbortSignal) {
+/** Materialize only CLI-consumable credentials for the Sandbox's read-only mount. */
+export async function syncSandboxConnections(store: ConnectionStore) {
   const bundle = await store.readRuntimeBundle();
   if (!bundle) return {};
-  signal.throwIfAborted();
-  const staging = `${CONNECTION_ROOT}/generation-${randomUUID()}`;
-  const installer = `/tmp/codex-command-tools-${randomUUID()}.sh`;
-  const installerContents = await readFile(new URL('../../scripts/sandbox/install-command-tools.sh', import.meta.url), 'utf8');
+  const root = store.sandboxRuntimeDirectory();
+  const generationName = `generation-${randomUUID()}`;
+  const staging = join(root, generationName);
+  const current = join(root, 'current');
   const { importedAt: _importedAt, ...content } = bundle;
   const glabHosts = bundle.connections.filter(item => item.type === 'glab').map(item => item.host).filter((host): host is string => Boolean(host));
-  const envs = { ...CONNECTION_ENVS, ...(glabHosts.length === 1 ? { GITLAB_HOST: `https://${glabHosts[0]}` } : {}),
-    ...(bundle.connections.some(item => item.type === 'kubernetes') ? { KUBECONFIG: `${CONNECTION_ROOT}/current/kubernetes/config.json` } : {}),
+  const envs = {
+    GLAB_CONFIG_DIR: '/home/user/.codex-web/credentials/current/glab',
+    MYSQL_TEST_LOGIN_FILE: '/home/user/.codex-web/credentials/current/.mylogin.cnf',
+    GIT_TERMINAL_PROMPT: '0',
+    ...(glabHosts.length === 1 ? { GITLAB_HOST: `https://${glabHosts[0]}` } : {}),
+    ...(bundle.connections.some(item => item.type === 'kubernetes') ? { KUBECONFIG: '/home/user/.codex-web/credentials/current/kubernetes/config.json' } : {}),
     ...(bundle.connections.find(item => item.type === 'meegle')?.host ? { MEEGLE_HOST: bundle.connections.find(item => item.type === 'meegle')!.host! } : {}),
     ...(bundle.connections.some(item => item.type === 'lark') ? {
-      LARKSUITE_CLI_CONFIG_DIR: `${CONNECTION_ROOT}/current/lark-config`,
-      LARKSUITE_CLI_DATA_DIR: `${CONNECTION_ROOT}/current/lark-data`,
+      LARKSUITE_CLI_CONFIG_DIR: '/home/user/.codex-web/credentials/current/lark-config',
+      LARKSUITE_CLI_DATA_DIR: '/home/user/.codex-web/credentials/current/lark-data',
       LARKSUITE_CLI_DEFAULT_AS: 'bot', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1',
     } : {}),
   };
-  const version = createHash('sha256').update('connections-v1\n').update(JSON.stringify(content)).update(installerContents).update(JSON.stringify(envs)).digest('hex');
-  const cliChecks = Object.keys(bundle.cliFiles ?? {}).map(path => {
+  const cliFiles = Object.entries(bundle.cliFiles ?? {}).map(([path, value]) => {
     if (!/^(lark-config|lark-data\/lark-cli|meegle|kubernetes)\/[a-zA-Z0-9_.-]+$/.test(path)) throw new Error('凭据路径无效');
-    return ' && test -f ' + quote(CONNECTION_ROOT + '/current/' + path);
-  }).join('') + (bundle.connections.some(item => item.type === 'meegle') ? ' && test "$(readlink /home/user/.meegle/config.json)" = ' + quote(CONNECTION_ROOT + '/current/meegle/config.json') : '');
-  let staged = false;
-  // SDK errors may include request headers or command output. Keep an internal,
-  // non-sensitive stage instead so the UI can say what needs attention.
-  let stage = '检查沙箱命令工具';
+    return { path, content: Buffer.from(value, 'base64') };
+  });
+  const files = [
+    { path: 'glab/config.yml', content: Buffer.from(bundle.glabConfig) },
+    { path: 'git-credentials', content: Buffer.from(bundle.gitCredentials) },
+    { path: 'gitconfig', content: Buffer.from(bundle.gitConfig) },
+    { path: '.mylogin.cnf', content: Buffer.from(bundle.mysqlLogin ?? '', 'base64') },
+    ...cliFiles,
+  ];
+  const version = createHash('sha256').update('sandbox-credentials-v2\n').update(JSON.stringify(content)).update(JSON.stringify(envs)).digest('hex');
+  // This directory alone is bind-mounted. Its contents remain per-file private
+  // to the Sandbox's fixed UID, while the persistent credential bundle stays
+  // in its non-mounted parent directory.
+  await mkdir(root, { recursive: true, mode: 0o755 });
+  await chmod(root, 0o755);
+  await mkdir(join(staging, 'glab'), { recursive: true, mode: 0o700 });
+  await chown(staging, 1000, 1000);
+  await chown(join(staging, 'glab'), 1000, 1000);
   try {
-    const probe = await sandbox.commands.run(`if test "$(cat ${quote(`${CONNECTION_ROOT}/current/.version`)} 2>/dev/null)" = ${quote(version)} && test -f ${quote(`${CONNECTION_ROOT}/current/glab/config.yml`)} && test -f ${quote(`${CONNECTION_ROOT}/current/git-credentials`)} && test -f ${quote(`${CONNECTION_ROOT}/current/.mylogin.cnf`)} && test -f /etc/profile.d/codex-connections.sh && command -v mysql >/dev/null && command -v glab >/dev/null && command -v git >/dev/null && command -v lark-cli >/dev/null && command -v meegle >/dev/null && command -v kubectl >/dev/null${cliChecks} && git config --global --get-all include.path | grep -Fxq ${quote(`${CONNECTION_ROOT}/current/gitconfig`)}; then printf ready; fi`, { user: 'user', signal, timeoutMs: 10_000 });
-    if (probe.stdout.trim() === 'ready') return envs;
-    stage = '安装沙箱命令工具';
-    await sandbox.files.write(installer, installerContents, { user: 'root', signal });
-    await sandbox.commands.run(`bash ${quote(installer)}`, { user: 'root', signal, timeoutMs: 300_000 });
-    stage = '创建凭据目录';
-    await sandbox.commands.run(`umask 077; test ! -L ${quote(CONNECTION_ROOT)} && mkdir -p ${quote(CONNECTION_ROOT)} && chmod 700 ${quote(CONNECTION_ROOT)} && mkdir ${quote(staging)} ${quote(`${staging}/glab`)}`, { user: 'user', signal, timeoutMs: 10_000 });
-    staged = true;
-    stage = '准备凭据文件';
-    const cliFiles = Object.entries(bundle.cliFiles ?? {}).map(([path, value]) => {
-      if (!/^(lark-config|lark-data\/lark-cli|meegle|kubernetes)\/[a-zA-Z0-9_.-]+$/.test(path)) throw new Error('Invalid credential path');
-      return { path, content: new Uint8Array(Buffer.from(value, 'base64')).buffer };
-    });
-    if (cliFiles.length) await sandbox.commands.run(`mkdir -p ${[...new Set(cliFiles.map(file => `${staging}/${file.path.slice(0, file.path.lastIndexOf('/'))}`))].map(quote).join(' ')}; chmod 700 ${[...new Set(cliFiles.map(file => `${staging}/${file.path.slice(0, file.path.lastIndexOf('/'))}`))].map(quote).join(' ')}`, { user: 'user', signal, timeoutMs: 10_000 });
-    const files = [
-      { path: 'glab/config.yml', content: bundle.glabConfig },
-      { path: 'git-credentials', content: bundle.gitCredentials },
-      { path: 'gitconfig', content: bundle.gitConfig },
-      { path: '.mylogin.cnf', content: new Uint8Array(Buffer.from(bundle.mysqlLogin ?? '', 'base64')).buffer },
-      ...cliFiles,
-    ];
     for (const file of files) {
-      signal.throwIfAborted();
-      await sandbox.files.write(`${staging}/${file.path}`, file.content, { user: 'user', signal });
+      const destination = join(staging, file.path);
+      const parent = dirname(destination);
+      await mkdir(parent, { recursive: true, mode: 0o700 });
+      const segments = file.path.split('/').slice(0, -1);
+      for (let index = 1; index <= segments.length; index += 1) await chown(join(staging, ...segments.slice(0, index)), 1000, 1000);
+      await writeFile(destination, file.content, { mode: 0o600, flag: 'wx' });
+      await chown(destination, 1000, 1000);
     }
-    stage = '启用凭据文件';
-    const include = `${CONNECTION_ROOT}/current/gitconfig`;
-    // A generation is complete before switching current. Older copies are removed
-    // so deleted/rotated credentials are not left in previous managed generations.
-    await sandbox.commands.run(`set -eu; chmod 600 ${files.map(file => quote(`${staging}/${file.path}`)).join(' ')}; chmod 700 ${quote(`${staging}/glab`)}; ln -s ${quote(staging)} ${quote(`${staging}-link`)}; mv -Tf ${quote(`${staging}-link`)} ${quote(`${CONNECTION_ROOT}/current`)}; if ! git config --global --get-all include.path | grep -Fxq ${quote(include)}; then git config --global --add include.path ${quote(include)}; fi; for directory in ${quote(CONNECTION_ROOT)}/generation-*; do if test "$directory" != ${quote(staging)}; then rm -rf -- "$directory"; fi; done`, { user: 'user', signal, timeoutMs: 10_000 });
-    if (bundle.connections.some(item => item.type === 'meegle')) {
-      stage = '配置 Meegle 凭据';
-      // CLI has no config-dir override. Keep its metadata cache in its normal
-      // location and link only the managed access-token config, never HOME.
-      await sandbox.commands.run(`set -eu; mkdir -p /home/user/.meegle; chmod 700 /home/user/.meegle; target=/home/user/.meegle/config.json; if test -e "$target" && ! test -L "$target"; then echo 'Existing Meegle config requires manual migration' >&2; exit 1; fi; ln -sfn ${quote(`${CONNECTION_ROOT}/current/meegle/config.json`)} "$target"`, { user: 'user', signal, timeoutMs: 10_000 });
-    }
-    if ('KUBECONFIG' in envs) {
-      stage = '配置 Kubernetes 凭据';
-      await sandbox.commands.run('mkdir -p /home/user/.kube/cache && chmod 700 /home/user/.kube', { user: 'user', signal, timeoutMs: 10_000 });
-    }
-    // Login shells launched by the Sandbox and Codex both need the same non-secret paths.
-    stage = '配置沙箱环境';
-    const profile = `if [ "$HOME" = /home/user ]; then\n${Object.entries(envs).map(([name, value]) => `  export ${name}=${quote(value)}`).join('\n')}\nfi\n`;
-    await sandbox.files.write('/etc/profile.d/codex-connections.sh', profile, { user: 'root', signal });
-    await sandbox.commands.run('chmod 0644 /etc/profile.d/codex-connections.sh', { user: 'root', signal, timeoutMs: 10_000 });
-    await sandbox.commands.run(`umask 077; printf %s ${quote(version)} > ${quote(`${staging}/.version`)}`, { user: 'user', signal, timeoutMs: 10_000 });
+    await writeFile(join(staging, '.version'), version, { mode: 0o600, flag: 'wx' });
+    await chown(join(staging, '.version'), 1000, 1000);
+    const next = join(root, `${generationName}-link`);
+    await symlink(generationName, next);
+    await rename(next, current);
+    const entries = await readdir(root, { withFileTypes: true });
+    await Promise.all(entries.filter(entry => entry.name.startsWith('generation-') && entry.name !== generationName && entry.name !== `${generationName}-link`)
+      .map(entry => rm(join(root, entry.name), { recursive: true, force: true })));
     return envs;
-  } catch {
-    if (signal.aborted) throw new DOMException('任务已停止', 'AbortError');
-    // Remote SDK errors can contain request headers; never forward them to UI.
-    throw new Error(`${stage}失败，请检查 Docker Sandbox 和命令工具镜像`);
-  } finally {
-    await sandbox.files.remove(installer, { user: 'root' }).catch(() => {});
-    if (staged) await sandbox.commands.run(`if test "$(readlink ${quote(`${CONNECTION_ROOT}/current`)})" != ${quote(staging)}; then rm -rf -- ${quote(staging)} ${quote(`${staging}-link`)}; fi`, { user: 'user', timeoutMs: 10_000 }).catch(() => {});
+  } catch (error) {
+    await rm(staging, { recursive: true, force: true });
+    throw error;
   }
 }

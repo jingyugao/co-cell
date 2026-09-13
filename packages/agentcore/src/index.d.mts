@@ -25,7 +25,7 @@ export type AgentEvent = ThreadEvent;
 export class AppServerEventAdapter { accept(event: AppServerEvent): AgentEvent[]; }
 export type UserInput = { type: 'text'; text: string } | { type: 'local_image'; path: string };
 export type Input = string | UserInput[];
-export interface CodexOptions { codexPathOverride?: string; config?: Record<string, unknown>; configOverrides?: string[]; apiKey?: string; baseUrl?: string; env?: Record<string, string> }
+export interface CodexOptions { codexPathOverride?: string; config?: Record<string, unknown>; configOverrides?: string[]; apiKey?: string; baseUrl?: string; env?: Record<string, string>; appServerUrl?: string; appServerHeaders?: Record<string, string> }
 export interface ThreadOptions {
  model?: string; workingDirectory?: string; sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
  modelReasoningEffort?: string; webSearchMode?: 'disabled' | 'cached' | 'live'; networkAccessEnabled?: boolean;

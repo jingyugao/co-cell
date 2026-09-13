@@ -144,6 +144,7 @@ export class ConnectionStore {
     if (current.metadata.host !== expected?.host || current.metadata.profile !== expected?.username) throw new Error('本机 Meegle 身份已切换，请重新同步凭据');
     return { ...bundle, cliFiles: { ...bundle.cliFiles, 'meegle/config.json': Buffer.from(current.configText).toString('base64') } };
   }
+  sandboxRuntimeDirectory() { return join(this.directory, 'sandbox-runtime'); }
   async recordVerification(importedAt: string, results: Array<{ id: string; status: 'ok' | 'auth' | 'network' | 'mysql-handshake' | 'failed' }>) {
     const operation = this.tail.then(async () => {
       const bundle = await this.readBundle();

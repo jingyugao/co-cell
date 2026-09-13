@@ -14,8 +14,9 @@ export class CodexAppServerClient extends EventEmitter {
     try { await client.connect(); return client; } catch (error) { await client.close(); throw error; }
   }
   async connect() {
-    if (this.child) throw new Error('Client already started');
+    if (this.child || this.socket) throw new Error('Client already started');
     if (this.closed) throw new Error('Client is closed');
+    if (this.options.url) return this.connectWebSocket();
     this.child = spawn(this.options.command ?? 'codex', this.options.args ?? ['app-server'], {
       cwd: this.options.cwd, env: this.options.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -36,8 +37,28 @@ export class CodexAppServerClient extends EventEmitter {
     });
     this.notify('initialized');
   }
+  async connectWebSocket() {
+    const socket = this.socket = new WebSocket(this.options.url, { headers: this.options.headers ?? {} });
+    await new Promise((resolve, reject) => {
+      const opened = () => { cleanup(); resolve(); };
+      const failed = () => { cleanup(); reject(new Error('App Server WebSocket connection failed')); };
+      const cleanup = () => { socket.removeEventListener('open', opened); socket.removeEventListener('error', failed); };
+      socket.addEventListener('open', opened, { once: true }); socket.addEventListener('error', failed, { once: true });
+    });
+    socket.addEventListener('message', event => {
+      try { this.receive(JSON.parse(String(event.data))); } catch (error) { this.emit('protocolError', error); this.fail(error); }
+    });
+    socket.addEventListener('error', () => this.fail(new Error('App Server WebSocket transport failed')));
+    socket.addEventListener('close', () => { if (!this.closed) this.fail(new Error('App Server WebSocket closed')); });
+    await this.request('initialize', {
+      clientInfo: { name: 'swarm_hive_app_server_client', version: '0.2.0' },
+      capabilities: { experimentalApi: true },
+    });
+    this.notify('initialized');
+  }
   send(message) {
-    if (this.closed || this.failure || !this.child) throw this.failure ?? new Error('Client is closed');
+    if (this.closed || this.failure || (!this.child && !this.socket)) throw this.failure ?? new Error('Client is closed');
+    if (this.socket) { this.socket.send(JSON.stringify(message)); return; }
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
   request(method, params) {
@@ -103,6 +124,7 @@ export class CodexAppServerClient extends EventEmitter {
     this.closed = true;
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('Client closed')); }
     this.pending.clear(); this.emit('closed'); this.lines?.close();
+    if (this.socket) { this.socket.close(); return; }
     const child = this.child;
     if (!child || child.exitCode !== null || child.signalCode !== null) return;
     await new Promise(resolve => {
@@ -200,7 +222,7 @@ export class Thread {
       signal?.throwIfAborted();
       const config = this.codex.options;
       const args = appServerArgs(config.config, config.configOverrides);
-      client = await CodexAppServerClient.spawn({ command: config.codexPathOverride, args, cwd: this.options.workingDirectory,
+      client = await CodexAppServerClient.spawn(config.appServerUrl ? { url: config.appServerUrl, headers: config.appServerHeaders } : { command: config.codexPathOverride, args, cwd: this.options.workingDirectory,
         env: { ...(config.env ?? process.env), ...(config.apiKey ? { CODEX_API_KEY: config.apiKey } : {}), ...(config.baseUrl ? { OPENAI_BASE_URL: config.baseUrl } : {}) } });
       this.codex.clients.add(client);
       client.on('stderr', message => { /* callers may observe diagnostics */ this.codex.emit?.('stderr', message); });

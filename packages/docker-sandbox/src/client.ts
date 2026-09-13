@@ -11,11 +11,16 @@ import type { DockerExecHandle, DockerExecOptions, DockerExecResult, DockerSandb
 const execFileAsync = promisify(execFile);
 
 export class DockerSandboxClient {
-  constructor(private readonly image: string, private readonly docker = 'docker', private readonly network = 'host') {}
+  constructor(private readonly image: string, private readonly docker = 'docker', private readonly network = 'host', private readonly credentialsHostDirectory?: string,
+    private readonly appServerHost?: string,
+    private readonly appServerEnvironment: Record<string, string> = {}) {}
   private async call(args: string[], timeout?: number, signal?: AbortSignal) { return execFileAsync(this.docker, args, { timeout, signal, maxBuffer: 16 * 1024 * 1024 }); }
   async create(projectId: string, workingDirectory: string): Promise<DockerSandboxRecord> {
     const name = `swarm-hive-sandbox-${projectId.slice(0, 12)}-${randomUUID().slice(0, 8)}`;
-    const { stdout } = await this.call(['run', '-d', '--name', name, '--network', this.network,
+    // Sandboxes share Docker's host network so project preview ports remain
+    // reachable. Give each long-lived App Server a distinct private port.
+    const appServerPort = 20_000 + (parseInt(randomUUID().replaceAll('-', '').slice(0, 6), 16) % 20_000);
+    const args = ['run', '-d', '--name', name, '--network', this.network,
       '--workdir', workingDirectory, '--label', 'app=swarm-hive-sandbox',
       '--label', 'swarm-hive.group=swarm-hive-sandbox',
       // A configured image may carry Compose labels. Override them so Docker
@@ -23,8 +28,26 @@ export class DockerSandboxClient {
       // their lifecycle.
       '--label', 'com.docker.compose.project=swarm-hive-sandbox',
       '--label', 'com.docker.compose.service=project-sandbox',
-      '--label', `projectId=${projectId}`, this.image]);
+      '--label', `swarm-hive.app-server-port=${appServerPort}`,
+      '--env', `CODEX_APP_SERVER_PORT=${appServerPort}`,
+      '--label', `projectId=${projectId}`];
+    for (const [key, value] of Object.entries(this.appServerEnvironment)) args.push('--env', `${key}=${value}`);
+    if (this.credentialsHostDirectory) args.push('--mount', `type=bind,src=${this.credentialsHostDirectory},dst=/home/user/.codex-web/credentials,readonly`);
+    if (this.credentialsHostDirectory) args.push('--mount', `type=bind,src=${join(this.credentialsHostDirectory, 'app-server-token')},dst=/home/user/.codex-web/app-server-token,readonly`);
+    args.push(this.image);
+    const { stdout } = await this.call(args);
     return { id: stdout.trim(), image: this.image, status: 'ready', projectId, workingDirectory, createdAt: new Date().toISOString() };
+  }
+  async appServer(id: string): Promise<{ url: string; token: string }> {
+    const { stdout } = await this.call(['inspect', '--format', '{{index .Config.Labels "swarm-hive.app-server-port"}}\t{{.Name}}', id]);
+    const [rawPort, rawName] = stdout.trim().split('\t');
+    const port = Number(rawPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Sandbox does not expose a managed App Server');
+    const { stdout: token } = await this.call(['exec', '--user', 'user', id, 'cat', '/home/user/.codex-web/app-server-token']);
+    if (!token.trim()) throw new Error('Sandbox App Server token is unavailable');
+    const host = this.appServerHost || rawName.replace(/^\//, '');
+    if (!host) throw new Error('Sandbox App Server hostname is unavailable');
+    return { url: `ws://${host}:${port}`, token: token.trim() };
   }
   async inspect(id: string): Promise<DockerSandboxStatus> {
     try {

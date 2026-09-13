@@ -22,17 +22,17 @@ swarm-hive 是基于 Codex TypeScript SDK 的 Web 编码工作台。用户按项
     ├─ SessionManager：会话状态、任务控制、事件订阅、跨模块协调
     ├─ runTurn：消费执行事件、更新并保存 turn、发布页面事件
     ├─ 凭据 / 共享文档 / 改进建议 / 诊断
-    └─ ContainerCodexRuntime：连接沙箱、准备环境、启动 worker、管理生命周期
+    └─ ContainerCodexRuntime：连接沙箱、管理常驻 App Server 与生命周期
             │ Docker CLI、命令输出、文件操作
             ▼
 Docker 项目 Sandbox
-    ├─ sandbox-worker.mjs → agentcore → Codex App Server → 模型与工具循环
+    ├─ 容器入口 → 常驻 Codex App Server（WebSocket JSON-RPC）→ 模型与工具循环
     ├─ 项目工作区、业务代码、开发工具、业务服务
     ├─ ~/.codex：Codex 原生上下文及共享文档副本
-    └─ ~/.codex-web/runtime：平台 worker、SDK 与配套脚本
+    └─ ~/.codex-web/credentials：只读凭据及 App Server capability token
 ```
 
-当前通过 `packages/agentcore` 接入 Codex App Server：agentcore 为每个线程启动独立的 `codex app-server` 子进程，使用 JSON-RPC 管理线程和 turn，并把原生通知转换为共享事件。Web 收到的是 worker 归并后的事件；底层 App Server 自行推进工具调用，不要把前端订阅事件当成能够控制每个模型步骤的暂停点。
+当前通过 `packages/agentcore` 接入 Codex App Server：每个 Sandbox 在容器入口启动一个常驻 App Server，Web 通过受 capability token 保护的 Docker 内网 WebSocket 使用 JSON-RPC 管理多个线程和 turn，并把原生通知转换为共享事件。底层 App Server 自行推进工具调用，不要把前端订阅事件当成能够控制每个模型步骤的暂停点。
 
 ## 核心概念与归属
 
@@ -58,7 +58,7 @@ Docker 项目 Sandbox
 | `backend/sessions/` | `manager.ts` 管理会话、运行任务、持久化和订阅；`routes.ts` 提供会话、提交、停止、SSE 等接口。 |
 | `backend/execution/` | `runner.ts` 处理单轮执行；`raw-tools.ts` 读取 Codex 原始工具记录。 |
 | `packages/agentcore/` | Codex App Server 运行时适配层：通过 JSON-RPC 启动/恢复线程、执行或中断 turn，归一化 item、用量和状态事件；不负责宿主机路由或持久化。 |
-| `backend/execution/worker/` | 同步到沙箱运行的独立 `.mjs` 脚本：调用 agentcore、检查工具、改进建议 MCP 与回执桥接；负责单轮生命周期和事件日志。 |
+| `backend/execution/worker/` | Sandbox 检查及兼容旧 worker 执行记录的辅助脚本；新 turn 不再启动单轮 worker。 |
 | `backend/sandboxes/` | 管理项目绑定、Docker provider、资源清单、文件与端口访问。 |
 | `backend/workspaces/` | Git 差异查询；文件路径校验、受限读取、内容类型和大小判断。 |
 | `packages/sandbox/`、`packages/docker-sandbox/` | provider-neutral 生命周期协调层和 Docker 命令传输。 |
@@ -79,8 +79,8 @@ Docker 项目 Sandbox
 
 1. 页面向 `/api/sessions/:id/turns` 提交消息，`SessionManager.startTurn()` 预留该会话的运行位置并持久化初始状态。
 2. `runTurn()` 根据执行模式调用本地 SDK 或 `ContainerCodexRuntime.run()`；日常项目使用 Sandbox。
-3. Sandbox runtime 获取项目沙箱，同步 worker、共享文档与凭据，启动该轮 worker。
-4. worker 使用会话 `threadId` 恢复上下文，通过 agentcore 启动或连接 Codex App Server，将归一化事件以逐行 JSON 输出。
+3. Sandbox runtime 获取项目沙箱，连接其常驻 App Server；共享文档和凭据通过只读挂载提供。
+4. Web 使用会话 `threadId` 通过 agentcore 的 WebSocket JSON-RPC 恢复或创建线程，并订阅原生事件。
 5. 宿主机归并事件，先保存会话，再通过 SSE 发布；结束时保存最终状态并释放运行记录。
 
 浏览器断开只取消订阅，不停止任务；重连通过会话快照恢复展示。agentcore 事件、Codex rollout 原始工具消息、模型 HTTP 抓包是不同数据来源，不混用，也不根据文件变更结果臆造原始工具参数。
@@ -125,7 +125,7 @@ Docker 项目 Sandbox
 项目标记完成满一天后由巡检归档；显式归档立即执行。归档会删除容器并清除项目与会话上的引用。归档项目不会因文件、预览或任务请求自动重建，只能由用户点击重建；重建不恢复旧数据。
 
 
-**当前重启限制：** Web 后端退出会取消活动任务，启动时把未完成任务标为中断。沙箱仍存在，但旧 worker 不会自动由新 Web 进程接管。无感升级、独立 worker 和步骤检查点均未实现；更新运行服务前先确认是否有任务，不能为了发布小改动直接中断用户会话。
+**当前重启限制：** Web 后端退出会取消活动任务，启动时把未完成任务标为中断。Sandbox 内常驻 App Server 仍存在，但旧 Web 连接不会自动接管活动 turn。无感升级与步骤检查点均未实现；更新运行服务前先确认是否有任务，不能为了发布小改动直接中断用户会话。
 
 ### Docker Compose 运行
 

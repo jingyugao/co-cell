@@ -1,6 +1,7 @@
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget, ThreadWorkspace } from '../sandboxes/types.js';
 import { randomUUID } from 'node:crypto';
+import { Codex } from '../../packages/agentcore/src/index.mjs';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
 import type { SandboxCommandHandle, SandboxHandle, SandboxProvider, SandboxLease, SandboxRecord } from '@swarm-hive/sandbox';
@@ -50,6 +51,7 @@ export interface ContainerRuntimeOptions {
   sharedDataDirectory?: URL;
   logger?: RuntimeLog;
   submitImprovement?: (context: Omit<ImprovementContext, 'projectName'>, input: unknown, requestId: string) => Promise<ImprovementReceipt>;
+  appServer?: (sandboxId: string) => Promise<{ url: string; token: string }>;
 }
 type Preparation = {
   preparing?: Promise<void>;
@@ -442,7 +444,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       const sharedDocs = await loadAgentDocs(new URL('docs/', sharedData));
       await this.command(entry, `sh -c ${quote(`mkdir -p ${quote(RUNTIME)} ${quote(`${RUNTIME}/agentcore`)} ${quote(`${RUNTIME}/node_modules/.bin`)} ${quote(`${ROOT}/images`)} /home/user/.codex ${quote(target.settings.workingDirectory)} && chmod 700 ${quote(ROOT)} /home/user/.codex && if test -x /usr/local/bin/codex; then ln -sfn /usr/local/bin/codex ${quote(`${RUNTIME}/node_modules/.bin/codex`)}; fi && cd ${quote(RUNTIME)} && if ! test -x ${quote(`${RUNTIME}/node_modules/.bin/codex`)}; then npm install --no-audit --no-fund --save-exact @openai/codex@0.153.4; fi`)}`, executionSignal, { timeoutMs: 300_000 });
       const connectionEnvs = this.options.connections
-        ? await syncSandboxConnections(entry.sandbox, this.options.connections, executionSignal)
+        ? await syncSandboxConnections(this.options.connections)
         : {};
       checkAbort(executionSignal);
       // Clear a legacy mirror only on the first preparation, before any worker
@@ -472,8 +474,50 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     });
   }
 
+  /**
+   * The App Server is the Sandbox entrypoint. Web owns the JSON-RPC client and
+   * persistence, so a turn no longer needs a copied worker, journal, or poller.
+   */
+  private async *runAppServer(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox): AsyncGenerator<AgentEvent> {
+    if (!this.options.appServer) throw new Error('Sandbox App Server endpoint is not configured');
+    let entry: Entry | undefined;
+    let codex: Codex | undefined;
+    let failed = false;
+    try {
+      entry = await this.acquire(session, true, onSandbox, turn.id, signal);
+      const connectionEnvs = this.options.connections ? await syncSandboxConnections(this.options.connections) : {};
+      const endpoint = await this.options.appServer(entry.metadata.id);
+      const images: string[] = [];
+      if (turn.images.length) {
+        await entry.sandbox.commands.run(`mkdir -p ${quote(`${ROOT}/images`)}`, { user: 'user', timeoutMs: 30_000 });
+        for (const [index, path] of turn.images.entries()) {
+          const destination = `${ROOT}/images/${turn.id}-${index}${extname(basename(path))}`;
+          await entry.sandbox.files.write(destination, new Uint8Array(await readFile(path)).buffer, { user: 'user', signal });
+          images.push(destination);
+        }
+      }
+      codex = new Codex({ apiKey: this.options.apiKey, baseUrl: this.options.baseUrl, config: this.options.modelConfig,
+        configOverrides: this.options.configOverrides, appServerUrl: endpoint.url,
+        appServerHeaders: { Authorization: `Bearer ${endpoint.token}` } });
+      const options = { workingDirectory: session.settings.workingDirectory, ...(session.settings.model ? { model: session.settings.model } : {}),
+        modelReasoningEffort: session.settings.modelReasoningEffort, sandboxMode: 'danger-full-access' as const,
+        webSearchMode: session.settings.webSearchMode, networkAccessEnabled: true, approvalPolicy: 'never' as const, skipGitRepoCheck: true,
+        additionalDirectories: Object.keys(connectionEnvs).length ? [CONNECTION_ROOT] : [] };
+      const thread = session.threadId ? codex.resumeThread(session.threadId, options) : codex.startThread(options);
+      const input = images.length ? [{ type: 'text' as const, text: turn.prompt }, ...images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
+      const streamed = await thread.runStreamed(input, { signal });
+      for await (const event of streamed.events) yield event;
+    } catch (error) { failed = true; throw error; }
+    finally {
+      await codex?.close();
+      if (entry) await this.release(entry, failed);
+    }
+  }
+
   async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, onApproval?: RequestUserApproval,
     onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
+    yield* this.runAppServer(session, turn, signal, onSandbox);
+    return;
     if (this.detachRequests.delete(turn.id)) throw new TurnLaunchCancelled();
     if (this.closing) throw new Error('Sandbox 运行时正在关闭');
     if (!this.options.apiKey) throw new Error('Sandbox 模式需要 CODEX_API_KEY 或 OPENAI_API_KEY');
@@ -511,7 +555,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       await this.command(entry, `cp ${quote(`${RUNTIME}/agentcore/index.mjs`)} ${quote(`${bundleDirectory}/agentcore/index.mjs`)}`, executionSignal);
       inputPath = `${runDirectory}/input.json`;
       checkAbort(executionSignal);
-      await entry.sandbox.files.write(inputPath, JSON.stringify({
+      await entry!.sandbox.files.write(inputPath!, JSON.stringify({
         workerId: turn.execution!.workerId, sessionId: session.id, turnId: turn.id, runDirectory,
         agentcorePath: `${bundleDirectory}/agentcore/index.mjs`,
         threadId: session.threadId, prompt: turn.prompt, images, settings: session.settings,
@@ -522,7 +566,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         approvalReplyDirectory: onApproval ? approvalReplyDirectory : undefined,
       }), { user: 'user', signal: executionSignal });
       const marker = `${runDirectory}/worker.pid`;
-      const body = `umask 077; echo $$ > ${quote(marker)}; exec ${NODE} ${quote(`${bundleDirectory}/sandbox-worker.mjs`)} ${quote(inputPath)}`;
+      const body = `umask 077; echo $$ > ${quote(marker)}; exec ${NODE} ${quote(`${bundleDirectory}/sandbox-worker.mjs`)} ${quote(inputPath!)}`;
       checkAbort(executionSignal);
       // Once the launch request is sent, its outcome may already be remote.
       // Shutdown must wait for its identity and then detach the observer.
@@ -554,11 +598,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       this.preparations.delete(turn.id);
       this.detachRequests.delete(turn.id);
       if (acquired) {
-        if (signal.aborted && launchRequested) detached = !await this.terminateWorker(acquired, turn, handle);
+        if (signal.aborted && launchRequested) detached = !await this.terminateWorker(acquired!, turn, handle);
         else await handle?.disconnect().catch(() => { });
-        await this.release(acquired, failed, detached);
+        await this.release(acquired!, failed, detached);
         if (signal.aborted && detached) {
-          if (turn.execution) turn.execution.stopRequested = true;
+          if (turn.execution) turn.execution!.stopRequested = true;
           throw new TurnTerminationUnconfirmed();
         }
       }

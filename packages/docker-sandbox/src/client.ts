@@ -17,7 +17,13 @@ export class DockerSandboxClient {
     const name = `swarm-hive-sandbox-${projectId.slice(0, 12)}-${randomUUID().slice(0, 8)}`;
     const { stdout } = await this.call(['run', '-d', '--name', name, '--network', this.network,
       '--workdir', workingDirectory, '--label', 'app=swarm-hive-sandbox',
-      '--label', 'swarm-hive.group=swarm-hive-sandbox', '--label', `projectId=${projectId}`, this.image]);
+      '--label', 'swarm-hive.group=swarm-hive-sandbox',
+      // A configured image may carry Compose labels. Override them so Docker
+      // Desktop groups project sandboxes separately without making Compose own
+      // their lifecycle.
+      '--label', 'com.docker.compose.project=swarm-hive-sandbox',
+      '--label', 'com.docker.compose.service=project-sandbox',
+      '--label', `projectId=${projectId}`, this.image]);
     return { id: stdout.trim(), image: this.image, status: 'ready', projectId, workingDirectory, createdAt: new Date().toISOString() };
   }
   async inspect(id: string): Promise<DockerSandboxStatus> {

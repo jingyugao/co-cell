@@ -1,12 +1,4 @@
 services:
-  sandbox-image:
-    build:
-      context: .
-      dockerfile: docker/sandbox/Dockerfile
-    image: ${DOCKER_SANDBOX_IMAGE:-swarm-hive-sandbox:latest}
-    command: ["true"]
-    restart: "no"
-
   mysql:
     image: mysql:8.4
     restart: unless-stopped
@@ -30,8 +22,6 @@ services:
   swarm-hive:
     build: .
     depends_on:
-      sandbox-image:
-        condition: service_completed_successfully
       mysql:
         condition: service_healthy
     restart: unless-stopped

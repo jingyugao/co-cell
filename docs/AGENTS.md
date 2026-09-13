@@ -141,7 +141,7 @@ make restart  # 构建并重启
 make down     # 停止并删除 Compose 容器
 ```
 
-直接使用 Compose 时执行 `docker compose up -d --build`。服务启动后访问 `http://localhost:3001`。不要使用 `--remove-orphans` 清理其他 Compose 服务，除非已确认孤儿容器不再被使用。
+`make up` 会先在宿主机直接构建 Sandbox 镜像，再构建并启动 Compose 服务。直接使用 Compose 时，先执行 `docker build -f docker/sandbox/Dockerfile -t swarm-hive-sandbox:latest .`，再执行 `docker compose up -d --build`。服务启动后访问 `http://localhost:3001`。不要使用 `--remove-orphans` 清理其他 Compose 服务，除非已确认孤儿容器不再被使用。
 
 ## 开发入口与验证
 

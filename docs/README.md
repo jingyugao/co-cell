@@ -19,11 +19,13 @@ test -f .env || cp .env.example .env
 PORT=3001 pnpm dev
 ```
 
-生产模式可直接使用 Compose。它会构建 Web 镜像和 `swarm-hive-sandbox:latest` 项目镜像：
+生产模式可通过 Makefile 构建 Web 镜像和 `swarm-hive-sandbox:latest` 项目镜像，再启动 Compose 服务：
 
 ```sh
-docker compose up -d --build
+make up
 ```
+
+若直接使用 Compose，先在宿主机执行 `docker build -f docker/sandbox/Dockerfile -t swarm-hive-sandbox:latest .`，再执行 `docker compose up -d --build`。
 
 打开 http://localhost:3001 。创建项目和会话本身不创建容器，首次发送任务时才创建。同一项目后续会话复用容器。
 

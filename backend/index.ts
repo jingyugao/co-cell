@@ -53,8 +53,19 @@ try { await access(sandboxAppServerToken); } catch {
   await writeFile(sandboxAppServerToken, randomBytes(32).toString('base64url'), { mode: 0o600 });
 }
 await chmod(sandboxAppServerToken, 0o644);
-const sandboxCredentialsHostDirectory = process.env.SANDBOX_CREDENTIALS_HOST_DIR || resolve(connections.sandboxRuntimeDirectory());
-const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BIN || 'docker', process.env.DOCKER_SANDBOX_NETWORK || 'swarm-hive_default', sandboxCredentialsHostDirectory,
+// The Web container creates this through its /app/data bind mount. Docker
+// commands, however, are evaluated by the host daemon and use the optional
+// host path supplied by Compose.
+const sandboxCredentialsDirectory = resolve(connections.sandboxDirectory());
+await mkdir(sandboxCredentialsDirectory, { recursive: true, mode: 0o700 });
+await chmod(sandboxCredentialsDirectory, 0o700);
+const sandboxCredentialsHostDirectory = process.env.SANDBOX_CREDENTIALS_HOST_DIR || sandboxCredentialsDirectory;
+const sandboxAppServerTokenHostPath = process.env.SANDBOX_APP_SERVER_TOKEN_HOST_PATH || sandboxAppServerToken;
+const sharedAgentsPath = resolve('data/AGENTS.md');
+const sharedAgentsHostPath = process.env.SANDBOX_SHARED_AGENTS_PATH || sharedAgentsPath;
+// Global rules are non-secret and need to be readable by the Sandbox's user.
+await chmod(sharedAgentsPath, 0o644);
+const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BIN || 'docker', process.env.DOCKER_SANDBOX_NETWORK || 'swarm-hive_default', sandboxCredentialsHostDirectory, sandboxAppServerTokenHostPath, sharedAgentsHostPath,
   process.env.SANDBOX_APP_SERVER_HOST, {
     ...(apiKey ? { CODEX_API_KEY: apiKey } : {}), ...(process.env.OPENAI_BASE_URL ? { OPENAI_BASE_URL: process.env.OPENAI_BASE_URL } : {}),
     CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, configOverrides).slice(1)),
@@ -87,7 +98,7 @@ await manager.init();
 const config: AppConfig = { sandbox: { enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };
-const app = createApp(manager, config, [`localhost:${port}`, `127.0.0.1:${port}`], undefined,
+const app = createApp(manager, config, [`localhost:${port}`, `127.0.0.1:${port}`],
   new DockerSandboxInventory(dockerClient), undefined, connections, improvements);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);

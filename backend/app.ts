@@ -6,7 +6,6 @@ import { z } from 'zod';
 import type { AppConfig } from '../protocol/types.js';
 import { SessionManager } from './sessions/manager.js';
 import { HttpError } from '../util/errors.js';
-import { RawToolReader } from './execution/raw-tools.js';
 import type { SandboxInventoryReader } from './sandboxes/inventory.js';
 import { SharedFiles } from './shared-files/service.js';
 import type { ConnectionStore } from './connections/store.js';
@@ -17,7 +16,7 @@ import { installSharedFilesRoutes } from './shared-files/routes.js';
 import { installSandboxesRoutes } from './sandboxes/routes.js';
 import { installSessionsRoutes } from './sessions/routes.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], rawTools: RawToolReader = new RawToolReader(), sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, improvements?: ImprovementStore) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, improvements?: ImprovementStore) {
   const app = new Hono();
   app.use('/api/*', async (c, next) => {
     const host = c.req.header('host');
@@ -42,7 +41,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   app.get('/api/config', c => c.json(config));
   installImprovementRoutes(app, improvements, manager);
   installProjectsRoutes(app, manager);
-  installSessionsRoutes(app, manager, config, rawTools);
+  installSessionsRoutes(app, manager, config);
   installSandboxesRoutes(app, sandboxes, manager);
   installConnectionsRoutes(app, connections);
   installSharedFilesRoutes(app, sharedFiles);

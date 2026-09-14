@@ -145,6 +145,11 @@ export class ConnectionStore {
     return { ...bundle, cliFiles: { ...bundle.cliFiles, 'meegle/config.json': Buffer.from(current.configText).toString('base64') } };
   }
   sandboxRuntimeDirectory() { return join(this.directory, 'sandbox-runtime'); }
+  /**
+   * Stable, host-owned files bind-mounted into every Sandbox. Unlike the
+   * runtime token directory, operators may edit these files directly.
+   */
+  sandboxDirectory() { return join(this.directory, 'sandbox'); }
   async recordVerification(importedAt: string, results: Array<{ id: string; status: 'ok' | 'auth' | 'network' | 'mysql-handshake' | 'failed' }>) {
     const operation = this.tail.then(async () => {
       const bundle = await this.readBundle();
@@ -209,7 +214,10 @@ export class ConnectionStore {
       }
       if (!connections.length) throw new HttpError(400, '本机没有可导入的服务凭据');
       const bundle: ConnectionBundle = { importedAt: new Date().toISOString(), connections, mysqlLogin,
-        glabConfig: JSON.stringify({ git_protocol: 'https', hosts }, null, 2), gitCredentials, gitConfig,
+        // glab uses the top-level host as its default when a command does not
+        // pass --hostname. Keep all imported hosts, but make the sole one
+        // directly usable by an interactive Sandbox shell.
+        glabConfig: JSON.stringify({ git_protocol: 'https', ...(Object.keys(hosts).length === 1 ? { host: Object.keys(hosts)[0] } : {}), hosts }, null, 2), gitCredentials, gitConfig,
         ...(kubernetes ? { kubernetesPolicy: kubernetes.policy } : {}),
         cliFiles: { ...kubernetes?.files, ...lark?.files, ...(meegle ? { 'meegle/config.json': Buffer.from(meegle.configText).toString('base64') } : {}) } };
       this.meegleRefresh = undefined;

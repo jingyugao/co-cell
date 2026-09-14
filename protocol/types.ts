@@ -215,35 +215,6 @@ export interface AppConfig {
   approvalPolicy: 'never';
   capabilities: { interactiveApprovals: false; tokenDeltas: false; sandboxPreviews?: boolean };
 }
-export interface GitChange { path: string; status: string }
-export interface Changes { branch: string; files: GitChange[]; diff: string; error?: string }
-export interface RawToolPayload {
-  type: 'custom_tool_call' | 'function_call' | 'custom_tool_call_output' | 'function_call_output';
-  id?: string;
-  call_id?: string;
-  name?: string;
-  input?: string;
-  arguments?: string;
-  output?: unknown;
-  status?: string;
-}
-export interface RawToolMessage {
-  /** Stable byte offset of this record within the local rollout. */
-  id: string;
-  timestamp?: string;
-  payload: RawToolPayload;
-}
-export interface RawToolPage {
-  location?: 'local' | 'sandbox';
-  sandboxId?: string;
-  source: 'codex-rollout';
-  threadId: string | null;
-  availability: 'available' | 'pending' | 'missing';
-  messages: RawToolMessage[];
-  nextCursor: number;
-  hasMore: boolean;
-  skippedLines: number;
-}
 export type StreamMessage =
   | { type: 'snapshot'; session: Session }
   | { type: 'sdk'; turnId: string; event: AgentEvent }

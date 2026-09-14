@@ -4,7 +4,6 @@ import { HttpError } from '../../util/errors.js';
 import { streamSSE } from 'hono/streaming';
 import type { AppConfig, StreamMessage } from '../../protocol/types.js';
 import type { SessionManager } from './manager.js';
-import type { RawToolReader } from '../execution/raw-tools.js';
 
 const settingsSchema = z.object({
   executionMode: z.enum(['local', 'sandbox']),
@@ -16,7 +15,7 @@ const settingsSchema = z.object({
   networkAccessEnabled: z.boolean(),
 }).partial().strict();
 
-export function installSessionsRoutes(app: Hono, manager: SessionManager, config: AppConfig, rawTools: RawToolReader) {
+export function installSessionsRoutes(app: Hono, manager: SessionManager, config: AppConfig) {
   const requireAllowedExecution = (mode: string | undefined) => {
     if (config.sandbox?.enabled && mode !== 'sandbox') throw new HttpError(403, '已启用容器执行，本机会话仅供查看历史；请在 Sandbox 项目中创建会话');
   };
@@ -79,14 +78,6 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
       stream.onAbort(() => { closed = true; finish(); });
       try { await disconnected; } finally { clearInterval(heartbeat); unsubscribe(); }
     });
-  });
-  app.get('/api/sessions/:id/changes', async c => {
-    return c.json(await manager.changes(c.req.param('id')));
-  });
-  app.get('/api/sessions/:id/raw-tools', async c => {
-    manager.get(c.req.param('id'));
-    const cursor = z.coerce.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(c.req.query('cursor') ?? 0);
-    return c.json(await manager.rawTools(c.req.param('id'), cursor, rawTools));
   });
   app.post('/api/sessions/:id/images', async c => {
     requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);

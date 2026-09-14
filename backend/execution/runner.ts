@@ -100,7 +100,13 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
       turn.status = controller.signal.aborted ? 'cancelled' : 'failed';
       turn.error = error instanceof Error ? error.message : String(error);
     }
-    if (controller.signal.aborted && turn.status === 'running') turn.status = 'cancelled';
+    // App Server reports a user-interrupted turn as turn.failed. The abort
+    // signal is authoritative here: it came from this Web session's Stop
+    // action, so preserve the turn as cancelled instead of a hidden failure.
+    if (controller.signal.aborted && (turn.status === 'running' || turn.status === 'failed')) {
+      turn.status = 'cancelled';
+      delete turn.error;
+    }
     turn.completedAt = new Date().toISOString();
     delete turn.phase;
     delete turn.retry;

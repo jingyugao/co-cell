@@ -19,7 +19,8 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
 COPY scripts/sandbox/install-command-tools.sh /usr/local/sbin/install-command-tools
 RUN bash /usr/local/sbin/install-command-tools \
   && rm /usr/local/sbin/install-command-tools \
-  && mkdir -p /home/user/workspace /home/user/.codex /home/user/.codex-web/runtime /home/user/.meegle /home/user/.kube/cache \
+  && mkdir -p /home/user/workspace /home/user/.codex /home/user/.codex-web/runtime /home/user/.codex-web/credentials/current /home/user/.meegle /home/user/.kube/cache \
+  && touch /home/user/.codex/AGENTS.md \
   && ln -s /home/user/.codex-web/credentials/current/meegle/config.json /home/user/.meegle/config.json \
   && chown -R user:user /home/user/workspace /home/user/.codex /home/user/.codex-web /home/user/.meegle /home/user/.kube
 

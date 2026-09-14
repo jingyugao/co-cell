@@ -4,9 +4,7 @@ import { join, resolve, sep, posix } from 'node:path';
 import type { Project, ProjectSummary, Session, SessionSummary, Settings, StreamMessage, Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
-import { getChanges } from '../workspaces/git.js';
 import type { WorkspaceFileReadOptions } from '../workspaces/files.js';
-import type { RawToolReader } from '../execution/raw-tools.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 
 import { HttpError } from '../../util/errors.js';
@@ -324,7 +322,15 @@ export class SessionManager {
         return { ...stored, nativeTurnId: turn.id };
       }
       if (stored.id === liveId) { stored.nativeTurnId = turn.id; if (!stored.prompt) stored.prompt = turn.prompt; return stored; }
+      // `thread/turns/list` can omit items that were emitted just before an
+      // interrupted turn terminated. Keep those already-persisted stream
+      // items until the native history contains a newer item with the same ID.
+      // Otherwise the post-stop history refresh makes the conversation appear
+      // to lose the Agent's visible output.
+      const storedOnlyItems = stored.items.filter(item => !turn.items.some(native => native.id === item.id));
       return { ...turn, id: stored.id, nativeTurnId: turn.id, sdkUsage: stored.sdkUsage,
+        items: [...turn.items, ...storedOnlyItems],
+        itemTimestamps: { ...stored.itemTimestamps, ...turn.itemTimestamps },
         contextUsage: turn.contextUsage?.map(call => {
           const old = stored.contextUsage?.find(value => call.responseId && value.responseId === call.responseId);
           return old ? { ...old, ...call } : call;
@@ -332,6 +338,13 @@ export class SessionManager {
     }).sort((left, right) => left.startedAt.localeCompare(right.startedAt));
     const live = previous.find(turn => turn.id === liveId);
     if (live && !mapped.some(turn => turn.id === live.id)) mapped.push(live);
+    // Failed native turns are deliberately not rendered as chat messages.
+    // Do not let that presentation filter turn a non-empty native response
+    // into an empty replacement for the durable transcript.
+    if (!mapped.length && previous.length) {
+      await this.save(session);
+      return;
+    }
     session.turns = mapped;
     session.status = live ? live.status : mapped.at(-1)?.status ?? 'idle';
     session.contextUsage = mapped.flatMap(turn => turn.contextUsage ?? []).at(-1);
@@ -424,7 +437,12 @@ export class SessionManager {
         });
       } catch (error) {
         await rm(temporary, { force: true });
-        throw error;
+        // A failed restore can leave a project bound to a stopped replacement
+        // even though the preceding archive is already durable. An explicit
+        // archive request may safely detach that unusable replacement and let
+        // the normal rebuild path restore the latest snapshot.
+        const previous = await this.projects.latestDataArchive(id);
+        if (!previous || !/container .* is not running|sandbox .* is unavailable/i.test(String(error))) throw error;
       }
       try { await this.sandbox?.delete(this.projectWorkspace(project)); }
       catch (error) {
@@ -615,12 +633,19 @@ export class SessionManager {
   }
 
   private save(session: Session): Promise<void> {
-    // Persist execution locators and numeric billing evidence, never a second message history.
+    // Native Codex history remains canonical for ordinary completed turns.
+    // An interrupted App Server turn may not expose its already-streamed items
+    // through thread/turns/list, though. Retain that visible partial transcript
+    // for cancelled turns so a refresh or Web restart cannot erase it.
     const turns = session.turns.map(turn => ({
       id: turn.id, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
       execution: turn.execution, codexAccepted: turn.codexAccepted, error: turn.error,
       approvals: turn.execution?.state !== 'terminal' ? turn.approvals : undefined,
-      prompt: '', images: [], items: [], usage: turn.usage, sdkUsage: turn.sdkUsage,
+      prompt: turn.status === 'cancelled' ? turn.prompt : '',
+      images: turn.status === 'cancelled' ? turn.images : [],
+      items: turn.status === 'cancelled' ? turn.items : [],
+      itemTimestamps: turn.status === 'cancelled' ? turn.itemTimestamps : undefined,
+      usage: turn.usage, sdkUsage: turn.sdkUsage,
       contextUsage: turn.contextUsage?.map(({ blockEstimates, blockTokenizer, blockTexts, ...call }) => call),
     }));
     const contextUsage = session.contextUsage && (() => {
@@ -792,16 +817,6 @@ export class SessionManager {
     } finally { release(); }
   }
 
-  async changes(id: string) {
-    const projectId = this.lookup(id).projectId;
-    if (projectId) await this.ensureProjectSandbox(projectId);
-    const session = this.lookup(id);
-    if (session.settings.executionMode !== 'sandbox') return getChanges(session.settings.workingDirectory);
-    if (!this.sandbox) throw new HttpError(503, 'Sandbox 未配置');
-    const release = this.projects.acquire(session.projectId);
-    try { return await this.sandbox.changes(session); } finally { release(); }
-  }
-
   async projectFile(projectId: string, path: string, options?: WorkspaceFileReadOptions) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     await this.ensureProjectSandbox(projectId);
@@ -811,16 +826,6 @@ export class SessionManager {
     const release = this.projects.acquire(project.id);
     try { return await this.sandbox.file(this.projectWorkspace(project), path, options); }
     finally { release(); }
-  }
-
-  async rawTools(id: string, cursor: number, localReader: RawToolReader) {
-    const projectId = this.lookup(id).projectId;
-    if (projectId) await this.ensureProjectSandbox(projectId);
-    const session = this.lookup(id);
-    if (session.settings.executionMode !== 'sandbox') return localReader.read(session.threadId, cursor);
-    if (!this.sandbox) throw new HttpError(503, 'Sandbox 未配置');
-    const release = this.projects.acquire(session.projectId);
-    try { return await this.sandbox.rawTools(session, cursor); } finally { release(); }
   }
 
   async close() {

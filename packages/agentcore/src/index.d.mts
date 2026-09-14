@@ -4,7 +4,7 @@ export type * from './types.js';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface RpcError { code: number; message: string; data?: unknown }
 export interface AppServerEvent { method: string; params?: any }
-export interface AppServerClientOptions { command?: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv; requestTimeoutMs?: number }
+export interface AppServerClientOptions { command?: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv; url?: string; headers?: Record<string, string>; requestTimeoutMs?: number }
 export class AppServerRpcError extends Error { readonly rpc: RpcError; constructor(rpc: RpcError, method: string); }
 export class CodexAppServerClient extends EventEmitter {
   constructor(options?: AppServerClientOptions);
@@ -22,7 +22,7 @@ export class CodexAppServerClient extends EventEmitter {
   close(): Promise<void>;
 }
 export type AgentEvent = ThreadEvent;
-export class AppServerEventAdapter { accept(event: AppServerEvent): AgentEvent[]; }
+export class AppServerEventAdapter { convert(item: any): any; accept(event: AppServerEvent): AgentEvent[]; }
 export type UserInput = { type: 'text'; text: string } | { type: 'local_image'; path: string };
 export type Input = string | UserInput[];
 export interface CodexOptions { codexPathOverride?: string; config?: Record<string, unknown>; configOverrides?: string[]; apiKey?: string; baseUrl?: string; env?: Record<string, string>; appServerUrl?: string; appServerHeaders?: Record<string, string> }

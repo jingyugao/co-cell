@@ -38,7 +38,15 @@ services:
       DOCKER_SANDBOX_IMAGE: ${DOCKER_SANDBOX_IMAGE:-swarm-hive-sandbox:latest}
       DOCKER_SANDBOX_NETWORK: ${DOCKER_SANDBOX_NETWORK:-swarm-hive_default}
       SANDBOX_WORKSPACE: ${SANDBOX_WORKSPACE:-/home/user/workspace}
-      SANDBOX_CREDENTIALS_HOST_DIR: ${SANDBOX_CREDENTIALS_HOST_DIR:-${PWD}/data/credentials/sandbox-runtime}
+      # A stable host directory mounted read-only as the Sandbox's current
+      # CLI credentials. Edit files below it to update existing Sandboxes.
+      SANDBOX_CREDENTIALS_HOST_DIR: ${SANDBOX_CREDENTIALS_HOST_DIR:-${PWD}/data/credentials/sandbox}
+      # Kept separate because it is an App Server capability secret, not a
+      # CLI credential made available to agents.
+      SANDBOX_APP_SERVER_TOKEN_HOST_PATH: ${SANDBOX_APP_SERVER_TOKEN_HOST_PATH:-${PWD}/data/credentials/sandbox-runtime/app-server-token}
+      # Docker commands issued by this container are evaluated by the host
+      # daemon, so this must be a host path rather than /app/data/AGENTS.md.
+      SANDBOX_SHARED_AGENTS_PATH: ${SANDBOX_SHARED_AGENTS_PATH:-${PWD}/data/AGENTS.md}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

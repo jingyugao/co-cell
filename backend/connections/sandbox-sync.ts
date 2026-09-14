@@ -1,16 +1,13 @@
-import { chmod, chown, mkdir, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, chown, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import type { ConnectionStore } from './store.js';
 
-/** Materialize only CLI-consumable credentials for the Sandbox's read-only mount. */
+/** Materialize CLI credentials in the stable host directory mounted by Sandboxes. */
 export async function syncSandboxConnections(store: ConnectionStore) {
   const bundle = await store.readRuntimeBundle();
   if (!bundle) return {};
-  const root = store.sandboxRuntimeDirectory();
-  const generationName = `generation-${randomUUID()}`;
-  const staging = join(root, generationName);
-  const current = join(root, 'current');
+  const root = store.sandboxDirectory();
   const { importedAt: _importedAt, ...content } = bundle;
   const glabHosts = bundle.connections.filter(item => item.type === 'glab').map(item => item.host).filter((host): host is string => Boolean(host));
   const envs = {
@@ -30,43 +27,50 @@ export async function syncSandboxConnections(store: ConnectionStore) {
     if (!/^(lark-config|lark-data\/lark-cli|meegle|kubernetes)\/[a-zA-Z0-9_.-]+$/.test(path)) throw new Error('凭据路径无效');
     return { path, content: Buffer.from(value, 'base64') };
   });
+  // Bundles imported before the default-host support stored JSON/YAML without
+  // `host`. Upgrade that generated format while preserving multi-host files.
+  let glabConfig = bundle.glabConfig;
+  if (glabHosts.length === 1) {
+    try {
+      const parsed = JSON.parse(glabConfig);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && !parsed.host) {
+        glabConfig = JSON.stringify({ ...parsed, host: glabHosts[0] }, null, 2);
+      }
+    } catch { /* A manually supplied YAML config remains untouched. */ }
+  }
   const files = [
-    { path: 'glab/config.yml', content: Buffer.from(bundle.glabConfig) },
+    { path: 'glab/config.yml', content: Buffer.from(glabConfig) },
     { path: 'git-credentials', content: Buffer.from(bundle.gitCredentials) },
     { path: 'gitconfig', content: Buffer.from(bundle.gitConfig) },
     { path: '.mylogin.cnf', content: Buffer.from(bundle.mysqlLogin ?? '', 'base64') },
     ...cliFiles,
   ];
-  const version = createHash('sha256').update('sandbox-credentials-v2\n').update(JSON.stringify(content)).update(JSON.stringify(envs)).digest('hex');
-  // This directory alone is bind-mounted. Its contents remain per-file private
-  // to the Sandbox's fixed UID, while the persistent credential bundle stays
-  // in its non-mounted parent directory.
-  await mkdir(root, { recursive: true, mode: 0o755 });
-  await chmod(root, 0o755);
-  await mkdir(join(staging, 'glab'), { recursive: true, mode: 0o700 });
-  await chown(staging, 1000, 1000);
-  await chown(join(staging, 'glab'), 1000, 1000);
-  try {
-    for (const file of files) {
-      const destination = join(staging, file.path);
-      const parent = dirname(destination);
-      await mkdir(parent, { recursive: true, mode: 0o700 });
-      const segments = file.path.split('/').slice(0, -1);
-      for (let index = 1; index <= segments.length; index += 1) await chown(join(staging, ...segments.slice(0, index)), 1000, 1000);
-      await writeFile(destination, file.content, { mode: 0o600, flag: 'wx' });
-      await chown(destination, 1000, 1000);
-    }
-    await writeFile(join(staging, '.version'), version, { mode: 0o600, flag: 'wx' });
-    await chown(join(staging, '.version'), 1000, 1000);
-    const next = join(root, `${generationName}-link`);
-    await symlink(generationName, next);
-    await rename(next, current);
-    const entries = await readdir(root, { withFileTypes: true });
-    await Promise.all(entries.filter(entry => entry.name.startsWith('generation-') && entry.name !== generationName && entry.name !== `${generationName}-link`)
-      .map(entry => rm(join(root, entry.name), { recursive: true, force: true })));
-    return envs;
-  } catch (error) {
-    await rm(staging, { recursive: true, force: true });
+  const version = createHash('sha256').update('sandbox-credentials-v3\n').update(JSON.stringify(content)).update(JSON.stringify(envs))
+    .update(glabConfig).digest('hex');
+  // Never replace this directory: a Docker bind mount follows its inode.
+  // Instead replace individual files only when an imported bundle changes.
+  // Hand edits therefore remain visible to already-running Sandboxes.
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  await chmod(root, 0o700);
+  await chown(root, 1000, 1000);
+  const previous = await readFile(join(root, '.version'), 'utf8').catch(error => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
     throw error;
+  });
+  if (previous.trim() === version) return envs;
+  for (const file of files) {
+    const destination = join(root, file.path);
+    const parent = dirname(destination);
+    await mkdir(parent, { recursive: true, mode: 0o700 });
+    await chown(parent, 1000, 1000);
+    const temporary = join(parent, `.${file.path.split('/').at(-1)}-${randomUUID()}.tmp`);
+    await writeFile(temporary, file.content, { mode: 0o600, flag: 'wx' });
+    await chown(temporary, 1000, 1000);
+    await rename(temporary, destination);
   }
+  const versionFile = join(root, `.version-${randomUUID()}.tmp`);
+  await writeFile(versionFile, version, { mode: 0o600, flag: 'wx' });
+  await chown(versionFile, 1000, 1000);
+  await rename(versionFile, join(root, '.version'));
+  return envs;
 }

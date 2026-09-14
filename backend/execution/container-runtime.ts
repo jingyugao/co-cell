@@ -1,14 +1,14 @@
 import type { SandboxState } from '../../protocol/sandbox-types.js';
-import type { WorkspaceTarget, ThreadWorkspace } from '../sandboxes/types.js';
+import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { randomUUID } from 'node:crypto';
-import { Codex } from '../../packages/agentcore/src/index.mjs';
+import { AppServerEventAdapter, Codex, CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
 import type { SandboxCommandHandle, SandboxHandle, SandboxProvider, SandboxLease, SandboxRecord } from '@swarm-hive/sandbox';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import type { AgentEvent, ContextUsage } from '../../protocol/types.js';
 import type { RequestUserApproval } from '../../protocol/approval-types.js';
-import type { Changes, RawToolPage, Session, Turn } from '../../protocol/types.js';
+import type { Session, Turn } from '../../protocol/types.js';
 import type { NativeHistory } from './native-history.mjs';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
 import { CONNECTION_ROOT, type ConnectionStore } from '../connections/store.js';
@@ -25,11 +25,9 @@ export interface SandboxRuntime {
   run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent>;
   recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent>;
   detach(turn: Turn): void;
-  changes(session: WorkspaceTarget): Promise<Changes>;
   preview(session: WorkspaceTarget, port: number): Promise<string>;
   file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
-  rawTools(session: ThreadWorkspace, cursor?: number): Promise<RawToolPage>;
-  history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<NativeHistory>;
+  history(session: Session, includeBlocks?: boolean): Promise<NativeHistory>;
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   restoreArchive?(target: WorkspaceTarget, archivePath: string): Promise<void>;
@@ -462,13 +460,16 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       }
       entry.preparation.sharedDocPaths = currentPaths;
       const managedAgents = [sharedAgents.trim(), SANDBOX_PERSISTENCE_GUIDANCE].filter(Boolean).join('\n\n') + '\n';
-      await this.writeAtomic(entry, `${CODEX_HOME}/AGENTS.md`, managedAgents, executionSignal);
-      for (const name of ['sandbox-worker.mjs', 'sandbox-inspect.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
-        checkAbort(executionSignal);
-        await this.writeAtomic(entry, `${RUNTIME}/${name}`, await readFile(new URL(`../execution/worker/${name}`, import.meta.url), 'utf8'), executionSignal);
-      }
-      await this.writeAtomic(entry, `${RUNTIME}/agentcore/index.mjs`,
-        await readFile(new URL('../../packages/agentcore/src/index.mjs', import.meta.url), 'utf8'), executionSignal);
+      // New Docker Sandboxes bind-mount this path read-only before the
+      // long-lived App Server starts. Older Sandboxes lack that mount and
+      // retain the copy-based fallback until they are rebuilt.
+      const agentsPath = `${CODEX_HOME}/AGENTS.md`;
+      const mountedAgents = await entry.sandbox.commands.run(`test -f ${quote(agentsPath)} && test ! -w ${quote(agentsPath)}`, { user: 'user', timeoutMs: 5_000 })
+        .then(result => result.exitCode === 0, () => false);
+      if (!mountedAgents) await this.writeAtomic(entry, agentsPath, managedAgents, executionSignal);
+      // The long-lived App Server owns execution. Its active turn path does
+      // not use the retired per-turn worker bundle; history inspection writes
+      // its small helper lazily in `inspect()`.
       entry.preparation.initialized = true;
       return connectionEnvs;
     });
@@ -485,7 +486,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     let failed = false;
     try {
       entry = await this.acquire(session, true, onSandbox, turn.id, signal);
-      const connectionEnvs = this.options.connections ? await syncSandboxConnections(this.options.connections) : {};
+      // App Server is long-lived, but the project environment still needs to
+      // be prepared before every turn. In particular, this publishes the
+      // global AGENTS.md and shared docs; previously that happened only in
+      // the retired per-turn worker path below.
+      const connectionEnvs = await this.prepareEnvironment(session, entry, signal);
       const endpoint = await this.options.appServer(entry.metadata.id);
       const images: string[] = [];
       if (turn.images.length) {
@@ -720,33 +725,6 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     return signalled || Boolean(killed);
   }
 
-  private async inspect<T>(session: WorkspaceTarget, mode: string, args: string[]): Promise<T> {
-    const entry = await this.acquire(session, false);
-    let failed = false;
-    try {
-      // History inspection must work for an existing thread before any new
-      // worker has started. Install the tiny App Server inspector on demand;
-      // it does not depend on the worker preparation lifecycle.
-      const inspectSignal = AbortSignal.timeout(30_000);
-      await this.command(entry, `mkdir -p ${quote(`${RUNTIME}/agentcore`)}`, inspectSignal, { timeoutMs: 30_000 });
-      await this.writeAtomic(entry, `${RUNTIME}/sandbox-inspect.mjs`, await readFile(new URL('../execution/worker/sandbox-inspect.mjs', import.meta.url), 'utf8'), inspectSignal);
-      await this.writeAtomic(entry, `${RUNTIME}/agentcore/index.mjs`, await readFile(new URL('../../packages/agentcore/src/index.mjs', import.meta.url), 'utf8'), inspectSignal);
-      const timeoutMs = mode === 'history' || mode === 'billing' ? 120_000 : 30_000;
-      const result = await entry.sandbox.commands.run(`${NODE} ${quote(`${RUNTIME}/sandbox-inspect.mjs`)} ${quote(mode)} ${args.map(quote).join(' ')}`, { user: 'user', timeoutMs });
-      return JSON.parse(result.stdout) as T;
-    } catch (error) {
-      failed = true;
-      const stdout = (error as { stdout?: string })?.stdout;
-      if (stdout) {
-        let detail;
-        try { detail = JSON.parse(stdout); } catch { /* Retain the transport error. */ }
-        if (typeof detail?.error === 'string') throw this.safeError(detail.error);
-      }
-      if (/not found|404/i.test(String(error))) await this.sandboxes.inspect(session).catch(() => { });
-      throw this.safeError(error);
-    }
-    finally { await this.release(entry, failed); }
-  }
   async preview(session: WorkspaceTarget, port: number): Promise<string> {
     if (this.closing) throw new Error('Sandbox 运行时正在关闭');
     if (!session.sandbox) throw new Error('项目沙箱尚未创建，请先启动服务');
@@ -777,23 +755,41 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     } finally { await this.release(entry, failed); }
   }
 
-  async changes(session: WorkspaceTarget): Promise<Changes> {
-    if (!session.sandbox) return { branch: '', files: [], diff: '', error: 'Sandbox 沙箱尚未创建，请先发送一条消息' };
-    return this.inspect(session, 'changes', [session.settings.workingDirectory]);
-  }
-  async rawTools(session: ThreadWorkspace, cursor = 0): Promise<RawToolPage> {
-    if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error('原始消息游标无效');
-    if (!session.threadId || !session.sandbox) return {
-      source: 'codex-rollout', location: 'sandbox', sandboxId: session.sandbox?.id,
-      threadId: session.threadId, availability: 'pending', messages: [], nextCursor: cursor, hasMore: false, skippedLines: 0,
-    };
-    const page = await this.inspect<RawToolPage>(session, 'raw', [session.threadId, String(cursor)]);
-    return { ...page, location: 'sandbox', sandboxId: session.sandbox.id };
-  }
-  async history(session: ThreadWorkspace, includeBlocks?: boolean): Promise<NativeHistory> {
+  async history(session: Session, _includeBlocks?: boolean): Promise<NativeHistory> {
     if (!session.threadId) return { turns: [] };
     if (!session.sandbox) throw new Error('Codex 会话对应的沙箱不可用');
-    return this.inspect<NativeHistory>(session, includeBlocks ? 'billing' : 'history', [session.threadId, '', session.startedAt ?? '', session.nativeHistoryPath ?? '']);
+    if (!this.options.appServer) throw new Error('Sandbox App Server endpoint is not configured');
+    let entry: Entry | undefined;
+    let client: CodexAppServerClient | undefined;
+    let failed = false;
+    try {
+      entry = await this.acquire(session, false);
+      const endpoint = await this.options.appServer(entry.metadata.id);
+      client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: { Authorization: `Bearer ${endpoint.token}` }, requestTimeoutMs: 120_000 });
+      const response = await client.request('thread/turns/list', { threadId: session.threadId, itemsView: 'full' });
+      const turns = (response.data ?? []).map((rawTurn: any) => {
+        const status = rawTurn.status === 'completed' ? 'completed'
+          : rawTurn.status === 'inProgress' ? 'running'
+            : ['interrupted', 'aborted', 'cancelled', 'canceled'].includes(rawTurn.status) ? 'cancelled' : 'failed';
+        const turn = { id: rawTurn.id, prompt: '', images: [], status, items: [] as Turn['items'], startedAt: new Date((rawTurn.startedAt ?? 0) * 1000).toISOString(),
+          ...(rawTurn.completedAt ? { completedAt: new Date(rawTurn.completedAt * 1000).toISOString() } : {}) };
+        for (const entry of rawTurn.items ?? []) {
+          const item = entry.item ?? entry;
+          if (item.type === 'userMessage') {
+            turn.prompt = (item.content ?? []).filter((part: any) => part.type === 'text').map((part: any) => part.text ?? '').join('');
+            continue;
+          }
+          const converted = new AppServerEventAdapter().convert(item);
+          if (converted) turn.items.push(converted);
+        }
+        return turn;
+      });
+      return { turns };
+    } catch (error) { failed = true; throw this.safeError(error); }
+    finally {
+      await client?.close();
+      if (entry) await this.release(entry, failed);
+    }
   }
   async delete(session: WorkspaceTarget) {
     await this.sandboxes.delete(session);
@@ -811,7 +807,11 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
       const content = await readFile(archivePath);
       const remote = `${RUNTIME}/archives/${randomUUID()}.tar.gz`;
       await entry.sandbox.files.write(remote, content, { user: 'root' });
-      const result = await entry.sandbox.commands.run(`set -eu; tar -xzf ${quote(remote)} -C /; rm -f ${quote(remote)}`, { user: 'root', timeoutMs: COMMAND_TIMEOUT_MS });
+      // AGENTS.md is a read-only host mount in freshly created Sandboxes. An
+      // older archive may contain the previous copied version, but it must not
+      // replace the current global instructions (and tar cannot overwrite the
+      // mount in any case).
+      const result = await entry.sandbox.commands.run(`set -eu; tar --exclude=home/user/.codex/AGENTS.md --exclude=home/user/.codex/AGENTS.md/* -xzf ${quote(remote)} -C /; rm -f ${quote(remote)}`, { user: 'root', timeoutMs: COMMAND_TIMEOUT_MS });
       if (result && 'exitCode' in result && result.exitCode) throw new Error(result.stderr || '归档恢复失败');
     } finally { await this.release(entry); }
   }

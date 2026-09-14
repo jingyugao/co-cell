@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HttpError } from '../../util/errors.js';
@@ -117,6 +117,9 @@ export class SharedFiles {
             throw error;
           });
         } else await rename(temp, location);
+        // This file is read-only bind-mounted into every Sandbox as the
+        // global Codex instruction source; it must be readable by uid 1000.
+        if (path === 'AGENTS.md') await chmod(location, 0o644);
       } finally { await unlink(temp).catch(error => { if (!missing(error)) throw error; }); }
       return { path, content, version: version(bytes) };
     });

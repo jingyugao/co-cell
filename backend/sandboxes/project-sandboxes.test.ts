@@ -180,3 +180,24 @@ test('an unconfirmed stop remains durable and restart retries termination withou
     await restarted.delete(restored);
   } finally { await restarted.close(); }
 });
+
+test('a user stop remains cancelled when App Server reports its interrupted turn as failed', async () => {
+  const now = new Date().toISOString();
+  const turn: Turn = { id: 'turn', prompt: 'stop me', images: [], items: [], status: 'running', startedAt: now };
+  const session: Session = { id: 'session', projectId: 'project', title: 'test', threadId: 'thread', status: 'running',
+    startedAt: now, createdAt: now, updatedAt: now, archivedAt: null, turns: [turn],
+    settings: { executionMode: 'sandbox', workingDirectory: '/home/user/workspace', model: 'test', modelReasoningEffort: 'low',
+      sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true } };
+  const controller = new AbortController();
+  controller.abort();
+  const sandbox = { async *run() {
+    yield { type: 'turn.started' as const, turn_id: 'native-turn' };
+    yield { type: 'turn.failed' as const, error: { message: 'Turn interrupted' } };
+  } } as unknown as ContainerCodexRuntime;
+  await runTurn(session, turn, controller, {
+    client: {} as TurnExecutionDependencies['client'], sandbox,
+    save: async () => {}, publish: () => {}, snapshot: () => structuredClone(session), updateSandbox: async () => {},
+  });
+  assert.equal(turn.status, 'cancelled');
+  assert.equal(turn.error, undefined);
+});

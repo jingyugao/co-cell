@@ -1,6 +1,17 @@
 # syntax=docker/dockerfile:1.7
 FROM node:22.18.0-bookworm-slim
 
+# The mutable `latest` tag is convenient for new Sandboxes, but is not enough
+# to identify the runtime an existing container was created from. Keep a human
+# readable build version and its source revision in the immutable image config.
+ARG SANDBOX_VERSION=0.1.1
+ARG SANDBOX_REVISION=unknown
+ARG SANDBOX_CREATED=unknown
+LABEL org.opencontainers.image.title="swarm-hive-sandbox" \
+      org.opencontainers.image.version="${SANDBOX_VERSION}" \
+      org.opencontainers.image.revision="${SANDBOX_REVISION}" \
+      org.opencontainers.image.created="${SANDBOX_CREATED}"
+
 # This is the disposable project runtime, not the web application image. The
 # host deliberately mounts Docker's socket into the web service and creates a
 # fresh container from this image for every project sandbox.
@@ -21,7 +32,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # co-installable versions with the same application extensions. PHP 8.2 is the
 # default for the current vendor tree; legacy branches can invoke php8.0.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-  curl -fsSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb \
+  curl --connect-timeout 20 --max-time 120 -fsSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb \
   && dpkg -i /tmp/debsuryorg-archive-keyring.deb \
   && rm /tmp/debsuryorg-archive-keyring.deb \
   && printf '%s\n' 'deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ bookworm main' > /etc/apt/sources.list.d/php.list \

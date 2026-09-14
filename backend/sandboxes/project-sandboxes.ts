@@ -20,12 +20,13 @@ export class ProjectSandboxes {
 
   async replace(target: WorkspaceTarget, replacement: SandboxState) {
     const binding = this.track(target);
-    const { workingDirectory: _directory, ...record } = replacement;
+    const { workingDirectory: _directory, image, ...record } = replacement;
+    const managerRecord = { ...record, ...(image ? { templateIdentity: structuredClone(image) } : {}) };
     if (target.sandbox) {
-      await this.manager.replace(resourceKey(target), target.sandbox.id, record);
+      await this.manager.replace(resourceKey(target), target.sandbox.id, managerRecord);
     } else {
       if (!binding.save) throw new Error('项目沙箱的持久化入口尚未配置');
-      await this.manager.bind(resourceKey(target), record, binding.persist);
+      await this.manager.bind(resourceKey(target), managerRecord, binding.persist);
     }
     target.sandbox = structuredClone(replacement);
   }
@@ -40,6 +41,7 @@ export class ProjectSandboxes {
   private project(record: SandboxRecord, workingDirectory: string): SandboxState {
     return {
       id: record.id, template: record.template, workingDirectory,
+      ...(record.templateIdentity ? { image: structuredClone(record.templateIdentity) } : {}),
       status: record.status === 'deleted' ? 'unavailable' : record.status,
       ...(record.lastActiveAt ? { lastActiveAt: record.lastActiveAt } : {}),
       ...(record.pausedAt ? { pausedAt: record.pausedAt } : {}),
@@ -73,9 +75,11 @@ export class ProjectSandboxes {
     }
     if (target.sandbox && !tracked) {
       const { workingDirectory: _directory, ...record } = target.sandbox;
+      const { image, ...persisted } = record;
       const activeAt = Date.parse(record.lastActiveAt ?? target.updatedAt);
       this.manager.track(key, {
-        ...record,
+        ...persisted,
+        ...(image ? { templateIdentity: structuredClone(image) } : {}),
         lastActiveAt: new Date(Number.isFinite(activeAt) ? activeAt : Date.now()).toISOString(),
       }, binding.persist);
     }

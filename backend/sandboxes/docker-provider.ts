@@ -47,10 +47,12 @@ export function dockerSandboxProvider(client: DockerSandboxClient): SandboxProvi
       return sandbox(id);
     },
     getInfo: async id => {
-      const state = await client.inspect(id);
+      const details = await client.containerDetails(id);
+      const state = details.status;
       const now = new Date();
       return { sandboxId: id, state: state === 'paused' ? 'paused' : state === 'ready' ? 'running' : 'unknown',
-        startedAt: now, endAt: new Date(now.getTime() + 3 * 60 * 60 * 1000), metadata: { app: 'codex-web' } };
+        startedAt: new Date(details.createdAt), endAt: new Date(now.getTime() + 3 * 60 * 60 * 1000), metadata: { app: 'codex-web' },
+        templateIdentity: details.imageIdentity };
     },
     pause: async id => { await client.pause(id); return true; },
     kill: async id => { await client.remove(id); return true; },

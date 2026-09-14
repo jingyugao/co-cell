@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { AppConfig, ProjectSummary, ProjectType } from '../../../protocol/types';
+import { SandboxVersion } from '../../components/SandboxVersion';
 import { projectDisplayName, projectTypeLabel } from '../../../util/project-types';
 import type { ProjectValues, ProjectUpdate } from './useProjects';
 import { groupArchivedProjectsByWeek } from './project-groups';
@@ -61,7 +62,7 @@ function ProjectForm({ initial, busy, onSubmit, onCancel }: {
   </form>;
 }
 
-function ProjectCard({ project, onUpdate, onRebuildSandbox, onOpenProject, onStatus }: Pick<Props, 'onUpdate' | 'onRebuildSandbox' | 'onOpenProject'> & {
+function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onOpenProject, onStatus }: Pick<Props, 'config' | 'onUpdate' | 'onRebuildSandbox' | 'onOpenProject'> & {
   project: ProjectSummary;
   onStatus: (name: string, status: 'active' | 'completed') => void;
 }) {
@@ -102,7 +103,7 @@ function ProjectCard({ project, onUpdate, onRebuildSandbox, onOpenProject, onSta
   }
 
   const openDisabled = needsRebuild || completed;
-  const sandboxDescription = project.sandbox ? <code title={project.sandbox.id}>{project.sandbox.id}</code>
+  const sandboxDescription = project.sandbox ? <span className="project-sandbox-detail"><code title={project.sandbox.id} aria-label={`Sandbox ID ${project.sandbox.id}`}>{project.sandbox.id.slice(0, 6)}</code><SandboxVersion image={project.sandbox.image} latestImage={config?.sandbox?.imageIdentity} /></span>
     : archived ? '已归档，需先重建'
     : project.executionMode === 'local' ? '本地运行' : '首次执行任务时创建';
 
@@ -197,7 +198,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
   const archivedGroups = view === 'archived' ? groupArchivedProjectsByWeek(visible) : [];
   const canCreate = config?.sandbox?.enabled === true;
   const stopCreating = () => { setCreating(false); setTimeout(() => createButton.current?.focus(), 0); };
-  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onOpenProject={onOpenProject} onStatus={(name, status) => {
+  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} config={config} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onOpenProject={onOpenProject} onStatus={(name, status) => {
     setMessage(status === 'completed' ? `「${name}」已标记完成；满 1 天后会自动归档并删除 Sandbox。` : `「${name}」已恢复为使用中。`);
     activeTab.current?.focus();
   }} />;

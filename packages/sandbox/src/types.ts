@@ -32,6 +32,13 @@ export interface SandboxHandle {
 export interface SandboxInfo {
   sandboxId: string; state: 'running' | 'paused' | 'unknown';
   startedAt: Date; endAt: Date; metadata?: Record<string, string>;
+  templateIdentity?: {
+    reference: string;
+    id: string;
+    repoDigests: string[];
+    version?: string;
+    createdAt?: string;
+  };
 }
 
 export type SandboxStatus =
@@ -53,6 +60,7 @@ export interface SandboxRecord {
   id: string;
   status: SandboxStatus;
   template: string;
+  templateIdentity?: SandboxInfo['templateIdentity'];
   lastActiveAt?: string;
   pausedAt?: string;
   operation?: SandboxOperation;

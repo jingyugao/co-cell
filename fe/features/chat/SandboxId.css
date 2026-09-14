@@ -1,0 +1,7 @@
+.sandbox-info > span:nth-child(3) > code {
+  display: inline-block;
+  max-width: 6ch;
+  overflow: hidden;
+  vertical-align: bottom;
+  white-space: nowrap;
+}

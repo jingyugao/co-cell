@@ -1,4 +1,4 @@
-import type { SandboxState } from './sandbox-types.js';
+import type { SandboxImageIdentity, SandboxState } from './sandbox-types.js';
 import type { UserApproval } from './approval-types.js';
 import type { ThreadEvent, ThreadItem, Usage } from './agent-protocol.js';
 
@@ -177,6 +177,7 @@ export interface SandboxRecord {
   sessions?: Array<{ id: string; title: string; status: SessionStatus }>;
   id: string;
   template: string;
+  image?: SandboxImageIdentity;
   state: 'running' | 'paused' | 'unknown';
   pausedAt?: string;
   cpuCount: number;
@@ -206,6 +207,7 @@ export interface AppConfig {
   sandbox?: {
     enabled: boolean;
     image: string;
+    imageIdentity?: SandboxImageIdentity;
     workingDirectory: string;
     archivedReclaimAfterMs?: number;
   };

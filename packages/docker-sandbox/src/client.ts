@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import type { DockerExecHandle, DockerExecOptions, DockerExecResult, DockerSandboxRecord, DockerSandboxStatus } from './types.js';
+import type { DockerExecHandle, DockerExecOptions, DockerExecResult, DockerImageIdentity, DockerSandboxRecord, DockerSandboxStatus } from './types.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -12,6 +12,40 @@ export class DockerSandboxClient {
     private readonly appServerTokenHostPath?: string, private readonly sharedAgentsHostPath?: string, private readonly appServerHost?: string,
     private readonly appServerEnvironment: Record<string, string> = {}) {}
   private async call(args: string[], timeout?: number, signal?: AbortSignal) { return execFileAsync(this.docker, args, { timeout, signal, maxBuffer: 16 * 1024 * 1024 }); }
+  async imageIdentity(reference = this.image): Promise<DockerImageIdentity> {
+    const { stdout } = await this.call(['image', 'inspect', '--format', '{{json .}}', reference]);
+    const image = JSON.parse(stdout) as {
+      Id: string; RepoDigests?: string[] | null; Created?: string;
+      Config?: { Labels?: Record<string, string> | null };
+    };
+    const labels = image.Config?.Labels ?? {};
+    return {
+      reference,
+      id: image.Id,
+      repoDigests: image.RepoDigests ?? [],
+      ...(labels['org.opencontainers.image.version'] ? { version: labels['org.opencontainers.image.version'] } : {}),
+      ...(labels['org.opencontainers.image.created'] || image.Created
+        ? { createdAt: labels['org.opencontainers.image.created'] || image.Created }
+        : {}),
+    };
+  }
+  async containerDetails(id: string): Promise<{ status: DockerSandboxStatus; createdAt: string; imageIdentity: DockerImageIdentity }> {
+    const { stdout } = await this.call(['inspect', '--format', '{{json .}}', id]);
+    const container = JSON.parse(stdout) as {
+      Image: string; Created: string; Config: { Image: string }; State: { Status: string; Paused: boolean };
+    };
+    const status = container.State.Status === 'paused' || (container.State.Status === 'running' && container.State.Paused)
+      ? 'paused' : container.State.Status === 'running' ? 'ready' : 'unavailable';
+    let imageIdentity: DockerImageIdentity;
+    try {
+      imageIdentity = { ...(await this.imageIdentity(container.Image)), reference: container.Config.Image };
+    } catch {
+      // Container inspect itself always exposes the immutable image ID, even
+      // if the image's optional labels/digests are no longer inspectable.
+      imageIdentity = { reference: container.Config.Image, id: container.Image, repoDigests: [] };
+    }
+    return { status, createdAt: container.Created, imageIdentity };
+  }
   async create(projectId: string, workingDirectory: string): Promise<DockerSandboxRecord> {
     const name = `swarm-hive-sandbox-${projectId.slice(0, 12)}-${randomUUID().slice(0, 8)}`;
     // Sandboxes share Docker's host network so project preview ports remain
@@ -41,7 +75,16 @@ export class DockerSandboxClient {
     if (this.sharedAgentsHostPath) args.push('--mount', `type=bind,src=${this.sharedAgentsHostPath},dst=/home/user/.codex/AGENTS.md`);
     args.push(this.image);
     const { stdout } = await this.call(args);
-    return { id: stdout.trim(), image: this.image, status: 'ready', projectId, workingDirectory, createdAt: new Date().toISOString() };
+    const id = stdout.trim();
+    try {
+      const details = await this.containerDetails(id);
+      return { id, image: details.imageIdentity.reference, imageIdentity: details.imageIdentity,
+        status: details.status, projectId, workingDirectory, createdAt: details.createdAt };
+    } catch {
+      // Do not report creation failure after `docker run` succeeded: callers
+      // would otherwise retry and leave this live container untracked.
+      return { id, image: this.image, status: 'ready', projectId, workingDirectory, createdAt: new Date().toISOString() };
+    }
   }
   async appServer(id: string): Promise<{ url: string; token: string }> {
     const { stdout } = await this.call(['inspect', '--format', '{{index .Config.Labels "swarm-hive.app-server-port"}}\t{{.Name}}', id]);
@@ -148,6 +191,16 @@ export class DockerSandboxClient {
       const [id, image, state, projectId] = line.split('\t');
       rows.set(id, { id, image, projectId, workingDirectory: '/home/user/workspace', createdAt: '', status: state === 'running' ? 'ready' : state === 'paused' ? 'paused' : 'unavailable' });
     }
-    return [...rows.values()];
+    return Promise.all([...rows.values()].map(async row => {
+      try {
+        const details = await this.containerDetails(row.id);
+        return { ...row, image: details.imageIdentity.reference, imageIdentity: details.imageIdentity,
+          createdAt: details.createdAt, status: details.status };
+      } catch {
+        // A container can disappear between `docker ps` and `docker inspect`.
+        // Keep it in inventory using the information already returned by ps.
+        return row;
+      }
+    }));
   }
 }

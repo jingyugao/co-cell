@@ -37,6 +37,10 @@ type Entry = {
 const cloneRecord = (record: SandboxRecord): SandboxRecord => ({
   ...record,
   ...(record.error ? { error: { ...record.error } } : {}),
+  ...(record.templateIdentity ? { templateIdentity: {
+    ...record.templateIdentity,
+    repoDigests: [...record.templateIdentity.repoDigests],
+  } } : {}),
 });
 
 const assertResourceKey = (resourceKey: string) => {
@@ -419,10 +423,19 @@ export class SandboxManager {
       const detail = this.safeMessage(error);
       throw new SandboxManagerError('unavailable', `Sandbox creation failed: ${detail}`, { cause: new Error(detail) });
     }
+    let templateIdentity: SandboxRecord['templateIdentity'];
+    try {
+      templateIdentity = (await this.provider.getInfo(sandbox.sandboxId)).templateIdentity;
+    } catch (error) {
+      // Identity enrichment must not turn a successfully-created remote
+      // resource into an orphan when an inspect call is temporarily flaky.
+      this.log({ event: 'sandbox.identity_inspect_failed', sandboxId: sandbox.sandboxId, message: this.safeMessage(error) });
+    }
     const now = new Date().toISOString();
     const entry = this.entry({
       id: sandbox.sandboxId, template: create.template, status: 'ready',
       lastActiveAt: now, version: 0,
+      ...(templateIdentity ? { templateIdentity } : {}),
     }, persist);
     entry.sandbox = sandbox;
     entry.lastRenewedAt = Date.now();
@@ -565,9 +578,14 @@ export class SandboxManager {
   private async applyObservation(resourceKey: string, entry: Entry, info: SandboxInfo): Promise<void> {
     const status: SandboxStatus = info.state === 'paused' ? 'paused' : 'ready';
     const pausedAt = status === 'paused' ? entry.record.pausedAt ?? new Date().toISOString() : undefined;
-    if (entry.record.status !== status || entry.record.pausedAt !== pausedAt || entry.record.operation) {
+    const identityChanged = info.templateIdentity
+      && JSON.stringify(entry.record.templateIdentity) !== JSON.stringify(info.templateIdentity);
+    if (entry.record.status !== status || entry.record.pausedAt !== pausedAt || entry.record.operation || identityChanged) {
       if (status === 'paused') entry.sandbox = undefined;
-      await this.change(resourceKey, entry, { status, pausedAt, operation: undefined, error: undefined });
+      await this.change(resourceKey, entry, {
+        status, pausedAt, operation: undefined, error: undefined,
+        ...(info.templateIdentity ? { templateIdentity: info.templateIdentity } : {}),
+      });
     }
   }
 

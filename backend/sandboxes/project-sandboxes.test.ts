@@ -23,7 +23,9 @@ function fixture() {
     create: async () => { counts.create++; return sandbox; },
     connect: async () => { counts.connect++; return sandbox; },
     getInfo: async () => ({ sandboxId: sandbox.sandboxId, state: 'running', startedAt: new Date(),
-      endAt: new Date(Date.now() + 3 * 3600_000) }) as SandboxInfo,
+      endAt: new Date(Date.now() + 3 * 3600_000), templateIdentity: {
+        reference: 'base:latest', id: `sha256:${'1'.repeat(64)}`, repoDigests: [], version: '20260914.1',
+      } }) as SandboxInfo,
     kill: async () => { counts.kill++; return true; },
     pause: async () => true,
   };
@@ -52,6 +54,8 @@ test('sibling sessions share one sandbox and a stable project persistence callba
     assert.equal(sibling.sandbox?.id, target.sandbox?.id);
     assert.ok(saved.length > 0);
     assert.equal(saved.at(-1)?.workingDirectory, target.settings.workingDirectory);
+    assert.equal(saved.at(-1)?.image?.version, '20260914.1');
+    assert.equal(target.sandbox?.image?.id, `sha256:${'1'.repeat(64)}`);
     assert.equal(siblingWrites, 0);
     await first.release();
     await assert.rejects(projects.delete(target), { code: 'busy' });

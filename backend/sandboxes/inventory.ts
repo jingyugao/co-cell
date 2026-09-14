@@ -23,7 +23,8 @@ export class DockerSandboxInventory implements SandboxInventoryReader {
     return { enabled: true, fetchedAt: new Date().toISOString(), sandboxes: rows.map(row => {
       const project = projectsBySandbox.get(row.id);
       const associated = associations.get(row.id) ?? [];
-      return { id: row.id, template: row.image, state: row.status === 'ready' ? 'running' : row.status === 'paused' ? 'paused' : 'unknown',
+      return { id: row.id, template: row.image, ...(row.imageIdentity ? { image: row.imageIdentity } : {}),
+        state: row.status === 'ready' ? 'running' : row.status === 'paused' ? 'paused' : 'unknown',
         cpuCount: 0, memoryMB: 0, startedAt: row.createdAt, endAt: '', session: associated[0] ?? null, sessions: associated,
         metrics: null, metricsStatus: row.status === 'paused' ? 'paused' : 'unavailable', metricsSource: 'docker',
         project: project ? { id: project.id, name: project.name, requirementUrl: project.requirementUrl, sessionCount: project.sessionCount } : null,

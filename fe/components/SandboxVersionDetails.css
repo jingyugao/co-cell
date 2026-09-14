@@ -1,0 +1,10 @@
+.sandbox-version-entry-value {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.sandbox-version-entry.current .sandbox-version-entry-value > span {
+  color: #4f773d;
+  font-weight: 700;
+}

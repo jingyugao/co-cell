@@ -1,5 +1,12 @@
 export type DockerSandboxStatus = 'ready' | 'paused' | 'unavailable';
-export type DockerSandboxRecord = { id: string; image: string; status: DockerSandboxStatus; projectId: string; workingDirectory: string; createdAt: string };
+export type DockerImageIdentity = {
+  reference: string;
+  id: string;
+  repoDigests: string[];
+  version?: string;
+  createdAt?: string;
+};
+export type DockerSandboxRecord = { id: string; image: string; imageIdentity?: DockerImageIdentity; status: DockerSandboxStatus; projectId: string; workingDirectory: string; createdAt: string };
 export type DockerExecOptions = {
   cwd?: string;
   env?: Record<string, string>;

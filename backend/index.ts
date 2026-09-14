@@ -70,6 +70,10 @@ const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BI
     ...(apiKey ? { CODEX_API_KEY: apiKey } : {}), ...(process.env.OPENAI_BASE_URL ? { OPENAI_BASE_URL: process.env.OPENAI_BASE_URL } : {}),
     CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, configOverrides).slice(1)),
   });
+const sandboxImageIdentity = await dockerClient.imageIdentity().catch(error => {
+  console.warn(`Unable to inspect Sandbox image identity: ${error instanceof Error ? error.message : String(error)}`);
+  return undefined;
+});
 const provider = dockerSandboxProvider(dockerClient);
 const sandboxManager = new SandboxManager({ provider, logger: runtimeLog });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
@@ -95,7 +99,8 @@ manager = new SessionManager(codex, webDataDirectory, defaults, runtime, sandbox
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   });
 await manager.init();
-const config: AppConfig = { sandbox: { enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
+const config: AppConfig = { sandbox: { enabled: true, image: sandboxImage,
+  ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}), workingDirectory: sandboxWorkingDirectory,
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };
 const app = createApp(manager, config, [`localhost:${port}`, `127.0.0.1:${port}`],

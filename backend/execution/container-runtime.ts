@@ -88,14 +88,6 @@ const RUNTIME = `${ROOT}/runtime`;
 const CODEX_HOME = '/home/user/.codex';
 const SHARED_DATA = new URL('../../data/', import.meta.url);
 const SHARED_DOCS = `${CODEX_HOME}/docs`;
-const SANDBOX_PERSISTENCE_GUIDANCE = `# Sandbox persistence
-
-The project Sandbox is a disposable Docker container. Rebuilding or reclaiming it creates a new empty container; files and Codex conversation context are not restored automatically.
-
-- Keep durable code, files, and business data inside the project workspace.
-- Operating-system packages, global installations, running processes, terminals, and port services are not preserved.
-- Declare dependencies in manifests and lockfiles, and keep repeatable setup and startup scripts in the workspace so the environment can be rebuilt.
-- Platform-managed credentials, shared rules, and shared documents are synchronized when a worker starts; do not copy secrets into the repository.`;
 // Keep control processes independent of a project's Node selection. Legacy base
 // sandboxes retain their existing interpreter until moved to the dev template.
 const NODE = '"$(if test -x /opt/codex-runtime/bin/node; then echo /opt/codex-runtime/bin/node; else command -v node; fi)"';
@@ -432,13 +424,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   private async prepareEnvironment(target: WorkspaceTarget, entry: Entry, executionSignal: AbortSignal) {
     return this.prepare(entry, executionSignal, async () => {
-      // Read on every turn, including resumed threads. Global guidance applies
-      // across Git roots without replacing any project-owned AGENTS.md.
+      // Shared documents are read on every turn, including resumed threads.
+      // Global AGENTS.md is a required host mount on all supported Sandboxes.
       const sharedData = this.options.sharedDataDirectory ?? SHARED_DATA;
-      const sharedAgents = await readFile(new URL('AGENTS.md', sharedData), 'utf8').catch(error => {
-        if (error.code === 'ENOENT') return ''; // Deleting global rules clears the remote copy next turn.
-        throw error;
-      });
       const sharedDocs = await loadAgentDocs(new URL('docs/', sharedData));
       await this.command(entry, `sh -c ${quote(`mkdir -p ${quote(RUNTIME)} ${quote(`${RUNTIME}/agentcore`)} ${quote(`${RUNTIME}/node_modules/.bin`)} ${quote(`${ROOT}/images`)} /home/user/.codex ${quote(target.settings.workingDirectory)} && chmod 700 ${quote(ROOT)} /home/user/.codex && if test -x /usr/local/bin/codex; then ln -sfn /usr/local/bin/codex ${quote(`${RUNTIME}/node_modules/.bin/codex`)}; fi && cd ${quote(RUNTIME)} && if ! test -x ${quote(`${RUNTIME}/node_modules/.bin/codex`)}; then npm install --no-audit --no-fund --save-exact @openai/codex@0.153.4; fi`)}`, executionSignal, { timeoutMs: 300_000 });
       const connectionEnvs = this.options.connections
@@ -459,14 +447,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         if (!currentPaths.has(path)) await entry.sandbox.files.remove(`${SHARED_DOCS}/${path}`, { user: 'user', signal: executionSignal });
       }
       entry.preparation.sharedDocPaths = currentPaths;
-      const managedAgents = [sharedAgents.trim(), SANDBOX_PERSISTENCE_GUIDANCE].filter(Boolean).join('\n\n') + '\n';
-      // New Docker Sandboxes bind-mount this path before the long-lived App
-      // Server starts. Older Sandboxes lack that mount and retain the
-      // copy-based fallback until they are rebuilt.
-      const agentsPath = `${CODEX_HOME}/AGENTS.md`;
-      const mountedAgents = await entry.sandbox.commands.run(`test -f ${quote(agentsPath)} && awk '$5 == ${quote(agentsPath)} { found = 1 } END { exit !found }' /proc/self/mountinfo`, { user: 'user', timeoutMs: 5_000 })
-        .then(result => result.exitCode === 0, () => false);
-      if (!mountedAgents) await this.writeAtomic(entry, agentsPath, managedAgents, executionSignal);
       // The long-lived App Server owns execution. Its active turn path does
       // not use the retired per-turn worker bundle; history inspection writes
       // its small helper lazily in `inspect()`.

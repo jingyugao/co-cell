@@ -31,13 +31,14 @@ export class DockerSandboxClient {
     for (const [key, value] of Object.entries(this.appServerEnvironment)) args.push('--env', `${key}=${value}`);
     // This is a stable host directory, rather than a per-turn generated
     // directory. A bind mount lets operators update CLI configuration without
-    // recreating a Sandbox; it is deliberately read-only in the Sandbox.
-    if (this.credentialsHostDirectory) args.push('--mount', `type=bind,src=${this.credentialsHostDirectory},dst=/home/user/.codex-web/credentials/current,readonly`);
-    if (this.appServerTokenHostPath) args.push('--mount', `type=bind,src=${this.appServerTokenHostPath},dst=/home/user/.codex-web/app-server-token,readonly`);
+    // recreating a Sandbox. Trusted personal deployments may let agents
+    // update the host-managed files as well.
+    if (this.credentialsHostDirectory) args.push('--mount', `type=bind,src=${this.credentialsHostDirectory},dst=/home/user/.codex-web/credentials/current`);
+    if (this.appServerTokenHostPath) args.push('--mount', `type=bind,src=${this.appServerTokenHostPath},dst=/home/user/.codex-web/app-server-token`);
     // The App Server is started with the container and discovers AGENTS.md at
     // thread creation time. Mount the global rules rather than copying them
     // after the server has already started.
-    if (this.sharedAgentsHostPath) args.push('--mount', `type=bind,src=${this.sharedAgentsHostPath},dst=/home/user/.codex/AGENTS.md,readonly`);
+    if (this.sharedAgentsHostPath) args.push('--mount', `type=bind,src=${this.sharedAgentsHostPath},dst=/home/user/.codex/AGENTS.md`);
     args.push(this.image);
     const { stdout } = await this.call(args);
     return { id: stdout.trim(), image: this.image, status: 'ready', projectId, workingDirectory, createdAt: new Date().toISOString() };

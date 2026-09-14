@@ -460,11 +460,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       }
       entry.preparation.sharedDocPaths = currentPaths;
       const managedAgents = [sharedAgents.trim(), SANDBOX_PERSISTENCE_GUIDANCE].filter(Boolean).join('\n\n') + '\n';
-      // New Docker Sandboxes bind-mount this path read-only before the
-      // long-lived App Server starts. Older Sandboxes lack that mount and
-      // retain the copy-based fallback until they are rebuilt.
+      // New Docker Sandboxes bind-mount this path before the long-lived App
+      // Server starts. Older Sandboxes lack that mount and retain the
+      // copy-based fallback until they are rebuilt.
       const agentsPath = `${CODEX_HOME}/AGENTS.md`;
-      const mountedAgents = await entry.sandbox.commands.run(`test -f ${quote(agentsPath)} && test ! -w ${quote(agentsPath)}`, { user: 'user', timeoutMs: 5_000 })
+      const mountedAgents = await entry.sandbox.commands.run(`test -f ${quote(agentsPath)} && awk '$5 == ${quote(agentsPath)} { found = 1 } END { exit !found }' /proc/self/mountinfo`, { user: 'user', timeoutMs: 5_000 })
         .then(result => result.exitCode === 0, () => false);
       if (!mountedAgents) await this.writeAtomic(entry, agentsPath, managedAgents, executionSignal);
       // The long-lived App Server owns execution. Its active turn path does

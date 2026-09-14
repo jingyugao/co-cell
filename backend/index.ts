@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
-import { access, chmod, mkdir, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { Codex, appServerArgs } from '../packages/agentcore/src/index.mjs';
 import { getRequestListener } from '@hono/node-server';
@@ -10,6 +10,7 @@ import type { AppConfig, Settings } from '../protocol/types.js';
 import type { ImprovementContext, ImprovementReceipt } from '../protocol/improvement-types.js';
 import { DEFAULT_MODEL } from '../util/models.js';
 import { ImprovementStore } from './improvements/store.js';
+import { NotificationStore } from './notifications/store.js';
 import { createApp } from './app.js';
 import { SessionManager } from './sessions/manager.js';
 import { ContainerCodexRuntime } from './execution/container-runtime.js';
@@ -22,6 +23,7 @@ import { createWebStateStore } from './infra/storage/web-state.js';
 import { DockerSandboxClient } from '../packages/docker-sandbox/src/index.js';
 import { dockerSandboxProvider } from './sandboxes/docker-provider.js';
 import { ConnectionStore } from './connections/store.js';
+import { ApprovalMcpService } from './approvals/mcp.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 const port = Number(process.env.PORT || 3000);
@@ -53,6 +55,23 @@ try { await access(sandboxAppServerToken); } catch {
   await writeFile(sandboxAppServerToken, randomBytes(32).toString('base64url'), { mode: 0o600 });
 }
 await chmod(sandboxAppServerToken, 0o644);
+const approvalMcpTokenPath = resolve(connections.sandboxRuntimeDirectory(), 'approval-mcp-token');
+try { await access(approvalMcpTokenPath); } catch {
+  await writeFile(approvalMcpTokenPath, randomBytes(32).toString('base64url'), { mode: 0o600 });
+}
+await chmod(approvalMcpTokenPath, 0o600);
+const approvalMcpToken = process.env.SANDBOX_APPROVAL_MCP_TOKEN || (await readFile(approvalMcpTokenPath, 'utf8')).trim();
+const approvalMcpUrl = process.env.SANDBOX_APPROVAL_MCP_URL || `http://swarm-hive:${port}/mcp/approvals`;
+const approvalMcpOverrides = [
+  `mcp_servers.swarm_approvals.url=${JSON.stringify(approvalMcpUrl)}`,
+  `mcp_servers.swarm_approvals.http_headers.Authorization=${JSON.stringify(`Bearer ${approvalMcpToken}`)}`,
+  'mcp_servers.swarm_approvals.enabled=true',
+  'mcp_servers.swarm_approvals.required=true',
+  'mcp_servers.swarm_approvals.enabled_tools=["request_user_approval"]',
+  'mcp_servers.swarm_approvals.omit_tools_from=["deferred"]',
+  'mcp_servers.swarm_approvals.startup_timeout_sec=10',
+  'mcp_servers.swarm_approvals.tool_timeout_sec=1900',
+];
 // The Web container creates this through its /app/data bind mount. Docker
 // commands, however, are evaluated by the host daemon and use the optional
 // host path supplied by Compose.
@@ -68,7 +87,7 @@ await chmod(sharedAgentsPath, 0o644);
 const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BIN || 'docker', process.env.DOCKER_SANDBOX_NETWORK || 'swarm-hive_default', sandboxCredentialsHostDirectory, sandboxAppServerTokenHostPath, sharedAgentsHostPath,
   process.env.SANDBOX_APP_SERVER_HOST, {
     ...(apiKey ? { CODEX_API_KEY: apiKey } : {}), ...(process.env.OPENAI_BASE_URL ? { OPENAI_BASE_URL: process.env.OPENAI_BASE_URL } : {}),
-    CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, configOverrides).slice(1)),
+    CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, [...(configOverrides ?? []), ...approvalMcpOverrides]).slice(1)),
   });
 const sandboxImageIdentity = await dockerClient.imageIdentity().catch(error => {
   console.warn(`Unable to inspect Sandbox image identity: ${error instanceof Error ? error.message : String(error)}`);
@@ -78,7 +97,11 @@ const provider = dockerSandboxProvider(dockerClient);
 const sandboxManager = new SandboxManager({ provider, logger: runtimeLog });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
 const improvements = new ImprovementStore(process.env.IMPROVEMENTS_DB_PATH ? resolve(process.env.IMPROVEMENTS_DB_PATH) : undefined);
+const notifications = new NotificationStore('data/notifications.json');
+await notifications.init();
 let manager: SessionManager;
+const approvalMcp = new ApprovalMcpService(approvalMcpToken, (context, input, requestId, signal) =>
+  manager.requestApproval(context.sessionId, context.turnId, context.projectId, requestId, input, signal));
 async function submitImprovement(context: Omit<ImprovementContext, 'projectName'>, input: unknown, requestId: string): Promise<ImprovementReceipt> {
   const session = manager.get(context.sessionId);
   if (!session.turns.some(turn => turn.id === context.turnId) || (session.projectId ?? null) !== context.projectId) throw new Error('建议来源会话不匹配');
@@ -97,24 +120,27 @@ manager = new SessionManager(codex, webDataDirectory, defaults, runtime, sandbox
   createWebStateStore(webDataDirectory, process.env.MYSQL_URL), webImagesDirectory, {
     archivedReclaimAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
-  });
+  }, notifications);
 await manager.init();
 const config: AppConfig = { sandbox: { enabled: true, image: sandboxImage,
   ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}), workingDirectory: sandboxWorkingDirectory,
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };
 const app = createApp(manager, config, [`localhost:${port}`, `127.0.0.1:${port}`],
-  new DockerSandboxInventory(dockerClient), undefined, connections, improvements);
+  new DockerSandboxInventory(dockerClient), undefined, connections, improvements, approvalMcp, notifications);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' }); }
 const listener = getRequestListener(app.fetch);
-const server = createServer((request, response) => { if (request.url?.startsWith('/api/') || !vite) void listener(request, response); else vite.middlewares(request, response); });
+const server = createServer((request, response) => { if (request.url?.startsWith('/api/') || request.url?.startsWith('/mcp/') || !vite) void listener(request, response); else vite.middlewares(request, response); });
 server.listen(port, process.env.HOST || '127.0.0.1', () => {
   void runtimeLog.write({ event: 'service.started', port, model: defaults.model, executionMode: 'sandbox' });
   console.log(`Codex Web ready at http://localhost:${port}`); console.log(`Sandbox: Docker image ${sandboxImage} · workspace ${sandboxWorkingDirectory}`);
 });
 let shuttingDown = false;
 async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await manager.close(); await sandboxManager.close();
+// Periodic sandbox archive for active projects — every 30 minutes
+const archiveInterval = setInterval(() => { void manager.scheduledArchive().catch(() => {}); }, 30 * 60 * 1000);
+archiveInterval.unref();
   improvements.close(); await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); }
 process.on('SIGINT', () => void shutdown()); process.on('SIGTERM', () => void shutdown());

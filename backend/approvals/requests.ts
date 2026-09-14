@@ -3,6 +3,9 @@ import type { UserApproval, RequestUserApproval } from '../../protocol/approval-
 import type { Turn } from '../../protocol/types.js';
 import { HttpError } from '../../util/errors.js';
 
+/** Accepts both standard UUIDs and Codex MCP callIds (`exec-<uuid>`). */
+const approvalIdSchema = z.string().regex(/^(?:exec-)?[0-9a-f-]{36}$/i, '无效的审批标识');
+
 const inputSchema = z.object({
   title: z.string().trim().min(1).max(200),
   target: z.string().trim().min(1).max(2000),
@@ -75,7 +78,7 @@ export class ApprovalRequests {
   }
 
   request: RequestUserApproval = async (requestId, input, signal) => {
-    const id = z.string().uuid().parse(requestId);
+    const id = approvalIdSchema.parse(requestId);
     const body = inputSchema.parse(input);
     const { result } = await this.serialize(async () => {
       if (this.unavailable(signal)) throw new HttpError(409, '本轮执行已结束，不能请求确认');

@@ -15,6 +15,7 @@ import { runTurn, type CodexClient } from '../execution/runner.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { ApprovalRequests, approvalDecisionSchema, cancelPersistedApprovals } from '../approvals/requests.js';
 import { readNativeHistory } from '../execution/native-history.mjs';
+import type { NotificationStore } from '../notifications/store.js';
 import { estimateNativeBlocksAsync } from '../execution/block-estimates.js';
 
 export type { CodexClient } from '../execution/runner.js';
@@ -42,6 +43,7 @@ export interface SandboxLifecycleOptions {
 }
 export class SessionManager {
   private lifecycle?: SandboxLifecycleService;
+  private notifications?: NotificationStore;
   private projects: ProjectService;
   private danglingDeletions = new Map<string, Promise<void>>();
   private sessions = new Map<string, Session>();
@@ -64,7 +66,9 @@ export class SessionManager {
     private state: WebStateStore = createWebStateStore(dataDirectory),
     private readonly imagesDirectory = join(dataDirectory, 'images'),
     lifecycleOptions: SandboxLifecycleOptions = {},
+    notifications?: NotificationStore,
   ) {
+    this.notifications = notifications;
     this.projects = new ProjectService(state);
     if (sandbox) {
       this.lifecycle = new SandboxLifecycleService({
@@ -222,7 +226,23 @@ export class SessionManager {
       save: () => this.save(session), publish: message => this.publish(id, message), snapshot: () => this.get(id),
       updateSandbox: sandbox => this.updateSandbox(session.projectId, id, sandbox),
       requestApproval: approvals.request, closeApprovals: () => approvals.close(), detachApprovals: () => approvals.detach(),
-    }).finally(execution.finish);
+    }).finally(() => {
+      execution.finish();
+      if (session.projectId) {
+        void this.scheduledArchiveForProject(session.projectId).catch(() => {});
+      }
+      if (this.notifications && turn.status !== 'running') {
+        const type = turn.status === 'completed' ? 'turn_completed'
+          : turn.status === 'cancelled' ? 'turn_cancelled' : 'turn_failed';
+        const label = type === 'turn_completed' ? '执行完成' : type === 'turn_cancelled' ? '已停止' : '执行失败';
+        const projectName = session.projectId ? this.projects.get(session.projectId)?.name : undefined;
+        this.notifications.add({
+          type, title: `【${projectName ?? '无项目'}】${label}: ${session.title}`,
+          body: turn.prompt.slice(0, 100),
+          sessionId: session.id, sessionTitle: session.title, projectName, turnId: turn.id,
+        });
+      }
+    });
     void running.catch(error => console.error('Session persistence failed:', error instanceof Error ? error.message : 'unknown error'));
   }
 
@@ -412,6 +432,36 @@ export class SessionManager {
       await this.sandbox.restoreArchive(target, join(this.dataDirectory, '..', 'sandbox-data-archives', archive.key));
     }
     return this.getProject(id);
+  }
+
+  /** Archive a single project sandbox (best-effort, no deletion). */
+  async scheduledArchiveForProject(projectId: string) {
+    if (!this.sandbox?.createArchive) return;
+    const project = this.projects.get(projectId);
+    if (!project?.sandbox || project.status === 'archived') return;
+    const directory = join(this.dataDirectory, '..', 'sandbox-data-archives');
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    try {
+      const key = `${randomUUID()}.tar.gz`;
+      const destination = join(directory, key);
+      const stored = await this.sandbox.createArchive(
+        { id: project.id, projectId: project.id, settings: { workingDirectory: project.workingDirectory }, sandbox: project.sandbox, updatedAt: project.updatedAt }, destination);
+      const sessions = [...this.sessions.values()].filter(s => s.projectId === projectId);
+      const threadIds = sessions.map(s => s.threadId).filter((v): v is string => Boolean(v));
+      await this.projects.saveDataArchive(projectId, {
+        key, format: 'codex-workspace-v1', ...stored, createdAt: new Date().toISOString(), threadIds,
+        workingDirectory: project.workingDirectory, sourceSandboxId: project.sandbox.id,
+        sourceProjectId: projectId, sourceTemplate: project.sandbox.template, manifestSha256: stored.sha256,
+      });
+    } catch { /* best-effort */ }
+  }
+
+  /** Archive all active project sandboxes without deleting them. */
+  async scheduledArchive() {
+    for (const project of this.projects.list()) {
+      if (!project.sandbox || project.status === 'archived') continue;
+      await this.scheduledArchiveForProject(project.id).catch(() => {});
+    }
   }
 
   async archiveProjectNow(id: string): Promise<ProjectSummary> {
@@ -735,6 +785,32 @@ export class SessionManager {
       throw new HttpError(409, '本轮执行已结束，确认请求已失效');
     }
     return this.get(id);
+  }
+
+  async requestApproval(id: string, turnId: string, projectId: string | null, requestId: string, input: unknown, signal: AbortSignal) {
+    const session = this.lookup(id);
+    if ((session.projectId ?? null) !== projectId) throw new HttpError(403, '审批 capability 与项目不匹配');
+    const execution = this.active.get(id);
+    if (execution?.turnId !== turnId || !execution.approvals) throw new HttpError(409, '来源任务已结束，不能请求确认');
+    const body = (input as { title?: string; target?: string }) ?? {};
+    this.notifications?.add({
+      type: 'approval_pending',
+      title: `【${session.projectId ? this.projects.get(session.projectId)?.name ?? '' : '无项目'}】审批: ${body.title ?? requestId}`,
+      body: (body.target ?? '').slice(0, 100),
+      sessionId: session.id, sessionTitle: session.title, projectName: session.projectId ? this.projects.get(session.projectId)?.name : undefined, turnId,
+    });
+    return execution.approvals.request(requestId, input, signal);
+  }
+
+  /** Resolve Web session/turn context from a Codex App-Server thread ID. */
+  findSessionByThreadId(threadId: string): { sessionId: string; turnId: string; projectId: string | null } | null {
+    for (const session of this.sessions.values()) {
+      if (session.threadId !== threadId) continue;
+      const execution = this.active.get(session.id);
+      if (!execution?.turnId) continue;
+      return { sessionId: session.id, turnId: execution.turnId, projectId: session.projectId ?? null };
+    }
+    return null;
   }
 
   async stop(id: string) {

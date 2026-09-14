@@ -15,9 +15,13 @@ import { installConnectionsRoutes } from './connections/routes.js';
 import { installSharedFilesRoutes } from './shared-files/routes.js';
 import { installSandboxesRoutes } from './sandboxes/routes.js';
 import { installSessionsRoutes } from './sessions/routes.js';
+import { installApprovalMcpRoutes, type ApprovalMcpService } from './approvals/mcp.js';
+import { installNotificationRoutes } from './notifications/routes.js';
+import type { NotificationStore } from './notifications/store.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, improvements?: ImprovementStore) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, improvements?: ImprovementStore, approvalMcp?: ApprovalMcpService, notifications?: NotificationStore) {
   const app = new Hono();
+  installApprovalMcpRoutes(app, approvalMcp, manager);
   app.use('/api/*', async (c, next) => {
     const host = c.req.header('host');
     if (!host || !allowedHosts.includes(host)) return c.json({ error: '仅允许从本机访问' }, 403);
@@ -42,6 +46,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   installImprovementRoutes(app, improvements, manager);
   installProjectsRoutes(app, manager);
   installSessionsRoutes(app, manager, config);
+  installNotificationRoutes(app, notifications);
   installSandboxesRoutes(app, sandboxes, manager);
   installConnectionsRoutes(app, connections);
   installSharedFilesRoutes(app, sharedFiles);

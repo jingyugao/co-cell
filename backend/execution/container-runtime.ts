@@ -94,12 +94,20 @@ const NODE = '"$(if test -x /opt/codex-runtime/bin/node; then echo /opt/codex-ru
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const checkAbort = (signal: AbortSignal) => { if (signal.aborted) throw new DOMException('任务已停止', 'AbortError'); };
 const transportFailure = (error: unknown) => /timeout|timed out|network|fetch failed|ECONN|EAI_AGAIN|ENOTFOUND|socket|5\d\d|429|unavailable|transport/i.test(String(error));
+const waitFor = (delayMs: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
+  const timer = setTimeout(done, delayMs);
+  const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(signal.reason); };
+  function done() { signal.removeEventListener('abort', abort); resolve(); }
+  signal.addEventListener('abort', abort, { once: true });
+  if (signal.aborted) abort();
+});
 
 /** Prepares and observes Codex workers using independently managed sandbox leases. */
 export class ContainerCodexRuntime implements SandboxRuntime {
   private closing = false;
   private runtimePreparations = new Map<string, Preparation>();
   private observers = new Map<string, AbortController>();
+  private appServerObservers = new Map<string, { close(): Promise<void> }>();
   private detachRequests = new Set<string>();
   private preparations = new Map<string, AbortController>();
   private readonly sandboxes: ProjectSandboxes;
@@ -112,6 +120,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   trackExecution(session: Session, turn: Turn) {
     if (turn.execution && session.sandbox && (!turn.execution.sandboxId || turn.execution.sandboxId === session.sandbox.id)) {
       this.sandboxes.holdUsage(session, turn.execution.workerId);
+    } else if (!turn.execution && turn.codexAccepted && turn.nativeTurnId && session.threadId && session.sandbox) {
+      this.sandboxes.holdUsage(session, turn.id);
     }
   }
   private safeError(error: unknown): Error {
@@ -457,33 +467,41 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   /**
    * The App Server is the Sandbox entrypoint. Web owns the JSON-RPC client and
-   * persistence, so a turn no longer needs a copied worker, journal, or poller.
+   * persistence, so ordinary execution no longer needs a copied worker or journal.
    */
   private async *runAppServer(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox): AsyncGenerator<AgentEvent> {
     if (!this.options.appServer) throw new Error('Sandbox App Server endpoint is not configured');
+    const observer = new AbortController();
+    this.observers.set(turn.id, observer);
+    if (this.detachRequests.has(turn.id)) observer.abort(new TurnObserverDetached());
+    const startupSignal = AbortSignal.any([signal, observer.signal]);
     let entry: Entry | undefined;
     let codex: Codex | undefined;
     let failed = false;
+    let detached = false;
     try {
-      entry = await this.acquire(session, true, onSandbox, turn.id, signal);
+      entry = await this.acquire(session, true, onSandbox, turn.id, startupSignal);
       // App Server is long-lived, but the project environment still needs to
       // be prepared before every turn. In particular, this publishes the
       // global AGENTS.md and shared docs; previously that happened only in
       // the retired per-turn worker path below.
-      const connectionEnvs = await this.prepareEnvironment(session, entry, signal);
+      const connectionEnvs = await this.prepareEnvironment(session, entry, startupSignal);
+      observer.signal.throwIfAborted();
       const endpoint = await this.options.appServer(entry.metadata.id);
       const images: string[] = [];
       if (turn.images.length) {
         await entry.sandbox.commands.run(`mkdir -p ${quote(`${ROOT}/images`)}`, { user: 'user', timeoutMs: 30_000 });
         for (const [index, path] of turn.images.entries()) {
           const destination = `${ROOT}/images/${turn.id}-${index}${extname(basename(path))}`;
-          await entry.sandbox.files.write(destination, new Uint8Array(await readFile(path)).buffer, { user: 'user', signal });
+          await entry.sandbox.files.write(destination, new Uint8Array(await readFile(path)).buffer, { user: 'user', signal: startupSignal });
           images.push(destination);
         }
       }
       codex = new Codex({ apiKey: this.options.apiKey, baseUrl: this.options.baseUrl, config: this.options.modelConfig,
         configOverrides: this.options.configOverrides, appServerUrl: endpoint.url,
         appServerHeaders: { Authorization: `Bearer ${endpoint.token}` } });
+      this.appServerObservers.set(turn.id, codex);
+      observer.signal.throwIfAborted();
       const options = { workingDirectory: session.settings.workingDirectory, ...(session.settings.model ? { model: session.settings.model } : {}),
         modelReasoningEffort: session.settings.modelReasoningEffort, sandboxMode: 'danger-full-access' as const,
         webSearchMode: session.settings.webSearchMode, networkAccessEnabled: true, approvalPolicy: 'never' as const, skipGitRepoCheck: true,
@@ -492,10 +510,18 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       const input = images.length ? [{ type: 'text' as const, text: turn.prompt }, ...images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
       const streamed = await thread.runStreamed(input, { signal });
       for await (const event of streamed.events) yield event;
-    } catch (error) { failed = true; throw error; }
+    } catch (error) {
+      detached = observer.signal.aborted || this.detachRequests.has(turn.id);
+      failed = !detached;
+      if (detached) throw new TurnObserverDetached();
+      throw error;
+    }
     finally {
+      if (this.observers.get(turn.id) === observer) this.observers.delete(turn.id);
+      if (this.appServerObservers.get(turn.id) === codex) this.appServerObservers.delete(turn.id);
+      this.detachRequests.delete(turn.id);
       await codex?.close();
-      if (entry) await this.release(entry, failed);
+      if (entry) await this.release(entry, failed, detached);
     }
   }
 
@@ -594,8 +620,119 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     }
   }
 
+  private mapAppServerTurn(rawTurn: any): Turn {
+    const status = rawTurn.status === 'completed' ? 'completed'
+      : rawTurn.status === 'inProgress' ? 'running'
+        : ['interrupted', 'aborted', 'cancelled', 'canceled'].includes(rawTurn.status) ? 'cancelled' : 'failed';
+    const turn: Turn = { id: rawTurn.id, prompt: '', images: [], status, items: [], codexAccepted: true,
+      startedAt: new Date((rawTurn.startedAt ?? 0) * 1000).toISOString(),
+      ...(rawTurn.completedAt ? { completedAt: new Date(rawTurn.completedAt * 1000).toISOString() } : {}),
+      ...(rawTurn.error?.message ? { error: rawTurn.error.message } : {}) };
+    const adapter = new AppServerEventAdapter();
+    for (const entry of rawTurn.items ?? []) {
+      const item = entry.item ?? entry;
+      if (item.type === 'userMessage') {
+        turn.prompt = (item.content ?? []).filter((part: any) => part.type === 'text').map((part: any) => part.text ?? '').join('');
+        continue;
+      }
+      const converted = adapter.convert(item);
+      if (converted) turn.items.push(converted);
+    }
+    return turn;
+  }
+
+  private async readAppServerTurns(client: CodexAppServerClient, threadId: string, latestOnly = false): Promise<Turn[]> {
+    const response = await client.request('thread/turns/list', { threadId, itemsView: 'full',
+      ...(latestOnly ? { limit: 1, sortDirection: 'desc' } : {}) });
+    return (response.data ?? []).map((rawTurn: any) => this.mapAppServerTurn(rawTurn));
+  }
+
+  /** Re-observe a turn already accepted by the persistent App Server without submitting its prompt again. */
+  private async *recoverAppServer(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox): AsyncGenerator<AgentEvent> {
+    if (!this.options.appServer || !session.sandbox || !session.threadId || !turn.nativeTurnId || !turn.codexAccepted) {
+      throw new Error('App Server turn recovery information is incomplete');
+    }
+    this.sandboxes.holdUsage(session, turn.id);
+    const detached = new AbortController();
+    this.observers.set(turn.id, detached);
+    if (this.detachRequests.has(turn.id)) detached.abort(new TurnObserverDetached());
+    const observerSignal = AbortSignal.any([signal, detached.signal]);
+    let entry: Entry | undefined;
+    let client: CodexAppServerClient | undefined;
+    let observerDetached = false;
+    let failed = false;
+    let interruptSent = false;
+    let interruptRequest: Promise<unknown> | undefined;
+    const emittedItems = new Map<string, string>();
+    const interrupt = () => {
+      if (!client || interruptSent) return;
+      interruptSent = true;
+      interruptRequest = client.turnInterrupt({ threadId: session.threadId!, turnId: turn.nativeTurnId! });
+      void interruptRequest.catch(() => {});
+    };
+    try {
+      entry = await this.acquire(session, false, onSandbox, turn.id, observerSignal);
+      const endpoint = await this.options.appServer(entry.metadata.id);
+      client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: { Authorization: `Bearer ${endpoint.token}` }, requestTimeoutMs: 120_000 });
+      this.appServerObservers.set(turn.id, client);
+      signal.addEventListener('abort', interrupt, { once: true });
+      if (signal.aborted) interrupt();
+      yield { type: 'turn.started', turn_id: turn.nativeTurnId };
+      while (true) {
+        detached.signal.throwIfAborted();
+        if (signal.aborted) { interrupt(); await interruptRequest; }
+        const turns = await this.readAppServerTurns(client, session.threadId, true);
+        const native = turns.find(candidate => candidate.id === turn.nativeTurnId);
+        if (!native) {
+          await waitFor(1000, observerSignal);
+          continue;
+        }
+        if (!turn.prompt && native.prompt) turn.prompt = native.prompt;
+        for (const item of native.items) {
+          const signature = JSON.stringify(item);
+          if (emittedItems.get(item.id) === signature) continue;
+          const previous = emittedItems.has(item.id);
+          emittedItems.set(item.id, signature);
+          const inProgress = 'status' in item && item.status === 'in_progress';
+          yield { type: inProgress ? (previous ? 'item.updated' : 'item.started') : 'item.completed', item };
+        }
+        if (native.status === 'completed') {
+          yield { type: 'turn.completed', usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0,
+            output_tokens: 0, reasoning_output_tokens: 0 } };
+          return;
+        }
+        if (native.status === 'failed' || native.status === 'cancelled') {
+          yield { type: 'turn.failed', error: { message: native.error ?? (native.status === 'cancelled' ? 'Turn cancelled' : 'Turn failed') } };
+          return;
+        }
+        await waitFor(1000, observerSignal);
+      }
+    } catch (error) {
+      observerDetached = detached.signal.aborted || this.detachRequests.has(turn.id) || error instanceof TurnObserverDetached;
+      failed = !observerDetached;
+      if (observerDetached) throw new TurnObserverDetached();
+      if (signal.aborted) {
+        interrupt();
+        await interruptRequest?.catch(() => {});
+        throw new DOMException('任务已停止', 'AbortError');
+      }
+      throw this.safeError(error);
+    } finally {
+      if (this.observers.get(turn.id) === detached) this.observers.delete(turn.id);
+      if (this.appServerObservers.get(turn.id) === client) this.appServerObservers.delete(turn.id);
+      signal.removeEventListener('abort', interrupt);
+      this.detachRequests.delete(turn.id);
+      await client?.close();
+      if (entry) await this.release(entry, failed, observerDetached);
+    }
+  }
+
   async *recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, onApproval?: RequestUserApproval,
     onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
+    if (!turn.execution) {
+      yield* this.recoverAppServer(session, turn, signal, onSandbox);
+      return;
+    }
     if (!turn.execution || !session.sandbox || (turn.execution.sandboxId && turn.execution.sandboxId !== session.sandbox.id)) {
       throw new Error('Sandbox worker recovery information is incomplete');
     }
@@ -656,6 +793,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     this.detachRequests.add(turn.id);
     this.preparations.get(turn.id)?.abort();
     this.observers.get(turn.id)?.abort(new TurnObserverDetached());
+    void this.appServerObservers.get(turn.id)?.close();
   }
 
   private async terminateWorker(entry: Entry, turn: Turn, handle?: SandboxCommandHandle) {
@@ -746,25 +884,7 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
       entry = await this.acquire(session, false);
       const endpoint = await this.options.appServer(entry.metadata.id);
       client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: { Authorization: `Bearer ${endpoint.token}` }, requestTimeoutMs: 120_000 });
-      const response = await client.request('thread/turns/list', { threadId: session.threadId, itemsView: 'full' });
-      const turns = (response.data ?? []).map((rawTurn: any) => {
-        const status = rawTurn.status === 'completed' ? 'completed'
-          : rawTurn.status === 'inProgress' ? 'running'
-            : ['interrupted', 'aborted', 'cancelled', 'canceled'].includes(rawTurn.status) ? 'cancelled' : 'failed';
-        const turn = { id: rawTurn.id, prompt: '', images: [], status, items: [] as Turn['items'], startedAt: new Date((rawTurn.startedAt ?? 0) * 1000).toISOString(),
-          ...(rawTurn.completedAt ? { completedAt: new Date(rawTurn.completedAt * 1000).toISOString() } : {}) };
-        for (const entry of rawTurn.items ?? []) {
-          const item = entry.item ?? entry;
-          if (item.type === 'userMessage') {
-            turn.prompt = (item.content ?? []).filter((part: any) => part.type === 'text').map((part: any) => part.text ?? '').join('');
-            continue;
-          }
-          const converted = new AppServerEventAdapter().convert(item);
-          if (converted) turn.items.push(converted);
-        }
-        return turn;
-      });
-      return { turns };
+      return { turns: await this.readAppServerTurns(client, session.threadId) };
     } catch (error) { failed = true; throw this.safeError(error); }
     finally {
       await client?.close();

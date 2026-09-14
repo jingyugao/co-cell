@@ -119,7 +119,7 @@ export class SessionManager {
         changed = true;
       }
       for (const turn of session.turns) {
-        if (turn.status === 'running' && !turn.execution) {
+        if (turn.status === 'running' && !turn.execution && !this.canRecover(session, turn)) {
           turn.status = 'cancelled';
           turn.error = '服务重启时发现本轮没有可恢复的执行任务，已标记为已停止。';
           turn.completedAt = new Date().toISOString();
@@ -144,7 +144,7 @@ export class SessionManager {
         changed = true;
         for (const turn of session.turns.filter(t => t.status === 'running' || this.canRecover(session, t))) {
           if (this.canRecover(session, turn)) {
-            // Message bodies are reconstructed by replaying the sandbox journal.
+            // Message bodies are reconstructed from the worker journal or an App Server turn snapshot.
             if (!turn.items.length && !turn.prompt && turn.execution) turn.execution.lastAppliedSeq = 0;
             turn.phase = 'recovering';
             continue;
@@ -186,9 +186,11 @@ export class SessionManager {
   }
 
   private canRecover(session: Session, turn: Turn): boolean {
-    return Boolean(this.sandbox && session.settings.executionMode === 'sandbox' && session.sandbox
-      && turn.execution?.kind === 'sandbox-worker' && turn.execution.protocolVersion === 1 && turn.execution.state !== 'terminal'
-      && (!turn.execution.sandboxId || turn.execution.sandboxId === session.sandbox.id));
+    if (!this.sandbox || session.settings.executionMode !== 'sandbox' || !session.sandbox) return false;
+    if (!turn.execution) return turn.status === 'running' && turn.codexAccepted === true
+      && Boolean(session.threadId && turn.nativeTurnId);
+    return turn.execution.kind === 'sandbox-worker' && turn.execution.protocolVersion === 1 && turn.execution.state !== 'terminal'
+      && (!turn.execution.sandboxId || turn.execution.sandboxId === session.sandbox.id);
   }
 
   private reserveTurn(session: Session): ActiveExecution {
@@ -640,7 +642,7 @@ export class SessionManager {
     const turns = session.turns.map(turn => ({
       id: turn.id, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
       execution: turn.execution, codexAccepted: turn.codexAccepted, error: turn.error,
-      approvals: turn.execution?.state !== 'terminal' ? turn.approvals : undefined,
+      approvals: turn.status === 'running' || (turn.execution && turn.execution.state !== 'terminal') ? turn.approvals : undefined,
       prompt: turn.status === 'cancelled' ? turn.prompt : '',
       images: turn.status === 'cancelled' ? turn.images : [],
       items: turn.status === 'cancelled' ? turn.items : [],
@@ -836,7 +838,7 @@ export class SessionManager {
     for (const [id, execution] of this.active) {
       const session = this.sessions.get(id);
       const turn = session?.turns.find(turn => turn.id === execution.turnId);
-      if (session?.settings.executionMode === 'sandbox' && turn?.execution?.kind === 'sandbox-worker' && this.sandbox) {
+      if (session?.settings.executionMode === 'sandbox' && turn && this.sandbox) {
         this.sandbox.detach(turn);
         if (execution.approvals) detachments.push(execution.approvals.detach());
       } else execution.controller.abort();

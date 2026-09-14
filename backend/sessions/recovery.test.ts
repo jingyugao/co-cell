@@ -23,8 +23,11 @@ test('Web detach persists the same worker; startup recovers it without submittin
   const runtime = {
     async close() {},
     detach(turn: Turn) { observers.get(turn.id)?.(); },
-    async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: Session['sandbox']) => Promise<void>) {
+    async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: Session['sandbox']) => Promise<void>,
+      _onApproval: unknown, onExecution: () => Promise<void>) {
       launches++;
+      turn.execution = { kind: 'sandbox-worker', protocolVersion: 1, workerId: 'legacy-worker', lastAppliedSeq: 0, state: 'launching' };
+      await onExecution();
       const stored = JSON.parse(await readFile(join(directory, `${session.id}.json`), 'utf8')) as Session;
       assert.equal(stored.turns[0].execution?.workerId, turn.execution?.workerId);
       assert.equal(stored.turns[0].execution?.state, 'launching');
@@ -93,6 +96,92 @@ test('legacy running turns are cancelled on restart instead of resubmitted', asy
     assert.match(second.get(session.id).turns[0].error!, /没有可恢复的执行任务/);
   } finally {
     await first.close(); await second.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('an accepted App Server turn is recovered after restart without submitting its prompt again', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hive-app-server-recovery-'));
+  let recoveries = 0, launches = 0, tracked = 0;
+  const runtime = {
+    async close() {},
+    trackExecution(_session: Session, turn: Turn) { tracked++; assert.equal(turn.nativeTurnId, 'native-turn'); },
+    async *run() { launches++; assert.fail('must not resubmit an accepted App Server turn'); },
+    async *recover(_session: Session, turn: Turn) {
+      recoveries++;
+      assert.equal(turn.execution, undefined);
+      yield { type: 'turn.started' as const, turn_id: 'native-turn' };
+      yield { type: 'item.completed' as const, item: { id: 'answer', type: 'agent_message' as const, text: 'finished remotely' } };
+      yield { type: 'turn.completed' as const, usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0,
+        output_tokens: 0, reasoning_output_tokens: 0 } };
+    },
+  } as unknown as SandboxRuntime;
+  const first = new SessionManager({} as CodexClient, directory, defaults, runtime);
+  const second = new SessionManager({} as CodexClient, directory, defaults, runtime);
+  try {
+    await first.init();
+    const session = await first.create();
+    await first.close();
+    const sandbox = { id: 'test-sandbox', template: 'test', status: 'ready' as const, workingDirectory: defaults.workingDirectory };
+    const projectPath = join(directory, 'projects', `${session.projectId}.json`);
+    const project = JSON.parse(await readFile(projectPath, 'utf8'));
+    project.sandbox = sandbox;
+    await writeFile(projectPath, JSON.stringify(project));
+    session.sandbox = sandbox;
+    session.threadId = 'thread-1';
+    session.status = 'running';
+    session.turns.push({ id: 'web-turn', nativeTurnId: 'native-turn', codexAccepted: true, prompt: '', images: [],
+      status: 'running', phase: 'running', items: [], startedAt: session.createdAt });
+    await writeFile(join(directory, `${session.id}.json`), JSON.stringify(session));
+
+    await second.init();
+    assert.equal(second.get(session.id).turns[0].phase, 'recovering');
+    await second.waitForIdle(session.id);
+    const recovered = second.get(session.id);
+    assert.equal(tracked, 1);
+    assert.equal(recoveries, 1);
+    assert.equal(launches, 0);
+    assert.equal(recovered.status, 'completed');
+    assert.equal(recovered.turns[0].status, 'completed');
+    assert.equal(recovered.turns[0].nativeTurnId, 'native-turn');
+    assert.equal(recovered.turns[0].error, undefined);
+  } finally {
+    await first.close(); await second.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('closing Web detaches an accepted App Server turn without aborting it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hive-app-server-detach-'));
+  let detach!: () => void;
+  let observedSignal: AbortSignal | undefined;
+  let detachCalls = 0;
+  const runtime = {
+    async close() {},
+    detach(turn: Turn) { detachCalls++; assert.equal(turn.nativeTurnId, 'native-turn'); detach(); },
+    async *run(_session: Session, _turn: Turn, signal: AbortSignal, onSandbox: (value: Session['sandbox']) => Promise<void>) {
+      observedSignal = signal;
+      await onSandbox({ id: 'test-sandbox', template: 'test', status: 'ready', workingDirectory: defaults.workingDirectory });
+      yield { type: 'thread.started' as const, thread_id: 'thread-1' };
+      yield { type: 'turn.started' as const, turn_id: 'native-turn' };
+      await new Promise<void>(resolve => { detach = resolve; });
+      throw new TurnObserverDetached();
+    },
+  } as unknown as SandboxRuntime;
+  const manager = new SessionManager({} as CodexClient, directory, defaults, runtime);
+  try {
+    await manager.init();
+    const session = await manager.create();
+    const turnId = await manager.startTurn(session.id, 'keep running');
+    await until(() => Boolean(detach));
+    await manager.close();
+    const turn = manager.get(session.id).turns.find(candidate => candidate.id === turnId)!;
+    assert.equal(detachCalls, 1);
+    assert.equal(observedSignal?.aborted, false);
+    assert.equal(turn.status, 'running');
+    assert.equal(turn.phase, 'recovering');
+  } finally {
+    await manager.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

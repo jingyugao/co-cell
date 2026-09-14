@@ -5,6 +5,7 @@ import type { SandboxHandle, SandboxInfo } from '@swarm-hive/sandbox';
 import { SandboxManager, type SandboxProvider } from '@swarm-hive/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { Session, Turn } from '../../protocol/types.js';
+import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import { ContainerCodexRuntime, TurnObserverDetached } from '../execution/container-runtime.js';
 import { runTurn } from '../execution/runner.js';
 import { ProjectSandboxes } from './project-sandboxes.js';
@@ -204,4 +205,62 @@ test('a user stop remains cancelled when App Server reports its interrupted turn
   });
   assert.equal(turn.status, 'cancelled');
   assert.equal(turn.error, undefined);
+});
+
+test('App Server recovery snapshots preserve native status, prompt, and full items', async () => {
+  const { provider, projects, manager } = fixture();
+  const runtime = new ContainerCodexRuntime({ provider, apiKey: '', sandboxes: projects });
+  try {
+    const running = runtime['mapAppServerTurn']({ id: 'native-turn', status: 'inProgress', startedAt: 1,
+      items: [
+        { type: 'userMessage', content: [{ type: 'text', text: 'continue after restart' }] },
+        { type: 'commandExecution', id: 'command', command: 'sleep 1', status: 'inProgress', aggregatedOutput: 'working' },
+      ] });
+    assert.equal(running.status, 'running');
+    assert.equal(running.prompt, 'continue after restart');
+    assert.deepEqual(running.items[0], { id: 'command', type: 'command_execution', command: 'sleep 1',
+      aggregated_output: 'working', status: 'in_progress' });
+
+    const completed = runtime['mapAppServerTurn']({ id: 'native-turn', status: 'completed', startedAt: 1, completedAt: 2,
+      items: [{ type: 'agentMessage', id: 'answer', text: 'done' }] });
+    assert.equal(completed.status, 'completed');
+    assert.equal(completed.completedAt, '1970-01-01T00:00:02.000Z');
+    assert.deepEqual(completed.items, [{ id: 'answer', type: 'agent_message', text: 'done' }]);
+  } finally { await runtime.close(); await manager.close(); }
+});
+
+test('App Server recovery polls the accepted native turn and never starts another turn', async () => {
+  const { provider, projects, manager, target, record } = fixture();
+  const turn: Turn = { id: randomUUID(), nativeTurnId: 'native-turn', codexAccepted: true, prompt: '', images: [], items: [],
+    status: 'running', startedAt: target.updatedAt };
+  const session: Session = { ...target, sandbox: record, title: 'test', threadId: 'thread-1', status: 'running',
+    startedAt: target.updatedAt, createdAt: target.updatedAt, archivedAt: null, turns: [turn],
+    settings: { ...target.settings, executionMode: 'sandbox', model: 'test', modelReasoningEffort: 'low',
+      sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: false } };
+  let listCalls = 0, startCalls = 0;
+  const originalSpawn = CodexAppServerClient.spawn;
+  CodexAppServerClient.spawn = (async () => ({
+    request: async (method: string) => {
+      if (method === 'turn/start') { startCalls++; assert.fail('recovery must not start a turn'); }
+      assert.equal(method, 'thread/turns/list');
+      listCalls++;
+      return { data: [{ id: 'native-turn', status: 'completed', startedAt: 1, completedAt: 2,
+        items: [{ type: 'agentMessage', id: 'answer', text: 'done after restart' }] }] };
+    },
+    turnInterrupt: async () => ({}),
+    close: async () => {},
+  })) as unknown as typeof CodexAppServerClient.spawn;
+  const runtime = new ContainerCodexRuntime({ provider, apiKey: '', sandboxes: projects,
+    appServer: async () => ({ url: 'ws://app-server.test', token: 'x'.repeat(24) }) });
+  runtime.track(session, async () => {});
+  try {
+    const events = [];
+    for await (const event of runtime.recover(session, turn, new AbortController().signal, async () => {})) events.push(event);
+    assert.equal(listCalls, 1);
+    assert.equal(startCalls, 0);
+    assert.deepEqual(events.map(event => event.type), ['turn.started', 'item.completed', 'turn.completed']);
+  } finally {
+    CodexAppServerClient.spawn = originalSpawn;
+    await runtime.close(); await manager.close();
+  }
 });

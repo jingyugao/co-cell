@@ -1,13 +1,13 @@
+import { createPool } from 'mysql2/promise';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import type { Hono } from 'hono';
 import type { SessionManager } from '../sessions/manager.js';
-import { createPool } from 'mysql2/promise';
 
 interface ArchiveEntry { key: string; size: number; createdAt: string; }
 interface FileEntry { name: string; type: 'file' | 'directory'; size: number; }
 
-function listTarFiles(archivePath: string): Promise<FileEntry[]> {
+function listTarFiles(archivePath: string): Promise<{ entries: FileEntry[]; rootPrefix: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn('tar', ['-tzf', archivePath], { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
@@ -30,7 +30,29 @@ function listTarFiles(archivePath: string): Promise<FileEntry[]> {
           entries.push({ name, type: 'file', size: 0 });
         }
       }
-      resolve(entries);
+      // Collapse singleton root directories: when the root level contains exactly
+      // one directory and no files, strip it so users do not have to drill through
+      // empty intermediate levels (e.g. "home/user/" collapses to reveal workspace/
+      // and .codex/ directly).
+      let rootPrefix = '';
+      if (entries.length > 0) {
+        for (;;) {
+          const root = entries.filter(e => !e.name.includes('/'));
+          const dirs = root.filter(e => e.type === 'directory');
+          const files = root.filter(e => e.type === 'file');
+          if (files.length > 0 || dirs.length !== 1) break;
+          const singleton = dirs[0].name + '/';
+          rootPrefix += singleton;
+          for (const f of entries) {
+            if (f.name.startsWith(singleton)) f.name = f.name.slice(singleton.length);
+          }
+          // Remove entries that became empty or are the singleton itself
+          for (let i = entries.length - 1; i >= 0; i--) {
+            if (entries[i].name === '' || entries[i].name === dirs[0].name) entries.splice(i, 1);
+          }
+        }
+      }
+      resolve({ entries, rootPrefix });
     });
   });
 }
@@ -85,7 +107,7 @@ export function installArchiveRoutes(app: Hono, manager: SessionManager) {
     if (!/^[A-Za-z0-9._-]+\.tar\.gz$/.test(key)) return c.json({ error: '无效的归档文件' }, 400);
     const archivePath = join(archivesDir, key);
     try {
-      const allFiles = await listTarFiles(archivePath);
+      const { entries: allFiles, rootPrefix } = await listTarFiles(archivePath);
       const prefix = path ? (path.endsWith('/') ? path : path + '/') : '';
       const filtered = allFiles.filter(f => {
         if (!f.name.startsWith(prefix)) return false;
@@ -93,21 +115,24 @@ export function installArchiveRoutes(app: Hono, manager: SessionManager) {
         const relative = f.name.slice(prefix.length);
         return !relative.includes('/');
       }).sort((a, b) => a.type !== b.type ? (a.type === 'directory' ? -1 : 1) : a.name.localeCompare(b.name));
-      return c.json({ path, entries: filtered });
+      return c.json({ path, rootPrefix, entries: filtered });
     } catch (e: any) { return c.json({ error: e.message }, 500); }
   });
 
   // Read a file from an archive
   app.get('/api/archives/:key/file', async c => {
     const key = c.req.param('key');
-    const path = c.req.query('path') || '';
+    const filePath = c.req.query('path') || '';
     if (!/^[A-Za-z0-9._-]+\.tar\.gz$/.test(key)) return c.json({ error: '无效的归档文件' }, 400);
-    if (!path) return c.json({ error: '缺少文件路径' }, 400);
+    if (!filePath) return c.json({ error: '缺少文件路径' }, 400);
     try {
-      const content = await readTarFile(join(archivesDir, key), path);
+      const archivePath = join(archivesDir, key);
+      const { rootPrefix } = await listTarFiles(archivePath);
+      const resolvedPath = rootPrefix ? rootPrefix + filePath : filePath;
+      const content = await readTarFile(archivePath, resolvedPath);
       const max = 512 * 1024;
-      if (content.length > max) return c.json({ path, content: content.slice(0, max), truncated: true, totalSize: content.length });
-      return c.json({ path, content, truncated: false });
+      if (content.length > max) return c.json({ path: filePath, content: content.slice(0, max), truncated: true, totalSize: content.length });
+      return c.json({ path: filePath, content, truncated: false });
     } catch (e: any) { return c.json({ error: e.message }, 500); }
   });
 }

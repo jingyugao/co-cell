@@ -109,7 +109,7 @@ export class DockerSandboxClient {
   async resume(id: string) { await this.call(['unpause', id]); }
   async remove(id: string) { await this.call(['rm', '--force', id]); }
   async archive(id: string, destination: string): Promise<{ sizeBytes: number; sha256: string }> {
-    const child = spawn(this.docker, ['exec', '--user', 'root', id, 'tar', '-czf', '-', '-C', '/', 'home/user/workspace', 'home/user/.codex'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(this.docker, ['exec', '--user', 'root', id, 'tar', '--warning=no-file-changed', '-czf', '-', '-C', '/', 'home/user/workspace', 'home/user/.codex'], { stdio: ['ignore', 'pipe', 'pipe'] });
     const output = createWriteStream(destination, { flags: 'wx', mode: 0o600 });
     const hash = createHash('sha256'); let sizeBytes = 0; let stderr = '';
     child.stderr.setEncoding('utf8').on('data', value => { stderr += value; });

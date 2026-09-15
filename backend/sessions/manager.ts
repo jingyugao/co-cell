@@ -228,9 +228,6 @@ export class SessionManager {
       requestApproval: approvals.request, closeApprovals: () => approvals.close(), detachApprovals: () => approvals.detach(),
     }).finally(() => {
       execution.finish();
-      if (session.projectId) {
-        void this.scheduledArchiveForProject(session.projectId).catch(() => {});
-      }
       if (this.notifications && turn.status !== 'running') {
         const type = turn.status === 'completed' ? 'turn_completed'
           : turn.status === 'cancelled' ? 'turn_cancelled' : 'turn_failed';
@@ -453,7 +450,7 @@ export class SessionManager {
         workingDirectory: project.workingDirectory, sourceSandboxId: project.sandbox.id,
         sourceProjectId: projectId, sourceTemplate: project.sandbox.template, manifestSha256: stored.sha256,
       });
-    } catch { /* best-effort */ }
+    } catch (e) { console.error("Archive failed:", e instanceof Error ? e.message : String(e)) }
   }
 
   /** Archive all active project sandboxes without deleting them. */

@@ -55,7 +55,11 @@ export function MarkdownLink({ href, resources, children, ...props }: ComponentP
   const resource = href ? resolveResource(href, resources) : null;
   let target = href ? defaultUrlTransform(href) : '';
   if (resource?.kind === 'file') target = fileViewUrl(resources.projectId!, resource.path, resource.line, resource.fragment);
-  else if (resource?.kind === 'service') target = `/api/projects/${encodeURIComponent(resources.projectId!)}/preview?url=${encodeURIComponent(resource.href)}`;
+  else if (resource?.kind === 'service') {
+    const url = new URL(resource.href);
+    const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+    target = `http://${resources.projectId!}.${port}.${window.location.host}${url.pathname}${url.search}${url.hash}`;
+  }
   else if (resource?.kind === 'external' || resource?.kind === 'anchor') target = resource.href;
   // Unresolved local paths must never become accidental routes on the Web host.
   if (!resource && target && !/^(?:https?:|mailto:|tel:|#)/i.test(target)) target = '';

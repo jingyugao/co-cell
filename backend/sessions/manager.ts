@@ -892,6 +892,19 @@ export class SessionManager {
     } finally { release(); }
   }
 
+  /** Returns the Docker container name for server-side proxy to sandbox services. */
+  async sandboxProxyHost(projectId: string): Promise<string> {
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    await this.ensureProjectSandbox(projectId);
+    const project = this.projects.get(projectId);
+    if (project.executionMode !== 'sandbox' || !this.sandbox) throw new HttpError(400, '此项目不使用 Sandbox 沙箱');
+    if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先启动服务');
+    const release = this.projects.acquire(project.id);
+    try {
+      return await this.sandbox.proxyHost(this.projectWorkspace(project));
+    } finally { release(); }
+  }
+
   async projectFile(projectId: string, path: string, options?: WorkspaceFileReadOptions) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     await this.ensureProjectSandbox(projectId);

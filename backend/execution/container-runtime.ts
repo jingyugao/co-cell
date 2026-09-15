@@ -1,6 +1,8 @@
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { AppServerEventAdapter, Codex, CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
@@ -26,6 +28,7 @@ export interface SandboxRuntime {
   recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent>;
   detach(turn: Turn): void;
   preview(session: WorkspaceTarget, port: number): Promise<string>;
+  proxyHost(session: WorkspaceTarget): Promise<string>;
   file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
   history(session: Session, includeBlocks?: boolean): Promise<NativeHistory>;
   delete(session: WorkspaceTarget): Promise<void>;
@@ -852,6 +855,18 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
       return `http://${entry.sandbox.getHost(port)}:${port}`;
     } catch (error) { failed = true; throw error; }
     finally { await this.release(entry, failed); }
+  }
+
+  async proxyHost(session: WorkspaceTarget): Promise<string> {
+    if (this.closing) throw new Error('Sandbox 运行时正在关闭');
+    if (!session.sandbox) throw new Error('项目沙箱尚未创建，请先启动服务');
+    const entry = await this.acquire(session, false);
+    try {
+      // Docker DNS resolves container names, not IDs. Convert.
+      const exec = promisify(execFile);
+      const { stdout } = await exec('docker', ['inspect', '--format', '{{.Name}}', entry.sandbox.sandboxId]);
+      return stdout.trim().replace(/^\//, '');
+    } finally { await this.release(entry, false); }
   }
 
   async file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult> {

@@ -109,6 +109,16 @@ RUN chown user:user /home/user
 USER user
 RUN git config --global --add include.path /home/user/.codex-web/credentials/current/gitconfig
 
-# A project Sandbox owns one long-lived App Server. Web connects over its
-# Docker-internal WebSocket; individual turns never start a worker process.
-CMD ["node", "-e", "const {spawn}=require('node:child_process'); const extra=JSON.parse(process.env.CODEX_APP_SERVER_ARGS||'[]'); const child=spawn('codex',['app-server',...extra,'--listen',`ws://0.0.0.0:${process.env.CODEX_APP_SERVER_PORT}`, '--ws-auth','capability-token','--ws-token-file','/home/user/.codex-web/app-server-token'],{stdio:'inherit'}); child.on('exit',(code,signal)=>process.exit(code??(signal?1:0))); process.on('SIGTERM',()=>child.kill('SIGTERM')); process.on('SIGINT',()=>child.kill('SIGINT')); "]
+# sandbox-proxy: lightweight HTTP reverse proxy for exposing localhost-bound
+# services through the container's Docker network interface.
+COPY docker/sandbox/sandbox-proxy/main.go /tmp/sandbox-proxy/main.go
+USER root
+RUN mise exec go@1.25 -- go build -C /tmp/sandbox-proxy -o sandbox-proxy main.go \
+  && cp /tmp/sandbox-proxy/sandbox-proxy /usr/local/bin/sandbox-proxy \
+  && rm -rf /tmp/sandbox-proxy
+USER user
+
+# A project Sandbox owns one long-lived App Server and a localhost→0.0.0.0 proxy.
+# Web connects over their Docker-internal WebSocket / HTTP; individual turns
+# never start a worker process.
+CMD ["node", "-e", "const {spawn}=require('node:child_process'); spawn('/usr/local/bin/sandbox-proxy',[],{stdio:'inherit',detached:true}).unref(); const extra=JSON.parse(process.env.CODEX_APP_SERVER_ARGS||'[]'); const child=spawn('codex',['app-server',...extra,'--listen',`ws://0.0.0.0:${process.env.CODEX_APP_SERVER_PORT}`, '--ws-auth','capability-token','--ws-token-file','/home/user/.codex-web/app-server-token'],{stdio:'inherit'}); child.on('exit',(code,signal)=>process.exit(code??(signal?1:0))); process.on('SIGTERM',()=>child.kill('SIGTERM')); process.on('SIGINT',()=>child.kill('SIGINT')); "]

@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
   && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
     bash ca-certificates curl git openssh-client \
-    make g++ procps rsync tar gzip unzip \
+    make g++ procps rsync tar gzip unzip tmux \
   && rm -rf /var/lib/apt/lists/* \
   && if getent passwd 1000 >/dev/null; then existing_user="$(getent passwd 1000 | cut -d: -f1)"; if [ "$existing_user" != user ]; then usermod -l user "$existing_user"; fi; else useradd --uid 1000 --create-home --shell /bin/bash user; fi \
   && if getent group 1000 >/dev/null; then existing_group="$(getent group 1000 | cut -d: -f1)"; if [ "$existing_group" != user ]; then groupmod -n user "$existing_group"; fi; else groupadd --gid 1000 user; fi \

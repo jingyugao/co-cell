@@ -31,13 +31,13 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   // The sandbox runs sandbox-proxy (Go) on port 40000 for localhost-bound services.
   const sandboxProxyPort = 40000;
 
-  async function sandboxFetch(sandboxName: string, port: number, path: string, req: Request): Promise<Response> {
+  async function sandboxFetch(sandboxName: string, port: number, path: string, req: Request, body?: ArrayBuffer): Promise<Response> {
     const headers = new Headers(req.headers);
     for (const h of hopByHopHeaders) headers.delete(h);
     headers.delete('host');
     const init: RequestInit = { method: req.method, headers, redirect: 'manual' };
     if (!['GET', 'HEAD'].includes(req.method)) {
-      init.body = await req.arrayBuffer();
+      init.body = body;
     }
     return fetch(`http://${sandboxName}:${port}${path}`, init);
   }
@@ -65,25 +65,23 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
 
     const url = new URL(c.req.url);
     const path = url.pathname + url.search;
+    // All sandbox service traffic goes through sandbox-proxy. Read the incoming
+    // body once before forwarding it.
+    const requestBody = ['GET', 'HEAD'].includes(c.req.method)
+      ? undefined
+      : await c.req.raw.clone().arrayBuffer();
 
-    // 1) Try direct fetch to the sandbox container (works for 0.0.0.0-bound services)
     let response: Response;
     try {
-      response = await sandboxFetch(sandboxHost, port, path, c.req.raw);
+      // sandbox-proxy path format: /<targetPort>/<originalPath>
+      response = await sandboxFetch(sandboxHost, sandboxProxyPort, `/${port}${path}`, c.req.raw, requestBody);
     } catch (error) {
       const sysErr = error as { cause?: { code?: string } };
       const code = (error as NodeJS.ErrnoException).code || sysErr.cause?.code;
       if (code === 'ECONNREFUSED' || code === 'ECONNRESET') {
-        // 2) Fall back to sandbox-proxy (port 40000) for localhost-bound services.
-        //    sandbox-proxy path format: /<targetPort>/<originalPath>
-        try {
-          response = await sandboxFetch(sandboxHost, sandboxProxyPort, `/${port}${path}`, c.req.raw);
-        } catch {
-          return new Response('沙箱服务未启动或端口不可达', { status: 504 });
-        }
-      } else {
-        return new Response(`沙箱代理失败: ${(error as Error).message}`, { status: 502 });
+        return new Response('沙箱服务未启动或端口不可达', { status: 504 });
       }
+      return new Response(`沙箱代理失败: ${(error as Error).message}`, { status: 502 });
     }
 
     // Stream response — no base tag needed (subdomain provides isolated origin)

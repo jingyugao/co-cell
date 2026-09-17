@@ -15,6 +15,7 @@ type Props = {
   onUpdate: (id: string, values: ProjectUpdate) => Promise<ProjectSummary>;
   onRebuildSandbox: (id: string) => Promise<ProjectSummary>;
   onOpenProject: (id: string) => void;
+  onViewArchive: (archiveKey: string) => void;
   onMenu: () => void;
   onBack: () => void;
 };
@@ -128,7 +129,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onOpenProjec
   </article>;
 }
 
-function ArchivedProjectRow({ project, onUpdate, onRebuildSandbox, onOpenProject, onRestored }: Pick<Props, 'onUpdate' | 'onRebuildSandbox' | 'onOpenProject'> & {
+function ArchivedProjectRow({ project, onUpdate, onRebuildSandbox, onOpenProject, onViewArchive, onRestored }: Pick<Props, 'onUpdate' | 'onRebuildSandbox' | 'onOpenProject' | 'onViewArchive'> & {
   project: ProjectSummary;
   onRestored: (name: string) => void;
 }) {
@@ -170,6 +171,7 @@ function ArchivedProjectRow({ project, onUpdate, onRebuildSandbox, onOpenProject
         {needsRebuild
           ? <button className="primary-button" disabled={!canRebuild || Boolean(request)} onClick={() => void rebuild()}>{request === 'rebuild' ? '正在重建…' : '重建 Sandbox'}</button>
           : <button className="secondary-button" disabled={Boolean(request)} onClick={() => onOpenProject(project.id)}>进入</button>}
+        {project.sandboxDataArchive?.key && <button className="secondary-button" onClick={() => onViewArchive(project.sandboxDataArchive!.key)}>查看归档</button>}
         <button className="project-archive-button" disabled={needsRebuild || Boolean(request)} title={needsRebuild ? '请先重建 Sandbox' : '恢复到进行中项目'} onClick={() => void restore()}>{request === 'restore' ? '恢复中…' : '恢复项目'}</button>
       </div>
     </div>
@@ -178,7 +180,7 @@ function ArchivedProjectRow({ project, onUpdate, onRebuildSandbox, onOpenProject
   </article>;
 }
 
-export default function ProjectsPage({ projects, config, loading, onRefresh, onCreate, onUpdate, onRebuildSandbox, onOpenProject, onMenu, onBack }: Props) {
+export default function ProjectsPage({ projects, config, loading, onRefresh, onCreate, onUpdate, onRebuildSandbox, onOpenProject, onViewArchive, onMenu, onBack }: Props) {
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState('');
@@ -202,7 +204,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
     setMessage(status === 'completed' ? `「${name}」已标记完成；满 1 天后会自动归档并删除 Sandbox。` : `「${name}」已恢复为使用中。`);
     activeTab.current?.focus();
   }} />;
-  const archivedRow = (project: ProjectSummary) => <ArchivedProjectRow key={project.id} project={project} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onOpenProject={onOpenProject} onRestored={name => {
+  const archivedRow = (project: ProjectSummary) => <ArchivedProjectRow key={project.id} project={project} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onOpenProject={onOpenProject} onViewArchive={onViewArchive} onRestored={name => {
     setMessage(`「${name}」已恢复到进行中项目。`);
     archivedTab.current?.focus();
   }} />;

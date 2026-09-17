@@ -49,7 +49,7 @@ export class SandboxLifecycleService {
   private async runSweep(): Promise<void> {
     const cutoff = this.now() - this.archivedReclaimAfterMs;
     const eligible = this.options.listProjects().filter(project => {
-      if (project.executionMode !== 'sandbox' || !project.sandbox) return false;
+      if (project.executionMode !== 'sandbox') return false;
       if (project.status !== 'completed') return false;
       const timestamp = Date.parse(project.completedAt ?? '');
       return Number.isFinite(timestamp) && timestamp <= cutoff;

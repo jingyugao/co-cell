@@ -24,8 +24,10 @@ sandbox-build:
 		--build-arg SANDBOX_CREATED=$(SANDBOX_CREATED) \
 		-t $(SANDBOX_IMAGE) -t $(SANDBOX_VERSIONED_IMAGE) .
 
-build: sandbox-build
+build:
 	$(COMPOSE) build $(SERVICE)
+
+rebuild: sandbox-build build
 
 up: build
 	$(COMPOSE) up -d

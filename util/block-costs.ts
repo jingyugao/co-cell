@@ -1,31 +1,129 @@
-import type { Turn } from '../protocol/types';
-import { MODEL_TOKEN_RATES, estimateTokenCostUsd } from './model-costs';
+/**
+ * 简化的 block 费用分摊 — 基于新的预估计费模型。
+ *
+ * 不再尝试猜测 provider 的缓存边界进行精细分摊。
+ * 改为基于文本 token 估算输出每个 turn 的预估费用结果，
+ * 方便前端展示每个 turn 的费用构成。
+ */
+import type { Turn } from '../protocol/types.js';
+import { MODEL_TOKEN_RATES } from './model-costs.js';
+import { estimateSessionCosts } from './billing.js';
 
-/** Allocate aggregate cached usage proportionally: its block boundary is unknown. */
-export function sessionBlockCosts(turns: Turn[]) {
-  const blocks = new Map<string, { id: string; label: string; cost: number; inputCost: number; outputCost: number; calls: number; turnId: string; itemId?: string; tokens: number; segment: number }>();
-  let total = 0, unassigned = 0, unknownCalls = 0;
-  for (const turn of turns) for (const call of turn.contextUsage ?? []) {
-    const cost = estimateTokenCostUsd(call.model, call);
-    const rates = call.model ? MODEL_TOKEN_RATES[call.model] : undefined;
-    if (cost === null || !rates) { unknownCalls++; continue; }
-    total += cost;
-    const estimates = call.blockEstimates ?? [];
-    const inputSum = estimates.reduce((sum, block) => sum + block.inputTokens, 0);
-    const outputSum = estimates.reduce((sum, block) => sum + block.outputTokens, 0);
-    const inputScale = inputSum > call.inputTokens ? call.inputTokens / inputSum : 1;
-    const outputScale = outputSum > call.outputTokens! ? call.outputTokens! / outputSum : 1;
-    const inputCost = ((call.inputTokens - call.cachedInputTokens!) * rates.inputUsdPerMillion + call.cachedInputTokens! * rates.cachedInputUsdPerMillion) / 1e6;
-    let assigned = 0;
-    for (const estimate of estimates) {
-      const input = call.inputTokens ? inputCost * estimate.inputTokens * inputScale / call.inputTokens : 0;
-      const output = estimate.outputTokens * outputScale * rates.outputUsdPerMillion / 1e6;
-      const owner = turns.find(candidate => candidate.id === estimate.turnId || candidate.nativeTurnId === estimate.turnId);
-      const block = blocks.get(estimate.id) ?? { id: estimate.id, label: estimate.label, cost: 0, inputCost: 0, outputCost: 0, calls: 0, turnId: owner?.id ?? turn.id, itemId: estimate.itemId, tokens: estimate.inputTokens || estimate.outputTokens, segment: call.segment ?? 0 };
-      block.inputCost += input; block.outputCost += output; block.cost += input + output; block.calls++;
-      blocks.set(estimate.id, block); assigned += input + output;
-    }
-    unassigned += Math.max(0, cost - assigned);
+export interface BlockCost {
+  id: string;
+  label: string;
+  cost: number;
+  inputCost: number;
+  outputCost: number;
+  calls: number;
+  turnId: string;
+  itemId?: string;
+  tokens: number;
+  segment: number;
+  /** 费用构成标记 */
+  costType: 'history' | 'newInput' | 'output';
+}
+
+export interface SessionBlockCostsResult {
+  blocks: BlockCost[];
+  total: number;
+  unassigned: number;
+  unknownCalls: number;
+  /** 每个 turn 的费用摘要，用于前端展示费用原因 */
+  turnSummaries: TurnCostSummary[];
+}
+
+export interface TurnCostSummary {
+  turnId: string;
+  turnIndex: number;
+  historyCost: number;
+  newInputCost: number;
+  outputCost: number;
+  totalCost: number;
+  summary: string;
+}
+
+export function sessionBlockCosts(turns: Turn[]): SessionBlockCostsResult {
+  // 确定使用的模型（取第一个 turn 中可用的模型名）
+  const resolvedModel = findModel(turns);
+  const rates = resolvedModel ? MODEL_TOKEN_RATES[resolvedModel] : undefined;
+  if (!rates || !resolvedModel) {
+    return { blocks: [], total: 0, unassigned: 0, unknownCalls: turns.length, turnSummaries: [] };
   }
-  return { blocks: [...blocks.values()], total, unassigned, unknownCalls };
+
+  // 使用新的预估计费模型
+  const estimate = estimateSessionCosts(turns, resolvedModel, rates);
+
+  // 构建简化的 block 数据（每个 turn 对应 3 个 block：历史/新输入/输出）
+  const blocks: BlockCost[] = [];
+  let total = 0;
+
+  for (const turnEst of estimate.turns) {
+    if (turnEst.historyCost > 0) {
+      blocks.push({
+        id: `${turnEst.turnId}-history`,
+        label: `Turn ${turnEst.turnIndex + 1} · 历史上下文`,
+        cost: turnEst.historyCost,
+        inputCost: turnEst.historyCost,
+        outputCost: 0,
+        calls: 1,
+        turnId: turnEst.turnId,
+        tokens: turnEst.estimatedHistoryTokens,
+        segment: turnEst.segment,
+        costType: 'history',
+      });
+      total += turnEst.historyCost;
+    }
+    if (turnEst.estimatedNewInputTokens > 0) {
+      blocks.push({
+        id: `${turnEst.turnId}-newInput`,
+        label: `Turn ${turnEst.turnIndex + 1} · 新输入`,
+        cost: turnEst.newInputCost,
+        inputCost: turnEst.newInputCost,
+        outputCost: 0,
+        calls: 1,
+        turnId: turnEst.turnId,
+        tokens: turnEst.estimatedNewInputTokens,
+        segment: turnEst.segment,
+        costType: 'newInput',
+      });
+      total += turnEst.newInputCost;
+    }
+    if (turnEst.estimatedOutputTokens > 0) {
+      blocks.push({
+        id: `${turnEst.turnId}-output`,
+        label: `Turn ${turnEst.turnIndex + 1} · 模型输出`,
+        cost: turnEst.outputCost,
+        inputCost: 0,
+        outputCost: turnEst.outputCost,
+        calls: 1,
+        turnId: turnEst.turnId,
+        tokens: turnEst.estimatedOutputTokens,
+        segment: turnEst.segment,
+        costType: 'output',
+      });
+      total += turnEst.outputCost;
+    }
+  }
+
+  const turnSummaries: TurnCostSummary[] = estimate.turns.map(t => ({
+    turnId: t.turnId,
+    turnIndex: t.turnIndex,
+    historyCost: t.historyCost,
+    newInputCost: t.newInputCost,
+    outputCost: t.outputCost,
+    totalCost: t.totalCost,
+    summary: t.summary,
+  }));
+
+  return { blocks, total, unassigned: 0, unknownCalls: 0, turnSummaries };
+}
+
+function findModel(turns: Turn[]): string | undefined {
+  for (const turn of turns) {
+    for (const call of turn.contextUsage ?? []) {
+      if (call.model) return call.model;
+    }
+  }
+  return turns.length > 0 ? 'gpt-5.6-terra' : undefined;
 }

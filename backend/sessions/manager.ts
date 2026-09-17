@@ -16,7 +16,8 @@ import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { ApprovalRequests, approvalDecisionSchema, cancelPersistedApprovals } from '../approvals/requests.js';
 import { readNativeHistory } from '../execution/native-history.mjs';
 import type { NotificationStore } from '../notifications/store.js';
-import { estimateNativeBlocksAsync } from '../execution/block-estimates.js';
+import { estimateSessionCosts, type SessionCostBreakdown } from '../../util/billing.js';
+import { MODEL_TOKEN_RATES } from '../../util/model-costs.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -54,7 +55,7 @@ export class SessionManager {
   private uploads = new Map<string, Set<Promise<string>>>();
   private closing = false;
   private historyReads = new Map<string, Promise<void>>();
-  private billingReads = new Map<string, Promise<Turn[]>>();
+  private billingReads = new Map<string, Promise<SessionCostBreakdown>>();
 
   constructor(
     private client: CodexClient,
@@ -278,7 +279,7 @@ export class SessionManager {
     }
   }
 
-  async billing(id: string): Promise<Turn[]> {
+  async billing(id: string): Promise<SessionCostBreakdown> {
     const pending = this.billingReads.get(id);
     if (pending) return pending;
     const operation = this.calculateBilling(id).finally(() => { this.billingReads.delete(id); });
@@ -286,22 +287,21 @@ export class SessionManager {
     return operation;
   }
 
-  private async calculateBilling(id: string): Promise<Turn[]> {
+  /**
+   * 使用简化的预估计费模型计算会话费用。
+   * 不依赖 provider 报告的真实 token 数，基于文本 token 估算。
+   * 假设始终使用提示缓存，历史上下文按缓存费率计费。
+   */
+  private async calculateBilling(id: string): Promise<SessionCostBreakdown> {
     const session = this.get(id);
-    if (!session.threadId) return [];
-    if (session.settings.executionMode === 'sandbox' && !session.sandbox) return session.turns.map(turn => ({ ...turn, prompt: '', images: [], items: [] }));
-    const native = session.settings.executionMode === 'sandbox'
-      ? await this.readSandboxHistory(session, true) : await readNativeHistory(session.threadId, undefined, true, session.startedAt, session.nativeHistoryPath);
-    if (native.path && native.path !== session.nativeHistoryPath) {
-      session.nativeHistoryPath = native.path;
-      await this.save(session);
+    const turns = session.turns;
+    const model = session.settings.model;
+    const rates = MODEL_TOKEN_RATES[model];
+    if (!rates || !turns.length) {
+      return { turns: [], totalCost: 0, totalHistoryCost: 0, totalNewInputCost: 0,
+        totalOutputCost: 0, model, totalTokens: 0 };
     }
-    const estimated = await estimateNativeBlocksAsync(native.turns);
-    // The billing rail consumes IDs and context usage only. Returning the
-    // complete transcript here duplicates every command/MCP result alongside
-    // the already-loaded conversation, which made opening a long session
-    // allocate and transfer tens of MB unnecessarily.
-    return estimated.map(turn => ({ ...turn, prompt: '', images: [], items: [] }));
+    return estimateSessionCosts(turns, model, rates);
   }
 
   private async readSandboxHistory(session: Session, includeBlocks = false) {
@@ -330,7 +330,7 @@ export class SessionManager {
     // App Server's thread/turns/list currently returns most-recent first,
     // while the durable UI transcript is chronological. Keep this boundary
     // explicit so a native-history refresh cannot reverse the conversation.
-    const mapped = native.turns.filter(turn => turn.status !== 'failed').map(turn => {
+    const mapped = native.turns.map(turn => {
       const stored = previous.find(old => old.id === turn.id || old.nativeTurnId === turn.id || (Date.parse(turn.startedAt) >= Date.parse(old.startedAt)
         && Date.parse(turn.startedAt) <= Date.parse(old.completedAt ?? new Date().toISOString())));
       if (!stored) return turn;

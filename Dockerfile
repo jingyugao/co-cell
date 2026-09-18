@@ -3,8 +3,12 @@ FROM node:22.18.0-bookworm-slim
 WORKDIR /app
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PATH
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates docker.io \
-  && rm -rf /var/lib/apt/lists/* \
+ARG DOCKER_CLI_VERSION=29.1.3
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tar \
+  && curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
+    | tar -xz -C /tmp \
+  && install -m 0755 "/tmp/docker/docker" /usr/local/bin/docker \
+  && rm -rf /tmp/docker /var/lib/apt/lists/* \
   && corepack enable
 RUN npm install --global @lark-project/meegle@1.0.20
 

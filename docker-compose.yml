@@ -9,7 +9,7 @@ services:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-root-password-before-production}
     command: ["mysqld", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci"]
     volumes:
-      - swarm-hive-mysql:/var/lib/mysql
+      - swarm-hive-mysql-sqlrestore:/var/lib/mysql
     ports:
       - "${MYSQL_LISTEN:-127.0.0.1}:${MYSQL_PORT:-3307}:3306"
     healthcheck:
@@ -37,6 +37,7 @@ services:
       MYSQL_URL: mysql://${MYSQL_USER:-swarm_hive}:${MYSQL_PASSWORD:-change-me-before-production}@mysql:3306/${MYSQL_DATABASE:-swarm_hive}
       DOCKER_SANDBOX_IMAGE: ${DOCKER_SANDBOX_IMAGE:-swarm-hive-sandbox:latest}
       DOCKER_SANDBOX_NETWORK: ${DOCKER_SANDBOX_NETWORK:-swarm-hive_default}
+      DOCKER_HOST: tcp://host.docker.internal:2375
       SANDBOX_WORKSPACE: ${SANDBOX_WORKSPACE:-/home/user/workspace}
       # A stable host directory mounted read-only as the Sandbox's current
       # CLI credentials. Edit files below it to update existing Sandboxes.
@@ -57,27 +58,22 @@ services:
       - ${MEEGLE_HOME:-/home/example/.meegle}:/root/.meegle
     ports:
       - "3001:3001"
-  litellm:
-    profiles: [litellm]
-    image: ghcr.io/berriai/litellm:v1.100.0
+  cliproxy:
+    image: eceasy/cli-proxy-api:v7.2.154
     restart: unless-stopped
-    user: ${LITELLM_UID:-1000}:${LITELLM_GID:-1000}
-    entrypoint: ["python", "/config/start.py"]
-    command: ["--config", "/config/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
-    env_file:
-      - ${LITELLM_DATA_DIR:-./data/litellm}/proxy.env
+    user: "1000:1000"
+    entrypoint: ["/CLIProxyAPI/CLIProxyAPI"]
+    command: ["--config", "/CLIProxyAPI/config.yaml"]
     environment:
       HOME: /tmp
-      CHATGPT_TOKEN_DIR: /auths
-      CHATGPT_DEFAULT_INSTRUCTIONS: " "
-      LITELLM_LOG: ERROR
-      LITELLM_TELEMETRY: "False"
+      TZ: Asia/Shanghai
     ports:
-      - "${LITELLM_LISTEN:-127.0.0.1}:8317:4000"
+      - "8317:8317"
     volumes:
-      - ${LITELLM_DATA_DIR:-./data/litellm}/config.yaml:/config/config.yaml:ro
-      - ./scripts/litellm/start.py:/config/start.py:ro
-      - ${LITELLM_DATA_DIR:-./data/litellm}/auths:/auths:ro
+      - ./data/cliproxyapi/config.yaml:/CLIProxyAPI/config.yaml:ro
+      - ./data/cliproxyapi/auths:/auths
+      - ./data/cliproxyapi/logs:/CLIProxyAPI/logs
+      - ${HOME}/.codex/auth.json:/tmp/codex-auth.json:ro
     logging:
       driver: json-file
       options:
@@ -85,4 +81,6 @@ services:
         max-file: "3"
 
 volumes:
-  swarm-hive-mysql:
+  swarm-hive-mysql-sqlrestore:
+    external: true
+    name: swarm-hive_swarm-hive-mysql-sqlrestore

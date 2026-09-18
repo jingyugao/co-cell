@@ -109,6 +109,11 @@ export class DockerSandboxClient {
   async resume(id: string) { await this.call(['unpause', id]); }
   async remove(id: string) { await this.call(['rm', '--force', id]); }
   async archive(id: string, destination: string): Promise<{ sizeBytes: number; sha256: string }> {
+    // Checkpoint all SQLite WAL files so the tar captures consistent database state.
+    // Without this, the restored thread_history may be discarded by the App Server.
+    try { await this.call(['exec', '--user', 'user', id, 'sh', '-c',
+      'for db in /home/user/.codex/*.sqlite; do [ -f "$db" ] && sqlite3 "$db" "PRAGMA wal_checkpoint(TRUNCATE)" 2>/dev/null; done; true'
+    ]); } catch { /* sqlite3 unavailable is non-fatal */ }
     const child = spawn(this.docker, ['exec', '--user', 'root', id, 'tar', '--warning=no-file-changed', '-czf', '-', '-C', '/', 'home/user/workspace', 'home/user/.codex'], { stdio: ['ignore', 'pipe', 'pipe'] });
     const output = createWriteStream(destination, { flags: 'wx', mode: 0o600 });
     const hash = createHash('sha256'); let sizeBytes = 0; let stderr = '';

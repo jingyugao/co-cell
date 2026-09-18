@@ -3,11 +3,15 @@ import { join } from 'node:path';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import type { Project, Session } from '../../../protocol/types.js';
 
+export type ArchiveRecord = { key: string; sizeBytes: number; createdAt: string };
+
 export interface WebStateStore {
   init(): Promise<void>; listProjects(): Promise<Project[]>; listSessions(): Promise<Session[]>;
   saveProject(project: Project): Promise<void>; saveSession(session: Session): Promise<void>;
   recordProjectArchive(projectId: string, archive: NonNullable<Project['sandboxDataArchive']>): Promise<void>;
   latestProjectArchive(projectId: string): Promise<NonNullable<Project['sandboxDataArchive']> | undefined>;
+  listProjectArchives(projectId: string): Promise<ArchiveRecord[]>;
+  deleteArchiveRecord(archiveKey: string): Promise<void>;
   deleteProject(id: string): Promise<void>; deleteSession(id: string): Promise<void>; close(): Promise<void>;
 }
 
@@ -28,6 +32,16 @@ export class JsonWebStateStore implements WebStateStore {
   async latestProjectArchive(projectId: string) {
     return (await this.listProjects()).find(project => project.id === projectId)?.sandboxDataArchive;
   }
+  async listProjectArchives(projectId: string): Promise<ArchiveRecord[]> {
+    const project = (await this.listProjects()).find(p => p.id === projectId);
+    if (!project?.sandboxDataArchive) return [];
+    return [{
+      key: project.sandboxDataArchive.key,
+      createdAt: project.sandboxDataArchive.createdAt,
+      sizeBytes: project.sandboxDataArchive.sizeBytes,
+    }];
+  }
+  async deleteArchiveRecord(_archiveKey: string) {} // JSON 模式：归档是指向项目文档的指针，无独立记录
   deleteProject(id: string): Promise<void> { return rm(join(this.projectsDirectory, `${id}.json`), { force: true }); }
   deleteSession(id: string): Promise<void> { return rm(join(this.directory, `${id}.json`), { force: true }); }
   async close() {}
@@ -79,6 +93,18 @@ export class MySqlWebStateStore implements WebStateStore {
     const [rows] = await this.pool.query<Array<RowDataPacket & { document: NonNullable<Project['sandboxDataArchive']> | string }>>(
       'SELECT document FROM project_sandbox_archives WHERE project_id = ? ORDER BY created_at DESC, archive_key DESC LIMIT 1', [projectId]);
     return rows[0] ? this.document<NonNullable<Project['sandboxDataArchive']>>(rows[0].document) : undefined;
+  }
+  async listProjectArchives(projectId: string): Promise<ArchiveRecord[]> {
+    const [rows] = await this.pool.query<Array<RowDataPacket & { archive_key: string; size_bytes: number; created_at: string }>>(
+      'SELECT archive_key, size_bytes, created_at FROM project_sandbox_archives WHERE project_id = ? ORDER BY created_at DESC, archive_key DESC', [projectId]);
+    return rows.map(row => ({
+      key: row.archive_key,
+      sizeBytes: Number(row.size_bytes),
+      createdAt: row.created_at ? new Date(row.created_at).toISOString() : '',
+    }));
+  }
+  async deleteArchiveRecord(archiveKey: string) {
+    await this.pool.query('DELETE FROM project_sandbox_archives WHERE archive_key = ?', [archiveKey]);
   }
   async deleteProject(id: string) { await this.pool.query('DELETE FROM projects WHERE id = ?', [id]); }
   async deleteSession(id: string) { await this.pool.query('DELETE FROM sessions WHERE id = ?', [id]); }

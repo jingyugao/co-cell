@@ -684,7 +684,7 @@ export class SandboxManager {
   }
 
   private notFound(error: unknown): boolean {
-    return /not found|404/i.test(String(error));
+    return /not found|no such container|404/i.test(String(error));
   }
 
   private safeMessage(error: unknown): string {

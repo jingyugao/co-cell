@@ -137,6 +137,8 @@ export interface Project {
     sourceTemplate?: string;
     manifestSha256: string;
   };
+  /** 指向 archives 模块的归档流 key（新方案），替代 sandboxDataArchive */
+  archiveKey?: string;
   archivedAt?: string | null;
   lifecycleHistory?: ProjectLifecycleRecord[];
   createdAt: string;
@@ -148,7 +150,10 @@ export interface ProjectLifecycleRecord {
   at: string;
   sandboxId?: string;
 }
-export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null }
+export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null;
+  /** 归档版本列表（新归档模块），按版本倒序 */
+  archiveVersions?: Array<{ id: string; version: number; sizeBytes: number; createdAt: string; sha256: string }>;
+}
 export interface Session {
   projectId?: string;
   id: string;

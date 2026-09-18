@@ -6,6 +6,7 @@ import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import type { WorkspaceFileReadOptions } from '../workspaces/files.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
+import type { ArchiveManager } from '../archives/manager.js';
 
 import { HttpError } from '../../util/errors.js';
 import { ProjectService, type ProjectInput, type ProjectUpdate } from '../projects/service.js';
@@ -68,6 +69,7 @@ export class SessionManager {
     private readonly imagesDirectory = join(dataDirectory, 'images'),
     lifecycleOptions: SandboxLifecycleOptions = {},
     notifications?: NotificationStore,
+    private _archiveManager?: ArchiveManager,
   ) {
     this.notifications = notifications;
     this.projects = new ProjectService(state);
@@ -79,6 +81,9 @@ export class SessionManager {
       });
     }
   }
+
+  /** @internal 供归档路由使用 */
+  get archiveManager(): ArchiveManager | undefined { return this._archiveManager; }
 
   async init() {
     await this.state.init();
@@ -176,6 +181,13 @@ export class SessionManager {
       if (project.updatedAt > owner.updatedAt) owner.updatedAt = project.updatedAt;
       this.sandbox?.track?.(owner, sandbox => this.updateSandbox(project.id, owner.id, sandbox));
     }
+    // Reconcile persisted project bindings with the current Docker daemon. A
+    // container may have disappeared while its database reference remained.
+    for (const project of this.projects.list()) {
+      if (project.executionMode !== 'sandbox' || !project.sandbox || !this.sandbox?.inspect) continue;
+      try { await this.sandbox.inspect(this.projectWorkspace(project)); }
+      catch { /* inspect persists an unavailable state for missing containers */ }
+    }
     for (const session of this.sessions.values()) {
       if (session.projectId || session.settings.executionMode !== 'sandbox' || !session.sandbox) continue;
       this.sandbox?.track?.(structuredClone(session), sandbox => this.updateSandbox(undefined, session.id, sandbox));
@@ -187,6 +199,10 @@ export class SessionManager {
     // Register remote use before connection/recovery yields to lifecycle scans.
     for (const { session, turn } of recoverable) this.sandbox?.trackExecution?.(session, turn);
     for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
+    // 已归档的项目只保留最新归档，清理旧归档释放磁盘空间
+    if (this._archiveManager) {
+      void this._archiveManager.retainAll(1).catch(() => {});
+    }
     this.lifecycle?.start();
   }
 
@@ -386,6 +402,24 @@ export class SessionManager {
     return [...this.projects.list()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(project => this.projectSummary(project));
   }
 
+  async listProjectsWithArchives(): Promise<ProjectSummary[]> {
+    const summaries = this.listProjects();
+    const archiveMgr = this._archiveManager;
+    if (!archiveMgr) return summaries;
+    return Promise.all(summaries.map(async s => {
+      if (!s.archiveKey) return s;
+      try {
+        const versions = await archiveMgr.listVersions(s.archiveKey);
+        s.archiveVersions = versions.map(v => ({ id: v.id, version: v.version, sizeBytes: v.sizeBytes, createdAt: v.createdAt, sha256: v.sha256 }));
+        if (!s.sandboxDataArchive && versions.length > 0) {
+          const v = versions[0];
+          s.sandboxDataArchive = { key: s.archiveKey, format: 'codex-workspace-v1', sha256: v.sha256, sizeBytes: v.sizeBytes, createdAt: v.createdAt, threadIds: [], workingDirectory: s.workingDirectory, sourceSandboxId: '', sourceProjectId: s.id, manifestSha256: v.sha256 };
+        }
+      } catch { /* skip enrichment failure */ }
+      return s;
+    }));
+  }
+
   private projectSummary(project: Project): ProjectSummary {
     return structuredClone({ ...project, status: project.status ?? (project.archivedAt ? 'archived' : 'active'), archivedAt: project.archivedAt ?? null, sessionCount: [...this.sessions.values()].filter(session => session.projectId === project.id).length,
       activeSessionId: this.projects.activeSessionId(project.id) });
@@ -414,19 +448,24 @@ export class SessionManager {
     if (!this.sandbox) throw new HttpError(503, 'Sandbox 未配置');
     const target = this.projectWorkspace(project);
     await this.sandbox.rebuild(target, sandbox => this.updateSandbox(id, id, sandbox, true));
-    // Rehydrate the durable workspace/Codex archive into the newly created
-    // container. Rebuilds must preserve native App Server history.
-    // The append-only archive ledger is authoritative. Restore the newest
-    // successful archive by timestamp instead of a mutable project pointer.
-    const archive = await this.projects.latestDataArchive(id);
-    if (archive && this.sandbox.restoreArchive) {
-      if (!/^[A-Za-z0-9._-]+\.tar\.gz$/.test(archive.key)) throw new HttpError(400, '归档文件名无效');
-      // updateSandbox persists the new binding; refresh the target before
-      // acquiring it for the restore operation.
+    // 优先从 ArchiveManager（新方案）读取归档，否则回退旧方案
+    let archivePath: string | undefined;
+    const archiveKey = this.projects.getArchiveKey(id);
+    if (archiveKey && this._archiveManager) {
+      const latest = await this._archiveManager.getLatest(archiveKey);
+      if (latest) archivePath = latest.storagePath;
+    }
+    if (!archivePath) {
+      const legacy = await this.projects.latestDataArchive(id);
+      if (legacy && this.sandbox.restoreArchive) {
+        if (!/^[A-Za-z0-9._-]+\.tar\.gz$/.test(legacy.key)) throw new HttpError(400, '归档文件名无效');
+        target.sandbox = this.projects.get(id).sandbox;
+        archivePath = join(this.dataDirectory, '..', 'sandbox-data-archives', legacy.key);
+      }
+    }
+    if (archivePath && this.sandbox.restoreArchive) {
       target.sandbox = this.projects.get(id).sandbox;
-      // `dataDirectory` points at the web-state subdirectory; archives live
-      // beside it under the data root.
-      await this.sandbox.restoreArchive(target, join(this.dataDirectory, '..', 'sandbox-data-archives', archive.key));
+      await this.sandbox.restoreArchive(target, archivePath);
     }
     return this.getProject(id);
   }
@@ -436,28 +475,80 @@ export class SessionManager {
     if (!this.sandbox?.createArchive) return;
     const project = this.projects.get(projectId);
     if (!project?.sandbox || project.status === 'archived') return;
-    const directory = join(this.dataDirectory, '..', 'sandbox-data-archives');
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    try {
-      const key = `${randomUUID()}.tar.gz`;
-      const destination = join(directory, key);
-      const stored = await this.sandbox.createArchive(
-        { id: project.id, projectId: project.id, settings: { workingDirectory: project.workingDirectory }, sandbox: project.sandbox, updatedAt: project.updatedAt }, destination);
-      const sessions = [...this.sessions.values()].filter(s => s.projectId === projectId);
-      const threadIds = sessions.map(s => s.threadId).filter((v): v is string => Boolean(v));
-      await this.projects.saveDataArchive(projectId, {
-        key, format: 'codex-workspace-v1', ...stored, createdAt: new Date().toISOString(), threadIds,
-        workingDirectory: project.workingDirectory, sourceSandboxId: project.sandbox.id,
-        sourceProjectId: projectId, sourceTemplate: project.sandbox.template, manifestSha256: stored.sha256,
+    const sessions = [...this.sessions.values()].filter(s => s.projectId === projectId);
+    const threadIds = sessions.map(s => s.threadId).filter((v): v is string => Boolean(v));
+    const metadata = {
+      format: 'codex-workspace-v1',
+      threadIds,
+      workingDirectory: project.workingDirectory,
+      sourceSandboxId: project.sandbox.id,
+      sourceProjectId: projectId,
+      sourceTemplate: project.sandbox.template,
+    };
+
+    if (this._archiveManager) {
+      // 新方案：使用 ArchiveManager 管理版本链
+      const version = await this._archiveManager.create(
+        this.projects.getArchiveKey(projectId),
+        metadata,
+        async path => {
+          const stored = await this.sandbox!.createArchive!(
+            { id: project.id, projectId, settings: { workingDirectory: project.workingDirectory }, sandbox: project.sandbox!, updatedAt: project.updatedAt },
+            path,
+          );
+          return { sizeBytes: stored.sizeBytes, sha256: stored.sha256 };
+        },
+      );
+      if (!this.projects.getArchiveKey(projectId)) {
+        await this.projects.saveArchiveKey(projectId, version.archiveKey);
+      }
+      // 同步更新 sandboxDataArchive 用于前端展示
+      await this.projects.updateSandboxDataArchive(projectId, {
+        key: version.archiveKey,
+        format: 'codex-workspace-v1',
+        sha256: version.sha256,
+        sizeBytes: version.sizeBytes,
+        createdAt: version.createdAt,
+        threadIds,
+        workingDirectory: metadata.workingDirectory,
+        sourceSandboxId: metadata.sourceSandboxId,
+        sourceProjectId: metadata.sourceProjectId,
+        sourceTemplate: metadata.sourceTemplate as string | undefined,
+        manifestSha256: version.sha256,
       });
-    } catch (e) { console.error("Archive failed:", e instanceof Error ? e.message : String(e)) }
+    } else {
+      // 旧方案（无 ArchiveManager 时兜底）
+      const directory = join(this.dataDirectory, '..', 'sandbox-data-archives');
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      try {
+        const key = `${randomUUID()}.tar.gz`;
+        const destination = join(directory, key);
+        const stored = await this.sandbox.createArchive(
+          { id: project.id, projectId, settings: { workingDirectory: project.workingDirectory }, sandbox: project.sandbox, updatedAt: project.updatedAt }, destination);
+        await this.projects.saveDataArchive(projectId, {
+          key, format: 'codex-workspace-v1', ...stored, createdAt: new Date().toISOString(), threadIds,
+          workingDirectory: project.workingDirectory, sourceSandboxId: project.sandbox.id,
+          sourceProjectId: projectId, sourceTemplate: project.sandbox.template, manifestSha256: stored.sha256,
+        });
+      } catch (e) { console.error("Archive failed:", e instanceof Error ? e.message : String(e)) }
+    }
   }
 
-  /** Archive all active project sandboxes without deleting them. */
+  /** Archive all active project sandboxes without deleting them.
+   *  每分钟扫描，只归档超过阈值的项目 */
+  private lastScheduledArchive = new Map<string, number>();
+  private readonly scheduledArchiveInterval =
+    Number(process.env.SANDBOX_SCHEDULED_ARCHIVE_THRESHOLD_MS ?? 30 * 60 * 1000);
+
   async scheduledArchive() {
+    const now = Date.now();
     for (const project of this.projects.list()) {
       if (!project.sandbox || project.status === 'archived') continue;
-      await this.scheduledArchiveForProject(project.id).catch(() => {});
+      const last = this.lastScheduledArchive.get(project.id) ?? 0;
+      if (now - last >= this.scheduledArchiveInterval) {
+        this.lastScheduledArchive.set(project.id, now);
+        await this.scheduledArchiveForProject(project.id).catch(() => {});
+      }
     }
   }
 
@@ -467,31 +558,75 @@ export class SessionManager {
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '本地项目不需要 Sandbox 归档');
     const sessions = [...this.sessions.values()].filter(session => session.projectId === id);
     if (sessions.some(session => this.active.has(session.id))) throw new HttpError(409, '项目仍有执行中的任务');
-    if (project.sandbox) {
+    const threadIds = sessions.map(session => session.threadId).filter((value): value is string => Boolean(value));
+    if (project.sandbox && project.sandbox.status !== 'unavailable') {
       if (!this.sandbox?.createArchive) throw new HttpError(503, 'Sandbox 数据归档未配置，未删除原 Sandbox');
-      const directory = join(this.dataDirectory, '..', 'sandbox-data-archives');
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      const key = `${randomUUID()}.tar.gz`;
-      const destination = join(directory, key);
-      const temporary = `${destination}.partial`;
-      try {
-        const stored = await this.sandbox.createArchive(this.projectWorkspace(project), temporary);
-        await rename(temporary, destination);
-        const threadIds = sessions.map(session => session.threadId).filter((value): value is string => Boolean(value));
-        await this.projects.saveDataArchive(id, {
-          key, format: 'codex-workspace-v1', ...stored, createdAt: new Date().toISOString(), threadIds,
-          workingDirectory: project.workingDirectory, sourceSandboxId: project.sandbox.id,
-          sourceProjectId: project.id, sourceTemplate: project.sandbox.template,
-          manifestSha256: stored.sha256,
-        });
-      } catch (error) {
-        await rm(temporary, { force: true });
-        // A failed restore can leave a project bound to a stopped replacement
-        // even though the preceding archive is already durable. An explicit
-        // archive request may safely detach that unusable replacement and let
-        // the normal rebuild path restore the latest snapshot.
-        const previous = await this.projects.latestDataArchive(id);
-        if (!previous || !/container .* is not running|sandbox .* is unavailable/i.test(String(error))) throw error;
+      if (this._archiveManager) {
+        // 新方案：ArchiveManager 管理版本链
+        try {
+          const version = await this._archiveManager.create(
+            this.projects.getArchiveKey(id),
+            {
+              format: 'codex-workspace-v1', threadIds,
+              workingDirectory: project.workingDirectory,
+              sourceSandboxId: project.sandbox.id,
+              sourceProjectId: project.id,
+              sourceTemplate: project.sandbox.template,
+            },
+            async path => {
+              const temporary = `${path}.partial`;
+              const stored = await this.sandbox!.createArchive!(this.projectWorkspace(project), temporary);
+              await rename(temporary, path);
+              return { sizeBytes: stored.sizeBytes, sha256: stored.sha256 };
+            },
+          );
+          if (!this.projects.getArchiveKey(id)) {
+            await this.projects.saveArchiveKey(id, version.archiveKey);
+          }
+          // 同步更新 sandboxDataArchive 用于前端展示
+          await this.projects.updateSandboxDataArchive(id, {
+            key: version.archiveKey,
+            format: 'codex-workspace-v1',
+            sha256: version.sha256,
+            sizeBytes: version.sizeBytes,
+            createdAt: version.createdAt,
+            threadIds,
+            workingDirectory: project.workingDirectory,
+            sourceSandboxId: project.sandbox.id,
+            sourceProjectId: project.id,
+            sourceTemplate: project.sandbox.template,
+            manifestSha256: version.sha256,
+          });
+        } catch (error) {
+          // The container may have been removed outside the app. Preserve the
+          // existing archive and continue with detach/rebuild instead of
+          // making recovery impossible solely because a backup source vanished.
+          const archiveKey = this.projects.getArchiveKey(id);
+          const latest = archiveKey ? await this._archiveManager.getLatest(archiveKey) : undefined;
+          const legacy = await this.projects.latestDataArchive(id);
+          if ((!latest && !legacy) || !/not found|no such container|404|unavailable/i.test(String(error))) throw error;
+        }
+      } else {
+        // 旧方案（无 ArchiveManager 时兜底）
+        const directory = join(this.dataDirectory, '..', 'sandbox-data-archives');
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        const key = `${randomUUID()}.tar.gz`;
+        const destination = join(directory, key);
+        const temporary = `${destination}.partial`;
+        try {
+          const stored = await this.sandbox.createArchive(this.projectWorkspace(project), temporary);
+          await rename(temporary, destination);
+          await this.projects.saveDataArchive(id, {
+            key, format: 'codex-workspace-v1', ...stored, createdAt: new Date().toISOString(), threadIds,
+            workingDirectory: project.workingDirectory, sourceSandboxId: project.sandbox.id,
+            sourceProjectId: project.id, sourceTemplate: project.sandbox.template,
+            manifestSha256: stored.sha256,
+          });
+        } catch (error) {
+          await rm(temporary, { force: true });
+          const previous = await this.projects.latestDataArchive(id);
+          if (!previous || !/container .* is not running|sandbox .* is unavailable/i.test(String(error))) throw error;
+        }
       }
       try { await this.sandbox?.delete(this.projectWorkspace(project)); }
       catch (error) {
@@ -501,7 +636,51 @@ export class SessionManager {
       for (const session of sessions) { delete session.sandbox; await this.save(session); }
     }
     await this.projects.archiveAndDetachSandbox(id, project.sandbox?.id);
+    // 归档后清理旧版本，只保留最新一份
+    const archiveKey = this.projects.getArchiveKey(id);
+    if (archiveKey && this._archiveManager) {
+      await this._archiveManager.retain(archiveKey, 1);
+    } else {
+      await this.pruneLegacyArchives(id);
+    }
     return this.getProject(id);
+  }
+
+  /** 旧方案兜底：清理旧归档记录和文件 */
+  private async pruneLegacyArchives(projectId: string): Promise<void> {
+    const archives = await this.state.listProjectArchives(projectId);
+    if (archives.length <= 1) return;
+    const archivesDir = join(this.dataDirectory, '..', 'sandbox-data-archives');
+    const toDelete = archives.slice(1);
+    for (const archive of toDelete) {
+      try {
+        await this.state.deleteArchiveRecord(archive.key);
+        await rm(join(archivesDir, archive.key), { force: true });
+      } catch { /* 记录或文件已不存在，跳过 */ }
+    }
+  }
+
+  /** 对所有已归档项目清理旧归档（新方案走 ArchiveManager，旧方案走 state） */
+  async pruneArchivedProjectArchives(): Promise<number> {
+    if (this._archiveManager) {
+      return this._archiveManager.retainAll(1);
+    }
+    const archivesDir = join(this.dataDirectory, '..', 'sandbox-data-archives');
+    const archivedProjects = this.projects.list().filter(p => p.status === 'archived');
+    let totalDeleted = 0;
+    for (const project of archivedProjects) {
+      const archives = await this.state.listProjectArchives(project.id);
+      if (archives.length <= 1) continue;
+      const toDelete = archives.slice(1);
+      for (const archive of toDelete) {
+        try {
+          await this.state.deleteArchiveRecord(archive.key);
+          await rm(join(archivesDir, archive.key), { force: true });
+          totalDeleted++;
+        } catch { /* 跳过单个失败 */ }
+      }
+    }
+    return totalDeleted;
   }
 
   private isSandboxReferenced(sandboxId: string): boolean {

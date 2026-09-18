@@ -24,6 +24,12 @@ class MemoryState implements WebStateStore {
   async saveSession() {}
   async recordProjectArchive() {}
   async latestProjectArchive(id: string) { return this.projects.find(item => item.id === id)?.sandboxDataArchive; }
+  async listProjectArchives(id: string) {
+    const project = this.projects.find(p => p.id === id);
+    const archive = project?.sandboxDataArchive;
+    return archive ? [{ key: archive.key, sizeBytes: archive.sizeBytes, createdAt: archive.createdAt }] : [];
+  }
+  async deleteArchiveRecord() {}
   async deleteProject(id: string) { this.projects = this.projects.filter(item => item.id !== id); }
   async deleteSession() {}
   async close() {}

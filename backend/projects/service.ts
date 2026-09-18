@@ -114,6 +114,21 @@ export class ProjectService {
     return this.state.latestProjectArchive(id);
   }
 
+  /** 保存项目的归档流 key */
+  async saveArchiveKey(id: string, archiveKey: string): Promise<void> {
+    await this.mutateSandboxMetadata(id, project => { project.archiveKey = archiveKey; });
+  }
+
+  /** 更新项目上的 sandboxDataArchive（用于前端展示，不写入 project_sandbox_archives 表） */
+  async updateSandboxDataArchive(id: string, archive: NonNullable<Project['sandboxDataArchive']>): Promise<void> {
+    await this.mutateSandboxMetadata(id, project => { project.sandboxDataArchive = structuredClone(archive); });
+  }
+
+  /** 获取项目的归档流 key */
+  getArchiveKey(id: string): string | undefined {
+    return this.records.get(id)?.archiveKey;
+  }
+
   private async mutateSandboxMetadata(id: string, mutate: (project: Project) => void, commitLifecycle = false) {
     await this.writer.run(id, async () => {
       const current = this.records.get(id);
@@ -129,6 +144,7 @@ export class ProjectService {
       // reserved its own write while storage was pending.
       current.sandbox = next.sandbox;
       current.sandboxDataArchive = next.sandboxDataArchive;
+      current.archiveKey = next.archiveKey;
       current.sandboxReclaimedAt = next.sandboxReclaimedAt;
       if (commitLifecycle) {
         current.status = next.status;

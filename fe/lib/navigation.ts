@@ -1,6 +1,6 @@
 import type { ProjectSummary, SessionSummary } from '../../protocol/types';
 
-export type Page = 'chat' | 'sandboxes' | 'projects' | 'files' | 'connections' | 'improvements' | 'archives';
+export type Page = 'chat' | 'sandboxes' | 'projects' | 'files' | 'connections' | 'improvements';
 export type Selection = { sessionId: string | null; projectId: string | null };
 const isActiveProject = (project: ProjectSummary) => (project.status ?? (project.archivedAt ? 'archived' : 'active')) === 'active';
 const pages: Page[] = ['sandboxes', 'projects', 'files', 'connections', 'improvements'];

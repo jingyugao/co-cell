@@ -4,7 +4,7 @@ import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { workspaceDownload } from '../workspaces/download.js';
 
-export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile' | 'rebuildProjectSandbox' | 'archiveProjectNow'>) {
+export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile' | 'rebuildProjectSandbox' | 'archiveProjectNow'>) {
   app.post('/api/projects/:id/archive', async c => c.json(await manager.archiveProjectNow(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/rebuild', async c => c.json(await manager.rebuildProjectSandbox(c.req.param('id')), 202));
   app.get('/api/projects/:id/files', async c => {
@@ -31,7 +31,7 @@ export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, '
   });
 
   const projectSchema = z.object({ name: z.string().trim().min(1).max(100), requirementUrl: z.string().trim().max(4096).url().refine(value => /^https?:\/\//i.test(value), '仅支持 HTTP 或 HTTPS 链接').nullable().optional() }).strict();
-  app.get('/api/projects', c => c.json(manager.listProjects()));
+  app.get('/api/projects', async c => c.json(await manager.listProjectsWithArchives()));
   const createSchema = projectSchema.extend({ name: z.string().trim().max(100).optional(), type: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional() })
     .refine(input => Boolean(input.name || input.requirementUrl), '请输入项目名称或绑定飞书需求');
   app.post('/api/projects', async c => c.json(await manager.createProject(createSchema.parse(await c.req.json())), 201));

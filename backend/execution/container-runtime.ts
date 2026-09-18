@@ -30,6 +30,7 @@ export interface SandboxRuntime {
   preview(session: WorkspaceTarget, port: number): Promise<string>;
   proxyHost(session: WorkspaceTarget): Promise<string>;
   file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
+  inspect?(target: WorkspaceTarget): Promise<unknown>;
   history(session: Session, includeBlocks?: boolean): Promise<NativeHistory>;
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
@@ -909,6 +910,10 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
   async delete(session: WorkspaceTarget) {
     await this.sandboxes.delete(session);
     if (session.sandbox) this.runtimePreparations.delete(session.sandbox.id);
+  }
+
+  async inspect(target: WorkspaceTarget) {
+    return this.sandboxes.inspect(target);
   }
 
   async rebuild(target: WorkspaceTarget, onSandbox: SaveSandbox) {

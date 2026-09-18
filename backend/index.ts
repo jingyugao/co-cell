@@ -14,6 +14,8 @@ import { NotificationStore } from './notifications/store.js';
 import { createApp } from './app.js';
 import { SessionManager } from './sessions/manager.js';
 import { ContainerCodexRuntime } from './execution/container-runtime.js';
+import { ArchiveStore } from './archives/store.js';
+import { ArchiveManager } from './archives/manager.js';
 import { ProjectSandboxes } from './sandboxes/project-sandboxes.js';
 import { DockerSandboxInventory } from './sandboxes/inventory.js';
 import { RuntimeLog } from './infra/diagnostics/runtime-log.js';
@@ -116,11 +118,15 @@ const webImagesDirectory = resolve(process.env.CODEX_WEB_IMAGES_DIR || 'data/ima
 const archivedReclaimAfterMs = Number(process.env.SANDBOX_ARCHIVED_RECLAIM_AFTER_MS ?? 24 * 60 * 60 * 1000);
 const lifecycleScanIntervalMs = process.env.SANDBOX_LIFECYCLE_SCAN_INTERVAL_MS === undefined ? undefined : Number(process.env.SANDBOX_LIFECYCLE_SCAN_INTERVAL_MS);
 if (!Number.isFinite(archivedReclaimAfterMs) || archivedReclaimAfterMs < 0) throw new Error('SANDBOX_ARCHIVED_RECLAIM_AFTER_MS must be non-negative');
+const archiveDataDir = resolve('data/sandbox-data-archives');
+const archiveStore = process.env.MYSQL_URL ? new ArchiveStore(process.env.MYSQL_URL) : undefined;
+if (archiveStore) await archiveStore.init();
+const archiveMgr = archiveStore ? new ArchiveManager(archiveStore, archiveDataDir) : undefined;
 manager = new SessionManager(codex, webDataDirectory, defaults, runtime, sandboxWorkingDirectory, runtimeLog,
   createWebStateStore(webDataDirectory, process.env.MYSQL_URL), webImagesDirectory, {
     archivedReclaimAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
-  }, notifications);
+  }, notifications, archiveMgr);
 await manager.init();
 const config: AppConfig = { sandbox: { enabled: true, image: sandboxImage,
   ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}), workingDirectory: sandboxWorkingDirectory,
@@ -138,9 +144,10 @@ server.listen(port, process.env.HOST || '127.0.0.1', () => {
   console.log(`Codex Web ready at http://localhost:${port}`); console.log(`Sandbox: Docker image ${sandboxImage} · workspace ${sandboxWorkingDirectory}`);
 });
 let shuttingDown = false;
-async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await manager.close(); await sandboxManager.close();
 // Periodic sandbox archive for active projects — every 30 minutes
-const archiveInterval = setInterval(() => { void manager.scheduledArchive().catch(() => {}); }, 30 * 60 * 1000);
+const archiveInterval = setInterval(() => { void manager.scheduledArchive().catch(() => {}); }, 60 * 1000);
 archiveInterval.unref();
+async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await manager.close(); await sandboxManager.close();
+  clearInterval(archiveInterval);
   improvements.close(); await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); }
 process.on('SIGINT', () => void shutdown()); process.on('SIGTERM', () => void shutdown());

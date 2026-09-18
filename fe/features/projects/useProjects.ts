@@ -26,6 +26,10 @@ export function useProjects() {
   const rebuildSandbox = useCallback(async (id: string) => storeProject(
     await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST' }),
   ), [storeProject]);
+  const recoverSandbox = useCallback(async (id: string) => {
+    await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, { method: 'POST' });
+    return storeProject(await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST' }));
+  }, [storeProject]);
 
-  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox };
+  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox, recoverSandbox };
 }

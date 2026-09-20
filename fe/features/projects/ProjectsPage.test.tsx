@@ -19,7 +19,7 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
   return renderToStaticMarkup(<ProjectsPage
     projects={projects} config={null} loading={false} initialView={initialView}
     onRefresh={async () => projects} onCreate={async () => project()} onUpdate={async () => project()}
-    onRebuildSandbox={async () => project()} onBackup={async () => project()} onArchive={async () => project()}
+    onRebuildSandbox={async () => project()} onBackup={async () => project()}
     onOpenProject={() => {}} onMenu={() => {}} onBack={() => {}}
   />);
 }
@@ -28,9 +28,16 @@ test('normal sandbox exposes backup and archive, with only the latest backup', (
   const html = page([project({ sandbox: { id: 'current', status: 'ready', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);
   assert.match(html, /正常/);
   assert.match(html, /立即备份/);
-  assert.match(html, /归档项目/);
+  assert.doesNotMatch(html, /归档项目/);
   assert.match(html, /最新备份/);
   assert.doesNotMatch(html, /查看归档|备份记录|历史备份/);
+});
+
+test('a backup from within the past hour is shown in minutes', () => {
+  const recentBackup = { ...backup, createdAt: new Date(Date.now() - 23 * 60 * 1000).toISOString() };
+  const html = page([project({ latestBackup: recentBackup })]);
+  assert.match(html, /最新备份[\s\S]*23 分前/);
+  assert.doesNotMatch(html, /归档时间|尚未归档/);
 });
 
 test('abnormal and missing sandboxes use the recovery-or-first-create paths', () => {
@@ -55,4 +62,9 @@ test('archived project restores from its latest backup and running operations di
   })]);
   assert.match(running, /备份：上传中/);
   assert.match(running, /disabled=""/);
+});
+
+test('a completed backup operation is not shown on the project card', () => {
+  const html = page([project({ sandboxOperation: { kind: 'backup', phase: '上传中', status: 'succeeded', updatedAt: now } })]);
+  assert.doesNotMatch(html, /备份：已完成/);
 });

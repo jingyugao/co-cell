@@ -15,7 +15,6 @@ type Props = {
   onUpdate: (id: string, values: ProjectUpdate) => Promise<ProjectSummary>;
   onRebuildSandbox: (id: string) => Promise<ProjectSummary>;
   onBackup: (id: string) => Promise<ProjectSummary>;
-  onArchive: (id: string, useExistingBackup?: boolean) => Promise<ProjectSummary>;
   onOpenProject: (id: string) => void;
   onMenu: () => void;
   onBack: () => void;
@@ -25,6 +24,11 @@ type Props = {
 
 const states = { starting: '异常', ready: '正常', paused: '异常', unavailable: '异常' };
 const date = (value: string) => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) : '—';
+const backupDate = (value: string) => {
+  const timestamp = Date.parse(value);
+  const elapsed = Date.now() - timestamp;
+  return Number.isFinite(timestamp) && elapsed >= 0 && elapsed < 60 * 60 * 1000 ? `${Math.floor(elapsed / (60 * 1000))} 分前` : date(value);
+};
 const DAY = 24 * 60 * 60 * 1000;
 const duration = (value: number | undefined, fallback: string) => value == null ? fallback : value % DAY === 0 ? `${value / DAY} 天` : value % (60 * 60 * 1000) === 0 ? `${value / (60 * 60 * 1000)} 小时` : fallback;
 
@@ -32,21 +36,20 @@ function latestBackup(project: ProjectSummary) {
   return project.latestBackup ?? project.sandboxDataArchive ?? null;
 }
 
-function ProjectForm({ initial, busy, onSubmit, onCancel }: {
-  initial?: ProjectSummary;
+function ProjectForm({ busy, onSubmit, onCancel }: {
   busy: boolean;
   onSubmit: (values: ProjectValues) => Promise<void>;
   onCancel: () => void;
 }) {
-  const [name, setName] = useState(initial?.name ?? '');
-  const [url, setUrl] = useState(initial?.requirementUrl ?? '');
-  const [type, setType] = useState<ProjectType>(initial?.type ?? (initial?.requirementUrl ? 2 : 1));
+  const [name, setName] = useState('');
+  const [url, setUrl] = useState('');
+  const [type, setType] = useState<ProjectType>(1);
   const [error, setError] = useState('');
   const feishu = type === 2;
-  const automaticName = !initial && feishu;
+  const automaticName = feishu;
   const input = useRef<HTMLInputElement>(null);
   useEffect(() => { input.current?.focus(); }, []);
-  return <form className="project-form" aria-label={initial ? `编辑项目 ${initial.name}` : '创建项目'} onKeyDown={event => {
+  return <form className="project-form" aria-label="创建项目" onKeyDown={event => {
     if (event.key === 'Escape' && !busy) { event.preventDefault(); onCancel(); }
   }} onSubmit={async event => {
     event.preventDefault();
@@ -61,23 +64,21 @@ function ProjectForm({ initial, busy, onSubmit, onCancel }: {
     try { await onSubmit({ name: automaticName ? '' : trimmedName, requirementUrl: feishu ? url.trim() : null, type }); }
     catch (err) { setError(err instanceof Error ? err.message : '保存失败，请重试。'); }
   }}>
-    <label>项目类型<select value={type} disabled={busy || Boolean(initial)} onChange={event => { const next = Number(event.target.value) as ProjectType; setType(next); if (!initial && next === 3 && !name.trim()) setName('本周项目'); }}><option value={1}>普通项目</option><option value={2}>飞书项目</option><option value={3}>本周项目</option></select>{initial && <span>项目类型创建后不可修改</span>}</label>
+    <label>项目类型<select value={type} disabled={busy} onChange={event => { const next = Number(event.target.value) as ProjectType; setType(next); if (next === 3 && !name.trim()) setName('本周项目'); }}><option value={1}>普通项目</option><option value={2}>飞书项目</option><option value={3}>本周项目</option></select></label>
     <label>项目名称<input ref={input} required={!automaticName} maxLength={100} value={automaticName ? '' : name} disabled={busy || automaticName} placeholder={automaticName ? '自动使用飞书需求名称' : type === 3 ? '例如：本周重点事项' : '例如：订单系统改造'} onChange={event => setName(event.target.value)} /></label>
     {feishu && <label>飞书需求链接<input type="url" required maxLength={4096} value={url} disabled={busy} placeholder="https://…" onChange={event => setUrl(event.target.value)} /></label>}
-    {!initial && <p className="project-form-hint">飞书项目自动读取需求名称；本周项目每周只能创建一个，下一周会自动显示为上周项目。项目内会话共享一个 Sandbox，首次执行任务时创建。</p>}
+    <p className="project-form-hint">飞书项目自动读取需求名称；本周项目每周只能创建一个，下一周会自动显示为上周项目。项目内会话共享一个 Sandbox，首次执行任务时创建。</p>
     {error && <p className="project-error" role="alert">{error}</p>}
-    <div className="project-form-actions"><button type="button" className="secondary-button" onClick={onCancel} disabled={busy}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? automaticName ? '正在读取飞书需求并创建…' : '保存中…' : initial ? '保存修改' : '创建并进入'}</button></div>
+    <div className="project-form-actions"><button type="button" className="secondary-button" onClick={onCancel} disabled={busy}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? automaticName ? '正在读取飞书需求并创建…' : '保存中…' : '创建并进入'}</button></div>
   </form>;
 }
 
-function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, onArchive, onOpenProject, onStatus }: Pick<Props, 'config' | 'onUpdate' | 'onRebuildSandbox' | 'onBackup' | 'onArchive' | 'onOpenProject'> & {
+function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, onOpenProject, onStatus }: Pick<Props, 'config' | 'onUpdate' | 'onRebuildSandbox' | 'onBackup' | 'onOpenProject'> & {
   project: ProjectSummary;
   onStatus: (name: string, status: 'active' | 'completed') => void;
 }) {
-  const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const editButton = useRef<HTMLButtonElement>(null);
   const pending = useRef(false);
   const status = project.status ?? (project.archivedAt ? 'archived' : 'active');
   const archived = status === 'archived';
@@ -93,7 +94,6 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
   const canRestore = project.executionMode === 'sandbox' && (archived || !sandboxNormal) && Boolean(backup) && !hasTask && !operating;
   const typeLabel = projectTypeLabel(project.type, project.weekOf);
   const displayName = projectDisplayName(project);
-  const stopEditing = () => { setEditing(false); setTimeout(() => editButton.current?.focus(), 0); };
 
   async function run(label: string, action: () => Promise<ProjectSummary>) {
     if (busy || operating) return;
@@ -115,16 +115,6 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
     if (!window.confirm(`将使用 ${date(backup.createdAt)} 的最新备份${action}。该时间之后未备份的文件和对话上下文可能无法恢复。`)) return;
     void run(action, () => onRebuildSandbox(project.id));
   }
-  function archive() {
-    if (hasTask || busy || operating) return;
-    const useExistingBackup = !sandboxNormal;
-    if (useExistingBackup) {
-      if (!backup) return;
-      if (!window.confirm(`当前环境无法生成新备份，将使用 ${date(backup.createdAt)} 的已有备份归档。故障环境中的最新数据不会被保存。`)) return;
-    } else if (!window.confirm('归档前将创建最新备份；备份成功后会释放当前 Sandbox。')) return;
-    void run('归档项目', () => onArchive(project.id, useExistingBackup));
-  }
-
   const openDisabled = archived || completed || sandboxBroken || (sandboxMissing && Boolean(backup));
   const sandboxDescription = project.executionMode === 'local' ? '本地运行'
     : sandboxNormal ? <span className="project-sandbox-detail"><span>正常</span><code title={project.sandbox!.id} aria-label={`Sandbox ID ${project.sandbox!.id}`}>{project.sandbox!.id.slice(0, 6)}</code><SandboxVersion image={project.sandbox!.image} latestImage={config?.sandbox?.imageIdentity} /></span>
@@ -135,27 +125,21 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
     <div className="project-card-heading"><span className="project-folder" aria-hidden="true">▱</span><div className="project-card-statuses"><span className="project-type-badge">{typeLabel}</span>{archived && <span className="project-archived-badge">已归档</span>}<span className={`project-status ${project.activeSessionId ? 'active' : ''}`}>{project.activeSessionId ? '任务执行中' : project.executionMode === 'local' ? '本地项目' : project.sandbox ? states[project.sandbox.status] : '无 Sandbox'}</span></div></div>
     <h2>{openDisabled ? <span className="project-title-disabled">{displayName}</span> : <button className="project-title-button" onClick={() => onOpenProject(project.id)}>{displayName}</button>}</h2>
     {project.requirementUrl && /^https?:\/\//i.test(project.requirementUrl) ? <div className="project-requirement-wrap"><a className="project-requirement" href={project.requirementUrl} target="_blank" rel="noopener noreferrer" title={project.requirementUrl}>飞书需求 ↗<span>{project.requirementUrl}</span></a>{project.requirementStatus && <p className="project-requirement-status"><span>飞书项目状态</span><strong>{project.requirementStatus}</strong></p>}</div> : project.type === 2 ? <p className="project-unlinked">飞书需求待绑定</p> : <p className="project-unlinked">{typeLabel}</p>}
-      <dl className="project-details"><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>最新备份</dt><dd>{backup ? <time dateTime={backup.createdAt}>{date(backup.createdAt)}</time> : '暂无备份'}</dd></div><div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div><div><dt>归档时间</dt><dd>{project.archivedAt ? <time dateTime={project.archivedAt}>{date(project.archivedAt)}</time> : '尚未归档'}</dd></div></dl>
-    {editing ? <ProjectForm initial={project} busy={busy} onCancel={stopEditing} onSubmit={async values => {
-      setBusy(true);
-      try { await onUpdate(project.id, values); stopEditing(); }
-      finally { setBusy(false); }
-    }} /> : <div className="project-card-actions">
+      <dl className="project-details"><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>最新备份</dt><dd>{backup ? <time dateTime={backup.createdAt} title={date(backup.createdAt)}>{backupDate(backup.createdAt)}</time> : '暂无备份'}</dd></div><div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div></dl>
+    <div className="project-card-actions">
       {canRestore ? <button className="primary-button" onClick={restore}>{archived ? '恢复项目' : '恢复环境'}</button>
         : <button className="primary-button" disabled={openDisabled || operating} onClick={() => onOpenProject(project.id)}>进入项目 <span aria-hidden="true">→</span></button>}
       {!archived && sandboxNormal && <button className="secondary-button" disabled={busy || operating || hasTask} onClick={() => void run('立即备份', () => onBackup(project.id))}>立即备份</button>}
-      {!archived && <button className="secondary-button" disabled={busy || operating || hasTask || (!sandboxNormal && !backup)} onClick={archive}>归档项目</button>}
-      {!archived && <button ref={editButton} className="secondary-button" onClick={() => { setEditing(true); setError(''); }} disabled={busy || operating}>编辑</button>}
       {!archived && <button className="project-archive-button" disabled={busy || operating} title={completed ? '恢复为使用中，才能继续对话' : '完成满 1 天后自动归档'} onClick={() => void changeStatus()}>{busy ? '处理中…' : completed ? '恢复使用中' : '标记已完成'}</button>}
-    </div>}
-    {operation && <p className={`project-operation ${operation.status === 'failed' ? 'failed' : ''}`} role={operation.status === 'failed' ? 'alert' : 'status'}><strong>{operation.kind === 'backup' ? '备份' : operation.kind === 'restore' ? '恢复环境' : '归档'}：{operation.status === 'running' ? operation.phase : operation.status === 'succeeded' ? '已完成' : '失败'}</strong>{operation.error && <span>{operation.error}</span>}</p>}
+    </div>
+    {operation && !(operation.kind === 'backup' && operation.status === 'succeeded') && <p className={`project-operation ${operation.status === 'failed' ? 'failed' : ''}`} role={operation.status === 'failed' ? 'alert' : 'status'}><strong>{operation.kind === 'backup' ? '备份' : operation.kind === 'restore' ? '恢复环境' : '归档'}：{operation.status === 'running' ? operation.phase : operation.status === 'succeeded' ? '已完成' : '失败'}</strong>{operation.error && <span>{operation.error}</span>}</p>}
     {cleanupPending && !operating && <p className="project-rebuild-hint" role="status">旧环境待清理，系统将自动重试。</p>}
     {!operation && sandboxMissing && backup && <p className="project-rebuild-hint">当前没有 Sandbox，可使用最新备份恢复环境。</p>}
     {error && <p className="project-error" role="alert">{error}</p>}
   </article>;
 }
 
-export default function ProjectsPage({ projects, config, loading, onRefresh, onCreate, onUpdate, onRebuildSandbox, onBackup, onArchive, onOpenProject, onMenu, onBack, initialView = 'active' }: Props) {
+export default function ProjectsPage({ projects, config, loading, onRefresh, onCreate, onUpdate, onRebuildSandbox, onBackup, onOpenProject, onMenu, onBack, initialView = 'active' }: Props) {
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState('');
@@ -180,7 +164,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
     const timer = window.setInterval(() => { void onRefresh().catch(() => undefined); }, 3_000);
     return () => window.clearInterval(timer);
   }, [projects, onRefresh]);
-  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} config={config} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onBackup={onBackup} onArchive={onArchive} onOpenProject={onOpenProject} onStatus={(name, status) => {
+  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} config={config} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onBackup={onBackup} onOpenProject={onOpenProject} onStatus={(name, status) => {
     setMessage(status === 'completed' ? `「${name}」已标记完成；满 1 天后会自动归档并删除 Sandbox。` : `「${name}」已恢复为使用中。`);
     activeTab.current?.focus();
   }} />;

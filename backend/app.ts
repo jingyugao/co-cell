@@ -45,7 +45,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   app.use('*', async (c, next) => {
     const host = c.req.header('host') || '';
     // Match subdomain pattern: <uuid>.digits.<anything>
-    const match = /^([a-f0-9-]+)\.(\d+)\.(.+)$/i.exec(host);
+    const match = /^([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})\.(\d+)\.(.+)$/i.exec(host);
     if (!match) return next();
 
     const projectId = match[1];

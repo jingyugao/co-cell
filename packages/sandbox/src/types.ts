@@ -8,6 +8,8 @@ export interface SandboxCommandHandle {
 export interface SandboxHandle {
   sandboxId: string;
   getHost(port: number): string;
+  /** Provider-specific externally reachable URL for a service bound to sandbox localhost. */
+  getServiceUrl?(port: number): Promise<string>;
   setTimeout(timeoutMs: number): Promise<void>;
   commands: {
     run(command: string, options: {
@@ -66,6 +68,12 @@ export interface SandboxRecord {
   operation?: SandboxOperation;
   error?: { code: string; message: string; at: string };
   version?: number;
+  checkpoint?: SandboxCheckpoint;
+}
+
+export interface SandboxCheckpoint {
+  id: string;
+  createdAt: string;
 }
 
 export type PersistSandboxRecord = (record: SandboxRecord) => Promise<void>;
@@ -78,6 +86,12 @@ export interface SandboxPolicy {
   timeoutMs: number;
   renewalIntervalMs: number;
   scanIntervalMs: number;
+  autoCheckpointAfterMs: number;
+}
+
+export interface SandboxCheckpointProvider {
+  checkpoint(sandboxId: string): Promise<SandboxCheckpoint>;
+  restore(sandboxId: string, checkpointId: string): Promise<void>;
 }
 
 export interface SandboxProvider {
@@ -91,6 +105,8 @@ export interface SandboxProvider {
   pause(sandboxId: string): Promise<boolean>;
   kill(sandboxId: string): Promise<boolean>;
 }
+
+export interface CheckpointableSandboxProvider extends SandboxProvider, SandboxCheckpointProvider {}
 
 export interface SandboxManagerOptions {
   provider: SandboxProvider;

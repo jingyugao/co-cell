@@ -48,6 +48,11 @@ services:
       # Docker commands issued by this container are evaluated by the host
       # daemon, so this must be a host path rather than /app/data/AGENTS.md.
       SANDBOX_SHARED_AGENTS_PATH: ${SANDBOX_SHARED_AGENTS_PATH:-${PWD}/data/AGENTS.md}
+      SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
+      GVISOR_BUNDLE_ROOT: ${GVISOR_BUNDLE_ROOT:-/var/lib/swarm-hive/gvisor/bundles}
+      GVISOR_NETNS_ROOT: ${GVISOR_NETNS_ROOT:-/var/run/netns}
+      GVISOR_APP_SERVER_HOST: host.docker.internal
+      GVISOR_HELPER_URL: ${GVISOR_HELPER_URL:-http://host.docker.internal:8090}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -55,9 +60,10 @@ services:
       # Docker sandbox mode intentionally has host-level Docker authority.
       # It is for trusted local deployments only.
       - /var/run/docker.sock:/var/run/docker.sock
+      - ${GVISOR_BUNDLE_ROOT:-/var/lib/swarm-hive/gvisor/bundles}:/var/lib/swarm-hive/gvisor/bundles
       - ${MEEGLE_HOME:-/home/example/.meegle}:/root/.meegle
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
   cliproxy:
     image: eceasy/cli-proxy-api:v7.2.154
     restart: unless-stopped
@@ -68,7 +74,7 @@ services:
       HOME: /tmp
       TZ: Asia/Shanghai
     ports:
-      - "8317:8317"
+      - "127.0.0.1:8317:8317"
     volumes:
       - ./data/cliproxyapi/config.yaml:/CLIProxyAPI/config.yaml:ro
       - ./data/cliproxyapi/auths:/auths

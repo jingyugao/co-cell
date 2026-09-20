@@ -128,6 +128,29 @@ test('inspect does not connect or renew a paused sandbox', async () => {
   await manager.close();
 });
 
+test('checkpointed sandbox restores before reconnecting and clears its checkpoint record', async () => {
+  let state: 'running' | 'paused' = 'running';
+  const calls: string[] = [];
+  const handle = { sandboxId: 'sandbox-1', setTimeout: async () => {} } as unknown as SandboxHandle;
+  const provider: SandboxProvider & { checkpoint(id: string): Promise<{ id: string; createdAt: string }>; restore(id: string, checkpointId: string): Promise<void> } = {
+    create: async () => handle,
+    connect: async () => { calls.push('connect'); assert.equal(state, 'running'); return handle; },
+    getInfo: async () => ({ sandboxId: 'sandbox-1', state, startedAt: new Date(), endAt: new Date(Date.now() + 60_000) }),
+    pause: async () => true, kill: async () => true,
+    checkpoint: async () => { calls.push('checkpoint'); state = 'paused'; return { id: 'checkpoint-1', createdAt: new Date().toISOString() }; },
+    restore: async () => { calls.push('restore'); state = 'running'; },
+  };
+  const manager = new SandboxManager({ provider, policy: { autoCheckpointAfterMs: 1, scanIntervalMs: 2 } });
+  manager.track('resource', { ...record('ready'), lastActiveAt: new Date(0).toISOString() }, async () => {});
+  await waitUntil(() => manager.peek('resource')?.checkpoint?.id === 'checkpoint-1');
+  assert.equal(manager.peek('resource')?.status, 'paused');
+  const lease = await manager.acquire('resource', { usageId: 'turn-1' });
+  assert.deepEqual(calls, ['checkpoint', 'restore', 'connect']);
+  assert.equal(manager.peek('resource')?.checkpoint, undefined);
+  await lease.release();
+  await manager.close();
+});
+
 test('multiple usages share renewal while inspect and idle scans never renew', async () => {
   const fake = fixture('paused');
   const manager = new SandboxManager({

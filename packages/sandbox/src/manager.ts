@@ -12,12 +12,14 @@ import type {
   SandboxStatus,
   SandboxInfo,
   SandboxHandle,
+  CheckpointableSandboxProvider,
 } from './types.js';
 
 export const DEFAULT_SANDBOX_POLICY: Readonly<SandboxPolicy> = Object.freeze({
   timeoutMs: 3 * 60 * 60 * 1000,
   renewalIntervalMs: 60 * 1000,
   scanIntervalMs: 60 * 1000,
+  autoCheckpointAfterMs: 60 * 60 * 1000,
 });
 
 type Usage = { references: number; detached: boolean; purpose?: string };
@@ -41,6 +43,7 @@ const cloneRecord = (record: SandboxRecord): SandboxRecord => ({
     ...record.templateIdentity,
     repoDigests: [...record.templateIdentity.repoDigests],
   } } : {}),
+  ...(record.checkpoint ? { checkpoint: { ...record.checkpoint } } : {}),
 });
 
 const assertResourceKey = (resourceKey: string) => {
@@ -63,6 +66,7 @@ export class SandboxManager {
   private readonly locks = new Map<string, Promise<void>>();
   private readonly policy: SandboxPolicy;
   private readonly provider: SandboxProvider;
+  private readonly checkpointProvider?: CheckpointableSandboxProvider;
   private readonly timer: ReturnType<typeof setInterval>;
   private sweeping?: Promise<void>;
   private closed = false;
@@ -75,6 +79,10 @@ export class SandboxManager {
       }
     }
     this.provider = options.provider;
+    if (typeof (options.provider as Partial<CheckpointableSandboxProvider>).checkpoint === 'function'
+      && typeof (options.provider as Partial<CheckpointableSandboxProvider>).restore === 'function') {
+      this.checkpointProvider = options.provider as CheckpointableSandboxProvider;
+    }
     this.timer = setInterval(() => { void this.sweep(); }, this.policy.scanIntervalMs);
     this.timer.unref();
   }
@@ -475,6 +483,12 @@ export class SandboxManager {
     }
     await this.change(resourceKey, entry, { operation });
     try {
+      // A checkpointed provider has no runnable instance until restore. Do
+      // this before connect: providers correctly reject a stopped instance.
+      if (entry.record.checkpoint && this.checkpointProvider) {
+        await this.checkpointProvider.restore(entry.record.id, entry.record.checkpoint.id);
+        await this.change(resourceKey, entry, { checkpoint: undefined });
+      }
       const sandbox = await this.provider.connect(entry.record.id, {
         timeoutMs: this.policy.timeoutMs,
       });
@@ -552,6 +566,19 @@ export class SandboxManager {
                 await this.renew(resourceKey, entry);
               }
               return;
+            }
+            const checkpoint = this.checkpointProvider?.checkpoint;
+            const idleAt = Date.parse(entry.record.lastActiveAt ?? '');
+            if (checkpoint && entry.record.status === 'ready' && Number.isFinite(idleAt)
+              && Date.now() - idleAt >= this.policy.autoCheckpointAfterMs && !entry.record.checkpoint) {
+              try {
+                const saved = await checkpoint(entry.record.id);
+                await this.change(resourceKey, entry, { checkpoint: saved, status: 'paused', pausedAt: new Date().toISOString() });
+                entry.sandbox = undefined;
+                this.log({ event: 'sandbox.checkpointed', resourceKey, sandboxId: entry.record.id, checkpointId: saved.id });
+              } catch (error) {
+                this.log({ event: 'sandbox.checkpoint_failed', resourceKey, sandboxId: entry.record.id, message: this.safeMessage(error) });
+              }
             }
             let info: SandboxInfo;
             try {

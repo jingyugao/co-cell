@@ -853,6 +853,7 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     const entry = await this.acquire(session, false);
     let failed = false;
     try {
+      if (entry.sandbox.getServiceUrl) return await entry.sandbox.getServiceUrl(port);
       return `http://${entry.sandbox.getHost(port)}:${port}`;
     } catch (error) { failed = true; throw error; }
     finally { await this.release(entry, failed); }

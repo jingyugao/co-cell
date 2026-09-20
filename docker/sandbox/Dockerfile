@@ -18,7 +18,10 @@ LABEL org.opencontainers.image.title="swarm-hive-sandbox" \
 # pnpm is installed directly rather than via Corepack: a disposable Sandbox can
 # otherwise retain a broken Corepack shim when its download cache is absent.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-  apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+  # node:22.18.0-bookworm-slim can retain a dangling Bash manpage alternative.
+  # Remove its stale registration before apt upgrades Bash.
+  update-alternatives --remove-all builtins.7.gz || true \
+  && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
   && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
     bash ca-certificates curl git openssh-client \
     make g++ procps rsync tar gzip unzip tmux \
@@ -81,20 +84,23 @@ RUN --mount=type=cache,target=/home/user/.cache/mise,uid=1000,gid=1000 \
 COPY scripts/sandbox/install-command-tools.sh /usr/local/sbin/install-command-tools
 RUN bash /usr/local/sbin/install-command-tools \
   && rm /usr/local/sbin/install-command-tools \
-  && mkdir -p /home/user/workspace /home/user/.codex /home/user/.codex-web/runtime /home/user/.codex-web/credentials/current /home/user/.meegle /home/user/.kube/cache \
+  && mkdir -p /home/user/workspace /home/user/.codex /home/user/.codex-web/credentials/current /home/user/.codex-web/runtime /home/user/.meegle /home/user/.kube/cache /home/user/.config/glab-cli /home/user/.config/lark-cli /home/user/.local/share/lark-cli \
   && touch /home/user/.codex/AGENTS.md \
-  && ln -s /home/user/.codex-web/credentials/current/meegle/config.json /home/user/.meegle/config.json \
-  && chown -R user:user /home/user/workspace /home/user/.codex /home/user/.codex-web /home/user/.meegle /home/user/.kube
+  # Mise's downloaded toolchains live under ~/.local and are already owned by
+  # user. Avoid recursively walking them merely to make empty mount targets
+  # writable; that adds several minutes to every image build.
+  && chown -R user:user /home/user/workspace /home/user/.codex /home/user/.codex-web /home/user/.meegle /home/user/.kube \
+  && chown user:user /home/user/.config /home/user/.local /home/user/.local/share /home/user/.config/glab-cli /home/user/.config/lark-cli /home/user/.local/share/lark-cli
 
 USER user
 WORKDIR /home/user/workspace
 ENV HOME=/home/user \
     CODEX_HOME=/home/user/.codex \
-    GLAB_CONFIG_DIR=/home/user/.codex-web/credentials/current/glab \
-    MYSQL_TEST_LOGIN_FILE=/home/user/.codex-web/credentials/current/.mylogin.cnf \
-    KUBECONFIG=/home/user/.codex-web/credentials/current/kubernetes/config.json \
-    LARKSUITE_CLI_CONFIG_DIR=/home/user/.codex-web/credentials/current/lark-config \
-    LARKSUITE_CLI_DATA_DIR=/home/user/.codex-web/credentials/current/lark-data \
+    GLAB_CONFIG_DIR=/home/user/.config/glab-cli \
+    MYSQL_TEST_LOGIN_FILE=/home/user/.mylogin.cnf \
+    KUBECONFIG=/home/user/.kube/config.json \
+    LARKSUITE_CLI_CONFIG_DIR=/home/user/.config/lark-cli \
+    LARKSUITE_CLI_DATA_DIR=/home/user/.local/share/lark-cli \
     LARKSUITE_CLI_DEFAULT_AS=bot \
     LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 \
     LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 \
@@ -107,7 +113,6 @@ ENV HOME=/home/user \
 USER root
 RUN chown user:user /home/user
 USER user
-RUN git config --global --add include.path /home/user/.codex-web/credentials/current/gitconfig
 
 # sandbox-proxy: lightweight HTTP reverse proxy for exposing localhost-bound
 # services through the container's Docker network interface.

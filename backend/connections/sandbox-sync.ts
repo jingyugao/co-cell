@@ -11,15 +11,15 @@ export async function syncSandboxConnections(store: ConnectionStore) {
   const { importedAt: _importedAt, ...content } = bundle;
   const glabHosts = bundle.connections.filter(item => item.type === 'glab').map(item => item.host).filter((host): host is string => Boolean(host));
   const envs = {
-    GLAB_CONFIG_DIR: '/home/user/.codex-web/credentials/current/glab',
-    MYSQL_TEST_LOGIN_FILE: '/home/user/.codex-web/credentials/current/.mylogin.cnf',
+    GLAB_CONFIG_DIR: '/home/user/.config/glab-cli',
+    MYSQL_TEST_LOGIN_FILE: '/home/user/.mylogin.cnf',
     GIT_TERMINAL_PROMPT: '0',
     ...(glabHosts.length === 1 ? { GITLAB_HOST: `https://${glabHosts[0]}` } : {}),
-    ...(bundle.connections.some(item => item.type === 'kubernetes') ? { KUBECONFIG: '/home/user/.codex-web/credentials/current/kubernetes/config.json' } : {}),
+    ...(bundle.connections.some(item => item.type === 'kubernetes') ? { KUBECONFIG: '/home/user/.kube/config.json' } : {}),
     ...(bundle.connections.find(item => item.type === 'meegle')?.host ? { MEEGLE_HOST: bundle.connections.find(item => item.type === 'meegle')!.host! } : {}),
     ...(bundle.connections.some(item => item.type === 'lark') ? {
-      LARKSUITE_CLI_CONFIG_DIR: '/home/user/.codex-web/credentials/current/lark-config',
-      LARKSUITE_CLI_DATA_DIR: '/home/user/.codex-web/credentials/current/lark-data',
+      LARKSUITE_CLI_CONFIG_DIR: '/home/user/.config/lark-cli',
+      LARKSUITE_CLI_DATA_DIR: '/home/user/.local/share/lark-cli',
       LARKSUITE_CLI_DEFAULT_AS: 'bot', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1',
     } : {}),
   };

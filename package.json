@@ -15,8 +15,7 @@
     "capture:http": "tsx backend/infra/diagnostics/capture-demo.ts",
     "credentials:import": "tsx backend/connections/import-local.ts",
     "credentials:migrate": "tsx backend/connections/migrate-credentials.ts",
-    "cliproxyapi": "node scripts/cliproxyapi/manage.mjs",
-    "kubernetes:configure": "node scripts/kubernetes-admin.mjs"
+    "cliproxyapi": "node scripts/cliproxyapi/manage.mjs"
   },
   "dependencies": {
     "@hono/node-server": "2.1.1",

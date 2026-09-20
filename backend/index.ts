@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { loadEnvFile } from 'node:process';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { access, chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, chmod, chown, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { Codex, appServerArgs } from '../packages/agentcore/src/index.mjs';
 import { getRequestListener } from '@hono/node-server';
@@ -25,6 +25,7 @@ import { modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
 import { DockerSandboxClient } from '../packages/docker-sandbox/src/index.js';
 import { dockerSandboxProvider } from './sandboxes/docker-provider.js';
+import { loadSandboxMounts } from './sandboxes/mounts.js';
 import { ConnectionStore } from './connections/store.js';
 import { ApprovalMcpService } from './approvals/mcp.js';
 
@@ -84,14 +85,22 @@ const approvalMcpOverrides = [
 const sandboxCredentialsDirectory = resolve(connections.sandboxDirectory());
 await mkdir(sandboxCredentialsDirectory, { recursive: true, mode: 0o700 });
 await chmod(sandboxCredentialsDirectory, 0o700);
-const sandboxCredentialsHostDirectory = process.env.SANDBOX_CREDENTIALS_HOST_DIR || sandboxCredentialsDirectory;
+for (const directory of ['glab', 'meegle', 'kubernetes', 'lark-config', 'lark-data']) {
+  const path = resolve(sandboxCredentialsDirectory, directory);
+  await mkdir(path, { recursive: true, mode: 0o700 }); await chmod(path, 0o700); await chown(path, 1000, 1000);
+}
+for (const file of ['gitconfig', 'git-credentials', '.mylogin.cnf']) {
+  try { await access(resolve(sandboxCredentialsDirectory, file)); }
+  catch { await writeFile(resolve(sandboxCredentialsDirectory, file), '', { mode: 0o600, flag: 'wx' }); }
+}
+const sandboxMounts = await loadSandboxMounts();
 const sandboxAppServerTokenHostPath = process.env.SANDBOX_APP_SERVER_TOKEN_HOST_PATH || sandboxAppServerToken;
 const sharedAgentsPath = resolve('data/AGENTS.md');
 const sharedAgentsHostPath = process.env.SANDBOX_SHARED_AGENTS_PATH || sharedAgentsPath;
 // Global rules are non-secret and need to be readable by the Sandbox's user.
 await chmod(sharedAgentsPath, 0o644);
-const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BIN || 'docker', process.env.DOCKER_SANDBOX_NETWORK || 'swarm-hive_default', sandboxCredentialsHostDirectory, sandboxAppServerTokenHostPath, sharedAgentsHostPath,
-  process.env.SANDBOX_APP_SERVER_HOST, {
+const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BIN || 'docker', process.env.DOCKER_SANDBOX_NETWORK || 'swarm-hive_default', sandboxAppServerTokenHostPath, sharedAgentsHostPath,
+  process.env.SANDBOX_APP_SERVER_HOST, sandboxMounts, {
     ...(apiKey ? { CODEX_API_KEY: apiKey } : {}), ...(process.env.OPENAI_BASE_URL ? { OPENAI_BASE_URL: process.env.OPENAI_BASE_URL } : {}),
     CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, [...(configOverrides ?? []), ...approvalMcpOverrides]).slice(1)),
   });
@@ -111,9 +120,9 @@ if (sandboxProviderKind === 'gvisor') {
     new GvisorHelperClient(process.env.GVISOR_HELPER_URL ?? (process.env.DOCKER_HOST ? 'http://host.docker.internal:8090' : 'http://127.0.0.1:8090')), sandboxImage, {
       bundleRoot: gvisorBundleRoot, workingDirectory: sandboxWorkingDirectory,
       process: { args: ['node', '-e', appServerCommand], cwd: sandboxWorkingDirectory, uid: 1000, gid: 1000, env: {
-        HOME: '/home/user', CODEX_HOME: '/home/user/.codex', GLAB_CONFIG_DIR: '/home/user/.codex-web/credentials/current/glab',
-        MYSQL_TEST_LOGIN_FILE: '/home/user/.codex-web/credentials/current/.mylogin.cnf', KUBECONFIG: '/home/user/.codex-web/credentials/current/kubernetes/config.json',
-        LARKSUITE_CLI_CONFIG_DIR: '/home/user/.codex-web/credentials/current/lark-config', LARKSUITE_CLI_DATA_DIR: '/home/user/.codex-web/credentials/current/lark-data',
+        HOME: '/home/user', CODEX_HOME: '/home/user/.codex', GLAB_CONFIG_DIR: '/home/user/.config/glab-cli',
+        MYSQL_TEST_LOGIN_FILE: '/home/user/.mylogin.cnf', KUBECONFIG: '/home/user/.kube/config.json',
+        LARKSUITE_CLI_CONFIG_DIR: '/home/user/.config/lark-cli', LARKSUITE_CLI_DATA_DIR: '/home/user/.local/share/lark-cli',
         LARKSUITE_CLI_DEFAULT_AS: 'bot', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1', GIT_TERMINAL_PROMPT: '0',
         MISE_DATA_DIR: '/home/user/.local/share/mise', MISE_CONFIG_DIR: '/home/user/.config/mise', MISE_STATE_DIR: '/home/user/.local/state/mise', MISE_TRUSTED_CONFIG_PATHS: sandboxWorkingDirectory,
         PATH: '/home/user/.local/share/mise/shims:/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin',
@@ -122,7 +131,7 @@ if (sandboxProviderKind === 'gvisor') {
       } },
       mounts: [
         { source: process.env.GVISOR_RESOLV_CONF ?? '/etc/resolv.conf', destination: '/etc/resolv.conf' },
-        { source: sandboxCredentialsHostDirectory, destination: '/home/user/.codex-web/credentials/current', readonly: false },
+        ...sandboxMounts,
         { source: sandboxAppServerTokenHostPath, destination: '/home/user/.codex-web/app-server-token' },
         { source: sharedAgentsHostPath, destination: '/home/user/.codex/AGENTS.md' },
       ], networkNamespaceRoot: process.env.GVISOR_NETNS_ROOT ?? '/var/run/netns',

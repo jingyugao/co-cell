@@ -1,13 +1,20 @@
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute } from 'node:path';
 import type { ConnectionInventory } from '../../protocol/connection-types.js';
 
-export const KUBERNETES_CREDENTIAL_POLICY = 'static-admin-v1';
+export const KUBERNETES_CREDENTIAL_POLICY = 'explicit-kubeconfig-v1';
 
-/** Import the dedicated, portable kubeconfig once. No cluster calls or token renewal. */
-export async function importKubernetesCredentials(home: string) {
+/**
+ * Import an operator-provided kubeconfig once. No cluster calls or token
+ * renewal occur here. Requiring an explicit path prevents the server from
+ * silently distributing a developer's default kubeconfig to Sandboxes.
+ */
+export async function importKubernetesCredentials(_home: string) {
+  const path = process.env.COCELL_KUBECONFIG;
+  if (!path) return undefined;
+  if (!isAbsolute(path)) throw new Error('COCELL_KUBECONFIG 必须是绝对路径');
   let text: string;
-  try { text = await readFile(join(home, '.kube/swarm-hive-admin.json'), 'utf8'); }
+  try { text = await readFile(path, 'utf8'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw new Error('无法读取 Kubernetes 专用凭据'); }
   try {
     const input = JSON.parse(text);
@@ -30,13 +37,13 @@ export async function importKubernetesCredentials(home: string) {
       contexts.push({ name: entry.name, context: { cluster: entry.name, user: entry.name,
         ...(entry.context.namespace ? { namespace: entry.context.namespace } : {}) } });
       connections.push({ id: 'kubernetes:' + entry.name, type: 'kubernetes', name: entry.name, host: url.host,
-        username: 'system:serviceaccount:codex-devtools:swarm-hive-admin',
-        note: '专用 cluster-admin 身份，拥有全部 Kubernetes RBAC 权限；令牌不自动到期，删除对应 Secret 或账号可撤销。' });
+        username: 'operator-provided',
+        note: '由部署者显式提供的 kubeconfig；其权限范围由部署者管理。' });
     }
     const current = input['current-context'] || contexts[0].name;
     if (!names.has(current)) throw Error();
     const config = { apiVersion: 'v1', kind: 'Config', clusters, users, contexts, 'current-context': current };
     return { connections, policy: KUBERNETES_CREDENTIAL_POLICY,
       files: { 'kubernetes/config.json': Buffer.from(JSON.stringify(config)).toString('base64') } };
-  } catch { throw new Error('Kubernetes 专用凭据无效，请运行 node scripts/kubernetes-admin.mjs 重新签发并导入'); }
+  } catch { throw new Error('COCELL_KUBECONFIG 无效或无法读取'); }
 }

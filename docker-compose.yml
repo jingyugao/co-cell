@@ -34,7 +34,7 @@ services:
       NODE_ENV: production
       PORT: 3001
       HOST: 0.0.0.0
-      MEEGLE_HOST: project.feishu.cn
+      MEEGLE_HOST: ${MEEGLE_HOST:-}
       USER: ${MEEGLE_AUTH_USER:-root}
       MYSQL_URL: mysql://${MYSQL_USER:-swarm_hive}:${MYSQL_PASSWORD:-change-me-before-production}@mysql:3306/${MYSQL_DATABASE:-swarm_hive}
       DOCKER_SANDBOX_IMAGE: ${DOCKER_SANDBOX_IMAGE:-swarm-hive-sandbox:latest}
@@ -50,6 +50,8 @@ services:
       # Docker commands issued by this container are evaluated by the host
       # daemon, so this must be a host path rather than /app/data/AGENTS.md.
       SANDBOX_SHARED_AGENTS_PATH: ${SANDBOX_SHARED_AGENTS_PATH:-${PWD}/data/AGENTS.md}
+      # Docker and the gVisor helper need host-visible sources for sandbox.toml.
+      SANDBOX_MOUNT_ROOT: ${SANDBOX_MOUNT_ROOT:-${PWD}}
       SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
       GVISOR_BUNDLE_ROOT: ${GVISOR_BUNDLE_ROOT:-/var/lib/swarm-hive/gvisor/bundles}
       GVISOR_NETNS_ROOT: ${GVISOR_NETNS_ROOT:-/var/run/netns}
@@ -63,7 +65,7 @@ services:
       # It is for trusted local deployments only.
       - /var/run/docker.sock:/var/run/docker.sock
       - ${GVISOR_BUNDLE_ROOT:-/var/lib/swarm-hive/gvisor/bundles}:/var/lib/swarm-hive/gvisor/bundles
-      - ${MEEGLE_HOME:-/home/example/.meegle}:/root/.meegle
+      - ${MEEGLE_HOME:-./data/meegle}:/root/.meegle
     ports:
       - "127.0.0.1:3001:3001"
   cliproxy:

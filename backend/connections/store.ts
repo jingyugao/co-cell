@@ -8,7 +8,6 @@ import { parseEnv } from 'node:util';
 import type { ConnectionInventory } from '../../protocol/connection-types.js';
 import { HttpError } from '../../util/errors.js';
 import { importLarkCredentials } from './lark-credentials.js';
-import { readMeegleCredentials } from './meegle-credentials.js';
 import { importKubernetesCredentials, KUBERNETES_CREDENTIAL_POLICY } from './kubernetes-credentials.js';
 
 export interface ConnectionBundle {
@@ -23,8 +22,8 @@ export interface ConnectionBundle {
 }
 export const CONNECTION_ROOT = '/home/user/.codex-web/credentials';
 export const CONNECTION_ENVS = {
-  GLAB_CONFIG_DIR: `${CONNECTION_ROOT}/current/glab`,
-  MYSQL_TEST_LOGIN_FILE: `${CONNECTION_ROOT}/current/.mylogin.cnf`,
+  GLAB_CONFIG_DIR: '/home/user/.config/glab-cli',
+  MYSQL_TEST_LOGIN_FILE: '/home/user/.mylogin.cnf',
   GIT_TERMINAL_PROMPT: '0',
 };
 export type LocalCommand = (command: string, args: string[], input?: string) => Promise<string>;
@@ -91,7 +90,6 @@ export class ConnectionStore {
   private home: string;
   private command: LocalCommand;
   private tail: Promise<unknown> = Promise.resolve();
-  private meegleRefresh?: Promise<Awaited<ReturnType<typeof readMeegleCredentials>>>;
   constructor(options: ConnectionStoreOptions = {}) {
     this.directory = options.directory ?? fileURLToPath(new URL('../../data/credentials/', import.meta.url));
     this.home = options.home ?? homedir(); this.command = options.command ?? localCommand;
@@ -134,15 +132,7 @@ export class ConnectionStore {
     if (bundle.connections.some(item => item.type === 'kubernetes') && bundle.kubernetesPolicy !== KUBERNETES_CREDENTIAL_POLICY) {
       throw new Error('请导入专用 Kubernetes 长期凭据');
     }
-    if (!bundle.connections.some(item => item.type === 'meegle')) return bundle;
-    if (!this.meegleRefresh) {
-      this.meegleRefresh = readMeegleCredentials({ home: this.home, command: this.command }).finally(() => { this.meegleRefresh = undefined; });
-    }
-    const current = await this.meegleRefresh;
-    if (!current) throw new Error('本机 Meegle 登录配置已移除，请重新同步凭据');
-    const expected = bundle.connections.find(item => item.type === 'meegle');
-    if (current.metadata.host !== expected?.host || current.metadata.profile !== expected?.username) throw new Error('本机 Meegle 身份已切换，请重新同步凭据');
-    return { ...bundle, cliFiles: { ...bundle.cliFiles, 'meegle/config.json': Buffer.from(current.configText).toString('base64') } };
+    return bundle;
   }
   sandboxRuntimeDirectory() { return join(this.directory, 'sandbox-runtime'); }
   /**
@@ -169,8 +159,6 @@ export class ConnectionStore {
       if (kubernetes) connections.push(...kubernetes.connections);
       const lark = await importLarkCredentials(this.home);
       if (lark) connections.push(...lark.connections);
-      const meegle = await readMeegleCredentials({ home: this.home, command: this.command });
-      if (meegle) connections.push({ id: `meegle:${meegle.metadata.host}`, type: 'meegle', name: '飞书项目', host: meegle.metadata.host, username: meegle.metadata.profile, note: '使用本机已登录身份。每轮任务准备当前访问令牌，刷新凭据保留在宿主机。' });
       const optional = async (command: string, args: string[], input?: string) => this.command(command, args, input).catch(() => '');
       let mysqlLogin: string | undefined;
       try {
@@ -209,7 +197,7 @@ export class ConnectionStore {
         const values = Object.fromEntries(output.split('\n').map(line => { const i = line.indexOf('='); return [line.slice(0, i), line.slice(i + 1)]; }));
         if (!values.username || !values.password) continue;
         gitCredentials += `https://${encodeURIComponent(values.username)}:${encodeURIComponent(values.password)}@${host}\n`;
-        gitConfig += `[credential "https://${host}"]\n\thelper =\n\thelper = store --file=${CONNECTION_ROOT}/current/git-credentials\n`;
+        gitConfig += `[credential "https://${host}"]\n\thelper =\n\thelper = store --file=/home/user/.git-credentials\n`;
         connections.push({ id: `git:${host}`, type: 'git', name: host, host, username: values.username });
       }
       if (!connections.length) throw new HttpError(400, '本机没有可导入的服务凭据');
@@ -219,8 +207,7 @@ export class ConnectionStore {
         // directly usable by an interactive Sandbox shell.
         glabConfig: JSON.stringify({ git_protocol: 'https', ...(Object.keys(hosts).length === 1 ? { host: Object.keys(hosts)[0] } : {}), hosts }, null, 2), gitCredentials, gitConfig,
         ...(kubernetes ? { kubernetesPolicy: kubernetes.policy } : {}),
-        cliFiles: { ...kubernetes?.files, ...lark?.files, ...(meegle ? { 'meegle/config.json': Buffer.from(meegle.configText).toString('base64') } : {}) } };
-      this.meegleRefresh = undefined;
+        cliFiles: { ...kubernetes?.files, ...lark?.files } };
       await writeConnectionBundle(this.directory, bundle);
       return { configured: true, importedAt: bundle.importedAt, scope: 'all-projects' as const, connections };
     });

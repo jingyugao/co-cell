@@ -8,11 +8,14 @@ import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import type { DockerExecHandle, DockerExecOptions, DockerExecResult, DockerImageIdentity, DockerSandboxRecord, DockerSandboxStatus } from './types.js';
 
+type Mount = { source: string; destination: string; readonly: boolean };
+
 const execFileAsync = promisify(execFile);
 
 export class DockerSandboxClient {
-  constructor(private readonly image: string, private readonly docker = 'docker', private readonly network = 'host', private readonly credentialsHostDirectory?: string,
-    private readonly appServerTokenHostPath?: string, private readonly sharedAgentsHostPath?: string, private readonly appServerHost?: string,
+  constructor(private readonly image: string, private readonly docker = 'docker', private readonly network = 'host', private readonly appServerTokenHostPath?: string,
+    private readonly sharedAgentsHostPath?: string, private readonly appServerHost?: string,
+    private readonly mounts: Mount[] = [],
     private readonly appServerEnvironment: Record<string, string> = {}) {}
   private async call(args: string[], timeout?: number, signal?: AbortSignal) { return execFileAsync(this.docker, args, { timeout, signal, maxBuffer: 16 * 1024 * 1024 }); }
   async imageIdentity(reference = this.image): Promise<DockerImageIdentity> {
@@ -70,7 +73,7 @@ export class DockerSandboxClient {
     // directory. A bind mount lets operators update CLI configuration without
     // recreating a Sandbox. Trusted personal deployments may let agents
     // update the host-managed files as well.
-    if (this.credentialsHostDirectory) args.push('--mount', `type=bind,src=${this.credentialsHostDirectory},dst=/home/user/.codex-web/credentials/current`);
+    for (const mount of this.mounts) args.push('--mount', `type=bind,src=${mount.source},dst=${mount.destination}${mount.readonly ? ',readonly' : ''}`);
     if (this.appServerTokenHostPath) args.push('--mount', `type=bind,src=${this.appServerTokenHostPath},dst=/home/user/.codex-web/app-server-token`);
     // The App Server is started with the container and discovers AGENTS.md at
     // thread creation time. Mount the global rules rather than copying them

@@ -102,6 +102,13 @@ export interface Turn {
   };
 }
 export type ProjectStatus = 'active' | 'completed' | 'archived';
+export interface ProjectSandboxOperation {
+  kind: 'backup' | 'restore' | 'archive';
+  phase: string;
+  status: 'running' | 'failed' | 'succeeded';
+  error?: string;
+  updatedAt: string;
+}
 /** 1: ordinary, 2: Feishu requirement, 3: weekly project. */
 export type ProjectType = 1 | 2 | 3;
 
@@ -139,6 +146,9 @@ export interface Project {
   };
   /** 指向 archives 模块的归档流 key（新方案），替代 sandboxDataArchive */
   archiveKey?: string;
+  sandboxOperation?: ProjectSandboxOperation;
+  /** Uncommitted replacement containers and retired containers awaiting cleanup. */
+  pendingSandboxCleanup?: SandboxState[];
   archivedAt?: string | null;
   lifecycleHistory?: ProjectLifecycleRecord[];
   createdAt: string;
@@ -151,6 +161,7 @@ export interface ProjectLifecycleRecord {
   sandboxId?: string;
 }
 export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null;
+  latestBackup?: { createdAt: string; sizeBytes: number; sha256: string };
   /** 归档版本列表（新归档模块），按版本倒序 */
   archiveVersions?: Array<{ id: string; version: number; sizeBytes: number; createdAt: string; sha256: string }>;
 }
@@ -160,6 +171,8 @@ export interface Session {
   threadId: string | null;
   /** Verified relative location of the Codex rollout, refreshed when it moves. */
   nativeHistoryPath?: string;
+  /** Transient history refresh failure; the saved transcript remains available. */
+  historyError?: string;
   title: string;
   settings: Settings;
   status: SessionStatus;

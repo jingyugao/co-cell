@@ -1,6 +1,9 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
+import { chown, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import type { DockerExecHandle, DockerExecOptions, DockerExecResult, DockerImageIdentity, DockerSandboxRecord, DockerSandboxStatus } from './types.js';
@@ -106,8 +109,38 @@ export class DockerSandboxClient {
     } catch { return 'unavailable'; }
   }
   async pause(id: string) { await this.call(['pause', id]); }
+  async stop(id: string) { await this.call(['stop', id], 30_000); }
   async resume(id: string) { await this.call(['unpause', id]); }
   async remove(id: string) { await this.call(['rm', '--force', id]); }
+  async restoreArchive(id: string, archivePath: string): Promise<void> {
+    const directory = await mkdtemp(join(tmpdir(), 'swarm-hive-restore-'));
+    try {
+      await execFileAsync('tar', ['--exclude=home/user/.codex/AGENTS.md', '--exclude=home/user/.codex/AGENTS.md/*',
+        '-xzf', archivePath, '-C', directory], { timeout: 120_000 });
+      const codex = join(directory, 'home/user/.codex');
+      const workspace = join(directory, 'home/user/workspace');
+      if (!(await stat(codex)).isDirectory() || !(await stat(workspace)).isDirectory()) throw new Error('归档缺少工作区或 Codex 数据');
+      // A fresh App Server already created SQLite sidecars. docker cp merges
+      // directories, so replace absent backup sidecars with empty files rather
+      // than replaying the new server's WAL over the restored database.
+      for (const name of await readdir(codex)) {
+        if (!name.endsWith('.sqlite')) continue;
+        const owner = await stat(join(codex, name));
+        for (const suffix of ['-wal', '-shm']) {
+          const path = join(codex, name + suffix);
+          try { await writeFile(path, '', { flag: 'wx', mode: 0o600 }); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue; throw error; }
+          await chown(path, owner.uid, owner.gid);
+        }
+      }
+      // Never overwrite SQLite while App Server has it open. Keep the new
+      // container stopped on copy failure so a retry can restore the same backup.
+      await this.call(['stop', id], 30_000);
+      await this.call(['cp', '-a', `${workspace}/.`, `${id}:/home/user/workspace`], 120_000);
+      await this.call(['cp', '-a', `${codex}/.`, `${id}:/home/user/.codex`], 120_000);
+      await this.call(['start', id], 30_000);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  }
   async archive(id: string, destination: string): Promise<{ sizeBytes: number; sha256: string }> {
     // Checkpoint all SQLite WAL files so the tar captures consistent database state.
     // Without this, the restored thread_history may be discarded by the App Server.

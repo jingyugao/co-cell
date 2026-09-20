@@ -172,18 +172,37 @@ test('multiple usages share renewal while inspect and idle scans never renew', a
   await manager.close();
 });
 
-test('management 404 marks an ordinary record unavailable without creating a replacement', async () => {
+for (const detail of ['404 sandbox not found', 'error: no such object: sandbox-1']) {
+test(`missing sandbox marks an ordinary record unavailable without creating a replacement: ${detail}`, async () => {
   const fake = fixture('paused');
-  fake.provider.getInfo = async () => { throw new Error('404 sandbox not found'); };
+  fake.provider.getInfo = async () => { throw new Error(detail); };
   const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
   manager.track('resource', record(), async () => {});
-  await assert.rejects(manager.inspect('resource'), /404 sandbox not found/);
+  await assert.rejects(manager.inspect('resource'), { code: 'not_accessible' });
   assert.equal(manager.peek('resource')?.status, 'unavailable');
   await assert.rejects(manager.acquire('resource', {
     usageId: 'turn-1', create: { template: 'replacement-must-not-be-created' },
-  }), /404 sandbox not found/);
+  }), { code: 'not_accessible' });
   assert.equal(fake.counts.create, 0);
   await manager.close();
+});
+}
+
+test('a stopped provider instance is unavailable on inspection and can become ready again', async () => {
+  const fake = fixture('running');
+  const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), async () => {});
+  const getInfo = fake.provider.getInfo;
+  try {
+    fake.provider.getInfo = async id => ({ ...await getInfo(id), state: 'unknown' });
+    await manager.inspect('resource');
+    assert.equal(manager.peek('resource')?.status, 'unavailable');
+    assert.equal(fake.counts.connect, 0);
+    assert.equal(fake.counts.create, 0);
+    fake.provider.getInfo = getInfo;
+    await manager.inspect('resource');
+    assert.equal(manager.peek('resource')?.status, 'ready');
+  } finally { await manager.close(); }
 });
 
 test('repeated pause preserves the original pausedAt', async () => {

@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import type { ProjectStatus, ProjectSummary, ProjectType } from '../../../protocol/types';
+import type { ProjectSandboxOperation, ProjectStatus, ProjectSummary, ProjectType } from '../../../protocol/types';
 import { api } from '../../lib/api';
 
 export type ProjectValues = { name: string; requirementUrl: string | null; type: ProjectType };
@@ -23,13 +23,24 @@ export function useProjects() {
   const updateProject = useCallback(async (id: string, values: ProjectUpdate) => storeProject(
     await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(values) }),
   ), [storeProject]);
-  const rebuildSandbox = useCallback(async (id: string) => storeProject(
-    await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST' }),
-  ), [storeProject]);
-  const recoverSandbox = useCallback(async (id: string) => {
-    await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, { method: 'POST' });
-    return storeProject(await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST' }));
-  }, [storeProject]);
+  const runSandboxOperation = useCallback(async (id: string, kind: ProjectSandboxOperation['kind'], request: () => Promise<ProjectSummary>) => {
+    const operation: ProjectSandboxOperation = { kind, phase: '提交请求', status: 'running', updatedAt: new Date().toISOString() };
+    setProjects(current => current.map(project => project.id === id ? { ...project, sandboxOperation: operation } : project));
+    try { return storeProject(await request()); }
+    finally { await refreshProjects().catch(() => undefined); }
+  }, [refreshProjects, storeProject]);
+  const rebuildSandbox = useCallback((id: string) => runSandboxOperation(id, 'restore', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST' }),
+  ), [runSandboxOperation]);
+  const backupProject = useCallback((id: string) => runSandboxOperation(id, 'backup', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/backup`, { method: 'POST' }),
+  ), [runSandboxOperation]);
+  const archiveProject = useCallback((id: string, useExistingBackup = false) => runSandboxOperation(id, 'archive', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, {
+      method: 'POST',
+      body: JSON.stringify({ useExistingBackup }),
+    }),
+  ), [runSandboxOperation]);
 
-  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox, recoverSandbox };
+  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox, backupProject, archiveProject };
 }

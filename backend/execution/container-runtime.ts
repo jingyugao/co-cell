@@ -34,6 +34,10 @@ export interface SandboxRuntime {
   history(session: Session, includeBlocks?: boolean): Promise<NativeHistory>;
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
+  createReplacement?(target: WorkspaceTarget, onSandbox: SaveSandbox): Promise<SandboxState>;
+  restoreReplacement?(sandbox: SandboxState, archivePath: string): Promise<void>;
+  verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
+  fenceSandbox?(sandbox: SandboxState): Promise<void>;
   restoreArchive?(target: WorkspaceTarget, archivePath: string): Promise<void>;
   createArchive?(target: WorkspaceTarget, archivePath: string): Promise<{ sizeBytes: number; sha256: string }>;
   detachSandbox?(target: WorkspaceTarget): Promise<void>;
@@ -922,7 +926,77 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     await lease.release();
   }
 
+  /** A candidate is never tracked under the project's live binding. */
+  async createReplacement(target: WorkspaceTarget, onSandbox: SaveSandbox): Promise<SandboxState> {
+    const template = this.sandboxes.templateReference;
+    const handle = await this.options.provider.create(template, {
+      timeoutMs: COMMAND_TIMEOUT_MS, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { app: 'codex-web', projectId: target.projectId ?? target.id, workingDirectory: target.settings.workingDirectory },
+    });
+    const sandbox: SandboxState = { id: handle.sandboxId, template, status: 'starting', workingDirectory: target.settings.workingDirectory };
+    try { await onSandbox(sandbox); }
+    catch (error) { await this.options.provider.kill(sandbox.id).catch(() => {}); throw error; }
+    return sandbox;
+  }
+
+  async restoreReplacement(sandbox: SandboxState, archivePath: string) {
+    const provider = this.options.provider as SandboxProvider & { restoreArchive?: (id: string, path: string) => Promise<void> };
+    if (!provider.restoreArchive) throw new HttpError(503, '当前 Sandbox provider 不支持离线备份恢复');
+    await provider.restoreArchive(sandbox.id, archivePath);
+  }
+
+  async verifySandbox(sandbox: SandboxState, timeoutMs?: number) {
+    if (timeoutMs !== undefined) return this.verifySandboxOnce(sandbox, timeoutMs);
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      try { return await this.verifySandboxOnce(sandbox, 5_000); }
+      catch (error) {
+        if (Date.now() >= deadline) throw this.safeError(error);
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+      }
+    }
+  }
+
+  private async verifySandboxOnce(sandbox: SandboxState, timeoutMs: number) {
+    const info = await this.options.provider.getInfo(sandbox.id);
+    if (info.state !== 'running') throw new HttpError(502, 'Sandbox 尚未就绪');
+    const handle = await this.options.provider.connect(sandbox.id, { timeoutMs });
+    await handle.commands.run(`test -d ${quote(sandbox.workingDirectory)} && test -d /home/user/.codex`, { timeoutMs });
+    if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
+    const endpoint = await this.options.appServer(sandbox.id);
+    const client = new CodexAppServerClient({ url: endpoint.url, headers: { Authorization: `Bearer ${endpoint.token}` }, requestTimeoutMs: timeoutMs });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        (async () => { await client.connect(); await client.request('thread/list', { limit: 1 }); })(),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new HttpError(502, 'Sandbox 服务验证超时')), timeoutMs); }),
+      ]);
+    } finally { if (timer) clearTimeout(timer); await client.close(); }
+    sandbox.status = 'ready';
+    sandbox.image = info.templateIdentity;
+  }
+
+  async fenceSandbox(sandbox: SandboxState) {
+    const provider = this.options.provider as SandboxProvider & { stop?: (id: string) => Promise<void> };
+    try {
+      if (provider.stop) await provider.stop(sandbox.id);
+      else {
+        const info = await provider.getInfo(sandbox.id);
+        if (info.state !== 'paused') await provider.pause(sandbox.id);
+      }
+    } catch (error) {
+      // A missing container is already fenced. Transport errors are not proof.
+      if (!/no such (?:container|object)|not found|404/i.test(String(error))) throw this.safeError(error);
+    }
+  }
+
   async restoreArchive(target: WorkspaceTarget, archivePath: string) {
+    const provider = this.options.provider as SandboxProvider & { restoreArchive?: (id: string, path: string) => Promise<void> };
+    if (target.sandbox && provider.restoreArchive) {
+      await provider.restoreArchive(target.sandbox.id, archivePath);
+      await this.sandboxes.inspect(target);
+      return;
+    }
     const entry = await this.acquire(target, false);
     try {
       const content = await readFile(archivePath);

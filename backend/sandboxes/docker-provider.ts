@@ -2,7 +2,11 @@ import type { SandboxCommandHandle, SandboxCommandResult, SandboxHandle, Sandbox
 import { DockerSandboxClient } from '../../packages/docker-sandbox/src/index.js';
 
 /** Adapts trusted local Docker containers to the provider-neutral coordinator. */
-export function dockerSandboxProvider(client: DockerSandboxClient): SandboxProvider & { archive(id: string, destination: string): Promise<{ sizeBytes: number; sha256: string }> } {
+export function dockerSandboxProvider(client: DockerSandboxClient): SandboxProvider & {
+  archive(id: string, destination: string): Promise<{ sizeBytes: number; sha256: string }>;
+  restoreArchive(id: string, archivePath: string): Promise<void>;
+  stop(id: string): Promise<void>;
+} {
   const sandbox = (id: string): SandboxHandle => ({
     sandboxId: id,
     setTimeout: async (_timeoutMs: number) => {},
@@ -57,5 +61,7 @@ export function dockerSandboxProvider(client: DockerSandboxClient): SandboxProvi
     pause: async id => { await client.pause(id); return true; },
     kill: async id => { await client.remove(id); return true; },
     archive: (id, destination) => client.archive(id, destination),
+    restoreArchive: (id, archivePath) => client.restoreArchive(id, archivePath),
+    stop: id => client.stop(id),
   };
 }

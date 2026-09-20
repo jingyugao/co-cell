@@ -3,11 +3,8 @@ import type { AppConfig, ProjectSummary, ProjectType } from '../../../protocol/t
 import { SandboxVersion } from '../../components/SandboxVersion';
 import { projectDisplayName, projectTypeLabel } from '../../../util/project-types';
 import type { ProjectValues, ProjectUpdate } from './useProjects';
-import ArchiveVersionBadge from './ArchiveVersionBadge';
 import { groupArchivedProjectsByWeek } from './project-groups';
 import './ProjectsPage.css';
-
-type ArchiveMeta = { sizeBytes: number; createdAt: string; sha256: string };
 
 type Props = {
   projects: ProjectSummary[];
@@ -17,30 +14,22 @@ type Props = {
   onCreate: (values: ProjectValues) => Promise<ProjectSummary>;
   onUpdate: (id: string, values: ProjectUpdate) => Promise<ProjectSummary>;
   onRebuildSandbox: (id: string) => Promise<ProjectSummary>;
-  onRecoverSandbox: (id: string) => Promise<ProjectSummary>;
+  onBackup: (id: string) => Promise<ProjectSummary>;
+  onArchive: (id: string, useExistingBackup?: boolean) => Promise<ProjectSummary>;
   onOpenProject: (id: string) => void;
-  onViewArchive: (archiveKey: string, meta: ArchiveMeta | null) => void;
   onMenu: () => void;
   onBack: () => void;
+  /** Used by the archive route and component tests; the product default is active. */
+  initialView?: 'active' | 'completed' | 'archived';
 };
 
-const states = { starting: '启动中', ready: '运行中', paused: '已暂停', unavailable: '不可用' };
+const states = { starting: '异常', ready: '正常', paused: '异常', unavailable: '异常' };
 const date = (value: string) => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) : '—';
 const DAY = 24 * 60 * 60 * 1000;
 const duration = (value: number | undefined, fallback: string) => value == null ? fallback : value % DAY === 0 ? `${value / DAY} 天` : value % (60 * 60 * 1000) === 0 ? `${value / (60 * 60 * 1000)} 小时` : fallback;
 
-function archiveMeta(project: { sandboxDataArchive?: { sizeBytes: number; createdAt: string; sha256: string } | null }): ArchiveMeta | null {
-  const a = project.sandboxDataArchive;
-  return a ? { sizeBytes: a.sizeBytes, createdAt: a.createdAt, sha256: a.sha256 } : null;
-}
-function fmtSize(bytes: number) {
-  if (bytes > 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-  if (bytes > 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  if (bytes > 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${bytes} B`;
-}
-function fmtTime(ts: string) {
-  try { return new Date(ts).toLocaleString('zh-CN'); } catch { return ts; }
+function latestBackup(project: ProjectSummary) {
+  return project.latestBackup ?? project.sandboxDataArchive ?? null;
 }
 
 function ProjectForm({ initial, busy, onSubmit, onCancel }: {
@@ -81,127 +70,96 @@ function ProjectForm({ initial, busy, onSubmit, onCancel }: {
   </form>;
 }
 
-function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onRecoverSandbox, onOpenProject, onViewArchive, onStatus }: Pick<Props, 'config' | 'onUpdate' | 'onRebuildSandbox' | 'onRecoverSandbox' | 'onOpenProject' | 'onViewArchive'> & {
+function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, onArchive, onOpenProject, onStatus }: Pick<Props, 'config' | 'onUpdate' | 'onRebuildSandbox' | 'onBackup' | 'onArchive' | 'onOpenProject'> & {
   project: ProjectSummary;
   onStatus: (name: string, status: 'active' | 'completed') => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [rebuilding, setRebuilding] = useState(false);
   const [error, setError] = useState('');
   const editButton = useRef<HTMLButtonElement>(null);
   const pending = useRef(false);
   const status = project.status ?? (project.archivedAt ? 'archived' : 'active');
   const archived = status === 'archived';
+  const completed = status === 'completed';
+  const operation = project.sandboxOperation;
+  const operating = operation?.status === 'running';
+  const hasTask = Boolean(project.activeSessionId);
+  const backup = latestBackup(project);
+  const cleanupPending = project.pendingSandboxCleanup?.some(item => item.id !== project.sandbox?.id) ?? false;
+  const sandboxNormal = project.executionMode === 'sandbox' && project.sandbox?.status === 'ready';
+  const sandboxBroken = project.executionMode === 'sandbox' && Boolean(project.sandbox) && !sandboxNormal;
+  const sandboxMissing = project.executionMode === 'sandbox' && !project.sandbox;
+  const canRestore = project.executionMode === 'sandbox' && (archived || !sandboxNormal) && Boolean(backup) && !hasTask && !operating;
   const typeLabel = projectTypeLabel(project.type, project.weekOf);
   const displayName = projectDisplayName(project);
-  const completed = status === 'completed';
-  const needsRebuild = archived && project.executionMode === 'sandbox' && !project.sandbox;
-  const canRebuild = needsRebuild && !project.sandbox && !project.activeSessionId;
   const stopEditing = () => { setEditing(false); setTimeout(() => editButton.current?.focus(), 0); };
 
+  async function run(label: string, action: () => Promise<ProjectSummary>) {
+    if (busy || operating) return;
+    setBusy(true); setError('');
+    try { await action(); }
+    catch (err) { setError(`${label}失败：${err instanceof Error ? err.message : '请重试。'}`); }
+    finally { setBusy(false); }
+  }
   async function changeStatus() {
-    if (pending.current || busy || rebuilding || (archived && needsRebuild)) return;
+    if (pending.current || busy || operating) return;
     pending.current = true; setBusy(true); setError('');
-    try {
-      const next = completed ? 'active' : 'completed';
-      await onUpdate(project.id, { status: next });
-      onStatus(project.name, next);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : '请重试。';
-      setError(`${completed ? '恢复项目' : '完成项目'}失败：${detail}`);
-    } finally { pending.current = false; setBusy(false); }
+    try { const next = completed ? 'active' : 'completed'; await onUpdate(project.id, { status: next }); onStatus(project.name, next); }
+    catch (err) { setError(`${completed ? '恢复使用中' : '标记完成'}失败：${err instanceof Error ? err.message : '请重试。'}`); }
+    finally { pending.current = false; setBusy(false); }
+  }
+  function restore() {
+    if (!backup || !canRestore) return;
+    const action = archived ? '恢复项目' : '恢复环境';
+    if (!window.confirm(`将使用 ${date(backup.createdAt)} 的最新备份${action}。该时间之后未备份的文件和对话上下文可能无法恢复。`)) return;
+    void run(action, () => onRebuildSandbox(project.id));
+  }
+  function archive() {
+    if (hasTask || busy || operating) return;
+    const useExistingBackup = !sandboxNormal;
+    if (useExistingBackup) {
+      if (!backup) return;
+      if (!window.confirm(`当前环境无法生成新备份，将使用 ${date(backup.createdAt)} 的已有备份归档。故障环境中的最新数据不会被保存。`)) return;
+    } else if (!window.confirm('归档前将创建最新备份；备份成功后会释放当前 Sandbox。')) return;
+    void run('归档项目', () => onArchive(project.id, useExistingBackup));
   }
 
-  async function rebuildSandbox() {
-    if (!canRebuild || rebuilding) return;
-    setRebuilding(true); setError('');
-    try { await onRebuildSandbox(project.id); }
-    catch (err) { setError(`重建 Sandbox 失败：${err instanceof Error ? err.message : '请重试。'}`); }
-    finally { setRebuilding(false); }
-  }
-  async function recoverSandbox() {
-    if (project.executionMode !== 'sandbox' || project.activeSessionId || rebuilding) return;
-    setRebuilding(true); setError('');
-    try { await onRecoverSandbox(project.id); }
-    catch (err) { setError(`恢复 Sandbox 失败：${err instanceof Error ? err.message : '请重试。'}`); }
-    finally { setRebuilding(false); }
-  }
-
-  const openDisabled = needsRebuild || completed;
-  const sandboxDescription = project.sandbox ? <span className="project-sandbox-detail"><code title={project.sandbox.id} aria-label={`Sandbox ID ${project.sandbox.id}`}>{project.sandbox.id.slice(0, 6)}</code><SandboxVersion image={project.sandbox.image} latestImage={config?.sandbox?.imageIdentity} /></span>
-    : archived ? '已归档，需先重建'
-    : project.executionMode === 'local' ? '本地运行' : '首次执行任务时创建';
+  const openDisabled = archived || completed || sandboxBroken || (sandboxMissing && Boolean(backup));
+  const sandboxDescription = project.executionMode === 'local' ? '本地运行'
+    : sandboxNormal ? <span className="project-sandbox-detail"><span>正常</span><code title={project.sandbox!.id} aria-label={`Sandbox ID ${project.sandbox!.id}`}>{project.sandbox!.id.slice(0, 6)}</code><SandboxVersion image={project.sandbox!.image} latestImage={config?.sandbox?.imageIdentity} /></span>
+    : sandboxBroken ? '异常'
+    : '无 Sandbox';
 
   return <article className={`project-card ${archived ? 'archived' : ''}`} aria-label={displayName}>
-    <div className="project-card-heading"><span className="project-folder" aria-hidden="true">▱</span><div className="project-card-statuses"><span className="project-type-badge">{typeLabel}</span>{archived && <span className="project-archived-badge">已归档</span>}<span className={`project-status ${project.activeSessionId ? 'active' : ''}`}>{project.activeSessionId ? '任务执行中' : project.sandbox ? states[project.sandbox.status] : archived ? '无 Sandbox' : project.executionMode === 'local' ? '本地项目' : '等待首次执行'}</span></div></div>
+    <div className="project-card-heading"><span className="project-folder" aria-hidden="true">▱</span><div className="project-card-statuses"><span className="project-type-badge">{typeLabel}</span>{archived && <span className="project-archived-badge">已归档</span>}<span className={`project-status ${project.activeSessionId ? 'active' : ''}`}>{project.activeSessionId ? '任务执行中' : project.executionMode === 'local' ? '本地项目' : project.sandbox ? states[project.sandbox.status] : '无 Sandbox'}</span></div></div>
     <h2>{openDisabled ? <span className="project-title-disabled">{displayName}</span> : <button className="project-title-button" onClick={() => onOpenProject(project.id)}>{displayName}</button>}</h2>
     {project.requirementUrl && /^https?:\/\//i.test(project.requirementUrl) ? <div className="project-requirement-wrap"><a className="project-requirement" href={project.requirementUrl} target="_blank" rel="noopener noreferrer" title={project.requirementUrl}>飞书需求 ↗<span>{project.requirementUrl}</span></a>{project.requirementStatus && <p className="project-requirement-status"><span>飞书项目状态</span><strong>{project.requirementStatus}</strong></p>}</div> : project.type === 2 ? <p className="project-unlinked">飞书需求待绑定</p> : <p className="project-unlinked">{typeLabel}</p>}
-      <dl className="project-details"><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div>{project.sandboxDataArchive && <div><dt>归档</dt><dd><ArchiveVersionBadge project={project} onView={onViewArchive} /></dd></div>}<div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div><div><dt>归档时间</dt><dd>{project.archivedAt ? <time dateTime={project.archivedAt}>{date(project.archivedAt)}</time> : '尚未归档'}</dd></div></dl>
+      <dl className="project-details"><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>最新备份</dt><dd>{backup ? <time dateTime={backup.createdAt}>{date(backup.createdAt)}</time> : '暂无备份'}</dd></div><div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div><div><dt>归档时间</dt><dd>{project.archivedAt ? <time dateTime={project.archivedAt}>{date(project.archivedAt)}</time> : '尚未归档'}</dd></div></dl>
     {editing ? <ProjectForm initial={project} busy={busy} onCancel={stopEditing} onSubmit={async values => {
       setBusy(true);
       try { await onUpdate(project.id, values); stopEditing(); }
       finally { setBusy(false); }
     }} /> : <div className="project-card-actions">
-      {project.executionMode === 'sandbox'
-        ? <button className="primary-button" disabled={Boolean(project.activeSessionId) || rebuilding} onClick={() => void recoverSandbox()}>{rebuilding ? '正在重建…' : '重建 Sandbox'}</button>
-        : needsRebuild
-        ? <button className="primary-button" disabled={!canRebuild || rebuilding} onClick={() => void rebuildSandbox()}>{rebuilding ? '正在重建…' : '重建 Sandbox'}</button>
-        : <button className="primary-button" disabled={openDisabled} onClick={() => onOpenProject(project.id)}>进入项目 <span aria-hidden="true">→</span></button>}
-      <button ref={editButton} className="secondary-button" onClick={() => { setEditing(true); setError(''); }} disabled={busy || rebuilding}>编辑</button>
-      {!archived && <button className="project-archive-button" disabled={busy || rebuilding} title={completed ? '恢复为使用中，才能继续对话' : '完成满 1 天后自动归档并删除 Sandbox'} onClick={() => void changeStatus()}>{busy ? '处理中…' : completed ? '恢复使用中' : '标记已完成'}</button>}
+      {canRestore ? <button className="primary-button" onClick={restore}>{archived ? '恢复项目' : '恢复环境'}</button>
+        : <button className="primary-button" disabled={openDisabled || operating} onClick={() => onOpenProject(project.id)}>进入项目 <span aria-hidden="true">→</span></button>}
+      {!archived && sandboxNormal && <button className="secondary-button" disabled={busy || operating || hasTask} onClick={() => void run('立即备份', () => onBackup(project.id))}>立即备份</button>}
+      {!archived && <button className="secondary-button" disabled={busy || operating || hasTask || (!sandboxNormal && !backup)} onClick={archive}>归档项目</button>}
+      {!archived && <button ref={editButton} className="secondary-button" onClick={() => { setEditing(true); setError(''); }} disabled={busy || operating}>编辑</button>}
+      {!archived && <button className="project-archive-button" disabled={busy || operating} title={completed ? '恢复为使用中，才能继续对话' : '完成满 1 天后自动归档'} onClick={() => void changeStatus()}>{busy ? '处理中…' : completed ? '恢复使用中' : '标记已完成'}</button>}
     </div>}
-    {needsRebuild && <p className="project-rebuild-hint">旧 Sandbox 已回收。重建成功后，项目会恢复到进行中列表。</p>}
+    {operation && <p className={`project-operation ${operation.status === 'failed' ? 'failed' : ''}`} role={operation.status === 'failed' ? 'alert' : 'status'}><strong>{operation.kind === 'backup' ? '备份' : operation.kind === 'restore' ? '恢复环境' : '归档'}：{operation.status === 'running' ? operation.phase : operation.status === 'succeeded' ? '已完成' : '失败'}</strong>{operation.error && <span>{operation.error}</span>}</p>}
+    {cleanupPending && !operating && <p className="project-rebuild-hint" role="status">旧环境待清理，系统将自动重试。</p>}
+    {!operation && sandboxMissing && backup && <p className="project-rebuild-hint">当前没有 Sandbox，可使用最新备份恢复环境。</p>}
     {error && <p className="project-error" role="alert">{error}</p>}
   </article>;
 }
 
-function ArchivedProjectRow({ project, onUpdate, onRebuildSandbox, onOpenProject, onViewArchive }: Pick<Props, 'onUpdate' | 'onRebuildSandbox' | 'onOpenProject' | 'onViewArchive'> & {
-  project: ProjectSummary;
-}) {
-  const [request, setRequest] = useState<'rebuild' | null>(null);
-  const [error, setError] = useState('');
-  // Archived projects are never entered directly. They must go through the
-  // explicit sandbox rebuild flow so the user controls when a new container is
-  // created, even if a stale persisted sandbox reference still exists.
-  const needsRebuild = project.executionMode === 'sandbox';
-  const canRebuild = needsRebuild && !project.sandbox && !project.activeSessionId;
-  const status = project.activeSessionId ? '任务执行中' : project.sandbox ? '数据异常：仍有关联 Sandbox'
-    : project.executionMode === 'local' ? '本地项目' : '等待首次执行';
-
-  async function rebuild() {
-    if (!canRebuild || request) return;
-    setRequest('rebuild'); setError('');
-    try { await onRebuildSandbox(project.id); }
-    catch (err) { setError(`重建 Sandbox 失败：${err instanceof Error ? err.message : '请重试。'}`); }
-    finally { setRequest(null); }
-  }
-
-  
-  return <article className="archived-project-row" role="listitem" aria-label={project.name}>
-    <div className="archived-project-main">
-      <div className="archived-project-name">
-        {needsRebuild ? <strong>{project.name}</strong> : <button onClick={() => onOpenProject(project.id)}>{project.name}</button>}
-        <span>{project.requirementStatus || project.requirementUrl || '未关联需求'}</span>
-      </div>
-      <div className="archived-project-meta"><span>{project.sessionCount} 个会话</span><time dateTime={project.archivedAt ?? undefined}>{project.archivedAt ? date(project.archivedAt) : '时间未知'}</time></div>
-      <span className="project-status">{status}</span>
-      <div className="archived-project-actions">
-        {needsRebuild
-          ? <button className="primary-button" disabled={!canRebuild || Boolean(request)} onClick={() => void rebuild()}>{request === 'rebuild' ? '正在重建…' : '重建 Sandbox'}</button>
-          : <button className="secondary-button" disabled={Boolean(request)} onClick={() => onOpenProject(project.id)}>进入</button>}
-        {project.sandboxDataArchive?.key && <button className="secondary-button" onClick={() => onViewArchive(project.sandboxDataArchive!.key, { sizeBytes: project.sandboxDataArchive!.sizeBytes, createdAt: project.sandboxDataArchive!.createdAt, sha256: project.sandboxDataArchive!.sha256 })}>查看归档</button>}
-      </div>
-    </div>
-    {error && <p className="project-error" role="alert">{error}</p>}
-  </article>;
-}
-
-export default function ProjectsPage({ projects, config, loading, onRefresh, onCreate, onUpdate, onRebuildSandbox, onRecoverSandbox, onOpenProject, onViewArchive, onMenu, onBack }: Props) {
+export default function ProjectsPage({ projects, config, loading, onRefresh, onCreate, onUpdate, onRebuildSandbox, onBackup, onArchive, onOpenProject, onMenu, onBack, initialView = 'active' }: Props) {
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState('');
-  const [view, setView] = useState<'active' | 'completed' | 'archived'>('active');
+  const [view, setView] = useState<'active' | 'completed' | 'archived'>(initialView);
   const currentView = useRef(view); currentView.current = view;
   const [message, setMessage] = useState('');
   const activeTab = useRef<HTMLButtonElement>(null);
@@ -217,17 +175,21 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
   const archivedGroups = view === 'archived' ? groupArchivedProjectsByWeek(visible) : [];
   const canCreate = config?.sandbox?.enabled === true;
   const stopCreating = () => { setCreating(false); setTimeout(() => createButton.current?.focus(), 0); };
-  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} config={config} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onRecoverSandbox={onRecoverSandbox} onOpenProject={onOpenProject} onViewArchive={onViewArchive} onStatus={(name, status) => {
+  useEffect(() => {
+    if (!projects.some(project => project.sandboxOperation?.status === 'running')) return;
+    const timer = window.setInterval(() => { void onRefresh().catch(() => undefined); }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [projects, onRefresh]);
+  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} config={config} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onBackup={onBackup} onArchive={onArchive} onOpenProject={onOpenProject} onStatus={(name, status) => {
     setMessage(status === 'completed' ? `「${name}」已标记完成；满 1 天后会自动归档并删除 Sandbox。` : `「${name}」已恢复为使用中。`);
     activeTab.current?.focus();
   }} />;
-  const archivedRow = (project: ProjectSummary) => <ArchivedProjectRow key={project.id} project={project} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onOpenProject={onOpenProject} onViewArchive={onViewArchive} />;
 
-  const empty = <div className="projects-empty"><span aria-hidden="true">▱</span><h2>{query.trim() && inView.length ? '没有匹配的项目' : view === 'archived' ? '还没有归档项目' : view === 'completed' ? '还没有已完成项目' : projects.length ? '暂无使用中的项目' : '从一个项目开始'}</h2><p>{query.trim() && inView.length ? '试试其他项目名称、需求链接或 Sandbox ID。' : view === 'archived' ? '归档项目会按周显示；重建时创建全新的空 Docker Sandbox。' : view === 'completed' ? '已完成项目不能继续对话；恢复为使用中后才可继续。' : '先创建项目，再开启会话。飞书需求可以稍后关联。'}</p>{view === 'active' && !inView.length && canCreate && !creating && <button className="primary-button" onClick={() => setCreating(true)}>{projects.length ? '创建项目' : '创建第一个项目'}</button>}</div>;
+  const empty = <div className="projects-empty"><span aria-hidden="true">▱</span><h2>{query.trim() && inView.length ? '没有匹配的项目' : view === 'archived' ? '还没有归档项目' : view === 'completed' ? '还没有已完成项目' : projects.length ? '暂无使用中的项目' : '从一个项目开始'}</h2><p>{query.trim() && inView.length ? '试试其他项目名称、需求链接或 Sandbox ID。' : view === 'archived' ? '归档项目会按周显示；恢复时使用最新成功备份创建环境。' : view === 'completed' ? '已完成项目不能继续对话；恢复为使用中后才可继续。' : '先创建项目，再开启会话。飞书需求可以稍后关联。'}</p>{view === 'active' && !inView.length && canCreate && !creating && <button className="primary-button" onClick={() => setCreating(true)}>{projects.length ? '创建项目' : '创建第一个项目'}</button>}</div>;
 
   return <main className="main-pane projects-page">
     <header className="topbar"><button className="icon-button mobile-only" aria-label="打开导航" onClick={onMenu}>☰</button><div className="breadcrumbs"><span>工作空间</span><span className="slash">/</span><strong>项目</strong></div><button className="secondary-button" onClick={onBack}>返回对话</button></header>
-    <div className="projects-scroll"><div className="projects-heading"><div><span className="projects-eyebrow">PROJECT WORKSPACE</span><h1>项目</h1><p>项目标记为已完成满 {duration(config?.sandbox?.archivedReclaimAfterMs, '1 天')} 后自动归档并删除 Sandbox；重建会创建全新的空 Docker 环境。</p></div><button ref={createButton} className="primary-button" disabled={!canCreate || creating} onClick={() => setCreating(true)}>＋ 创建项目</button></div>
+    <div className="projects-scroll"><div className="projects-heading"><div><span className="projects-eyebrow">PROJECT WORKSPACE</span><h1>项目</h1><p>项目标记为已完成满 {duration(config?.sandbox?.archivedReclaimAfterMs, '1 天')} 后自动归档并释放 Sandbox；恢复时使用最新成功备份创建环境。</p></div><button ref={createButton} className="primary-button" disabled={!canCreate || creating} onClick={() => setCreating(true)}>＋ 创建项目</button></div>
       {!config ? <p className="project-notice" role="status">正在读取项目配置…</p> : !canCreate && <p className="project-notice">创建项目需要先在服务端配置 Docker sandbox。已有项目仍可查看。</p>}
       {error && <p className="project-error project-page-error" role="alert">{error}</p>}
       {message && <p className="project-message" role="status">{message}</p>}
@@ -240,7 +202,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
       <p className="projects-archive-hint">{view === 'archived' ? '按归档日期每周一组。恢复会创建新的 Sandbox。' : view === 'completed' ? '已完成项目必须恢复为使用中，才能继续对话。' : '可将项目标记为已完成；满 1 天后系统会归档并删除其 Sandbox。'}</p>
       {!projects.length && loading ? <section className="project-grid" aria-busy="true"><div className="projects-empty" role="status"><span className="spinner" /> 正在读取项目…</div></section>
         : !visible.length ? <section className="project-grid">{empty}</section>
-        : view === 'archived' ? <div className="project-week-groups" aria-label="已归档项目列表">{archivedGroups.map(group => <section className="project-week-group" key={group.key}><h2>{group.label}<span>{group.projects.length}</span></h2><div className="archived-project-list" role="list">{group.projects.map(archivedRow)}</div></section>)}</div>
+        : view === 'archived' ? <div className="project-week-groups" aria-label="已归档项目列表">{archivedGroups.map(group => <section className="project-week-group" key={group.key}><h2>{group.label}<span>{group.projects.length}</span></h2><div className="project-grid">{group.projects.map(card)}</div></section>)}</div>
         : <section className="project-grid" aria-label={`${view === 'completed' ? '已完成' : '使用中'}项目列表`}>{visible.map(card)}</section>}
     </div>
   </main>;

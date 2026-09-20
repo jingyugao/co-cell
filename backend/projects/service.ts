@@ -31,6 +31,10 @@ export class ProjectService {
       if (project.status === 'completed' && !project.completedAt) { project.completedAt = project.updatedAt; migratedStatus = true; }
       if (project.status === 'archived' && !project.archivedAt) { project.archivedAt = project.updatedAt; migratedStatus = true; }
       if (!project.type) { project.type = project.requirementUrl ? 2 : 1; migratedStatus = true; }
+      if (project.sandboxOperation?.status === 'running') {
+        project.sandboxOperation = { ...project.sandboxOperation, status: 'failed', error: '服务重启，操作未确认完成，请重试。', updatedAt: new Date().toISOString() };
+        migratedStatus = true;
+      }
       this.records.set(project.id, project);
       if (migratedStatus) await this.save(project);
     }
@@ -129,6 +133,14 @@ export class ProjectService {
     return this.records.get(id)?.archiveKey;
   }
 
+  async updateSandboxOperation(id: string, operation: Project['sandboxOperation']) {
+    await this.mutateSandboxMetadata(id, project => { project.sandboxOperation = operation; });
+  }
+
+  async setPendingSandboxCleanup(id: string, sandboxes: NonNullable<Project['pendingSandboxCleanup']>) {
+    await this.mutateSandboxMetadata(id, project => { project.pendingSandboxCleanup = structuredClone(sandboxes); });
+  }
+
   private async mutateSandboxMetadata(id: string, mutate: (project: Project) => void, commitLifecycle = false) {
     await this.writer.run(id, async () => {
       const current = this.records.get(id);
@@ -146,6 +158,8 @@ export class ProjectService {
       current.sandboxDataArchive = next.sandboxDataArchive;
       current.archiveKey = next.archiveKey;
       current.sandboxReclaimedAt = next.sandboxReclaimedAt;
+      current.sandboxOperation = next.sandboxOperation;
+      current.pendingSandboxCleanup = next.pendingSandboxCleanup;
       if (commitLifecycle) {
         current.status = next.status;
         current.completedAt = next.completedAt;

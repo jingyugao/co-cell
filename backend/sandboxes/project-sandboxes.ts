@@ -18,6 +18,8 @@ export class ProjectSandboxes {
 
   constructor(readonly manager: SandboxManager, private template: string) {}
 
+  get templateReference() { return this.template; }
+
   async replace(target: WorkspaceTarget, replacement: SandboxState) {
     const binding = this.track(target);
     const { workingDirectory: _directory, image, ...record } = replacement;

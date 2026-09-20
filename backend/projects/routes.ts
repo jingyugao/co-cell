@@ -4,8 +4,16 @@ import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { workspaceDownload } from '../workspaces/download.js';
 
-export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile' | 'rebuildProjectSandbox' | 'archiveProjectNow'>) {
-  app.post('/api/projects/:id/archive', async c => c.json(await manager.archiveProjectNow(c.req.param('id')), 202));
+export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile' | 'rebuildProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow'>) {
+  app.post('/api/projects/:id/archive', async c => {
+    const body = await c.req.text();
+    let parsed: unknown;
+    try { parsed = body ? JSON.parse(body) : {}; }
+    catch { throw new HttpError(400, '请求 JSON 无效'); }
+    const input = z.object({ useExistingBackup: z.boolean().optional() }).strict().parse(parsed);
+    return c.json(await manager.archiveProjectNow(c.req.param('id'), input), 202);
+  });
+  app.post('/api/projects/:id/backup', async c => c.json(await manager.backupProjectNow(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/rebuild', async c => c.json(await manager.rebuildProjectSandbox(c.req.param('id')), 202));
   app.get('/api/projects/:id/files', async c => {
     const path = c.req.query('path');

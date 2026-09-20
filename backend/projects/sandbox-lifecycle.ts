@@ -51,6 +51,9 @@ export class SandboxLifecycleService {
     const eligible = this.options.listProjects().filter(project => {
       if (project.executionMode !== 'sandbox') return false;
       if (project.status !== 'completed') return false;
+      // An unhealthy/missing environment needs explicit confirmation to archive
+      // using an older backup; automatic reclamation must never make that choice.
+      if (project.sandbox?.status !== 'ready') return false;
       const timestamp = Date.parse(project.completedAt ?? '');
       return Number.isFinite(timestamp) && timestamp <= cutoff;
     });

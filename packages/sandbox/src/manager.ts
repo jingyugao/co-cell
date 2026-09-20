@@ -603,12 +603,12 @@ export class SandboxManager {
   }
 
   private async applyObservation(resourceKey: string, entry: Entry, info: SandboxInfo): Promise<void> {
-    const status: SandboxStatus = info.state === 'paused' ? 'paused' : 'ready';
+    const status: SandboxStatus = info.state === 'paused' ? 'paused' : info.state === 'running' ? 'ready' : 'unavailable';
     const pausedAt = status === 'paused' ? entry.record.pausedAt ?? new Date().toISOString() : undefined;
     const identityChanged = info.templateIdentity
       && JSON.stringify(entry.record.templateIdentity) !== JSON.stringify(info.templateIdentity);
     if (entry.record.status !== status || entry.record.pausedAt !== pausedAt || entry.record.operation || identityChanged) {
-      if (status === 'paused') entry.sandbox = undefined;
+      if (status !== 'ready') entry.sandbox = undefined;
       await this.change(resourceKey, entry, {
         status, pausedAt, operation: undefined, error: undefined,
         ...(info.templateIdentity ? { templateIdentity: info.templateIdentity } : {}),
@@ -711,7 +711,7 @@ export class SandboxManager {
   }
 
   private notFound(error: unknown): boolean {
-    return /not found|no such container|404/i.test(String(error));
+    return /not found|no such (?:container|object)|404/i.test(String(error));
   }
 
   private safeMessage(error: unknown): string {

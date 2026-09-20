@@ -24,6 +24,8 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      cliproxy:
+        condition: service_started
     restart: unless-stopped
     hostname: ${MEEGLE_AUTH_HOSTNAME:-swarm-hive}
     env_file:

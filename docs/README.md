@@ -25,11 +25,11 @@ CoCell 提供任务组织和执行环境；研发步骤由你和 Agent 在会话
 
 | 场景 | 处理方式 | 收益 |
 | --- | --- | --- |
-| 暂时不用，稍后继续 | 暂停 / 恢复；gVisor 支持 checkpoint 保存运行状态并停止实例 | 减少闲置运行资源占用，使用 checkpoint 时释放实例运行内存 |
+| 暂时不用，稍后继续 | 通过 gVisor checkpoint 保存运行状态并暂停，需要时恢复 | 释放闲置 Sandbox 的运行内存，恢复后接续工作 |
 | 项目告一段落 | 备份工作区与 Codex 状态后归档，释放原 Sandbox | 减少长期保留容器带来的磁盘占用 |
 | 重新开始工作，或原环境异常 | 校验最新备份，在新 Sandbox 中恢复并验证后切换 | 复用已保存的代码和会话状态，减少从头准备的工作 |
 
-**当前后端能力有区别：**默认 Docker 后端支持数据备份、归档和恢复；其暂停使用 [`docker pause`](https://docs.docker.com/reference/cli/docker/container/pause/)，冻结进程不等于释放内存。可选 gVisor 后端支持闲置 checkpoint 和按需恢复，默认闲置阈值为一小时。
+当前使用 **gVisor** 运行 Sandbox。闲置后通过 checkpoint 将运行状态保存到磁盘并停止实例，释放运行内存；再次使用时从 checkpoint 恢复，继续已有工作。默认闲置阈值为一小时，可按使用习惯调整。
 
 归档保存的是工作区与 `~/.codex`，恢复时使用新环境。镜像外临时安装的系统软件需要通过镜像或初始化流程重建。压缩备份本身仍占磁盘，实际节省量取决于项目内容和保留版本数。
 
@@ -75,11 +75,11 @@ CoCell 提供任务组织和执行环境；研发步骤由你和 Agent 在会话
 2. 让 Agent 阅读需求、共享知识和现有代码，讨论技术方案。
 3. 在项目会话中推进开发与验证，查看工具记录、代码差异和运行预览。
 4. 将可复用的结论写入知识库，处理 Agent 提出的改进建议。
-5. 暂时离开时利用后端支持的暂停能力；项目完成后备份归档，需要继续时恢复。
+5. 暂时离开时暂停 Sandbox、释放内存；项目完成后备份归档、回收磁盘空间，需要继续时恢复。
 
 ## 开发与运行
 
-需要 Node.js 22.18+、pnpm 10、Docker，以及可用的模型认证和 API 入口。可选 gVisor 后端还需要宿主机的 `runsc`、CNI 和 [gVisor helper](../scripts/gvisor-helper/README.md)。
+需要 Node.js 22.18+、pnpm 10、Docker，以及可用的模型认证和 API 入口。gVisor 运行环境需要宿主机的 `runsc`、CNI 和 [gVisor helper](../scripts/gvisor-helper/README.md)。
 
 以下命令安装依赖、准备共享规则文件并启动本地 Web 开发服务，请在仓库根目录执行：
 
@@ -90,7 +90,7 @@ mkdir -p data/docs
 touch data/AGENTS.md
 ```
 
-编辑 `.env`，填写 `CODEX_API_KEY`（或 `OPENAI_API_KEY`）、模型名称和所需的 `OPENAI_BASE_URL`。在 `data/AGENTS.md` 中填写工作约定，然后启动：
+编辑 `.env`，设置 `SANDBOX_PROVIDER=gvisor`，填写 `CODEX_API_KEY`（或 `OPENAI_API_KEY`）、模型名称和所需的 `OPENAI_BASE_URL`。在 `data/AGENTS.md` 中填写工作约定，然后启动：
 
 ```sh
 PORT=3001 pnpm dev
@@ -99,7 +99,7 @@ PORT=3001 pnpm dev
 打开 <http://localhost:3001>。启动 Web 服务后，执行 Agent 任务还需要完成 Sandbox 环境配置：
 
 - 构建项目镜像：`docker build -f docker/sandbox/Dockerfile -t swarm-hive-sandbox:latest .`。
-- 配置 `DOCKER_SANDBOX_NETWORK` 对应的 Docker 网络，并确保 Sandbox 能访问模型入口和 `SANDBOX_APPROVAL_MCP_URL`。
+- 启动 gVisor helper，配置 `GVISOR_HELPER_URL` 和对应的 bundle、网络环境，确保 Sandbox 能访问模型入口和 `SANDBOX_APPROVAL_MCP_URL`。
 - 按需在连接页导入研发工具凭据；Kubernetes 通过 `COCELL_KUBECONFIG` 显式启用。
 
 仓库也提供 [Docker Compose 配置](../docker-compose.yml)。使用前需要准备其中声明的外部 MySQL volume、CLIProxyAPI 配置与认证文件，并按运行环境核对 Docker daemon 地址和挂载路径。它目前需要本机配置，尚不是开箱即用的安装向导。
@@ -115,11 +115,11 @@ PORT=3001 pnpm dev
 | `PORT` | Web 端口；程序默认 `3000`，示例使用 `3001` |
 | `CODEX_API_KEY` / `OPENAI_API_KEY` | 模型认证 |
 | `OPENAI_BASE_URL` / `CODEX_MODEL` | 模型入口与默认模型 |
-| `SANDBOX_PROVIDER` | `docker`（默认）或 `gvisor` |
+| `SANDBOX_PROVIDER` | Sandbox 后端，本说明使用 `gvisor`；也支持 `docker` |
 | `DOCKER_SANDBOX_IMAGE` | 项目 Sandbox 镜像 |
 | `DOCKER_SANDBOX_NETWORK` | Docker Sandbox 使用的网络 |
 | `SANDBOX_APPROVAL_MCP_URL` | Sandbox 可访问的人工确认工具入口 |
-| `SANDBOX_AUTO_CHECKPOINT_AFTER_MS` | 支持 checkpoint 的后端的闲置阈值，默认一小时 |
+| `SANDBOX_AUTO_CHECKPOINT_AFTER_MS` | gVisor 自动保存运行状态并暂停的闲置阈值，默认一小时 |
 | `SANDBOX_ARCHIVED_RECLAIM_AFTER_MS` | 已完成项目自动归档前的等待时间，默认一天 |
 | `SANDBOX_SCHEDULED_ARCHIVE_THRESHOLD_MS` | 周期备份阈值，默认 30 分钟 |
 | `CODEX_WEB_DATA_DIR` | JSON 元数据目录，默认 `data/web-state` |

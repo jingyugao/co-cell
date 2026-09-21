@@ -7,6 +7,20 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 import { DockerSandboxClient } from './client.js';
 
+test('CellBox proxy is copied before the managed process starts', async () => {
+  const client = new DockerSandboxClient('cellbox:latest', 'docker', 'bridge', undefined, undefined, undefined, [], {}, '/app/backend/cellbox-proxy.mjs', 'process.exit(0)');
+  const calls: string[] = [];
+  client['call'] = async args => {
+    calls.push(args[0]);
+    return { stdout: args[0] === 'create' ? 'cellbox-id\n' : '', stderr: '' } as Awaited<ReturnType<typeof client['call']>>;
+  };
+  client['containerDetails'] = async () => ({ status: 'ready', createdAt: '2026-01-01T00:00:00.000Z', imageIdentity: { reference: 'cellbox:latest', id: 'sha256:test', repoDigests: [] } });
+
+  await client.create('project-id', '/home/user/workspace');
+
+  assert.deepEqual(calls, ['create', 'cp', 'start']);
+});
+
 for (const failCopy of [false, true]) {
   test(`archive restoration copies offline and only starts after successful copies (failCopy=${failCopy})`, async () => {
     const root = await mkdtemp(join(tmpdir(), 'hive-restore-test-'));

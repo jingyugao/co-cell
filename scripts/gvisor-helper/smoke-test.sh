@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE="${SANDBOX_IMAGE:-swarm-hive-sandbox:latest}"
+IMAGE="${SANDBOX_IMAGE:-cellbox:latest}"
 ID="${GVISOR_TEST_ID:-swarm-hive-gvisor-smoke}"
 RUNSC="${GVISOR_RUNSC:-/usr/local/bin/runsc}"
 ROOT="${GVISOR_ROOT:-/var/run/runsc}"

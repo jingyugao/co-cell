@@ -79,7 +79,7 @@ CoCell 提供任务组织和执行环境；研发步骤由你和 Agent 在会话
 
 ## 开发与运行
 
-需要 Node.js 22.18+、pnpm 10、Docker，以及可用的模型认证和 API 入口。gVisor 运行环境需要宿主机的 `runsc`、CNI 和 [gVisor helper](../scripts/gvisor-helper/README.md)。
+需要 Node.js 22.18+、pnpm 10、Docker，以及可用的模型认证和 API 入口。每个 CellBox 镜像由使用者构建，需包含 `node` 和 `codex` CLI，并提供 `CELLBOX_USER` 对应的可写 home 目录。gVisor 运行环境还需要宿主机的 `runsc`、CNI 和 [gVisor helper](scripts/gvisor-helper/README.md)。
 
 以下命令安装依赖、准备共享规则文件并启动本地 Web 开发服务，请在仓库根目录执行：
 
@@ -98,17 +98,17 @@ PORT=3001 pnpm dev
 
 打开 <http://localhost:3001>。启动 Web 服务后，执行 Agent 任务还需要完成 Sandbox 环境配置：
 
-- 构建项目镜像：`docker build -f docker/sandbox/Dockerfile -t swarm-hive-sandbox:latest .`。
+- 将 `DOCKER_SANDBOX_IMAGE` 和 `CELLBOX_CONFIG_PATH` 成对设置为一个 Box 的镜像和配置。可用 `docker build -t samplebox:latest cellbox/samplebox` 构建最小示例，并设置 `CELLBOX_CONFIG_PATH=cellbox/samplebox/sandbox.toml`；示例只挂载 Git 配置和凭据。平台在创建时会复制 `cellbox-proxy`，再启动 Codex App Server。
 - 启动 gVisor helper，配置 `GVISOR_HELPER_URL` 和对应的 bundle、网络环境，确保 Sandbox 能访问模型入口和 `SANDBOX_APPROVAL_MCP_URL`。
 - 按需在连接页导入研发工具凭据；Kubernetes 通过 `COCELL_KUBECONFIG` 显式启用。
 
-仓库也提供 [Docker Compose 配置](../docker-compose.yml)。使用前需要准备其中声明的外部 MySQL volume、CLIProxyAPI 配置与认证文件，并按运行环境核对 Docker daemon 地址和挂载路径。它目前需要本机配置，尚不是开箱即用的安装向导。
+仓库也提供 [Docker Compose 配置](docker-compose.yml)。使用前需要准备其中声明的外部 MySQL volume、CLIProxyAPI 配置与认证文件，并按运行环境核对 Docker daemon 地址和挂载路径。它目前需要本机配置，尚不是开箱即用的安装向导。
 
 服务、镜像和部分环境变量中仍保留历史名称 `swarm-hive`，项目名称统一为 **CoCell**。
 
 ## 配置与数据
 
-基础配置见 [`.env.example`](../.env.example)。常用选项：
+基础配置见 [`.env.example`](.env.example)。常用选项：
 
 | 变量 | 用途 |
 | --- | --- |
@@ -156,9 +156,9 @@ pnpm build
 后端负责项目、会话、持久化与 HTTP/SSE 接口；`packages/agentcore` 连接 Codex App Server，`packages/sandbox` 管理 Sandbox 生命周期；React 前端展示任务和项目资源。接口契约放在 `protocol/`，共享计算放在 `util/`。
 
 - [贡献指南](AGENTS.md)
-- [项目](projects.md)
-- [Sandbox](sandbox-module.md)
-- [归档](archive-module.md)
-- [RBAC 与 Sandbox 角色](rbac.md)
-- [工具挂载](tool-mounts.md)
-- [长期记忆](long-term-memory.md)
+- [项目](docs/projects.md)
+- [Sandbox](docs/sandbox-module.md)
+- [归档](docs/archive-module.md)
+- [RBAC 与 Sandbox 角色](docs/rbac.md)
+- [工具挂载](docs/tool-mounts.md)
+- [长期记忆](docs/long-term-memory.md)

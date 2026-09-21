@@ -1,0 +1,4 @@
+# This Box intentionally supplies only Git configuration and credentials.
+[rw_mount]
+"~/.gitconfig" = "./data/credentials/sandbox/gitconfig"
+"~/.git-credentials" = "./data/credentials/sandbox/git-credentials"

@@ -16,7 +16,11 @@ export class DockerSandboxClient {
   constructor(private readonly image: string, private readonly docker = 'docker', private readonly network = 'host', private readonly appServerTokenHostPath?: string,
     private readonly sharedAgentsHostPath?: string, private readonly appServerHost?: string,
     private readonly mounts: Mount[] = [],
-    private readonly appServerEnvironment: Record<string, string> = {}) {}
+    private readonly appServerEnvironment: Record<string, string> = {},
+    private readonly cellboxProxyHostPath?: string,
+    private readonly startupCommand?: string,
+    private readonly runtimeUser = 'user') {}
+  get defaultUser() { return this.runtimeUser; }
   private async call(args: string[], timeout?: number, signal?: AbortSignal) { return execFileAsync(this.docker, args, { timeout, signal, maxBuffer: 16 * 1024 * 1024 }); }
   async imageIdentity(reference = this.image): Promise<DockerImageIdentity> {
     const { stdout } = await this.call(['image', 'inspect', '--format', '{{json .}}', reference]);
@@ -53,18 +57,18 @@ export class DockerSandboxClient {
     return { status, createdAt: container.Created, imageIdentity };
   }
   async create(projectId: string, workingDirectory: string): Promise<DockerSandboxRecord> {
-    const name = `swarm-hive-sandbox-${projectId.slice(0, 12)}-${randomUUID().slice(0, 8)}`;
+    const name = `cellbox-${projectId.slice(0, 12)}-${randomUUID().slice(0, 8)}`;
     // Sandboxes share Docker's host network so project preview ports remain
     // reachable. Give each long-lived App Server a distinct private port.
     const appServerPort = 20_000 + (parseInt(randomUUID().replaceAll('-', '').slice(0, 6), 16) % 20_000);
-    const args = ['run', '-d', '--name', name, '--network', this.network,
-      '--workdir', workingDirectory, '--label', 'app=swarm-hive-sandbox',
-      '--label', 'swarm-hive.group=swarm-hive-sandbox',
+    const args = ['create', '--name', name, '--network', this.network, '--user', this.runtimeUser,
+      '--workdir', workingDirectory, '--label', 'app=cellbox',
+      '--label', 'co-cell.group=cellbox',
       // A configured image may carry Compose labels. Override them so Docker
       // Desktop groups project sandboxes separately without making Compose own
       // their lifecycle.
-      '--label', 'com.docker.compose.project=swarm-hive-sandbox',
-      '--label', 'com.docker.compose.service=project-sandbox',
+      '--label', 'com.docker.compose.project=cellbox',
+      '--label', 'com.docker.compose.service=cellbox',
       '--label', `swarm-hive.app-server-port=${appServerPort}`,
       '--env', `CODEX_APP_SERVER_PORT=${appServerPort}`,
       '--label', `projectId=${projectId}`];
@@ -80,14 +84,22 @@ export class DockerSandboxClient {
     // after the server has already started.
     if (this.sharedAgentsHostPath) args.push('--mount', `type=bind,src=${this.sharedAgentsHostPath},dst=/home/user/.codex/AGENTS.md`);
     args.push(this.image);
+    if (this.startupCommand) args.push('node', '-e', this.startupCommand);
     const { stdout } = await this.call(args);
     const id = stdout.trim();
+    try {
+      if (this.cellboxProxyHostPath) await this.call(['cp', this.cellboxProxyHostPath, `${id}:/tmp/cellbox-proxy.mjs`]);
+      await this.call(['start', id], 30_000);
+    } catch (error) {
+      await this.remove(id).catch(() => {});
+      throw error;
+    }
     try {
       const details = await this.containerDetails(id);
       return { id, image: details.imageIdentity.reference, imageIdentity: details.imageIdentity,
         status: details.status, projectId, workingDirectory, createdAt: details.createdAt };
     } catch {
-      // Do not report creation failure after `docker run` succeeded: callers
+      // Do not report creation failure after `docker start` succeeded: callers
       // would otherwise retry and leave this live container untracked.
       return { id, image: this.image, status: 'ready', projectId, workingDirectory, createdAt: new Date().toISOString() };
     }
@@ -97,7 +109,7 @@ export class DockerSandboxClient {
     const [rawPort, rawName] = stdout.trim().split('\t');
     const port = Number(rawPort);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Sandbox does not expose a managed App Server');
-    const { stdout: token } = await this.call(['exec', '--user', 'user', id, 'cat', '/home/user/.codex-web/app-server-token']);
+    const { stdout: token } = await this.call(['exec', '--user', this.runtimeUser, id, 'cat', '/home/user/.codex-web/app-server-token']);
     if (!token.trim()) throw new Error('Sandbox App Server token is unavailable');
     const host = this.appServerHost || rawName.replace(/^\//, '');
     if (!host) throw new Error('Sandbox App Server hostname is unavailable');
@@ -162,14 +174,14 @@ export class DockerSandboxClient {
     return { sizeBytes, sha256: hash.digest('hex') };
   }
   async exec(id: string, command: string, options: DockerExecOptions = {}): Promise<DockerExecResult> {
-    const args = ['exec']; for (const [key, value] of Object.entries(options.env ?? {})) args.push('--env', `${key}=${value}`); if (options.cwd) args.push('--workdir', options.cwd); args.push('--user', options.user ?? 'user', id, 'sh', '-lc', command);
+    const args = ['exec']; for (const [key, value] of Object.entries(options.env ?? {})) args.push('--env', `${key}=${value}`); if (options.cwd) args.push('--workdir', options.cwd); args.push('--user', options.user ?? this.runtimeUser, id, 'sh', '-lc', command);
     try { const result = await this.call(args, options.timeoutMs, options.signal); return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 }; } catch (error) { const value = error as { stdout?: string; stderr?: string; code?: number }; return { stdout: value.stdout ?? '', stderr: value.stderr ?? String(error), exitCode: typeof value.code === 'number' ? value.code : 1 }; }
   }
   execAttached(id: string, command: string, options: DockerExecOptions = {}): DockerExecHandle {
     const args = ['exec'];
     for (const [key, value] of Object.entries(options.env ?? {})) args.push('--env', `${key}=${value}`);
     if (options.cwd) args.push('--workdir', options.cwd);
-    args.push('--user', options.user ?? 'user', id, 'sh', '-lc', command);
+    args.push('--user', options.user ?? this.runtimeUser, id, 'sh', '-lc', command);
     const child = spawn(this.docker, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', settled = false;
     child.stdout.setEncoding('utf8').on('data', value => { stdout += value; options.onStdout?.(value); });
@@ -203,7 +215,7 @@ export class DockerSandboxClient {
     };
   }
   async readFile(id: string, path: string): Promise<Buffer> { const result = await this.exec(id, `base64 -w0 -- ${JSON.stringify(path)}`); if (result.exitCode) throw new Error(result.stderr); return Buffer.from(result.stdout, 'base64'); }
-  async writeFile(id: string, path: string, content: Buffer, user = 'user'): Promise<void> {
+  async writeFile(id: string, path: string, content: Buffer, user = this.runtimeUser): Promise<void> {
     const parent = path.slice(0, Math.max(path.lastIndexOf('/'), 1));
     const prepared = await this.exec(id, `mkdir -p -- ${JSON.stringify(parent)}`, { user });
     if (prepared.exitCode) throw new Error(prepared.stderr);
@@ -226,7 +238,7 @@ export class DockerSandboxClient {
     // Project bindings persist Docker's full 64-character ID. `docker ps`
     // otherwise emits its 12-character display ID and every live Sandbox is
     // incorrectly classified as dangling by the inventory view.
-    const outputs = await Promise.all(['swarm-hive.group=swarm-hive-sandbox', 'app=swarm-hive'].map(label => this.call(['ps', '-a', '--no-trunc', '--filter', `label=${label}`, '--format', '{{.ID}}\\t{{.Image}}\\t{{.State}}\\t{{.Label "projectId"}}']).then(value => value.stdout)));
+    const outputs = await Promise.all(['co-cell.group=cellbox', 'swarm-hive.group=swarm-hive-sandbox', 'app=swarm-hive'].map(label => this.call(['ps', '-a', '--no-trunc', '--filter', `label=${label}`, '--format', '{{.ID}}\\t{{.Image}}\\t{{.State}}\\t{{.Label "projectId"}}']).then(value => value.stdout)));
     const rows = new Map<string, DockerSandboxRecord>();
     for (const output of outputs) for (const line of output.trim().split('\n').filter(Boolean)) {
       const [id, image, state, projectId] = line.split('\t');

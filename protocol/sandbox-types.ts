@@ -1,6 +1,6 @@
 /** Docker image identity captured when a Sandbox container is created. */
 export interface SandboxImageIdentity {
-  /** Mutable reference requested by the service, for example `swarm-hive-sandbox:latest`. */
+  /** Mutable reference requested by the service, for example `cellbox:latest`. */
   reference: string;
   /** Immutable Docker image content ID (`sha256:...`). */
   id: string;

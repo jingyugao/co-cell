@@ -5,6 +5,7 @@ dist/
 !.env.example
 .codex-web/
 data/
+docker/
 # Keep project documentation; captures and local verification files stay local.
 /tmp/*
 /scripts/e2b/preview-*.mjs

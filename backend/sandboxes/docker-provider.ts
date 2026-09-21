@@ -34,7 +34,7 @@ export function dockerSandboxProvider(client: DockerSandboxClient): SandboxProvi
     } } as SandboxHandle['commands'],
     files: {
       read: async (path: string) => (await client.readFile(id, path)).toString(),
-      write: async (path: string, value: Uint8Array | string, options: { user?: string } = {}) => client.writeFile(id, path, Buffer.from(value), options.user ?? 'user'),
+      write: async (path: string, value: Uint8Array | string, options: { user?: string } = {}) => client.writeFile(id, path, Buffer.from(value), options.user ?? client.defaultUser),
       exists: async (path: string) => (await client.exec(id, `test -e ${JSON.stringify(path)}`)).exitCode === 0,
       remove: async (path: string) => { await client.exec(id, `rm -rf -- ${JSON.stringify(path)}`); },
       rename: async (from: string, to: string) => { const result = await client.exec(id, `mv -- ${JSON.stringify(from)} ${JSON.stringify(to)}`); if (result.exitCode) throw new Error(result.stderr); },

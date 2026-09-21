@@ -32,7 +32,7 @@ export class CodexAppServerClient extends EventEmitter {
     });
     this.lines.on('close', () => { if (!this.closed) this.fail(new Error(`App Server output closed${this.stderrText ? `: ${this.stderrText.trim().slice(-1000)}` : ''}`)); });
     await this.request('initialize', {
-      clientInfo: { name: 'swarm_hive_app_server_client', version: '0.2.0' },
+      clientInfo: { name: 'co_cell_app_server_client', version: '0.2.0' },
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized');
@@ -51,7 +51,7 @@ export class CodexAppServerClient extends EventEmitter {
     socket.addEventListener('error', () => this.fail(new Error('App Server WebSocket transport failed')));
     socket.addEventListener('close', () => { if (!this.closed) this.fail(new Error('App Server WebSocket closed')); });
     await this.request('initialize', {
-      clientInfo: { name: 'swarm_hive_app_server_client', version: '0.2.0' },
+      clientInfo: { name: 'co_cell_app_server_client', version: '0.2.0' },
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized');

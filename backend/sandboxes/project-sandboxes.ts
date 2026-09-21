@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { SandboxManager, SandboxLease, SandboxRecord } from '@swarm-hive/sandbox';
+import type { SandboxManager, SandboxLease, SandboxRecord } from '@co-cell/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
 

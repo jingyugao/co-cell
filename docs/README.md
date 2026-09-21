@@ -1,6 +1,6 @@
-# swarm-hive 项目说明
+# CoCell 项目说明
 
-swarm-hive 是基于 TypeScript、Codex App Server 和 React 的单用户 Web 编码工作台。每个项目对应一个本地 Docker Sandbox；项目内多个会话共享工作区，各自保留 Codex thread。页面展示执行事件、工具详情、代码差异、文件和服务预览。
+CoCell 是基于 TypeScript、Codex App Server 和 React 的单用户 Web 编码工作台。每个项目对应一个本地 Docker Sandbox；项目内多个会话共享工作区，各自保留 Codex thread。页面展示执行事件、工具详情、代码差异、文件和服务预览。
 
 Docker 是唯一 Sandbox provider。Web 服务持有 Docker socket 的宿主机权限，本地部署不把项目容器当作安全隔离边界，只适用于可信用户。
 

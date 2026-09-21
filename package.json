@@ -1,5 +1,5 @@
 {
-  "name": "codex-web-demo",
+  "name": "co-cell",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -20,9 +20,9 @@
   "dependencies": {
     "@hono/node-server": "2.1.1",
     "@openai/codex": "0.153.4",
-    "@swarm-hive/agentcore": "file:packages/agentcore",
-    "@swarm-hive/docker-sandbox": "file:packages/docker-sandbox",
-    "@swarm-hive/sandbox": "file:packages/sandbox",
+    "@co-cell/agentcore": "file:packages/agentcore",
+    "@co-cell/docker-sandbox": "file:packages/docker-sandbox",
+    "@co-cell/sandbox": "file:packages/sandbox",
     "hono": "4.13.3",
     "js-tiktoken": "1.0.21",
     "mysql2": "3.15.3",

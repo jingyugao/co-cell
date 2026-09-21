@@ -6,7 +6,7 @@ import { access, chmod, chown, mkdir, readFile, writeFile } from 'node:fs/promis
 import { randomBytes } from 'node:crypto';
 import { Codex, appServerArgs } from '../packages/agentcore/src/index.mjs';
 import { getRequestListener } from '@hono/node-server';
-import { DockerSandboxImageManager, GvisorHelperClient, GvisorSandboxProvider, SandboxManager, type SandboxProvider } from '@swarm-hive/sandbox';
+import { DockerSandboxImageManager, GvisorHelperClient, GvisorSandboxProvider, SandboxManager, type SandboxProvider } from '@co-cell/sandbox';
 import type { AppConfig, Settings } from '../protocol/types.js';
 import type { ImprovementContext, ImprovementReceipt } from '../protocol/improvement-types.js';
 import { DEFAULT_MODEL } from '../util/models.js';

@@ -1,4 +1,4 @@
-import type { SandboxCommandHandle, SandboxCommandResult, SandboxHandle, SandboxProvider } from '@swarm-hive/sandbox';
+import type { SandboxCommandHandle, SandboxCommandResult, SandboxHandle, SandboxProvider } from '@co-cell/sandbox';
 import { DockerSandboxClient } from '../../packages/docker-sandbox/src/index.js';
 
 /** Adapts trusted local Docker containers to the provider-neutral coordinator. */

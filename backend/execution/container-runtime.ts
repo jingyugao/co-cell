@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { AppServerEventAdapter, Codex, CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
-import type { SandboxCommandHandle, SandboxHandle, SandboxProvider, SandboxLease, SandboxRecord } from '@swarm-hive/sandbox';
+import type { SandboxCommandHandle, SandboxHandle, SandboxProvider, SandboxLease, SandboxRecord } from '@co-cell/sandbox';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import type { AgentEvent, ContextUsage } from '../../protocol/types.js';
 import type { RequestUserApproval } from '../../protocol/approval-types.js';

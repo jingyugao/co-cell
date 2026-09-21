@@ -7,7 +7,7 @@ FROM node:22.18.0-bookworm-slim
 ARG SANDBOX_VERSION=0.1.1
 ARG SANDBOX_REVISION=unknown
 ARG SANDBOX_CREATED=unknown
-LABEL org.opencontainers.image.title="swarm-hive-sandbox" \
+LABEL org.opencontainers.image.title="co-cell-sandbox" \
       org.opencontainers.image.version="${SANDBOX_VERSION}" \
       org.opencontainers.image.revision="${SANDBOX_REVISION}" \
       org.opencontainers.image.created="${SANDBOX_CREATED}"

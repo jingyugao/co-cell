@@ -79,7 +79,7 @@ export default function SandboxManager({ config, onOpenSession, onOpenProject, o
   return <main className="main-pane sandbox-page">
     <header className="topbar"><button className="icon-button mobile-only" aria-label="打开导航" onClick={onMenu}>☰</button><div className="breadcrumbs"><span>工作空间</span><span className="slash">/</span><strong>沙箱管理</strong></div><button className="secondary-button" onClick={onBack}>返回对话</button></header>
     <div className="sandbox-scroll">
-      <div className="sandbox-heading"><div><span className="sandbox-eyebrow">DOCKER SANDBOX</span><h1>沙箱管理</h1><p>查看当前 Docker 中由 swarm-hive 创建的容器及其项目关联。</p></div><button className="primary-button sandbox-refresh" disabled={loading} onClick={() => setRefresh(value => value + 1)}>{loading ? <><span className="spinner" />读取中…</> : '刷新列表'}</button></div>
+      <div className="sandbox-heading"><div><span className="sandbox-eyebrow">DOCKER SANDBOX</span><h1>沙箱管理</h1><p>查看当前 Docker 中由 CoCell 创建的容器及其项目关联。</p></div><button className="primary-button sandbox-refresh" disabled={loading} onClick={() => setRefresh(value => value + 1)}>{loading ? <><span className="spinner" />读取中…</> : '刷新列表'}</button></div>
       {error && <div className="sandbox-warning" role="alert">{error}{data && ' 下方保留上次成功读取的数据。'}</div>}
       {data?.enabled === false ? <div className="sandbox-empty"><h2>尚未配置 Docker Sandbox</h2><p>配置服务端 Docker后，即可查看沙箱和资源用量。</p></div> : <>
         <div className="sandbox-stats">

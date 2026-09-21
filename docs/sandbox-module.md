@@ -74,7 +74,7 @@ tar --exclude=home/user/.codex/AGENTS.md -xzf archive.tar.gz -C /
 ## Docker Compose 配置
 
 - `DOCKER_HOST: tcp://host.docker.internal:2375` — 容器内 Docker CLI 通过 TCP 连接宿主机 daemon
-- `DOCKER_SANDBOX_NETWORK: swarm-hive_default` — Sandbox 容器与 Swarm-hive 同网络
+- `DOCKER_SANDBOX_NETWORK: swarm-hive_default` — Sandbox 容器与 CoCell 同网络
 - `extra_hosts: host.docker.internal:host-gateway` — DNS 解析宿主机
 
 ## 环境变量

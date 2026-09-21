@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
-import type { SandboxHandle, SandboxInfo } from '@swarm-hive/sandbox';
-import { SandboxManager, type SandboxProvider } from '@swarm-hive/sandbox';
+import type { SandboxHandle, SandboxInfo } from '@co-cell/sandbox';
+import { SandboxManager, type SandboxProvider } from '@co-cell/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { Session, Turn } from '../../protocol/types.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';

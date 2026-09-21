@@ -4,13 +4,13 @@
 
 Codex App Server 是运行在每个 Sandbox 容器内的 Node.js 进程，负责：
 
-1. 通过 WebSocket 与 Swarm-hive 后端通信
+1. 通过 WebSocket 与 CoCell 后端通信
 2. 调用 Codex SDK 执行 Agent 任务（读写文件、执行命令等）
 3. 维护对话线程状态（thread history）
 4. 管理 MCP 服务器（审批等）
 
 ```
-Swarm-hive Backend ←→ WebSocket ←→ Codex App Server (Sandbox 内)
+CoCell Backend ←→ WebSocket ←→ Codex App Server (Sandbox 内)
                                          ↓
                                     Codex SDK
                                          ↓
@@ -66,7 +66,7 @@ App Server 将所有状态存储在 `/home/user/.codex/`：
 ## 网络
 
 - App Server 监听 `0.0.0.0:36606` (WebSocket)
-- Swarm-hive 通过容器名 DNS 连接：`http://<sandbox-name>:36606`
+- CoCell 通过容器名 DNS 连接：`http://<sandbox-name>:36606`
 - LLM API 调用通过 cliproxy 代理：`http://cliproxy:8317/v1`
 
 ## MCP 审批

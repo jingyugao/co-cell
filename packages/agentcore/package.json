@@ -1,5 +1,5 @@
 {
-  "name": "@swarm-hive/agentcore",
+  "name": "@co-cell/agentcore",
   "version": "0.2.0",
   "private": true,
   "type": "module",

@@ -282,7 +282,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
             if (diagnostic && typeof diagnostic === 'object') {
               const fields = Object.fromEntries(allowed.filter(key => key in diagnostic).map(key => [key, diagnostic[key]]));
               void this.options.logger?.write({
-                ...fields, source: 'sandbox-proxy', sessionId: session.id, projectId: session.projectId,
+                ...fields, source: 'cellbox-proxy', sessionId: session.id, projectId: session.projectId,
                 turnId: turn.id, threadId: session.threadId, sandboxId: entry.metadata.id, model: session.settings.model
               });
               const inputTokens = diagnostic.inputTokens;

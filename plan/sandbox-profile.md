@@ -3,7 +3,7 @@
 ## 目标
 
 让 CoCell 可以运行用户自定义 Docker 镜像，而不要求镜像继承内置
-`swarm-hive-sandbox`。镜像运行契约由 profile 声明；内置镜像只是默认
+`cellbox`。镜像运行契约由 profile 声明；内置镜像只是默认
 profile 的一种实现。
 
 凭据不属于 profile。用户通过根目录 `sandbox.toml` 配置宿主机到
@@ -14,7 +14,7 @@ Sandbox 的文件/目录挂载。Meegle 等 CLI 的凭据格式、加密、刷�
 
 ```toml
 [image]
-reference = "swarm-hive-sandbox:latest"
+reference = "cellbox:latest"
 
 [runtime]
 user = "user"

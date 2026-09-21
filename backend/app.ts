@@ -28,7 +28,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   // {projectId}.{port}.{swarm-hive-host}/path → sandbox container:port/path
   // Runs before the host-access check so remote users can reach sandbox services.
   const hopByHopHeaders = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
-  // The sandbox runs sandbox-proxy (Go) on port 40000 for localhost-bound services.
+  // CellBox runs the Node-based cellbox-proxy on port 40000 for localhost-bound services.
   const sandboxProxyPort = 40000;
 
   async function sandboxFetch(sandboxName: string, port: number, path: string, req: Request, body?: ArrayBuffer): Promise<Response> {
@@ -65,7 +65,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
 
     const url = new URL(c.req.url);
     const path = url.pathname + url.search;
-    // All sandbox service traffic goes through sandbox-proxy. Read the incoming
+    // All CellBox service traffic goes through cellbox-proxy. Read the incoming
     // body once before forwarding it.
     const requestBody = ['GET', 'HEAD'].includes(c.req.method)
       ? undefined
@@ -73,7 +73,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
 
     let response: Response;
     try {
-      // sandbox-proxy path format: /<targetPort>/<originalPath>
+      // cellbox-proxy path format: /<targetPort>/<originalPath>
       response = await sandboxFetch(sandboxHost, sandboxProxyPort, `/${port}${path}`, c.req.raw, requestBody);
     } catch (error) {
       const sysErr = error as { cause?: { code?: string } };

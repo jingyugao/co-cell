@@ -33,4 +33,4 @@ node scripts/gvisor-helper/server.mjs
 
 helper 会为每个 Sandbox 建立独立 network namespace，并调用 CNI `bridge`、`host-local` 和 `loopback` 配置网卡与默认路由。它为整个专用子网维护一条出站 NAT 规则，并在 `FORWARD` 顶部维护一条同子网互访的拒绝规则，阻止 Sandbox 通过共享 bridge 直接访问彼此。restore 前会用 CNI 重建同名 namespace 的网络，因为 runsc 会把接口配置导入自身 netstack；删除 Sandbox 时通过 CNI `DEL` 清理网卡和 IPAM。`GVISOR_CNI_NETWORK`、`GVISOR_CNI_BRIDGE` 和 `GVISOR_CNI_SUBNET` 必须与本机已有 Docker/Kubernetes 网络错开。
 
-`forward` 会启动 `runsc port-forward`，将一个随机宿主机端口转发至 guest 的 `remotePort`。gVisor provider 对每个 Sandbox 保持两条转发：Codex App Server 端口，以及 guest `40000` 的 `sandbox-proxy`；普通项目服务通过后者的 `/<targetPort>/...` 路径访问。
+`forward` 会启动 `runsc port-forward`，将一个随机宿主机端口转发至 guest 的 `remotePort`。gVisor provider 对每个 CellBox 保持两条转发：Codex App Server 端口，以及 guest `40000` 的 `cellbox-proxy`；普通项目服务通过后者的 `/<targetPort>/...` 路径访问。

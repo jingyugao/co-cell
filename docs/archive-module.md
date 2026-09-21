@@ -1,90 +1,50 @@
-# 归档模块
+# 归档
 
-## 设计
+归档用于在保留项目数据的同时回收 Sandbox，减少长期闲置环境的磁盘占用。重新开始工作时，使用最新备份创建并验证新环境，再切换项目绑定。
 
-采用 **archive_info（流）+ archive_versions（版本链）** 两张表，事务保证 `is_latest` 一致性。
+## 备份、归档与恢复
 
-```
-archive_info                     archive_versions
-┌──────────────────────┐         ┌───────────────────────────┐
-│ archive_key (PK)     │         │ id (PK)                   │
-│ latest_version_id ───┼───────→│ archive_key                │
-│ created_at           │         │ version (递增)             │
-│ updated_at           │         │ parent_id (自引用)         │
-└──────────────────────┘         │ is_latest                  │
-                                 │ storage_path               │
-                                 │ size_bytes                 │
-                                 │ sha256                     │
-                                 │ metadata (JSON)            │
-                                 │ status (active|deleted)    │
-                                 └───────────────────────────┘
-```
+| 操作 | 行为 |
+| --- | --- |
+| 备份 | 保存工作区和 Codex 状态，保留当前环境 |
+| 归档 | 生成并校验备份，停止和解绑环境，回收 Sandbox |
+| 恢复 | 校验最新备份，创建新环境、还原数据并验证，成功后切换绑定 |
 
-## 核心操作
+运行环境正常时，归档先生成新备份。环境异常且无法生成新备份时，可以确认使用已有备份归档；此时保存范围以该备份为准。
 
-### 创建版本
-```
-BEGIN
-  SELECT ... FROM archive_info WHERE key=? FOR UPDATE  // 行锁
-  INSERT archive_versions (is_latest=TRUE, parent_id=旧最新ID)
-  UPDATE archive_info SET latest_version_id=新ID
-  UPDATE 旧版本 SET is_latest=FALSE
-COMMIT
-```
+恢复会核对文件存在性、大小与 SHA-256。最新备份缺失或损坏时停止操作；新环境验证成功后才成为项目的当前环境。清理失败的旧环境保留待清理记录，后续扫描继续处理。
 
-### 保留 N 个版本 (retain)
-```
-BEGIN
-  SELECT ... FOR UPDATE  // 锁流
-  SELECT version FROM archive_versions
-    WHERE key=? AND status='active'
-    ORDER BY version DESC LIMIT 1 OFFSET N-1
-  → 找不到 = 版本不够 N，什么都不删
-  UPDATE archive_versions SET status='soft_deleted'
-    WHERE key=? AND is_latest=FALSE AND version < cutoff
-COMMIT
-```
+## 保存范围
 
-**安全保证**：`is_latest=FALSE` 条件确保最新版本永远不会被删除。总数不足 N 时 OFFSET 超出范围，子查询返回空，不做任何操作。
+数据归档格式包含项目工作区和 `/home/user/.codex`，用于保留代码及原生会话状态。共享知识、凭据配置和应用元数据单独维护、备份。
 
-### 物理清理 (sweep)
-定期扫描 `status='soft_deleted'` 的记录，删除物理文件后 `DELETE` 数据库行。
+镜像之外临时安装的系统软件通过镜像或初始化流程重建。归档文件自身仍占磁盘，可结合版本保留策略控制占用。
 
-## SQLite WAL Checkpoint
+项目操作层通过 provider 的 `archive/restoreArchive` 接口执行数据备份与恢复；Docker 后端的具体实现位于 [DockerSandboxClient](../packages/docker-sandbox/src/client.ts)。gVisor 运行状态 checkpoint 的流程见 [Sandbox](sandbox-module.md)。
 
-**问题**：归档时 App Server 正在运行，SQLite 处于 WAL 模式。tar 打包的 `.sqlite-wal` 文件在恢复后与新的 App Server 进程不兼容，导致线程数据丢失。
+## 周期备份与版本
 
-**修复** (`packages/docker-sandbox/src/client.ts`)：
-```typescript
-// archive() 前：对所有 .sqlite 文件做 checkpoint
-for db in /home/user/.codex/*.sqlite; do
-  sqlite3 "$db" "PRAGMA wal_checkpoint(TRUNCATE)"
-done
-```
+后台每分钟扫描项目，按 `SANDBOX_SCHEDULED_ARCHIVE_THRESHOLD_MS` 判断是否备份，默认阈值为 30 分钟。周期备份保留运行环境；项目归档才回收环境。
 
-## 文件结构
+配置 MySQL 后，版本化归档使用两张表：
 
-```
-backend/archives/
-├── types.ts      — ArchiveStream, ArchiveVersion, CreateArchiveVersionInput
-├── store.ts      — ArchiveStore: 数据层，MySQL 事务操作
-├── manager.ts    — ArchiveManager: 业务编排 + 物理文件管理
-└── routes.ts     — API: 归档列表、版本查询、文件浏览、清理触发
-```
+- `archive_info`：归档流，指向最新版本。
+- `archive_versions`：版本、文件路径、大小、SHA-256 和来源元数据。
 
-## API
+创建版本通过事务更新最新指针。保留策略把旧版本标记为待清理，物理清理再删除文件和记录；最新版本受保留条件保护。
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/archives` | 项目归档摘要（兼容旧表） |
-| GET | `/api/archives/:key/versions` | 归档流版本列表 |
-| GET | `/api/archives/:key/files?path=` | 浏览归档内文件 |
-| GET | `/api/archives/:key/file?path=` | 读取归档内文件内容 |
-| POST | `/api/archives/prune` | 全局清理旧版本 |
+未启用版本化归档管理时，项目操作层也支持文件备份及项目中的备份元数据。默认文件目录为 `data/sandbox-data-archives/`，迁移时应连同对应元数据一起保存。
 
-## 集成点
+## 接口与实现
 
-- `SessionManager.archiveProjectNow()` — 完整归档 + 删除 Sandbox
-- `SessionManager.scheduledArchive()` — 1 分钟定时扫描，30 分钟阈值快照
-- `SessionManager.rebuildProjectSandbox()` — 重建时从 ArchiveManager 读取最新归档恢复
-- 前端 `ArchiveVersionBadge` + `ArchiveViewer` — hover 版本列表 + 文件浏览
+| 接口 | 用途 |
+| --- | --- |
+| `POST /api/projects/:id/backup` | 立即备份 |
+| `POST /api/projects/:id/archive` | 归档项目；可显式选择已有备份 |
+| `POST /api/projects/:id/sandbox/rebuild` | 从最新备份恢复 |
+| `GET /api/archives/:key/versions` | 查看归档版本 |
+| `GET /api/archives/:key/files` | 浏览备份中的文件 |
+| `GET /api/archives/:key/file` | 读取备份中的文件内容 |
+| `POST /api/archives/prune` | 清理旧版本 |
+
+实现入口：[项目备份与恢复编排](../backend/projects/sandbox-operations.ts)、[归档管理](../backend/archives/manager.ts)、[版本存储](../backend/archives/store.ts)。

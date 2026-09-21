@@ -45,7 +45,11 @@ const configOverrides = process.env.CODEX_CONFIG_OVERRIDES_JSON ? JSON.parse(pro
 const codex = new Codex({ ...(apiKey ? { apiKey } : {}), ...(process.env.CODEX_PATH ? { codexPathOverride: process.env.CODEX_PATH } : {}),
   config: modelConfig, ...(configOverrides ? { configOverrides } : {}) });
 
-const sandboxImage = process.env.DOCKER_SANDBOX_IMAGE || 'swarm-hive-sandbox:latest';
+const sandboxImage = process.env.DOCKER_SANDBOX_IMAGE || 'cellbox:latest';
+const cellboxUser = process.env.CELLBOX_USER || 'user';
+const cellboxUid = Number(process.env.CELLBOX_UID || 1000);
+const cellboxGid = Number(process.env.CELLBOX_GID || 1000);
+if (!Number.isInteger(cellboxUid) || cellboxUid < 0 || !Number.isInteger(cellboxGid) || cellboxGid < 0) throw new Error('CELLBOX_UID and CELLBOX_GID must be non-negative integers');
 const sandboxWorkingDirectory = process.env.SANDBOX_WORKSPACE || '/home/user/workspace';
 const localWorkingDirectory = resolve(process.env.CODEX_WORKSPACE || process.cwd());
 const defaults: Settings = { executionMode: 'sandbox', workingDirectory: sandboxWorkingDirectory,
@@ -93,25 +97,23 @@ for (const file of ['gitconfig', 'git-credentials', '.mylogin.cnf']) {
   try { await access(resolve(sandboxCredentialsDirectory, file)); }
   catch { await writeFile(resolve(sandboxCredentialsDirectory, file), '', { mode: 0o600, flag: 'wx' }); }
 }
-const sandboxMounts = await loadSandboxMounts();
+const cellboxConfigPath = resolve(process.env.CELLBOX_CONFIG_PATH || 'sandbox.toml');
+const sandboxMounts = await loadSandboxMounts(cellboxConfigPath);
 const sandboxAppServerTokenHostPath = process.env.SANDBOX_APP_SERVER_TOKEN_HOST_PATH || sandboxAppServerToken;
 const sharedAgentsPath = resolve('data/AGENTS.md');
 const sharedAgentsHostPath = process.env.SANDBOX_SHARED_AGENTS_PATH || sharedAgentsPath;
 // Global rules are non-secret and need to be readable by the Sandbox's user.
 await chmod(sharedAgentsPath, 0o644);
+const cellboxProxySource = (await readFile(resolve('backend/cellbox-proxy.mjs'))).toString('base64');
+const appServerCommand = "const fs=require('node:fs'); if (!fs.existsSync('/tmp/cellbox-proxy.mjs')) fs.writeFileSync('/tmp/cellbox-proxy.mjs',Buffer.from(process.env.CELLBOX_PROXY_SOURCE,'base64')); const {spawn}=require('node:child_process'); spawn('node',['/tmp/cellbox-proxy.mjs'],{stdio:'inherit',detached:true}).unref(); const extra=JSON.parse(process.env.CODEX_APP_SERVER_ARGS||'[]'); const child=spawn('codex',['app-server',...extra,'--listen',`ws://0.0.0.0:${process.env.CODEX_APP_SERVER_PORT}`, '--ws-auth','capability-token','--ws-token-file','/home/user/.codex-web/app-server-token'],{stdio:'inherit'}); child.on('exit',(code,signal)=>process.exit(code??(signal?1:0))); process.on('SIGTERM',()=>child.kill('SIGTERM')); process.on('SIGINT',()=>child.kill('SIGINT')); ";
 const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BIN || 'docker', process.env.DOCKER_SANDBOX_NETWORK || 'swarm-hive_default', sandboxAppServerTokenHostPath, sharedAgentsHostPath,
   process.env.SANDBOX_APP_SERVER_HOST, sandboxMounts, {
     ...(apiKey ? { CODEX_API_KEY: apiKey } : {}), ...(process.env.OPENAI_BASE_URL ? { OPENAI_BASE_URL: process.env.OPENAI_BASE_URL } : {}),
-    CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, [...(configOverrides ?? []), ...approvalMcpOverrides]).slice(1)),
-  });
-const sandboxImageIdentity = await dockerClient.imageIdentity().catch(error => {
-  console.warn(`Unable to inspect Sandbox image identity: ${error instanceof Error ? error.message : String(error)}`);
-  return undefined;
-});
+    CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, [...(configOverrides ?? []), ...approvalMcpOverrides]).slice(1)), CELLBOX_PROXY_SOURCE: cellboxProxySource,
+  }, resolve('backend/cellbox-proxy.mjs'), appServerCommand, cellboxUser);
 const sandboxProviderKind = process.env.SANDBOX_PROVIDER ?? 'docker';
 if (sandboxProviderKind !== 'docker' && sandboxProviderKind !== 'gvisor') throw new Error('SANDBOX_PROVIDER must be docker or gvisor');
 const gvisorBundleRoot = resolve(process.env.GVISOR_BUNDLE_ROOT ?? '/var/lib/swarm-hive/gvisor/bundles');
-const appServerCommand = "const {spawn}=require('node:child_process'); spawn('/usr/local/bin/sandbox-proxy',[],{stdio:'inherit',detached:true}).unref(); const extra=JSON.parse(process.env.CODEX_APP_SERVER_ARGS||'[]'); const child=spawn('codex',['app-server',...extra,'--listen',`ws://0.0.0.0:${process.env.CODEX_APP_SERVER_PORT}`, '--ws-auth','capability-token','--ws-token-file','/home/user/.codex-web/app-server-token'],{stdio:'inherit'}); child.on('exit',(code,signal)=>process.exit(code??(signal?1:0))); process.on('SIGTERM',()=>child.kill('SIGTERM')); process.on('SIGINT',()=>child.kill('SIGINT')); ";
 let provider: SandboxProvider;
 let appServer: (sandboxId: string) => Promise<{ url: string; token: string }>;
 if (sandboxProviderKind === 'gvisor') {
@@ -119,7 +121,7 @@ if (sandboxProviderKind === 'gvisor') {
   const gvisor = new GvisorSandboxProvider(new DockerSandboxImageManager(dirname(gvisorBundleRoot), process.env.DOCKER_BIN || 'docker'),
     new GvisorHelperClient(process.env.GVISOR_HELPER_URL ?? (process.env.DOCKER_HOST ? 'http://host.docker.internal:8090' : 'http://127.0.0.1:8090')), sandboxImage, {
       bundleRoot: gvisorBundleRoot, workingDirectory: sandboxWorkingDirectory,
-      process: { args: ['node', '-e', appServerCommand], cwd: sandboxWorkingDirectory, uid: 1000, gid: 1000, env: {
+      process: { args: ['node', '-e', appServerCommand], cwd: sandboxWorkingDirectory, uid: cellboxUid, gid: cellboxGid, env: {
         HOME: '/home/user', CODEX_HOME: '/home/user/.codex', GLAB_CONFIG_DIR: '/home/user/.config/glab-cli',
         MYSQL_TEST_LOGIN_FILE: '/home/user/.mylogin.cnf', KUBECONFIG: '/home/user/.kube/config.json',
         LARKSUITE_CLI_CONFIG_DIR: '/home/user/.config/lark-cli', LARKSUITE_CLI_DATA_DIR: '/home/user/.local/share/lark-cli',
@@ -127,7 +129,7 @@ if (sandboxProviderKind === 'gvisor') {
         MISE_DATA_DIR: '/home/user/.local/share/mise', MISE_CONFIG_DIR: '/home/user/.config/mise', MISE_STATE_DIR: '/home/user/.local/state/mise', MISE_TRUSTED_CONFIG_PATHS: sandboxWorkingDirectory,
         PATH: '/home/user/.local/share/mise/shims:/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin',
         ...(apiKey ? { CODEX_API_KEY: apiKey } : {}), ...(process.env.OPENAI_BASE_URL ? { OPENAI_BASE_URL: process.env.OPENAI_BASE_URL } : {}),
-        CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, [...(configOverrides ?? []), ...approvalMcpOverrides]).slice(1)),
+        CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, [...(configOverrides ?? []), ...approvalMcpOverrides]).slice(1)), CELLBOX_PROXY_SOURCE: cellboxProxySource,
       } },
       mounts: [
         { source: process.env.GVISOR_RESOLV_CONF ?? '/etc/resolv.conf', destination: '/etc/resolv.conf' },
@@ -178,8 +180,7 @@ manager = new SessionManager(codex, webDataDirectory, defaults, runtime, sandbox
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   }, notifications, archiveMgr);
 await manager.init();
-const config: AppConfig = { sandbox: { enabled: true, image: sandboxImage,
-  ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}), workingDirectory: sandboxWorkingDirectory,
+const config: AppConfig = { sandbox: { enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);

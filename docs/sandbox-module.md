@@ -1,90 +1,53 @@
-# Sandbox 模块
+# Sandbox
 
-## 架构
+Sandbox 提供项目代码、命令工具和 Agent 的执行环境。每个项目绑定一个 Sandbox，项目内的会话复用环境。当前使用 gVisor，通过 checkpoint 在闲置时释放运行内存，在需要时恢复工作。
 
-```
-SessionManager
-  └── SandboxRuntime (container-runtime.ts)
-        └── ProjectSandboxes (sandbox inventory)
-              └── SandboxManager (packages/sandbox)
-                    └── SandboxProvider
-                          └── DockerSandboxClient (docker CLI)
-```
+## 暂停与恢复
 
-## DockerSandboxClient
+1. 首次执行任务时创建环境，启动持久运行的 Codex App Server。
+2. 会话使用环境时，生命周期管理器记录使用状态。
+3. 没有活动使用者且达到闲置阈值时，调用 gVisor checkpoint 保存运行状态，并停止实例。
+4. 再次访问时，管理器根据保存的 checkpoint 恢复实例，重新连接后继续工作。
 
-`packages/docker-sandbox/src/client.ts` — 对 `docker` CLI 的封装。
+`SANDBOX_AUTO_CHECKPOINT_AFTER_MS` 控制自动 checkpoint 的闲置阈值，默认一小时。运行状态写入磁盘后释放实例运行内存，因此可以同时保留多个项目而不让所有环境持续占用内存。
 
-| 方法 | 说明 |
-|------|------|
-| `create(projectId, workDir)` | `docker run` 创建 Sandbox 容器 |
-| `exec(id, cmd)` | `docker exec` 执行命令 |
-| `archive(id, dest)` | `docker exec tar -czf` 打包 workspace + .codex |
-| `restore(id, archivePath)` | 上传 tar.gz 到容器内，`tar -xzf` 还原 |
-| `remove(id)` | `docker rm --force` 删除容器 |
-| `inspect(id)` | `docker inspect` 获取容器状态 |
+暂停保存运行状态，用于短期闲置；[归档](archive-module.md)保存项目数据并回收环境，用于长期存放。恢复运行状态还依赖对应的文件系统 bundle 和 checkpoint 文件。
 
-### Sandbox 容器规格
+## 环境中的内容
 
-- **镜像**: `swarm-hive-sandbox:latest`（Dockerfile 在仓库根目录）
-- **工作目录**: `/home/user/workspace`
-- **Codex 状态**: `/home/user/.codex/`
-- **凭据挂载**: `/home/user/.codex-web/credentials/`（只读）
-- **AppServer Token**: `/home/user/.codex-web/app-server-token`（只读）
-- **全局规则**: `/home/user/.codex/AGENTS.md`（只读）
-- **网络**: `swarm-hive_default`（与 swarm-hive、MySQL、cliproxy 同网络）
+| 位置 | 用途 |
+| --- | --- |
+| `/home/user/workspace` | 默认项目工作区 |
+| `/home/user/.codex` | Codex 配置、原生会话及相关状态 |
+| `/home/user/.codex/AGENTS.md` | 共享工作约定 |
+| `/home/user/.codex/docs` | 从共享知识库同步的文档 |
+| `sandbox.toml` 定义的挂载 | Git、GitLab、数据库、飞书等工具配置 |
 
-### 归档文件结构
+共享规则与知识的维护见[长期记忆](long-term-memory.md)，工具操作权限的设计见[RBAC](rbac.md)。
 
-```bash
-docker exec <container> tar -czf - -C / \
-  home/user/workspace \
-  home/user/.codex
-```
+## 模块分工
 
-还原时排除 `AGENTS.md`（它是只读挂载的）：
-```bash
-tar --exclude=home/user/.codex/AGENTS.md -xzf archive.tar.gz -C /
-```
+| 模块 | 职责 |
+| --- | --- |
+| `backend/execution/container-runtime.ts` | 任务执行、环境准备、App Server 连接和文件访问 |
+| `backend/sandboxes/project-sandboxes.ts` | 项目与 Sandbox 的绑定和使用租约 |
+| `packages/sandbox/src/manager.ts` | 创建、连接、闲置 checkpoint、恢复与回收 |
+| `packages/sandbox/src/providers/gvisor/` | gVisor provider，与宿主 helper 通信 |
+| `scripts/gvisor-helper/server.mjs` | 调用 runsc，管理网络、checkpoint 和端口转发 |
+| `packages/docker-sandbox/` | Docker 后端及其数据备份、恢复实现 |
 
-## ContainerCodexRuntime
+生命周期与具体 provider 分开管理。运行状态保存使用 `checkpoint/restore`，文件备份恢复使用独立的数据归档接口。
 
-`backend/execution/container-runtime.ts` — 业务层的 Sandbox 运行时。
+## 运行配置
 
-### 关键操作
+| 配置 | 用途 |
+| --- | --- |
+| `SANDBOX_PROVIDER=gvisor` | 选择 gVisor 后端 |
+| `DOCKER_SANDBOX_IMAGE` | 提供环境文件系统的项目镜像 |
+| `GVISOR_HELPER_URL` | 宿主 helper 地址 |
+| `GVISOR_BUNDLE_ROOT` | 文件系统 bundle 目录 |
+| `GVISOR_NETNS_ROOT` | 网络 namespace 目录 |
+| `GVISOR_APP_SERVER_HOST` | CoCell 连接 App Server 的地址 |
+| `SANDBOX_AUTO_CHECKPOINT_AFTER_MS` | 自动 checkpoint 的闲置阈值 |
 
-- **executeTurn**: 向 Sandbox AppServer 提交 Codex turn，WebSocket 流式接收结果
-- **createArchive**: 委托 DockerSandboxClient.archive，产出 tar.gz
-- **restoreArchive**: 上传 tar.gz → 容器内解压（排除 AGENTS.md）
-- **rebuild**: 创建新容器 + 恢复归档
-- **inspect**: 检查容器是否存在，不存在时标记为 `unavailable`
-
-## 生命周期
-
-```
-项目创建 → Sandbox 懒加载（首次执行任务时创建）
-     ↓
-定时快照（30min 阈值）→ scheduledArchiveForProject
-     ↓
-标记完成 → 1 天后自动归档 → archiveProjectNow → 删除 Sandbox
-     ↓
-已归档 → rebuildProjectSandbox → 新容器 + 恢复最新归档
-```
-
-## Docker Compose 配置
-
-- `DOCKER_HOST: tcp://host.docker.internal:2375` — 容器内 Docker CLI 通过 TCP 连接宿主机 daemon
-- `DOCKER_SANDBOX_NETWORK: swarm-hive_default` — Sandbox 容器与 CoCell 同网络
-- `extra_hosts: host.docker.internal:host-gateway` — DNS 解析宿主机
-
-## 环境变量
-
-| 变量 | 说明 |
-|------|------|
-| `DOCKER_SANDBOX_IMAGE` | Sandbox 镜像名 |
-| `DOCKER_SANDBOX_NETWORK` | Docker 网络名 |
-| `SANDBOX_WORKSPACE` | 容器内工作目录 |
-| `SANDBOX_CREDENTIALS_HOST_DIR` | 凭据宿主机路径 |
-| `SANDBOX_ARCHIVED_RECLAIM_AFTER_MS` | 完成后多久归档（默认 24h） |
-| `SANDBOX_LIFECYCLE_SCAN_INTERVAL_MS` | 生命周期扫描间隔 |
-| `SANDBOX_SCHEDULED_ARCHIVE_THRESHOLD_MS` | 定时归档阈值（默认 30min） |
+宿主需要 runsc 和 CNI。部署命令见 [gVisor helper 说明](../scripts/gvisor-helper/README.md)，挂载配置见 [sandbox.toml](../sandbox.toml)。

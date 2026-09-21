@@ -156,9 +156,8 @@ pnpm build
 后端负责项目、会话、持久化与 HTTP/SSE 接口；`packages/agentcore` 连接 Codex App Server，`packages/sandbox` 管理 Sandbox 生命周期；React 前端展示任务和项目资源。接口契约放在 `protocol/`，共享计算放在 `util/`。
 
 - [贡献指南](AGENTS.md)
-- [架构说明](ARCHITECTURE.md)
-- [Sandbox 模块](sandbox-module.md)
-- [归档模块](archive-module.md)
-- [项目文件与资源预览](workspace-resources.md)
-- [改进建议](improvements.md)
-- [运行日志](runtime-logging.md)
+- [项目](projects.md)
+- [Sandbox](sandbox-module.md)
+- [归档](archive-module.md)
+- [RBAC 与 Sandbox 角色](rbac.md)
+- [长期记忆](long-term-memory.md)

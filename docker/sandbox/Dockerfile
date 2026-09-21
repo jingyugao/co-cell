@@ -30,10 +30,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   && if getent group 1000 >/dev/null; then existing_group="$(getent group 1000 | cut -d: -f1)"; if [ "$existing_group" != user ]; then groupmod -n user "$existing_group"; fi; else groupadd --gid 1000 user; fi \
   && usermod -g user user
 
-# example-backend's maintained Dockerfile uses PHP 8.0, while its current
-# unlocked vendor tree contains dependencies requiring PHP 8.2. Install both
-# co-installable versions with the same application extensions. PHP 8.2 is the
-# default for the current vendor tree; legacy branches can invoke php8.0.
+# Support PHP 8.0 and PHP 8.2 projects with the same application extensions.
+# PHP 8.2 is the default; legacy projects can invoke php8.0 explicitly.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   curl --connect-timeout 20 --max-time 120 -fsSLo /tmp/debsuryorg-archive-keyring.deb https://packages.sury.org/debsuryorg-archive-keyring.deb \
   && dpkg -i /tmp/debsuryorg-archive-keyring.deb \

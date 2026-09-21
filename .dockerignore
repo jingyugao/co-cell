@@ -8,3 +8,8 @@ tmp
 .env
 .env.*
 !.env.example
+/auth.json
+/.git-credentials
+/.mylogin.cnf
+/.kube/
+/.ssh/

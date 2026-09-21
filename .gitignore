@@ -7,11 +7,15 @@ dist/
 data/
 # Keep project documentation; captures and local verification files stay local.
 /tmp/*
-/scripts/e2b/preview-example-backend.mjs
+/scripts/e2b/preview-*.mjs
 /scripts/e2b/configure-local-disk.sh
 
 coverage/
 *.tsbuildinfo
 *.log
 .DS_Store
-./tmp
+/auth.json
+/.git-credentials
+/.mylogin.cnf
+/.kube/
+/.ssh/

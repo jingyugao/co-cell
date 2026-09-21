@@ -144,7 +144,7 @@ PORT=3001 pnpm dev
 当前版本面向可信用户的本机、自托管使用。后续计划：
 
 - **移动端适配**：优化手机和平板上的布局、触控操作与任务跟进体验，支持多端协作。
-- **Sandbox role 与 RBAC**：按角色控制 `glab`、`kubectl` 等工具的操作权限。
+- **工具挂载与 RBAC**：Sandbox 通过 wrapper 转发 `glab`、`kubectl` 等工具调用，校验角色权限后，使用宿主机 CLI 和凭证执行。
 
 ## 参与开发
 
@@ -160,4 +160,5 @@ pnpm build
 - [Sandbox](sandbox-module.md)
 - [归档](archive-module.md)
 - [RBAC 与 Sandbox 角色](rbac.md)
+- [工具挂载](tool-mounts.md)
 - [长期记忆](long-term-memory.md)

@@ -23,7 +23,7 @@ Sandbox 提供项目代码、命令工具和 Agent 的执行环境。每个项�
 | `/home/user/.codex/docs` | 从共享知识库同步的文档 |
 | `sandbox.toml` 定义的挂载 | Git、GitLab、数据库、飞书等工具配置 |
 
-共享规则与知识的维护见[长期记忆](long-term-memory.md)，工具操作权限的设计见[RBAC](rbac.md)。
+共享规则与知识的维护见[长期记忆](long-term-memory.md)，工具操作权限的设计见[RBAC](rbac.md)。[工具挂载](tool-mounts.md)描述通过 Sandbox wrapper 转发调用、经授权后使用宿主机 CLI 和凭证执行的设计。
 
 ## 模块分工
 

@@ -3,6 +3,7 @@
 CoCell is a TypeScript, Node.js, Hono, React, and Vite web workspace for
 running coding agents in project-scoped Docker Sandboxes.
 
+swarm-hive is old name of thie project. We should use CoCell now.
 ## Development
 
 Use Node.js 22.18 or later and pnpm. Install dependencies with

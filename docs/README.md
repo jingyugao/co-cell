@@ -1,107 +1,155 @@
-# CoCell 项目说明
+# CoCell
 
-CoCell 是基于 TypeScript、Codex App Server 和 React 的单用户 Web 编码工作台。每个项目对应一个本地 Docker Sandbox；项目内多个会话共享工作区，各自保留 Codex thread。页面展示执行事件、工具详情、代码差异、文件和服务预览。
+**面向个人开发者的 AI 研发工作台：管理研发流程，按需恢复工作环境，让项目经验持续积累。**
 
-Docker 是唯一 Sandbox provider。Web 服务持有 Docker socket 的宿主机权限，本地部署不把项目容器当作安全隔离边界，只适用于可信用户。
+CoCell 将需求、项目、Agent 会话、代码工作区和知识库放在一起。你可以围绕一个需求持续推进方案、开发和验证，在多个任务间切换，并在下次回来时继续使用已有的环境和上下文，减少重复解释业务、准备环境和查找历史的工作。
 
-## 快速启动
+当前定位是自托管、单用户的研发工作台，基于 TypeScript、Hono、React 和 Codex App Server 构建。
 
-需要 Node.js 22.18+、pnpm 10、Docker Compose 和模型 API key。
+## CoCell 能做什么
+
+### 1. 管理研发流程，减少重复工作
+
+以项目组织任务和会话，保留需求来源、执行过程和工作产物。支持普通项目、关联飞书需求的项目，以及按周归集的项目。
+
+- 关联飞书项目需求，读取名称和状态，从需求入口发起技术方案讨论。
+- 同一项目中的多个会话复用工作区和 Sandbox，各自保留独立的对话上下文。
+- 将方案讨论、代码实现、问题排查放在不同会话中，减少任务切换时反复准备环境的成本。
+- 用“使用中 → 已完成 → 归档”管理项目生命周期，需要继续时恢复工作。
+
+CoCell 提供任务组织和执行环境；研发步骤由你和 Agent 在会话中推进。
+
+### 2. 按需使用 Sandbox，管理内存和磁盘占用
+
+每个项目拥有自己的 Sandbox，首次执行任务时创建，后续会话继续复用。短期闲置与长期存放采用不同的处理方式：
+
+| 场景 | 处理方式 | 收益 |
+| --- | --- | --- |
+| 暂时不用，稍后继续 | 暂停 / 恢复；gVisor 支持 checkpoint 保存运行状态并停止实例 | 减少闲置运行资源占用，使用 checkpoint 时释放实例运行内存 |
+| 项目告一段落 | 备份工作区与 Codex 状态后归档，释放原 Sandbox | 减少长期保留容器带来的磁盘占用 |
+| 重新开始工作，或原环境异常 | 校验最新备份，在新 Sandbox 中恢复并验证后切换 | 复用已保存的代码和会话状态，减少从头准备的工作 |
+
+**当前后端能力有区别：**默认 Docker 后端支持数据备份、归档和恢复；其暂停使用 [`docker pause`](https://docs.docker.com/reference/cli/docker/container/pause/)，冻结进程不等于释放内存。可选 gVisor 后端支持闲置 checkpoint 和按需恢复，默认闲置阈值为一小时；目前尚未接入 Docker 后端的数据归档恢复接口。
+
+归档保存的是工作区与 `~/.codex`，恢复时使用新环境。镜像外临时安装的系统软件需要通过镜像或初始化流程重建。压缩备份本身仍占磁盘，实际节省量取决于项目内容和保留版本数。
+
+### 3. 维护长期记忆，让经验跨任务复用
+
+把稳定的项目背景、业务规则和开发约定沉淀为可编辑的共享知识库，减少每次开始任务都重新介绍项目的工作。
+
+- **共享规则**：通过 `data/AGENTS.md` 维护工作约定。
+- **共享知识库**：通过 `data/docs/` 维护仓库职责、业务模块、常见问题和操作经验；任务准备时同步到 Sandbox，供 Agent 查阅。
+- **持续纠错**：Agent 可以提交知识库补充、纠错和环境优化建议，附上依据、目标文档和建议正文。
+- **人工维护**：在页面中编辑共享文件、处理建议状态，再把确认后的经验写入知识库。
+
+当前长期记忆以文件化知识和持久化会话为基础。建议提交后进入待处理列表，由人确认并维护知识内容。
+
+### 4. 让长任务可以持续推进
+
+浏览器关闭或刷新后，已提交的任务仍可继续执行；Web 服务重启后，会重新观察 Sandbox 已接受的活动任务。每个项目可以保留多个独立会话，同一项目的不同会话可并行推进。
+
+通知中心汇集任务完成、失败、取消和待确认事项。Agent 可通过审批工具提出需要人工决定的问题，方便你在多个项目之间切换。同项目会话共享文件，修改同一文件时仍需协调。
+
+### 5. 在一个界面检查过程、结果和成本
+
+- 查看流式回复、工具调用、执行结果和代码差异，追溯一次任务做了什么。
+- 在会话中预览项目文件、Markdown、图片，下载产物或打开项目服务预览。
+- 查看 Token 使用情况和费用估算，了解任务的模型消耗。
+- 查看 Sandbox 的 CPU、内存和磁盘指标，以及备份版本和归档文件。
+
+### 6. 复用已有研发工具，积累改进建议
+
+通过连接管理向 Sandbox 提供 Git、GitLab CLI、MySQL、飞书、Meegle 和可选 Kubernetes 的本机工具配置，减少每个项目重复接入的工作。
+
+除了完成当前任务，Agent 也可以记录代码、业务流程、知识库和开发环境中的改进机会。建议保留来源项目与会话，并支持搜索、筛选、暂缓和标记完成，便于后续集中处理。
+
+## 一个典型的工作过程
+
+1. 创建项目，填写目标或关联飞书需求。
+2. 让 Agent 阅读需求、共享知识和现有代码，讨论技术方案。
+3. 在项目会话中推进开发与验证，查看工具记录、代码差异和运行预览。
+4. 将可复用的结论写入知识库，处理 Agent 提出的改进建议。
+5. 暂时离开时利用后端支持的暂停能力；项目完成后备份归档，需要继续时恢复。
+
+## 开发与运行
+
+需要 Node.js 22.18+、pnpm 10、Docker，以及可用的模型认证和 API 入口。可选 gVisor 后端还需要宿主机的 `runsc`、CNI 和 [gVisor helper](../scripts/gvisor-helper/README.md)。
+
+以下命令安装依赖、准备共享规则文件并启动本地 Web 开发服务，请在仓库根目录执行：
 
 ```sh
 pnpm install --frozen-lockfile
 test -f .env || cp .env.example .env
+mkdir -p data/docs
+touch data/AGENTS.md
 ```
 
-在 `.env` 中填写 `CODEX_API_KEY`（或 `OPENAI_API_KEY`）；使用模型代理时设置 `OPENAI_BASE_URL`。开发模式：
+编辑 `.env`，填写 `CODEX_API_KEY`（或 `OPENAI_API_KEY`）、模型名称和所需的 `OPENAI_BASE_URL`。在 `data/AGENTS.md` 中填写工作约定，然后启动：
 
 ```sh
 PORT=3001 pnpm dev
 ```
 
-生产模式可通过 Makefile 构建 Web 镜像和 `swarm-hive-sandbox:latest` 项目镜像，再启动 Compose 服务：
+打开 <http://localhost:3001>。启动 Web 服务后，执行 Agent 任务还需要完成 Sandbox 环境配置：
 
-```sh
-make up
-```
+- 构建项目镜像：`docker build -f docker/sandbox/Dockerfile -t swarm-hive-sandbox:latest .`。
+- 配置 `DOCKER_SANDBOX_NETWORK` 对应的 Docker 网络，并确保 Sandbox 能访问模型入口和 `SANDBOX_APPROVAL_MCP_URL`。
+- 按需在连接页导入研发工具凭据；Kubernetes 通过 `COCELL_KUBECONFIG` 显式启用。
 
-若直接使用 Compose，先在宿主机执行 `docker build -f docker/sandbox/Dockerfile -t swarm-hive-sandbox:latest .`，再执行 `docker compose up -d --build`。
+仓库也提供 [Docker Compose 配置](../docker-compose.yml)。使用前需要准备其中声明的外部 MySQL volume、CLIProxyAPI 配置与认证文件，并按运行环境核对 Docker daemon 地址和挂载路径。它目前需要本机配置，尚不是开箱即用的安装向导。
 
-打开 http://localhost:3001 。创建项目和会话本身不创建容器，首次发送任务时才创建。同一项目后续会话复用容器。
+服务、镜像和部分环境变量中仍保留历史名称 `swarm-hive`，项目名称统一为 **CoCell**。
 
-## 配置与持久目录
+## 配置与数据
 
-完整配置见 `.env.example`。常用变量：
+基础配置见 [`.env.example`](../.env.example)。常用选项：
 
 | 变量 | 用途 |
 | --- | --- |
-| `PORT` | HTTP 端口，应用默认 `3000`，Compose 固定为 `3001` |
-| `CODEX_API_KEY` / `OPENAI_API_KEY` | 模型认证，前者优先 |
-| `OPENAI_BASE_URL` | 容器可访问的 Responses API 地址 |
-| `CODEX_MODEL` | 默认模型 |
-| `DOCKER_SANDBOX_IMAGE` | 项目容器镜像，默认 `swarm-hive-sandbox:latest` |
-| `SANDBOX_WORKSPACE` | 项目容器内工作目录，默认 `/home/user/workspace` |
+| `PORT` | Web 端口；程序默认 `3000`，示例使用 `3001` |
+| `CODEX_API_KEY` / `OPENAI_API_KEY` | 模型认证 |
+| `OPENAI_BASE_URL` / `CODEX_MODEL` | 模型入口与默认模型 |
+| `SANDBOX_PROVIDER` | `docker`（默认）或 `gvisor` |
+| `DOCKER_SANDBOX_IMAGE` | 项目 Sandbox 镜像 |
+| `DOCKER_SANDBOX_NETWORK` | Docker Sandbox 使用的网络 |
+| `SANDBOX_APPROVAL_MCP_URL` | Sandbox 可访问的人工确认工具入口 |
+| `SANDBOX_AUTO_CHECKPOINT_AFTER_MS` | 支持 checkpoint 的后端的闲置阈值，默认一小时 |
 | `SANDBOX_ARCHIVED_RECLAIM_AFTER_MS` | 已完成项目自动归档前的等待时间，默认一天 |
-| `SANDBOX_LIFECYCLE_SCAN_INTERVAL_MS` | 项目生命周期巡检间隔，默认一分钟 |
-| `CODEX_WEB_DATA_DIR` | JSON 元数据及旧数据导入目录，默认 `data/web-state` |
-| `MYSQL_URL` | 配置后使用 MySQL 保存项目和会话元数据 |
+| `SANDBOX_SCHEDULED_ARCHIVE_THRESHOLD_MS` | 周期备份阈值，默认 30 分钟 |
+| `CODEX_WEB_DATA_DIR` | JSON 元数据目录，默认 `data/web-state` |
+| `MYSQL_URL` | 启用 MySQL 元数据存储及版本化归档管理 |
 
-Sandbox 内 Codex 固定使用 `danger-full-access` 和命令网络访问。项目范围由共享及项目 `AGENTS.md` 约定，而不是依赖容器提供安全隔离。
+需要保留和备份的数据：
 
-需要单独备份：
-
-| 路径 | 内容 |
+| 位置 | 内容 |
 | --- | --- |
-| `data/web-state/` 或 MySQL | 项目、会话元数据 |
+| `data/web-state/` 或 MySQL | 项目、会话及相关元数据 |
+| `data/sandbox-data-archives/` | 工作区和 Codex 状态的压缩备份 |
+| `data/AGENTS.md`、`data/docs/` | 共享规则和长期知识 |
+| `data/improvements.sqlite` | 改进建议及处理记录 |
 | `data/images/` | 上传图片 |
-| `data/improvements.sqlite` | 改进建议 |
-| `data/AGENTS.md`、`data/docs/` | 下发给项目的共享规则和知识库 |
-| `data/credentials/` | 连接凭据 |
-| `data/logs/` | 运行诊断日志 |
+| `data/credentials/` | 本机连接配置与凭据 |
+| gVisor 配置的 bundle / checkpoint 目录 | 使用该后端时的文件系统与运行状态 |
 
-项目工作区和 `~/.codex` 只存在于当前 Docker 容器中。项目归档会立即删除并解绑容器，不保留 Sandbox 快照；重建会创建全新的空容器，不能恢复旧工作区或旧容器内的 Codex thread。
+数据文件和对应元数据需要一起备份；共享知识与连接配置独立于项目归档维护。
 
-## 执行与生命周期
+## 当前定位与后续方向
 
-- 同一会话同时只运行一个 turn；同项目不同会话可以并行，文件和端口冲突由使用者协调。
-- 关闭或刷新浏览器只取消订阅，不停止任务。Web 服务重启后会重新观察已被 Sandbox App Server 接受的活动 turn，不会重复提交 prompt；尚未被接受的启动中任务仍会取消。
-- 删除会话只删除网页历史和附件，保留项目 Sandbox；删除项目会删除全部会话和当前容器。
-- 项目可从“使用中”标记为“已完成”，到期后巡检自动归档并删除容器。
-- 归档项目不能进入或执行任务，只展示“重建 Sandbox”。重建成功后项目回到使用中。
-- Docker 使用 host network，项目服务端口直接位于宿主机；不同项目使用同一端口会冲突。
-- 连接页导入的 `glab`、MySQL、Git、Lark、Meegle 和 Kubernetes 凭据会在下一轮任务准备阶段同步到 Sandbox。
+当前版本面向可信用户的本机、自托管使用。下一步计划增加 Sandbox role 与 RBAC，按角色控制 `glab`、`kubectl` 等工具的操作权限；这部分尚未实现。
 
-## 开发与验证
+## 参与开发
 
 ```sh
 pnpm typecheck
 pnpm build
-tests=$(rg --files backend fe util | rg '\.test\.tsx?$' | tr '\n' ' ')
-node --import tsx --test $tests
 ```
 
-代码结构：
+后端负责项目、会话、持久化与 HTTP/SSE 接口；`packages/agentcore` 连接 Codex App Server，`packages/sandbox` 管理 Sandbox 生命周期；React 前端展示任务和项目资源。接口契约放在 `protocol/`，共享计算放在 `util/`。
 
-| 目录 | 职责 |
-| --- | --- |
-| `backend/projects/` | 项目记录、状态和归档操作 |
-| `backend/sessions/` | 会话、任务、订阅及跨模块协调 |
-| `backend/execution/` | Container runtime、worker 和执行事件 |
-| `backend/sandboxes/` | 项目绑定、Docker provider、资源清单和预览 |
-| `packages/sandbox/` | provider-neutral Sandbox 生命周期协调层 |
-| `packages/docker-sandbox/` | Docker 命令传输实现 |
-| `packages/agentcore/` | Codex App Server JSON-RPC 适配层 |
-| `backend/connections/`、`backend/shared-files/` | 凭据和共享文档 |
-| `protocol/` | 前后端数据契约 |
-| `fe/features/` | 各业务页面和局部逻辑 |
-
-## 文档索引
-
-- [项目开发指南](AGENTS.md)
-- [项目与会话](projects.md)
-- [项目文件与资源链接](workspace-resources.md)
-- [Agent 改进建议](improvements.md)
+- [贡献指南](AGENTS.md)
+- [架构说明](ARCHITECTURE.md)
+- [Sandbox 模块](sandbox-module.md)
+- [归档模块](archive-module.md)
+- [项目文件与资源预览](workspace-resources.md)
+- [改进建议](improvements.md)
 - [运行日志](runtime-logging.md)
-- [原始 HTTP 抓包](http-capture.md)
-- [模型过载重试](model-overload-retries.md)
-- [Kubernetes 开发调试权限](kubernetes-access.md)

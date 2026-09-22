@@ -25,7 +25,7 @@ import { modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
 import { DockerSandboxClient } from '../packages/docker-sandbox/src/index.js';
 import { dockerSandboxProvider } from './sandboxes/docker-provider.js';
-import { loadSandboxMounts } from './sandboxes/mounts.js';
+import { loadSandboxConfig } from './sandboxes/mounts.js';
 import { ConnectionStore } from './connections/store.js';
 import { ApprovalMcpService } from './approvals/mcp.js';
 
@@ -45,16 +45,6 @@ const configOverrides = process.env.CODEX_CONFIG_OVERRIDES_JSON ? JSON.parse(pro
 const codex = new Codex({ ...(apiKey ? { apiKey } : {}), ...(process.env.CODEX_PATH ? { codexPathOverride: process.env.CODEX_PATH } : {}),
   config: modelConfig, ...(configOverrides ? { configOverrides } : {}) });
 
-const sandboxImage = process.env.DOCKER_SANDBOX_IMAGE || 'cellbox:latest';
-const cellboxUser = process.env.CELLBOX_USER || 'user';
-const cellboxUid = Number(process.env.CELLBOX_UID || 1000);
-const cellboxGid = Number(process.env.CELLBOX_GID || 1000);
-if (!Number.isInteger(cellboxUid) || cellboxUid < 0 || !Number.isInteger(cellboxGid) || cellboxGid < 0) throw new Error('CELLBOX_UID and CELLBOX_GID must be non-negative integers');
-const sandboxWorkingDirectory = process.env.SANDBOX_WORKSPACE || '/home/user/workspace';
-const localWorkingDirectory = resolve(process.env.CODEX_WORKSPACE || process.cwd());
-const defaults: Settings = { executionMode: 'sandbox', workingDirectory: sandboxWorkingDirectory,
-  model: process.env.CODEX_MODEL || DEFAULT_MODEL, modelReasoningEffort: 'medium', sandboxMode: 'danger-full-access',
-  webSearchMode: 'cached', networkAccessEnabled: true };
 const runtimeLog = new RuntimeLog({ ...(process.env.RUNTIME_LOG_DIRECTORY ? { directory: resolve(process.env.RUNTIME_LOG_DIRECTORY) } : {}),
   secrets: [apiKey].filter((value): value is string => Boolean(value)) });
 // Tests and parallel local instances can isolate their capability token and
@@ -98,7 +88,19 @@ for (const file of ['gitconfig', 'git-credentials', '.mylogin.cnf']) {
   catch { await writeFile(resolve(sandboxCredentialsDirectory, file), '', { mode: 0o600, flag: 'wx' }); }
 }
 const cellboxConfigPath = resolve(process.env.CELLBOX_CONFIG_PATH || 'sandbox.toml');
-const sandboxMounts = await loadSandboxMounts(cellboxConfigPath);
+const cellboxConfig = await loadSandboxConfig(cellboxConfigPath);
+const sandboxImage = cellboxConfig.runtime.image || process.env.DOCKER_SANDBOX_IMAGE || 'cellbox:latest';
+const cellboxUser = cellboxConfig.runtime.user || process.env.CELLBOX_USER || 'user';
+const cellboxUid = cellboxConfig.runtime.uid ?? Number(process.env.CELLBOX_UID || 1000);
+const cellboxGid = cellboxConfig.runtime.gid ?? Number(process.env.CELLBOX_GID || 1000);
+if (!Number.isInteger(cellboxUid) || cellboxUid < 0 || !Number.isInteger(cellboxGid) || cellboxGid < 0) throw new Error('CELLBOX_UID and CELLBOX_GID must be non-negative integers');
+const sandboxWorkingDirectory = cellboxConfig.runtime.workingDirectory || process.env.SANDBOX_WORKSPACE || '/home/user/workspace';
+const sandboxNetwork = cellboxConfig.runtime.network || process.env.DOCKER_SANDBOX_NETWORK || 'swarm-hive_default';
+const sandboxMounts = cellboxConfig.mounts;
+const localWorkingDirectory = resolve(process.env.CODEX_WORKSPACE || process.cwd());
+const defaults: Settings = { executionMode: 'sandbox', workingDirectory: sandboxWorkingDirectory,
+  model: process.env.CODEX_MODEL || DEFAULT_MODEL, modelReasoningEffort: 'medium', sandboxMode: 'danger-full-access',
+  webSearchMode: 'cached', networkAccessEnabled: true };
 const sandboxAppServerTokenHostPath = process.env.SANDBOX_APP_SERVER_TOKEN_HOST_PATH || sandboxAppServerToken;
 const sharedAgentsPath = resolve('data/AGENTS.md');
 const sharedAgentsHostPath = process.env.SANDBOX_SHARED_AGENTS_PATH || sharedAgentsPath;
@@ -106,7 +108,7 @@ const sharedAgentsHostPath = process.env.SANDBOX_SHARED_AGENTS_PATH || sharedAge
 await chmod(sharedAgentsPath, 0o644);
 const cellboxProxySource = (await readFile(resolve('backend/cellbox-proxy.mjs'))).toString('base64');
 const appServerCommand = "const fs=require('node:fs'); if (!fs.existsSync('/tmp/cellbox-proxy.mjs')) fs.writeFileSync('/tmp/cellbox-proxy.mjs',Buffer.from(process.env.CELLBOX_PROXY_SOURCE,'base64')); const {spawn}=require('node:child_process'); spawn('node',['/tmp/cellbox-proxy.mjs'],{stdio:'inherit',detached:true}).unref(); const extra=JSON.parse(process.env.CODEX_APP_SERVER_ARGS||'[]'); const child=spawn('codex',['app-server',...extra,'--listen',`ws://0.0.0.0:${process.env.CODEX_APP_SERVER_PORT}`, '--ws-auth','capability-token','--ws-token-file','/home/user/.codex-web/app-server-token'],{stdio:'inherit'}); child.on('exit',(code,signal)=>process.exit(code??(signal?1:0))); process.on('SIGTERM',()=>child.kill('SIGTERM')); process.on('SIGINT',()=>child.kill('SIGINT')); ";
-const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BIN || 'docker', process.env.DOCKER_SANDBOX_NETWORK || 'swarm-hive_default', sandboxAppServerTokenHostPath, sharedAgentsHostPath,
+const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BIN || 'docker', sandboxNetwork, sandboxAppServerTokenHostPath, sharedAgentsHostPath,
   process.env.SANDBOX_APP_SERVER_HOST, sandboxMounts, {
     ...(apiKey ? { CODEX_API_KEY: apiKey } : {}), ...(process.env.OPENAI_BASE_URL ? { OPENAI_BASE_URL: process.env.OPENAI_BASE_URL } : {}),
     CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, [...(configOverrides ?? []), ...approvalMcpOverrides]).slice(1)), CELLBOX_PROXY_SOURCE: cellboxProxySource,

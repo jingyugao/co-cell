@@ -15,7 +15,8 @@
     "capture:http": "tsx backend/infra/diagnostics/capture-demo.ts",
     "credentials:import": "tsx backend/connections/import-local.ts",
     "credentials:migrate": "tsx backend/connections/migrate-credentials.ts",
-    "cliproxyapi": "node scripts/cliproxyapi/manage.mjs"
+    "cliproxyapi": "node scripts/cliproxyapi/manage.mjs",
+    "env:audit": "node scripts/config/audit-env.mjs"
   },
   "dependencies": {
     "@hono/node-server": "2.1.1",

@@ -50,4 +50,4 @@ Sandbox 提供项目代码、命令工具和 Agent 的执行环境。每个项�
 | `GVISOR_APP_SERVER_HOST` | CoCell 连接 App Server 的地址 |
 | `SANDBOX_AUTO_CHECKPOINT_AFTER_MS` | 自动 checkpoint 的闲置阈值 |
 
-宿主需要 runsc 和 CNI。部署命令见 [gVisor helper 说明](../scripts/gvisor-helper/README.md)，挂载配置见 [sandbox.toml](../sandbox.toml)。
+宿主需要 runsc 和 CNI。部署命令见 [gVisor helper 说明](../scripts/gvisor-helper/README.md)，挂载配置由所选 Box 的 `sandbox.toml` 提供。

@@ -24,11 +24,12 @@ function fmtMtime(ts?: string) {
 
 type Props = {
   archiveKey: string;
-  archiveMeta: { sizeBytes: number; createdAt: string; sha256: string } | null;
+  versionId?: string;
+  archiveMeta: { sizeBytes: number; bytesAdded?: number; createdAt: string } | null;
   onClose: () => void;
 };
 
-export default function ArchiveViewer({ archiveKey, archiveMeta, onClose }: Props) {
+export default function ArchiveViewer({ archiveKey, versionId, archiveMeta, onClose }: Props) {
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [currentPath, setCurrentPath] = useState('');
   const [viewingFile, setViewingFile] = useState<{ path: string; content: string; truncated: boolean } | null>(null);
@@ -37,32 +38,32 @@ export default function ArchiveViewer({ archiveKey, archiveMeta, onClose }: Prop
 
   useEffect(() => {
     setLoading(true);
-    api<{ entries: FileEntry[]; rootPrefix: string }>(`/api/archives/${encodeURIComponent(archiveKey)}/files`)
+    api<{ entries: FileEntry[]; rootPrefix: string }>(`/api/archives/${encodeURIComponent(archiveKey)}/files${versionId ? `?version=${encodeURIComponent(versionId)}` : ''}`)
       .then(r => setFiles(r.entries))
       .catch(e => setError(errorMessage(e)))
       .finally(() => setLoading(false));
-  }, [archiveKey]);
+  }, [archiveKey, versionId]);
 
   const navigateTo = useCallback(async (path: string) => {
     setCurrentPath(path);
     setViewingFile(null);
     setLoading(true);
     try {
-      const r = await api<{ entries: FileEntry[] }>(`/api/archives/${encodeURIComponent(archiveKey)}/files?path=${encodeURIComponent(path)}`);
+      const r = await api<{ entries: FileEntry[] }>(`/api/archives/${encodeURIComponent(archiveKey)}/files?path=${encodeURIComponent(path)}${versionId ? `&version=${encodeURIComponent(versionId)}` : ''}`);
       setFiles(r.entries);
     } catch (e) { setError(errorMessage(e)); }
     finally { setLoading(false); }
-  }, [archiveKey]);
+  }, [archiveKey, versionId]);
 
   const viewFile = useCallback(async (filePath: string) => {
     setViewingFile(null);
     setLoading(true);
     try {
-      const r = await api<{ content: string; truncated: boolean }>(`/api/archives/${encodeURIComponent(archiveKey)}/file?path=${encodeURIComponent(filePath)}`);
+      const r = await api<{ content: string; truncated: boolean }>(`/api/archives/${encodeURIComponent(archiveKey)}/file?path=${encodeURIComponent(filePath)}${versionId ? `&version=${encodeURIComponent(versionId)}` : ''}`);
       setViewingFile({ path: filePath, content: r.content, truncated: r.truncated });
     } catch (e) { setError(errorMessage(e)); }
     finally { setLoading(false); }
-  }, [archiveKey]);
+  }, [archiveKey, versionId]);
 
   // 面包屑：useMemo 避免每次渲染重新计算
   const breadcrumbs = useMemo(() => currentPath ? currentPath.split('/').filter(Boolean) : [], [currentPath]);
@@ -84,7 +85,8 @@ export default function ArchiveViewer({ archiveKey, archiveMeta, onClose }: Prop
           <span className="archive-viewer-key" title={archiveKey}>{archiveKey.slice(0, 8)}</span>
           {archiveMeta && <>
             <span className="archive-viewer-sep">·</span>
-            <span className="archive-viewer-size">{fmtSize(archiveMeta.sizeBytes)}</span>
+            <span className="archive-viewer-size">{fmtSize(archiveMeta.sizeBytes)}
+              {archiveMeta.bytesAdded === undefined ? '' : ` · 新增 ${fmtSize(archiveMeta.bytesAdded)}`}</span>
             <span className="archive-viewer-sep">·</span>
             <span className="archive-viewer-time">{fmtTime(archiveMeta.createdAt)}</span>
           </>}

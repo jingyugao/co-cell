@@ -15,8 +15,7 @@ import { NotificationStore } from './notifications/store.js';
 import { createApp } from './app.js';
 import { SessionManager } from './sessions/manager.js';
 import { ContainerCodexRuntime } from './execution/container-runtime.js';
-import { ArchiveStore } from './archives/store.js';
-import { ArchiveManager } from './archives/manager.js';
+import { createArchiveService } from '@co-cell/archives';
 import { ProjectSandboxes } from './sandboxes/project-sandboxes.js';
 import { DockerSandboxInventory } from './sandboxes/inventory.js';
 import { RuntimeLog } from './infra/diagnostics/runtime-log.js';
@@ -112,7 +111,16 @@ const dockerClient = new DockerSandboxClient(sandboxImage, process.env.DOCKER_BI
   process.env.SANDBOX_APP_SERVER_HOST, sandboxMounts, {
     ...(apiKey ? { CODEX_API_KEY: apiKey } : {}), ...(process.env.OPENAI_BASE_URL ? { OPENAI_BASE_URL: process.env.OPENAI_BASE_URL } : {}),
     CODEX_APP_SERVER_ARGS: JSON.stringify(appServerArgs(modelConfig, [...(configOverrides ?? []), ...approvalMcpOverrides]).slice(1)), CELLBOX_PROXY_SOURCE: cellboxProxySource,
-  }, resolve('backend/cellbox-proxy.mjs'), appServerCommand, cellboxUser);
+  }, resolve('backend/cellbox-proxy.mjs'), appServerCommand, cellboxUser, {
+    root: resolve('data/sandbox-project-data'),
+    dockerRoot: resolve(process.env.SANDBOX_MOUNT_ROOT || process.cwd(), 'data/sandbox-project-data'),
+    uid: cellboxUid, gid: cellboxGid,
+  }, {
+    root: resolve('data/sandbox-restic'),
+    dockerRoot: resolve(process.env.SANDBOX_MOUNT_ROOT || process.cwd(), 'data/sandbox-restic'),
+    sandboxRoot: '/home/user/.codex-web/archives/repositories',
+    uid: cellboxUid, gid: cellboxGid,
+  });
 const sandboxProviderKind = process.env.SANDBOX_PROVIDER ?? 'docker';
 if (sandboxProviderKind !== 'docker' && sandboxProviderKind !== 'gvisor') throw new Error('SANDBOX_PROVIDER must be docker or gvisor');
 const gvisorBundleRoot = resolve(process.env.GVISOR_BUNDLE_ROOT ?? '/var/lib/swarm-hive/gvisor/bundles');
@@ -173,16 +181,33 @@ const archivedReclaimAfterMs = Number(process.env.SANDBOX_ARCHIVED_RECLAIM_AFTER
 const lifecycleScanIntervalMs = process.env.SANDBOX_LIFECYCLE_SCAN_INTERVAL_MS === undefined ? undefined : Number(process.env.SANDBOX_LIFECYCLE_SCAN_INTERVAL_MS);
 if (!Number.isFinite(archivedReclaimAfterMs) || archivedReclaimAfterMs < 0) throw new Error('SANDBOX_ARCHIVED_RECLAIM_AFTER_MS must be non-negative');
 const archiveDataDir = resolve('data/sandbox-data-archives');
-const archiveStore = process.env.MYSQL_URL ? new ArchiveStore(process.env.MYSQL_URL) : undefined;
-if (archiveStore) await archiveStore.init();
-const archiveMgr = archiveStore ? new ArchiveManager(archiveStore, archiveDataDir) : undefined;
+const archiveMgr = process.env.MYSQL_URL ? await createArchiveService({ databaseUrl: process.env.MYSQL_URL,
+  archivesDirectory: archiveDataDir,
+  ...(sandboxProviderKind === 'docker' ? { incremental: { uid: cellboxUid, gid: cellboxGid,
+    sandboxRepositoryRoot: '/home/user/.codex-web/archives/repositories' } } : {}) }) : undefined;
 manager = new SessionManager(codex, webDataDirectory, defaults, runtime, sandboxWorkingDirectory, runtimeLog,
   createWebStateStore(webDataDirectory, process.env.MYSQL_URL), webImagesDirectory, {
     archivedReclaimAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
-  }, notifications, archiveMgr);
+  }, notifications, archiveMgr,
+  cellboxConfig.backupIgnore ?? ['workspace/.go-cache/', 'workspace/.uv-cache/', 'codex/AGENTS.md', 'codex/auth.json']);
 await manager.init();
+if (archiveMgr?.supportsSnapshots) {
+  try {
+    await archiveMgr.initializeStorage();
+    const orphans = await archiveMgr.unrecordedVersions();
+    for (const orphan of orphans) await runtimeLog.write({ event: 'sandbox.backup_orphan_snapshot', ...orphan });
+  } catch (error) {
+    await runtimeLog.write({ event: 'sandbox.archive_reconciliation_failed', error });
+  }
+}
+const sandboxImageIdentity = sandboxProviderKind === 'docker'
+  ? await dockerClient.imageIdentity(sandboxImage).catch(async error => {
+    await runtimeLog.write({ event: 'sandbox.image_identity_unavailable', error });
+    return undefined;
+  }) : undefined;
 const config: AppConfig = { sandbox: { enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
+  ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}),
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
@@ -201,7 +226,23 @@ let shuttingDown = false;
 // Periodic sandbox archive for active projects — every 30 minutes
 const archiveInterval = setInterval(() => { void manager.scheduledArchive().catch(() => {}); }, 60 * 1000);
 archiveInterval.unref();
+let sweepingArchives = false;
+const sweepArchives = () => {
+  if (sweepingArchives || !archiveMgr) return;
+  sweepingArchives = true;
+  void (async () => {
+    await archiveMgr.sweepManagedVersions();
+    await archiveMgr.sweep();
+  })().catch(error => runtimeLog.write({ event: 'sandbox.archive_sweep_failed', error }))
+    .finally(() => { sweepingArchives = false; });
+};
+// Repeated service restarts must not postpone cleanup indefinitely.
+const initialArchiveSweep = setTimeout(sweepArchives, 60 * 1000);
+initialArchiveSweep.unref();
+const archiveSweepInterval = setInterval(sweepArchives, 60 * 60 * 1000);
+archiveSweepInterval.unref();
 async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await manager.close(); await sandboxManager.close();
-  clearInterval(archiveInterval);
+  clearInterval(archiveInterval); clearTimeout(initialArchiveSweep);
+  clearInterval(archiveSweepInterval);
   improvements.close(); await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); }
 process.on('SIGINT', () => void shutdown()); process.on('SIGTERM', () => void shutdown());

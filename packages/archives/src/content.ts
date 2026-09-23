@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdir, readFile, rm, stat } from 'node:fs/promises';
-import { dirname, isAbsolute, join } from 'node:path';
+import { lstat, mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import type { ResticArchives } from './restic.js';
 import type { ArchiveContentContract, ArchiveFileContent, ArchiveFileEntry, ArchiveFileInfo, ArchiveListing, ArchiveRestoreTarget, ArchiveVersionDetails } from './contract.js';
 import type { ArchiveArtifact, ArchiveSource, ArchiveVersion } from './types.js';
@@ -220,6 +220,27 @@ export class FileDriver implements ArchiveDriver {
     for (const item of items) await rm(this.storagePath(item), { force: true });
   }
 
+  /** Retired legacy versions may have a stored path outside the current naming scheme. */
+  async removeStored(storagePath: string): Promise<void> {
+    if (!this.directory || !isAbsolute(storagePath) || !storagePath.endsWith('.tar.gz')) {
+      throw new Error('Invalid stored file archive path');
+    }
+    let file;
+    try { file = await lstat(storagePath); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    if (!file.isFile() || file.isSymbolicLink()) throw new Error('Stored file archive is not a regular file');
+    const root = await realpath(this.directory);
+    const parent = await realpath(dirname(storagePath));
+    const child = relative(root, parent);
+    if (child === '..' || child.startsWith(`..${sep}`) || isAbsolute(child)) {
+      throw new Error('Stored file archive is outside the archive directory');
+    }
+    await rm(storagePath);
+  }
+
   async unrecordedVersions(_referenced: Set<string>): Promise<ArchiveReference[]> { return []; }
 
   async inspect(storagePath: string): Promise<ArchiveFileInfo> {
@@ -259,7 +280,8 @@ export class FileDriver implements ArchiveDriver {
   describe(version: ArchiveVersion): ArchiveVersionDetails {
     const value = fileOf(version);
     return { id: value.id, version: value.version, createdAt: value.createdAt,
-      sizeBytes: value.sizeBytes, label: value.sha256.slice(0, 8), isLatest: value.isLatest, metadata: value.metadata };
+      sizeBytes: value.sizeBytes, checksum: value.sha256, label: value.sha256.slice(0, 8),
+      isLatest: value.isLatest, metadata: value.metadata };
   }
 }
 
@@ -358,7 +380,8 @@ export class RevisionDriver implements ArchiveDriver {
   describe(version: ArchiveVersion): ArchiveVersionDetails {
     const value = revisionOf(version);
     return { id: value.id, version: value.version, createdAt: value.createdAt,
-      sizeBytes: value.logicalSizeBytes, bytesAdded: value.bytesAdded, label: value.snapshotId.slice(0, 8),
+      sizeBytes: value.logicalSizeBytes, bytesAdded: value.bytesAdded, revisionId: value.snapshotId,
+      label: value.snapshotId.slice(0, 8),
       isLatest: value.isLatest, metadata: value.metadata };
   }
 }

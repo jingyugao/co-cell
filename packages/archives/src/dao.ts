@@ -97,7 +97,7 @@ export class ArchiveDao {
 
   /** Reserve a version without changing the stream's visible latest version. */
   async beginPendingVersion(id: string, archiveKey: string, format: ArchiveVersion['format'],
-    storagePath: string | null, metadata: Record<string, unknown>): Promise<string> {
+    storagePath: string | null, metadata: Record<string, unknown>, repositoryId: string | null): Promise<string> {
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
@@ -112,7 +112,7 @@ export class ArchiveDao {
           repository_id, metadata, status, created_at)
          VALUES (?, ?, ?, ?, FALSE, ?, ?, ?, CAST(? AS JSON), 'pending', NOW(3))`,
         [id, archiveKey, await this.nextVersion(conn, archiveKey), streams[0]?.latest_version_id ?? null,
-          format, storagePath, format === ARCHIVE_FORMAT.snapshot ? archiveKey : null, JSON.stringify(metadata)]);
+          format, storagePath, repositoryId, JSON.stringify(metadata)]);
       await conn.commit();
       return id;
     } catch (error) { await conn.rollback(); throw error; }
@@ -128,10 +128,12 @@ export class ArchiveDao {
       storagePath: row.storage_path, repositoryId: row.repository_id } : undefined;
   }
 
-  async listPendingVersions(): Promise<Array<{ id: string; archiveKey: string; format: ArchiveVersion['format'] }>> {
+  async listPendingVersions(): Promise<Array<{ id: string; archiveKey: string; repositoryId: string | null;
+    format: ArchiveVersion['format'] }>> {
     const [rows] = await this.pool.query<ArchiveVersionRow[]>(
-      "SELECT id, archive_key, format FROM archive_versions WHERE status = 'pending' ORDER BY created_at");
+      "SELECT id, archive_key, repository_id, format FROM archive_versions WHERE status = 'pending' ORDER BY created_at");
     return rows.map(row => ({ id: row.id, archiveKey: row.archive_key,
+      repositoryId: row.repository_id,
       format: row.format as ArchiveVersion['format'] }));
   }
 
@@ -404,13 +406,16 @@ export class ArchiveDao {
   }
 
   /** 查找所有已软删除的版本，返回其文件路径列表 */
-  async listSoftDeleted(): Promise<Array<{ id: string; storeId: string }>> {
+  async listSoftDeleted(): Promise<Array<{ id: string; storagePath: string }>> {
     const [rows] = await this.pool.query<ArchiveVersionRow[]>(
-      `SELECT v.id, v.archive_key FROM archive_versions v
+      `SELECT v.id, v.storage_path FROM archive_versions v
        LEFT JOIN archive_info i ON i.latest_version_id = v.id
-       WHERE v.status = 'soft_deleted' AND v.format = ? AND i.latest_version_id IS NULL`, [ARCHIVE_FORMAT.file],
+       WHERE v.status = 'soft_deleted' AND v.format = ? AND i.latest_version_id IS NULL
+         AND v.storage_path IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM archive_versions live
+           WHERE live.storage_path = v.storage_path AND live.status IN ('active','pending'))`, [ARCHIVE_FORMAT.file],
     );
-    return rows.map(row => ({ id: row.id, storeId: row.archive_key }));
+    return rows.map(row => ({ id: row.id, storagePath: row.storage_path! }));
   }
 
   async listSoftDeletedRestic(): Promise<Array<{ id: string; repositoryId: string; snapshotId: string }>> {

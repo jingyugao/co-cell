@@ -24,8 +24,10 @@ export class ArchiveManager extends ArchiveContentService implements ArchiveServ
 
   get supportsSnapshots(): boolean { return this.storage !== undefined; }
 
-  async beginBackup(input: { storeId: string; metadata: Record<string, unknown> }): Promise<PendingArchiveBackup> {
-    const format = this.storage ? ARCHIVE_FORMAT.snapshot : ARCHIVE_FORMAT.file;
+  async beginBackup(input: { storeId: string; archiveKey?: string; hostBacked: boolean;
+    metadata: Record<string, unknown> }): Promise<PendingArchiveBackup> {
+    const archiveKey = input.archiveKey ?? input.storeId;
+    const format = input.hostBacked && this.storage ? ARCHIVE_FORMAT.snapshot : ARCHIVE_FORMAT.file;
     if (format === ARCHIVE_FORMAT.snapshot && !this.commandPaths.sandboxRepositoryRoot) {
       throw new Error('Sandbox revision repository path is not configured');
     }
@@ -34,15 +36,16 @@ export class ArchiveManager extends ArchiveContentService implements ArchiveServ
     if (format === ARCHIVE_FORMAT.file) {
       if (!this.commandPaths.sandboxArchiveDirectory) throw new Error('Sandbox archive directory is not configured');
       await mkdir(this.archivesDir, { recursive: true, mode: 0o700 });
-      storagePath = this.file.storagePath({ storeId: input.storeId, revisionId: id });
+      storagePath = this.file.storagePath({ storeId: archiveKey, revisionId: id });
     }
-    await this.dao.beginPendingVersion(id, input.storeId, format, storagePath, input.metadata);
+    await this.dao.beginPendingVersion(id, archiveKey, format, storagePath, input.metadata,
+      format === ARCHIVE_FORMAT.snapshot ? input.storeId : null);
     return { id, storeId: input.storeId };
   }
 
   async listPendingBackups(): Promise<PendingArchiveBackup[]> {
     return (await this.dao.listPendingVersions()).map(item => ({ id: item.id,
-      storeId: item.archiveKey }));
+      storeId: item.repositoryId ?? item.archiveKey }));
   }
 
   async commandForBackup(id: string, input: { sandboxId: string; sourceRoot: string;
@@ -60,9 +63,10 @@ export class ArchiveManager extends ArchiveContentService implements ArchiveServ
     if (!this.storage || !this.commandPaths.sandboxRepositoryRoot) {
       throw new Error('Sandbox revision repository path is not configured');
     }
-    return this.storage.getCmd({ storeId: pending.archiveKey, sandboxId: input.sandboxId,
+    if (!pending.repositoryId) throw new Error('Pending revision archive has no store ID');
+    return this.storage.getCmd({ storeId: pending.repositoryId, sandboxId: input.sandboxId,
       sourceRoot: input.sourceRoot, ignores: input.ignores,
-      storagePath: join(this.commandPaths.sandboxRepositoryRoot, pending.archiveKey) });
+      storagePath: join(this.commandPaths.sandboxRepositoryRoot, pending.repositoryId) });
   }
 
   async finishBackup(id: string, result: ArchiveCommandResult): Promise<ArchiveVersion> {
@@ -77,8 +81,9 @@ export class ArchiveManager extends ArchiveContentService implements ArchiveServ
       return this.dao.finishPendingVersion(id, { format: ARCHIVE_FORMAT.file, ...info });
     }
     if (!this.storage) throw new Error('Revision archives are unavailable');
+    if (!pending.repositoryId) throw new Error('Pending revision archive has no store ID');
     const summary = this.storage.parseCommandResult(result.stdout);
-    await this.storage.validate({ format: ARCHIVE_FORMAT.snapshot, repositoryId: pending.archiveKey,
+    await this.storage.validate({ format: ARCHIVE_FORMAT.snapshot, repositoryId: pending.repositoryId,
       ...summary, createdAt: new Date().toISOString() });
     return this.dao.finishPendingVersion(id, { format: ARCHIVE_FORMAT.snapshot, ...summary });
   }
@@ -184,9 +189,9 @@ export class ArchiveManager extends ArchiveContentService implements ArchiveServ
     if (!deleted.length) return 0;
 
     let fileDeleted = 0;
-    for (const { id, storeId } of deleted) {
+    for (const { id, storagePath } of deleted) {
       try {
-        await this.file.remove([{ storeId, revisionId: id }]);
+        await this.file.removeStored(storagePath);
       } catch {
         // Keep the row for retry if physical cleanup fails.
         continue;

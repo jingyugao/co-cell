@@ -6,7 +6,6 @@ import { join } from 'node:path';
 import test from 'node:test';
 import type { ArchiveDao } from './dao.js';
 import type { RevisionDriver } from './content.js';
-import { FileDriver } from './content.js';
 import { ArchiveManager } from './manager.js';
 import { ARCHIVE_FORMAT } from './formats.js';
 import type { ArchiveVersion } from './types.js';
@@ -37,7 +36,7 @@ test('pending file backup becomes finished only after the command artifact is ve
     } as unknown as ArchiveDao;
     const manager = new ArchiveManager(dao, archiveDirectory, undefined,
       { sandboxArchiveDirectory: archiveDirectory });
-    const pending = await manager.beginBackup({ storeId: 'store', metadata: {} });
+    const pending = await manager.beginBackup({ storeId: 'store', hostBacked: false, metadata: {} });
     const command = await manager.commandForBackup(pending.id,
       { sandboxId: 'sandbox', sourceRoot, ignores: [] });
     await assert.rejects(manager.finishBackup(pending.id, { exitCode: 0, stdout: '' }));
@@ -67,17 +66,16 @@ test('revision backup verifies the reported snapshot before finishing its versio
 test('file sweep keeps rows whose physical removal fails', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-archive-sweep-'));
   try {
-    const driver = new FileDriver(root);
     const goodId = '11111111-1111-4111-8111-111111111111';
     const failedId = '22222222-2222-4222-8222-222222222222';
-    const file = driver.storagePath({ storeId: 'store', revisionId: goodId });
-    const directory = driver.storagePath({ storeId: 'store', revisionId: failedId });
-    await mkdir(join(file, '..'), { recursive: true });
+    // Older versions stored arbitrary paths under the archive root.
+    const file = join(root, `${goodId}.tar.gz`);
+    const directory = join(root, `${failedId}.tar.gz`);
     await writeFile(file, 'archive');
     await mkdir(directory);
     const deleted: string[][] = [];
     const dao = {
-      listSoftDeleted: async () => [{ id: goodId, storeId: 'store' }, { id: failedId, storeId: 'store' }],
+      listSoftDeleted: async () => [{ id: goodId, storagePath: file }, { id: failedId, storagePath: directory }],
       hardDelete: async (ids: string[]) => { deleted.push(ids); },
     } as unknown as ArchiveDao;
     const manager = new ArchiveManager(dao, root);

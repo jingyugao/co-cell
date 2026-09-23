@@ -15,6 +15,7 @@ export interface SandboxRuntimeConfig {
 export interface SandboxConfig {
   mounts: SandboxMount[];
   runtime: SandboxRuntimeConfig;
+  backupIgnore?: string[];
 }
 
 const mountSections: Record<string, boolean> = { rw_mount: false, r_mount: true };
@@ -33,17 +34,31 @@ export async function loadSandboxConfig(path = resolve('sandbox.toml'), hostRoot
   let text: string;
   try { text = await readFile(path, 'utf8'); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { mounts: [], runtime: {} }; throw error; }
-  let section: 'sandbox' | boolean | undefined;
+  let section: 'sandbox' | 'backup_ignore' | boolean | undefined;
   const seen = new Set<string>();
   const mounts: SandboxMount[] = [];
   const runtime: SandboxRuntimeConfig = {};
+  let backupIgnore: string[] | undefined;
   for (const [index, raw] of text.split('\n').entries()) {
     const line = raw.trimStart().startsWith('#') ? '' : raw.replace(/\s+#.*$/, '').trim();
     if (!line) continue;
     const header = /^\[([a-z_]+)\]$/.exec(line);
     if (header) {
-      section = header[1] === 'sandbox' ? 'sandbox' : mountSections[header[1]];
+      section = header[1] === 'sandbox' || header[1] === 'backup_ignore' ? header[1] : mountSections[header[1]];
       if (section === undefined) throw new Error(`${path}:${index + 1}: unsupported section`);
+      if (section === 'backup_ignore') backupIgnore ??= [];
+      continue;
+    }
+    if (section === 'backup_ignore') {
+      const entry = /^"([^"\\]*(?:\\.[^"\\]*)*)"\s*=\s*true\s*$/.exec(line);
+      if (!entry) throw new Error(`${path}:${index + 1}: expected a quoted path set to true`);
+      const value = entry[1].replace(/\\"/g, '"');
+      if (!/^(workspace|codex)\/[A-Za-z0-9_.\/-]+\/?$/.test(value) || value.includes('\0')
+        || value.includes('\\') || value.split('/').some(part => part === '.' || part === '..') || value.includes('//')) {
+        throw new Error(`${path}:${index + 1}: backup_ignore paths must stay relative to project data`);
+      }
+      if (backupIgnore!.includes(value)) throw new Error(`${path}:${index + 1}: duplicate backup_ignore path`);
+      backupIgnore!.push(value);
       continue;
     }
     const entry = /^(?:"([^"\\]*(?:\\.[^"\\]*)*)"|([A-Za-z0-9_.-]+))\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"\s*$/.exec(line);
@@ -69,7 +84,7 @@ export async function loadSandboxConfig(path = resolve('sandbox.toml'), hostRoot
     if (seen.has(expanded)) throw new Error(`${path}:${index + 1}: duplicate destination`);
     seen.add(expanded); mounts.push({ source: resolve(hostRoot || dirname(path), source), destination: expanded, readonly: section });
   }
-  return { mounts, runtime };
+  return { mounts, runtime, ...(backupIgnore ? { backupIgnore } : {}) };
 }
 
 /** Backward-compatible mount-only access for callers that do not need runtime settings. */

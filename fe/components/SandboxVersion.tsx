@@ -13,6 +13,7 @@ export interface SandboxVersionProps {
   image?: SandboxImageIdentity;
   latestImage?: SandboxImageIdentity;
   className?: string;
+  onSwitchToLatest?: () => void;
 }
 
 const date = (value: string | undefined) => value && Number.isFinite(Date.parse(value))
@@ -20,10 +21,11 @@ const date = (value: string | undefined) => value && Number.isFinite(Date.parse(
   : null;
 
 const imageVersion = (image: SandboxImageIdentity) => image.version?.trim()
+  || image.reference.match(/:([^/:@]+)$/)?.[1]?.replace(/^latest$/, '')
   || image.id.replace(/^sha256:/, '').slice(0, 12);
 
 /** Compact image-version indicator with an accessible hover/focus version chain. */
-export function SandboxVersion({ image, latestImage, className = '' }: SandboxVersionProps) {
+export function SandboxVersion({ image, latestImage, className = '', onSwitchToLatest }: SandboxVersionProps) {
   const tooltipId = useId();
   if (!image) return null;
   const isLatest = Boolean(latestImage?.id && latestImage.id === image.id);
@@ -52,6 +54,9 @@ export function SandboxVersion({ image, latestImage, className = '' }: SandboxVe
           {index < entries.length - 1 && <i aria-hidden="true">↓</i>}
         </span>)}
       </span>
+      {onSwitchToLatest && <button type="button" className="sandbox-version-switch" onClick={event => {
+        event.preventDefault(); event.stopPropagation(); onSwitchToLatest();
+      }}>切换到最新版本</button>}
     </span>}
   </span>;
 }

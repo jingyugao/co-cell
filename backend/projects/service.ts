@@ -7,7 +7,7 @@ import type { WebStateStore } from '../infra/storage/web-state.js';
 import { readRequirementInfo } from './requirements.js';
 
 export type ProjectInput = { name?: string; requirementUrl?: string | null; type?: ProjectType };
-export type ProjectUpdate = Partial<ProjectInput> & { status?: ProjectStatus };
+export type ProjectUpdate = Partial<ProjectInput> & { status?: ProjectStatus; backupRetentionCount?: number };
 
 /** Owns project records and guards operations against concurrent deletion. */
 export class ProjectService {
@@ -128,6 +128,13 @@ export class ProjectService {
     await this.mutateSandboxMetadata(id, project => { project.sandboxDataArchive = structuredClone(archive); });
   }
 
+  async updateLatestBackup(id: string, backup: NonNullable<Project['latestBackup']>, options: { clearLegacyArchive?: boolean } = {}): Promise<void> {
+    await this.mutateSandboxMetadata(id, project => {
+      project.latestBackup = structuredClone(backup);
+      if (options.clearLegacyArchive) delete project.sandboxDataArchive;
+    });
+  }
+
   /** 获取项目的归档流 key */
   getArchiveKey(id: string): string | undefined {
     return this.records.get(id)?.archiveKey;
@@ -156,6 +163,7 @@ export class ProjectService {
       // reserved its own write while storage was pending.
       current.sandbox = next.sandbox;
       current.sandboxDataArchive = next.sandboxDataArchive;
+      current.latestBackup = next.latestBackup;
       current.archiveKey = next.archiveKey;
       current.sandboxReclaimedAt = next.sandboxReclaimedAt;
       current.sandboxOperation = next.sandboxOperation;
@@ -214,10 +222,12 @@ export class ProjectService {
       if (project.type === 2 && !input.requirementUrl?.trim()) throw new HttpError(400, '飞书项目必须绑定飞书需求');
       if (project.type !== 2 && input.requirementUrl) throw new HttpError(400, '只有飞书项目可以绑定飞书需求');
     }
+    if (input.backupRetentionCount !== undefined && (!Number.isInteger(input.backupRetentionCount)
+      || input.backupRetentionCount < 2 || input.backupRetentionCount > 100)) throw new HttpError(400, '备份保留数量须为 2 到 100');
     const release = this.acquire(id);
     const previous = {
       name: project.name, requirementUrl: project.requirementUrl, status: project.status, completedAt: project.completedAt, archivedAt: project.archivedAt,
-      lifecycleHistory: structuredClone(project.lifecycleHistory), updatedAt: project.updatedAt,
+      lifecycleHistory: structuredClone(project.lifecycleHistory), backupRetentionCount: project.backupRetentionCount, updatedAt: project.updatedAt,
     };
     const revision = (this.revisions.get(id) ?? 0) + 1;
     this.revisions.set(id, revision);
@@ -225,6 +235,7 @@ export class ProjectService {
     try {
       if (input.name !== undefined) project.name = input.name.trim();
       if (input.requirementUrl !== undefined) project.requirementUrl = input.requirementUrl;
+      if (input.backupRetentionCount !== undefined) project.backupRetentionCount = input.backupRetentionCount;
       const requestedStatus = input.status;
       if (requestedStatus !== undefined && requestedStatus !== project.status) {
         const from = project.status;
@@ -255,6 +266,7 @@ export class ProjectService {
         project.completedAt = previous.completedAt;
         project.archivedAt = previous.archivedAt;
         project.lifecycleHistory = previous.lifecycleHistory;
+        project.backupRetentionCount = previous.backupRetentionCount;
         if (project.updatedAt === updatedAt) project.updatedAt = previous.updatedAt;
       }
       throw error;

@@ -18,7 +18,7 @@ export interface ResticSnapshot {
   version: string;
 }
 
-/** Service-owned Restic repositories. Neither the password nor repository is mounted in a Sandbox. */
+/** Service-managed repositories. A project's repository may be mounted in its Sandbox; the password stays service-only. */
 export class ResticArchives {
   readonly repositoryRoot: string;
   readonly passwordFile: string;
@@ -105,6 +105,11 @@ export class ResticArchives {
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       await this.run(repositoryId, ['init']);
+      // The service initializes the repository as root, while the Sandbox
+      // command writes subsequent snapshots as the configured Sandbox user.
+      if (this.uid !== undefined && this.gid !== undefined) {
+        await exec('chown', ['-R', `${this.uid}:${this.gid}`, path]);
+      }
     }
   }
 

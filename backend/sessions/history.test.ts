@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Session, Settings, StreamMessage, Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
-import type { ArchiveManager } from '../archives/manager.js';
+import { createArchiveReader, type ArchiveService } from '@co-cell/archives';
 import { SessionManager, type CodexClient } from './manager.js';
 
 const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/user/workspace', model: 'test',
@@ -205,10 +205,14 @@ test('recovery validates latest backup, preserves old binding until verified, an
     await manager['updateSandbox'](session.projectId, session.id, { ...sandbox, status: 'unavailable' });
     const archivePath = join(f.directory, 'backup.tar.gz');
     await manager['projects'].saveArchiveKey(session.projectId!, 'archive-stream');
+    const reader = createArchiveReader();
     manager['_archiveManager'] = {
-      async getLatest() { return { storagePath: archivePath, sizeBytes: 6, sha256: createHash('sha256').update('backup').digest('hex') }; },
+      validate: reader.validate.bind(reader),
+      restore: reader.restore.bind(reader),
+      async getLatest() { return reader.artifactFromFile({ storagePath: archivePath, sizeBytes: 6,
+        sha256: createHash('sha256').update('backup').digest('hex'), createdAt: new Date().toISOString() }); },
       async retain() {},
-    } as unknown as ArchiveManager;
+    } as unknown as ArchiveService;
     await assert.rejects(manager.rebuildProjectSandbox(session.projectId!), /最新备份不存在/);
     assert.equal(manager.getProject(session.projectId!).status, 'active');
     // The runtime stub verifies restoration; this fixture only needs a nonempty backup file.

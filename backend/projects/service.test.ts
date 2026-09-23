@@ -70,6 +70,22 @@ test('an archived Sandbox project cannot change status directly before rebuild',
   assert.equal(service.get(value.id).lifecycleHistory, undefined);
 });
 
+test('backup retention accepts and persists counts from 2 to 100', async () => {
+  const state = new MemoryState([project()]);
+  const service = new ProjectService(state);
+  await service.init();
+
+  for (const count of [1, 101, 2.5]) {
+    await assert.rejects(service.update('project-1', { backupRetentionCount: count }), /备份保留数量/);
+  }
+  assert.equal(service.get('project-1').backupRetentionCount, undefined);
+
+  await service.update('project-1', { backupRetentionCount: 2 });
+  assert.equal(state.projects[0].backupRetentionCount, 2);
+  await service.update('project-1', { backupRetentionCount: 100 });
+  assert.equal(service.get('project-1').backupRetentionCount, 100);
+});
+
 test('weekly projects are unique per China week and become last-week projects in the following week', async () => {
   let now = new Date('2026-09-13T10:00:00.000Z'); // Sunday evening in China
   const service = new ProjectService(new MemoryState([]), async () => ({ name: 'unused', status: null }), () => now);

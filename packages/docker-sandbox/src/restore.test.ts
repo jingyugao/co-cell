@@ -21,8 +21,8 @@ test('CellBox proxy is copied before the managed process starts', async () => {
   assert.deepEqual(calls, ['create', 'cp', 'start']);
 });
 
-for (const failCopy of [false, true]) {
-  test(`archive restoration copies offline and only starts after successful copies (failCopy=${failCopy})`, async () => {
+for (const failCopy of [false, true]) for (const initialStatus of ['running', 'created']) {
+  test(`archive restoration copies offline and only starts after successful copies (failCopy=${failCopy}, initial=${initialStatus})`, async () => {
     const root = await mkdtemp(join(tmpdir(), 'hive-restore-test-'));
     const codex = join(root, 'home/user/.codex');
     const workspace = join(root, 'home/user/workspace');
@@ -41,7 +41,8 @@ for (const failCopy of [false, true]) {
       client['call'] = async args => {
         calls.push(args[0]);
         if (args[0] === 'cp') {
-          assert.equal(calls[0], 'stop');
+          assert.deepEqual(calls.slice(0, initialStatus === 'running' ? 2 : 1),
+            initialStatus === 'running' ? ['inspect', 'stop'] : ['inspect']);
           assert.equal(args[1], '-a');
           if (args[3].endsWith('/.codex')) {
             stagedCodex = args[2];
@@ -53,11 +54,12 @@ for (const failCopy of [false, true]) {
             if (failCopy) throw new Error('copy failed');
           }
         }
-        return { stdout: '', stderr: '' } as Awaited<ReturnType<typeof client['call']>>;
+        return { stdout: args[0] === 'inspect' ? `${initialStatus}\tfalse` : '', stderr: '' } as Awaited<ReturnType<typeof client['call']>>;
       };
       if (failCopy) await assert.rejects(client.restoreArchive('sandbox', archive), /copy failed/);
       else await client.restoreArchive('sandbox', archive);
-      assert.deepEqual(calls, failCopy ? ['stop', 'cp', 'cp'] : ['stop', 'cp', 'cp', 'start']);
+      const expected = ['inspect', ...(initialStatus === 'running' ? ['stop'] : []), 'cp', 'cp', ...(!failCopy ? ['start'] : [])];
+      assert.deepEqual(calls, expected);
       await assert.rejects(access(stagedCodex));
     } finally { await rm(root, { recursive: true, force: true }); }
   });

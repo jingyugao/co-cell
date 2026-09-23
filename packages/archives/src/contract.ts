@@ -60,6 +60,8 @@ export interface ArchiveVersionDetails {
   createdAt: string;
   sizeBytes: number;
   bytesAdded?: number;
+  revisionId?: string;
+  checksum?: string;
   label: string;
   isLatest: boolean;
   metadata: Record<string, unknown>;
@@ -68,7 +70,8 @@ export interface ArchiveVersionDetails {
 /** The version catalog and content operations used by project workflows and HTTP routes. */
 export interface ArchiveService extends ArchiveContentContract {
   readonly supportsSnapshots: boolean;
-  beginBackup(input: { storeId: string; metadata: Record<string, unknown> }): Promise<PendingArchiveBackup>;
+  beginBackup(input: { storeId: string; archiveKey?: string; hostBacked: boolean;
+    metadata: Record<string, unknown> }): Promise<PendingArchiveBackup>;
   listPendingBackups(): Promise<PendingArchiveBackup[]>;
   commandForBackup(id: string, input: { sandboxId: string; sourceRoot: string; ignores: readonly string[] }): Promise<ArchiveCommand>;
   finishBackup(id: string, result: ArchiveCommandResult): Promise<ArchiveVersion>;

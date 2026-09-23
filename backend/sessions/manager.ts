@@ -7,7 +7,7 @@ import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
 import type { WorkspaceFileReadOptions } from '../workspaces/files.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
-import type { ArchiveManager } from '../archives/manager.js';
+import type { ArchiveService } from '@co-cell/archives';
 
 import { HttpError } from '../../util/errors.js';
 import { ProjectService, type ProjectInput, type ProjectUpdate } from '../projects/service.js';
@@ -72,16 +72,20 @@ export class SessionManager {
     private readonly imagesDirectory = join(dataDirectory, 'images'),
     lifecycleOptions: SandboxLifecycleOptions = {},
     notifications?: NotificationStore,
-    private _archiveManager?: ArchiveManager,
+    private _archiveManager?: ArchiveService,
+    backupIgnore: string[] = [],
   ) {
     this.notifications = notifications;
     this.projects = new ProjectService(state);
     if (sandbox) {
       this.sandboxOperations = new ProjectSandboxOperations({
         projects: this.projects, runtime: sandbox, archives: () => this._archiveManager,
+        content: this._archiveManager,
         directory: join(dataDirectory, '..', 'sandbox-data-archives'),
         threadIds: id => [...this.sessions.values()].filter(session => session.projectId === id).flatMap(session => session.threadId ? [session.threadId] : []),
         saveSandbox: (id, value, restore) => this.updateSandbox(id, id, value, restore),
+        logger: this.logger,
+        backupIgnore,
         detached: async id => {
           for (const session of this.sessions.values()) {
             if (session.projectId !== id) continue;
@@ -100,11 +104,45 @@ export class SessionManager {
   }
 
   /** @internal 供归档路由使用 */
-  get archiveManager(): ArchiveManager | undefined { return this._archiveManager; }
+  get archiveManager(): ArchiveService | undefined { return this._archiveManager; }
 
   async init() {
     await this.state.init();
     await this.projects.init();
+    // A process crash can interrupt a backup while Docker is paused. The
+    // persisted operation phase survives the running -> failed reconciliation.
+    for (const project of this.projects.list()) {
+      if (project.sandbox && ['backup', 'switch'].includes(project.sandboxOperation?.kind ?? '')
+        && ['暂停环境', '创建 Restic 快照', '创建增量快照'].includes(project.sandboxOperation?.phase ?? '')) {
+        if (!this.sandbox?.resumeAfterBackup) throw new Error('Cannot reconcile an interrupted paused Sandbox backup');
+        await this.sandbox.resumeAfterBackup(project.sandbox.id);
+      }
+      if (['migrate', 'switch'].includes(project.sandboxOperation?.kind ?? '')
+        && ['创建首个 Restic 快照', '创建首个增量快照'].includes(project.sandboxOperation?.phase ?? '')) {
+        if (!this.sandbox?.resumeAfterBackup) throw new Error('Cannot reconcile an interrupted migration snapshot');
+        for (const candidate of project.pendingSandboxCleanup ?? []) await this.sandbox.resumeAfterBackup(candidate.id);
+      }
+      if (['migrate', 'switch'].includes(project.sandboxOperation?.kind ?? '') && project.sandboxOperation?.phase === '切换环境'
+        && project.archiveKey && this._archiveManager) {
+        const latest = await this._archiveManager.getLatest(project.archiveKey);
+        const hostBacked = project.sandbox && await this.sandbox?.hostData?.({ id: project.id, projectId: project.id,
+          settings: { workingDirectory: project.workingDirectory }, sandbox: project.sandbox, updatedAt: project.updatedAt });
+        if (!hostBacked && latest?.metadata.verified === true && latest.metadata.sourceSandboxId !== project.sandbox?.id) {
+          const reverted = await this._archiveManager.revertLatestVersion(project.archiveKey, latest.id);
+          if (!reverted) throw new Error(`Cannot reconcile interrupted Sandbox migration for ${project.id}`);
+          const previous = await this._archiveManager.getLatest(project.archiveKey);
+          if (previous) {
+            const details = this._archiveManager.describe(previous);
+            await this.projects.updateLatestBackup(project.id, { createdAt: details.createdAt, sizeBytes: details.sizeBytes,
+              ...(details.bytesAdded === undefined ? {} : { bytesAdded: details.bytesAdded }) });
+          }
+          if (project.sandbox) await this.sandbox?.startReplacement?.(project.sandbox).catch(() => {});
+        } else if (hostBacked && project.sandbox && latest?.metadata.sourceSandboxId === project.sandbox.id) {
+          // The old host-backed Sandbox was fenced before its replacement was persisted.
+          await this.sandbox?.startReplacement?.(project.sandbox);
+        }
+      }
+    }
     for (const session of await this.state.listSessions()) {
       // Invalid state is reported rather than silently overwriting someone's history.
       if (!session.id || !Array.isArray(session.turns) || !session.settings) {
@@ -216,10 +254,6 @@ export class SessionManager {
     // Register remote use before connection/recovery yields to lifecycle scans.
     for (const { session, turn } of recoverable) this.sandbox?.trackExecution?.(session, turn);
     for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
-    // 已归档的项目只保留最新归档，清理旧归档释放磁盘空间
-    if (this._archiveManager) {
-      void this._archiveManager.retainAll(1).catch(() => {});
-    }
     this.lifecycle?.start();
   }
 
@@ -286,22 +320,20 @@ export class SessionManager {
     return structuredClone({ ...this.lookup(id), historyError: this.historyErrors.get(id) });
   }
   async read(id: string): Promise<Session> {
-    // The persisted session is the availability path for the chat UI. Native
-    // rollout history lives in Sandbox and can be slow for long-running threads;
-    // refresh it in the background instead of turning a transient inspection
-    // timeout into a blank conversation.
+    // Prefer the App Server's current history. A saved transcript is the
+    // fallback when the Sandbox is detached or history inspection fails.
     this.lookup(id);
-    this.refreshNativeHistory(id);
+    await this.refreshNativeHistory(id);
     return this.get(id);
   }
 
-  private refreshNativeHistory(id: string) {
+  private refreshNativeHistory(id: string): Promise<void> {
     const session = this.sessions.get(id);
     const projectId = session?.projectId;
-    if (projectId && this.projects.isMaintaining(projectId)) return;
+    if (projectId && this.projects.isMaintaining(projectId)) return Promise.resolve();
     if (session?.settings.executionMode === 'sandbox' && projectId && !this.projects.get(projectId).sandbox) {
       if (session.threadId) this.historyErrors.set(id, '项目 Sandbox 尚未恢复，暂时无法补全历史消息。当前显示已保存的内容。');
-      return;
+      return Promise.resolve();
     }
     let pending = this.historyReads.get(id);
     if (!pending) {
@@ -324,6 +356,7 @@ export class SessionManager {
         .finally(() => { this.historyReads.delete(id); });
       this.historyReads.set(id, pending);
     }
+    return pending;
   }
 
   async billing(id: string): Promise<SessionCostBreakdown> {
@@ -469,10 +502,11 @@ export class SessionManager {
       if (!s.archiveKey) return s;
       try {
         const v = await archiveMgr.getLatest(s.archiveKey);
-        s.latestBackup = v ? { createdAt: v.createdAt, sizeBytes: v.sizeBytes, sha256: v.sha256 } : undefined;
-        if (v) {
-          s.sandboxDataArchive = { key: s.archiveKey, format: 'codex-workspace-v1', sha256: v.sha256, sizeBytes: v.sizeBytes, createdAt: v.createdAt, threadIds: [], workingDirectory: s.workingDirectory, sourceSandboxId: '', sourceProjectId: s.id, manifestSha256: v.sha256 };
-        } else delete s.sandboxDataArchive;
+        const latestDetails = v ? archiveMgr.describe(v) : undefined;
+        s.latestBackup = latestDetails ? { createdAt: latestDetails.createdAt,
+          sizeBytes: latestDetails.sizeBytes, bytesAdded: latestDetails.bytesAdded } : undefined;
+        delete s.sandboxDataArchive;
+        s.archiveVersions = (await archiveMgr.listVersions(s.archiveKey)).map(version => archiveMgr.describe(version));
       } catch { /* skip enrichment failure */ }
       return s;
     }));
@@ -480,7 +514,8 @@ export class SessionManager {
 
   private projectSummary(project: Project): ProjectSummary {
     return structuredClone({ ...project, status: project.status ?? (project.archivedAt ? 'archived' : 'active'), archivedAt: project.archivedAt ?? null, sessionCount: [...this.sessions.values()].filter(session => session.projectId === project.id).length,
-      latestBackup: project.sandboxDataArchive ? { createdAt: project.sandboxDataArchive.createdAt, sizeBytes: project.sandboxDataArchive.sizeBytes, sha256: project.sandboxDataArchive.sha256 } : undefined,
+      latestBackup: project.latestBackup ?? (project.sandboxDataArchive ? { createdAt: project.sandboxDataArchive.createdAt,
+        sizeBytes: project.sandboxDataArchive.sizeBytes } : undefined),
       activeSessionId: this.projects.activeSessionId(project.id) });
   }
 
@@ -507,12 +542,23 @@ export class SessionManager {
     return this.getProject(id);
   }
 
+  async migrateProjectSandbox(id: string): Promise<ProjectSummary> {
+    await this.runProjectSandboxOperation(id, 'migrate');
+    return this.getProject(id);
+  }
+
+  async switchProjectSandboxVersion(id: string, targetImageId: string): Promise<ProjectSummary> {
+    await this.runProjectSandboxOperation(id, 'switch', { targetImageId });
+    return this.getProject(id);
+  }
+
   async archiveProjectNow(id: string, options: { useExistingBackup?: boolean } = {}): Promise<ProjectSummary> {
     await this.runProjectSandboxOperation(id, 'archive', options);
     return this.getProject(id);
   }
 
-  private async runProjectSandboxOperation(id: string, kind: 'backup' | 'restore' | 'archive', options: { useExistingBackup?: boolean } = {}) {
+  private async runProjectSandboxOperation(id: string, kind: 'backup' | 'restore' | 'archive' | 'migrate' | 'switch',
+    options: { useExistingBackup?: boolean; targetImageId?: string } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
     await this.sandboxOperations.run(id, kind, options);
@@ -545,7 +591,13 @@ export class SessionManager {
   /** 对所有已归档项目清理旧归档（新方案走 ArchiveManager，旧方案走 state） */
   async pruneArchivedProjectArchives(): Promise<number> {
     if (this._archiveManager) {
-      return this._archiveManager.retainAll(1);
+      let retired = 0;
+      for (const project of this.projects.list().filter(p => p.status === 'archived' && p.archiveKey)) {
+        retired += await this._archiveManager.retain(project.archiveKey!, project.backupRetentionCount ?? 2);
+      }
+      await this._archiveManager.sweepManagedVersions();
+      await this._archiveManager.sweep();
+      return retired;
     }
     const archivesDir = join(this.dataDirectory, '..', 'sandbox-data-archives');
     const archivedProjects = this.projects.list().filter(p => p.status === 'archived');

@@ -3,7 +3,7 @@ import type { ProjectSandboxOperation, ProjectStatus, ProjectSummary, ProjectTyp
 import { api } from '../../lib/api';
 
 export type ProjectValues = { name: string; requirementUrl: string | null; type: ProjectType };
-export type ProjectUpdate = Partial<ProjectValues> & { status?: ProjectStatus };
+export type ProjectUpdate = Partial<ProjectValues> & { status?: ProjectStatus; backupRetentionCount?: number };
 
 export function useProjects() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -35,5 +35,10 @@ export function useProjects() {
   const backupProject = useCallback((id: string) => runSandboxOperation(id, 'backup', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/backup`, { method: 'POST' }),
   ), [runSandboxOperation]);
-  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox, backupProject };
+  const switchSandbox = useCallback((id: string, targetImageId: string) => runSandboxOperation(id, 'switch', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/switch-version`, {
+      method: 'POST', body: JSON.stringify({ targetImageId }),
+    }),
+  ), [runSandboxOperation]);
+  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox, backupProject, switchSandbox };
 }

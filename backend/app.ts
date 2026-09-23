@@ -18,7 +18,7 @@ import { installSessionsRoutes } from './sessions/routes.js';
 import { installApprovalMcpRoutes, type ApprovalMcpService } from './approvals/mcp.js';
 import { installNotificationRoutes } from './notifications/routes.js';
 import type { NotificationStore } from './notifications/store.js';
-import { installArchiveRoutes } from './archives/routes.js';
+import { installArchiveRoutes } from './routes/archives.js';
 
 export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, improvements?: ImprovementStore, approvalMcp?: ApprovalMcpService, notifications?: NotificationStore) {
   const app = new Hono();

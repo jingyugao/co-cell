@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Session, Settings, StreamMessage, Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
-import type { ArchiveManager } from '../archives/manager.js';
+import { createArchiveReader, type ArchiveService } from '@co-cell/archives';
 import { SessionManager, type CodexClient } from './manager.js';
 
 const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/user/workspace', model: 'test',
@@ -65,6 +65,25 @@ test('completed messages survive Web restart and failed Sandbox history reads', 
     assert.equal(stored.turns[0].prompt, '1+1等于几');
     assert.deepEqual(stored.turns[0].items, [answer]);
     unsubscribe();
+  } finally { await f.close(); }
+});
+
+test('session read returns App Server history before the saved transcript', async () => {
+  const f = await fixture();
+  try {
+    const first = await f.start();
+    const session = await first.create();
+    await first.startTurn(session.id, '1+1等于几');
+    await first.waitForIdle(session.id);
+    const completed = first.get(session.id);
+    await first.close();
+
+    const remoteAnswer = { ...answer, text: '来自 App Server 的回复' };
+    f.runtime.history = async () => ({ turns: [{ ...completed.turns[0], id: 'native-turn', items: [remoteAnswer] }] });
+    const second = await f.start();
+    const snapshot = await second.read(session.id);
+    assert.deepEqual(snapshot.turns[0].items, [remoteAnswer]);
+    assert.equal(snapshot.historyError, undefined);
   } finally { await f.close(); }
 });
 
@@ -186,10 +205,14 @@ test('recovery validates latest backup, preserves old binding until verified, an
     await manager['updateSandbox'](session.projectId, session.id, { ...sandbox, status: 'unavailable' });
     const archivePath = join(f.directory, 'backup.tar.gz');
     await manager['projects'].saveArchiveKey(session.projectId!, 'archive-stream');
+    const reader = createArchiveReader();
     manager['_archiveManager'] = {
-      async getLatest() { return { storagePath: archivePath, sizeBytes: 6, sha256: createHash('sha256').update('backup').digest('hex') }; },
+      validate: reader.validate.bind(reader),
+      restore: reader.restore.bind(reader),
+      async getLatest() { return reader.artifactFromFile({ storagePath: archivePath, sizeBytes: 6,
+        sha256: createHash('sha256').update('backup').digest('hex'), createdAt: new Date().toISOString() }); },
       async retain() {},
-    } as unknown as ArchiveManager;
+    } as unknown as ArchiveService;
     await assert.rejects(manager.rebuildProjectSandbox(session.projectId!), /最新备份不存在/);
     assert.equal(manager.getProject(session.projectId!).status, 'active');
     // The runtime stub verifies restoration; this fixture only needs a nonempty backup file.

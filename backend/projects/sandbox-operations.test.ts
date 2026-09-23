@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import type { Project } from '../../protocol/types.js';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
-import type { ArchiveManager } from '../archives/manager.js';
+import { createArchiveReader, type ArchiveService } from '@co-cell/archives';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { JsonWebStateStore } from '../infra/storage/web-state.js';
 import { ProjectService } from './service.js';
@@ -22,15 +22,22 @@ const project = (id: string, overrides: Partial<Project> = {}): Project => ({
 const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 
 class FakeArchives {
-  latest?: { storagePath: string; sizeBytes: number; sha256: string; createdAt: string };
+  private readonly reader = createArchiveReader();
+  supportsSnapshots = false;
+  latest?: ReturnType<typeof this.reader.artifactFromFile>;
   creates = 0;
+  retentions: number[] = [];
   constructor(private directory: string) {}
+  validate: ArchiveService['validate'] = archive => this.reader.validate(archive);
+  restore: ArchiveService['restore'] = (archive, target) => this.reader.restore(archive, target);
   async getLatest() { return this.latest; }
+  async retain(_key: string, count: number) { this.retentions.push(count); return 0; }
+  async applyRetention() { return 0; }
   async create(key: string | undefined, _metadata: Record<string, unknown>, create: (path: string) => Promise<{ sizeBytes: number; sha256: string }>) {
     this.creates++;
     const path = join(this.directory, `archive-${this.creates}.tar.gz`);
     const file = await create(path);
-    this.latest = { ...file, storagePath: path, createdAt: '2026-09-20T01:00:00.000Z' };
+    this.latest = this.reader.artifactFromFile({ ...file, storagePath: path, createdAt: '2026-09-20T01:00:00.000Z' });
     return { archiveKey: key ?? 'archive-stream', ...this.latest };
   }
 }
@@ -65,11 +72,12 @@ async function fixture(value: Project, control: RuntimeControl = {}, latest?: st
   const archives = new FakeArchives(directory);
   if (latest !== undefined) {
     const path = join(directory, 'latest.tar.gz'); await writeFile(path, latest);
-    archives.latest = { storagePath: path, sizeBytes: Buffer.byteLength(latest), sha256: digest(latest), createdAt: '2026-09-20T00:30:00.000Z' };
+    archives.latest = createArchiveReader().artifactFromFile({ storagePath: path, sizeBytes: Buffer.byteLength(latest),
+      sha256: digest(latest), createdAt: '2026-09-20T00:30:00.000Z' });
     await projects.saveArchiveKey(value.id, 'archive-stream');
   }
   const calls: string[] = [];
-  const operations = new ProjectSandboxOperations({ projects, runtime: runtime(control, calls), archives: () => archives as unknown as ArchiveManager,
+  const operations = new ProjectSandboxOperations({ projects, runtime: runtime(control, calls), archives: () => archives as unknown as ArchiveService,
     directory: join(directory, 'archives'), threadIds: () => ['thread-1'], saveSandbox: async (id, value, restore) => { await projects.updateSandbox(id, value, restore); }, detached: async () => {} });
   return { directory, state, projects, archives, calls, operations, async close() { await operations.close(); await projects.close(); await state.close(); await rm(directory, { recursive: true, force: true }); } };
 }
@@ -80,6 +88,7 @@ test('manual backup succeeds without changing lifecycle and a failed replacement
     await f.operations.run('11111111-1111-4111-8111-111111111111', 'backup');
     assert.equal(f.projects.get('11111111-1111-4111-8111-111111111111').status, 'active');
     assert.equal(f.archives.creates, 1);
+    assert.deepEqual(f.archives.retentions, [2]);
     const before = f.archives.latest!;
     // The archive manager should not replace a successful pointer when creation fails.
     const failing = await fixture(project('22222222-2222-4222-8222-222222222222', { archiveKey: 'archive-stream' }), { archive: 'fail' }, 'old backup');
@@ -89,6 +98,251 @@ test('manual backup succeeds without changing lifecycle and a failed replacement
     } finally { await failing.close(); }
     assert.equal(before.sha256, digest('a valid backup'));
   } finally { await f.close(); }
+});
+
+test('Restic backup resumes Docker on failure and advances the archive only after verification', async () => {
+  const id = 'abababab-abab-4bab-8bab-abababababab';
+  const f = await fixture(project(id, { archiveKey: id }), {}, 'old backup');
+  const calls: string[] = [];
+  let fail = true;
+  let versions = 0;
+  const hostRuntime: SandboxRuntime = {
+    ...runtime({}, calls),
+    async hostData() { return { root: '/source', workspace: '/source/workspace', codex: '/source/codex' }; },
+    async pauseForBackup() { calls.push('pause'); },
+    async resumeAfterBackup() { calls.push('resume'); },
+  };
+  f.archives.supportsSnapshots = true;
+  (f.archives as unknown as { prepareSnapshot: () => Promise<void> }).prepareSnapshot = async () => { calls.push('ready'); calls.push('space'); };
+  (f.archives as unknown as { captureSnapshot: () => Promise<unknown> }).captureSnapshot = async () => {
+      calls.push('snapshot');
+      if (fail) throw new Error('restic failed');
+      return { location: { storeId: id, revisionId: 'a'.repeat(64) }, logicalSizeBytes: 500, bytesAdded: 12,
+        storageSizeBytes: 600, durationMs: 42, engineVersion: 'test' };
+    };
+  (f.archives as unknown as { recordVersion: (...args: unknown[]) => unknown }).recordVersion = async () => {
+    calls.push('createVersion'); versions++;
+    return { archiveKey: id, createdAt: '2026-09-20T01:00:00.000Z' };
+  };
+  const operations = new ProjectSandboxOperations({ projects: f.projects, runtime: hostRuntime, archives: () => f.archives as unknown as ArchiveService,
+    directory: f.directory, threadIds: () => [], saveSandbox: async () => {}, detached: async () => {} });
+  try {
+    await assert.rejects(operations.run(id, 'backup'), /restic failed/);
+    assert.deepEqual(calls.slice(-3), ['pause', 'snapshot', 'resume']);
+    assert.equal(versions, 0);
+    fail = false;
+    await operations.run(id, 'backup');
+    assert.deepEqual(calls.slice(-4), ['pause', 'snapshot', 'resume', 'createVersion']);
+    assert.equal(versions, 1);
+    assert.equal(f.projects.get(id).latestBackup?.sizeBytes, 500);
+    assert.equal(f.projects.get(id).latestBackup?.bytesAdded, 12);
+    assert.equal(f.projects.get(id).sandboxOperation?.addedBytes, 12);
+  } finally { await operations.close(); await f.close(); }
+});
+
+test('command backup releases checkpoint scope and only advances after verification', async () => {
+  const id = 'edededed-eded-4ded-8ded-edededededed';
+  const f = await fixture(project(id, { archiveKey: 'archive-stream' }), {}, 'old backup');
+  const calls: string[] = [];
+  let fail = true;
+  const hostRuntime: SandboxRuntime = {
+    ...runtime({}, calls),
+    async hostData() { return { root: '/host/source', workspace: '/host/source/workspace', codex: '/host/source/codex' }; },
+    async archiveSourceRoot() { return '/home/user/.cocell-backup-source'; },
+    async quiesceForBackup() { calls.push('quiesce'); return async () => { calls.push('release'); }; },
+    async executeArchiveCommand(_sandboxId, command) {
+      calls.push(`run:${command.executable}`);
+      if (fail) throw new Error('backup command failed');
+      return { exitCode: 0, stdout: 'summary' };
+    },
+  };
+  f.archives.supportsSnapshots = true;
+  Object.assign(f.archives, {
+    async beginBackup(input: { storeId: string; archiveKey: string; hostBacked: boolean }) {
+      assert.deepEqual([input.storeId, input.archiveKey, input.hostBacked], [id, 'archive-stream', true]);
+      calls.push('pending'); return { id: 'pending-id', storeId: id };
+    },
+    async commandForBackup(_id: string, input: { sourceRoot: string }) {
+      assert.equal(input.sourceRoot, '/home/user/.cocell-backup-source');
+      calls.push('command'); return { executable: 'restic', args: [] };
+    },
+    async finishBackup() {
+      calls.push('finished'); return { id: 'version-id', archiveKey: 'archive-stream',
+        createdAt: '2026-09-20T01:00:00.000Z' };
+    },
+    async failBackup() { calls.push('failed'); },
+    describe() { return { sizeBytes: 500, bytesAdded: 12, revisionId: 'a'.repeat(64) }; },
+  });
+  const operations = new ProjectSandboxOperations({ projects: f.projects, runtime: hostRuntime,
+    archives: () => f.archives as unknown as ArchiveService, directory: f.directory, threadIds: () => [],
+    saveSandbox: async () => {}, detached: async () => {} });
+  try {
+    await assert.rejects(operations.run(id, 'backup'), /backup command failed/);
+    assert.deepEqual(calls.slice(-6), ['quiesce', 'pending', 'command', 'run:restic', 'failed', 'release']);
+    assert.equal(f.projects.get(id).latestBackup?.sizeBytes, undefined);
+    fail = false;
+    await operations.run(id, 'backup');
+    assert.equal(f.projects.get(id).latestBackup?.sizeBytes, 500);
+    assert.equal(f.projects.get(id).latestBackup?.revisionId, 'a'.repeat(64));
+    assert.ok(calls.lastIndexOf('finished') < calls.lastIndexOf('release'));
+  } finally { await operations.close(); await f.close(); }
+});
+
+test('host-backed version switch verifies the replacement before fencing the old Sandbox', async () => {
+  const id = 'cececece-cece-4cec-8cec-cececececece';
+  const oldImageId = `sha256:${'a'.repeat(64)}`;
+  const targetImageId = `sha256:${'b'.repeat(64)}`;
+  const f = await fixture(project(id, { archiveKey: id,
+    sandbox: { ...sandbox(), image: { reference: 'mybox:latest', id: oldImageId, repoDigests: [] } } }));
+  const calls: string[] = [];
+  let failVerification = true;
+  const version = { id: 'revision-version', archiveKey: id, createdAt: '2026-09-20T01:00:00.000Z',
+    metadata: { threadIds: ['thread-1'] } };
+  const hostRuntime: SandboxRuntime = {
+    ...runtime({}, calls),
+    async currentImageIdentity() { return { reference: 'mybox:latest', id: targetImageId, repoDigests: [] }; },
+    async hostData() { return { root: '/old-generation', workspace: '/old-generation/workspace', codex: '/old-generation/codex' }; },
+    async archiveSourceRoot() { return '/backup-source'; },
+    async quiesceForBackup() { calls.push('checkpoint'); return async () => {}; },
+    async executeArchiveCommand() { calls.push('backup-command'); return { exitCode: 0, stdout: 'summary' }; },
+    async createStoppedReplacement(_target, onSandbox) {
+      calls.push('create-stopped'); const replacement = sandbox('sandbox-new', 'starting');
+      await onSandbox(replacement); return { sandbox: replacement, root: '/new-generation' };
+    },
+    async startReplacement(value) { calls.push(`start:${value.id}`); },
+    async verifySandbox(value) {
+      calls.push(`verify:${value.id}`);
+      if (value.id === 'sandbox-new' && failVerification) throw new Error('verify failed');
+      if (value.id === 'sandbox-new') value.image = { reference: 'mybox:latest', id: targetImageId, repoDigests: [] };
+    },
+    async verifyHistory() { calls.push('verify-history'); },
+    track() { calls.push('track'); },
+  };
+  f.archives.supportsSnapshots = true;
+  Object.assign(f.archives, {
+    async beginBackup() { calls.push('pending'); return { id: 'pending', storeId: id }; },
+    async commandForBackup() { return { executable: 'restic', args: [] }; },
+    async finishBackup() { calls.push('finish-backup'); return version; },
+    async failBackup() {},
+    async getLatest() { return version; },
+    describe() { return { sizeBytes: 100, bytesAdded: 10, revisionId: 'c'.repeat(64) }; },
+  });
+  const operations = new ProjectSandboxOperations({ projects: f.projects, runtime: hostRuntime,
+    archives: () => f.archives as unknown as ArchiveService,
+    content: { async validate() {}, async restore(_archive, destination) {
+      await destination.restoreIntoDirectory(async root => { assert.equal(root, '/new-generation'); calls.push('populate'); });
+    } },
+    directory: f.directory, threadIds: () => ['thread-1'],
+    saveSandbox: async (projectId, value) => { await f.projects.updateSandbox(projectId, value); }, detached: async () => {} });
+  try {
+    await assert.rejects(operations.run(id, 'switch', { targetImageId }), /verify failed/);
+    assert.equal(f.projects.get(id).sandbox?.id, 'sandbox-old');
+    assert.equal(calls.includes('fence:sandbox-old'), false);
+    failVerification = false;
+    await operations.run(id, 'switch', { targetImageId });
+    assert.ok(calls.lastIndexOf('verify-history') < calls.lastIndexOf('fence:sandbox-old'));
+    assert.equal(f.projects.get(id).sandbox?.id, 'sandbox-new');
+  } finally { await operations.close(); await f.close(); }
+});
+
+test('Restic restore fills a stopped generation before start and keeps the old binding on verification failure', async () => {
+  const id = 'bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc';
+  const f = await fixture(project(id, { sandbox: sandbox('old', 'unavailable'), archiveKey: id }));
+  const calls: string[] = [];
+  let failVerification = true;
+  (f.archives as unknown as { getLatest: () => unknown }).getLatest = async () =>
+    createArchiveReader().artifactFromRevision({ location: { storeId: id, revisionId: 'b'.repeat(64) },
+      logicalSizeBytes: 500, bytesAdded: 12, metadata: { threadIds: ['thread-one'] },
+      createdAt: '2026-09-20T01:00:00.000Z' });
+  const hostRuntime: SandboxRuntime = {
+    ...runtime({}, calls),
+    async createStoppedReplacement(_target, onSandbox) {
+      calls.push('createStopped');
+      const candidate = sandbox('candidate', 'starting');
+      await onSandbox(candidate);
+      return { sandbox: candidate, root: '/empty-generation' };
+    },
+    async startReplacement() { calls.push('start'); },
+    async verifySandbox() { calls.push('verifySandbox'); if (failVerification) throw new Error('bad history'); },
+    async verifyHistory(_sandbox, ids) { calls.push(`threadRead:${ids[0]}`); },
+  };
+  const content: Pick<ArchiveService, 'validate' | 'restore'> = {
+    async validate() { calls.push('verifySnapshot'); },
+    async restore(_archive, target) {
+      calls.push('verifySnapshot');
+      await target.restoreIntoDirectory(async () => { calls.push('restoreFiles'); });
+    },
+  };
+  const operations = new ProjectSandboxOperations({ projects: f.projects, runtime: hostRuntime, archives: () => f.archives as unknown as ArchiveService,
+    content, directory: f.directory, threadIds: () => [], saveSandbox: async (projectId, value) => { await f.projects.updateSandbox(projectId, value); }, detached: async () => {} });
+  try {
+    await assert.rejects(operations.run(id, 'restore'), /bad history/);
+    assert.ok(calls.indexOf('createStopped') < calls.indexOf('restoreFiles'));
+    assert.ok(calls.indexOf('restoreFiles') < calls.indexOf('start'));
+    assert.equal(f.projects.get(id).sandbox?.id, 'old');
+    failVerification = false;
+    await operations.run(id, 'restore');
+    assert.equal(f.projects.get(id).sandbox?.id, 'candidate');
+    assert.ok(calls.includes('threadRead:thread-one'));
+  } finally { await operations.close(); await f.close(); }
+});
+
+test('explicit migration keeps the original Sandbox until tar restore and first Restic snapshot verify', async () => {
+  const id = 'cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd';
+  const f = await fixture(project(id, { archiveKey: id }));
+  const calls: string[] = [];
+  const control: RuntimeControl = { verify: 'fail' };
+  const targetImageId = `sha256:${'d'.repeat(64)}`;
+  const hostRuntime: SandboxRuntime = {
+    ...runtime(control, calls),
+    async currentImageIdentity() { return { reference: 'mybox:latest', id: targetImageId, repoDigests: [] }; },
+    async verifySandbox(value) {
+      calls.push(`verify:${value.id}`);
+      if (value.id === 'sandbox-new' && control.verify === 'fail') throw new Error('verify failed');
+      if (value.id === 'sandbox-new') value.image = { reference: 'mybox:latest', id: targetImageId, repoDigests: [] };
+    },
+    async hostData(value) { return value.sandbox?.id === 'sandbox-new'
+      ? { root: '/new-generation', workspace: '/new-generation/workspace', codex: '/new-generation/codex' } : undefined; },
+    async pauseForBackup() { calls.push('pauseCandidate'); },
+    async resumeAfterBackup() { calls.push('resumeCandidate'); },
+    async startReplacement() { calls.push('resumeOriginal'); },
+    track() { calls.push('track'); },
+  };
+  f.archives.supportsSnapshots = true;
+  (f.archives as unknown as { prepareSnapshot: () => Promise<void> }).prepareSnapshot = async () => { calls.push('prepareSnapshot'); };
+  (f.archives as unknown as { captureSnapshot: () => Promise<unknown> }).captureSnapshot = async () => {
+    calls.push('snapshot'); return { location: { storeId: id, revisionId: 'c'.repeat(64) },
+      logicalSizeBytes: 100, bytesAdded: 100, storageSizeBytes: 150, durationMs: 10, engineVersion: 'test' };
+  };
+  let reverted = 0;
+  (f.archives as unknown as { recordVersion: (...args: unknown[]) => unknown }).recordVersion = async () => {
+    calls.push('recordVersion'); return { id: 'recorded-version', archiveKey: id, createdAt: '2026-09-20T01:00:00.000Z' };
+  };
+  (f.archives as unknown as { revertLatestVersion: (...args: unknown[]) => unknown }).revertLatestVersion = async (_key, versionId) => {
+    assert.equal(versionId, 'recorded-version'); reverted++; return true;
+  };
+  const operations = new ProjectSandboxOperations({ projects: f.projects, runtime: hostRuntime, archives: () => f.archives as unknown as ArchiveService,
+    directory: f.directory, threadIds: () => [], saveSandbox: async (projectId, value) => { await f.projects.updateSandbox(projectId, value); }, detached: async () => {} });
+  try {
+    await assert.rejects(operations.run(id, 'migrate'), /verify failed/);
+    assert.equal(f.projects.get(id).sandbox?.id, 'sandbox-old');
+    assert.equal(calls.includes('snapshot'), false);
+    control.verify = 'ok';
+    control.fence = 'fail';
+    await assert.rejects(operations.run(id, 'migrate'), /fence failed/);
+    assert.equal(f.projects.get(id).sandbox?.id, 'sandbox-old');
+    assert.equal(f.projects.get(id).latestBackup?.sizeBytes, 'a valid backup'.length);
+    assert.equal(f.projects.get(id).latestBackup?.bytesAdded, undefined);
+    assert.equal(reverted, 1);
+    control.fence = 'ok';
+    await operations.run(id, 'switch', { targetImageId });
+    assert.ok(calls.indexOf('archive') < calls.indexOf('restore'));
+    assert.ok(calls.indexOf('restore') < calls.indexOf('snapshot'));
+    assert.ok(calls.indexOf('snapshot') < calls.lastIndexOf('fence:sandbox-old'));
+    assert.equal(f.projects.get(id).sandbox?.id, 'sandbox-new');
+    assert.equal(f.projects.get(id).latestBackup?.sizeBytes, 100);
+    assert.equal(f.projects.get(id).latestBackup?.bytesAdded, 100);
+  } finally { await operations.close(); await f.close(); }
 });
 
 test('active or completed projects replace unavailable or absent sandboxes and preserve business status', async () => {

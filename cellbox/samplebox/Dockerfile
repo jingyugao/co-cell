@@ -1,7 +1,7 @@
 FROM node:22.18.0-bookworm-slim
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git \
+  && apt-get install -y --no-install-recommends git restic sqlite3 \
   && rm -rf /var/lib/apt/lists/* \
   && npm install --global @openai/codex@0.153.4
 

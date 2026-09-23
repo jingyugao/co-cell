@@ -1,8 +1,9 @@
 import { useId } from 'react';
 import type { ProjectSummary } from '../../../protocol/types';
 
-type ArchiveVersion = { sizeBytes: number; createdAt: string; sha256: string; version: number; id: string };
-type Props = { project: ProjectSummary; onView: (archiveKey: string, meta: { sizeBytes: number; createdAt: string; sha256: string }) => void };
+type ArchiveVersion = NonNullable<ProjectSummary['archiveVersions']>[number];
+type Props = { project: ProjectSummary; onView: (archiveKey: string, versionId: string | undefined,
+  meta: { sizeBytes: number; bytesAdded?: number; createdAt: string }) => void };
 
 function fmtSize(bytes: number) {
   if (bytes > 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
@@ -18,17 +19,19 @@ function fmtDate(ts: string) {
 export default function ArchiveVersionBadge({ project, onView }: Props) {
   const tooltipId = useId();
   const versions: ArchiveVersion[] = (project.archiveVersions && project.archiveVersions.length > 0)
-    ? project.archiveVersions as ArchiveVersion[]
+    ? project.archiveVersions
     : project.sandboxDataArchive
-      ? [{ sizeBytes: project.sandboxDataArchive.sizeBytes, createdAt: project.sandboxDataArchive.createdAt, sha256: project.sandboxDataArchive.sha256, version: 0, id: project.sandboxDataArchive.key }]
+      ? [{ sizeBytes: project.sandboxDataArchive.sizeBytes, createdAt: project.sandboxDataArchive.createdAt,
+        label: project.sandboxDataArchive.sha256.slice(0, 8), version: 0, id: project.sandboxDataArchive.key }]
       : [];
   if (!versions.length) return null;
 
   const latest = versions[0];
-  const key = project.sandboxDataArchive?.key || project.archiveKey || latest.id;
+  const key = project.archiveKey || project.sandboxDataArchive?.key || latest.id;
 
   function handleClick(v: ArchiveVersion) {
-    onView(key, { sizeBytes: v.sizeBytes, createdAt: v.createdAt, sha256: v.sha256 });
+    onView(key, project.archiveKey ? v.id : undefined,
+      { sizeBytes: v.sizeBytes, bytesAdded: v.bytesAdded, createdAt: v.createdAt });
   }
 
   return <span className="archive-badge" tabIndex={0} aria-describedby={tooltipId}>
@@ -45,9 +48,9 @@ export default function ArchiveVersionBadge({ project, onView }: Props) {
             key={v.id}
             onClick={() => handleClick(v)}
           >
-            <code>{fmtSize(v.sizeBytes)}</code>
+            <code>{fmtSize(v.sizeBytes)}{v.bytesAdded === undefined ? '' : ` · +${fmtSize(v.bytesAdded)}`}</code>
             <time dateTime={v.createdAt}>{fmtDate(v.createdAt)}</time>
-            <em>{v.sha256.slice(0, 8)}</em>
+            <em>{v.label}</em>
             {i < versions.length - 1 && <i aria-hidden="true">↓</i>}
           </button>
         ))}

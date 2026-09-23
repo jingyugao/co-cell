@@ -8,21 +8,24 @@ importers:
 
   .:
     dependencies:
-      '@hono/node-server':
-        specifier: 2.1.1
-        version: 2.1.1(hono@4.13.3)
-      '@openai/codex':
-        specifier: 0.153.4
-        version: 0.153.4
       '@co-cell/agentcore':
         specifier: file:packages/agentcore
         version: file:packages/agentcore
+      '@co-cell/archives':
+        specifier: file:packages/archives
+        version: file:packages/archives
       '@co-cell/docker-sandbox':
         specifier: file:packages/docker-sandbox
         version: file:packages/docker-sandbox
       '@co-cell/sandbox':
         specifier: file:packages/sandbox
         version: file:packages/sandbox
+      '@hono/node-server':
+        specifier: 2.1.1
+        version: 2.1.1(hono@4.13.3)
+      '@openai/codex':
+        specifier: 0.153.4
+        version: 0.153.4
       hono:
         specifier: 4.13.3
         version: 4.13.3
@@ -71,6 +74,22 @@ importers:
         version: 8.2.2(@types/node@24.13.3)(esbuild@0.28.2)(tsx@4.23.12)
 
 packages:
+
+  '@co-cell/agentcore@file:packages/agentcore':
+    resolution: {directory: packages/agentcore, type: directory}
+    engines: {node: '>=22'}
+
+  '@co-cell/archives@file:packages/archives':
+    resolution: {directory: packages/archives, type: directory}
+    engines: {node: '>=22.18.0'}
+
+  '@co-cell/docker-sandbox@file:packages/docker-sandbox':
+    resolution: {directory: packages/docker-sandbox, type: directory}
+    engines: {node: '>=22.18.0'}
+
+  '@co-cell/sandbox@file:packages/sandbox':
+    resolution: {directory: packages/sandbox, type: directory}
+    engines: {node: '>=22.18.0'}
 
   '@esbuild/aix-ppc64@0.28.2':
     resolution: {integrity: sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ==}
@@ -376,18 +395,6 @@ packages:
 
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
-
-  '@co-cell/agentcore@file:packages/agentcore':
-    resolution: {directory: packages/agentcore, type: directory}
-    engines: {node: '>=22'}
-
-  '@co-cell/docker-sandbox@file:packages/docker-sandbox':
-    resolution: {directory: packages/docker-sandbox, type: directory}
-    engines: {node: '>=22.18.0'}
-
-  '@co-cell/sandbox@file:packages/sandbox':
-    resolution: {directory: packages/sandbox, type: directory}
-    engines: {node: '>=22.18.0'}
 
   '@types/debug@4.1.13':
     resolution: {integrity: sha512-KSVgmQmzMwPlmtljOomayoR89W4FynCAi3E8PPs7vmDVPe84hT+vGPKkJfThkmXs0x0jAaa9U8uW8bbfyS2fWw==}
@@ -983,6 +990,14 @@ packages:
 
 snapshots:
 
+  '@co-cell/agentcore@file:packages/agentcore': {}
+
+  '@co-cell/archives@file:packages/archives': {}
+
+  '@co-cell/docker-sandbox@file:packages/docker-sandbox': {}
+
+  '@co-cell/sandbox@file:packages/sandbox': {}
+
   '@esbuild/aix-ppc64@0.28.2':
     optional: true
 
@@ -1140,12 +1155,6 @@ snapshots:
     optional: true
 
   '@rolldown/pluginutils@1.0.1': {}
-
-  '@co-cell/agentcore@file:packages/agentcore': {}
-
-  '@co-cell/docker-sandbox@file:packages/docker-sandbox': {}
-
-  '@co-cell/sandbox@file:packages/sandbox': {}
 
   '@types/debug@4.1.13':
     dependencies:

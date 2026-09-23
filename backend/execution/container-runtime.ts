@@ -1,4 +1,4 @@
-import type { SandboxState } from '../../protocol/sandbox-types.js';
+import type { SandboxImageIdentity, SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -7,6 +7,7 @@ import { AppServerEventAdapter, Codex, CodexAppServerClient } from '../../packag
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
 import type { SandboxCommandHandle, SandboxHandle, SandboxProvider, SandboxLease, SandboxRecord } from '@co-cell/sandbox';
+import type { ArchiveCommand } from '@co-cell/archives';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import type { AgentEvent, ContextUsage } from '../../protocol/types.js';
 import type { RequestUserApproval } from '../../protocol/approval-types.js';
@@ -22,6 +23,13 @@ import type { ModelProxyKind } from './model-proxy.js';
 import { parseWorkspaceFile, READ_SANDBOX_FILE_SCRIPT, workspaceFileRequest, type WorkspaceFileResult, type WorkspaceFileReadOptions } from '../workspaces/files.js';
 
 export interface SandboxRuntime {
+  currentImageIdentity?(): Promise<SandboxImageIdentity>;
+  hostData?(target: WorkspaceTarget): Promise<{ root: string; workspace: string; codex: string } | undefined>;
+  archiveSourceRoot?(sandboxId: string): Promise<string | undefined>;
+  executeArchiveCommand?(sandboxId: string, command: ArchiveCommand): Promise<{ exitCode: number; stdout: string }>;
+  quiesceForBackup?(sandboxId: string): Promise<() => Promise<void>>;
+  pauseForBackup?(sandboxId: string): Promise<void>;
+  resumeAfterBackup?(sandboxId: string): Promise<void>;
   track?(session: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): void;
   trackExecution?(session: Session, turn: Turn): void;
   run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent>;
@@ -35,8 +43,11 @@ export interface SandboxRuntime {
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   createReplacement?(target: WorkspaceTarget, onSandbox: SaveSandbox): Promise<SandboxState>;
+  createStoppedReplacement?(target: WorkspaceTarget, onSandbox: SaveSandbox): Promise<{ sandbox: SandboxState; root: string }>;
+  startReplacement?(sandbox: SandboxState): Promise<void>;
   restoreReplacement?(sandbox: SandboxState, archivePath: string): Promise<void>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
+  verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
   fenceSandbox?(sandbox: SandboxState): Promise<void>;
   restoreArchive?(target: WorkspaceTarget, archivePath: string): Promise<void>;
   createArchive?(target: WorkspaceTarget, archivePath: string): Promise<{ sizeBytes: number; sha256: string }>;
@@ -125,6 +136,27 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   track(target: WorkspaceTarget, notify: SaveSandbox) { this.sandboxes.track(target, notify); }
+  async currentImageIdentity(): Promise<SandboxImageIdentity> {
+    const provider = this.options.provider as SandboxProvider & { currentImageIdentity?: () => Promise<SandboxImageIdentity> };
+    if (!provider.currentImageIdentity) throw new Error('Sandbox provider does not support image switching');
+    return provider.currentImageIdentity();
+  }
+  async archiveSourceRoot(sandboxId: string): Promise<string | undefined> {
+    const provider = this.options.provider as SandboxProvider & { archiveSourceRoot?: (id: string) => Promise<string | undefined> };
+    return provider.archiveSourceRoot?.(sandboxId);
+  }
+  async executeArchiveCommand(sandboxId: string, command: ArchiveCommand): Promise<{ exitCode: number; stdout: string }> {
+    const provider = this.options.provider as SandboxProvider & {
+      executeArchiveCommand?: (id: string, command: ArchiveCommand) => Promise<{ exitCode: number; stdout: string }>;
+    };
+    if (!provider.executeArchiveCommand) throw new Error('Sandbox provider does not support archive commands');
+    return provider.executeArchiveCommand(sandboxId, command);
+  }
+  async quiesceForBackup(sandboxId: string): Promise<() => Promise<void>> {
+    const provider = this.options.provider as SandboxProvider & { quiesceForBackup?: (id: string) => Promise<() => Promise<void>> };
+    if (!provider.quiesceForBackup) throw new Error('Sandbox provider does not support backup checkpointing');
+    return provider.quiesceForBackup(sandboxId);
+  }
   trackExecution(session: Session, turn: Turn) {
     if (turn.execution && session.sandbox && (!turn.execution.sandboxId || turn.execution.sandboxId === session.sandbox.id)) {
       this.sandboxes.holdUsage(session, turn.execution.workerId);
@@ -929,14 +961,39 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
   /** A candidate is never tracked under the project's live binding. */
   async createReplacement(target: WorkspaceTarget, onSandbox: SaveSandbox): Promise<SandboxState> {
     const template = this.sandboxes.templateReference;
-    const handle = await this.options.provider.create(template, {
+    const provider = this.options.provider as SandboxProvider & {
+      createStopped?: (projectId: string, workingDirectory: string) => Promise<{ id: string }>;
+    };
+    const created = provider.createStopped
+      ? await provider.createStopped(target.projectId ?? target.id, target.settings.workingDirectory)
+      : undefined;
+    const handle = created ? undefined : await provider.create(template, {
       timeoutMs: COMMAND_TIMEOUT_MS, lifecycle: { onTimeout: 'pause', autoResume: false },
       metadata: { app: 'codex-web', projectId: target.projectId ?? target.id, workingDirectory: target.settings.workingDirectory },
     });
-    const sandbox: SandboxState = { id: handle.sandboxId, template, status: 'starting', workingDirectory: target.settings.workingDirectory };
+    const sandbox: SandboxState = { id: created?.id ?? handle!.sandboxId, template, status: 'starting', workingDirectory: target.settings.workingDirectory };
     try { await onSandbox(sandbox); }
     catch (error) { await this.options.provider.kill(sandbox.id).catch(() => {}); throw error; }
     return sandbox;
+  }
+
+  async createStoppedReplacement(target: WorkspaceTarget, onSandbox: SaveSandbox) {
+    const provider = this.options.provider as SandboxProvider & {
+      createStopped?: (projectId: string, workingDirectory: string) => Promise<{ id: string; root: string }>;
+    };
+    if (!provider.createStopped) throw new HttpError(503, 'Sandbox provider 不支持 Restic 恢复');
+    const created = await provider.createStopped(target.projectId ?? target.id, target.settings.workingDirectory);
+    const sandbox: SandboxState = { id: created.id, template: this.sandboxes.templateReference,
+      status: 'starting', workingDirectory: target.settings.workingDirectory };
+    try { await onSandbox(sandbox); }
+    catch (error) { await this.options.provider.kill(sandbox.id).catch(() => {}); throw error; }
+    return { sandbox, root: created.root };
+  }
+
+  async startReplacement(sandbox: SandboxState) {
+    const provider = this.options.provider as SandboxProvider & { start?: (id: string) => Promise<void> };
+    if (!provider.start) throw new HttpError(503, 'Sandbox provider 不支持启动替换环境');
+    await provider.start(sandbox.id);
   }
 
   async restoreReplacement(sandbox: SandboxState, archivePath: string) {
@@ -955,6 +1012,17 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
         await new Promise(resolve => setTimeout(resolve, 1_000));
       }
     }
+  }
+
+  async verifyHistory(sandbox: SandboxState, threadIds: string[]) {
+    if (!threadIds.length) return;
+    if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
+    const endpoint = await this.options.appServer(sandbox.id);
+    const client = new CodexAppServerClient({ url: endpoint.url, headers: { Authorization: `Bearer ${endpoint.token}` }, requestTimeoutMs: 10_000 });
+    try {
+      await client.connect();
+      for (const threadId of [...new Set(threadIds)].slice(0, 3)) await client.request('thread/read', { threadId });
+    } finally { await client.close(); }
   }
 
   private async verifySandboxOnce(sandbox: SandboxState, timeoutMs: number) {
@@ -1016,6 +1084,26 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     const client = this.options.provider as SandboxProvider & { archive?: (id: string, destination: string) => Promise<{ sizeBytes: number; sha256: string }> };
     if (!client.archive) throw new Error('Sandbox provider 不支持数据归档');
     return client.archive(target.sandbox.id, archivePath);
+  }
+
+  async hostData(target: WorkspaceTarget) {
+    if (!target.sandbox) return undefined;
+    const provider = this.options.provider as SandboxProvider & { hostData?: (projectId: string, sandboxId: string) => Promise<{ root: string; workspace: string; codex: string } | undefined> };
+    return provider.hostData?.(target.projectId ?? target.id, target.sandbox.id);
+  }
+
+  async pauseForBackup(sandboxId: string) { await this.options.provider.pause(sandboxId); }
+
+  async resumeAfterBackup(sandboxId: string) {
+    const provider = this.options.provider as SandboxProvider & { resume?: (id: string) => Promise<void> };
+    if (!provider.resume) throw new Error('Sandbox provider does not support resume');
+    let info;
+    try { info = await provider.getInfo(sandboxId); }
+    catch (error) {
+      if (/no such (?:container|object)|not found|404/i.test(String(error))) return;
+      throw error;
+    }
+    if (info.state === 'paused') await provider.resume(sandboxId);
   }
 
   async detachSandbox(target: WorkspaceTarget) {

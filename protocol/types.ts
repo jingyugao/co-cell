@@ -103,10 +103,16 @@ export interface Turn {
 }
 export type ProjectStatus = 'active' | 'completed' | 'archived';
 export interface ProjectSandboxOperation {
-  kind: 'backup' | 'restore' | 'archive';
+  kind: 'backup' | 'restore' | 'archive' | 'migrate' | 'switch';
   phase: string;
   status: 'running' | 'failed' | 'succeeded';
   error?: string;
+  durationMs?: number;
+  scannedBytes?: number;
+  addedBytes?: number;
+  repositorySizeBytes?: number;
+  snapshotId?: string;
+  verified?: boolean;
   updatedAt: string;
 }
 /** 1: ordinary, 2: Feishu requirement, 3: weekly project. */
@@ -146,6 +152,8 @@ export interface Project {
   };
   /** 指向 archives 模块的归档流 key（新方案），替代 sandboxDataArchive */
   archiveKey?: string;
+  backupRetentionCount?: number;
+  latestBackup?: LatestBackupSummary;
   sandboxOperation?: ProjectSandboxOperation;
   /** Uncommitted replacement containers and retired containers awaiting cleanup. */
   pendingSandboxCleanup?: SandboxState[];
@@ -160,10 +168,33 @@ export interface ProjectLifecycleRecord {
   at: string;
   sandboxId?: string;
 }
+export interface LatestBackupSummary {
+  createdAt: string;
+  sizeBytes?: number;
+  bytesAdded?: number;
+  checksum?: string;
+  revisionId?: string;
+  storageSizeBytes?: number;
+  /** Fields retained for project records written before the format-neutral summary. */
+  format?: string;
+  sha256?: string;
+  logicalSizeBytes?: number;
+  snapshotId?: string;
+  repositorySizeBytes?: number;
+}
+
+export interface ArchiveVersionSummary {
+  id: string;
+  version: number;
+  createdAt: string;
+  sizeBytes: number;
+  bytesAdded?: number;
+  label: string;
+}
+
 export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null;
-  latestBackup?: { createdAt: string; sizeBytes: number; sha256: string };
   /** 归档版本列表（新归档模块），按版本倒序 */
-  archiveVersions?: Array<{ id: string; version: number; sizeBytes: number; createdAt: string; sha256: string }>;
+  archiveVersions?: ArchiveVersionSummary[];
 }
 export interface Session {
   projectId?: string;

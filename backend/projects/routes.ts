@@ -4,7 +4,7 @@ import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { workspaceDownload } from '../workspaces/download.js';
 
-export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile' | 'rebuildProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow'>) {
+export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile' | 'rebuildProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'migrateProjectSandbox' | 'switchProjectSandboxVersion'>) {
   app.post('/api/projects/:id/archive', async c => {
     const body = await c.req.text();
     let parsed: unknown;
@@ -14,6 +14,11 @@ export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, '
     return c.json(await manager.archiveProjectNow(c.req.param('id'), input), 202);
   });
   app.post('/api/projects/:id/backup', async c => c.json(await manager.backupProjectNow(c.req.param('id')), 202));
+  app.post('/api/projects/:id/sandbox/migrate', async c => c.json(await manager.migrateProjectSandbox(c.req.param('id')), 202));
+  app.post('/api/projects/:id/sandbox/switch-version', async c => {
+    const input = z.object({ targetImageId: z.string().regex(/^sha256:[a-f0-9]{64}$/) }).strict().parse(await c.req.json());
+    return c.json(await manager.switchProjectSandboxVersion(c.req.param('id'), input.targetImageId), 202);
+  });
   app.post('/api/projects/:id/sandbox/rebuild', async c => c.json(await manager.rebuildProjectSandbox(c.req.param('id')), 202));
   app.get('/api/projects/:id/files', async c => {
     const path = c.req.query('path');
@@ -44,6 +49,6 @@ export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, '
     .refine(input => Boolean(input.name || input.requirementUrl), '请输入项目名称或绑定飞书需求');
   app.post('/api/projects', async c => c.json(await manager.createProject(createSchema.parse(await c.req.json())), 201));
   app.get('/api/projects/:id', c => c.json(manager.getProject(c.req.param('id'))));
-  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional() }).parse(await c.req.json()))));
+  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional(), backupRetentionCount: z.number().int().min(2).max(100).optional() }).parse(await c.req.json()))));
   app.delete('/api/projects/:id', async c => { await manager.deleteProject(c.req.param('id')); return c.json({ ok: true }); });
 }

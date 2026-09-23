@@ -9,6 +9,7 @@ import type { ArchiveManager } from '../archives/manager.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import type { ProjectService } from './service.js';
 import { HttpError } from '../../util/errors.js';
+import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 
 const target = (project: Project): WorkspaceTarget => ({ id: project.id, projectId: project.id,
   settings: { workingDirectory: project.workingDirectory }, sandbox: project.sandbox, updatedAt: project.updatedAt });
@@ -26,6 +27,7 @@ export class ProjectSandboxOperations {
     threadIds: (id: string) => string[];
     saveSandbox: (id: string, sandbox: SandboxState, restore: boolean) => Promise<void>;
     detached: (id: string) => Promise<void>;
+    logger?: RuntimeLog;
   }) {}
 
   async latest(id: string): Promise<Backup> {
@@ -71,6 +73,16 @@ export class ProjectSandboxOperations {
         } else await this.archive(id, options.useExistingBackup === true);
         await this.deps.projects.updateSandboxOperation(id, { kind, phase: '完成', status: 'succeeded', updatedAt: new Date().toISOString() });
       } catch (error) {
+        // Keep the user-facing state deliberately concise, but always retain the
+        // provider error and operation context in the bounded server log. Without
+        // this, restore failures are indistinguishable from one another in the UI.
+        void this.deps.logger?.write({
+          event: 'sandbox.operation_failed',
+          operation: kind,
+          projectId: id,
+          phase: this.deps.projects.get(id).sandboxOperation?.phase,
+          error,
+        });
         await this.deps.projects.updateSandboxOperation(id, { kind, phase: this.deps.projects.get(id).sandboxOperation?.phase ?? '检查环境',
           status: 'failed', error: error instanceof HttpError ? error.message : '操作失败，请重试；详细原因请查看服务端日志。', updatedAt: new Date().toISOString() });
         throw error;

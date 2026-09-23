@@ -82,6 +82,7 @@ export class SessionManager {
         directory: join(dataDirectory, '..', 'sandbox-data-archives'),
         threadIds: id => [...this.sessions.values()].filter(session => session.projectId === id).flatMap(session => session.threadId ? [session.threadId] : []),
         saveSandbox: (id, value, restore) => this.updateSandbox(id, id, value, restore),
+        logger: this.logger,
         detached: async id => {
           for (const session of this.sessions.values()) {
             if (session.projectId !== id) continue;
@@ -286,22 +287,20 @@ export class SessionManager {
     return structuredClone({ ...this.lookup(id), historyError: this.historyErrors.get(id) });
   }
   async read(id: string): Promise<Session> {
-    // The persisted session is the availability path for the chat UI. Native
-    // rollout history lives in Sandbox and can be slow for long-running threads;
-    // refresh it in the background instead of turning a transient inspection
-    // timeout into a blank conversation.
+    // Prefer the App Server's current history. A saved transcript is the
+    // fallback when the Sandbox is detached or history inspection fails.
     this.lookup(id);
-    this.refreshNativeHistory(id);
+    await this.refreshNativeHistory(id);
     return this.get(id);
   }
 
-  private refreshNativeHistory(id: string) {
+  private refreshNativeHistory(id: string): Promise<void> {
     const session = this.sessions.get(id);
     const projectId = session?.projectId;
-    if (projectId && this.projects.isMaintaining(projectId)) return;
+    if (projectId && this.projects.isMaintaining(projectId)) return Promise.resolve();
     if (session?.settings.executionMode === 'sandbox' && projectId && !this.projects.get(projectId).sandbox) {
       if (session.threadId) this.historyErrors.set(id, '项目 Sandbox 尚未恢复，暂时无法补全历史消息。当前显示已保存的内容。');
-      return;
+      return Promise.resolve();
     }
     let pending = this.historyReads.get(id);
     if (!pending) {
@@ -324,6 +323,7 @@ export class SessionManager {
         .finally(() => { this.historyReads.delete(id); });
       this.historyReads.set(id, pending);
     }
+    return pending;
   }
 
   async billing(id: string): Promise<SessionCostBreakdown> {

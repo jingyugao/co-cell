@@ -68,6 +68,25 @@ test('completed messages survive Web restart and failed Sandbox history reads', 
   } finally { await f.close(); }
 });
 
+test('session read returns App Server history before the saved transcript', async () => {
+  const f = await fixture();
+  try {
+    const first = await f.start();
+    const session = await first.create();
+    await first.startTurn(session.id, '1+1等于几');
+    await first.waitForIdle(session.id);
+    const completed = first.get(session.id);
+    await first.close();
+
+    const remoteAnswer = { ...answer, text: '来自 App Server 的回复' };
+    f.runtime.history = async () => ({ turns: [{ ...completed.turns[0], id: 'native-turn', items: [remoteAnswer] }] });
+    const second = await f.start();
+    const snapshot = await second.read(session.id);
+    assert.deepEqual(snapshot.turns[0].items, [remoteAnswer]);
+    assert.equal(snapshot.historyError, undefined);
+  } finally { await f.close(); }
+});
+
 test('legacy empty transcripts are backfilled and a successful retry clears the history warning', async () => {
   const f = await fixture();
   try {

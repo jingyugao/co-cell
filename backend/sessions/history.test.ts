@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { Session, Settings, StreamMessage, Turn } from '../../protocol/types.js';
+import type { Session, Settings, Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { createArchiveReader, type ArchiveService } from '@co-cell/archives';
 import { SessionManager, type CodexClient } from './manager.js';
@@ -40,7 +40,7 @@ async function fixture() {
   } };
 }
 
-test('completed messages survive Web restart and failed Sandbox history reads', async () => {
+test('Sandbox history failure shows an error without serving the saved transcript', async () => {
   const f = await fixture();
   try {
     const first = await f.start();
@@ -50,21 +50,9 @@ test('completed messages survive Web restart and failed Sandbox history reads', 
     await first.close();
 
     const second = await f.start();
-    const events: StreamMessage[] = [];
-    const unsubscribe = second.subscribe(session.id, event => events.push(event));
     const snapshot = await second.read(session.id);
-    assert.equal(snapshot.turns[0].prompt, '1+1等于几');
-    assert.deepEqual(snapshot.turns[0].items, [answer]);
-    await second['historyReads'].get(session.id);
-    const failed = second.get(session.id);
-    assert.match(failed.historyError!, /历史消息暂时无法加载/);
-    assert.deepEqual(failed.turns, snapshot.turns);
-    assert.ok(events.some(event => event.type === 'state' && event.session.historyError));
-    const stored = JSON.parse(await readFile(join(f.directory, `${session.id}.json`), 'utf8')) as Session;
-    assert.equal(stored.historyError, undefined);
-    assert.equal(stored.turns[0].prompt, '1+1等于几');
-    assert.deepEqual(stored.turns[0].items, [answer]);
-    unsubscribe();
+    assert.deepEqual(snapshot.turns, []);
+    assert.match(snapshot.historyError!, /历史消息暂时无法/);
   } finally { await f.close(); }
 });
 
@@ -87,7 +75,48 @@ test('session read returns App Server history before the saved transcript', asyn
   } finally { await f.close(); }
 });
 
-test('legacy empty transcripts are backfilled and a successful retry clears the history warning', async () => {
+test('Sandbox detail and older turns use App Server cursors', async () => {
+  const f = await fixture();
+  try {
+    const manager = await f.start();
+    const created = await manager.create();
+    await manager.startTurn(created.id, 'first');
+    await manager.waitForIdle(created.id);
+    assert.equal(manager.list().find(item => item.id === created.id)?.turnCount, 1);
+    const original = manager.get(created.id).turns[0];
+    const seen: Array<{ cursor?: string; limit?: number } | undefined> = [];
+    f.runtime.history = async (_session, options) => {
+      seen.push(options);
+      return options?.cursor === 'older'
+        ? { turns: [{ ...original, id: 'old-turn', prompt: 'older' }], nextCursor: null }
+        : { turns: [{ ...original, id: 'new-turn', prompt: 'newer' }], nextCursor: 'older' };
+    };
+    const detail = await manager.read(created.id);
+    assert.deepEqual(detail.turns.map(turn => turn.prompt), ['newer']);
+    assert.equal(detail.historyNextCursor, 'older');
+    const older = await manager.olderTurns(created.id, detail.historyNextCursor!);
+    assert.deepEqual(older.turns.map(turn => turn.prompt), ['older']);
+    assert.equal(older.nextCursor, null);
+    assert.deepEqual(seen, [{ limit: 20 }, { cursor: 'older', limit: 20 }]);
+  } finally { await f.close(); }
+});
+
+test('a submission rejected before Codex accepts it is not retained after restart', async () => {
+  const f = await fixture();
+  try {
+    f.runtime.run = async function* () { throw new Error('Sandbox creation failed'); };
+    const first = await f.start();
+    const created = await first.create();
+    await first.startTurn(created.id, 'not delivered');
+    await first.waitForIdle(created.id);
+    assert.equal(first.get(created.id).turns[0].codexAccepted, false);
+    await first.close();
+    const second = await f.start();
+    assert.equal(second.list().some(session => session.id === created.id), false);
+  } finally { await f.close(); }
+});
+
+test('a successful App Server retry clears the history warning', async () => {
   const f = await fixture();
   try {
     const first = await f.start();
@@ -104,25 +133,22 @@ test('legacy empty transcripts are backfilled and a successful retry clears the 
 
     const second = await f.start();
     await second.read(session.id);
-    await second['historyReads'].get(session.id);
-    assert.ok(second.get(session.id).historyError);
+    assert.ok((await second.read(session.id)).historyError);
     f.runtime.history = async () => ({ turns: [{ ...complete.turns[0], id: 'native-turn' }] });
-    await second.read(session.id);
-    await second['historyReads'].get(session.id);
-    assert.equal(second.get(session.id).historyError, undefined);
+    const restored = await second.read(session.id);
+    assert.equal(restored.historyError, undefined);
+    assert.equal(restored.turns[0].prompt, '1+1等于几');
     const stored = JSON.parse(await readFile(path, 'utf8')) as Session;
-    assert.equal(stored.turns[0].prompt, '1+1等于几');
-    assert.deepEqual(stored.turns[0].items, [answer]);
+    assert.equal(stored.turns[0].prompt, '');
     await second.close();
 
     f.runtime.history = async () => { throw new Error('Sandbox is unavailable again'); };
     const third = await f.start();
-    assert.equal(third.get(session.id).turns[0].prompt, '1+1等于几');
-    assert.deepEqual(third.get(session.id).turns[0].items, [answer]);
+    assert.deepEqual((await third.read(session.id)).turns, []);
   } finally { await f.close(); }
 });
 
-test('a partial backup history cannot erase later saved turns', async () => {
+test('a native history page does not append saved turns outside that page', async () => {
   const f = await fixture();
   try {
     const first = await f.start();
@@ -139,15 +165,14 @@ test('a partial backup history cannot erase later saved turns', async () => {
     await writeFile(path, JSON.stringify(stored));
     f.runtime.history = async () => ({ turns: [{ ...stored.turns[0], id: 'native-turn' }] });
     const second = await f.start();
-    await second.read(session.id);
-    await second['historyReads'].get(session.id);
-    assert.equal(second.get(session.id).turns.length, 2);
-    assert.deepEqual(second.get(session.id).turns[1], later);
+    const page = await second.read(session.id);
+    assert.equal(page.turns.length, 1);
+    assert.equal(page.turns[0].id, 'native-turn');
     assert.equal((JSON.parse(await readFile(path, 'utf8')) as Session).turns.length, 2);
   } finally { await f.close(); }
 });
 
-test('a detached archived Sandbox keeps its saved messages and explains unavailable native history', async () => {
+test('an archived Sandbox reports that history cannot be loaded until restoration', async () => {
   const f = await fixture();
   try {
     const first = await f.start();
@@ -166,8 +191,7 @@ test('a detached archived Sandbox keeps its saved messages and explains unavaila
     const second = await f.start();
     const snapshot = await second.read(session.id);
     assert.match(snapshot.historyError!, /Sandbox 尚未恢复/);
-    assert.equal(snapshot.turns[0].prompt, '1+1等于几');
-    assert.deepEqual(snapshot.turns[0].items, [answer]);
+    assert.deepEqual(snapshot.turns, []);
   } finally { await f.close(); }
 });
 

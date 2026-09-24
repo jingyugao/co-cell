@@ -47,9 +47,10 @@ test('an async answer waits for the current turn and is not duplicated after res
     assert.equal(queued.turns[0].userInputRequests?.[0].status, 'queued');
     assert.equal(queued.turns.length, 1);
     releaseFirst();
-    await until(() => first.get(session.id).turns.length === 2 && first.get(session.id).turns[1].status === 'completed');
-    assert.equal(first.get(session.id).turns[1].prompt, 'UAT');
-    assert.equal(first.get(session.id).turns[0].userInputRequests?.[0].status, 'answered');
+    await until(() => first['lookup'](session.id).turns.length === 2 && first['lookup'](session.id).turns[1].status === 'completed');
+    assert.equal(first['lookup'](session.id).turns[1].prompt, 'UAT');
+    assert.equal(first['lookup'](session.id).turns[0].userInputRequests?.[0].status, 'answered');
+    await first.waitForIdle(session.id);
     await first.close();
 
     // Simulate a crash after the answer turn was saved but before its receipt.
@@ -60,9 +61,9 @@ test('an async answer waits for the current turn and is not duplicated after res
     await writeFile(path, JSON.stringify(persisted));
     second = new SessionManager({} as CodexClient, directory, defaults, runtime);
     await second.init();
-    await until(() => second!.get(session.id).turns[0].userInputRequests?.[0].status === 'answered');
-    assert.equal(second.get(session.id).turns.length, 2);
-    assert.equal(second.get(session.id).turns[0].userInputRequests?.[0].answerTurnId, persisted.turns[1].id);
+    await until(() => second!['lookup'](session.id).turns[0].userInputRequests?.[0].status === 'answered');
+    assert.equal(second['lookup'](session.id).turns.length, 2);
+    assert.equal(second['lookup'](session.id).turns[0].userInputRequests?.[0].answerTurnId, persisted.turns[1].id);
     assert.equal(launches, 2);
   } finally {
     releaseFirst();

@@ -1,7 +1,7 @@
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
-import type { Project, Session } from '../../../protocol/types.js';
+import type { Project, Session, Turn } from '../../../protocol/types.js';
 
 export type ArchiveRecord = { key: string; sizeBytes: number; createdAt: string };
 
@@ -80,7 +80,27 @@ export class MySqlWebStateStore implements WebStateStore {
     } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
   }
   async listProjects(): Promise<Project[]> { const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects'); return rows.map(row => this.document<Project>(row.document)); }
-  async listSessions(): Promise<Session[]> { const [rows] = await this.pool.query<Array<RowDataPacket & { document: Session | string }>>('SELECT document FROM sessions'); return rows.map(row => this.document<Session>(row.document)); }
+  async listSessions(): Promise<Session[]> {
+    const [rows] = await this.pool.query<Array<RowDataPacket & { document: Session | string }>>('SELECT document FROM sessions');
+    const sessions: Session[] = [];
+    for (const row of rows) {
+      const stored = this.document<Session & { pendingTurns?: Turn[] }>(row.document);
+      if (stored.settings.executionMode !== 'sandbox') { sessions.push(stored); continue; }
+      const oldTurns = stored.turns ?? [];
+      const pendingTurns = stored.pendingTurns ?? oldTurns.filter(turn =>
+        turn.codexAccepted && (turn.status === 'running' || turn.userInputRequests?.some(request => request.status === 'queued')));
+      const acceptedCount = oldTurns.filter(turn => turn.codexAccepted || turn.nativeTurnId).length;
+      const session: Session = { ...stored, turns: pendingTurns,
+        turnCount: Math.max(stored.turnCount ?? 0, acceptedCount) };
+      delete (session as Session & { pendingTurns?: Turn[] }).pendingTurns;
+      // Existing rows are compacted on startup; new documents never include `turns`.
+      if ('turns' in stored) await this.saveSessionWith(this.pool, session);
+      // A submission that never reached Codex has no App Server history.
+      if (!session.threadId && !session.turnCount && session.status !== 'idle' && !pendingTurns.length) continue;
+      sessions.push(session);
+    }
+    return sessions;
+  }
   saveProject(project: Project): Promise<void> { return this.saveProjectWith(this.pool, project); }
   saveSession(session: Session): Promise<void> { return this.saveSessionWith(this.pool, session); }
   async recordProjectArchive(projectId: string, archive: NonNullable<Project['sandboxDataArchive']>) {
@@ -114,7 +134,18 @@ export class MySqlWebStateStore implements WebStateStore {
     await executor.query(`INSERT INTO projects (id,name,requirement_url,execution_mode,working_directory,archived_at,created_at,updated_at,document) VALUES (?,?,?,?,?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE name=VALUES(name),requirement_url=VALUES(requirement_url),execution_mode=VALUES(execution_mode),working_directory=VALUES(working_directory),archived_at=VALUES(archived_at),updated_at=VALUES(updated_at),document=VALUES(document)`, [project.id, project.name, project.requirementUrl, project.executionMode, project.workingDirectory, this.mysqlDate(project.archivedAt), this.mysqlDate(project.createdAt), this.mysqlDate(project.updatedAt), JSON.stringify(project)]);
   }
   private async saveSessionWith(executor: Pick<Pool, 'query'>, session: Session) {
-    await executor.query(`INSERT INTO sessions (id,project_id,thread_id,title,status,archived_at,started_at,created_at,updated_at,document) VALUES (?,?,?,?,?,?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE project_id=VALUES(project_id),thread_id=VALUES(thread_id),title=VALUES(title),status=VALUES(status),archived_at=VALUES(archived_at),started_at=VALUES(started_at),updated_at=VALUES(updated_at),document=VALUES(document)`, [session.id, session.projectId ?? null, session.threadId, session.title, session.status, this.mysqlDate(session.archivedAt), this.mysqlDate(session.startedAt), this.mysqlDate(session.createdAt), this.mysqlDate(session.updatedAt), JSON.stringify(session)]);
+    const document = session.settings.executionMode === 'sandbox' ? this.compactSandboxSession(session) : session;
+    await executor.query(`INSERT INTO sessions (id,project_id,thread_id,title,status,archived_at,started_at,created_at,updated_at,document) VALUES (?,?,?,?,?,?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE project_id=VALUES(project_id),thread_id=VALUES(thread_id),title=VALUES(title),status=VALUES(status),archived_at=VALUES(archived_at),started_at=VALUES(started_at),updated_at=VALUES(updated_at),document=VALUES(document)`, [session.id, session.projectId ?? null, session.threadId, session.title, session.status, this.mysqlDate(session.archivedAt), this.mysqlDate(session.startedAt), this.mysqlDate(session.createdAt), this.mysqlDate(session.updatedAt), JSON.stringify(document)]);
+  }
+  private compactSandboxSession(session: Session) {
+    const { turns, historyNextCursor: _cursor, ...metadata } = session;
+    const pendingTurns = turns.filter(turn => turn.codexAccepted &&
+      (turn.status === 'running' || turn.userInputRequests?.some(request => request.status === 'queued')))
+      .map(turn => ({ ...turn, images: [], items: [], itemTimestamps: {},
+        contextUsage: undefined, sdkUsage: undefined, usage: undefined }));
+    return { ...metadata, turnCount: Math.max(session.turnCount ?? 0,
+      turns.filter(turn => turn.codexAccepted || turn.nativeTurnId).length),
+      ...(pendingTurns.length ? { pendingTurns } : {}) };
   }
   private mysqlDate(value: string | null | undefined): string | null {
     if (!value) return null;

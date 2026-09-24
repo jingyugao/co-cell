@@ -32,6 +32,10 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
     return c.json(await manager.create(input), 201);
   });
   app.get('/api/sessions/:id', async c => c.json(await manager.read(c.req.param('id'))));
+  app.get('/api/sessions/:id/turns', async c => {
+    const cursor = z.string().min(1).max(4096).parse(c.req.query('cursor'));
+    return c.json(await manager.olderTurns(c.req.param('id'), cursor));
+  });
   app.get('/api/sessions/:id/billing', async c => c.json(await manager.billing(c.req.param('id'))));
   app.patch('/api/sessions/:id', async c => {
     const input = z.object({ title: z.string().trim().min(1).max(100).optional(), settings: settingsSchema.optional(), archived: z.boolean().optional() }).strict().parse(await c.req.json());
@@ -63,7 +67,7 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   });
   app.get('/api/sessions/:id/events', async c => {
     const id = c.req.param('id');
-    await manager.read(id);
+    manager.get(id);
     return streamSSE(c, async stream => {
       let queue: Promise<void> = Promise.resolve();
       let closed = false;

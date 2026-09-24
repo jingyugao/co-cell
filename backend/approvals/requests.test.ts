@@ -98,6 +98,8 @@ test('manager binds decisions to session and turn, cancels on stop and persists 
   const directory = await mkdtemp(join(tmpdir(), 'hive-approvals-'));
   let result: UserApproval | undefined;
   const runtime = { async close() {}, async *run(_session: unknown, _turn: unknown, signal: AbortSignal, _sandbox: unknown, approve: RequestUserApproval) {
+    yield { type: 'thread.started', thread_id: randomUUID() };
+    yield { type: 'turn.started', turn_id: randomUUID() };
     result = await approve(randomUUID(), input, signal);
     yield { type: 'turn.completed', usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } };
   } } as unknown as SandboxRuntime;

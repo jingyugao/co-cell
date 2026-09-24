@@ -216,11 +216,16 @@ export interface Session {
   createdAt: string;
   updatedAt: string;
   turns: Turn[];
+  /** Cursor for older App Server turns in a session-detail response. Never persisted. */
+  historyNextCursor?: string | null;
+  /** Total accepted turns when only a page of conversation is loaded. */
+  turnCount?: number;
   /** Most recently observed model context length. */
   contextUsage?: ContextUsage;
   sandbox?: SandboxState;
 }
 export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };
+export interface SessionTurnPage { turns: Turn[]; nextCursor: string | null }
 export interface SandboxRecord {
   /** Platform-created sandbox without a current binding or in-flight reservation. */
   dangling?: boolean;

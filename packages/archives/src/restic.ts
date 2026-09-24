@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 const exec = promisify(execFile);
 const identifier = /^[a-f0-9-]{36}$/i;
 const snapshotIdentifier = /^[a-f0-9]{64}$/i;
+export const RESTIC_LOCK_WAIT = '5m';
 
 export interface ResticSnapshot {
   repositoryId: string;
@@ -88,7 +89,8 @@ export class ResticArchives {
     delete environment.RESTIC_PASSWORD;
     delete environment.RESTIC_PASSWORD_COMMAND;
     try {
-      const { stdout } = await exec(this.binary, args, { cwd, env: environment, timeout: 3 * 60 * 60 * 1000, maxBuffer: 64 * 1024 * 1024 });
+      const { stdout } = await exec(this.binary, repositoryId ? ['--retry-lock', RESTIC_LOCK_WAIT, ...args] : args,
+        { cwd, env: environment, timeout: 3 * 60 * 60 * 1000, maxBuffer: 64 * 1024 * 1024 });
       return stdout;
     } catch (error) {
       const failure = error as Error & { stderr?: string };

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { lstat, mkdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
-import type { ResticArchives } from './restic.js';
+import { RESTIC_LOCK_WAIT, type ResticArchives } from './restic.js';
 import type { ArchiveContentContract, ArchiveFileContent, ArchiveFileEntry, ArchiveFileInfo, ArchiveListing, ArchiveRestoreTarget, ArchiveVersionDetails } from './contract.js';
 import type { ArchiveArtifact, ArchiveSource, ArchiveVersion } from './types.js';
 import { ARCHIVE_FORMAT } from './formats.js';
@@ -294,7 +294,7 @@ export class RevisionDriver implements ArchiveDriver {
     await this.storage.ready();
     await this.storage.ensureRepository(input.storeId);
     const password = (await readFile(this.storage.passwordFile, 'utf8')).trim();
-    const args = ['backup', '--json', '--group-by', 'host', '--tag', `project:${input.storeId}`,
+    const args = ['backup', '--retry-lock', RESTIC_LOCK_WAIT, '--json', '--group-by', 'host', '--tag', `project:${input.storeId}`,
       '--tag', `sandbox:${input.sandboxId}`];
     for (const ignore of input.ignores) args.push(`--exclude=${join(input.sourceRoot, validateBackupIgnore(ignore))}`);
     args.push('workspace', 'codex');

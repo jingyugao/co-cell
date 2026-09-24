@@ -34,6 +34,12 @@ test('Restic stores incremental project snapshots and restores the relative layo
     await writeFile(join(source, 'workspace', 'file.txt'), 'second version');
     const third = await restic.snapshot(repositoryId, sandboxId, source, ['workspace/.go-cache/']);
     const content = new ArchiveContentService(new RevisionDriver(restic));
+    const sandboxCommand = await new RevisionDriver(restic).getCmd({ storeId: repositoryId, sandboxId,
+      sourceRoot: source, storagePath: restic.repository(repositoryId), ignores: ['workspace/.go-cache/'] });
+    const sandboxOutput = execFileSync(binary, [...sandboxCommand.args], {
+      cwd: sandboxCommand.cwd, env: { ...process.env, ...sandboxCommand.env }, encoding: 'utf8' });
+    const sandboxSnapshot = new RevisionDriver(restic).parseCommandResult(sandboxOutput);
+    assert.ok((await restic.listSnapshots(repositoryId)).includes(sandboxSnapshot.snapshotId));
     const archive = { format: ARCHIVE_FORMAT.snapshot, repositoryId, snapshotId: third.snapshotId,
       logicalSizeBytes: third.logicalSizeBytes, bytesAdded: third.addedBytes, createdAt: new Date().toISOString() };
     await content.validate(archive);

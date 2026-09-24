@@ -32,6 +32,7 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
     return c.json(await manager.create(input), 201);
   });
   app.get('/api/sessions/:id', async c => c.json(await manager.read(c.req.param('id'))));
+  app.get('/api/sessions/:id/subagents', async c => c.json(await manager.subagents(c.req.param('id'))));
   app.get('/api/sessions/:id/turns', async c => {
     const cursor = z.string().min(1).max(4096).parse(c.req.query('cursor'));
     return c.json(await manager.olderTurns(c.req.param('id'), cursor));

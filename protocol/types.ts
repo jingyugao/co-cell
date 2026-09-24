@@ -226,6 +226,15 @@ export interface Session {
 }
 export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };
 export interface SessionTurnPage { turns: Turn[]; nextCursor: string | null }
+export interface SubagentConversation {
+  threadId: string;
+  parentThreadId: string;
+  path: string;
+  nickname?: string;
+  depth: number;
+  startedAt: string;
+  turns: Turn[];
+}
 export interface SandboxRecord {
   /** Platform-created sandbox without a current binding or in-flight reservation. */
   dangling?: boolean;

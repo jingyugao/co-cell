@@ -11,8 +11,9 @@ import type { ArchiveCommand } from '@co-cell/archives';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import type { AgentEvent, ContextUsage } from '../../protocol/types.js';
 import type { RequestUserApproval } from '../../protocol/approval-types.js';
-import type { Session, Turn } from '../../protocol/types.js';
+import type { Session, SubagentConversation, Turn } from '../../protocol/types.js';
 import type { NativeHistory } from './native-history.mjs';
+import { readSubagentConversations } from './native-history.mjs';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
 import { CONNECTION_ROOT, type ConnectionStore } from '../connections/store.js';
 import { syncSandboxConnections } from '../connections/sandbox-sync.js';
@@ -40,6 +41,7 @@ export interface SandboxRuntime {
   file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
   inspect?(target: WorkspaceTarget): Promise<unknown>;
   history(session: Session, options?: { cursor?: string; limit?: number }): Promise<NativeHistory>;
+  subagents?(session: Session): Promise<SubagentConversation[]>;
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   createReplacement?(target: WorkspaceTarget, onSandbox: SaveSandbox): Promise<SandboxState>;
@@ -946,6 +948,12 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
       await client?.close();
       if (entry) await this.release(entry, failed);
     }
+  }
+  async subagents(session: Session): Promise<SubagentConversation[]> {
+    if (!session.threadId) return [];
+    const host = await this.hostData(session);
+    if (!host) return [];
+    return readSubagentConversations(session.threadId, host.codex);
   }
   async delete(session: WorkspaceTarget) {
     await this.sandboxes.delete(session);

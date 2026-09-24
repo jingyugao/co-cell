@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
-import type { Project, ProjectSummary, Session, SessionSummary, SessionTurnPage, Settings, StreamMessage, Turn } from '../../protocol/types.js';
+import type { Project, ProjectSummary, Session, SessionSummary, SessionTurnPage, Settings, StreamMessage, SubagentConversation, Turn } from '../../protocol/types.js';
 import type { UserInputQuestion, UserInputRequest } from '../../protocol/user-input-types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
@@ -17,7 +18,7 @@ import { createWebStateStore, type WebStateStore } from '../infra/storage/web-st
 import { runTurn, type CodexClient } from '../execution/runner.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { ApprovalRequests, approvalDecisionSchema, cancelPersistedApprovals } from '../approvals/requests.js';
-import { readNativeHistory } from '../execution/native-history.mjs';
+import { readNativeHistory, readSubagentConversations } from '../execution/native-history.mjs';
 import type { NotificationStore } from '../notifications/store.js';
 import { estimateSessionCosts, type SessionCostBreakdown } from '../../util/billing.js';
 import { MODEL_TOKEN_RATES } from '../../util/model-costs.js';
@@ -382,6 +383,19 @@ export class SessionManager {
     if (session.projectId && this.projects.isMaintaining(session.projectId)) throw new HttpError(409, '项目正在维护，请稍后重试');
     const page = await this.readSandboxHistory(session, { cursor, limit: 20 });
     return { turns: page.turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt)), nextCursor: page.nextCursor ?? null };
+  }
+
+  async subagents(id: string): Promise<SubagentConversation[]> {
+    const session = this.lookup(id);
+    if (!session.threadId) return [];
+    if (session.settings.executionMode === 'sandbox') {
+      if (!session.sandbox || (session.projectId && this.projects.isMaintaining(session.projectId))) return [];
+      if (!this.sandbox?.subagents) return [];
+      const release = this.projects.acquire(session.projectId);
+      try { return await this.sandbox.subagents(session); }
+      finally { release(); }
+    }
+    return readSubagentConversations(session.threadId, process.env.CODEX_HOME || join(homedir(), '.codex'));
   }
 
   private refreshNativeHistory(id: string): Promise<void> {

@@ -1,0 +1,10 @@
+.subagent-group{margin:20px 0 22px;border-left:2px solid #d8e2c9;padding-left:14px}
+.subagent-group-title{display:flex;align-items:center;gap:7px;margin:0 0 10px;color:#697b58;font-size:11px}
+.subagent-group-title strong{font-weight:600}.subagent-group-title span{background:#e7eddf;border-radius:9px;padding:1px 6px;font-size:10px}
+.subagent-card{border:1px solid #dfe7d7;border-radius:9px;background:#fafcf8;margin:8px 0;overflow:hidden}
+.subagent-card>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;padding:11px 13px}
+.subagent-card>summary::-webkit-details-marker{display:none}.subagent-card>summary>svg{color:#91a082;transition:transform .15s}.subagent-card[open]>summary>svg{transform:rotate(90deg)}
+.subagent-avatar{width:27px;height:27px;border-radius:8px;background:#e5eddb;color:#627b4c;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0}
+.subagent-identity{display:flex;flex-direction:column;min-width:0;flex:1;gap:2px}.subagent-identity strong{font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.subagent-identity small{font-size:9px;color:#9ba594;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.subagent-status{font-size:10px;color:#7e9070;white-space:nowrap}.subagent-status.failed{color:#ad6d58}.subagent-status.running{color:#9b8554}
+.subagent-transcript{border-top:1px solid #e7ede1;padding:10px 15px 14px 19px;max-height:540px;overflow:auto;font-size:12px}.subagent-transcript>.agent-message{margin:9px 0 15px}.subagent-transcript .tool-card{background:#fff}.subagent-empty{font-size:11px;color:#9ba594}

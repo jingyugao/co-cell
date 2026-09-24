@@ -222,3 +222,62 @@ export async function readNativeHistory(threadId, codexHome = process.env.CODEX_
   }
   throw new Error('找不到 Codex 原生会话记录');
 }
+
+/** Discover child rollouts by Codex's parent-thread metadata, then use the same
+ * bounded reader as ordinary local history. No task payloads are decrypted. */
+export async function readSubagentConversations(threadId, codexHome) {
+  if (!/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(threadId)) throw new Error('Codex thread ID 格式错误');
+  const home = await realpath(codexHome);
+  const candidates = [];
+  let visited = 0;
+  async function scan(directory, depth) {
+    if (++visited > 10000) throw new Error('Codex 会话目录超过读取限制');
+    let entries;
+    try { entries = await readdir(directory, { withFileTypes: true }); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory() && depth > 0) await scan(path, depth - 1);
+      else if (entry.isFile() && /^rollout-.*-[a-f\d-]{36}\.jsonl$/i.test(entry.name)) candidates.push(path);
+    }
+  }
+  await scan(join(home, 'sessions'), 4);
+  await scan(join(home, 'archived_sessions'), 4);
+  const found = [];
+  for (const path of candidates) {
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let firstLine;
+    try {
+      const buffer = Buffer.alloc(256 * 1024);
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+      const end = buffer.subarray(0, bytesRead).indexOf(10);
+      if (end < 0) continue;
+      firstLine = JSON.parse(buffer.subarray(0, end).toString('utf8'));
+    } catch { continue; }
+    finally { await file.close(); }
+    const metadata = firstLine?.payload;
+    const spawn = metadata?.source?.subagent?.thread_spawn;
+    if (!spawn || !/^[a-f\d-]{36}$/i.test(metadata.id ?? '')) continue;
+    found.push({ path, threadId: metadata.id, parentThreadId: spawn.parent_thread_id,
+      pathName: spawn.agent_path, nickname: spawn.agent_nickname, depth: spawn.depth,
+      startedAt: firstLine.timestamp });
+  }
+  const descendants = new Set([threadId]);
+  const result = [];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const child of found) {
+      if (!descendants.has(child.parentThreadId) || descendants.has(child.threadId)) continue;
+      descendants.add(child.threadId);
+      changed = true;
+      const history = await readNativeHistory(child.threadId, home, false, undefined, relative(home, child.path));
+      result.push({ threadId: child.threadId, parentThreadId: child.parentThreadId,
+        path: typeof child.pathName === 'string' ? child.pathName : child.threadId,
+        ...(typeof child.nickname === 'string' ? { nickname: child.nickname } : {}),
+        depth: Number.isInteger(child.depth) ? child.depth : 1,
+        startedAt: child.startedAt, turns: history.turns.map(turn => ({ ...turn, prompt: '' })) });
+    }
+  }
+  return result.sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+}

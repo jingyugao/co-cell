@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
-import type { Project, ProjectSummary, Session, SessionSummary, Settings, StreamMessage, Turn } from '../../protocol/types.js';
+import type { Project, ProjectSummary, Session, SessionSummary, SessionTurnPage, Settings, StreamMessage, Turn } from '../../protocol/types.js';
 import type { UserInputQuestion, UserInputRequest } from '../../protocol/user-input-types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
@@ -300,7 +300,16 @@ export class SessionManager {
       save: () => this.save(session), publish: message => this.publish(id, message), snapshot: () => this.get(id),
       updateSandbox: sandbox => this.updateSandbox(session.projectId, id, sandbox),
       requestApproval: approvals.request, closeApprovals: () => approvals.close(), detachApprovals: () => approvals.detach(),
-    }).finally(() => {
+    }).finally(async () => {
+      if (session.settings.executionMode === 'sandbox' && session.status !== 'running'
+        && !(session.turnCount ?? 0) && !session.turns.some(candidate => candidate.codexAccepted)) {
+        try {
+          await this.writer.wait(id);
+          await this.state.deleteSession(id);
+        } catch (error) {
+          console.error('Unaccepted session cleanup failed:', error instanceof Error ? error.message : 'unknown error');
+        }
+      }
       execution.finish();
       void this.startQueuedUserInput(id).catch(error => console.error('Queued user answer failed:', error instanceof Error ? error.message : 'unknown error'));
       if (this.notifications && turn.status !== 'running') {
@@ -320,18 +329,59 @@ export class SessionManager {
 
   list(): SessionSummary[] {
     return [...this.sessions.values()].map(session => this.hydrate(session)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-      .map(({ turns, ...session }) => structuredClone({ ...session, turnCount: turns.length }));
+      .map(({ turns, ...session }) => structuredClone({ ...session, turnCount: session.settings.executionMode === 'sandbox'
+        ? Math.max(session.turnCount ?? 0, turns.filter(turn => turn.codexAccepted).length) : turns.length }));
   }
 
   get(id: string): Session {
-    return structuredClone({ ...this.lookup(id), historyError: this.historyErrors.get(id) });
+    const session = this.lookup(id);
+    const turns = session.settings.executionMode === 'sandbox' ? session.turns.slice(-1) : session.turns;
+    return structuredClone({ ...session, turns, historyError: this.historyErrors.get(id) });
   }
   async read(id: string): Promise<Session> {
-    // Prefer the App Server's current history. A saved transcript is the
-    // fallback when the Sandbox is detached or history inspection fails.
-    this.lookup(id);
+    const session = this.lookup(id);
+    if (session.settings.executionMode === 'sandbox') {
+      const snapshot = this.get(id);
+      if (!session.threadId) {
+        this.historyErrors.delete(id);
+        return { ...snapshot, turns: session.turns.filter(turn => turn.status === 'running'), historyNextCursor: null,
+          historyError: undefined };
+      }
+      if (session.projectId && (this.projects.isMaintaining(session.projectId) || !this.projects.get(session.projectId).sandbox)) {
+        const historyError = '项目 Sandbox 尚未恢复，暂时无法加载历史消息。';
+        this.historyErrors.set(id, historyError);
+        return { ...snapshot, turns: session.turns.filter(turn => turn.status === 'running'), historyNextCursor: null,
+          historyError };
+      }
+      try {
+        const page = await this.readSandboxHistory(session, { limit: 20 });
+        this.historyErrors.delete(id);
+        const live = session.turns.filter(turn => turn.status === 'running');
+        const turns = page.turns.map(native => {
+          const current = live.find(turn => turn.nativeTurnId === native.id || turn.id === native.id);
+          return current ? { ...native, ...current, nativeTurnId: native.id,
+            prompt: current.prompt || native.prompt, items: current.items.length ? current.items : native.items } : native;
+        });
+        for (const turn of live) if (!turns.some(candidate => candidate.id === turn.id)) turns.push(turn);
+        turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+        return { ...snapshot, turns, historyNextCursor: page.nextCursor ?? null, historyError: undefined };
+      } catch (error) {
+        console.error('Native history read failed:', error instanceof Error ? error.message : 'unknown error');
+        const historyError = '历史消息暂时无法从 Sandbox 加载，请确认项目 Sandbox 可用后刷新重试。';
+        this.historyErrors.set(id, historyError);
+        return { ...snapshot, turns: session.turns.filter(turn => turn.status === 'running'), historyNextCursor: null, historyError };
+      }
+    }
     await this.refreshNativeHistory(id);
     return this.get(id);
+  }
+
+  async olderTurns(id: string, cursor: string): Promise<SessionTurnPage> {
+    const session = this.lookup(id);
+    if (session.settings.executionMode !== 'sandbox' || !session.threadId) throw new HttpError(400, '此会话没有可分页的 Sandbox 历史');
+    if (session.projectId && this.projects.isMaintaining(session.projectId)) throw new HttpError(409, '项目正在维护，请稍后重试');
+    const page = await this.readSandboxHistory(session, { cursor, limit: 20 });
+    return { turns: page.turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt)), nextCursor: page.nextCursor ?? null };
   }
 
   private refreshNativeHistory(id: string): Promise<void> {
@@ -350,8 +400,7 @@ export class SessionManager {
           if (this.sessions.has(id) && !this.deleting.has(id)) this.publish(id, { type: 'state', session: this.get(id) });
         })
         .catch(error => {
-          // The durable snapshot remains usable when Sandbox's bounded inspection
-          // request times out. A later page visit can retry the refresh.
+          // Local Codex history can be retried on a later page visit.
           console.error('Native history refresh failed:', error instanceof Error ? error.message : 'unknown error');
           if (this.sessions.has(id) && !this.deleting.has(id)) {
             this.historyErrors.set(id, session?.settings.executionMode === 'sandbox'
@@ -381,7 +430,17 @@ export class SessionManager {
    */
   private async calculateBilling(id: string): Promise<SessionCostBreakdown> {
     const session = this.get(id);
-    const turns = session.turns;
+    let turns = session.turns;
+    if (session.settings.executionMode === 'sandbox' && session.threadId) {
+      turns = [];
+      let cursor: string | null = null;
+      do {
+        const page = await this.readSandboxHistory(session, { ...(cursor ? { cursor } : {}), limit: 50 });
+        turns.push(...page.turns);
+        cursor = page.nextCursor ?? null;
+      } while (cursor);
+      turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+    }
     const model = session.settings.model;
     const rates = MODEL_TOKEN_RATES[model];
     if (!rates || !turns.length) {
@@ -391,16 +450,16 @@ export class SessionManager {
     return estimateSessionCosts(turns, model, rates);
   }
 
-  private async readSandboxHistory(session: Session, includeBlocks = false) {
+  private async readSandboxHistory(session: Session, options: { cursor?: string; limit?: number } = {}) {
     const release = this.projects.acquire(session.projectId);
-    try { return await this.sandbox!.history(session, includeBlocks); }
+    try { return await this.sandbox!.history(session, options); }
     finally { release(); }
   }
 
   private async loadNativeHistory(id: string) {
     const session = this.lookup(id);
-    const native = !session.threadId ? { turns: [] } : session.settings.executionMode === 'sandbox'
-      ? await this.readSandboxHistory(session) : await readNativeHistory(session.threadId, undefined, false, session.startedAt, session.nativeHistoryPath);
+    const native = !session.threadId ? { turns: [] }
+      : await readNativeHistory(session.threadId, undefined, false, session.startedAt, session.nativeHistoryPath);
     if (native.path && native.path !== session.nativeHistoryPath) session.nativeHistoryPath = native.path;
     const previous = session.turns;
     // A partial or empty rollout response must never erase the durable UI

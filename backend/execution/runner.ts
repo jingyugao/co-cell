@@ -55,7 +55,12 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
       else if (event.type === 'turn.started' || event.type === 'turn.completed') terminalFailure = undefined;
       if (event.type === 'thread.started') session.threadId = event.thread_id;
       if (event.type === 'runtime.context_usage') session.contextUsage = { ...event.contextUsage };
+      const acceptedBeforeEvent = turn.codexAccepted === true;
       Object.assign(turn, applyTurnEvent(turn, event));
+      if (event.type === 'turn.started' && !acceptedBeforeEvent) {
+        session.turnCount = Math.max(session.turnCount ?? 0,
+          session.turns.filter(candidate => candidate !== turn && candidate.codexAccepted).length) + 1;
+      }
       if (event.type === 'error') log('sdk.error', { error: event.message });
       else if (event.type === 'turn.failed') log('turn.failed', { error: event.error.message });
       else if (event.type === 'item.started' || event.type === 'item.completed') {

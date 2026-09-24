@@ -39,7 +39,7 @@ export interface SandboxRuntime {
   proxyHost(session: WorkspaceTarget): Promise<string>;
   file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
   inspect?(target: WorkspaceTarget): Promise<unknown>;
-  history(session: Session, includeBlocks?: boolean): Promise<NativeHistory>;
+  history(session: Session, options?: { cursor?: string; limit?: number }): Promise<NativeHistory>;
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   createReplacement?(target: WorkspaceTarget, onSandbox: SaveSandbox): Promise<SandboxState>;
@@ -926,7 +926,7 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     } finally { await this.release(entry, failed); }
   }
 
-  async history(session: Session, _includeBlocks?: boolean): Promise<NativeHistory> {
+  async history(session: Session, options: { cursor?: string; limit?: number } = {}): Promise<NativeHistory> {
     if (!session.threadId) return { turns: [] };
     if (!session.sandbox) throw new Error('Codex 会话对应的沙箱不可用');
     if (!this.options.appServer) throw new Error('Sandbox App Server endpoint is not configured');
@@ -937,7 +937,10 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
       entry = await this.acquire(session, false);
       const endpoint = await this.options.appServer(entry.metadata.id);
       client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: { Authorization: `Bearer ${endpoint.token}` }, requestTimeoutMs: 120_000 });
-      return { turns: await this.readAppServerTurns(client, session.threadId) };
+      const response = await client.request('thread/turns/list', { threadId: session.threadId,
+        itemsView: 'full', sortDirection: 'desc', limit: options.limit ?? 20,
+        ...(options.cursor ? { cursor: options.cursor } : {}) });
+      return { turns: (response.data ?? []).map((rawTurn: any) => this.mapAppServerTurn(rawTurn)), nextCursor: response.nextCursor ?? null };
     } catch (error) { failed = true; throw this.safeError(error); }
     finally {
       await client?.close();

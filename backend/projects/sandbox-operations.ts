@@ -84,6 +84,7 @@ export class ProjectSandboxOperations {
           await this.backup(id);
         } else if (kind === 'migrate') await this.migrate(id);
         else if (kind === 'switch') await this.switchVersion(id, options.targetImageId);
+        else if (kind === 'refresh') await this.refreshRuntime(id);
         else await this.archive(id, options.useExistingBackup === true);
         await this.deps.projects.updateSandboxOperation(id, { ...this.deps.projects.get(id).sandboxOperation!, kind,
           phase: '完成', status: 'succeeded', updatedAt: new Date().toISOString() });
@@ -356,7 +357,13 @@ export class ProjectSandboxOperations {
   }
 
   /** Switch a ready project to the currently configured image, preserving the old binding until verification. */
-  private async switchVersion(id: string, targetImageId: string | undefined) {
+  private async refreshRuntime(id: string) {
+    const image = await this.deps.runtime.currentImageIdentity?.();
+    if (!image) throw new HttpError(503, 'Sandbox 当前镜像不可用');
+    await this.switchVersion(id, image.id, true);
+  }
+
+  private async switchVersion(id: string, targetImageId: string | undefined, allowSameImage = false) {
     const { projects, runtime } = this.deps;
     const project = projects.get(id);
     if (!targetImageId || !/^sha256:[a-f0-9]{64}$/.test(targetImageId)) throw new HttpError(400, '目标 Sandbox 版本无效');
@@ -364,7 +371,7 @@ export class ProjectSandboxOperations {
     if (!runtime.currentImageIdentity) throw new HttpError(503, 'Sandbox 不支持版本切换');
     const latestImage = await runtime.currentImageIdentity();
     if (latestImage.id !== targetImageId) throw new HttpError(409, 'Sandbox 最新版本已变化，请刷新页面');
-    if (project.sandbox.image?.id === targetImageId) throw new HttpError(409, '项目已使用此 Sandbox 版本');
+    if (!allowSameImage && project.sandbox.image?.id === targetImageId) throw new HttpError(409, '项目已使用此 Sandbox 版本');
     await this.inspect(id);
     if (projects.get(id).sandbox?.status !== 'ready') throw new HttpError(409, 'Sandbox 不正常，无法切换版本');
     if (!await runtime.hostData?.(target(project))) return this.migrate(id, targetImageId);

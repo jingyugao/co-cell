@@ -67,7 +67,7 @@ const approvalMcpOverrides = [
   `mcp_servers.swarm_approvals.http_headers.Authorization=${JSON.stringify(`Bearer ${approvalMcpToken}`)}`,
   'mcp_servers.swarm_approvals.enabled=true',
   'mcp_servers.swarm_approvals.required=true',
-  'mcp_servers.swarm_approvals.enabled_tools=["request_user_approval"]',
+  'mcp_servers.swarm_approvals.enabled_tools=["request_user_approval","request_user_input_async"]',
   'mcp_servers.swarm_approvals.omit_tools_from=["deferred"]',
   'mcp_servers.swarm_approvals.startup_timeout_sec=10',
   'mcp_servers.swarm_approvals.tool_timeout_sec=1900',
@@ -164,7 +164,8 @@ const notifications = new NotificationStore(process.env.NOTIFICATIONS_DATA_PATH 
 await notifications.init();
 let manager: SessionManager;
 const approvalMcp = new ApprovalMcpService(approvalMcpToken, (context, input, requestId, signal) =>
-  manager.requestApproval(context.sessionId, context.turnId, context.projectId, requestId, input, signal));
+  manager.requestApproval(context.sessionId, context.turnId, context.projectId, requestId, input, signal),
+  (context, questions, requestId) => manager.requestUserInput(context.sessionId, context.turnId, context.projectId, requestId, questions));
 async function submitImprovement(context: Omit<ImprovementContext, 'projectName'>, input: unknown, requestId: string): Promise<ImprovementReceipt> {
   const session = manager.get(context.sessionId);
   if (!session.turns.some(turn => turn.id === context.turnId) || (session.projectId ?? null) !== context.projectId) throw new Error('建议来源会话不匹配');

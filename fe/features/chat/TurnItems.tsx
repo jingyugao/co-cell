@@ -5,14 +5,16 @@ import type { MarkdownResources } from './Markdown';
 import ItemView from './ItemView';
 import ToolDetails from './ToolDetails';
 import UserApprovalCard from './UserApprovalCard';
+import UserInputCard from './UserInputCard';
 import { matchApprovalItems } from './approval-items';
 
 /** Place decisions at their tool call, so later execution and replies stay below them. */
-export default function TurnItems({ turn, sessionId, onApprovalResolved, highlightedItemIds, ...resources }: {
+export default function TurnItems({ turn, sessionId, onApprovalResolved, onUserInputAnswered, highlightedItemIds, ...resources }: {
   turn: Turn;
   highlightedItemIds?: string[];
   sessionId: string;
   onApprovalResolved: (approval: UserApproval) => void;
+  onUserInputAnswered: (session: import('../../../protocol/types').Session) => void;
 } & MarkdownResources) {
   const { matches, unmatched } = matchApprovalItems(turn.items, turn.approvals ?? []);
   const renderApproval = (approval: UserApproval) => <UserApprovalCard key={approval.id}
@@ -27,5 +29,6 @@ export default function TurnItems({ turn, sessionId, onApprovalResolved, highlig
     {turn.compactions?.filter(boundary => boundary.beforeItemIndex >= turn.items.length).map(boundary => <div key={boundary.segment} className="compact-divider" role="separator">上下文已压缩 · 第 {boundary.segment + 1} 段对话 · 后续重新计费</div>)}
     {/* A request can arrive before its SDK item. Keep it actionable without inventing a match. */}
     {unmatched.map(renderApproval)}
+    {turn.userInputRequests?.map(request => <UserInputCard key={request.id} request={request} sessionId={sessionId} turnId={turn.id} onAnswered={onUserInputAnswered} />)}
   </>;
 }

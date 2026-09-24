@@ -1,5 +1,6 @@
 import type { SandboxImageIdentity, SandboxState } from './sandbox-types.js';
 import type { UserApproval } from './approval-types.js';
+import type { UserInputRequest } from './user-input-types.js';
 import type { ThreadEvent, ThreadItem, Usage } from './agent-protocol.js';
 
 export type SessionStatus = 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -88,6 +89,7 @@ export interface Turn {
   contextUsage?: ContextUsage[];
   retry?: RetryState;
   approvals?: UserApproval[];
+  userInputRequests?: UserInputRequest[];
   /** Durable reference to a Codex worker that runs inside a Sandbox. */
   execution?: {
     kind: 'sandbox-worker';
@@ -103,7 +105,7 @@ export interface Turn {
 }
 export type ProjectStatus = 'active' | 'completed' | 'archived';
 export interface ProjectSandboxOperation {
-  kind: 'backup' | 'restore' | 'archive' | 'migrate' | 'switch';
+  kind: 'backup' | 'restore' | 'archive' | 'migrate' | 'switch' | 'refresh';
   phase: string;
   status: 'running' | 'failed' | 'succeeded';
   error?: string;

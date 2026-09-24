@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
 import type { Project, ProjectSummary, Session, SessionSummary, Settings, StreamMessage, Turn } from '../../protocol/types.js';
+import type { UserInputQuestion, UserInputRequest } from '../../protocol/user-input-types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
@@ -254,6 +255,11 @@ export class SessionManager {
     // Register remote use before connection/recovery yields to lifecycle scans.
     for (const { session, turn } of recoverable) this.sandbox?.trackExecution?.(session, turn);
     for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
+    for (const session of this.sessions.values()) {
+      if (session.turns.some(turn => turn.userInputRequests?.some(request => request.status === 'queued')) && !this.active.has(session.id)) {
+        void this.startQueuedUserInput(session.id).catch(error => console.error('Queued user answer recovery failed:', error instanceof Error ? error.message : 'unknown error'));
+      }
+    }
     this.lifecycle?.start();
   }
 
@@ -296,6 +302,7 @@ export class SessionManager {
       requestApproval: approvals.request, closeApprovals: () => approvals.close(), detachApprovals: () => approvals.detach(),
     }).finally(() => {
       execution.finish();
+      void this.startQueuedUserInput(id).catch(error => console.error('Queued user answer failed:', error instanceof Error ? error.message : 'unknown error'));
       if (this.notifications && turn.status !== 'running') {
         const type = turn.status === 'completed' ? 'turn_completed'
           : turn.status === 'cancelled' ? 'turn_cancelled' : 'turn_failed';
@@ -428,6 +435,7 @@ export class SessionManager {
       // to lose the Agent's visible output.
       const storedOnlyItems = stored.items.filter(item => !turn.items.some(native => native.id === item.id));
       return { ...turn, id: stored.id, nativeTurnId: turn.id, sdkUsage: stored.sdkUsage,
+        userInputRequests: stored.userInputRequests,
         prompt: turn.prompt || stored.prompt,
         images: turn.images.length ? turn.images : stored.images,
         items: [...turn.items, ...storedOnlyItems],
@@ -552,12 +560,17 @@ export class SessionManager {
     return this.getProject(id);
   }
 
+  async refreshProjectSandboxRuntime(id: string): Promise<ProjectSummary> {
+    await this.runProjectSandboxOperation(id, 'refresh');
+    return this.getProject(id);
+  }
+
   async archiveProjectNow(id: string, options: { useExistingBackup?: boolean } = {}): Promise<ProjectSummary> {
     await this.runProjectSandboxOperation(id, 'archive', options);
     return this.getProject(id);
   }
 
-  private async runProjectSandboxOperation(id: string, kind: 'backup' | 'restore' | 'archive' | 'migrate' | 'switch',
+  private async runProjectSandboxOperation(id: string, kind: 'backup' | 'restore' | 'archive' | 'migrate' | 'switch' | 'refresh',
     options: { useExistingBackup?: boolean; targetImageId?: string } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
@@ -812,6 +825,7 @@ export class SessionManager {
       id: turn.id, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
       execution: turn.execution, codexAccepted: turn.codexAccepted, error: turn.error,
       approvals: turn.status === 'running' || (turn.execution && turn.execution.state !== 'terminal') ? turn.approvals : undefined,
+      userInputRequests: turn.userInputRequests,
       prompt: turn.prompt,
       images: turn.images,
       items: turn.items,
@@ -919,6 +933,65 @@ export class SessionManager {
       sessionId: session.id, sessionTitle: session.title, projectName: session.projectId ? this.projects.get(session.projectId)?.name : undefined, turnId,
     });
     return execution.approvals.request(requestId, input, signal);
+  }
+
+  async requestUserInput(id: string, turnId: string, projectId: string | null, requestId: string,
+    questions: UserInputQuestion[]): Promise<UserInputRequest> {
+    const session = this.lookup(id);
+    if ((session.projectId ?? null) !== projectId) throw new HttpError(403, '提问来源项目不匹配');
+    const turn = session.turns.find(item => item.id === turnId);
+    if (!turn || this.active.get(id)?.turnId !== turnId || turn.status !== 'running') {
+      throw new HttpError(409, '来源任务已结束，不能发送问题');
+    }
+    const existing = turn.userInputRequests?.find(item => item.id === requestId);
+    if (existing) {
+      if (JSON.stringify(existing.questions) !== JSON.stringify(questions)) throw new HttpError(409, '提问 ID 已用于其他内容');
+      return structuredClone(existing);
+    }
+    if ((turn.userInputRequests?.length ?? 0) >= 20) throw new HttpError(409, '本轮提问过多');
+    const question: UserInputRequest = { id: requestId, questions, status: 'pending', createdAt: new Date().toISOString() };
+    (turn.userInputRequests ??= []).push(question);
+    session.updatedAt = question.createdAt;
+    await this.save(session);
+    this.publish(id, { type: 'state', session: this.get(id) });
+    return structuredClone(question);
+  }
+
+  async answerUserInput(id: string, turnId: string, requestId: string, answer: string): Promise<Session> {
+    const session = this.lookup(id);
+    const request = session.turns.find(turn => turn.id === turnId)?.userInputRequests?.find(item => item.id === requestId);
+    if (!request) throw new HttpError(404, '问题不存在');
+    if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
+    request.status = 'queued';
+    request.answer = answer;
+    request.answeredAt = new Date().toISOString();
+    session.updatedAt = request.answeredAt;
+    await this.save(session);
+    this.publish(id, { type: 'state', session: this.get(id) });
+    if (!this.active.has(id)) await this.startQueuedUserInput(id);
+    return this.get(id);
+  }
+
+  private async startQueuedUserInput(id: string): Promise<void> {
+    if (this.active.has(id)) return;
+    const session = this.lookup(id);
+    for (const [index, source] of session.turns.entries()) {
+      for (const request of source.userInputRequests ?? []) {
+        if (request.status !== 'queued' || !request.answer) continue;
+        const prompt = request.questions.length === 1 ? request.answer : `对之前问题的回答：\n${request.answer}`;
+        // A crash after startTurn saved the new turn but before this receipt
+        // was saved must not submit the same answer a second time.
+        const existing = session.turns.slice(index + 1).find(turn => turn.prompt === prompt
+          && Date.parse(turn.startedAt) >= Date.parse(request.answeredAt ?? request.createdAt));
+        const answerTurnId = existing?.id ?? await this.startTurn(id, prompt);
+        request.status = 'answered';
+        request.answerTurnId = answerTurnId;
+        session.updatedAt = new Date().toISOString();
+        await this.save(session);
+        this.publish(id, { type: 'state', session: this.get(id) });
+        if (!existing) return;
+      }
+    }
   }
 
   /** Resolve Web session/turn context from a Codex App-Server thread ID. */

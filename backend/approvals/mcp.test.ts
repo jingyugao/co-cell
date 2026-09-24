@@ -42,6 +42,38 @@ test('tool call remains pending until the user decision is returned', async () =
   assert.equal(result.approved, true);
 });
 
+test('async question returns only after the question is saved, without waiting for its answer', async () => {
+  const questions = [{ title: 'Which environment?', options: ['UAT', 'Production'] }];
+  let save!: () => void;
+  const saved = new Promise<void>(resolve => { save = resolve; });
+  const service = new ApprovalMcpService(secret, async () => { throw new Error('unused'); }, async (receivedContext, received, id) => {
+    assert.deepEqual(receivedContext, context);
+    assert.deepEqual(received, questions);
+    assert.equal(id, 'call-123');
+    await saved;
+    return { id, questions, status: 'pending', createdAt: new Date().toISOString() };
+  });
+  const operation = service.handle(context, { jsonrpc: '2.0', id: 8, method: 'tools/call', params: {
+    name: 'request_user_input_async', arguments: { questions }, _meta: { callId: 'call-123' },
+  } }, new AbortController().signal);
+  let settled = false;
+  void operation.then(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  save();
+  const response = await operation;
+  assert.deepEqual((response.body as { result: { structuredContent: unknown } }).result.structuredContent,
+    { accepted: true, requestId: 'call-123' });
+});
+
+test('async question rejects malformed payloads', async () => {
+  const service = new ApprovalMcpService(secret, async () => { throw new Error('unused'); }, async () => { throw new Error('should not be called'); });
+  const response = await service.handle(context, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: {
+    name: 'request_user_input_async', arguments: { questions: [{ title: '' }] },
+  } }, new AbortController().signal);
+  assert.equal((response.body as { result: { isError: boolean } }).result.isError, true);
+});
+
 test('initialize negotiates a supported protocol and notifications return no body', async () => {
   const service = new ApprovalMcpService(secret, async () => { throw new Error('unused'); });
   const initialized = await service.handle(context, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26' } }, new AbortController().signal);
@@ -60,4 +92,8 @@ test('HTTP transport rejects anonymous callers and accepts the fixed bearer toke
   } });
   assert.equal(response.status, 200);
   assert.equal((await response.json() as { result: { tools: Array<{ name: string }> } }).result.tools[0].name, 'request_user_approval');
+  const tools = (await (await app.request('/mcp/approvals', { method: 'POST', body: JSON.stringify(request), headers: {
+    'content-type': 'application/json', authorization: `Bearer ${secret}`,
+  } })).json() as { result: { tools: Array<{ name: string }> } }).result.tools;
+  assert.ok(tools.some(tool => tool.name === 'request_user_input_async'));
 });

@@ -1,0 +1,10 @@
+.user-input-card{border:1px solid #d7dcca;border-radius:10px;background:#f8f9f3;margin:16px 0;padding:16px;overflow-wrap:anywhere}
+.user-input-card>header{display:flex;justify-content:space-between;gap:12px;align-items:baseline;font-size:13px}
+.user-input-card>header span{font-size:11px;color:#6c755d}
+.user-input-card fieldset{border:0;padding:0;margin:16px 0}
+.user-input-card legend{font-size:12px;font-weight:600;line-height:1.6;margin-bottom:8px}
+.user-input-option{display:flex;align-items:flex-start;gap:8px;margin:7px 0;font-size:12px;cursor:pointer}
+.user-input-option input{margin-top:2px}
+.user-input-custom{display:block;margin-top:12px;font-size:11px;color:#6c755d}
+.user-input-custom textarea{display:block;box-sizing:border-box;width:100%;margin-top:6px;padding:8px;border:1px solid #d7dcca;border-radius:6px;background:#fffefa;font:inherit;color:#333;resize:vertical}
+.user-input-answer{white-space:pre-wrap;font-size:12px;line-height:1.6}

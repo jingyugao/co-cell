@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -56,5 +56,24 @@ test('Restic stores incremental project snapshots and restores the relative layo
     assert.equal((await restic.listSnapshots(repositoryId)).includes(first.snapshotId), false);
     await restic.verify(repositoryId, third.snapshotId);
     await restic.checkDataSubset(repositoryId, 10);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('an existing repository is repaired for Sandbox access after root maintenance', { skip: !available || process.getuid?.() !== 0 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-restic-owner-'));
+  try {
+    const restic = new ResticArchives({ repositoryRoot: join(root, 'repositories'),
+      passwordFile: join(root, 'credentials', 'password'), binary, uid: 1000, gid: 1000 });
+    await restic.ready();
+    const repositoryId = randomUUID();
+    await restic.ensureRepository(repositoryId);
+    const index = join(restic.repository(repositoryId), 'index', 'root-owned-index');
+    await writeFile(index, 'fixture', { mode: 0o400 });
+    assert.equal((await stat(index)).uid, 0);
+    await restic.ensureRepository(repositoryId);
+    const repaired = await stat(index);
+    assert.equal(repaired.uid, 1000);
+    assert.equal(repaired.gid, 1000);
+    assert.equal(repaired.mode & 0o777, 0o400);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

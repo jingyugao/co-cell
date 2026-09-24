@@ -93,7 +93,24 @@ export class ResticArchives {
     } catch (error) {
       const failure = error as Error & { stderr?: string };
       throw new Error(`Restic ${args[0]} failed: ${failure.stderr?.trim() || failure.message}`);
+    } finally {
+      // Host-side Restic runs as the Web service (often root), while the
+      // Sandbox writes snapshots as uid/gid 1000. Even check/restore may add
+      // index files; normalize them before the Sandbox accesses the repo.
+      if (repositoryId && ['init', 'backup', 'check', 'restore', 'forget', 'prune', 'repair'].includes(args[0])) {
+        await this.repairRepositoryOwnership(repositoryId);
+      }
     }
+  }
+
+  private async repairRepositoryOwnership(repositoryId: string) {
+    if (this.uid === undefined || this.gid === undefined || process.getuid?.() !== 0) return;
+    const path = this.repository(repositoryId);
+    // find does not follow symlinks, and chown -h changes a symlink itself.
+    // Only mismatched entries are touched so repeated checks avoid rewriting
+    // metadata for the whole repository.
+    await exec('find', [path, '-xdev', '(', '!', '-uid', String(this.uid), '-o', '!', '-gid', String(this.gid), ')',
+      '-exec', 'chown', '-h', `${this.uid}:${this.gid}`, '{}', '+'], { timeout: 10 * 60_000 });
   }
 
   async ensureRepository(repositoryId: string) {
@@ -105,12 +122,10 @@ export class ResticArchives {
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       await this.run(repositoryId, ['init']);
-      // The service initializes the repository as root, while the Sandbox
-      // command writes subsequent snapshots as the configured Sandbox user.
-      if (this.uid !== undefined && this.gid !== undefined) {
-        await exec('chown', ['-R', `${this.uid}:${this.gid}`, path]);
-      }
     }
+    // Repair files left by an earlier host maintenance command before a
+    // Sandbox backup tries to read the repository.
+    await this.repairRepositoryOwnership(repositoryId);
   }
 
   async assertSpace(repositoryId?: string, sourceRoot?: string) {

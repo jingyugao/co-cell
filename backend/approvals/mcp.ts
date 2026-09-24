@@ -3,10 +3,12 @@ import type { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
 import type { UserApproval, UserApprovalInput } from '../../protocol/approval-types.js';
+import type { UserInputQuestion, UserInputRequest } from '../../protocol/user-input-types.js';
 import type { SessionManager } from '../sessions/manager.js';
 
 export type ApprovalMcpContext = { sessionId: string; turnId: string; projectId: string | null };
 type RequestApproval = (context: ApprovalMcpContext, input: UserApprovalInput, requestId: string, signal: AbortSignal) => Promise<UserApproval>;
+type RequestUserInput = (context: ApprovalMcpContext, questions: UserInputQuestion[], requestId: string) => Promise<UserInputRequest>;
 
 export const approvalInputSchema = z.object({
   title: z.string().trim().min(1).max(200),
@@ -28,6 +30,25 @@ const tool = {
       impact: { type: 'string', minLength: 1, maxLength: 8000, description: '影响范围和关键风险；未知范围应明确说明。' },
     },
     required: ['title', 'target', 'action', 'impact'],
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+};
+
+export const userInputSchema = z.object({ questions: z.array(z.object({
+  title: z.string().trim().min(1).max(1000),
+  options: z.array(z.string().trim().min(1).max(500)).min(1).max(8).optional(),
+}).strict()).min(1).max(5) }).strict();
+const userInputTool = {
+  name: 'request_user_input_async',
+  title: '向用户提问',
+  description: '向用户发送一组简短问题并立即返回。用户可选择建议答案或填写自由文本；回答随后作为新的用户消息进入本会话。此工具不等待回答。',
+  inputSchema: {
+    type: 'object', additionalProperties: false,
+    properties: { questions: { type: 'array', minItems: 1, maxItems: 5, items: {
+      type: 'object', additionalProperties: false,
+      properties: { title: { type: 'string', minLength: 1, maxLength: 1000 }, options: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string', minLength: 1, maxLength: 500 } } },
+      required: ['title'],
+    } } }, required: ['questions'],
   },
   annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
 };
@@ -54,7 +75,8 @@ function resolveContext(meta: ReturnType<typeof metaSchema.parse>, manager?: Ses
 
 /** Stateless transport with a synchronous approval waiter scoped to one session turn. */
 export class ApprovalMcpService {
-  constructor(private readonly token: string, private readonly requestApproval: RequestApproval) {
+  constructor(private readonly token: string, private readonly requestApproval: RequestApproval,
+    private readonly requestUserInput?: RequestUserInput) {
     if (Buffer.byteLength(token) < 32) throw new Error('Approval MCP token must be at least 32 bytes');
   }
 
@@ -77,13 +99,29 @@ export class ApprovalMcpService {
       } } };
     }
     if (request.method === 'ping') return { status: 200, body: { jsonrpc: '2.0', id: request.id, result: {} } };
-    if (request.method === 'tools/list') return { status: 200, body: { jsonrpc: '2.0', id: request.id, result: { tools: [tool] } } };
+    if (request.method === 'tools/list') return { status: 200, body: { jsonrpc: '2.0', id: request.id, result: { tools: [tool, userInputTool] } } };
     if (request.method !== 'tools/call') return { status: 200, body: rpcError(request.id, -32601, 'Method not found') };
     const params = request.params as { name?: unknown; arguments?: unknown; _meta?: unknown } | undefined;
-    if (params?.name !== tool.name) return { status: 200, body: rpcError(request.id, -32602, 'Unknown tool') };
+    if (params?.name !== tool.name && params?.name !== userInputTool.name) return { status: 200, body: rpcError(request.id, -32602, 'Unknown tool') };
     if (!context) return { status: 200, body: { jsonrpc: '2.0', id: request.id, result: {
       isError: true, content: [{ type: 'text', text: '审批 MCP 已连接，但尚未配置来源 Sandbox 到活动任务的定位。不得执行待审批操作。' }],
     } } };
+    if (params.name === userInputTool.name) {
+      const parsed = userInputSchema.safeParse(params.arguments);
+      if (!parsed.success || !this.requestUserInput) return { status: 200, body: { jsonrpc: '2.0', id: request.id, result: {
+        isError: true, content: [{ type: 'text', text: parsed.success ? '用户提问服务不可用' : `提问参数无效：${z.prettifyError(parsed.error)}` }],
+      } } };
+      const meta = metaSchema.parse(params._meta);
+      try {
+        const receipt = await this.requestUserInput(context, parsed.data.questions, meta?.callId ?? randomUUID());
+        const result = { accepted: true, requestId: receipt.id };
+        return { status: 200, body: { jsonrpc: '2.0', id: request.id, result: {
+          content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result,
+        } } };
+      } catch (error) { return { status: 200, body: { jsonrpc: '2.0', id: request.id, result: {
+        isError: true, content: [{ type: 'text', text: error instanceof Error ? error.message : '提问发送失败' }],
+      } } }; }
+    }
     const parsed = approvalInputSchema.safeParse(params.arguments);
     if (!parsed.success) return { status: 200, body: { jsonrpc: '2.0', id: request.id, result: {
       isError: true, content: [{ type: 'text', text: `审批工单参数无效：${z.prettifyError(parsed.error)}` }],

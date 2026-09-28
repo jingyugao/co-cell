@@ -1,6 +1,4 @@
 import type { SandboxImageIdentity, SandboxState } from './sandbox-types.js';
-import type { UserApproval } from './approval-types.js';
-import type { UserInputRequest } from './user-input-types.js';
 import type { ThreadEvent, ThreadItem, Usage } from './agent-protocol.js';
 
 export type SessionStatus = 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -88,24 +86,12 @@ export interface Turn {
   /** One entry for each completed model request in this turn. */
   contextUsage?: ContextUsage[];
   retry?: RetryState;
-  approvals?: UserApproval[];
-  userInputRequests?: UserInputRequest[];
-  /** Durable reference to a Codex worker that runs inside a Sandbox. */
-  execution?: {
-    kind: 'sandbox-worker';
-    protocolVersion: 1;
-    workerId: string;
-    sandboxId?: string;
-    commandPid?: number;
-    /** Keep retrying termination after reconnect/restart until it is confirmed. */
-    stopRequested?: boolean;
-    lastAppliedSeq: number;
-    state: 'launching' | 'running' | 'detached' | 'terminal';
-  };
 }
 export type ProjectStatus = 'active' | 'completed' | 'archived';
 export interface ProjectSandboxOperation {
-  kind: 'backup' | 'restore' | 'archive' | 'migrate' | 'switch' | 'refresh';
+	/** Persisted intention ID used for remote operation idempotency. */
+	id?: string;
+  kind: 'backup' | 'restore' | 'archive' | 'refresh';
   phase: string;
   status: 'running' | 'failed' | 'succeeded';
   error?: string;
@@ -138,22 +124,8 @@ export interface Project {
   sandbox?: SandboxState;
   /** Timestamp at which project archiving removed the previous sandbox. */
   sandboxReclaimedAt?: string;
-  /** Archive containing the workspace and ~/.codex state for rebuilds. */
-  sandboxDataArchive?: {
-    key: string;
-    format: 'codex-workspace-v1';
-    sha256: string;
-    sizeBytes: number;
-    createdAt: string;
-    threadIds: string[];
-    workingDirectory: string;
-    sourceSandboxId: string;
-    sourceProjectId?: string;
-    sourceTemplate?: string;
-    manifestSha256: string;
-  };
-  /** 指向 archives 模块的归档流 key（新方案），替代 sandboxDataArchive */
-  archiveKey?: string;
+	/** Product references only; archive bytes and integrity belong to the box service. */
+	remoteArchives?: import('./remote-archive-types.js').RemoteArchiveRef[];
   backupRetentionCount?: number;
   latestBackup?: LatestBackupSummary;
   sandboxOperation?: ProjectSandboxOperation;
@@ -173,16 +145,7 @@ export interface ProjectLifecycleRecord {
 export interface LatestBackupSummary {
   createdAt: string;
   sizeBytes?: number;
-  bytesAdded?: number;
   checksum?: string;
-  revisionId?: string;
-  storageSizeBytes?: number;
-  /** Fields retained for project records written before the format-neutral summary. */
-  format?: string;
-  sha256?: string;
-  logicalSizeBytes?: number;
-  snapshotId?: string;
-  repositorySizeBytes?: number;
 }
 
 export interface ArchiveVersionSummary {
@@ -195,7 +158,7 @@ export interface ArchiveVersionSummary {
 }
 
 export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null;
-  /** 归档版本列表（新归档模块），按版本倒序 */
+  /** Cellbox archive versions, newest first. */
   archiveVersions?: ArchiveVersionSummary[];
 }
 export interface Session {
@@ -259,7 +222,7 @@ export interface SandboxRecord {
     diskTotalBytes: number | null;
   } | null;
   metricsStatus: 'available' | 'paused' | 'unavailable' | 'pending';
-  metricsSource?: 'docker';
+  metricsSource?: 'cellbox';
   metricsMessage?: string;
 }
 export interface SandboxInventory {
@@ -270,6 +233,8 @@ export interface SandboxInventory {
 export interface AppConfig {
   localWorkingDirectory?: string;
   sandbox?: {
+    provider?: 'cellbox';
+    kind?: 'k8s-resumable';
     enabled: boolean;
     image: string;
     imageIdentity?: SandboxImageIdentity;

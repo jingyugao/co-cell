@@ -1,4 +1,4 @@
-export type NotificationType = 'approval_pending' | 'turn_completed' | 'turn_failed' | 'turn_cancelled';
+export type NotificationType = 'turn_completed' | 'turn_failed' | 'turn_cancelled';
 
 export interface AppNotification {
   id: string;

@@ -1,9 +1,9 @@
 import type { ProjectSummary, SessionSummary } from '../../protocol/types';
 
-export type Page = 'chat' | 'sandboxes' | 'projects' | 'files' | 'connections' | 'improvements';
+export type Page = 'chat' | 'sandboxes' | 'projects' | 'files' | 'connections';
 export type Selection = { sessionId: string | null; projectId: string | null };
 const isActiveProject = (project: ProjectSummary) => (project.status ?? (project.archivedAt ? 'archived' : 'active')) === 'active';
-const pages: Page[] = ['sandboxes', 'projects', 'files', 'connections', 'improvements'];
+const pages: Page[] = ['sandboxes', 'projects', 'files', 'connections'];
 
 export function readRoute(location = window.location) {
   const page: Page = pages.includes(location.hash.slice(1) as Page) ? location.hash.slice(1) as Page : 'chat';

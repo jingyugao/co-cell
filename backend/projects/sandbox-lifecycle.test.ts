@@ -3,7 +3,7 @@ import test from 'node:test';
 import type { Project } from '../../protocol/types.js';
 import { SandboxLifecycleService } from './sandbox-lifecycle.js';
 
-const sandbox = { id: 'sandbox-1', status: 'ready' as const, template: 'base', workingDirectory: '/home/user/workspace' };
+const sandbox = { id: 'sandbox-1', status: 'ready' as const, template: 'base', workingDirectory: '/home/agent/workspace' };
 const project = (id: string, overrides: Partial<Project> = {}): Project => ({
   id, name: id, requirementUrl: null, executionMode: 'sandbox', workingDirectory: sandbox.workingDirectory,
   sandbox: { ...sandbox, id: `sandbox-${id}` }, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(),

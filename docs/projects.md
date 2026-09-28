@@ -30,7 +30,7 @@
 
 ## 持久化与接口
 
-项目元数据使用 JSON 或 MySQL 保存，由 `MYSQL_URL` 选择存储方式。JSON 默认位于 `data/web-state/`。`project.sandbox` 保存项目的当前环境绑定，会话同步该绑定。
+项目与会话元数据仅使用 MySQL 保存，必须配置 `MYSQL_URL`。缺少配置或数据库初始化失败时服务无法启动，不再支持 JSON 文件存储或自动导入。`project.sandbox` 保存项目的当前环境绑定，会话同步该绑定。
 
 | 接口 | 用途 |
 | --- | --- |

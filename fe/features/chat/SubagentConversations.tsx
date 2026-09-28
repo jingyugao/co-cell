@@ -13,15 +13,22 @@ export function useSubagentConversations(sessionId: string | null, running: bool
     setAgents([]); setError(false);
     if (!sessionId) return;
     let active = true;
-    const refresh = () => { void api<SubagentConversation[]>(`/api/sessions/${sessionId}/subagents`)
-      .then(value => { if (active) { setAgents(value); setError(false); } })
-      .catch(() => { if (active) setError(true); }); };
-    refresh();
-    if (running) {
-      const timer = setInterval(refresh, 5000);
-      return () => { active = false; clearInterval(timer); };
-    }
-    return () => { active = false; };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    const refresh = async () => {
+      let failed = false;
+      try {
+        const value = await api<SubagentConversation[]>(`/api/sessions/${sessionId}/subagents`, { signal: controller.signal });
+        if (active) { setAgents(value); setError(false); }
+      } catch {
+        failed = true;
+        if (active) setError(true);
+      } finally {
+        if (active && (running || failed)) timer = setTimeout(() => { void refresh(); }, 5000);
+      }
+    };
+    void refresh();
+    return () => { active = false; controller.abort(); if (timer) clearTimeout(timer); };
   }, [sessionId, running]);
   return { agents, error };
 }

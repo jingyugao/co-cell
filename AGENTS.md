@@ -34,3 +34,30 @@ Never hard-code secrets or organization-specific hosts, identities, paths, or
 deployment details. Treat external changes such as deploying, merging,
 publishing, modifying cluster resources, or writing production data as actions
 that require explicit operator authorization.
+
+## Deployment
+
+Run deployments from this repository's root. The Cellbox source is in the
+sibling `cell-box` repository. Set `COCELL_REGISTRY_ENDPOINT` to the HTTP
+registry origin used by the installation.
+
+```sh
+make deploy-cellbox-api CELLBOX_SOURCE_DIR=../cell-box COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT
+make deploy-cellbox-controller CELLBOX_SOURCE_DIR=../cell-box COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT
+make deploy-co-cell COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT
+make deploy-all CELLBOX_SOURCE_DIR=../cell-box COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT
+make deploy-debug-mount CELLBOX_SOURCE_DIR=../cell-box COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT COCELL_DEBUG_READ_ONLY_HOST_PATH=/ABSOLUTE/NODE/DIRECTORY COCELL_SANDBOX_IMAGE_TAG=v0.0.2
+```
+
+`deploy-cellbox-controller` updates the ResumablePod CRD and controller image.
+`deploy-cellbox-api` builds and publishes the Cellbox API image, checks for
+active operations, updates its `Recreate` deployment, and verifies the running
+Pod uses the published digest. `deploy-co-cell` deploys only the CoCell web
+service. `deploy-debug-mount` builds Cellbox once and runs the controller, API,
+and Sandbox deployments in sequence. `deploy-all` also deploys the CoCell web
+service. With the debug host mount, remove `__mysqlLogin` and
+`__kubernetes_config.json` from CoCell's credential-slot mapping; their CLI
+wrappers read those files from the mount. Keep registry addresses and
+credentials in local configuration, not
+in this file. Do not apply Cellbox's example `deploy/cellbox-api.yaml` to the
+CoCell installation.

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Project, ProjectStatus, ProjectType, Settings } from '../../protocol/types.js';
 import { projectWeekOf } from '../../util/project-types.js';
 import { HttpError } from '../../util/errors.js';
-import { AtomicJsonWriter } from '../infra/storage/atomic-json.js';
+import { RecordWriteQueue } from '../infra/storage/record-write-queue.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import { readRequirementInfo } from './requirements.js';
 
@@ -18,7 +18,7 @@ export class ProjectService {
   private activeSessions = new Map<string, Set<string>>();
   private maintenance = new Set<string>();
   private creatingWeeklyProjects = new Set<string>();
-  private writer = new AtomicJsonWriter();
+  private writer = new RecordWriteQueue();
   constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo, private now: () => Date = () => new Date()) {}
 
   async init() {
@@ -106,38 +106,17 @@ export class ProjectService {
     }, true);
   }
 
-  async saveDataArchive(id: string, archive: NonNullable<Project['sandboxDataArchive']>): Promise<void> {
-    // Record first: if the project pointer write fails, the immutable archive
-    // remains discoverable in the ledger. Historical rows are never updated.
-    await this.state.recordProjectArchive(id, archive);
-    await this.mutateSandboxMetadata(id, project => { project.sandboxDataArchive = structuredClone(archive); });
-  }
-
-  latestDataArchive(id: string) {
-    this.get(id);
-    return this.state.latestProjectArchive(id);
-  }
-
-  /** 保存项目的归档流 key */
-  async saveArchiveKey(id: string, archiveKey: string): Promise<void> {
-    await this.mutateSandboxMetadata(id, project => { project.archiveKey = archiveKey; });
-  }
-
-  /** 更新项目上的 sandboxDataArchive（用于前端展示，不写入 project_sandbox_archives 表） */
-  async updateSandboxDataArchive(id: string, archive: NonNullable<Project['sandboxDataArchive']>): Promise<void> {
-    await this.mutateSandboxMetadata(id, project => { project.sandboxDataArchive = structuredClone(archive); });
-  }
-
-  async updateLatestBackup(id: string, backup: NonNullable<Project['latestBackup']>, options: { clearLegacyArchive?: boolean } = {}): Promise<void> {
+  async saveRemoteArchive(id: string, archive: NonNullable<Project['remoteArchives']>[number]): Promise<void> {
     await this.mutateSandboxMetadata(id, project => {
-      project.latestBackup = structuredClone(backup);
-      if (options.clearLegacyArchive) delete project.sandboxDataArchive;
+      project.remoteArchives = [structuredClone(archive), ...(project.remoteArchives ?? []).filter(item => item.id !== archive.id)];
+      project.latestBackup = { createdAt: archive.createdAt, sizeBytes: archive.sizeBytes, checksum: archive.sha256 };
     });
   }
-
-  /** 获取项目的归档流 key */
-  getArchiveKey(id: string): string | undefined {
-    return this.records.get(id)?.archiveKey;
+  async removeRemoteArchive(id: string, archiveId: string): Promise<void> {
+    await this.mutateSandboxMetadata(id, project => {
+      if (project.remoteArchives?.[0]?.id === archiveId) throw new HttpError(409, '不能删除最新的远程归档');
+      project.remoteArchives = (project.remoteArchives ?? []).filter(ref => ref.id !== archiveId);
+    });
   }
 
   async updateSandboxOperation(id: string, operation: Project['sandboxOperation']) {
@@ -162,9 +141,9 @@ export class ProjectService {
       // Commit only the fields this operation owns; an unrelated edit may have
       // reserved its own write while storage was pending.
       current.sandbox = next.sandbox;
-      current.sandboxDataArchive = next.sandboxDataArchive;
+      current.workingDirectory = next.workingDirectory;
       current.latestBackup = next.latestBackup;
-      current.archiveKey = next.archiveKey;
+	  current.remoteArchives = next.remoteArchives;
       current.sandboxReclaimedAt = next.sandboxReclaimedAt;
       current.sandboxOperation = next.sandboxOperation;
       current.pendingSandboxCleanup = next.pendingSandboxCleanup;
@@ -279,6 +258,7 @@ export class ProjectService {
     await this.mutateSandboxMetadata(id, next => {
       delete next.sandboxReclaimedAt;
       next.sandbox = structuredClone(sandbox);
+      next.workingDirectory = sandbox.workingDirectory;
       if (restoreProject && next.status === 'archived') {
         const at = new Date().toISOString();
         next.status = 'active';

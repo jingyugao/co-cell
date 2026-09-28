@@ -7,8 +7,8 @@ import { ProjectService } from './service.js';
 
 const project = (): Project => ({
   id: 'project-1', name: 'Archive history', requirementUrl: null, executionMode: 'sandbox',
-  workingDirectory: '/home/user/workspace',
-  sandbox: { id: 'sandbox-1', template: 'base', status: 'ready', workingDirectory: '/home/user/workspace' },
+  workingDirectory: '/home/agent/workspace',
+  sandbox: { id: 'sandbox-1', template: 'base', status: 'ready', workingDirectory: '/home/agent/workspace' },
   archivedAt: null, createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-01T00:00:00.000Z',
 });
 
@@ -22,14 +22,6 @@ class MemoryState implements WebStateStore {
     if (index < 0) this.projects.push(structuredClone(value)); else this.projects[index] = structuredClone(value);
   }
   async saveSession() {}
-  async recordProjectArchive() {}
-  async latestProjectArchive(id: string) { return this.projects.find(item => item.id === id)?.sandboxDataArchive; }
-  async listProjectArchives(id: string) {
-    const project = this.projects.find(p => p.id === id);
-    const archive = project?.sandboxDataArchive;
-    return archive ? [{ key: archive.key, sizeBytes: archive.sizeBytes, createdAt: archive.createdAt }] : [];
-  }
-  async deleteArchiveRecord() {}
   async deleteProject(id: string) { this.projects = this.projects.filter(item => item.id !== id); }
   async deleteSession() {}
   async close() {}
@@ -48,7 +40,7 @@ test('archive detaches the Sandbox and rebuilding restores the project with a ne
   assert.equal(archived.lifecycleHistory?.[0].action, 'archived');
   assert.equal(archived.lifecycleHistory?.[0].sandboxId, 'sandbox-1');
 
-  await service.updateSandbox('project-1', { id: 'sandbox-2', template: 'image', status: 'ready', workingDirectory: '/home/user/workspace' }, true);
+  await service.updateSandbox('project-1', { id: 'sandbox-2', template: 'image', status: 'ready', workingDirectory: '/home/agent/workspace' }, true);
   const restored = service.get('project-1');
   assert.equal(restored.archivedAt, null);
   assert.equal(restored.sandbox?.id, 'sandbox-2');
@@ -90,7 +82,7 @@ test('weekly projects are unique per China week and become last-week projects in
   let now = new Date('2026-09-13T10:00:00.000Z'); // Sunday evening in China
   const service = new ProjectService(new MemoryState([]), async () => ({ name: 'unused', status: null }), () => now);
   await service.init();
-  const settings = { executionMode: 'sandbox', workingDirectory: '/home/user/workspace' } as Settings;
+  const settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace' } as Settings;
 
   const weekly = await service.create({ name: '本周重点', type: 3 }, settings);
   assert.equal(weekly.weekOf, '2026-09-07');

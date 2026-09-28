@@ -4,7 +4,7 @@ import type { ProjectSummary, SessionSummary } from '../../protocol/types.js';
 import { resolveSelection } from './navigation.js';
 
 const project = (id: string, archivedAt: string | null): ProjectSummary => ({
-  id, name: id, requirementUrl: null, executionMode: 'sandbox', workingDirectory: '/home/user/workspace',
+  id, name: id, requirementUrl: null, executionMode: 'sandbox', workingDirectory: '/home/agent/workspace',
   archivedAt, createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-01T00:00:00.000Z',
   sessionCount: 0, activeSessionId: null,
 });

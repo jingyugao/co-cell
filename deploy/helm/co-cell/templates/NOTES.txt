@@ -1,0 +1,6 @@
+CoCell Service: {{ include "co-cell.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+Public URL: {{ .Values.publicUrl }}
+Cellbox REST service and its Kubernetes operator are installed separately.
+The existing runtime Secret must include MYSQL_URL for application startup.
+The data PVC is retained when the Helm release is removed.
+Use --namespace {{ .Release.Namespace }} --create-namespace for installation if the namespace does not exist.

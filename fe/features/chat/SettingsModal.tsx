@@ -20,7 +20,7 @@ export default function SettingsModal({ project, settings, session, config, onCl
   const dialogRef = useRef<HTMLDivElement>(null);
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) => setValues(previous => ({ ...previous, [key]: value }));
   function changeExecutionMode(mode: 'local' | 'sandbox') {
-    setValues(previous => effectiveSettings({ ...previous, executionMode: mode, networkAccessEnabled: mode === 'sandbox', workingDirectory: mode === 'sandbox' ? config?.sandbox?.workingDirectory || '/home/user/workspace' : config?.localWorkingDirectory || config?.defaults.workingDirectory || previous.workingDirectory }));
+    setValues(previous => effectiveSettings({ ...previous, executionMode: mode, networkAccessEnabled: mode === 'sandbox', workingDirectory: mode === 'sandbox' ? config?.sandbox?.workingDirectory || '/home/agent/workspace' : config?.localWorkingDirectory || config?.defaults.workingDirectory || previous.workingDirectory }));
     setThread('');
   }
   useEffect(() => {

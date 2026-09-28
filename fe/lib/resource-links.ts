@@ -17,7 +17,7 @@ const localAddress = /^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):\d{1,5}(?:
 const documentExtensions = /\.(?:md|mdx|txt|go|js|jsx|ts|tsx|mjs|cjs|json|yaml|yml|toml|xml|html|htm|css|scss|less|py|php|sh|bash|zsh|sql|rs|java|c|h|cc|cpp|hpp|cs|rb|vue|svelte|proto|lock|log|csv|tsv|pdf|png|jpe?g|gif|webp|svg|ico|zip|gz|tar|wasm|ipynb)$/i;
 // A deliberately conservative domain heuristic. Explicit schemes always take precedence.
 const domainTlds = new Set(['com', 'org', 'net', 'edu', 'gov', 'mil', 'int', 'io', 'ai', 'app', 'dev', 'site', 'cn', 'uk', 'de', 'fr', 'jp', 'us', 'co', 'me', 'info', 'biz', 'xyz', 'tech', 'cloud', 'online', 'store', 'tv']);
-const sharedDocs = '/home/user/.codex/docs';
+const sharedDocs = '/home/agent/workspace/.cocell/codex/docs';
 
 function absolutePath(value: string): string | null {
   if (!value.startsWith('/') || value.startsWith('//') || /[\x00-\x1f\x7f\\]/.test(value)) return null;

@@ -113,7 +113,7 @@ mkdir -p data/docs
 touch data/AGENTS.md
 ```
 
-按照[开发运行与数据维护](docs/development-and-operations.md)填写模型认证、Sandbox 镜像与运行环境配置，然后启动 Web 开发服务：
+按照[开发运行与数据维护](docs/development-and-operations.md)填写必需的 `MYSQL_URL`、模型认证、Sandbox 镜像与运行环境配置，然后启动 Web 开发服务。项目与会话元数据仅使用 MySQL：
 
 ```sh
 PORT=3001 pnpm dev

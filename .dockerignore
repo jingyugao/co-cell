@@ -4,6 +4,8 @@ dist
 .codex-web
 data
 tmp
+deploy/local
+cellbox/mybox
 *.log
 .env
 .env.*

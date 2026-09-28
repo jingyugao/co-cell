@@ -2,9 +2,8 @@ import type { Codex, Input, Thread, ThreadOptions } from '../../packages/agentco
 import type { AgentEvent, Session, StreamMessage, Turn } from '../../protocol/types.js';
 import { applyTurnEvent } from '../../util/session-events.js';
 import { HttpError } from '../../util/errors.js';
-import { TurnLaunchCancelled, TurnObserverDetached, TurnTerminationUnconfirmed, type SandboxRuntime } from './container-runtime.js';
+import { TurnObserverDetached, type SandboxRuntime } from './container-runtime.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
-import type { RequestUserApproval } from '../../protocol/approval-types.js';
 
 export type CodexClient = Pick<Codex, 'startThread' | 'resumeThread'>;
 
@@ -16,9 +15,6 @@ type TurnExecutionDependencies = {
   publish(message: StreamMessage): void;
   snapshot(): Session;
   updateSandbox(sandbox: NonNullable<Session['sandbox']>): Promise<void>;
-  requestApproval?: RequestUserApproval;
-  closeApprovals?(): Promise<void>;
-  detachApprovals?(): Promise<void>;
   recovering?: boolean;
 };
 
@@ -41,7 +37,7 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
     if (executionMode === 'sandbox') {
       if (!sandbox) throw new HttpError(503, 'Sandbox 未配置，无法运行此沙箱会话');
       const observe = dependencies.recovering ? sandbox.recover.bind(sandbox) : sandbox.run.bind(sandbox);
-      events = observe(session, turn, controller.signal, sandbox => updateSandbox(sandbox), dependencies.requestApproval, save);
+      events = observe(session, turn, controller.signal, sandbox => updateSandbox(sandbox));
     } else {
       const thread: Thread = session.threadId ? client.resumeThread(session.threadId, options) : client.startThread(options);
       const input: Input = turn.images.length ? [{ type: 'text', text: turn.prompt }, ...turn.images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
@@ -78,32 +74,21 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
   } catch (error) {
     if (error instanceof TurnObserverDetached) {
       detached = true;
-      if (error instanceof TurnTerminationUnconfirmed) turn.error = error.message;
-    } else if (error instanceof TurnLaunchCancelled) {
-      turn.status = 'cancelled';
-      turn.error = '服务正在升级，本轮尚未启动 Codex，可重新发送消息。';
     } else {
-      const cancelled = controller.signal.aborted || (turn.execution?.stopRequested && error instanceof DOMException && error.name === 'AbortError');
+      const cancelled = controller.signal.aborted;
       turn.status = cancelled ? 'cancelled' : 'failed';
       if (!cancelled) turn.error = terminalFailure ?? (error instanceof Error ? error.message : String(error));
       else delete turn.error;
     }
   } finally {
     if (detached) {
-      await dependencies.detachApprovals?.();
       turn.phase = 'recovering';
-      if (turn.execution) turn.execution.state = 'detached';
       session.status = 'running';
       session.updatedAt = new Date().toISOString();
       log('turn.observer_detached', { durationMs: Date.now() - started });
       await save();
       publish({ type: 'state', session: snapshot() });
       return;
-    }
-    try { await dependencies.closeApprovals?.(); }
-    catch (error) {
-      turn.status = controller.signal.aborted ? 'cancelled' : 'failed';
-      turn.error = error instanceof Error ? error.message : String(error);
     }
     // App Server reports a user-interrupted turn as turn.failed. The abort
     // signal is authoritative here: it came from this Web session's Stop
@@ -115,7 +100,6 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
     turn.completedAt = new Date().toISOString();
     delete turn.phase;
     delete turn.retry;
-    if (turn.execution) turn.execution.state = 'terminal';
     session.status = turn.status;
     session.updatedAt = turn.completedAt;
     log('turn.finished', { status: turn.status, durationMs: Date.now() - started, error: turn.error });

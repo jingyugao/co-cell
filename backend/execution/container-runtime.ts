@@ -1,120 +1,81 @@
 import type { SandboxImageIdentity, SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
-import { randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { createHash, randomUUID } from 'node:crypto';
 import { AppServerEventAdapter, Codex, CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
-import type { SandboxCommandHandle, SandboxHandle, SandboxProvider, SandboxLease, SandboxRecord } from '@co-cell/sandbox';
-import type { ArchiveCommand } from '@co-cell/archives';
+import type { SandboxHandle, SandboxProvider, SandboxLease, SandboxRecord, CellboxServiceAccess } from '@co-cell/sandbox';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
-import type { AgentEvent, ContextUsage } from '../../protocol/types.js';
-import type { RequestUserApproval } from '../../protocol/approval-types.js';
+import { readCellboxWorkspaceFile } from '../sandboxes/cellbox-files.js';
+import type { AgentEvent } from '../../protocol/types.js';
 import type { Session, SubagentConversation, Turn } from '../../protocol/types.js';
 import type { NativeHistory } from './native-history.mjs';
 import { readSubagentConversations } from './native-history.mjs';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
-import { CONNECTION_ROOT, type ConnectionStore } from '../connections/store.js';
-import { syncSandboxConnections } from '../connections/sandbox-sync.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
-import type { ImprovementContext, ImprovementReceipt } from '../../protocol/improvement-types.js';
 import { HttpError } from '../../util/errors.js';
-import type { ModelProxyKind } from './model-proxy.js';
-import { parseWorkspaceFile, READ_SANDBOX_FILE_SCRIPT, workspaceFileRequest, type WorkspaceFileResult, type WorkspaceFileReadOptions } from '../workspaces/files.js';
+import type { WorkspaceFileResult, WorkspaceFileReadOptions } from '../workspaces/files.js';
 
 export interface SandboxRuntime {
+	remoteArchives?: import('../archives/remote.js').RemoteArchives;
   currentImageIdentity?(): Promise<SandboxImageIdentity>;
-  hostData?(target: WorkspaceTarget): Promise<{ root: string; workspace: string; codex: string } | undefined>;
-  archiveSourceRoot?(sandboxId: string): Promise<string | undefined>;
-  executeArchiveCommand?(sandboxId: string, command: ArchiveCommand): Promise<{ exitCode: number; stdout: string }>;
-  quiesceForBackup?(sandboxId: string): Promise<() => Promise<void>>;
-  pauseForBackup?(sandboxId: string): Promise<void>;
-  resumeAfterBackup?(sandboxId: string): Promise<void>;
   track?(session: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): void;
   trackExecution?(session: Session, turn: Turn): void;
-  run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent>;
-  recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent>;
+  run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
+  recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
   detach(turn: Turn): void;
-  preview(session: WorkspaceTarget, port: number): Promise<string>;
-  proxyHost(session: WorkspaceTarget): Promise<string>;
+  service?(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response>;
   file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
   inspect?(target: WorkspaceTarget): Promise<unknown>;
   history(session: Session, options?: { cursor?: string; limit?: number }): Promise<NativeHistory>;
   subagents?(session: Session): Promise<SubagentConversation[]>;
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
-  createReplacement?(target: WorkspaceTarget, onSandbox: SaveSandbox): Promise<SandboxState>;
-  createStoppedReplacement?(target: WorkspaceTarget, onSandbox: SaveSandbox): Promise<{ sandbox: SandboxState; root: string }>;
-  startReplacement?(sandbox: SandboxState): Promise<void>;
-  restoreReplacement?(sandbox: SandboxState, archivePath: string): Promise<void>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
   verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
   fenceSandbox?(sandbox: SandboxState): Promise<void>;
-  restoreArchive?(target: WorkspaceTarget, archivePath: string): Promise<void>;
-  createArchive?(target: WorkspaceTarget, archivePath: string): Promise<{ sizeBytes: number; sha256: string }>;
   detachSandbox?(target: WorkspaceTarget): Promise<void>;
   pauseDanglingSandbox?(sandboxId: string): Promise<void>;
   deleteDanglingSandbox?(sandboxId: string): Promise<void>;
   close(): Promise<void>;
 }
+export interface AppServerEndpoint { url: string; token?: string; headers?: Record<string,string>; release?: () => Promise<void> }
+const endpointHeaders = (endpoint: AppServerEndpoint) => endpoint.headers ?? (endpoint.token ? { Authorization: 'Bearer ' + endpoint.token } : {});
 export interface ContainerRuntimeOptions {
+  paths: { root: string; runtime: string; codexHome: string; node: string };
+  prepareRemote: (sandbox: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal) => Promise<boolean>;
+  acquireRemoteUsage?: (sandboxId: string) => Promise<() => Promise<void>>;
+  remoteArchives?: import('../archives/remote.js').RemoteArchives;
   sandboxes: ProjectSandboxes;
   provider: SandboxProvider;
-  connections?: ConnectionStore;
   apiKey: string;
   baseUrl?: string;
-  proxyKind?: ModelProxyKind;
   modelConfig?: Record<string, unknown>;
   configOverrides?: string[];
   sharedDataDirectory?: URL;
   logger?: RuntimeLog;
-  submitImprovement?: (context: Omit<ImprovementContext, 'projectName'>, input: unknown, requestId: string) => Promise<ImprovementReceipt>;
-  appServer?: (sandboxId: string) => Promise<{ url: string; token: string }>;
+  appServer?: (sandboxId: string) => Promise<AppServerEndpoint>;
+  serviceAccess?: (sandboxId: string, port: number) => Promise<CellboxServiceAccess>;
 }
 type Preparation = {
   preparing?: Promise<void>;
   sharedDocPaths?: Set<string>;
-  initialized?: boolean;
+  sharedDocDigests?: Map<string, string>;
+  agentInstructionsDigest?: string;
 };
 type Entry = {
   sandbox: SandboxHandle;
   readonly metadata: SandboxRecord;
   lease: SandboxLease;
   preparation: Preparation;
+  releaseRemote?: () => Promise<void>;
 };
-type WorkerEnvelope = { v: 1; workerId: string; turnId: string; seq: number; event: Record<string, unknown> };
-type WorkerState = {
-  protocolVersion: 1; workerId: string; sessionId: string; turnId: string; pid: number;
-  status: 'running' | 'completed' | 'failed' | 'cancelled'; threadId: string | null; lastSeq: number; error?: string
-};
-type WorkerEvent = Record<string, unknown> & { type: string; requestId?: string; input?: unknown; diagnostic?: Record<string, unknown> };
 export class TurnObserverDetached extends Error {
   constructor() { super('Web observer detached'); this.name = 'TurnObserverDetached'; }
 }
-export class TurnTerminationUnconfirmed extends TurnObserverDetached {
-  constructor() {
-    super();
-    this.name = 'TurnTerminationUnconfirmed';
-    this.message = '沙箱中的停止操作尚未确认，请稍后重试停止。';
-  }
-}
-export class TurnLaunchCancelled extends Error {
-  constructor() { super('Web shut down before the worker was launched'); this.name = 'TurnLaunchCancelled'; }
-}
-// Command budgets are execution policy, separate from the sandbox's idle lease.
-const COMMAND_TIMEOUT_MS = 3 * 60 * 60 * 1000;
-const ROOT = '/home/user/.codex-web';
-const RUNTIME = `${ROOT}/runtime`;
-const CODEX_HOME = '/home/user/.codex';
 const SHARED_DATA = new URL('../../data/', import.meta.url);
-const SHARED_DOCS = `${CODEX_HOME}/docs`;
-// Keep control processes independent of a project's Node selection. Legacy base
-// sandboxes retain their existing interpreter until moved to the dev template.
-const NODE = '"$(if test -x /opt/codex-runtime/bin/node; then echo /opt/codex-runtime/bin/node; else command -v node; fi)"';
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const checkAbort = (signal: AbortSignal) => { if (signal.aborted) throw new DOMException('任务已停止', 'AbortError'); };
-const transportFailure = (error: unknown) => /timeout|timed out|network|fetch failed|ECONN|EAI_AGAIN|ENOTFOUND|socket|5\d\d|429|unavailable|transport/i.test(String(error));
 const waitFor = (delayMs: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
   const timer = setTimeout(done, delayMs);
   const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(signal.reason); };
@@ -123,19 +84,25 @@ const waitFor = (delayMs: number, signal: AbortSignal) => new Promise<void>((res
   if (signal.aborted) abort();
 });
 
-/** Prepares and observes Codex workers using independently managed sandbox leases. */
+/** Prepares project Sandboxes and observes turns on their persistent Codex App Server. */
 export class ContainerCodexRuntime implements SandboxRuntime {
   private closing = false;
   private runtimePreparations = new Map<string, Preparation>();
   private observers = new Map<string, AbortController>();
   private appServerObservers = new Map<string, { close(): Promise<void> }>();
   private detachRequests = new Set<string>();
-  private preparations = new Map<string, AbortController>();
   private readonly sandboxes: ProjectSandboxes;
 
   constructor(private options: ContainerRuntimeOptions) {
     this.sandboxes = options.sandboxes;
   }
+
+  get remoteArchives() { return this.options.remoteArchives; }
+  private get root() { return this.options.paths.root; }
+  private get runtimeDirectory() { return this.options.paths.runtime; }
+  private get codexHome() { return this.options.paths.codexHome; }
+  private get sharedDocs() { return this.codexHome + '/docs'; }
+  private get node() { return this.options.paths.node; }
 
   track(target: WorkspaceTarget, notify: SaveSandbox) { this.sandboxes.track(target, notify); }
   async currentImageIdentity(): Promise<SandboxImageIdentity> {
@@ -143,26 +110,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (!provider.currentImageIdentity) throw new Error('Sandbox provider does not support image switching');
     return provider.currentImageIdentity();
   }
-  async archiveSourceRoot(sandboxId: string): Promise<string | undefined> {
-    const provider = this.options.provider as SandboxProvider & { archiveSourceRoot?: (id: string) => Promise<string | undefined> };
-    return provider.archiveSourceRoot?.(sandboxId);
-  }
-  async executeArchiveCommand(sandboxId: string, command: ArchiveCommand): Promise<{ exitCode: number; stdout: string }> {
-    const provider = this.options.provider as SandboxProvider & {
-      executeArchiveCommand?: (id: string, command: ArchiveCommand) => Promise<{ exitCode: number; stdout: string }>;
-    };
-    if (!provider.executeArchiveCommand) throw new Error('Sandbox provider does not support archive commands');
-    return provider.executeArchiveCommand(sandboxId, command);
-  }
-  async quiesceForBackup(sandboxId: string): Promise<() => Promise<void>> {
-    const provider = this.options.provider as SandboxProvider & { quiesceForBackup?: (id: string) => Promise<() => Promise<void>> };
-    if (!provider.quiesceForBackup) throw new Error('Sandbox provider does not support backup checkpointing');
-    return provider.quiesceForBackup(sandboxId);
-  }
   trackExecution(session: Session, turn: Turn) {
-    if (turn.execution && session.sandbox && (!turn.execution.sandboxId || turn.execution.sandboxId === session.sandbox.id)) {
-      this.sandboxes.holdUsage(session, turn.execution.workerId);
-    } else if (!turn.execution && turn.codexAccepted && turn.nativeTurnId && session.threadId && session.sandbox) {
+    if (turn.codexAccepted && turn.nativeTurnId && session.threadId && session.sandbox) {
       this.sandboxes.holdUsage(session, turn.id);
     }
   }
@@ -170,6 +119,15 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     let message = error instanceof Error ? error.message : String(error);
     if (this.options.apiKey) message = message.replaceAll(this.options.apiKey, '[REDACTED]');
     return new Error(message);
+  }
+
+  private async releaseEndpoint(endpoint?: AppServerEndpoint) {
+    try { await endpoint?.release?.(); }
+    catch (error) {
+      // The grant also expires remotely; cleanup failure must not lose the
+      // execution result or prevent releasing the local sandbox usage.
+      void this.options.logger?.write({ event: 'sandbox.access_release_failed', error: this.safeError(error).message });
+    }
   }
 
   private async acquire(target: WorkspaceTarget, create: boolean, notify?: SaveSandbox, usageId?: string, signal?: AbortSignal): Promise<Entry> {
@@ -180,222 +138,17 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       preparation = {};
       this.runtimePreparations.set(lease.record.id, preparation);
     }
-    return { sandbox: lease.sandbox, get metadata() { return lease.record; }, lease, preparation };
+    let releaseRemote: (() => Promise<void>) | undefined;
+    try { releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id); }
+    catch (error) { await lease.release(); throw error; }
+    return { sandbox: lease.sandbox, get metadata() { return lease.record; }, lease, preparation, releaseRemote };
   }
 
   private async release(entry: Entry, failed = false, detached = false) {
-    try { await entry.lease.release({ detached }); }
+    try { try { await entry.releaseRemote?.(); } finally { await entry.lease.release({ detached }); } }
     catch (error) {
       void this.options.logger?.write({ event: 'sandbox.release_failed', sandboxId: entry.metadata.id, message: this.safeError(error).message });
       if (!failed) throw this.safeError(error);
-    }
-  }
-
-  private runDirectory(turn: Turn) {
-    if (!/^[0-9a-f-]{36}$/i.test(turn.id) || !turn.execution || !/^[0-9a-f-]{36}$/i.test(turn.execution.workerId)) {
-      throw new Error('Sandbox worker identity is invalid');
-    }
-    return `${RUNTIME}/turns/${turn.id}/${turn.execution.workerId}`;
-  }
-
-  private async readWorkerState(entry: Entry, turn: Turn): Promise<WorkerState | undefined> {
-    try { return JSON.parse(await entry.sandbox.files.read(`${this.runDirectory(turn)}/state.json`, { user: 'user' })); }
-    catch (error) { if ((error as Error).message.includes('404') || /not found/i.test(String(error))) return undefined; throw error; }
-  }
-
-  private async readWorkerEvents(entry: Entry, turn: Turn): Promise<WorkerEnvelope[]> {
-    let contents: string;
-    try { contents = await entry.sandbox.files.read(`${this.runDirectory(turn)}/events.jsonl`, { user: 'user' }); }
-    catch (error) { if ((error as Error).message.includes('404') || /not found/i.test(String(error))) return []; throw error; }
-    const lines = contents.split('\n');
-    const result: WorkerEnvelope[] = [];
-    for (let index = 0; index < lines.length; index++) {
-      const line = lines[index];
-      if (!line.trim()) continue;
-      let envelope: WorkerEnvelope;
-      try {
-        envelope = JSON.parse(line) as WorkerEnvelope;
-      } catch {
-        // Only an incomplete trailing append is recoverable.
-        if (index !== lines.length - 1) throw new Error('Sandbox worker journal contains an invalid event');
-        continue;
-      }
-      if (envelope.v !== 1 || envelope.workerId !== turn.execution?.workerId || envelope.turnId !== turn.id
-        || !Number.isSafeInteger(envelope.seq) || envelope.seq !== result.length + 1
-        || !envelope.event || typeof envelope.event.type !== 'string') throw new Error('Sandbox worker journal contains an invalid envelope');
-      result.push(envelope);
-    }
-    return result;
-  }
-
-  private async observeRead<T>(read: () => Promise<T>, signal: AbortSignal): Promise<T> {
-    while (true) {
-      signal.throwIfAborted();
-      try { return await read(); }
-      catch (error) {
-        // A lost Web-to-Sandbox connection says nothing about whether the remote
-        // worker is alive. Keep its turn reserved until observation recovers.
-        if (!transportFailure(error)) throw error;
-        await new Promise<void>((resolve, reject) => {
-          const done = () => { signal.removeEventListener('abort', abort); resolve(); };
-          const timer = setTimeout(done, 1000);
-          const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(signal.reason); };
-          signal.addEventListener('abort', abort, { once: true });
-          if (signal.aborted) abort();
-        });
-      }
-    }
-  }
-
-  private async *observeWorker(entry: Entry, session: Session, turn: Turn, signal: AbortSignal,
-    onApproval?: RequestUserApproval, onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
-    const detached = new AbortController();
-    this.observers.set(turn.id, detached);
-    if (this.detachRequests.has(turn.id)) detached.abort(new TurnObserverDetached());
-    const observerSignal = AbortSignal.any([signal, detached.signal]);
-    const approvalTasks = new Map<string, Promise<void>>();
-    const improvementTasks = new Map<string, Promise<void>>();
-    let idleSince = 0;
-    let deadSince = 0;
-    let lastHealthCheck = 0;
-    try {
-      while (true) {
-        if (detached.signal.aborted) throw new TurnObserverDetached();
-        signal.throwIfAborted();
-        const envelopes = await this.observeRead(() => this.readWorkerEvents(entry, turn), observerSignal);
-        const cancelledApprovals = new Set(envelopes.filter(value => value.event.type === 'runtime.user_approval_cancelled')
-          .map(value => value.event.requestId));
-        let advanced = false;
-        for (const envelope of envelopes) {
-          if (detached.signal.aborted) throw new TurnObserverDetached();
-          signal.throwIfAborted();
-          const event = envelope.event as WorkerEvent;
-          const applied = envelope.seq <= (turn.execution?.lastAppliedSeq ?? 0);
-          const control = event.type === 'runtime.user_approval_request' || event.type === 'runtime.improvement_proposal';
-          // The UI cursor does not acknowledge delivery of a control reply. Replay
-          // those requests after a Web crash, using their durable business IDs.
-          if (applied && !control) continue;
-          if (!applied && envelope.seq !== (turn.execution?.lastAppliedSeq ?? 0) + 1) throw new Error('Sandbox worker journal has an event gap');
-          if (event.type === 'runtime.user_approval_request') {
-            const requestId = event.requestId;
-            if (requestId && !/^[0-9a-f-]{36}$/i.test(requestId)) throw new Error('Invalid worker approval request ID');
-            if (onApproval && requestId && !cancelledApprovals.has(requestId) && !approvalTasks.has(requestId)) {
-              const task = (async () => {
-                let reply;
-                try { reply = { ok: true, approval: await onApproval(requestId, event.input, signal) }; }
-                catch {
-                  if (detached.signal.aborted) return;
-                  reply = { ok: false, error: '未获得用户同意，请检查请求内容或等待状态。不得执行该操作。' };
-                }
-                observerSignal.throwIfAborted();
-                await this.writeAtomic(entry, `${this.runDirectory(turn)}/approvals/${requestId}.json`, JSON.stringify(reply), observerSignal);
-              })().catch(() => { approvalTasks.delete(requestId); });
-              approvalTasks.set(requestId, task);
-            }
-          } else if (event.type === 'runtime.improvement_proposal') {
-            const requestId = event.requestId;
-            if (requestId && !/^[0-9a-f-]{36}$/i.test(requestId)) throw new Error('Invalid worker improvement request ID');
-            if (requestId && this.options.submitImprovement && !improvementTasks.has(requestId)) {
-              const task = (async () => {
-                let reply;
-                try {
-                  const receipt = await this.options.submitImprovement!({
-                    projectId: session.projectId ?? null,
-                    sessionId: session.id, sessionTitle: session.title, turnId: turn.id, sandboxId: entry.metadata.id
-                  }, event.input, requestId);
-                  reply = { ok: true, receipt };
-                } catch { reply = { ok: false, error: '建议未能保存，请检查五个字段均为有效文本后重试。' }; }
-                observerSignal.throwIfAborted();
-                await this.writeAtomic(entry, `${this.runDirectory(turn)}/improvements/${requestId}.json`, JSON.stringify(reply), observerSignal);
-              })().catch(() => { improvementTasks.delete(requestId); });
-              improvementTasks.set(requestId, task);
-            }
-          } else if (event.type === 'runtime.diagnostic') {
-            const allowed = ['event', 'requestId', 'method', 'path', 'upstream', 'status', 'httpStatus', 'durationMs', 'requestBytes', 'responseBytes', 'model', 'inputItems', 'responseId', 'upstreamRequestId', 'requestIds', 'error', 'message', 'code', 'terminalEvent', 'terminationReason', 'reason', 'incompleteReason', 'transportComplete', 'contentType', 'contentEncoding', 'sseEvents', 'parseError', 'clientAborted', 'requestAttempt', 'attempt', 'maxRetries', 'delayMs', 'nextRetryAt', 'channelId', 'inputTokens', 'cachedInputTokens', 'outputTokens', 'rawUsage'];
-            const diagnostic = event.diagnostic;
-            if (diagnostic && typeof diagnostic === 'object') {
-              const fields = Object.fromEntries(allowed.filter(key => key in diagnostic).map(key => [key, diagnostic[key]]));
-              void this.options.logger?.write({
-                ...fields, source: 'cellbox-proxy', sessionId: session.id, projectId: session.projectId,
-                turnId: turn.id, threadId: session.threadId, sandboxId: entry.metadata.id, model: session.settings.model
-              });
-              const inputTokens = diagnostic.inputTokens;
-              const cachedInputTokens = diagnostic.cachedInputTokens;
-              const outputTokens = diagnostic.outputTokens;
-              if (diagnostic.event === 'api.completed' && typeof inputTokens === 'number' && Number.isSafeInteger(inputTokens) && inputTokens >= 0) {
-                yield {
-                  type: 'runtime.context_usage',
-                  contextUsage: {
-                    model: session.settings.model,
-                    source: 'responses',
-                    ...(typeof diagnostic.requestId === 'string' ? { requestId: diagnostic.requestId } : {}),
-                    ...(typeof diagnostic.responseId === 'string' ? { responseId: diagnostic.responseId } : {}),
-                    ...(typeof diagnostic.requestAttempt === 'number' && Number.isSafeInteger(diagnostic.requestAttempt) && diagnostic.requestAttempt > 0
-                      ? { requestAttempt: diagnostic.requestAttempt } : {}),
-                    ...(diagnostic.requestIds && typeof diagnostic.requestIds === 'object'
-                      ? { requestIds: Object.fromEntries(Object.entries(diagnostic.requestIds).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) } : {}),
-                    ...(diagnostic.rawUsage && typeof diagnostic.rawUsage === 'object'
-                      ? { rawUsage: diagnostic.rawUsage as ContextUsage['rawUsage'] } : {}),
-                    inputTokens,
-                    ...(typeof cachedInputTokens === 'number' && Number.isSafeInteger(cachedInputTokens) && cachedInputTokens >= 0
-                      ? { cachedInputTokens } : {}),
-                    ...(typeof outputTokens === 'number' && Number.isSafeInteger(outputTokens) && outputTokens >= 0
-                      ? { outputTokens } : {}),
-                    observedAt: new Date().toISOString(),
-                  },
-                };
-              }
-            }
-          } else if (!event.type.startsWith('runtime.worker_')) {
-            yield event as unknown as AgentEvent;
-          }
-          if (!applied) {
-            // The consumer must apply and persist the yielded event before a
-            // concurrent save can expose its cursor. Replaying an already
-            // saved SDK item is idempotent; skipping an unapplied item is not.
-            if (turn.execution) turn.execution.lastAppliedSeq = envelope.seq;
-            await onExecution?.();
-            advanced = true;
-          }
-        }
-        const state = await this.observeRead(() => this.readWorkerState(entry, turn), observerSignal);
-        if (state && (state.workerId !== turn.execution?.workerId || state.turnId !== turn.id || state.sessionId !== session.id
-          || state.protocolVersion !== 1 || !Number.isSafeInteger(state.lastSeq) || state.lastSeq < 0
-          || !Number.isSafeInteger(state.pid) || state.pid <= 1)) {
-          throw new Error('Sandbox worker state does not match this turn');
-        }
-        // The worker can finish between our journal read and state read. Drain
-        // the final committed sequence before acting on its terminal state.
-        const drained = state && (turn.execution?.lastAppliedSeq ?? 0) >= state.lastSeq;
-        if (drained && state.status === 'completed') return;
-        if (drained && state.status === 'failed') throw this.safeError(state.error || 'Sandbox Codex worker failed');
-        if (drained && state.status === 'cancelled') throw new DOMException('任务已停止', 'AbortError');
-        if (state?.status === 'running' && Date.now() - lastHealthCheck >= 5_000) {
-          lastHealthCheck = Date.now();
-          const alive = await entry.sandbox.commands.run(`kill -0 ${state.pid}`, { user: 'user', timeoutMs: 5_000 })
-            .then(() => true, error => (error as { exitCode?: number }).exitCode === 1 ? false : undefined);
-          if (alive !== false) deadSince = 0;
-          else if (!deadSince) deadSince = Date.now();
-          else if (Date.now() - deadSince >= 2_000) throw new Error('Sandbox Codex worker exited without a terminal event');
-        }
-        if (advanced) idleSince = 0;
-        else idleSince ||= Date.now();
-        if (!state && idleSince && Date.now() - idleSince > 30_000) throw new Error('Sandbox Codex worker state missing');
-        await new Promise<void>((resolve, reject) => {
-          const done = () => { observerSignal.removeEventListener('abort', abort); resolve(); };
-          const timer = setTimeout(done, 250);
-          const abort = () => { clearTimeout(timer); observerSignal.removeEventListener('abort', abort); reject(observerSignal.reason); };
-          observerSignal.addEventListener('abort', abort, { once: true });
-          if (observerSignal.aborted) abort();
-        }).catch(error => { if (detached.signal.aborted) throw new TurnObserverDetached(); throw error; });
-      }
-    } catch (error) {
-      if (detached.signal.aborted) throw new TurnObserverDetached();
-      if (signal.aborted || error instanceof DOMException && error.name === 'AbortError') throw error;
-      throw this.safeError(error);
-    } finally {
-      if (this.observers.get(turn.id) === detached) this.observers.delete(turn.id);
-      this.detachRequests.delete(turn.id);
     }
   }
 
@@ -407,45 +160,10 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     timeoutMs?: number;
   } = {}) {
     checkAbort(signal);
-    const marker = `/tmp/codex-web-${randomUUID()}.pid`;
-    const body = `umask 077; echo $$ > ${quote(marker)}; exec ${command}`;
-    let handle: SandboxCommandHandle | undefined;
-    let stopping: Promise<void> | undefined;
-    const stop = () => {
-      if (!handle || stopping) return;
-      stopping = (async () => {
-        try {
-          // Capture descendants before terminating the group: shell tools can create
-          // their own process groups. TERM lets the SDK abort and reap its children;
-          // the bounded KILL pass also catches a command that ignores termination.
-          const terminate = `const fs=require('node:fs');const cp=require('node:child_process');let root;try{root=Number(fs.readFileSync(${JSON.stringify(marker)},'utf8').trim())}catch{process.exit(0)}if(!Number.isInteger(root)||root<2)process.exit(1);const rows=cp.execFileSync('ps',['-e','-o','pid=,ppid='],{encoding:'utf8'}).trim().split('\\n').map(s=>s.trim().split(/\\s+/).map(Number));const targets=new Set([root]);let changed=true;while(changed){changed=false;for(const [pid,ppid] of rows)if(targets.has(ppid)&&!targets.has(pid)){targets.add(pid);changed=true}}const kill=(pid,sig)=>{try{process.kill(pid,sig)}catch{}};kill(-root,'SIGTERM');for(const pid of targets)kill(pid,'SIGTERM');setTimeout(()=>{kill(-root,'SIGKILL');for(const pid of targets)kill(pid,'SIGKILL');try{fs.unlinkSync(${JSON.stringify(marker)})}catch{}},1200);`;
-          await entry.sandbox.commands.run(
-            `${NODE} -e ${quote(terminate)}`,
-            { user: 'user', timeoutMs: 10_000 },
-          );
-        } finally { await handle?.kill().catch(() => false); }
-      })();
-    };
-    signal.addEventListener('abort', stop, { once: true });
-    try {
-      handle = await entry.sandbox.commands.run(`setsid sh -c ${quote(body)}`, {
-        user: 'user', background: true, timeoutMs: options.timeoutMs ?? COMMAND_TIMEOUT_MS,
-        onStdout: options.onStdout, onStderr: options.onStderr, envs: options.envs,
-      });
-      if (signal.aborted) stop();
-      const result = await handle.wait();
-      checkAbort(signal);
-      return result;
-    } catch (error) {
-      stop();
-      if (signal.aborted) throw new DOMException('任务已停止', 'AbortError');
-      throw this.safeError(error);
-    } finally {
-      signal.removeEventListener('abort', stop);
-      await stopping?.catch(() => { });
-      // Marker cleanup is bounded and does not affect any other process group.
-      await entry.sandbox.files.remove(marker, { user: 'user' }).catch(() => { });
-    }
+    const result = await entry.sandbox.commands.run(command, { user: 'agent', signal, timeoutMs: Math.min(options.timeoutMs ?? 30_000, 300_000), envs: options.envs });
+    options.onStdout?.(result.stdout);
+    options.onStderr?.(result.stderr);
+    return result;
   }
 
   private async writeAtomic(entry: Entry, path: string, content: string | ArrayBuffer, signal: AbortSignal) {
@@ -480,30 +198,43 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       // Global AGENTS.md is a required host mount on all supported Sandboxes.
       const sharedData = this.options.sharedDataDirectory ?? SHARED_DATA;
       const sharedDocs = await loadAgentDocs(new URL('docs/', sharedData));
-      await this.command(entry, `sh -c ${quote(`mkdir -p ${quote(RUNTIME)} ${quote(`${RUNTIME}/agentcore`)} ${quote(`${RUNTIME}/node_modules/.bin`)} ${quote(`${ROOT}/images`)} /home/user/.codex ${quote(target.settings.workingDirectory)} && chmod 700 ${quote(ROOT)} /home/user/.codex && if test -x /usr/local/bin/codex; then ln -sfn /usr/local/bin/codex ${quote(`${RUNTIME}/node_modules/.bin/codex`)}; fi && cd ${quote(RUNTIME)} && if ! test -x ${quote(`${RUNTIME}/node_modules/.bin/codex`)}; then npm install --no-audit --no-fund --save-exact @openai/codex@0.153.4; fi`)}`, executionSignal, { timeoutMs: 300_000 });
-      const connectionEnvs = this.options.connections
-        ? await syncSandboxConnections(this.options.connections)
-        : {};
+      const fresh = await this.options.prepareRemote(entry.sandbox, target, executionSignal);
+      if (fresh) {
+        entry.preparation.sharedDocPaths = undefined;
+        entry.preparation.sharedDocDigests = undefined;
+        entry.preparation.agentInstructionsDigest = undefined;
+      }
+      const agents = await readFile(new URL('AGENTS.md', sharedData), 'utf8').catch(error => {
+        if (error.code === 'ENOENT') return '';
+        throw error;
+      });
+      const digest = createHash('sha256').update(agents).digest('hex');
+      if (entry.preparation.agentInstructionsDigest !== digest) {
+        await this.writeAtomic(entry, this.codexHome + '/AGENTS.md', agents, executionSignal);
+        entry.preparation.agentInstructionsDigest = digest;
+      }
       checkAbort(executionSignal);
-      // Clear a legacy mirror only on the first preparation, before any worker
-      // starts. Subsequent turns update files atomically while siblings run.
-      const docDirectories = new Set([SHARED_DOCS, ...sharedDocs.map(file => posix.dirname(`${SHARED_DOCS}/${file.path}`))]);
-      const clearLegacy = entry.preparation.sharedDocPaths ? '' : `rm -rf ${quote(SHARED_DOCS)} ${quote(`${ROOT}/docs`)} && `;
-      await this.command(entry, `sh -c ${quote(`${clearLegacy}mkdir -p ${[...docDirectories].map(quote).join(' ')}`)}`, executionSignal);
+      // On first preparation, replace the previous shared document snapshot.
+      const docDirectories = new Set([this.sharedDocs, ...sharedDocs.map(file => posix.dirname(`${this.sharedDocs}/${file.path}`))]);
+      const clearPrevious = entry.preparation.sharedDocPaths ? '' : `rm -rf ${quote(this.sharedDocs)} && `;
+      const currentPaths = new Set(sharedDocs.map(file => file.path));
+      const previousPaths = entry.preparation.sharedDocPaths;
+      const currentDigests = new Map(sharedDocs.map(file => [file.path,
+        createHash('sha256').update(new Uint8Array(file.contents)).digest('hex')]));
+      if (!previousPaths || sharedDocs.some(file => !previousPaths.has(file.path))) {
+        await this.command(entry, `sh -c ${quote(`${clearPrevious}mkdir -p ${[...docDirectories].map(quote).join(' ')}`)}`, executionSignal);
+      }
       for (const file of sharedDocs) {
         checkAbort(executionSignal);
-        await this.writeAtomic(entry, `${SHARED_DOCS}/${file.path}`, file.contents, executionSignal);
+        if (entry.preparation.sharedDocDigests?.get(file.path) === currentDigests.get(file.path)) continue;
+        await this.writeAtomic(entry, `${this.sharedDocs}/${file.path}`, file.contents, executionSignal);
       }
-      const currentPaths = new Set(sharedDocs.map(file => file.path));
       for (const path of entry.preparation.sharedDocPaths ?? []) {
-        if (!currentPaths.has(path)) await entry.sandbox.files.remove(`${SHARED_DOCS}/${path}`, { user: 'user', signal: executionSignal });
+        if (!currentPaths.has(path)) await entry.sandbox.files.remove(`${this.sharedDocs}/${path}`, { user: 'user', signal: executionSignal });
       }
       entry.preparation.sharedDocPaths = currentPaths;
-      // The long-lived App Server owns execution. Its active turn path does
-      // not use the retired per-turn worker bundle; history inspection writes
-      // its small helper lazily in `inspect()`.
-      entry.preparation.initialized = true;
-      return connectionEnvs;
+      entry.preparation.sharedDocDigests = currentDigests;
+      return;
     });
   }
 
@@ -519,35 +250,32 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const startupSignal = AbortSignal.any([signal, observer.signal]);
     let entry: Entry | undefined;
     let codex: Codex | undefined;
+    let endpoint: AppServerEndpoint | undefined;
     let failed = false;
     let detached = false;
     try {
       entry = await this.acquire(session, true, onSandbox, turn.id, startupSignal);
-      // App Server is long-lived, but the project environment still needs to
-      // be prepared before every turn. In particular, this publishes the
-      // global AGENTS.md and shared docs; previously that happened only in
-      // the retired per-turn worker path below.
-      const connectionEnvs = await this.prepareEnvironment(session, entry, startupSignal);
+      // Publish the global AGENTS.md and shared docs before every turn.
+      await this.prepareEnvironment(session, entry, startupSignal);
       observer.signal.throwIfAborted();
-      const endpoint = await this.options.appServer(entry.metadata.id);
+      endpoint = await this.options.appServer(entry.metadata.id);
       const images: string[] = [];
       if (turn.images.length) {
-        await entry.sandbox.commands.run(`mkdir -p ${quote(`${ROOT}/images`)}`, { user: 'user', timeoutMs: 30_000 });
+        await entry.sandbox.commands.run(`mkdir -p ${quote(`${this.root}/images`)}`, { user: 'user', timeoutMs: 30_000 });
         for (const [index, path] of turn.images.entries()) {
-          const destination = `${ROOT}/images/${turn.id}-${index}${extname(basename(path))}`;
+          const destination = `${this.root}/images/${turn.id}-${index}${extname(basename(path))}`;
           await entry.sandbox.files.write(destination, new Uint8Array(await readFile(path)).buffer, { user: 'user', signal: startupSignal });
           images.push(destination);
         }
       }
       codex = new Codex({ apiKey: this.options.apiKey, baseUrl: this.options.baseUrl, config: this.options.modelConfig,
         configOverrides: this.options.configOverrides, appServerUrl: endpoint.url,
-        appServerHeaders: { Authorization: `Bearer ${endpoint.token}` } });
+        appServerHeaders: endpointHeaders(endpoint) });
       this.appServerObservers.set(turn.id, codex);
       observer.signal.throwIfAborted();
       const options = { workingDirectory: session.settings.workingDirectory, ...(session.settings.model ? { model: session.settings.model } : {}),
         modelReasoningEffort: session.settings.modelReasoningEffort, sandboxMode: 'danger-full-access' as const,
-        webSearchMode: session.settings.webSearchMode, networkAccessEnabled: true, approvalPolicy: 'never' as const, skipGitRepoCheck: true,
-        additionalDirectories: Object.keys(connectionEnvs).length ? [CONNECTION_ROOT] : [] };
+        webSearchMode: session.settings.webSearchMode, networkAccessEnabled: true, approvalPolicy: 'never' as const, skipGitRepoCheck: true };
       const thread = session.threadId ? codex.resumeThread(session.threadId, options) : codex.startThread(options);
       const input = images.length ? [{ type: 'text' as const, text: turn.prompt }, ...images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
       const streamed = await thread.runStreamed(input, { signal });
@@ -563,103 +291,13 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       if (this.appServerObservers.get(turn.id) === codex) this.appServerObservers.delete(turn.id);
       this.detachRequests.delete(turn.id);
       await codex?.close();
+      await this.releaseEndpoint(endpoint);
       if (entry) await this.release(entry, failed, detached);
     }
   }
 
-  async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, onApproval?: RequestUserApproval,
-    onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
+  async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox): AsyncGenerator<AgentEvent> {
     yield* this.runAppServer(session, turn, signal, onSandbox);
-    return;
-    if (this.detachRequests.delete(turn.id)) throw new TurnLaunchCancelled();
-    if (this.closing) throw new Error('Sandbox 运行时正在关闭');
-    if (!this.options.apiKey) throw new Error('Sandbox 模式需要 CODEX_API_KEY 或 OPENAI_API_KEY');
-    checkAbort(signal);
-    let acquired: Entry | undefined;
-    let inputPath: string | undefined;
-    let handle: SandboxCommandHandle | undefined;
-    let failed = false;
-    let detached = false;
-    let launchRequested = false;
-    const preparation = new AbortController();
-    this.preparations.set(turn.id, preparation);
-    if (this.detachRequests.has(turn.id)) preparation.abort();
-    try {
-      const acquireSignal = AbortSignal.any([signal, preparation.signal]);
-      const entry = acquired = await this.acquire(session, true, onSandbox, turn.execution?.workerId ?? turn.id, acquireSignal);
-      const executionSignal = AbortSignal.any([signal, entry.lease.signal, preparation.signal]);
-      checkAbort(executionSignal);
-      const connectionEnvs = await this.prepareEnvironment(session, entry, executionSignal);
-      const images: string[] = [];
-      for (const path of turn.images) {
-        checkAbort(executionSignal);
-        const destination = `${ROOT}/images/${turn.id}-${images.length}${extname(basename(path))}`;
-        await entry.sandbox.files.write(destination, new Uint8Array(await readFile(path)).buffer, { user: 'user', signal: executionSignal });
-        images.push(destination);
-      }
-      const runDirectory = this.runDirectory(turn);
-      const bundleDirectory = `${runDirectory}/bundle`;
-      const approvalReplyDirectory = `${runDirectory}/approvals`;
-      const improvementReplyDirectory = `${runDirectory}/improvements`;
-      await this.command(entry, `mkdir -p ${quote(bundleDirectory)} ${quote(`${bundleDirectory}/agentcore`)} ${quote(approvalReplyDirectory)} ${quote(improvementReplyDirectory)}`, executionSignal);
-      for (const name of ['sandbox-worker.mjs', 'improvement-bridge.mjs', 'improvement-mcp.mjs', 'approval-bridge.mjs', 'approval-mcp.mjs']) {
-        await this.command(entry, `cp ${quote(`${RUNTIME}/${name}`)} ${quote(`${bundleDirectory}/${name}`)}`, executionSignal);
-      }
-      await this.command(entry, `cp ${quote(`${RUNTIME}/agentcore/index.mjs`)} ${quote(`${bundleDirectory}/agentcore/index.mjs`)}`, executionSignal);
-      inputPath = `${runDirectory}/input.json`;
-      checkAbort(executionSignal);
-      await entry!.sandbox.files.write(inputPath!, JSON.stringify({
-        workerId: turn.execution!.workerId, sessionId: session.id, turnId: turn.id, runDirectory,
-        agentcorePath: `${bundleDirectory}/agentcore/index.mjs`,
-        threadId: session.threadId, prompt: turn.prompt, images, settings: session.settings,
-        connectionDirectories: Object.keys(connectionEnvs).length ? [CONNECTION_ROOT, ...('MEEGLE_HOST' in connectionEnvs ? ['/home/user/.meegle'] : []), ...('KUBECONFIG' in connectionEnvs ? ['/home/user/.kube'] : [])] : [],
-        baseUrl: this.options.baseUrl, proxyKind: this.options.proxyKind,
-        modelConfig: this.options.modelConfig, configOverrides: this.options.configOverrides,
-        improvementReplyDirectory: this.options.submitImprovement ? improvementReplyDirectory : undefined,
-        approvalReplyDirectory: onApproval ? approvalReplyDirectory : undefined,
-      }), { user: 'user', signal: executionSignal });
-      const marker = `${runDirectory}/worker.pid`;
-      const body = `umask 077; echo $$ > ${quote(marker)}; exec ${NODE} ${quote(`${bundleDirectory}/sandbox-worker.mjs`)} ${quote(inputPath!)}`;
-      checkAbort(executionSignal);
-      // Once the launch request is sent, its outcome may already be remote.
-      // Shutdown must wait for its identity and then detach the observer.
-      this.preparations.delete(turn.id);
-      try {
-        launchRequested = true;
-        handle = await entry.sandbox.commands.run(`setsid sh -c ${quote(body)}`, {
-          user: 'user', background: true,
-          timeoutMs: 0,
-          envs: { ...connectionEnvs, CODEX_API_KEY: this.options.apiKey, CODEX_HOME },
-        });
-      } catch (error) {
-        // A timed-out launch may already have started remotely. Observe the
-        // preassigned run directory; never send the launch request twice.
-        if (!transportFailure(error)) throw error;
-      }
-      turn.execution!.commandPid = handle?.pid;
-      turn.execution!.sandboxId = entry.metadata.id;
-      turn.execution!.state = 'running';
-      await onExecution?.();
-      for await (const event of this.observeWorker(entry, session, turn, signal, onApproval, onExecution)) yield event;
-    } catch (error) {
-      failed = true;
-      detached = error instanceof TurnObserverDetached;
-      if (preparation.signal.aborted) throw new TurnLaunchCancelled();
-      if (detached || signal.aborted) throw error;
-      throw this.safeError(error);
-    } finally {
-      this.preparations.delete(turn.id);
-      this.detachRequests.delete(turn.id);
-      if (acquired) {
-        if (signal.aborted && launchRequested) detached = !await this.terminateWorker(acquired!, turn, handle);
-        else await handle?.disconnect().catch(() => { });
-        await this.release(acquired!, failed, detached);
-        if (signal.aborted && detached) {
-          if (turn.execution) turn.execution!.stopRequested = true;
-          throw new TurnTerminationUnconfirmed();
-        }
-      }
-    }
   }
 
   private mapAppServerTurn(rawTurn: any): Turn {
@@ -701,6 +339,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const observerSignal = AbortSignal.any([signal, detached.signal]);
     let entry: Entry | undefined;
     let client: CodexAppServerClient | undefined;
+    let endpoint: AppServerEndpoint | undefined;
     let observerDetached = false;
     let failed = false;
     let interruptSent = false;
@@ -714,8 +353,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     };
     try {
       entry = await this.acquire(session, false, onSandbox, turn.id, observerSignal);
-      const endpoint = await this.options.appServer(entry.metadata.id);
-      client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: { Authorization: `Bearer ${endpoint.token}` }, requestTimeoutMs: 120_000 });
+      endpoint = await this.options.appServer(entry.metadata.id);
+      client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: endpointHeaders(endpoint), requestTimeoutMs: 120_000 });
       this.appServerObservers.set(turn.id, client);
       signal.addEventListener('abort', interrupt, { once: true });
       if (signal.aborted) interrupt();
@@ -765,161 +404,76 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       signal.removeEventListener('abort', interrupt);
       this.detachRequests.delete(turn.id);
       await client?.close();
+      await this.releaseEndpoint(endpoint);
       if (entry) await this.release(entry, failed, observerDetached);
     }
   }
 
-  async *recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, onApproval?: RequestUserApproval,
-    onExecution?: () => Promise<void>): AsyncGenerator<AgentEvent> {
-    if (!turn.execution) {
-      yield* this.recoverAppServer(session, turn, signal, onSandbox);
-      return;
-    }
-    if (!turn.execution || !session.sandbox || (turn.execution.sandboxId && turn.execution.sandboxId !== session.sandbox.id)) {
-      throw new Error('Sandbox worker recovery information is incomplete');
-    }
-    if (turn.execution.stopRequested) signal = AbortSignal.any([signal, AbortSignal.abort()]);
-    this.sandboxes.holdUsage(session, turn.execution.workerId);
-    const reconnect = new AbortController();
-    this.observers.set(turn.id, reconnect);
-    if (this.detachRequests.has(turn.id)) reconnect.abort(new TurnObserverDetached());
-    let acquired: Entry | undefined;
-    let failed = false;
-    let detached = false;
-    try {
-      const reconnectSignal = AbortSignal.any([signal, reconnect.signal]);
-      const entry = acquired = await this.observeRead(
-        () => this.acquire(session, false, onSandbox, turn.execution!.workerId, reconnectSignal), reconnectSignal);
-      if (this.observers.get(turn.id) === reconnect) this.observers.delete(turn.id);
-      if (!turn.prompt) {
-        const input = JSON.parse(await entry.sandbox.files.read(`${this.runDirectory(turn)}/input.json`, { user: 'user', signal }));
-        turn.prompt = typeof input.prompt === 'string' ? input.prompt : '';
-        turn.images = Array.isArray(input.images) ? input.images.filter((path: unknown) => typeof path === 'string') : [];
-      }
-      turn.execution.sandboxId = entry.metadata.id;
-      turn.execution.state = 'running';
-      await onExecution?.();
-      for await (const event of this.observeWorker(entry, session, turn, signal, onApproval, onExecution)) yield event;
-    } catch (error) {
-      failed = true;
-      detached = reconnect.signal.aborted || error instanceof TurnObserverDetached;
-      if (detached) throw new TurnObserverDetached();
-      if (signal.aborted) throw new DOMException('任务已停止', 'AbortError');
-      throw this.safeError(error);
-    } finally {
-      if (this.observers.get(turn.id) === reconnect) this.observers.delete(turn.id);
-      if (signal.aborted && !acquired) {
-        // Cancellation can win while a shared connect is still in flight. Try
-        // once to stop the existing worker using its original identity. The
-        // manager discards late cancelled acquisitions without leaking leases.
-        try {
-          acquired = await this.acquire(session, false, onSandbox, turn.execution.workerId, AbortSignal.timeout(10_000));
-        } catch (error) {
-          void this.options.logger?.write({ event: 'sandbox.worker_termination_unconfirmed',
-            sandboxId: session.sandbox.id, turnId: turn.id, message: this.safeError(error).message });
-        }
-      }
-      if (acquired) {
-        if (signal.aborted) detached = !await this.terminateWorker(acquired, turn);
-        await this.release(acquired, failed, detached);
-      }
-      if (signal.aborted && (!acquired || detached)) {
-        turn.execution.stopRequested = true;
-        throw new TurnTerminationUnconfirmed();
-      }
-    }
+  async *recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox): AsyncGenerator<AgentEvent> {
+    yield* this.recoverAppServer(session, turn, signal, onSandbox);
   }
 
   detach(turn: Turn) {
-    if (turn.execution) turn.execution.state = 'detached';
     this.detachRequests.add(turn.id);
-    this.preparations.get(turn.id)?.abort();
     this.observers.get(turn.id)?.abort(new TurnObserverDetached());
     void this.appServerObservers.get(turn.id)?.close();
   }
 
-  private async terminateWorker(entry: Entry, turn: Turn, handle?: SandboxCommandHandle) {
-    const marker = `${this.runDirectory(turn)}/worker.pid`;
-    const script = `
-const fs = require('node:fs'), cp = require('node:child_process');
-const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
-(async () => {
-  let root;
-  try { root = Number(fs.readFileSync(${JSON.stringify(marker)}, 'utf8').trim()); } catch {}
-  if (!Number.isInteger(root) || root <= 1) {
-    // An unacknowledged launch may still be pending remotely. Missing PID is
-    // not proof that no worker exists or will start.
-    let state;
-    try { state = JSON.parse(fs.readFileSync(${JSON.stringify(this.runDirectory(turn) + '/state.json')}, 'utf8')); } catch {}
-    reply(Boolean(state && state.workerId === ${JSON.stringify(turn.execution?.workerId)}
-      && state.turnId === ${JSON.stringify(turn.id)} && ['completed', 'failed', 'cancelled'].includes(state.status)));
-    return;
-  }
-  const rows = cp.execFileSync('ps', ['-e', '-o', 'pid=,ppid='], { encoding: 'utf8' }).trim()
-    .split('\\n').map(row => row.trim().split(/\\s+/).map(Number));
-  const targets = new Set([root]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const [pid, ppid] of rows) if (targets.has(ppid) && !targets.has(pid)) { targets.add(pid); changed = true; }
-  }
-  let confirmed = true;
-  const kill = (pid, signal) => {
-    try { process.kill(pid, signal); }
-    catch (error) { if (error.code !== 'ESRCH') confirmed = false; }
-  };
-  kill(-root, 'SIGTERM');
-  for (const pid of targets) kill(pid, 'SIGTERM');
-  await new Promise(resolve => setTimeout(resolve, 1200));
-  kill(-root, 'SIGKILL');
-  for (const pid of targets) kill(pid, 'SIGKILL');
-  reply(confirmed);
-})().catch(() => reply(false));
-`;
-    const signalled = await entry.sandbox.commands.run(`${NODE} -e ${quote(script)}`, { user: 'user', timeoutMs: 10_000 })
-      .then(result => { try { return JSON.parse(result.stdout).confirmed === true; } catch { return false; } }, () => false);
-    const killed = await handle?.kill().catch(() => false);
-    if (!signalled && !killed) {
-      void this.options.logger?.write({ event: 'sandbox.worker_termination_unconfirmed', sandboxId: entry.metadata.id, turnId: turn.id });
-    }
-    return signalled || Boolean(killed);
-  }
-
-  async preview(session: WorkspaceTarget, port: number): Promise<string> {
-    if (this.closing) throw new Error('Sandbox 运行时正在关闭');
-    if (!session.sandbox) throw new Error('项目沙箱尚未创建，请先启动服务');
+  async service(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response> {
+    if (!this.options.serviceAccess) throw new HttpError(503, 'Sandbox 服务代理未配置');
     const entry = await this.acquire(session, false);
-    let failed = false;
+    let access: CellboxServiceAccess | undefined;
+    let released = false;
+    const release = async () => {
+      if (released) return;
+      released = true;
+      try { await access?.revoke(); }
+      catch (error) { void this.options.logger?.write({ event: 'sandbox.access_release_failed', error: this.safeError(error).message }); }
+      await this.release(entry, true);
+    };
     try {
-      if (entry.sandbox.getServiceUrl) return await entry.sandbox.getServiceUrl(port);
-      return `http://${entry.sandbox.getHost(port)}:${port}`;
-    } catch (error) { failed = true; throw error; }
-    finally { await this.release(entry, failed); }
-  }
-
-  async proxyHost(session: WorkspaceTarget): Promise<string> {
-    if (this.closing) throw new Error('Sandbox 运行时正在关闭');
-    if (!session.sandbox) throw new Error('项目沙箱尚未创建，请先启动服务');
-    const entry = await this.acquire(session, false);
-    try {
-      // Docker DNS resolves container names, not IDs. Convert.
-      const exec = promisify(execFile);
-      const { stdout } = await exec('docker', ['inspect', '--format', '{{.Name}}', entry.sandbox.sandboxId]);
-      return stdout.trim().replace(/^\//, '');
-    } finally { await this.release(entry, false); }
+      access = await this.options.serviceAccess(entry.sandbox.sandboxId, port);
+      const headers = new Headers(access.headers);
+      for (const name of ['accept', 'accept-language', 'content-type', 'range', 'if-none-match', 'if-modified-since']) {
+        const value = request.headers.get(name);
+        if (value !== null) headers.set(name, value);
+      }
+      const url = `${access.url.replace(/\/$/, '')}${path}`;
+      const upstream = await fetch(url, { method: request.method, headers,
+        body: ['GET', 'HEAD'].includes(request.method) ? undefined : await request.arrayBuffer(), redirect: 'manual' });
+      const outHeaders = new Headers();
+      for (const name of ['content-type', 'content-disposition', 'cache-control', 'etag', 'last-modified', 'location', 'accept-ranges', 'content-range']) {
+        const value = upstream.headers.get(name);
+        if (value !== null) outHeaders.set(name, value);
+      }
+      const reader = upstream.body?.getReader();
+      if (!reader) {
+        await release();
+        return new Response(null, { status: upstream.status, headers: outHeaders });
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) { controller.close(); await release(); }
+            else controller.enqueue(value);
+          } catch (error) { controller.error(error); await release(); }
+        },
+        async cancel(reason) { try { await reader.cancel(reason); } finally { await release(); } },
+      });
+      return new Response(stream, { status: upstream.status, headers: outHeaders });
+    } catch (error) { await release(); throw error; }
   }
 
   async file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult> {
     if (this.closing) throw new HttpError(503, 'Sandbox 运行时正在关闭');
-    const request = workspaceFileRequest(session.settings.workingDirectory, path, options);
     let entry: Entry;
     try { entry = await this.acquire(session, false); }
     catch (error) { throw new HttpError(502, this.safeError(error).message); }
     let failed = false;
     try {
-      const encoded = Buffer.from(JSON.stringify(request)).toString('base64');
-      const result = await entry.sandbox.commands.run(`${NODE} --input-type=commonjs -e ${quote(READ_SANDBOX_FILE_SCRIPT)} ${quote(encoded)}`, { user: 'user', timeoutMs: 30_000 });
-      return parseWorkspaceFile(result.stdout);
+      return await readCellboxWorkspaceFile(entry.sandbox,
+        this.node, session.settings.workingDirectory, path, options, this.sharedDocs);
     } catch (error) {
       failed = true;
       if (error instanceof HttpError) throw error;
@@ -934,11 +488,12 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     if (!this.options.appServer) throw new Error('Sandbox App Server endpoint is not configured');
     let entry: Entry | undefined;
     let client: CodexAppServerClient | undefined;
+    let endpoint: AppServerEndpoint | undefined;
     let failed = false;
     try {
       entry = await this.acquire(session, false);
-      const endpoint = await this.options.appServer(entry.metadata.id);
-      client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: { Authorization: `Bearer ${endpoint.token}` }, requestTimeoutMs: 120_000 });
+      endpoint = await this.options.appServer(entry.metadata.id);
+      client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: endpointHeaders(endpoint), requestTimeoutMs: 120_000 });
       const response = await client.request('thread/turns/list', { threadId: session.threadId,
         itemsView: 'full', sortDirection: 'desc', limit: options.limit ?? 20,
         ...(options.cursor ? { cursor: options.cursor } : {}) });
@@ -946,14 +501,23 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     } catch (error) { failed = true; throw this.safeError(error); }
     finally {
       await client?.close();
+      await this.releaseEndpoint(endpoint);
       if (entry) await this.release(entry, failed);
     }
   }
   async subagents(session: Session): Promise<SubagentConversation[]> {
     if (!session.threadId) return [];
-    const host = await this.hostData(session);
-    if (!host) return [];
-    return readSubagentConversations(session.threadId, host.codex);
+    if (!session.sandbox) return [];
+    const entry = await this.acquire(session, false);
+    try {
+      const signal = AbortSignal.timeout(120_000);
+      const helper = this.runtimeDirectory + '/native-history.mjs';
+      await this.command(entry, `mkdir -p -- ${quote(this.runtimeDirectory)}`, signal);
+      await this.writeAtomic(entry, helper, await readFile(new URL('./native-history.mjs', import.meta.url), 'utf8'), signal);
+      const script = `import {readSubagentConversations} from ${JSON.stringify(helper)};console.log(JSON.stringify(await readSubagentConversations(${JSON.stringify(session.threadId)},${JSON.stringify(this.codexHome)})));`;
+      const output = await this.command(entry, `${this.node} --input-type=module -e ${quote(script)}`, signal, { timeoutMs: 120_000 });
+      return JSON.parse(output.stdout);
+    } finally { await this.release(entry); }
   }
   async delete(session: WorkspaceTarget) {
     await this.sandboxes.delete(session);
@@ -965,52 +529,8 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
   }
 
   async rebuild(target: WorkspaceTarget, onSandbox: SaveSandbox) {
-    const lease = await this.sandboxes.acquire(target, { create: true, save: onSandbox });
-    await lease.release();
-  }
-
-  /** A candidate is never tracked under the project's live binding. */
-  async createReplacement(target: WorkspaceTarget, onSandbox: SaveSandbox): Promise<SandboxState> {
-    const template = this.sandboxes.templateReference;
-    const provider = this.options.provider as SandboxProvider & {
-      createStopped?: (projectId: string, workingDirectory: string) => Promise<{ id: string }>;
-    };
-    const created = provider.createStopped
-      ? await provider.createStopped(target.projectId ?? target.id, target.settings.workingDirectory)
-      : undefined;
-    const handle = created ? undefined : await provider.create(template, {
-      timeoutMs: COMMAND_TIMEOUT_MS, lifecycle: { onTimeout: 'pause', autoResume: false },
-      metadata: { app: 'codex-web', projectId: target.projectId ?? target.id, workingDirectory: target.settings.workingDirectory },
-    });
-    const sandbox: SandboxState = { id: created?.id ?? handle!.sandboxId, template, status: 'starting', workingDirectory: target.settings.workingDirectory };
-    try { await onSandbox(sandbox); }
-    catch (error) { await this.options.provider.kill(sandbox.id).catch(() => {}); throw error; }
-    return sandbox;
-  }
-
-  async createStoppedReplacement(target: WorkspaceTarget, onSandbox: SaveSandbox) {
-    const provider = this.options.provider as SandboxProvider & {
-      createStopped?: (projectId: string, workingDirectory: string) => Promise<{ id: string; root: string }>;
-    };
-    if (!provider.createStopped) throw new HttpError(503, 'Sandbox provider 不支持 Restic 恢复');
-    const created = await provider.createStopped(target.projectId ?? target.id, target.settings.workingDirectory);
-    const sandbox: SandboxState = { id: created.id, template: this.sandboxes.templateReference,
-      status: 'starting', workingDirectory: target.settings.workingDirectory };
-    try { await onSandbox(sandbox); }
-    catch (error) { await this.options.provider.kill(sandbox.id).catch(() => {}); throw error; }
-    return { sandbox, root: created.root };
-  }
-
-  async startReplacement(sandbox: SandboxState) {
-    const provider = this.options.provider as SandboxProvider & { start?: (id: string) => Promise<void> };
-    if (!provider.start) throw new HttpError(503, 'Sandbox provider 不支持启动替换环境');
-    await provider.start(sandbox.id);
-  }
-
-  async restoreReplacement(sandbox: SandboxState, archivePath: string) {
-    const provider = this.options.provider as SandboxProvider & { restoreArchive?: (id: string, path: string) => Promise<void> };
-    if (!provider.restoreArchive) throw new HttpError(503, '当前 Sandbox provider 不支持离线备份恢复');
-    await provider.restoreArchive(sandbox.id, archivePath);
+    const entry = await this.acquire(target,true,onSandbox);
+    try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
   }
 
   async verifySandbox(sandbox: SandboxState, timeoutMs?: number) {
@@ -1029,28 +549,29 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
     if (!threadIds.length) return;
     if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
     const endpoint = await this.options.appServer(sandbox.id);
-    const client = new CodexAppServerClient({ url: endpoint.url, headers: { Authorization: `Bearer ${endpoint.token}` }, requestTimeoutMs: 10_000 });
+    const client = new CodexAppServerClient({ url: endpoint.url, headers: endpointHeaders(endpoint), requestTimeoutMs: 10_000 });
     try {
       await client.connect();
-      for (const threadId of [...new Set(threadIds)].slice(0, 3)) await client.request('thread/read', { threadId });
-    } finally { await client.close(); }
+      for (const threadId of [...new Set(threadIds)].slice(0, 3)) await client.request('thread/read', { threadId, includeTurns: true });
+    } finally { try { await client.close(); } finally { await this.releaseEndpoint(endpoint); } }
   }
 
   private async verifySandboxOnce(sandbox: SandboxState, timeoutMs: number) {
     const info = await this.options.provider.getInfo(sandbox.id);
     if (info.state !== 'running') throw new HttpError(502, 'Sandbox 尚未就绪');
     const handle = await this.options.provider.connect(sandbox.id, { timeoutMs });
-    await handle.commands.run(`test -d ${quote(sandbox.workingDirectory)} && test -d /home/user/.codex`, { timeoutMs });
+    await this.options.prepareRemote(handle, { id: sandbox.id, settings: { workingDirectory: sandbox.workingDirectory }, sandbox, updatedAt: new Date().toISOString() }, AbortSignal.timeout(timeoutMs));
+    await handle.commands.run(`test -d ${quote(sandbox.workingDirectory)} && test -d ${quote(this.codexHome)}`, { timeoutMs });
     if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
     const endpoint = await this.options.appServer(sandbox.id);
-    const client = new CodexAppServerClient({ url: endpoint.url, headers: { Authorization: `Bearer ${endpoint.token}` }, requestTimeoutMs: timeoutMs });
+    const client = new CodexAppServerClient({ url: endpoint.url, headers: endpointHeaders(endpoint), requestTimeoutMs: timeoutMs });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
         (async () => { await client.connect(); await client.request('thread/list', { limit: 1 }); })(),
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new HttpError(502, 'Sandbox 服务验证超时')), timeoutMs); }),
       ]);
-    } finally { if (timer) clearTimeout(timer); await client.close(); }
+    } finally { if (timer) clearTimeout(timer); try { await client.close(); } finally { await this.releaseEndpoint(endpoint); } }
     sandbox.status = 'ready';
     sandbox.image = info.templateIdentity;
   }
@@ -1064,57 +585,10 @@ const reply = confirmed => process.stdout.write(JSON.stringify({ confirmed }));
         if (info.state !== 'paused') await provider.pause(sandbox.id);
       }
     } catch (error) {
-      // A missing container is already fenced. Transport errors are not proof.
-      if (!/no such (?:container|object)|not found|404/i.test(String(error))) throw this.safeError(error);
+      // A missing or terminally failed box cannot run work. Transport errors
+      // are not proof that the old environment has stopped.
+      if (!/no such (?:container|object)|not found|404|Box \S+ is (?:failed|deleted)/i.test(String(error))) throw this.safeError(error);
     }
-  }
-
-  async restoreArchive(target: WorkspaceTarget, archivePath: string) {
-    const provider = this.options.provider as SandboxProvider & { restoreArchive?: (id: string, path: string) => Promise<void> };
-    if (target.sandbox && provider.restoreArchive) {
-      await provider.restoreArchive(target.sandbox.id, archivePath);
-      await this.sandboxes.inspect(target);
-      return;
-    }
-    const entry = await this.acquire(target, false);
-    try {
-      const content = await readFile(archivePath);
-      const remote = `${RUNTIME}/archives/${randomUUID()}.tar.gz`;
-      await entry.sandbox.files.write(remote, content, { user: 'root' });
-      // AGENTS.md is a read-only host mount in freshly created Sandboxes. An
-      // older archive may contain the previous copied version, but it must not
-      // replace the current global instructions (and tar cannot overwrite the
-      // mount in any case).
-      const result = await entry.sandbox.commands.run(`set -eu; tar --exclude=home/user/.codex/AGENTS.md --exclude=home/user/.codex/AGENTS.md/* -xzf ${quote(remote)} -C /; rm -f ${quote(remote)}`, { user: 'root', timeoutMs: COMMAND_TIMEOUT_MS });
-      if (result && 'exitCode' in result && result.exitCode) throw new Error(result.stderr || '归档恢复失败');
-    } finally { await this.release(entry); }
-  }
-
-  async createArchive(target: WorkspaceTarget, archivePath: string) {
-    if (!target.sandbox) throw new Error('Sandbox 不可用，无法归档');
-    const client = this.options.provider as SandboxProvider & { archive?: (id: string, destination: string) => Promise<{ sizeBytes: number; sha256: string }> };
-    if (!client.archive) throw new Error('Sandbox provider 不支持数据归档');
-    return client.archive(target.sandbox.id, archivePath);
-  }
-
-  async hostData(target: WorkspaceTarget) {
-    if (!target.sandbox) return undefined;
-    const provider = this.options.provider as SandboxProvider & { hostData?: (projectId: string, sandboxId: string) => Promise<{ root: string; workspace: string; codex: string } | undefined> };
-    return provider.hostData?.(target.projectId ?? target.id, target.sandbox.id);
-  }
-
-  async pauseForBackup(sandboxId: string) { await this.options.provider.pause(sandboxId); }
-
-  async resumeAfterBackup(sandboxId: string) {
-    const provider = this.options.provider as SandboxProvider & { resume?: (id: string) => Promise<void> };
-    if (!provider.resume) throw new Error('Sandbox provider does not support resume');
-    let info;
-    try { info = await provider.getInfo(sandboxId); }
-    catch (error) {
-      if (/no such (?:container|object)|not found|404/i.test(String(error))) return;
-      throw error;
-    }
-    if (info.state === 'paused') await provider.resume(sandboxId);
   }
 
   async detachSandbox(target: WorkspaceTarget) {

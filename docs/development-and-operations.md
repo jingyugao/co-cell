@@ -15,7 +15,7 @@ mkdir -p data/docs
 touch data/AGENTS.md
 ```
 
-编辑 `.env`，设置 `SANDBOX_PROVIDER=gvisor`，填写 `CODEX_API_KEY`（或 `OPENAI_API_KEY`）、模型名称和所需的 `OPENAI_BASE_URL`。在 `data/AGENTS.md` 中填写工作约定，然后启动：
+编辑 `.env`，填写必需的 `MYSQL_URL`、`CODEX_API_KEY`（或 `OPENAI_API_KEY`）、模型名称和所需的 `OPENAI_BASE_URL`，并配置 Sandbox 后端。项目与会话元数据仅使用 MySQL；缺少数据库配置或数据库初始化失败时服务无法启动。在 `data/AGENTS.md` 中填写工作约定，然后启动：
 
 ```sh
 PORT=3001 pnpm dev
@@ -47,14 +47,14 @@ PORT=3001 pnpm dev
 | `SANDBOX_AUTO_CHECKPOINT_AFTER_MS` | gVisor 自动保存运行状态并暂停的闲置阈值，默认一小时 |
 | `SANDBOX_ARCHIVED_RECLAIM_AFTER_MS` | 已完成项目自动归档前的等待时间，默认一天 |
 | `SANDBOX_SCHEDULED_ARCHIVE_THRESHOLD_MS` | 周期备份阈值，默认 30 分钟 |
-| `CODEX_WEB_DATA_DIR` | JSON 元数据目录，默认 `data/web-state` |
-| `MYSQL_URL` | 启用 MySQL 元数据存储及版本化归档管理 |
+| `CODEX_WEB_DATA_DIR` | 本地会话附件及归档路径基准，默认 `data/web-state`；不保存项目或会话元数据 |
+| `MYSQL_URL` | 必需的 MySQL 连接地址，保存项目、会话及归档元数据 |
 
 需要保留和备份的数据：
 
 | 位置 | 内容 |
 | --- | --- |
-| `data/web-state/` 或 MySQL | 项目、会话及相关元数据 |
+| MySQL | 项目、会话及相关元数据 |
 | `data/sandbox-data-archives/` | 工作区和 Codex 状态的压缩备份 |
 | `data/AGENTS.md`、`data/docs/` | 共享规则和长期知识 |
 | `data/improvements.sqlite` | 改进建议及处理记录 |

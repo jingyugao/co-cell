@@ -572,7 +572,7 @@ export class SandboxManager {
             if (checkpoint && entry.record.status === 'ready' && Number.isFinite(idleAt)
               && Date.now() - idleAt >= this.policy.autoCheckpointAfterMs && !entry.record.checkpoint) {
               try {
-                const saved = await checkpoint(entry.record.id);
+                const saved = await checkpoint.call(this.checkpointProvider, entry.record.id);
                 await this.change(resourceKey, entry, { checkpoint: saved, status: 'paused', pausedAt: new Date().toISOString() });
                 entry.sandbox = undefined;
                 this.log({ event: 'sandbox.checkpointed', resourceKey, sandboxId: entry.record.id, checkpointId: saved.id });

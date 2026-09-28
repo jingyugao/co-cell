@@ -19,24 +19,10 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
   return renderToStaticMarkup(<ProjectsPage
     projects={projects} config={config} loading={false} initialView={initialView}
     onRefresh={async () => projects} onCreate={async () => project()} onUpdate={async () => project()}
-    onRebuildSandbox={async () => project()} onBackup={async () => project()} onSwitchSandbox={async () => project()}
+    onRebuildSandbox={async () => project()} onBackup={async () => project()}
     onOpenProject={() => {}} onMenu={() => {}} onBack={() => {}}
   />);
 }
-
-test('outdated ready sandbox offers switching only when the project is idle and active', () => {
-  const currentImage = { reference: 'cellbox:latest', id: 'sha256:old', repoDigests: [], version: '1.0' };
-  const latestImage = { reference: 'cellbox:latest', id: 'sha256:new', repoDigests: [], version: '2.0' };
-  const config = { sandbox: { enabled: true, image: 'cellbox:latest', imageIdentity: latestImage } } as unknown as AppConfig;
-  const sandbox = { id: 'current', status: 'ready' as const, template: 'default', workingDirectory: '/workspace', image: currentImage };
-  const outdated = page([project({ sandbox })], undefined, config);
-  assert.match(outdated, /切换到最新版本/);
-
-  assert.doesNotMatch(page([project({ sandbox: { ...sandbox, image: latestImage } })], undefined, config), /切换到最新版本/);
-  assert.doesNotMatch(page([project({ sandbox, activeSessionId: 'session-1' })], undefined, config), /切换到最新版本/);
-  assert.doesNotMatch(page([project({ sandbox, status: 'archived', archivedAt: now })], 'archived', config), /切换到最新版本/);
-  assert.doesNotMatch(page([project({ sandbox, sandboxOperation: { kind: 'backup', phase: '处理中', status: 'running', updatedAt: now } })], undefined, config), /切换到最新版本/);
-});
 
 test('normal sandbox exposes backup and archive, with only the latest backup', () => {
   const html = page([project({ sandbox: { id: 'current', status: 'ready', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);

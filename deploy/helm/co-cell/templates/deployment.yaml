@@ -1,0 +1,162 @@
+{{- if and (not .Values.image.tag) (not .Values.image.digest) -}}
+{{- fail "Set image.tag or image.digest" -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "co-cell.fullname" . }}
+  labels:
+    {{- include "co-cell.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "co-cell.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "co-cell.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "co-cell.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: co-cell
+          image: {{ include "co-cell.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          workingDir: /app
+          command: [/usr/local/bin/node, --import, tsx, backend/index.ts]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 3001
+              protocol: TCP
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "3001"
+            - name: NODE_ENV
+              value: production
+            - name: HOME
+              value: /app/data/home
+            - name: CODEX_HOME
+              value: /app/data/home/.codex
+            - name: CELLBOX_KIND
+              value: k8s-resumable
+            - name: CELLBOX_API_URL
+              value: {{ .Values.cellbox.apiUrl | quote }}
+            - name: CELLBOX_PROFILE
+              value: {{ .Values.cellbox.profile | quote }}
+            - name: COCELL_PUBLIC_URL
+              value: {{ .Values.publicUrl | quote }}
+            - name: CODEX_WEB_DATA_DIR
+              value: /app/data/web-state
+            - name: CODEX_WEB_IMAGES_DIR
+              value: /app/data/images
+            - name: CONNECTIONS_DATA_DIR
+              value: /app/data/credentials
+            - name: RUNTIME_LOG_DIRECTORY
+              value: /app/data/logs
+            - name: NOTIFICATIONS_DATA_PATH
+              value: /app/data/notifications.json
+            - name: CELLBOX_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret | quote }}
+                  key: CELLBOX_API_TOKEN
+            - name: COCELL_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret | quote }}
+                  key: COCELL_ACCESS_TOKEN
+            - name: MYSQL_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret | quote }}
+                  key: MYSQL_URL
+            {{- range $key := list "CODEX_API_KEY" "OPENAI_API_KEY" "OSS_ACCESS_KEY" "OSS_SECRET_KEY" }}
+            - name: {{ $key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.existingSecret | quote }}
+                  key: {{ $key }}
+                  optional: true
+            {{- end }}
+            {{- with .Values.config.codexModel }}
+            - name: CODEX_MODEL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.config.openaiBaseUrl }}
+            - name: OPENAI_BASE_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.config.codexProxyKind }}
+            - name: CODEX_PROXY_KIND
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.config.ossEndpoint }}
+            - name: OSS_ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.config.credentialSlots }}
+            - name: CELLBOX_CREDENTIAL_SLOTS_JSON
+              value: {{ toJson . | quote }}
+            {{- end }}
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "co-cell.pvcName" . }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

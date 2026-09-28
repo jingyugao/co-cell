@@ -8,7 +8,7 @@ import { installProjectsRoutes } from './routes.js';
 function fixture(contents: Buffer, image = false) {
   const calls: Array<WorkspaceFileReadOptions | undefined> = [];
   const file: WorkspaceFile = {
-    path: `/home/user/workspace/${image ? 'pixel.png' : 'export.tsv'}`,
+    path: `/home/agent/workspace/${image ? 'pixel.png' : 'export.tsv'}`,
     name: image ? 'pixel.png' : 'export.tsv',
     size: contents.length,
     kind: image ? 'image' : 'binary',

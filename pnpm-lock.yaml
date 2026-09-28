@@ -11,12 +11,6 @@ importers:
       '@co-cell/agentcore':
         specifier: file:packages/agentcore
         version: file:packages/agentcore
-      '@co-cell/archives':
-        specifier: file:packages/archives
-        version: file:packages/archives
-      '@co-cell/docker-sandbox':
-        specifier: file:packages/docker-sandbox
-        version: file:packages/docker-sandbox
       '@co-cell/sandbox':
         specifier: file:packages/sandbox
         version: file:packages/sandbox
@@ -78,14 +72,6 @@ packages:
   '@co-cell/agentcore@file:packages/agentcore':
     resolution: {directory: packages/agentcore, type: directory}
     engines: {node: '>=22'}
-
-  '@co-cell/archives@file:packages/archives':
-    resolution: {directory: packages/archives, type: directory}
-    engines: {node: '>=22.18.0'}
-
-  '@co-cell/docker-sandbox@file:packages/docker-sandbox':
-    resolution: {directory: packages/docker-sandbox, type: directory}
-    engines: {node: '>=22.18.0'}
 
   '@co-cell/sandbox@file:packages/sandbox':
     resolution: {directory: packages/sandbox, type: directory}
@@ -991,10 +977,6 @@ packages:
 snapshots:
 
   '@co-cell/agentcore@file:packages/agentcore': {}
-
-  '@co-cell/archives@file:packages/archives': {}
-
-  '@co-cell/docker-sandbox@file:packages/docker-sandbox': {}
 
   '@co-cell/sandbox@file:packages/sandbox': {}
 

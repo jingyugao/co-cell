@@ -1,7 +1,36 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Session } from '../../../protocol/types.js';
-import { MySqlWebStateStore } from './web-state.js';
+import { createWebStateStore, MySqlWebStateStore } from './web-state.js';
+
+test('metadata storage requires MYSQL_URL and rejects invalid URLs without exposing credentials', () => {
+  for (const value of [undefined, '', ' \t\n']) {
+    assert.throws(() => createWebStateStore(value), /MYSQL_URL is required/);
+  }
+  for (const value of ['file:///tmp/state', 'postgres://user:secret@localhost/db', 'mysql://localhost', 'mysql://user:secret@host:invalid/db']) {
+    assert.throws(() => createWebStateStore(value), error => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /MYSQL_URL must be a valid mysql:\/\/ URL/);
+      assert.equal(error.message.includes('secret'), false);
+      return true;
+    });
+  }
+});
+
+test('configured metadata storage is MySQL without connecting until initialization', async () => {
+  const store = createWebStateStore('mysql://user:unused@database.invalid/cocell');
+  assert.ok(store instanceof MySqlWebStateStore);
+  await store.close();
+});
+
+test('database initialization failure propagates instead of falling back to local files', async () => {
+  const store = Object.create(MySqlWebStateStore.prototype) as MySqlWebStateStore;
+  const failure = new Error('Database unavailable');
+  (store as unknown as { pool: { query: () => Promise<unknown> } }).pool = {
+    async query() { throw failure; },
+  };
+  await assert.rejects(store.init(), error => error === failure);
+});
 
 const now = '2026-09-24T00:00:00.000Z';
 const session: Session = {

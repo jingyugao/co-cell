@@ -1,0 +1,70 @@
+#!/usr/local/bin/node
+import { spawnSync } from 'node:child_process';
+import { realpathSync, statSync } from 'node:fs';
+
+const hostRoot = '/home/debug';
+function hostCredential(relative) {
+  try {
+    const path = realpathSync(`${hostRoot}/${relative}`);
+    if (path.startsWith(`${hostRoot}/`) && statSync(path).isFile()) return path;
+  } catch { /* The host mount is optional when a Cellbox credential slot is configured. */ }
+  return '';
+}
+
+function fail(message) {
+  console.error(message);
+  process.exit(2);
+}
+
+const tool = process.argv[2];
+let args;
+try { args = JSON.parse(process.argv[3]); } catch { fail('Invalid tool arguments'); }
+if (!Array.isArray(args) || args.length > 64 || args.some(arg => typeof arg !== 'string' || arg.includes('\0') || arg.length > 8192)) {
+  fail('Invalid tool arguments');
+}
+
+let binary;
+let env;
+if (tool === 'mysql') {
+  const mountedLogin = hostCredential('.mylogin.cnf');
+  const loginFile = process.env.MYSQL_TEST_LOGIN_FILE || mountedLogin;
+  if (!loginFile) fail('MySQL credential file is unavailable to the debug user');
+  const login = args.find(arg => /^--login-path=[A-Za-z0-9_.-]+$/.test(arg));
+  const execute = args.indexOf('-e');
+  if (!login || execute < 0 || execute !== args.length - 2 ||
+      args.length !== 3 || !/^(SELECT|SHOW|DESCRIBE|DESC|EXPLAIN)\b/i.test(args[execute + 1].trim())) {
+    fail('Use mysql --login-path=NAME -e READ_ONLY_SQL');
+  }
+  const sql = args[execute + 1].trim().replace(/;\s*$/, '');
+  if (sql.includes(';') || /\b(INTO\s+(?:OUTFILE|DUMPFILE)|FOR\s+UPDATE|LOCK\s+IN\s+SHARE\s+MODE)\b/i.test(sql)) {
+    fail('Only one read-only SQL statement is supported');
+  }
+  binary = '/opt/cellbox/debug-bin/mysql';
+  env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: mountedLogin ? hostRoot : '/var/lib/cellbox/debug', MYSQL_TEST_LOGIN_FILE: loginFile };
+} else if (tool === 'kubectl') {
+  const mountedKubeconfig = hostCredential('.kube/config');
+  const kubeconfig = process.env.KUBECONFIG || mountedKubeconfig;
+  if (!kubeconfig) fail('Kubernetes credential file is unavailable to the debug user');
+  const verbs = new Set(['get', 'describe', 'logs', 'top', 'api-resources', 'api-versions', 'version', 'cluster-info']);
+  let index = 0;
+  while (index < args.length) {
+    if (['--context', '--namespace', '-n'].includes(args[index])) { index += 2; continue; }
+    if (/^--(?:context|namespace)=/.test(args[index])) { index += 1; continue; }
+    break;
+  }
+  const verb = args[index];
+  const forbidden = /^(?:-f|--filename|--kubeconfig|--token|--server|--user|--cluster|--as|--as-group|--client-key|--client-certificate|--certificate-authority|--raw|--template-file)(?:=|$)/;
+  if (!verbs.has(verb) || (verb === 'cluster-info' && args.includes('dump')) ||
+      args.some(arg => forbidden.test(arg) ||
+      /(?:go-template-file|jsonpath-file|custom-columns-file)/.test(arg))) {
+    fail('Only read-only kubectl commands with the admitted kubeconfig are supported');
+  }
+  binary = '/opt/cellbox/debug-bin/kubectl';
+  env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: mountedKubeconfig ? hostRoot : '/var/lib/cellbox/debug', KUBECONFIG: kubeconfig };
+} else {
+  fail('Unknown CoCell tool');
+}
+
+const result = spawnSync(binary, args, { cwd: '/home/agent/workspace', env, stdio: 'inherit' });
+if (result.error) console.error(`Tool failed: ${result.error.message}`);
+process.exit(result.status ?? 1);

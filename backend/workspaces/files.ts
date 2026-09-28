@@ -4,7 +4,7 @@ import { HttpError } from '../../util/errors.js';
 
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_TEXT_BYTES = 1024 * 1024;
-export const SANDBOX_DOCS_DIRECTORY = '/home/user/.codex/docs';
+export const SANDBOX_DOCS_DIRECTORY = '/home/agent/workspace/.cocell/codex/docs';
 export interface WorkspaceFileResult { file: WorkspaceFile; data: Buffer; version?: string }
 export interface WorkspaceFileReadOptions {
   metadataOnly?: boolean;

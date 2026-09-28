@@ -1,0 +1,35 @@
+{{- if .Values.ingress.enabled }}
+{{- $url := urlParse .Values.publicUrl }}
+{{- if ne (get $url "scheme") "https" }}{{ fail "ingress requires publicUrl to be an HTTPS origin" }}{{ end }}
+{{- $host := regexReplaceAll ":[0-9]+$" (get $url "host") "" }}
+{{- if not .Values.ingress.tlsSecretName }}{{ fail "ingress.tlsSecretName is required when ingress is enabled" }}{{ end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "co-cell.fullname" . }}
+  labels:
+    {{- include "co-cell.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      secretName: {{ .Values.ingress.tlsSecretName | quote }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "co-cell.fullname" . }}
+                port:
+                  name: http
+{{- end }}

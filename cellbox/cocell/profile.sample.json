@@ -1,0 +1,61 @@
+{
+  "id": "cocell-k8s-resumable",
+  "provider": "resumable-k8s-pod",
+  "image": "registry.example.invalid/cocell@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "namespace": "REPLACE_WITH_ADMITTED_NAMESPACE",
+  "nodeName": "REPLACE_WITH_PRELOADED_NODE",
+  "cpu": 2,
+  "memoryMiB": 4096,
+  "clients": ["cocell"],
+  "guest": {
+    "workspace": "/home/agent/workspace",
+    "agent": { "uid": 11000, "gid": 11000 },
+    "debug": { "uid": 0, "gid": 0 },
+    "command": ["/usr/local/bin/node", "/opt/product/cocell/launcher.mjs"],
+    "env": {},
+    "tools": [
+      {
+        "id": "cocell_mysql",
+        "executable": "/opt/cellbox/tools/cocell-cli",
+        "args": ["mysql"],
+        "inputPatterns": ["[\\s\\S]*"],
+        "credentialEnv": { "MYSQL_TEST_LOGIN_FILE": "cocell_mysql_login" }
+      },
+      {
+        "id": "cocell_kubectl",
+        "executable": "/opt/cellbox/tools/cocell-cli",
+        "args": ["kubectl"],
+        "inputPatterns": ["[\\s\\S]*"],
+        "credentialEnv": { "KUBECONFIG": "cocell_kubeconfig" }
+      },
+      {
+        "id": "cocell_archive_backup",
+        "executable": "/opt/cellbox/tools/cocell-archive-backup",
+        "args": [
+          "--endpoint",
+          "REPLACE_WITH_OSS_ENDPOINT",
+          "--bucket",
+          "co-cell-archives",
+          "--region",
+          "us-east-1",
+          "--prefix",
+          "legacy-archives"
+        ],
+        "inputPatterns": ["[A-Za-z0-9][A-Za-z0-9._/-]{0,199}"],
+        "credentialEnv": {
+          "AWS_ACCESS_KEY_ID": "cocell_oss_access_key",
+          "AWS_SECRET_ACCESS_KEY": "cocell_oss_secret_key"
+        }
+      },
+      {
+        "id": "cocell_archive_restore",
+        "executable": "/opt/cellbox/tools/cocell-archive-restore",
+        "args": [],
+        "inputPatterns": ["[\\s\\S]+", "https?://[^\\s/]+(?::\\d+)?/?"],
+        "credentialEnv": { "AWS_ACCESS_KEY_ID": "cocell_oss_access_key", "AWS_SECRET_ACCESS_KEY": "cocell_oss_secret_key" },
+        "workspaceRead": true,
+        "workspaceWrite": true
+      }
+    ]
+  }
+}

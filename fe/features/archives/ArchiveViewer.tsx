@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, errorMessage } from '../../lib/api';
 import { Icon } from '../../components/Icon';
-// ArchiveBrowser.css no longer needed — styles in styles.css
 
 type FileEntry = { name: string; type: 'file' | 'directory'; size: number; mtime?: string };
 

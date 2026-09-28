@@ -1,10 +1,10 @@
-import type { Hono } from 'hono';
+import type { Context, Hono } from 'hono';
 import { z } from 'zod';
 import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { workspaceDownload } from '../workspaces/download.js';
 
-export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectFile' | 'rebuildProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'migrateProjectSandbox' | 'switchProjectSandboxVersion' | 'refreshProjectSandboxRuntime'>) {
+export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFile' | 'rebuildProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>) {
   app.post('/api/projects/:id/archive', async c => {
     const body = await c.req.text();
     let parsed: unknown;
@@ -14,11 +14,6 @@ export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, '
     return c.json(await manager.archiveProjectNow(c.req.param('id'), input), 202);
   });
   app.post('/api/projects/:id/backup', async c => c.json(await manager.backupProjectNow(c.req.param('id')), 202));
-  app.post('/api/projects/:id/sandbox/migrate', async c => c.json(await manager.migrateProjectSandbox(c.req.param('id')), 202));
-  app.post('/api/projects/:id/sandbox/switch-version', async c => {
-    const input = z.object({ targetImageId: z.string().regex(/^sha256:[a-f0-9]{64}$/) }).strict().parse(await c.req.json());
-    return c.json(await manager.switchProjectSandboxVersion(c.req.param('id'), input.targetImageId), 202);
-  });
   app.post('/api/projects/:id/sandbox/rebuild', async c => c.json(await manager.rebuildProjectSandbox(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/refresh-runtime', async c => c.json(await manager.refreshProjectSandboxRuntime(c.req.param('id')), 202));
   app.get('/api/projects/:id/files', async c => {
@@ -43,6 +38,34 @@ export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, '
     if (!href || href.length > 8192) throw new HttpError(400, '预览链接无效');
     return c.redirect(await manager.preview(c.req.param('id'), href), 302);
   });
+
+  const service = async (c: Context) => {
+    const projectId = c.req.param('id');
+    if (!projectId) throw new HttpError(400, '项目 ID 无效');
+    const port = Number(c.req.param('port'));
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, '服务端口无效');
+    const prefix = `/api/projects/${encodeURIComponent(projectId)}/service/${port}`;
+    const url = new URL(c.req.url);
+    const path = (url.pathname.slice(prefix.length) || '/') + url.search;
+    const response = await manager.projectService(projectId, port, path, c.req.raw);
+    const headers = new Headers(response.headers);
+    const location = headers.get('location');
+    if (location) {
+      try {
+        const target = new URL(location, `http://localhost:${port}${path}`);
+        if (['localhost', '127.0.0.1', '0.0.0.0'].includes(target.hostname) && Number(target.port || 80) === port)
+          headers.set('location', `${prefix}${target.pathname}${target.search}${target.hash}`);
+      } catch { /* Keep the upstream location. */ }
+    }
+    headers.delete('set-cookie');
+    headers.set('Cache-Control', 'no-store');
+    headers.set('Content-Security-Policy', 'sandbox allow-scripts allow-forms allow-popups');
+    headers.set('Referrer-Policy', 'no-referrer');
+    headers.set('X-Content-Type-Options', 'nosniff');
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  };
+  app.all('/api/projects/:id/service/:port', service);
+  app.all('/api/projects/:id/service/:port/*', service);
 
   const projectSchema = z.object({ name: z.string().trim().min(1).max(100), requirementUrl: z.string().trim().max(4096).url().refine(value => /^https?:\/\//i.test(value), '仅支持 HTTP 或 HTTPS 链接').nullable().optional() }).strict();
   app.get('/api/projects', async c => c.json(await manager.listProjectsWithArchives()));

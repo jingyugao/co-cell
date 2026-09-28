@@ -1,0 +1,33 @@
+# Example only. Replace the Docker Hub account, image version, URLs, and profile.
+# Supply the named Secrets separately; credentials must never go in this file.
+# The runtime Secret must contain CELLBOX_API_TOKEN, COCELL_ACCESS_TOKEN,
+# and MYSQL_URL for the application to start.
+image:
+  repository: docker.io/your-dockerhub-account/co-cell
+  tag: replace-me
+
+# For a private Docker Hub repository, create this pull Secret in co-cell first.
+# imagePullSecrets:
+#   - name: dockerhub-pull
+
+existingSecret: co-cell-secrets
+
+cellbox:
+  apiUrl: https://cellbox-api.example.invalid
+  profile: replace-with-resumable-profile
+
+publicUrl: https://co-cell.example.invalid
+
+# After importing dedicated MySQL and Kubernetes credentials into CoCell:
+# config:
+#   credentialSlots:
+#     __mysqlLogin: cocell_mysql_login
+#     __kubernetes_config.json: cocell_kubeconfig
+
+ingress:
+  enabled: true
+  className: traefik
+  tlsSecretName: co-cell-tls
+
+persistence:
+  storageClassName: local-path

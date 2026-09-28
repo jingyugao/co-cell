@@ -18,19 +18,14 @@ function fmtDate(ts: string) {
 
 export default function ArchiveVersionBadge({ project, onView }: Props) {
   const tooltipId = useId();
-  const versions: ArchiveVersion[] = (project.archiveVersions && project.archiveVersions.length > 0)
-    ? project.archiveVersions
-    : project.sandboxDataArchive
-      ? [{ sizeBytes: project.sandboxDataArchive.sizeBytes, createdAt: project.sandboxDataArchive.createdAt,
-        label: project.sandboxDataArchive.sha256.slice(0, 8), version: 0, id: project.sandboxDataArchive.key }]
-      : [];
+  const versions: ArchiveVersion[] = project.archiveVersions ?? [];
   if (!versions.length) return null;
 
   const latest = versions[0];
-  const key = project.archiveKey || project.sandboxDataArchive?.key || latest.id;
+  const key = latest.id;
 
   function handleClick(v: ArchiveVersion) {
-    onView(key, project.archiveKey ? v.id : undefined,
+    onView(key, v.id,
       { sizeBytes: v.sizeBytes, bytesAdded: v.bytesAdded, createdAt: v.createdAt });
   }
 

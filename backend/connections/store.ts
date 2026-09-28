@@ -20,12 +20,6 @@ export interface ConnectionBundle {
   cliFiles?: Record<string, string>;
   kubernetesPolicy?: string;
 }
-export const CONNECTION_ROOT = '/home/user/.codex-web/credentials';
-export const CONNECTION_ENVS = {
-  GLAB_CONFIG_DIR: '/home/user/.config/glab-cli',
-  MYSQL_TEST_LOGIN_FILE: '/home/user/.mylogin.cnf',
-  GIT_TERMINAL_PROMPT: '0',
-};
 export type LocalCommand = (command: string, args: string[], input?: string) => Promise<string>;
 export function localCredentialEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...source, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GH_PROMPT_DISABLED: 'true' };
@@ -197,7 +191,7 @@ export class ConnectionStore {
         const values = Object.fromEntries(output.split('\n').map(line => { const i = line.indexOf('='); return [line.slice(0, i), line.slice(i + 1)]; }));
         if (!values.username || !values.password) continue;
         gitCredentials += `https://${encodeURIComponent(values.username)}:${encodeURIComponent(values.password)}@${host}\n`;
-        gitConfig += `[credential "https://${host}"]\n\thelper =\n\thelper = store --file=/home/user/.git-credentials\n`;
+        gitConfig += `[credential "https://${host}"]\n\thelper =\n\thelper = store --file=/home/debug/.git-credentials\n`;
         connections.push({ id: `git:${host}`, type: 'git', name: host, host, username: values.username });
       }
       if (!connections.length) throw new HttpError(400, '本机没有可导入的服务凭据');

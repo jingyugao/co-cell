@@ -3,21 +3,19 @@ import { homedir } from 'node:os';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
 import type { Project, ProjectSummary, Session, SessionSummary, SessionTurnPage, Settings, StreamMessage, SubagentConversation, Turn } from '../../protocol/types.js';
-import type { UserInputQuestion, UserInputRequest } from '../../protocol/user-input-types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
 import type { WorkspaceFileReadOptions } from '../workspaces/files.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
-import type { ArchiveService } from '@co-cell/archives';
+import { pruneRemoteArchives } from '../archives/retention.js';
 
 import { HttpError } from '../../util/errors.js';
 import { ProjectService, type ProjectInput, type ProjectUpdate } from '../projects/service.js';
-import { AtomicJsonWriter } from '../infra/storage/atomic-json.js';
-import { createWebStateStore, type WebStateStore } from '../infra/storage/web-state.js';
+import { RecordWriteQueue } from '../infra/storage/record-write-queue.js';
+import type { WebStateStore } from '../infra/storage/web-state.js';
 import { runTurn, type CodexClient } from '../execution/runner.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
-import { ApprovalRequests, approvalDecisionSchema, cancelPersistedApprovals } from '../approvals/requests.js';
 import { readNativeHistory, readSubagentConversations } from '../execution/native-history.mjs';
 import type { NotificationStore } from '../notifications/store.js';
 import { estimateSessionCosts, type SessionCostBreakdown } from '../../util/billing.js';
@@ -29,7 +27,6 @@ type ActiveExecution = {
   controller: AbortController;
   done: Promise<void>;
   turnId?: string;
-  approvals?: ApprovalRequests;
   finish(): void;
 };
 
@@ -55,7 +52,7 @@ export class SessionManager {
   private sessions = new Map<string, Session>();
   private active = new Map<string, ActiveExecution>();
   private subscribers = new Map<string, Set<Subscriber>>();
-  private writer = new AtomicJsonWriter();
+  private writer = new RecordWriteQueue();
   private deleting = new Set<string>();
   private uploads = new Map<string, Set<Promise<string>>>();
   private closing = false;
@@ -67,27 +64,22 @@ export class SessionManager {
     private client: CodexClient,
     public readonly dataDirectory: string,
     public readonly defaults: Settings,
+    private state: WebStateStore,
     private sandbox?: SandboxRuntime,
-    private sandboxWorkingDirectory = '/home/user/workspace',
+    private sandboxWorkingDirectory = '/home/agent/workspace',
     private logger?: RuntimeLog,
-    private state: WebStateStore = createWebStateStore(dataDirectory),
     private readonly imagesDirectory = join(dataDirectory, 'images'),
     lifecycleOptions: SandboxLifecycleOptions = {},
     notifications?: NotificationStore,
-    private _archiveManager?: ArchiveService,
-    backupIgnore: string[] = [],
   ) {
     this.notifications = notifications;
     this.projects = new ProjectService(state);
     if (sandbox) {
       this.sandboxOperations = new ProjectSandboxOperations({
-        projects: this.projects, runtime: sandbox, archives: () => this._archiveManager,
-        content: this._archiveManager,
-        directory: join(dataDirectory, '..', 'sandbox-data-archives'),
+        projects: this.projects, runtime: sandbox,
         threadIds: id => [...this.sessions.values()].filter(session => session.projectId === id).flatMap(session => session.threadId ? [session.threadId] : []),
         saveSandbox: (id, value, restore) => this.updateSandbox(id, id, value, restore),
         logger: this.logger,
-        backupIgnore,
         detached: async id => {
           for (const session of this.sessions.values()) {
             if (session.projectId !== id) continue;
@@ -105,46 +97,11 @@ export class SessionManager {
     }
   }
 
-  /** @internal 供归档路由使用 */
-  get archiveManager(): ArchiveService | undefined { return this._archiveManager; }
+	get remoteArchives() { return this.sandbox?.remoteArchives; }
 
   async init() {
     await this.state.init();
     await this.projects.init();
-    // A process crash can interrupt a backup while Docker is paused. The
-    // persisted operation phase survives the running -> failed reconciliation.
-    for (const project of this.projects.list()) {
-      if (project.sandbox && ['backup', 'switch'].includes(project.sandboxOperation?.kind ?? '')
-        && ['暂停环境', '创建 Restic 快照', '创建增量快照'].includes(project.sandboxOperation?.phase ?? '')) {
-        if (!this.sandbox?.resumeAfterBackup) throw new Error('Cannot reconcile an interrupted paused Sandbox backup');
-        await this.sandbox.resumeAfterBackup(project.sandbox.id);
-      }
-      if (['migrate', 'switch'].includes(project.sandboxOperation?.kind ?? '')
-        && ['创建首个 Restic 快照', '创建首个增量快照'].includes(project.sandboxOperation?.phase ?? '')) {
-        if (!this.sandbox?.resumeAfterBackup) throw new Error('Cannot reconcile an interrupted migration snapshot');
-        for (const candidate of project.pendingSandboxCleanup ?? []) await this.sandbox.resumeAfterBackup(candidate.id);
-      }
-      if (['migrate', 'switch'].includes(project.sandboxOperation?.kind ?? '') && project.sandboxOperation?.phase === '切换环境'
-        && project.archiveKey && this._archiveManager) {
-        const latest = await this._archiveManager.getLatest(project.archiveKey);
-        const hostBacked = project.sandbox && await this.sandbox?.hostData?.({ id: project.id, projectId: project.id,
-          settings: { workingDirectory: project.workingDirectory }, sandbox: project.sandbox, updatedAt: project.updatedAt });
-        if (!hostBacked && latest?.metadata.verified === true && latest.metadata.sourceSandboxId !== project.sandbox?.id) {
-          const reverted = await this._archiveManager.revertLatestVersion(project.archiveKey, latest.id);
-          if (!reverted) throw new Error(`Cannot reconcile interrupted Sandbox migration for ${project.id}`);
-          const previous = await this._archiveManager.getLatest(project.archiveKey);
-          if (previous) {
-            const details = this._archiveManager.describe(previous);
-            await this.projects.updateLatestBackup(project.id, { createdAt: details.createdAt, sizeBytes: details.sizeBytes,
-              ...(details.bytesAdded === undefined ? {} : { bytesAdded: details.bytesAdded }) });
-          }
-          if (project.sandbox) await this.sandbox?.startReplacement?.(project.sandbox).catch(() => {});
-        } else if (hostBacked && project.sandbox && latest?.metadata.sourceSandboxId === project.sandbox.id) {
-          // The old host-backed Sandbox was fenced before its replacement was persisted.
-          await this.sandbox?.startReplacement?.(project.sandbox);
-        }
-      }
-    }
     for (const session of await this.state.listSessions()) {
       // Invalid state is reported rather than silently overwriting someone's history.
       if (!session.id || !Array.isArray(session.turns) || !session.settings) {
@@ -186,13 +143,12 @@ export class SessionManager {
         changed = true;
       }
       for (const turn of session.turns) {
-        if (turn.status === 'running' && !turn.execution && !this.canRecover(session, turn)) {
+        if (turn.status === 'running' && !this.canRecover(session, turn)) {
           turn.status = 'cancelled';
           turn.error = '服务重启时发现本轮没有可恢复的执行任务，已标记为已停止。';
           turn.completedAt = new Date().toISOString();
           changed = true;
         }
-        if (!this.canRecover(session, turn) && cancelPersistedApprovals(turn)) changed = true;
         if (turn.retry !== undefined) {
           delete turn.retry;
           changed = true;
@@ -211,13 +167,11 @@ export class SessionManager {
         changed = true;
         for (const turn of session.turns.filter(t => t.status === 'running' || this.canRecover(session, t))) {
           if (this.canRecover(session, turn)) {
-            // Message bodies are reconstructed from the worker journal or an App Server turn snapshot.
-            if (!turn.items.length && !turn.prompt && turn.execution) turn.execution.lastAppliedSeq = 0;
+            // Message bodies are reconstructed from the App Server turn snapshot.
             turn.phase = 'recovering';
             continue;
           }
           turn.status = 'cancelled';
-          if (turn.execution) turn.execution.state = 'terminal';
           delete turn.phase;
           turn.error = '服务已重启，本轮执行已中断。可以发送消息继续原会话。';
           turn.completedAt = new Date().toISOString();
@@ -238,8 +192,8 @@ export class SessionManager {
       if (project.updatedAt > owner.updatedAt) owner.updatedAt = project.updatedAt;
       this.sandbox?.track?.(owner, sandbox => this.updateSandbox(project.id, owner.id, sandbox));
     }
-    // Reconcile persisted project bindings with the current Docker daemon. A
-    // container may have disappeared while its database reference remained.
+    // Reconcile persisted project bindings with Cellbox. A Pod may have
+    // disappeared while its database reference remained.
     for (const project of this.projects.list()) {
       if (project.executionMode !== 'sandbox' || !project.sandbox || !this.sandbox?.inspect) continue;
       try { await this.sandbox.inspect(this.projectWorkspace(project)); }
@@ -257,19 +211,14 @@ export class SessionManager {
     for (const { session, turn } of recoverable) this.sandbox?.trackExecution?.(session, turn);
     for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
     for (const session of this.sessions.values()) {
-      if (session.turns.some(turn => turn.userInputRequests?.some(request => request.status === 'queued')) && !this.active.has(session.id)) {
-        void this.startQueuedUserInput(session.id).catch(error => console.error('Queued user answer recovery failed:', error instanceof Error ? error.message : 'unknown error'));
-      }
     }
     this.lifecycle?.start();
   }
 
   private canRecover(session: Session, turn: Turn): boolean {
     if (!this.sandbox || session.settings.executionMode !== 'sandbox' || !session.sandbox) return false;
-    if (!turn.execution) return turn.status === 'running' && turn.codexAccepted === true
+    return turn.status === 'running' && turn.codexAccepted === true
       && Boolean(session.threadId && turn.nativeTurnId);
-    return turn.execution.kind === 'sandbox-worker' && turn.execution.protocolVersion === 1 && turn.execution.state !== 'terminal'
-      && (!turn.execution.sandboxId || turn.execution.sandboxId === session.sandbox.id);
   }
 
   private reserveTurn(session: Session): ActiveExecution {
@@ -290,17 +239,10 @@ export class SessionManager {
   private executeTurn(session: Session, turn: Turn, execution: ActiveExecution, recovering = false) {
     const id = session.id;
     execution.turnId = turn.id;
-    const approvals = new ApprovalRequests(turn, execution.controller.signal, async () => {
-      session.updatedAt = new Date().toISOString();
-      await this.save(session);
-      this.publish(id, { type: 'state', session: this.get(id) });
-    });
-    execution.approvals = approvals;
     const running = runTurn(session, turn, execution.controller, {
       client: this.client, sandbox: this.sandbox, logger: this.logger, recovering,
       save: () => this.save(session), publish: message => this.publish(id, message), snapshot: () => this.get(id),
       updateSandbox: sandbox => this.updateSandbox(session.projectId, id, sandbox),
-      requestApproval: approvals.request, closeApprovals: () => approvals.close(), detachApprovals: () => approvals.detach(),
     }).finally(async () => {
       if (session.settings.executionMode === 'sandbox' && session.status !== 'running'
         && !(session.turnCount ?? 0) && !session.turns.some(candidate => candidate.codexAccepted)) {
@@ -312,7 +254,6 @@ export class SessionManager {
         }
       }
       execution.finish();
-      void this.startQueuedUserInput(id).catch(error => console.error('Queued user answer failed:', error instanceof Error ? error.message : 'unknown error'));
       if (this.notifications && turn.status !== 'running') {
         const type = turn.status === 'completed' ? 'turn_completed'
           : turn.status === 'cancelled' ? 'turn_cancelled' : 'turn_failed';
@@ -393,6 +334,12 @@ export class SessionManager {
       if (!this.sandbox?.subagents) return [];
       const release = this.projects.acquire(session.projectId);
       try { return await this.sandbox.subagents(session); }
+      catch (error) {
+        if (error && typeof error === 'object' && 'code' in error && error.code === 'BUSY') {
+          throw new HttpError(503, 'Sandbox 正忙，请稍后重试');
+        }
+        throw error;
+      }
       finally { release(); }
     }
     return readSubagentConversations(session.threadId, process.env.CODEX_HOME || join(homedir(), '.codex'));
@@ -508,7 +455,6 @@ export class SessionManager {
       // to lose the Agent's visible output.
       const storedOnlyItems = stored.items.filter(item => !turn.items.some(native => native.id === item.id));
       return { ...turn, id: stored.id, nativeTurnId: turn.id, sdkUsage: stored.sdkUsage,
-        userInputRequests: stored.userInputRequests,
         prompt: turn.prompt || stored.prompt,
         images: turn.images.length ? turn.images : stored.images,
         items: [...turn.items, ...storedOnlyItems],
@@ -555,48 +501,18 @@ export class SessionManager {
   }
 
   async listProjectsWithArchives(): Promise<ProjectSummary[]> {
-    // Refresh provider observations without waking containers. Maintenance owns
-    // the binding while backup/restore/archive is in progress.
-    const candidates = this.projects.list().filter(project => project.sandbox && project.executionMode === 'sandbox'
-      && !this.projects.isMaintaining(project.id) && !this.projects.activeSessionId(project.id));
-    for (let offset = 0; offset < candidates.length; offset += 4) {
-      await Promise.all(candidates.slice(offset, offset + 4).map(async project => {
-        if (!this.sandbox?.inspect || this.projects.isMaintaining(project.id)) return;
-        const release = this.projects.acquire(project.id);
-        try {
-          await this.sandbox.inspect(this.projectWorkspace(project));
-          const current = this.projects.get(project.id);
-          if (current.sandbox?.status === 'ready' && this.sandbox.verifySandbox
-            && [...this.sessions.values()].some(session => session.projectId === project.id && this.historyErrors.has(session.id))) {
-            await this.sandbox.verifySandbox(current.sandbox, 5_000);
-          }
-        } catch {
-          const current = this.projects.find(project.id);
-          if (current?.sandbox) await this.updateSandbox(project.id, project.id, { ...current.sandbox, status: 'unavailable' });
-        } finally { release(); }
-      }));
-    }
+    // Listing uses recorded state. Runtime operations inspect their Sandbox
+    // before acting, so a status refresh here would contend with backups.
     const summaries = this.listProjects();
-    const archiveMgr = this._archiveManager;
-    if (!archiveMgr) return summaries;
-    return Promise.all(summaries.map(async s => {
-      if (!s.archiveKey) return s;
-      try {
-        const v = await archiveMgr.getLatest(s.archiveKey);
-        const latestDetails = v ? archiveMgr.describe(v) : undefined;
-        s.latestBackup = latestDetails ? { createdAt: latestDetails.createdAt,
-          sizeBytes: latestDetails.sizeBytes, bytesAdded: latestDetails.bytesAdded } : undefined;
-        delete s.sandboxDataArchive;
-        s.archiveVersions = (await archiveMgr.listVersions(s.archiveKey)).map(version => archiveMgr.describe(version));
-      } catch { /* skip enrichment failure */ }
-      return s;
-    }));
+    return summaries.map(project => ({ ...project, archiveVersions: project.remoteArchives?.map((archive, index, all) => ({
+      id: archive.id, version: all.length - index, createdAt: archive.createdAt,
+      sizeBytes: archive.sizeBytes, label: `版本 ${all.length - index}`,
+    })) }));
   }
 
   private projectSummary(project: Project): ProjectSummary {
     return structuredClone({ ...project, status: project.status ?? (project.archivedAt ? 'archived' : 'active'), archivedAt: project.archivedAt ?? null, sessionCount: [...this.sessions.values()].filter(session => session.projectId === project.id).length,
-      latestBackup: project.latestBackup ?? (project.sandboxDataArchive ? { createdAt: project.sandboxDataArchive.createdAt,
-        sizeBytes: project.sandboxDataArchive.sizeBytes } : undefined),
+      latestBackup: project.latestBackup,
       activeSessionId: this.projects.activeSessionId(project.id) });
   }
 
@@ -623,16 +539,6 @@ export class SessionManager {
     return this.getProject(id);
   }
 
-  async migrateProjectSandbox(id: string): Promise<ProjectSummary> {
-    await this.runProjectSandboxOperation(id, 'migrate');
-    return this.getProject(id);
-  }
-
-  async switchProjectSandboxVersion(id: string, targetImageId: string): Promise<ProjectSummary> {
-    await this.runProjectSandboxOperation(id, 'switch', { targetImageId });
-    return this.getProject(id);
-  }
-
   async refreshProjectSandboxRuntime(id: string): Promise<ProjectSummary> {
     await this.runProjectSandboxOperation(id, 'refresh');
     return this.getProject(id);
@@ -643,8 +549,8 @@ export class SessionManager {
     return this.getProject(id);
   }
 
-  private async runProjectSandboxOperation(id: string, kind: 'backup' | 'restore' | 'archive' | 'migrate' | 'switch' | 'refresh',
-    options: { useExistingBackup?: boolean; targetImageId?: string } = {}) {
+  private async runProjectSandboxOperation(id: string, kind: 'backup' | 'restore' | 'archive' | 'refresh',
+    options: { useExistingBackup?: boolean } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
     await this.sandboxOperations.run(id, kind, options);
@@ -674,41 +580,21 @@ export class SessionManager {
     }
   }
 
-  /** 对所有已归档项目清理旧归档（新方案走 ArchiveManager，旧方案走 state） */
   async pruneArchivedProjectArchives(): Promise<number> {
-    if (this._archiveManager) {
-      let retired = 0;
-      for (const project of this.projects.list().filter(p => p.status === 'archived' && p.archiveKey)) {
-        retired += await this._archiveManager.retain(project.archiveKey!, project.backupRetentionCount ?? 2);
-      }
-      await this._archiveManager.sweepManagedVersions();
-      await this._archiveManager.sweep();
-      return retired;
+    const remote = this.remoteArchives;
+    if (!remote) return 0;
+    let removed = 0;
+    for (const project of this.projects.list().filter(p => p.status === 'archived')) {
+      removed += await pruneRemoteArchives(project.remoteArchives ?? [], project.backupRetentionCount ?? 2,
+        remote, id => this.projects.removeRemoteArchive(project.id, id));
     }
-    const archivesDir = join(this.dataDirectory, '..', 'sandbox-data-archives');
-    const archivedProjects = this.projects.list().filter(p => p.status === 'archived');
-    let totalDeleted = 0;
-    for (const project of archivedProjects) {
-      const archives = await this.state.listProjectArchives(project.id);
-      if (archives.length <= 1) continue;
-      const toDelete = archives.slice(1);
-      for (const archive of toDelete) {
-        try {
-          await this.state.deleteArchiveRecord(archive.key);
-          await rm(join(archivesDir, archive.key), { force: true });
-          totalDeleted++;
-        } catch { /* 跳过单个失败 */ }
-      }
-    }
-    return totalDeleted;
+    return removed;
   }
 
   private isSandboxReferenced(sandboxId: string): boolean {
     return this.projects.list().some(project => project.sandbox?.id === sandboxId
       || (this.projects.isMaintaining(project.id) && project.pendingSandboxCleanup?.some(sandbox => sandbox.id === sandboxId)))
-      || [...this.sessions.values()].some(session =>
-        (!session.projectId && session.sandbox?.id === sandboxId)
-        || session.turns.some(turn => turn.execution?.sandboxId === sandboxId && turn.execution.state !== 'terminal'));
+      || [...this.sessions.values()].some(session => !session.projectId && session.sandbox?.id === sandboxId);
   }
 
   async sweepSandboxLifecycle() {
@@ -721,7 +607,7 @@ export class SessionManager {
     if (project.status === 'archived') {
       throw new HttpError(409, '项目已归档，请先点击“恢复项目”');
     }
-    if (!project.sandbox && (project.archiveKey || project.sandboxDataArchive)) {
+    if (!project.sandbox && (project.remoteArchives?.length)) {
       throw new HttpError(409, '项目环境尚未恢复，请先点击“恢复环境”；不会创建空环境');
     }
   }
@@ -777,6 +663,7 @@ export class SessionManager {
       for (const sibling of this.sessions.values()) {
         if (sibling.projectId !== projectId || this.deleting.has(sibling.id)) continue;
         sibling.sandbox = structuredClone(sandbox);
+        sibling.settings.workingDirectory = sandbox.workingDirectory;
         try { await this.save(sibling); }
         catch (error) {
           if (!replacing) throw error;
@@ -800,7 +687,10 @@ export class SessionManager {
       if (!this.sandbox) throw new HttpError(400, 'Sandbox 尚未配置，请检查服务端连接设置');
       if (!posix.isAbsolute(settings.workingDirectory) || settings.workingDirectory.includes('\0')) throw new HttpError(400, 'Sandbox 工作目录必须是沙箱内的绝对路径');
       const directory = posix.normalize(settings.workingDirectory);
-      if (!directory.startsWith('/home/user/') || /^\/home\/user\/\.codex(?:-web)?(?:\/|$)/.test(directory)) throw new HttpError(400, 'Sandbox 工作目录须位于 /home/user 下，且不能使用 Codex 内部目录');
+      if ((directory !== '/home/agent/workspace' && !directory.startsWith('/home/agent/workspace/'))
+        || /^\/home\/agent\/workspace\/\.cocell(?:\/|$)/.test(directory)) {
+        throw new HttpError(400, 'Sandbox 工作目录须位于 /home/agent/workspace 下，且不能使用 Codex 内部目录');
+      }
       return normalizeExecutionSettings({ ...settings, workingDirectory: directory });
     }
     let directory: string;
@@ -896,9 +786,7 @@ export class SessionManager {
     // not make completed messages disappear after a Web restart.
     const turns = session.turns.map(turn => ({
       id: turn.id, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
-      execution: turn.execution, codexAccepted: turn.codexAccepted, error: turn.error,
-      approvals: turn.status === 'running' || (turn.execution && turn.execution.state !== 'terminal') ? turn.approvals : undefined,
-      userInputRequests: turn.userInputRequests,
+      codexAccepted: turn.codexAccepted, error: turn.error,
       prompt: turn.prompt,
       images: turn.images,
       items: turn.items,
@@ -970,7 +858,6 @@ export class SessionManager {
       this.executeTurn(session, turn, execution);
       return turn.id;
     } catch (error) {
-      await execution.approvals?.close().catch(() => {});
       this.sessions.set(id, previous);
       execution.finish();
       this.publish(id, { type: 'state', session: this.get(id) });
@@ -978,127 +865,20 @@ export class SessionManager {
     }
   }
 
-  async resolveApproval(id: string, turnId: string, approvalId: string, input: unknown): Promise<Session> {
-    const decision = approvalDecisionSchema.parse(input);
-    const session = this.lookup(id);
-    const turn = session.turns.find(item => item.id === turnId);
-    const approval = turn?.approvals?.find(item => item.id === approvalId);
-    if (!turn || !approval) throw new HttpError(404, '确认请求不存在');
-    const execution = this.active.get(id);
-    if (execution?.turnId === turnId && execution.approvals) {
-      await execution.approvals.decide(approvalId, decision);
-    } else if (approval.status !== decision.decision) {
-      throw new HttpError(409, '本轮执行已结束，确认请求已失效');
-    }
-    return this.get(id);
-  }
-
-  async requestApproval(id: string, turnId: string, projectId: string | null, requestId: string, input: unknown, signal: AbortSignal) {
-    const session = this.lookup(id);
-    if ((session.projectId ?? null) !== projectId) throw new HttpError(403, '审批 capability 与项目不匹配');
-    const execution = this.active.get(id);
-    if (execution?.turnId !== turnId || !execution.approvals) throw new HttpError(409, '来源任务已结束，不能请求确认');
-    const body = (input as { title?: string; target?: string }) ?? {};
-    this.notifications?.add({
-      type: 'approval_pending',
-      title: `【${session.projectId ? this.projects.get(session.projectId)?.name ?? '' : '无项目'}】审批: ${body.title ?? requestId}`,
-      body: (body.target ?? '').slice(0, 100),
-      sessionId: session.id, sessionTitle: session.title, projectName: session.projectId ? this.projects.get(session.projectId)?.name : undefined, turnId,
-    });
-    return execution.approvals.request(requestId, input, signal);
-  }
-
-  async requestUserInput(id: string, turnId: string, projectId: string | null, requestId: string,
-    questions: UserInputQuestion[]): Promise<UserInputRequest> {
-    const session = this.lookup(id);
-    if ((session.projectId ?? null) !== projectId) throw new HttpError(403, '提问来源项目不匹配');
-    const turn = session.turns.find(item => item.id === turnId);
-    if (!turn || this.active.get(id)?.turnId !== turnId || turn.status !== 'running') {
-      throw new HttpError(409, '来源任务已结束，不能发送问题');
-    }
-    const existing = turn.userInputRequests?.find(item => item.id === requestId);
-    if (existing) {
-      if (JSON.stringify(existing.questions) !== JSON.stringify(questions)) throw new HttpError(409, '提问 ID 已用于其他内容');
-      return structuredClone(existing);
-    }
-    if ((turn.userInputRequests?.length ?? 0) >= 20) throw new HttpError(409, '本轮提问过多');
-    const question: UserInputRequest = { id: requestId, questions, status: 'pending', createdAt: new Date().toISOString() };
-    (turn.userInputRequests ??= []).push(question);
-    session.updatedAt = question.createdAt;
-    await this.save(session);
-    this.publish(id, { type: 'state', session: this.get(id) });
-    return structuredClone(question);
-  }
-
-  async answerUserInput(id: string, turnId: string, requestId: string, answer: string): Promise<Session> {
-    const session = this.lookup(id);
-    const request = session.turns.find(turn => turn.id === turnId)?.userInputRequests?.find(item => item.id === requestId);
-    if (!request) throw new HttpError(404, '问题不存在');
-    if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
-    request.status = 'queued';
-    request.answer = answer;
-    request.answeredAt = new Date().toISOString();
-    session.updatedAt = request.answeredAt;
-    await this.save(session);
-    this.publish(id, { type: 'state', session: this.get(id) });
-    if (!this.active.has(id)) await this.startQueuedUserInput(id);
-    return this.get(id);
-  }
-
-  private async startQueuedUserInput(id: string): Promise<void> {
-    if (this.active.has(id)) return;
-    const session = this.lookup(id);
-    for (const [index, source] of session.turns.entries()) {
-      for (const request of source.userInputRequests ?? []) {
-        if (request.status !== 'queued' || !request.answer) continue;
-        const prompt = request.questions.length === 1 ? request.answer : `对之前问题的回答：\n${request.answer}`;
-        // A crash after startTurn saved the new turn but before this receipt
-        // was saved must not submit the same answer a second time.
-        const existing = session.turns.slice(index + 1).find(turn => turn.prompt === prompt
-          && Date.parse(turn.startedAt) >= Date.parse(request.answeredAt ?? request.createdAt));
-        const answerTurnId = existing?.id ?? await this.startTurn(id, prompt);
-        request.status = 'answered';
-        request.answerTurnId = answerTurnId;
-        session.updatedAt = new Date().toISOString();
-        await this.save(session);
-        this.publish(id, { type: 'state', session: this.get(id) });
-        if (!existing) return;
-      }
-    }
-  }
-
-  /** Resolve Web session/turn context from a Codex App-Server thread ID. */
-  findSessionByThreadId(threadId: string): { sessionId: string; turnId: string; projectId: string | null } | null {
-    for (const session of this.sessions.values()) {
-      if (session.threadId !== threadId) continue;
-      const execution = this.active.get(session.id);
-      if (!execution?.turnId) continue;
-      return { sessionId: session.id, turnId: execution.turnId, projectId: session.projectId ?? null };
-    }
-    return null;
-  }
-
   async stop(id: string) {
     const current = this.lookup(id);
     const execution = this.active.get(id);
     if (execution) {
-      const turn = current.turns.find(turn => turn.id === execution.turnId);
-      if (turn?.execution) {
-        turn.execution.stopRequested = true;
-        await this.save(current);
-      }
       execution.controller.abort();
       await execution.done;
       return;
     }
 
     const pending = current.turns.slice().reverse().find(turn => this.canRecover(current, turn));
-    if (pending?.execution) {
+    if (pending) {
       const recovery = this.reserveTurn(current);
       recovery.turnId = pending.id;
       try {
-        pending.execution.stopRequested = true;
-        await this.save(current);
         recovery.controller.abort();
         this.executeTurn(current, pending, recovery, true);
         await recovery.done;
@@ -1150,27 +930,33 @@ export class SessionManager {
     const project = this.projects.get(projectId);
     if (project.executionMode !== 'sandbox' || !this.sandbox) throw new HttpError(400, '此项目不使用 Sandbox 沙箱');
     if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先启动服务');
-    const release = this.projects.acquire(project.id);
-    const owner = this.projectWorkspace(project);
-    try {
-      const origin = await this.sandbox.preview(owner, port);
-      const target = new URL(origin);
-      target.pathname = url.pathname; target.search = url.search; target.hash = url.hash;
-      return target.href;
-    } finally { release(); }
+    return `/api/projects/${encodeURIComponent(projectId)}/service/${port}${url.pathname}${url.search}${url.hash}`;
   }
 
-  /** Returns the Docker container name for server-side proxy to sandbox services. */
-  async sandboxProxyHost(projectId: string): Promise<string> {
-    if (this.closing) throw new HttpError(503, '服务正在关闭');
+  async projectService(projectId: string, port: number, path: string, request: Request): Promise<Response> {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, '服务端口无效');
     await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
-    if (project.executionMode !== 'sandbox' || !this.sandbox) throw new HttpError(400, '此项目不使用 Sandbox 沙箱');
-    if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先启动服务');
+    if (!project.sandbox || !this.sandbox?.service) throw new HttpError(503, 'Sandbox 服务代理未配置');
     const release = this.projects.acquire(project.id);
+    let released = false;
+    const done = () => { if (!released) { released = true; release(); } };
     try {
-      return await this.sandbox.proxyHost(this.projectWorkspace(project));
-    } finally { release(); }
+      const response = await this.sandbox.service(this.projectWorkspace(project), port, path, request);
+      if (!response.body) { done(); return response; }
+      const reader = response.body.getReader();
+      const body = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          try {
+            const next = await reader.read();
+            if (next.done) { controller.close(); done(); }
+            else controller.enqueue(next.value);
+          } catch (error) { controller.error(error); done(); }
+        },
+        async cancel(reason) { try { await reader.cancel(reason); } finally { done(); } },
+      });
+      return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+    } catch (error) { done(); throw error; }
   }
 
   async projectFile(projectId: string, path: string, options?: WorkspaceFileReadOptions) {
@@ -1195,7 +981,6 @@ export class SessionManager {
       const turn = session?.turns.find(turn => turn.id === execution.turnId);
       if (session?.settings.executionMode === 'sandbox' && turn && this.sandbox) {
         this.sandbox.detach(turn);
-        if (execution.approvals) detachments.push(execution.approvals.detach());
       } else execution.controller.abort();
     }
     await Promise.allSettled(detachments);

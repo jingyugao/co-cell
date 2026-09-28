@@ -1,15 +1,14 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Session, Settings, Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
-import { createArchiveReader, type ArchiveService } from '@co-cell/archives';
 import { SessionManager, type CodexClient } from './manager.js';
+import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 
-const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/user/workspace', model: 'test',
+const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
   modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
 const answer = { id: 'answer', type: 'agent_message' as const, text: '2' };
 
@@ -27,14 +26,15 @@ async function fixture() {
     },
     async history() { throw new Error('Sandbox is unavailable'); },
   } as unknown as SandboxRuntime;
+  const state = new MemoryWebStateStore();
   const managers: SessionManager[] = [];
   const start = async () => {
-    const manager = new SessionManager({} as CodexClient, directory, defaults, runtime);
+    const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime);
     managers.push(manager);
     await manager.init();
     return manager;
   };
-  return { directory, runtime, start, async close() {
+  return { directory, runtime, state, start, async close() {
     for (const manager of managers) await manager.close();
     await rm(directory, { recursive: true, force: true });
   } };
@@ -125,11 +125,10 @@ test('a successful App Server retry clears the history warning', async () => {
     await first.waitForIdle(session.id);
     const complete = first.get(session.id);
     await first.close();
-    const path = join(f.directory, `${session.id}.json`);
-    const legacy = JSON.parse(await readFile(path, 'utf8')) as Session;
+    const legacy = (await f.state.listSessions()).find(value => value.id === session.id)!;
     legacy.turns[0].prompt = '';
     legacy.turns[0].items = [];
-    await writeFile(path, JSON.stringify(legacy));
+    await f.state.saveSession(legacy);
 
     const second = await f.start();
     await second.read(session.id);
@@ -138,7 +137,7 @@ test('a successful App Server retry clears the history warning', async () => {
     const restored = await second.read(session.id);
     assert.equal(restored.historyError, undefined);
     assert.equal(restored.turns[0].prompt, '1+1等于几');
-    const stored = JSON.parse(await readFile(path, 'utf8')) as Session;
+    const stored = (await f.state.listSessions()).find(value => value.id === session.id)!;
     assert.equal(stored.turns[0].prompt, '');
     await second.close();
 
@@ -156,19 +155,18 @@ test('a native history page does not append saved turns outside that page', asyn
     await first.startTurn(session.id, '1+1等于几');
     await first.waitForIdle(session.id);
     await first.close();
-    const path = join(f.directory, `${session.id}.json`);
-    const stored = JSON.parse(await readFile(path, 'utf8')) as Session;
+    const stored = (await f.state.listSessions()).find(value => value.id === session.id)!;
     const later: Turn = { ...stored.turns[0], id: 'later-turn', nativeTurnId: 'later-native', prompt: 'later prompt',
       startedAt: new Date(Date.parse(stored.turns[0].completedAt!) + 1000).toISOString(),
       completedAt: new Date(Date.parse(stored.turns[0].completedAt!) + 2000).toISOString() };
     stored.turns.push(later);
-    await writeFile(path, JSON.stringify(stored));
+    await f.state.saveSession(stored);
     f.runtime.history = async () => ({ turns: [{ ...stored.turns[0], id: 'native-turn' }] });
     const second = await f.start();
     const page = await second.read(session.id);
     assert.equal(page.turns.length, 1);
     assert.equal(page.turns[0].id, 'native-turn');
-    assert.equal((JSON.parse(await readFile(path, 'utf8')) as Session).turns.length, 2);
+    assert.equal((await f.state.listSessions()).find(value => value.id === session.id)!.turns.length, 2);
   } finally { await f.close(); }
 });
 
@@ -180,99 +178,16 @@ test('an archived Sandbox reports that history cannot be loaded until restoratio
     await first.startTurn(session.id, '1+1等于几');
     await first.waitForIdle(session.id);
     await first.close();
-    const path = join(f.directory, 'projects', `${session.projectId}.json`);
-    const project = JSON.parse(await readFile(path, 'utf8'));
+    const project = (await f.state.listProjects()).find(value => value.id === session.projectId)!;
     delete project.sandbox;
     project.status = 'archived';
     project.archivedAt = new Date().toISOString();
-    await writeFile(path, JSON.stringify(project));
+    await f.state.saveProject(project);
     f.runtime.history = async () => { assert.fail('must not try to wake an archived Sandbox'); };
 
     const second = await f.start();
     const snapshot = await second.read(session.id);
     assert.match(snapshot.historyError!, /Sandbox 尚未恢复/);
     assert.deepEqual(snapshot.turns, []);
-  } finally { await f.close(); }
-});
-
-test('recovery detects a deleted container despite stale ready metadata and refuses an empty replacement without backup', async () => {
-  const f = await fixture();
-  try {
-    const manager = await f.start();
-    const session = await manager.create();
-    await manager.startTurn(session.id, '1+1等于几');
-    await manager.waitForIdle(session.id);
-    f.runtime.inspect = async target => {
-      await manager['updateSandbox'](session.projectId, session.id, { ...target.sandbox!, status: 'unavailable' });
-      throw Object.assign(new Error('no such object: test-sandbox'), { code: 'not_accessible' });
-    };
-    f.runtime.createArchive = async () => { assert.fail('cannot back up a missing container'); };
-    f.runtime.delete = async () => { assert.fail('must preserve the old reference without a backup'); };
-    f.runtime.detachSandbox = async () => { assert.fail('must not detach without a backup'); };
-    await assert.rejects(manager.archiveProjectNow(session.projectId!), /未找到可恢复的最新备份/);
-    const project = manager.getProject(session.projectId!);
-    assert.equal(project.status, 'active');
-    assert.equal(project.sandbox?.id, 'test-sandbox');
-    assert.equal(project.sandbox?.status, 'unavailable');
-    assert.deepEqual(manager.get(session.id).turns[0].items, [answer]);
-  } finally { await f.close(); }
-});
-
-test('recovery validates latest backup, preserves old binding until verified, and retries without archiving', async () => {
-  const f = await fixture();
-  try {
-    const manager = await f.start();
-    const session = await manager.create();
-    await manager.startTurn(session.id, '1+1等于几');
-    await manager.waitForIdle(session.id);
-    const sandbox = manager.getProject(session.projectId!).sandbox!;
-    await manager['updateSandbox'](session.projectId, session.id, { ...sandbox, status: 'unavailable' });
-    const archivePath = join(f.directory, 'backup.tar.gz');
-    await manager['projects'].saveArchiveKey(session.projectId!, 'archive-stream');
-    const reader = createArchiveReader();
-    manager['_archiveManager'] = {
-      validate: reader.validate.bind(reader),
-      restore: reader.restore.bind(reader),
-      async getLatest() { return reader.artifactFromFile({ storagePath: archivePath, sizeBytes: 6,
-        sha256: createHash('sha256').update('backup').digest('hex'), createdAt: new Date().toISOString() }); },
-      async retain() {},
-    } as unknown as ArchiveService;
-    await assert.rejects(manager.rebuildProjectSandbox(session.projectId!), /最新备份不存在/);
-    assert.equal(manager.getProject(session.projectId!).status, 'active');
-    // The runtime stub verifies restoration; this fixture only needs a nonempty backup file.
-    await writeFile(archivePath, 'backup');
-    let detached = false, restored = false, creates = 0;
-    f.runtime.detachSandbox = async target => { assert.equal(target.sandbox?.id, 'test-sandbox'); detached = true; };
-    f.runtime.fenceSandbox = async () => {};
-    f.runtime.deleteDanglingSandbox = async () => {};
-    f.runtime.verifySandbox = async () => {};
-    f.runtime.createReplacement = async (_target, save) => {
-      creates++;
-      assert.equal(detached, true);
-      const candidate = { ...sandbox, id: `replacement-${creates}` };
-      await save(candidate);
-      return candidate;
-    };
-    f.runtime.restoreReplacement = async (candidate, path) => {
-      assert.equal(candidate.id, `replacement-${creates}`);
-      assert.equal(path, archivePath);
-      assert.equal(manager.getProject(session.projectId!).status, 'active');
-      assert.equal(manager.getProject(session.projectId!).sandbox?.id, 'test-sandbox');
-      assert.equal(manager['projects'].isMaintaining(session.projectId!), true);
-      if (!restored) { restored = true; throw new Error('copy interrupted'); }
-      restored = true;
-    };
-    await assert.rejects(manager.rebuildProjectSandbox(session.projectId!), /copy interrupted/);
-    assert.equal(manager.getProject(session.projectId!).status, 'active');
-    assert.equal(manager.get(session.id).sandbox?.id, 'test-sandbox');
-    assert.equal(manager['projects'].isMaintaining(session.projectId!), false);
-    await manager.rebuildProjectSandbox(session.projectId!);
-    assert.equal(creates, 2);
-    assert.equal(restored, true);
-    assert.equal(manager.getProject(session.projectId!).status, 'active');
-    assert.equal(manager.getProject(session.projectId!).archivedAt, null);
-    assert.equal(manager.getProject(session.projectId!).lifecycleHistory?.length ?? 0, 0);
-    assert.equal(manager.getProject(session.projectId!).sandbox?.id, 'replacement-2');
-    assert.equal(manager.get(session.id).threadId, 'original-thread');
   } finally { await f.close(); }
 });

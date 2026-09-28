@@ -5,7 +5,7 @@ import { groupArchivedProjectsByWeek } from './project-groups.js';
 
 function project(id: string, archivedAt: Date): ProjectSummary {
   return {
-    id, name: id, requirementUrl: null, executionMode: 'sandbox', workingDirectory: '/home/user/workspace',
+    id, name: id, requirementUrl: null, executionMode: 'sandbox', workingDirectory: '/home/agent/workspace',
     archivedAt: archivedAt.toISOString(), createdAt: archivedAt.toISOString(), updatedAt: archivedAt.toISOString(),
     sessionCount: 0, activeSessionId: null,
   };

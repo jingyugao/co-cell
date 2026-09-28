@@ -20,7 +20,9 @@ services:
       start_period: 20s
 
   swarm-hive:
-    build: .
+    build:
+      context: .
+      dockerfile: deploy/web/Dockerfile
     depends_on:
       mysql:
         condition: service_healthy
@@ -37,35 +39,10 @@ services:
       MEEGLE_HOST: ${MEEGLE_HOST:-}
       USER: ${MEEGLE_AUTH_USER:-root}
       MYSQL_URL: mysql://${MYSQL_USER:-swarm_hive}:${MYSQL_PASSWORD:-change-me-before-production}@mysql:3306/${MYSQL_DATABASE:-swarm_hive}
-      DOCKER_SANDBOX_IMAGE: ${DOCKER_SANDBOX_IMAGE:-cellbox:latest}
-      DOCKER_SANDBOX_NETWORK: ${DOCKER_SANDBOX_NETWORK:-swarm-hive_default}
-      DOCKER_HOST: tcp://host.docker.internal:2375
-      SANDBOX_WORKSPACE: ${SANDBOX_WORKSPACE:-/home/user/workspace}
-      CELLBOX_CONFIG_PATH: ${CELLBOX_CONFIG_PATH:-sandbox.toml}
-      # A stable host directory mounted read-only as the Sandbox's current
-      # CLI credentials. Edit files below it to update existing Sandboxes.
-      SANDBOX_CREDENTIALS_HOST_DIR: ${SANDBOX_CREDENTIALS_HOST_DIR:-${PWD}/data/credentials/sandbox}
-      # Kept separate because it is an App Server capability secret, not a
-      # CLI credential made available to agents.
-      SANDBOX_APP_SERVER_TOKEN_HOST_PATH: ${SANDBOX_APP_SERVER_TOKEN_HOST_PATH:-${PWD}/data/credentials/sandbox-runtime/app-server-token}
-      # Docker commands issued by this container are evaluated by the host
-      # daemon, so this must be a host path rather than /app/data/AGENTS.md.
-      SANDBOX_SHARED_AGENTS_PATH: ${SANDBOX_SHARED_AGENTS_PATH:-${PWD}/data/AGENTS.md}
-      # Docker and the gVisor helper need host-visible sources for sandbox.toml.
-      SANDBOX_MOUNT_ROOT: ${SANDBOX_MOUNT_ROOT:-${PWD}}
-      SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
-      GVISOR_BUNDLE_ROOT: ${GVISOR_BUNDLE_ROOT:-/var/lib/swarm-hive/gvisor/bundles}
-      GVISOR_NETNS_ROOT: ${GVISOR_NETNS_ROOT:-/var/run/netns}
-      GVISOR_APP_SERVER_HOST: host.docker.internal
-      GVISOR_HELPER_URL: ${GVISOR_HELPER_URL:-http://host.docker.internal:8090}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data
-      # Docker sandbox mode intentionally has host-level Docker authority.
-      # It is for trusted local deployments only.
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${GVISOR_BUNDLE_ROOT:-/var/lib/swarm-hive/gvisor/bundles}:/var/lib/swarm-hive/gvisor/bundles
       - ${MEEGLE_HOME:-./data/meegle}:/root/.meegle
     ports:
       - "127.0.0.1:3001:3001"

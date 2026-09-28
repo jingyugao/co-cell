@@ -38,8 +38,7 @@ export function mergeSession(current: Session | null, incoming: Session): Sessio
     const previous = turns.get(key(turn));
     turns.set(key(turn), previous ? { ...previous, ...turn,
       prompt: turn.prompt || previous.prompt,
-      items: turn.items.length ? turn.items : previous.items,
-      userInputRequests: turn.userInputRequests ?? previous.userInputRequests } : turn);
+      items: turn.items.length ? turn.items : previous.items } : turn);
   }
   const merged: Session = { ...incoming, turns: [...turns.values()].sort((left, right) => left.startedAt.localeCompare(right.startedAt)),
     historyNextCursor: current.historyNextCursor !== undefined ? current.historyNextCursor : incoming.historyNextCursor };

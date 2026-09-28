@@ -1,5 +1,3 @@
-import { installImprovementRoutes } from './improvements/routes.js';
-import type { ImprovementStore } from './improvements/store.js';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
@@ -15,90 +13,23 @@ import { installConnectionsRoutes } from './connections/routes.js';
 import { installSharedFilesRoutes } from './shared-files/routes.js';
 import { installSandboxesRoutes } from './sandboxes/routes.js';
 import { installSessionsRoutes } from './sessions/routes.js';
-import { installApprovalMcpRoutes, type ApprovalMcpService } from './approvals/mcp.js';
 import { installNotificationRoutes } from './notifications/routes.js';
 import type { NotificationStore } from './notifications/store.js';
 import { installArchiveRoutes } from './routes/archives.js';
+import { installOperatorAccess, type OperatorAccessOptions } from './access/operator.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, improvements?: ImprovementStore, approvalMcp?: ApprovalMcpService, notifications?: NotificationStore) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions) {
   const app = new Hono();
-  installApprovalMcpRoutes(app, approvalMcp, manager);
-
-  // Sandbox service proxy via subdomain:
-  // {projectId}.{port}.{swarm-hive-host}/path → sandbox container:port/path
-  // Runs before the host-access check so remote users can reach sandbox services.
-  const hopByHopHeaders = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
-  // CellBox runs the Node-based cellbox-proxy on port 40000 for localhost-bound services.
-  const sandboxProxyPort = 40000;
-
-  async function sandboxFetch(sandboxName: string, port: number, path: string, req: Request, body?: ArrayBuffer): Promise<Response> {
-    const headers = new Headers(req.headers);
-    for (const h of hopByHopHeaders) headers.delete(h);
-    headers.delete('host');
-    const init: RequestInit = { method: req.method, headers, redirect: 'manual' };
-    if (!['GET', 'HEAD'].includes(req.method)) {
-      init.body = body;
-    }
-    return fetch(`http://${sandboxName}:${port}${path}`, init);
-  }
-
-  app.use('*', async (c, next) => {
-    const host = c.req.header('host') || '';
-    // Match subdomain pattern: <uuid>.digits.<anything>
-    const match = /^([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})\.(\d+)\.(.+)$/i.exec(host);
-    if (!match) return next();
-
-    const projectId = match[1];
-    const port = parseInt(match[2], 10);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) return next();
-
-    // Verify the project exists and has a running sandbox, get its container name
-    let sandboxHost: string;
-    try {
-      sandboxHost = await manager.sandboxProxyHost(projectId);
-    } catch (error) {
-      if (error instanceof HttpError) {
-        return new Response(error.message, { status: error.status as 400 });
-      }
-      return next();
-    }
-
-    const url = new URL(c.req.url);
-    const path = url.pathname + url.search;
-    // All CellBox service traffic goes through cellbox-proxy. Read the incoming
-    // body once before forwarding it.
-    const requestBody = ['GET', 'HEAD'].includes(c.req.method)
-      ? undefined
-      : await c.req.raw.clone().arrayBuffer();
-
-    let response: Response;
-    try {
-      // cellbox-proxy path format: /<targetPort>/<originalPath>
-      response = await sandboxFetch(sandboxHost, sandboxProxyPort, `/${port}${path}`, c.req.raw, requestBody);
-    } catch (error) {
-      const sysErr = error as { cause?: { code?: string } };
-      const code = (error as NodeJS.ErrnoException).code || sysErr.cause?.code;
-      if (code === 'ECONNREFUSED' || code === 'ECONNRESET') {
-        return new Response('沙箱服务未启动或端口不可达', { status: 504 });
-      }
-      return new Response(`沙箱代理失败: ${(error as Error).message}`, { status: 502 });
-    }
-
-    // Stream response — no base tag needed (subdomain provides isolated origin)
-    const outHeaders = new Headers(response.headers);
-    for (const h of hopByHopHeaders) outHeaders.delete(h);
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: outHeaders,
-    });
-  });
+  if (operatorAccess) installOperatorAccess(app, operatorAccess);
 
   app.use('/api/*', async (c, next) => {
     const host = c.req.header('host');
-    if (!host || !allowedHosts.includes(host)) return c.json({ error: '仅允许从本机访问' }, 403);
+    if (!operatorAccess && (!host || !allowedHosts.includes(host))) return c.json({ error: '仅允许从本机访问' }, 403);
     const origin = c.req.header('origin');
-    if (origin && !allowedHosts.some(hostname => origin === `http://${hostname}`)) {
+    const originAllowed = operatorAccess
+      ? origin === new URL(operatorAccess.publicUrl).origin
+      : allowedHosts.some(hostname => origin === `http://${hostname}`);
+    if (origin && !originAllowed) {
       return c.json({ error: '不允许跨站请求' }, 403);
     }
     c.header('Cache-Control', 'no-store');
@@ -115,7 +46,6 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   });
 
   app.get('/api/config', c => c.json(config));
-  installImprovementRoutes(app, improvements, manager);
   installProjectsRoutes(app, manager);
   installSessionsRoutes(app, manager, config);
   installNotificationRoutes(app, notifications);

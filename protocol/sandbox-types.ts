@@ -1,8 +1,8 @@
-/** Docker image identity captured when a Sandbox container is created. */
+/** Immutable OCI image identity captured by the selected sandbox backend. */
 export interface SandboxImageIdentity {
   /** Mutable reference requested by the service, for example `cellbox:latest`. */
   reference: string;
-  /** Immutable Docker image content ID (`sha256:...`). */
+  /** Docker content ID or an immutable registry reference (`repository@sha256:...`). */
   id: string;
   /** Registry content digests, when the image was pulled from a registry. */
   repoDigests: string[];

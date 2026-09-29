@@ -6,22 +6,17 @@ dist/
 .codex-web/
 data/
 docker/
-# Keep project documentation; captures and local verification files stay local.
+# Keep local notes, captures, and verification files out of Git.
 /tmp/*
 /deploy/local/
-!/tmp/docs/
-/tmp/docs/*
-!/tmp/docs/cellbox-k8s-runtime.md
-!/tmp/docs/cellbox-repository-boundary.md
-!/tmp/docs/cocell-repository-boundary.md
-!/tmp/docs/cocell-cellbox-contracts.md
-!/tmp/docs/co-cell-helm.md
 /scripts/e2b/preview-*.mjs
 /scripts/e2b/configure-local-disk.sh
 
 coverage/
 *.tsbuildinfo
 *.log
+__pycache__/
+*.py[cod]
 .docker-cache/
 .DS_Store
 /auth.json

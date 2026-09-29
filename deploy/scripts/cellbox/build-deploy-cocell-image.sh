@@ -2,8 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-if [[ $# -ne 1 ]]; then
-  echo "usage: COCELL_REGISTRY_ENDPOINT=http://HOST:PORT $0 CELLBOX_SOURCE_DIR" >&2
+if [[ $# -ne 0 ]]; then
+  echo "usage: COCELL_REGISTRY_ENDPOINT=http://HOST:PORT $0" >&2
   exit 2
 fi
 if [[ -n "${COCELL_DEBUG_READ_ONLY_HOST_PATH:-}" && -n "${COCELL_DEBUG_READ_WRITE_HOST_PATH:-}" ]]; then
@@ -39,7 +39,7 @@ config_secret="${COCELL_CELLBOX_CONFIG_SECRET:-cellbox-api-config}"
 api_deployment="${COCELL_CELLBOX_API_DEPLOYMENT:-cellbox-api}"
 profile_id="${COCELL_CELLBOX_PROFILE:-cocell-k8s-resumable}"
 
-for command in curl docker jq kubectl python3 skopeo; do
+for command in curl jq kubectl python3 skopeo; do
   command -v "$command" >/dev/null 2>&1 || { echo "required command not found: $command" >&2; exit 1; }
 done
 if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 3 --max-time 8 "${registry_endpoint}/v2/")" != 200 ]]; then
@@ -52,13 +52,6 @@ if ! kubectl --context "$kube_context" get crd resumablepods.recovery.gvisor.dev
   exit 1
 fi
 
-build_result="$("$repo_root/deploy/scripts/cellbox/build-cocell-image.sh" "$1")"
-prepared_tag="$(jq -er '.tag' <<< "$build_result")"
-image_key="$(jq -er '.key' <<< "$build_result")"
-if [[ ! "$image_key" =~ ^[a-f0-9]{64}$ || "$prepared_tag" != "cellbox-prepared:${image_key}" ]]; then
-  echo "Cellbox image builder returned an invalid image identity" >&2
-  exit 1
-fi
 manifest_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --head \
   -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
   "${registry_endpoint}/v2/${image_repository#${registry_host}/}/manifests/${image_tag}")"
@@ -66,20 +59,16 @@ case "$manifest_status" in
   200)
     remote_image="$(skopeo inspect --tls-verify=false "docker://${image}")"
     remote_key="$(jq -r '.Labels["cellbox.image-key"] // empty' <<< "$remote_image")"
-    if [[ "$remote_key" != "$image_key" ]]; then
-      echo "${image} already exists with different content; choose a new version" >&2
+    remote_version="$(jq -r '.Labels["cellbox.managed-image"] // empty' <<< "$remote_image")"
+    if [[ "$remote_version" != "1" || ! "$remote_key" =~ ^[a-f0-9]{64}$ ]]; then
+      echo "${image} is not a Cellbox prepared image" >&2
       exit 1
     fi
-    echo "Reusing ${image} (same Cellbox image key)"
     digest="$(jq -er '.Digest' <<< "$remote_image")"
     ;;
   404)
-    echo "Publishing ${prepared_tag} to ${image}"
-    image_archive="$(mktemp --suffix=.tar)"
-    trap 'rm -f "$image_archive"' EXIT
-    docker save --output "$image_archive" "$prepared_tag"
-    skopeo copy --dest-tls-verify=false "docker-archive:${image_archive}" "docker://${image}"
-    digest="$(skopeo inspect --tls-verify=false "docker://${image}" | jq -er '.Digest')"
+    echo "Prepared Cellbox sandbox image ${image} is missing; publish it before deploying" >&2
+    exit 1
     ;;
   *)
     echo "Cannot check ${image}: registry returned HTTP ${manifest_status}" >&2

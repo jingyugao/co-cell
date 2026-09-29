@@ -39,9 +39,8 @@ deploy-cellbox-controller:
 	python3 deploy/scripts/k8s/deploy-cellbox-controller.py "$$CELLBOX_SOURCE_DIR"
 
 deploy-cocell-sandbox:
-	@test -n "$${CELLBOX_SOURCE_DIR:-}" || { echo "Set CELLBOX_SOURCE_DIR to the Cellbox source directory" >&2; exit 2; }
 	@test -n "$${COCELL_REGISTRY_ENDPOINT:-}" || { echo "Set COCELL_REGISTRY_ENDPOINT to the local HTTP registry origin" >&2; exit 2; }
-	deploy/scripts/cellbox/build-deploy-cocell-image.sh "$$CELLBOX_SOURCE_DIR"
+	deploy/scripts/cellbox/build-deploy-cocell-image.sh
 
 deploy-debug-mount:
 	@test -n "$${CELLBOX_SOURCE_DIR:-}" || { echo "Set CELLBOX_SOURCE_DIR to the Cellbox source directory" >&2; exit 2; }

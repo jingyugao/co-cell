@@ -10,8 +10,6 @@ docker/
 /tmp/*
 /deploy/local/
 /deploy/mybox/
-/scripts/e2b/preview-*.mjs
-/scripts/e2b/configure-local-disk.sh
 
 coverage/
 *.tsbuildinfo
@@ -20,8 +18,4 @@ __pycache__/
 *.py[cod]
 .docker-cache/
 .DS_Store
-/auth.json
-/.git-credentials
-/.mylogin.cnf
-/.kube/
-/.ssh/
+todo

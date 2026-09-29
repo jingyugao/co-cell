@@ -31,6 +31,7 @@ export interface SandboxRuntime {
   subagents?(session: Session): Promise<SubagentConversation[]>;
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
+  resume?(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
   verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
   fenceSandbox?(sandbox: SandboxState): Promise<void>;
@@ -530,6 +531,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   async rebuild(target: WorkspaceTarget, onSandbox: SaveSandbox) {
     const entry = await this.acquire(target,true,onSandbox);
+    try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
+  }
+  async resume(target: WorkspaceTarget, onSandbox: SaveSandbox) {
+    if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
+    const entry = await this.acquire(target, false, onSandbox);
     try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
   }
 

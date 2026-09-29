@@ -66,6 +66,6 @@ PORT=3001 pnpm dev
 
 ## 当前 Sandbox 的暂停与恢复
 
-当前 gVisor 后端通过 checkpoint 保存运行状态并暂停实例，释放运行内存；再次使用时从 checkpoint 恢复。归档保存工作区与 `~/.codex`，恢复归档时使用新环境。镜像外临时安装的系统软件需要通过镜像或初始化流程重建，备份本身仍占磁盘。
+当前 Cellbox 的 ResumablePod 后端通过同节点 gVisor checkpoint 保存运行状态并暂停实例，释放运行内存；再次使用时从 checkpoint 恢复。归档保存工作区与 Codex 状态，恢复归档时使用新环境。镜像外临时安装的系统软件需要通过镜像或初始化流程重建，备份本身仍占磁盘。
 
-具体行为与限制见[Sandbox](sandbox-module.md)和[归档](archive-module.md)。
+当前 Cellbox 镜像、工具代理与运行限制见 [Cellbox 设计](cellbox-design.md)，数据恢复见[归档](archive-module.md)。

@@ -91,7 +91,7 @@ export type ProjectStatus = 'active' | 'completed' | 'archived';
 export interface ProjectSandboxOperation {
 	/** Persisted intention ID used for remote operation idempotency. */
 	id?: string;
-  kind: 'backup' | 'restore' | 'archive' | 'refresh';
+  kind: 'backup' | 'restore' | 'archive' | 'refresh' | 'resume';
   phase: string;
   status: 'running' | 'failed' | 'succeeded';
   error?: string;

@@ -9,8 +9,7 @@ docker/
 # Keep local notes, captures, and verification files out of Git.
 /tmp/*
 /deploy/local/
-/scripts/e2b/preview-*.mjs
-/scripts/e2b/configure-local-disk.sh
+/deploy/mybox/
 
 coverage/
 *.tsbuildinfo
@@ -19,8 +18,4 @@ __pycache__/
 *.py[cod]
 .docker-cache/
 .DS_Store
-/auth.json
-/.git-credentials
-/.mylogin.cnf
-/.kube/
-/.ssh/
+todo

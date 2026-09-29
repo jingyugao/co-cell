@@ -539,6 +539,11 @@ export class SessionManager {
     return this.getProject(id);
   }
 
+  async resumeProjectSandbox(id: string): Promise<ProjectSummary> {
+    await this.runProjectSandboxOperation(id, 'resume');
+    return this.getProject(id);
+  }
+
   async refreshProjectSandboxRuntime(id: string): Promise<ProjectSummary> {
     await this.runProjectSandboxOperation(id, 'refresh');
     return this.getProject(id);
@@ -549,7 +554,7 @@ export class SessionManager {
     return this.getProject(id);
   }
 
-  private async runProjectSandboxOperation(id: string, kind: 'backup' | 'restore' | 'archive' | 'refresh',
+  private async runProjectSandboxOperation(id: string, kind: 'backup' | 'restore' | 'archive' | 'refresh' | 'resume',
     options: { useExistingBackup?: boolean } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');

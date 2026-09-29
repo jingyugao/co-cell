@@ -7,7 +7,9 @@ import os
 import posixpath
 import sys
 
-profile_id, image, sample_path = sys.argv[1:]
+from proxy_tools import load_proxy_tools
+
+profile_id, image, sample_path, proxy_config, base_image = sys.argv[1:]
 secret = json.load(sys.stdin)
 config = json.loads(base64.b64decode(secret["data"]["config.json"]))
 profiles = [profile for profile in config["profiles"] if profile["id"] == profile_id]
@@ -16,10 +18,8 @@ if len(profiles) != 1:
 profile = profiles[0]
 with open(sample_path, encoding="utf-8") as stream:
     sample = json.load(stream)
-owned_ids = {"cocell_mysql", "cocell_kubectl"}
-desired = [tool for tool in sample["guest"]["tools"] if tool["id"] in owned_ids]
-if {tool["id"] for tool in desired} != owned_ids:
-    raise SystemExit("sample profile is missing an admitted CLI tool")
+proxy_tools, owned_ids = load_proxy_tools(proxy_config, base_image, required=bool(os.environ.get("COCELL_PROXY_TOOLS_CONFIG")))
+desired = [tool["profile"] for tool in proxy_tools]
 read_only_path = os.environ.get("COCELL_DEBUG_READ_ONLY_HOST_PATH", "")
 read_write_path = os.environ.get("COCELL_DEBUG_READ_WRITE_HOST_PATH", "")
 old_read_only_path = profile.get("debugReadOnlyHostPath", "")
@@ -44,9 +44,6 @@ if read_write_path:
 elif read_only_path:
     profile.pop("debugReadWriteHostPath", None)
     profile["debugReadOnlyHostPath"] = read_only_path
-if read_only_path or read_write_path or old_read_only_path or old_read_write_path:
-    for tool in desired:
-        tool.pop("credentialEnv", None)
 profile["guest"]["workspace"] = sample["guest"]["workspace"]
 tools = profile["guest"].setdefault("tools", [])
 updated = [tool for tool in tools if tool["id"] not in owned_ids] + desired

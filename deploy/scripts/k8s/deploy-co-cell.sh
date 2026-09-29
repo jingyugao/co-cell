@@ -61,6 +61,17 @@ else
   echo "Create deploy/local/co-cell.values.yaml from deploy/helm/co-cell/values-k3s.example.yaml before the first install." >&2
   exit 1
 fi
+preview_args=()
+if [[ -n "${COCELL_PREVIEW_SUBDOMAINS:-}" ]]; then
+  case "$COCELL_PREVIEW_SUBDOMAINS" in
+    0) preview_args=(--set ingress.previewSubdomains=false) ;;
+    1) preview_args=(--set ingress.previewSubdomains=true) ;;
+    *) echo "COCELL_PREVIEW_SUBDOMAINS must be 0 or 1" >&2; exit 2 ;;
+  esac
+fi
+if [[ -n "${COCELL_PREVIEW_TLS_SECRET_NAME:-}" ]]; then
+  preview_args+=(--set-string "ingress.previewTlsSecretName=${COCELL_PREVIEW_TLS_SECRET_NAME}")
+fi
 if [[ ! -d "$chart" ]]; then
   echo "Helm chart not found: $chart" >&2
   exit 1
@@ -80,6 +91,7 @@ helm upgrade "$release" "$chart" \
   --kube-context "$kube_context" \
   --namespace "$namespace" \
   "${values_args[@]}" \
+  "${preview_args[@]}" \
   --set-string "image.repository=${image_repository}" \
   --set-string "image.tag=${image_tag}" \
   --set-string image.digest= \

@@ -15,20 +15,6 @@
     "env": {},
     "tools": [
       {
-        "id": "cocell_mysql",
-        "executable": "/opt/cellbox/tools/cocell-cli",
-        "args": ["mysql"],
-        "inputPatterns": ["[\\s\\S]*"],
-        "credentialEnv": { "MYSQL_TEST_LOGIN_FILE": "cocell_mysql_login" }
-      },
-      {
-        "id": "cocell_kubectl",
-        "executable": "/opt/cellbox/tools/cocell-cli",
-        "args": ["kubectl"],
-        "inputPatterns": ["[\\s\\S]*"],
-        "credentialEnv": { "KUBECONFIG": "cocell_kubeconfig" }
-      },
-      {
         "id": "cocell_archive_backup",
         "executable": "/opt/cellbox/tools/cocell-archive-backup",
         "args": [

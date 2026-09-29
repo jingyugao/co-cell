@@ -35,5 +35,8 @@ export function useProjects() {
   const backupProject = useCallback((id: string) => runSandboxOperation(id, 'backup', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/backup`, { method: 'POST' }),
   ), [runSandboxOperation]);
-  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox, backupProject };
+  const resumeSandbox = useCallback((id: string) => runSandboxOperation(id, 'resume', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/resume`, { method: 'POST' }),
+  ), [runSandboxOperation]);
+  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox, backupProject, resumeSandbox };
 }

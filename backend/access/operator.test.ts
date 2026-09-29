@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import test from 'node:test';
 import { Hono } from 'hono';
 import { installOperatorAccess, isAuthenticatedDevRequest, type OperatorAccessOptions } from './operator.js';
@@ -25,6 +26,7 @@ function setup(overrides: Partial<OperatorAccessOptions> = {}) {
   const app = new Hono();
   installOperatorAccess(app, options);
   app.get('/', c => c.text('home'));
+  app.get('/page', c => c.html('<!doctype html><title>CoCell</title>'));
   app.get('/api/data', c => c.json({ ok: true }));
   app.post('/api/write', c => c.json({ ok: true }));
   return { app, calls, access };
@@ -46,6 +48,10 @@ test('protects UI and API, then issues a signed HttpOnly session', async () => {
   assert.equal(api.status, 401);
   assert.deepEqual(await api.json(), { error: 'Authentication required' });
   assert.equal((await app.request(`${origin}/auth/login`)).status, 200);
+  const loginPage = await app.request(`${origin}/auth/login`);
+  assert.equal(loginPage.headers.get('strict-transport-security'), 'max-age=86400');
+  assert.equal(loginPage.headers.get('x-frame-options'), 'DENY');
+  assert.match(loginPage.headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/);
   const signedIn = await login(app);
   assert.equal(signedIn.status, 303);
   assert.equal(signedIn.headers.get('location'), '/');
@@ -55,7 +61,13 @@ test('protects UI and API, then issues a signed HttpOnly session', async () => {
   assert.match(cookie, /Secure/);
   assert.doesNotMatch(cookie, /Max-Age|Expires=/);
   assert.doesNotMatch(cookie, new RegExp(token));
+  const signedExpiry = /^cocell_operator=v1\.(\d+)\./.exec(cookie)?.[1];
+  assert.ok(signedExpiry && Number(signedExpiry) > Date.now());
+  assert.ok(Number(signedExpiry) <= Date.now() + 12 * 60 * 60 * 1000);
   assert.equal((await app.request(`${origin}/api/data`, { headers: { cookie } })).status, 200);
+  const page = await app.request(`${origin}/page`, { headers: { cookie } });
+  assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'self'/);
+  assert.match(page.headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/);
   assert.equal((await app.request(`${origin}/api/data`, { headers: { authorization: `Bearer ${token}` } })).status, 200);
   assert.equal((await app.request(`${origin}/api/data`, { headers: {
     cookie, authorization: 'Bearer wrong',
@@ -72,6 +84,12 @@ test('rejects tampered cookies, login CSRF, and cookie write CSRF', async () => 
   const pair = cookie.split(';')[0];
   const tampered = pair.slice(0, -1) + (pair.endsWith('A') ? 'B' : 'A');
   assert.equal((await app.request(`${origin}/api/data`, { headers: { cookie: tampered } })).status, 401);
+  for (const expires of ['0', String(Date.now() - 1)]) {
+    const signature = createHmac('sha256', token).update(`cocell-operator-v1\0${expires}`).digest('base64url');
+    assert.equal((await app.request(`${origin}/api/data`, { headers: {
+      cookie: `cocell_operator=v1.${expires}.${signature}`,
+    } })).status, 401);
+  }
   assert.equal((await app.request(`${origin}/api/data`, { headers: { cookie: pair } })).status, 200);
   assert.equal((await app.request(`${origin}/api/write`, { method: 'POST', headers: { cookie: pair } })).status, 403);
   assert.equal((await app.request(`${origin}/api/write`, { method: 'POST',
@@ -80,7 +98,7 @@ test('rejects tampered cookies, login CSRF, and cookie write CSRF', async () => 
     headers: { authorization: `Bearer ${token}` } })).status, 200);
 });
 
-test('preserves pending Cellbox request through login and authorizes the owned box', async () => {
+test('preserves pending Cellbox request through login and requires a same-origin approval POST', async () => {
   const { app, calls } = setup();
   const pending = await app.request(`${origin}/api/cellbox/authorize?request_id=request-1`);
   assert.equal(pending.status, 303);
@@ -89,12 +107,26 @@ test('preserves pending Cellbox request through login and authorizes the owned b
   assert.equal(next, '/api/cellbox/authorize?request_id=request-1');
   const signedIn = await login(app, next);
   assert.equal(signedIn.headers.get('location'), next);
-  const approved = await app.request(`${origin}${next}`, { headers: {
+  const confirmation = await app.request(`${origin}${next}`, { headers: {
     cookie: signedIn.headers.get('set-cookie')!,
   } });
+  assert.equal(confirmation.status, 200);
+  assert.match(await confirmation.text(), /Approve Sandbox access\?/);
+  assert.deepEqual(calls, ['get:request-1']);
+  const body = new URLSearchParams({ request_id: 'request-1' }).toString();
+  const foreign = await app.request(`${origin}/api/cellbox/authorize`, { method: 'POST', headers: {
+    cookie: signedIn.headers.get('set-cookie')!, origin: 'https://evil.example',
+    'content-type': 'application/x-www-form-urlencoded',
+  }, body });
+  assert.equal(foreign.status, 403);
+  assert.deepEqual(calls, ['get:request-1']);
+  const approved = await app.request(`${origin}/api/cellbox/authorize`, { method: 'POST', headers: {
+    cookie: signedIn.headers.get('set-cookie')!, origin,
+    'content-type': 'application/x-www-form-urlencoded',
+  }, body });
   assert.equal(approved.status, 303);
   assert.equal(approved.headers.get('location'), 'https://gateway.example.test/access/callback?state=two');
-  assert.deepEqual(calls, ['get:request-1', 'approve:request-1:operator']);
+  assert.deepEqual(calls, ['get:request-1', 'get:request-1', 'approve:request-1:operator']);
 });
 
 test('denies foreign or archived boxes and unsafe callback URLs', async () => {
@@ -119,7 +151,10 @@ test('denies foreign or archived boxes and unsafe callback URLs', async () => {
       expiresAt: new Date(Date.now() + 60_000).toISOString(), approved: false, consumed: false }; },
     async approveAccessRequest() { return { redirectUrl: 'https://evil.example/access/callback' }; },
   } });
-  assert.equal((await redirected.app.request(path, { headers: { authorization: `Bearer ${token}` } })).status, 502);
+  assert.equal((await redirected.app.request(`${origin}/api/cellbox/authorize`, { method: 'POST',
+    headers: { authorization: `Bearer ${token}`, origin, 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ request_id: 'request-1' }).toString(),
+  })).status, 502);
 });
 
 test('configuration and return paths cannot weaken origin checks or add open redirects', async () => {

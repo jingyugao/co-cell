@@ -128,12 +128,17 @@
       "additionalProperties": false,
       "required": [
         "enabled",
+        "previewSubdomains",
         "className",
         "annotations",
-        "tlsSecretName"
+        "tlsSecretName",
+        "previewTlsSecretName"
       ],
       "properties": {
         "enabled": {
+          "type": "boolean"
+        },
+        "previewSubdomains": {
           "type": "boolean"
         },
         "className": {
@@ -146,6 +151,9 @@
           }
         },
         "tlsSecretName": {
+          "type": "string"
+        },
+        "previewTlsSecretName": {
           "type": "string"
         }
       }

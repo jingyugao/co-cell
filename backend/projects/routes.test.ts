@@ -111,3 +111,13 @@ test('rebuild endpoint returns the newly bound Sandbox for an archived project',
     assert.equal((await app.request(`/api/projects/project-to-rebuild/sandbox/${removed}`, { method: 'POST' })).status, 404);
   }
 });
+
+test('resume endpoint returns the resumed project', async () => {
+  const app = new Hono();
+  installProjectsRoutes(app, {
+    resumeProjectSandbox: async (id: string) => ({ id, sandbox: { id: 'same-sandbox', status: 'ready' } }) as never,
+  } as unknown as Parameters<typeof installProjectsRoutes>[1]);
+  const response = await app.request('/api/projects/project-to-resume/sandbox/resume', { method: 'POST' });
+  assert.equal(response.status, 202);
+  assert.deepEqual(await response.json(), { id: 'project-to-resume', sandbox: { id: 'same-sandbox', status: 'ready' } });
+});

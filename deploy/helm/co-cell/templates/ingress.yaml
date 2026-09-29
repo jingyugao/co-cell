@@ -21,6 +21,11 @@ spec:
     - hosts:
         - {{ $host | quote }}
       secretName: {{ .Values.ingress.tlsSecretName | quote }}
+    {{- if .Values.ingress.previewSubdomains }}
+    - hosts:
+        - {{ printf "*.%s" $host | quote }}
+      secretName: {{ default .Values.ingress.tlsSecretName .Values.ingress.previewTlsSecretName | quote }}
+    {{- end }}
   rules:
     - host: {{ $host | quote }}
       http:
@@ -32,4 +37,16 @@ spec:
                 name: {{ include "co-cell.fullname" . }}
                 port:
                   name: http
+    {{- if .Values.ingress.previewSubdomains }}
+    - host: {{ printf "*.%s" $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "co-cell.fullname" . }}
+                port:
+                  name: http
+    {{- end }}
 {{- end }}

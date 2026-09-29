@@ -19,7 +19,7 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
   return renderToStaticMarkup(<ProjectsPage
     projects={projects} config={config} loading={false} initialView={initialView}
     onRefresh={async () => projects} onCreate={async () => project()} onUpdate={async () => project()}
-    onRebuildSandbox={async () => project()} onBackup={async () => project()}
+    onRebuildSandbox={async () => project()} onBackup={async () => project()} onResumeSandbox={async () => project()}
     onOpenProject={() => {}} onMenu={() => {}} onBack={() => {}}
   />);
 }
@@ -27,6 +27,8 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
 test('normal sandbox exposes backup and archive, with only the latest backup', () => {
   const html = page([project({ sandbox: { id: 'current', status: 'ready', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);
   assert.match(html, /正常/);
+  assert.match(html, /aria-label="项目操作"/);
+  assert.match(html, /aria-label="Sandbox 操作"/);
   assert.match(html, /立即备份/);
   assert.doesNotMatch(html, /归档项目/);
   assert.match(html, /最新备份/);
@@ -50,6 +52,14 @@ test('abnormal and missing sandboxes use the recovery-or-first-create paths', ()
   assert.match(missing, /无 Sandbox/);
   assert.match(missing, /进入项目/);
   assert.doesNotMatch(missing, /恢复环境/);
+});
+
+test('paused sandbox shows its state and resumes the same environment', () => {
+  const html = page([project({ sandbox: { id: 'paused-box', status: 'paused', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);
+  assert.match(html, /已暂停/);
+  assert.match(html, /恢复运行/);
+  assert.match(html, /<button class="primary-button">进入项目/);
+  assert.doesNotMatch(html, /恢复环境|立即备份|>异常</);
 });
 
 test('archived project restores from its latest backup and running operations disable actions', () => {

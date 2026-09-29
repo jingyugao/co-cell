@@ -17,10 +17,15 @@ import { installNotificationRoutes } from './notifications/routes.js';
 import type { NotificationStore } from './notifications/store.js';
 import { installArchiveRoutes } from './routes/archives.js';
 import { installOperatorAccess, type OperatorAccessOptions } from './access/operator.js';
+import { proxyProjectService } from './projects/routes.js';
 
 export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions) {
   const app = new Hono();
-  if (operatorAccess) installOperatorAccess(app, operatorAccess);
+  if (operatorAccess) installOperatorAccess(app, {
+    ...operatorAccess,
+    serviceProxy: (projectId, port, path, request) =>
+      proxyProjectService(manager, projectId, port, path, request, '', true),
+  });
 
   app.use('/api/*', async (c, next) => {
     const host = c.req.header('host');
@@ -46,7 +51,8 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   });
 
   app.get('/api/config', c => c.json(config));
-  installProjectsRoutes(app, manager);
+  installProjectsRoutes(app, manager, operatorAccess?.previewSubdomains
+    ? { publicUrl: operatorAccess.publicUrl, token: operatorAccess.token } : undefined);
   installSessionsRoutes(app, manager, config);
   installNotificationRoutes(app, notifications);
   installArchiveRoutes(app, manager);

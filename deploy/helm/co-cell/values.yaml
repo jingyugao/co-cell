@@ -30,9 +30,11 @@ service:
 
 ingress:
   enabled: false
+  previewSubdomains: false
   className: ""
   annotations: {}
   tlsSecretName: ""
+  previewTlsSecretName: ""
 
 persistence:
   existingClaim: ""

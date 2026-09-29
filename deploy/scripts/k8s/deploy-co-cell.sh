@@ -69,6 +69,9 @@ if [[ -n "${COCELL_PREVIEW_SUBDOMAINS:-}" ]]; then
     *) echo "COCELL_PREVIEW_SUBDOMAINS must be 0 or 1" >&2; exit 2 ;;
   esac
 fi
+if [[ -n "${COCELL_PREVIEW_TLS_SECRET_NAME:-}" ]]; then
+  preview_args+=(--set-string "ingress.previewTlsSecretName=${COCELL_PREVIEW_TLS_SECRET_NAME}")
+fi
 if [[ ! -d "$chart" ]]; then
   echo "Helm chart not found: $chart" >&2
   exit 1

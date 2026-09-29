@@ -20,10 +20,12 @@ spec:
   tls:
     - hosts:
         - {{ $host | quote }}
-        {{- if .Values.ingress.previewSubdomains }}
-        - {{ printf "*.%s" $host | quote }}
-        {{- end }}
       secretName: {{ .Values.ingress.tlsSecretName | quote }}
+    {{- if .Values.ingress.previewSubdomains }}
+    - hosts:
+        - {{ printf "*.%s" $host | quote }}
+      secretName: {{ default .Values.ingress.tlsSecretName .Values.ingress.previewTlsSecretName | quote }}
+    {{- end }}
   rules:
     - host: {{ $host | quote }}
       http:

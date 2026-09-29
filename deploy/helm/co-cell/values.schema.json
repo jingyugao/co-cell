@@ -131,7 +131,8 @@
         "previewSubdomains",
         "className",
         "annotations",
-        "tlsSecretName"
+        "tlsSecretName",
+        "previewTlsSecretName"
       ],
       "properties": {
         "enabled": {
@@ -150,6 +151,9 @@
           }
         },
         "tlsSecretName": {
+          "type": "string"
+        },
+        "previewTlsSecretName": {
           "type": "string"
         }
       }

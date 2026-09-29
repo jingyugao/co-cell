@@ -67,6 +67,8 @@ spec:
               value: {{ .Values.cellbox.profile | quote }}
             - name: COCELL_PUBLIC_URL
               value: {{ .Values.publicUrl | quote }}
+            - name: COCELL_PREVIEW_SUBDOMAINS
+              value: {{ ternary "1" "0" .Values.ingress.previewSubdomains | quote }}
             - name: CODEX_WEB_DATA_DIR
               value: /app/data/web-state
             - name: CODEX_WEB_IMAGES_DIR

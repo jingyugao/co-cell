@@ -96,10 +96,11 @@ const config: AppConfig = { sandbox: { provider:'cellbox',kind:'k8s-resumable',e
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };
 const publicUrl=process.env.COCELL_PUBLIC_URL||`http://127.0.0.1:${port}`;
+const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
-  inventory, undefined, connections, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,provider:cellboxProvider,projects:()=>manager.listProjects() });
+  inventory, undefined, connections, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,provider:cellboxProvider,projects:()=>manager.listProjects() });
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }

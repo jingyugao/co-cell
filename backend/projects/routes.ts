@@ -3,8 +3,32 @@ import { z } from 'zod';
 import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { workspaceDownload } from '../workspaces/download.js';
+import { serviceHost } from './service-host.js';
 
-export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFile' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>) {
+type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFile' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
+
+export async function proxyProjectService(manager: Pick<SessionManager, 'projectService'>, projectId: string, port: number,
+  path: string, request: Request, prefix: string, isolatedOrigin = false): Promise<Response> {
+  const response = await manager.projectService(projectId, port, path, request);
+  const headers = new Headers(response.headers);
+  const location = headers.get('location');
+  if (location) {
+    try {
+      const target = new URL(location, `http://localhost:${port}${path}`);
+      if (['localhost', '127.0.0.1', '0.0.0.0'].includes(target.hostname) && Number(target.port || 80) === port)
+        headers.set('location', `${prefix}${target.pathname}${target.search}${target.hash}`);
+    } catch { /* Keep the upstream location. */ }
+  }
+  headers.delete('set-cookie');
+  headers.set('Cache-Control', 'no-store');
+  if (!isolatedOrigin) headers.set('Content-Security-Policy', 'sandbox allow-scripts allow-forms allow-popups');
+  headers.set('Referrer-Policy', 'no-referrer');
+  headers.set('X-Content-Type-Options', 'nosniff');
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
+  previewHosts?: { publicUrl: string; token: string }) {
   app.post('/api/projects/:id/archive', async c => {
     const body = await c.req.text();
     let parsed: unknown;
@@ -37,7 +61,13 @@ export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, '
   app.get('/api/projects/:id/preview', async c => {
     const href = c.req.query('url');
     if (!href || href.length > 8192) throw new HttpError(400, '预览链接无效');
-    return c.redirect(await manager.preview(c.req.param('id'), href), 302);
+    const legacyPath = await manager.preview(c.req.param('id'), href);
+    if (!previewHosts) return c.redirect(legacyPath, 302);
+    const target = new URL(href);
+    const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+    const host = serviceHost(c.req.param('id'), port, previewHosts.publicUrl, previewHosts.token);
+    const base = new URL(previewHosts.publicUrl);
+    return c.redirect(`${base.protocol}//${host}${target.pathname}${target.search}${target.hash}`, 302);
   });
 
   const service = async (c: Context) => {
@@ -48,22 +78,7 @@ export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, '
     const prefix = `/api/projects/${encodeURIComponent(projectId)}/service/${port}`;
     const url = new URL(c.req.url);
     const path = (url.pathname.slice(prefix.length) || '/') + url.search;
-    const response = await manager.projectService(projectId, port, path, c.req.raw);
-    const headers = new Headers(response.headers);
-    const location = headers.get('location');
-    if (location) {
-      try {
-        const target = new URL(location, `http://localhost:${port}${path}`);
-        if (['localhost', '127.0.0.1', '0.0.0.0'].includes(target.hostname) && Number(target.port || 80) === port)
-          headers.set('location', `${prefix}${target.pathname}${target.search}${target.hash}`);
-      } catch { /* Keep the upstream location. */ }
-    }
-    headers.delete('set-cookie');
-    headers.set('Cache-Control', 'no-store');
-    headers.set('Content-Security-Policy', 'sandbox allow-scripts allow-forms allow-popups');
-    headers.set('Referrer-Policy', 'no-referrer');
-    headers.set('X-Content-Type-Options', 'nosniff');
-    return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+    return proxyProjectService(manager, projectId, port, path, c.req.raw, prefix);
   };
   app.all('/api/projects/:id/service/:port', service);
   app.all('/api/projects/:id/service/:port/*', service);

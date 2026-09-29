@@ -1,10 +1,12 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { setCookie } from 'hono/cookie';
+import { parseServiceHost } from '../projects/service-host.js';
 
 const COOKIE = 'cocell_operator';
+const PREVIEW_COOKIE = 'cocell_preview';
 const MAX_LOGIN_BYTES = 4096;
 const REQUEST_ID = /^[A-Za-z0-9_-]{1,200}$/;
 
@@ -20,6 +22,8 @@ interface AccessRequest {
 export interface OperatorAccessOptions {
   token: string;
   publicUrl: string;
+  previewSubdomains?: boolean;
+  serviceProxy?: (projectId: string, port: number, path: string, request: Request) => Promise<Response>;
   provider: {
     getAccessRequest(id: string): Promise<AccessRequest>;
     approveAccessRequest(id: string, subject: string): Promise<{ redirectUrl: string }>;
@@ -38,17 +42,17 @@ function fixedEqual(a: string, b: string): boolean {
   return timingSafeEqual(left, right);
 }
 
-function sessionSignature(token: string, expires: string): string {
-  return createHmac('sha256', token).update(`cocell-operator-v1\0${expires}`).digest('base64url');
+function sessionSignature(token: string, expires: string, scope = 'operator'): string {
+  return createHmac('sha256', token).update(`cocell-${scope}-v1\0${expires}`).digest('base64url');
 }
 
-function validSession(value: string | undefined, token: string): boolean {
+function validSession(value: string | undefined, token: string, scope = 'operator'): boolean {
   if (!value) return false;
   const parts = /^v1\.(\d{1,13})\.([A-Za-z0-9_-]{43})$/.exec(value);
   if (!parts) return false;
   const expires = Number(parts[1]);
   if (!Number.isSafeInteger(expires) || (expires !== 0 && expires <= Date.now())) return false;
-  return fixedEqual(parts[2], sessionSignature(token, parts[1]));
+  return fixedEqual(parts[2], sessionSignature(token, parts[1], scope));
 }
 
 type AuthHeaders = Headers | { authorization?: string | string[]; cookie?: string | string[] };
@@ -59,9 +63,9 @@ function header(headers: AuthHeaders, name: 'authorization' | 'cookie'): string 
   return typeof value === 'string' ? value : undefined;
 }
 
-function sessionCookie(raw: string | undefined): string | undefined {
-  const values = raw?.split(';').map(part => part.trim()).filter(part => part.startsWith(`${COOKIE}=`)) ?? [];
-  return values.length === 1 ? values[0].slice(COOKIE.length + 1) : undefined;
+function sessionCookie(raw: string | undefined, name = COOKIE): string | undefined {
+  const values = raw?.split(';').map(part => part.trim()).filter(part => part.startsWith(`${name}=`)) ?? [];
+  return values.length === 1 ? values[0].slice(name.length + 1) : undefined;
 }
 
 /** Shared by Hono and the Vite development request gate. */
@@ -72,6 +76,15 @@ export function isAuthenticatedOperatorRequest(headers: AuthHeaders, token: stri
     return fixedEqual(bearer, token);
   }
   return validSession(sessionCookie(header(headers, 'cookie')), token);
+}
+
+function isAuthenticatedPreviewRequest(headers: AuthHeaders, token: string): boolean {
+  const authorization = header(headers, 'authorization');
+  if (authorization !== undefined) {
+    const bearer = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+    return fixedEqual(bearer, token);
+  }
+  return validSession(sessionCookie(header(headers, 'cookie'), PREVIEW_COOKIE), token, 'preview');
 }
 
 /** Vite must only receive authenticated asset requests in Cellbox mode. */
@@ -100,6 +113,18 @@ function safeReturnPath(input: string | null, publicOrigin: string): string {
   return url.pathname;
 }
 
+function safeLoginTarget(input: string | null, publicOrigin: string, token: string, previewSubdomains: boolean): string {
+  if (!input || !previewSubdomains || input.startsWith('/')) return safeReturnPath(input, publicOrigin);
+  if (input.length > 16384 || /[\\\u0000-\u001f\u007f]/.test(input)) return '/';
+  try {
+    const url = new URL(input);
+    const root = new URL(publicOrigin);
+    if (url.protocol !== root.protocol || url.username || url.password || url.hash ||
+        !parseServiceHost(url.host, publicOrigin, token)) return '/';
+    return url.href;
+  } catch { return '/'; }
+}
+
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
 }
@@ -123,19 +148,46 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
       publicUrl.search || publicUrl.hash) {
     throw new Error('COCELL_PUBLIC_URL must be an HTTPS origin or loopback HTTP origin');
   }
+  if (options.previewSubdomains && (publicUrl.protocol !== 'https:' || !publicUrl.hostname.includes('.'))) {
+    throw new Error('Preview subdomains require an HTTPS public URL with a domain name');
+  }
   const origin = publicUrl.origin;
   const host = publicUrl.host.toLowerCase();
+  const setPreviewCookie = (c: Context) => {
+    const expires = '0';
+    setCookie(c, PREVIEW_COOKIE, `v1.${expires}.${sessionSignature(options.token, expires, 'preview')}`, {
+      path: '/', domain: publicUrl.hostname, httpOnly: true, sameSite: 'Lax', secure: publicUrl.protocol === 'https:',
+    });
+  };
+
+  if (options.previewSubdomains) app.use('*', bodyLimit({ maxSize: 12 * 1024 * 1024,
+    onError: c => c.text('Request too large', 413) }));
 
   app.use('*', async (c, next) => {
     const path = new URL(c.req.url).pathname;
     const requestHost = (c.req.header('host') ?? new URL(c.req.url).host).toLowerCase();
-    if (requestHost !== host) return c.text('Invalid host', 403);
+    if (requestHost !== host) {
+      const target = options.previewSubdomains && parseServiceHost(requestHost, options.publicUrl, options.token);
+      if (!target || !options.serviceProxy) return c.text('Invalid host', 403);
+      const serviceOrigin = `${publicUrl.protocol}//${requestHost}`;
+      if (!isAuthenticatedPreviewRequest(c.req.raw.headers, options.token)) {
+        const returnUrl = `${serviceOrigin}${path}${new URL(c.req.url).search}`;
+        return c.redirect(`${origin}/auth/preview?next=${encodeURIComponent(returnUrl)}`, 303);
+      }
+      const requestOrigin = c.req.header('origin');
+      if (requestOrigin && requestOrigin !== serviceOrigin) return c.text('Invalid origin', 403);
+      return options.serviceProxy(target.projectId, target.port, path + new URL(c.req.url).search, c.req.raw);
+    }
     if (path === '/auth/login' && ['GET', 'POST'].includes(c.req.method)) {
       return next();
     }
     const authorization = c.req.header('authorization');
     const authenticated = isAuthenticatedOperatorRequest(c.req.raw.headers, options.token);
     if (!authenticated) {
+      if (path === '/auth/preview' && options.previewSubdomains) {
+        const target = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, options.token, true);
+        return c.redirect(`/auth/login?next=${encodeURIComponent(target)}`, 303);
+      }
       if (path.startsWith('/api/') && path !== '/api/cellbox/authorize') {
         return c.json({ error: 'Authentication required' }, 401);
       }
@@ -152,7 +204,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
   app.use('/auth/login', bodyLimit({ maxSize: MAX_LOGIN_BYTES,
     onError: c => c.text('Request too large', 413) }));
   app.get('/auth/login', c => {
-    const nextPath = safeReturnPath(new URL(c.req.url).searchParams.get('next'), origin);
+    const nextPath = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, options.token, !!options.previewSubdomains);
     c.header('Cache-Control', 'no-store');
     c.header('Content-Security-Policy', "default-src 'none'; form-action 'self'; base-uri 'none'");
     c.header('X-Content-Type-Options', 'nosniff');
@@ -170,13 +222,21 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     if (submitted.length !== 1 || !fixedEqual(submitted[0], options.token)) {
       return c.text('Invalid access token', 401);
     }
-    const nextPath = safeReturnPath(form.get('next'), origin);
+    const nextPath = safeLoginTarget(form.get('next'), origin, options.token, !!options.previewSubdomains);
     const expires = '0';
     setCookie(c, COOKIE, `v1.${expires}.${sessionSignature(options.token, expires)}`, {
       path: '/', httpOnly: true, sameSite: 'Lax', secure: publicUrl.protocol === 'https:',
     });
+    if (options.previewSubdomains) setPreviewCookie(c);
     c.header('Cache-Control', 'no-store');
     return c.redirect(nextPath, 303);
+  });
+
+  if (options.previewSubdomains) app.get('/auth/preview', c => {
+    const target = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, options.token, true);
+    setPreviewCookie(c);
+    c.header('Cache-Control', 'no-store');
+    return c.redirect(target, 303);
   });
 
   app.get('/api/cellbox/authorize', async c => {

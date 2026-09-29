@@ -33,6 +33,31 @@ async function fixture(value: Project) {
   return { projects, async close() { await projects.close(); await state.close(); } };
 }
 
+test('resume reconnects a paused Sandbox without replacing its binding', async () => {
+  const id = 'e1e1e1e1-e1e1-4e1e-8e1e-e1e1e1e1e1e1';
+  const f = await fixture(project(id, { sandbox: sandbox('same-sandbox', 'paused') }));
+  const calls: string[] = [];
+  const sandboxRuntime: SandboxRuntime = {
+    ...runtime({}, calls),
+    async resume(value, save) {
+      calls.push(`resume:${value.sandbox?.id}`);
+      await save({ ...value.sandbox!, status: 'ready' });
+    },
+  };
+  const operations = new ProjectSandboxOperations({ projects: f.projects, runtime: sandboxRuntime,
+    threadIds: () => [], saveSandbox: async (projectId, value) => { await f.projects.updateSandbox(projectId, value, false); },
+    detached: async () => {} });
+  try {
+    await operations.run(id, 'resume');
+    assert.deepEqual(calls, ['inspect', 'resume:same-sandbox']);
+    assert.equal(f.projects.get(id).sandbox?.id, 'same-sandbox');
+    assert.equal(f.projects.get(id).sandbox?.status, 'ready');
+    assert.equal(f.projects.get(id).sandboxOperation?.status, 'succeeded');
+    await assert.rejects(operations.run(id, 'resume'), /Sandbox 未暂停/);
+    assert.equal(f.projects.get(id).sandbox?.id, 'same-sandbox');
+  } finally { await operations.close(); await f.close(); }
+});
+
 const remoteReference: RemoteArchiveRef = {
   id: 'arc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', createdAt: '2026-09-20T01:00:00.000Z',
   sizeBytes: 128, sha256: 'b'.repeat(64), imageId: `registry.example/cellbox@sha256:${'a'.repeat(64)}`,

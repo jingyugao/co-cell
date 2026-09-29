@@ -57,6 +57,7 @@ export class ProjectSandboxOperations {
       try {
         await this.deps.projects.updateSandboxOperation(id, { id: randomUUID(), kind, phase: '检查环境', status: 'running', updatedAt: new Date().toISOString() });
         if (kind === 'restore') await this.restore(id);
+        else if (kind === 'resume') await this.resume(id);
         else if (kind === 'backup') {
           if (project.status === 'archived') throw new HttpError(409, '已归档项目不能立即备份');
           await this.inspect(id);
@@ -135,6 +136,19 @@ export class ProjectSandboxOperations {
         });
       }
       return;
+  }
+
+  private async resume(id: string) {
+    const { projects, runtime } = this.deps;
+    const project = projects.get(id);
+    if (project.status === 'archived' || !project.sandbox) throw new HttpError(409, '项目没有可恢复运行的 Sandbox');
+    await this.inspect(id);
+    const current = projects.get(id);
+    if (current.sandbox?.status !== 'paused') throw new HttpError(409, 'Sandbox 未暂停，无需恢复运行');
+    if (!runtime.resume) throw new HttpError(503, 'Sandbox 不支持恢复运行');
+    await this.phase(id, '恢复运行');
+    await runtime.resume(target(current), sandbox => this.deps.saveSandbox(id, sandbox, false));
+    if (projects.get(id).sandbox?.status !== 'ready') throw new Error('Sandbox 恢复后未就绪');
   }
 
   private async rememberCleanup(id: string, sandbox: SandboxState) {

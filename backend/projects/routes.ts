@@ -4,7 +4,7 @@ import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { workspaceDownload } from '../workspaces/download.js';
 
-export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFile' | 'rebuildProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>) {
+export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFile' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>) {
   app.post('/api/projects/:id/archive', async c => {
     const body = await c.req.text();
     let parsed: unknown;
@@ -15,6 +15,7 @@ export function installProjectsRoutes(app: Hono, manager: Pick<SessionManager, '
   });
   app.post('/api/projects/:id/backup', async c => c.json(await manager.backupProjectNow(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/rebuild', async c => c.json(await manager.rebuildProjectSandbox(c.req.param('id')), 202));
+  app.post('/api/projects/:id/sandbox/resume', async c => c.json(await manager.resumeProjectSandbox(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/refresh-runtime', async c => c.json(await manager.refreshProjectSandboxRuntime(c.req.param('id')), 202));
   app.get('/api/projects/:id/files', async c => {
     const path = c.req.query('path');

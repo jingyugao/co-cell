@@ -8,22 +8,20 @@ function fail(message) {
 
 const tool = process.argv[2];
 const policy = process.argv[3];
-const payload = process.argv[4];
 if (!/^[a-z][a-z0-9_-]{0,63}$/.test(tool ?? '') ||
-    !/^(?:-|[a-z][a-z0-9_-]{0,63})$/.test(policy ?? '') ||
-    typeof payload !== 'string' || process.argv.length !== 5) {
+    !/^(?:-|[a-z][a-z0-9_-]{0,63})$/.test(policy ?? '')) {
   fail('Invalid proxy tool configuration');
 }
-let args;
-try { args = JSON.parse(payload); } catch { fail('Invalid tool arguments'); }
-if (!Array.isArray(args) || args.length > 64 ||
-    args.some(arg => typeof arg !== 'string' || arg.includes('\0') || Buffer.byteLength(arg) > 8192)) {
+const args = process.argv.slice(4);
+if (args.length > 32 ||
+    args.some(arg => arg.includes('\0') || Buffer.byteLength(arg) > 8192) ||
+    args.reduce((bytes, arg) => bytes + Buffer.byteLength(arg), 0) > 8192) {
   fail('Invalid tool arguments');
 }
 
 const env = { ...process.env, PATH: '/usr/local/bin:/usr/bin:/bin' };
 if (policy !== '-') {
-  const checked = spawnSync(`/opt/cellbox/tools/${policy}`, [tool, payload], { env, stdio: 'inherit' });
+  const checked = spawnSync(`/opt/cellbox/tools/${policy}`, [tool, ...args], { env, stdio: 'inherit' });
   if (checked.error) fail(`Tool policy unavailable: ${checked.error.message}`);
   if (checked.status !== 0) process.exit(checked.status ?? 1);
 }

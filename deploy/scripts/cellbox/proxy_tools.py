@@ -34,6 +34,9 @@ def load_proxy_tools(config_path: str, base_image: str, *, required: bool = Fals
     for name, spec in sorted(configured_tools.items()):
         if not NAME.fullmatch(name) or not isinstance(spec, dict):
             raise ValueError(f"invalid proxy tool name: {name!r}")
+        unknown = set(spec) - {"id", "policy", "allow_unrestricted"}
+        if unknown:
+            raise ValueError(f"unknown proxy tool options for {name}: {', '.join(sorted(unknown))}")
         tool_id = spec.get("id")
         if not isinstance(tool_id, str) or not TOOL_ID.fullmatch(tool_id) or tool_id in ids:
             raise ValueError(f"invalid or duplicate proxy tool ID: {tool_id!r}")
@@ -51,14 +54,6 @@ def load_proxy_tools(config_path: str, base_image: str, *, required: bool = Fals
             if (policy_path.parent != policy_root or not policy_path.is_file()
                     or not NAME.fullmatch(policy_path.name)):
                 raise ValueError(f"invalid policy file for {name}")
-        patterns = spec.get("input_patterns", ['[\\s\\S]*'])
-        credential_env = spec.get("credential_env", {})
-        if (not isinstance(patterns, list) or len(patterns) != 1 or
-                not all(isinstance(pattern, str) for pattern in patterns)
-                or not isinstance(credential_env, dict)
-                or not all(isinstance(key, str) and isinstance(value, str)
-                           for key, value in credential_env.items())):
-            raise ValueError(f"invalid policy arguments for {name}")
         tools.append({
             "name": name,
             "policy_path": policy_path,
@@ -66,8 +61,7 @@ def load_proxy_tools(config_path: str, base_image: str, *, required: bool = Fals
                 "id": tool_id,
                 "executable": "/opt/cellbox/tools/cocell-proxy",
                 "args": [name, policy_path.name if policy_path else "-"],
-                "inputPatterns": patterns,
-                "credentialEnv": credential_env,
+                "passThroughArgs": True,
             },
         })
     if not managed:

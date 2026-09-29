@@ -44,9 +44,6 @@ if read_write_path:
 elif read_only_path:
     profile.pop("debugReadWriteHostPath", None)
     profile["debugReadOnlyHostPath"] = read_only_path
-if read_only_path or read_write_path or old_read_only_path or old_read_write_path:
-    for tool in desired:
-        tool.pop("credentialEnv", None)
 profile["guest"]["workspace"] = sample["guest"]["workspace"]
 tools = profile["guest"].setdefault("tools", [])
 updated = [tool for tool in tools if tool["id"] not in owned_ids] + desired

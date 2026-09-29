@@ -96,7 +96,8 @@ profile_patch="$(kubectl --context "$kube_context" --namespace "$namespace" get 
   COCELL_DEBUG_READ_ONLY_HOST_PATH="${COCELL_DEBUG_READ_ONLY_HOST_PATH:-}" \
   COCELL_DEBUG_READ_WRITE_HOST_PATH="${COCELL_DEBUG_READ_WRITE_HOST_PATH:-}" \
   COCELL_DEBUG_HOST_UID="${COCELL_DEBUG_HOST_UID:-}" COCELL_DEBUG_HOST_GID="${COCELL_DEBUG_HOST_GID:-}" \
-  python3 "$repo_root/deploy/scripts/cellbox/patch-cocell-profile.py" "$profile_id" "$immutable_image" "$repo_root/cellbox/cocell/profile.sample.json")"
+  python3 "$repo_root/deploy/scripts/cellbox/patch-cocell-profile.py" "$profile_id" "$immutable_image" "$repo_root/deploy/box-wrap/profile.sample.json" \
+    "${COCELL_PROXY_TOOLS_CONFIG:-$repo_root/deploy/mybox/sandbox.toml}" "${COCELL_USER_BASE_IMAGE:-node:22.18.0-bookworm-slim}")"
 if [[ "$profile_patch" == "[]" ]]; then
   echo "Cellbox profile ${profile_id} already uses ${immutable_image} and the admitted tools"
   exit 0

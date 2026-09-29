@@ -5,7 +5,7 @@ dist
 data
 tmp
 deploy/local
-cellbox/mybox
+deploy/mybox
 *.log
 .env
 .env.*

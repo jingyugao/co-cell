@@ -18,12 +18,6 @@ cellbox:
 
 publicUrl: https://co-cell.example.invalid
 
-# After importing dedicated MySQL and Kubernetes credentials into CoCell:
-# config:
-#   credentialSlots:
-#     __mysqlLogin: cocell_mysql_login
-#     __kubernetes_config.json: cocell_kubeconfig
-
 ingress:
   enabled: true
   className: traefik

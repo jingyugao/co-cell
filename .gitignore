@@ -9,6 +9,7 @@ docker/
 # Keep local notes, captures, and verification files out of Git.
 /tmp/*
 /deploy/local/
+/deploy/mybox/
 /scripts/e2b/preview-*.mjs
 /scripts/e2b/configure-local-disk.sh
 

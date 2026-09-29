@@ -20,7 +20,7 @@
 
 镜像之外临时安装的系统软件通过镜像或初始化流程重建。归档文件自身仍占磁盘，可结合版本保留策略控制占用。
 
-项目操作层通过 provider 的 `archive/restoreArchive` 接口执行数据备份与恢复；Docker 后端的具体实现位于 [DockerSandboxClient](../packages/docker-sandbox/src/client.ts)。gVisor 运行状态 checkpoint 的流程见 [Sandbox](sandbox-module.md)。
+项目操作层通过 provider 的 `archive/restoreArchive` 接口执行数据备份与恢复；Docker 后端的具体实现位于 [DockerSandboxClient](../packages/docker-sandbox/src/client.ts)。当前 Cellbox 的同节点 checkpoint 与跨镜像归档恢复见 [Cellbox 设计](cellbox-design.md)。
 
 ## 周期备份与版本
 

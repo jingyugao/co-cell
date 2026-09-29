@@ -126,8 +126,8 @@ PORT=3001 pnpm dev
 - [产品定位与目标体验](docs/product-vision.md)
 - [产品完善进展](docs/product-progress.md)
 - [开发运行与数据维护](docs/development-and-operations.md)
-- [项目](docs/projects.md) · [Sandbox](docs/sandbox-module.md) · [归档](docs/archive-module.md)
-- [长期记忆](docs/long-term-memory.md) · [工具挂载](docs/tool-mounts.md) · [RBAC](docs/rbac.md)
+- [项目](docs/projects.md) · [Cellbox 设计](docs/cellbox-design.md) · [归档](docs/archive-module.md)
+- [长期记忆](docs/long-term-memory.md) · [RBAC](docs/rbac.md)
 - [贡献指南](AGENTS.md)
 
 项目基于 TypeScript、Hono、React 和 Vite 构建，`packages/agentcore` 连接 Codex App Server，`packages/sandbox` 管理 Sandbox 生命周期。接口契约位于 `protocol/`，共享计算位于 `util/`。

@@ -121,6 +121,7 @@ test('preview subdomain routes a signed project and port and grants browser acce
   assert.equal(response.headers.get('location'), '/next');
   assert.equal(response.headers.get('set-cookie'), null);
   assert.equal(response.headers.get('content-security-policy'), null);
+  assert.equal(response.headers.get('x-frame-options'), null);
   assert.equal((await app.request(serviceUrl, { headers: { cookie: operatorCookie } })).status, 303);
   assert.equal((await app.request(serviceUrl, { headers: { cookie: previewCookie.split(';')[0], origin: 'https://evil.example' } })).status, 403);
   const tampered = new URL(serviceUrl);

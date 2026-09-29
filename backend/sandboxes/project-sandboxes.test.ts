@@ -12,7 +12,7 @@ import { ProjectSandboxes } from './project-sandboxes.js';
 import type { WorkspaceTarget } from './types.js';
 type TurnExecutionDependencies = Parameters<typeof runTurn>[3];
 const runtimePaths = { root: '/home/agent/workspace/.cocell', runtime: '/home/agent/workspace/.cocell/runtime',
-  codexHome: '/home/agent/workspace/.cocell/codex', node: 'node' };
+  codexHome: '/home/agent/workspace/.cocell/codex', node: '/usr/local/bin/node' };
 
 function fixture() {
   const counts = { create: 0, connect: 0, kill: 0, renew: 0 };
@@ -79,7 +79,8 @@ test('workspace file reads use a protected lease without requiring Codex or a mo
   sandbox.commands.run = (async () => {
     startRead();
     await finished;
-    return { exitCode: 0, stderr: '', stdout: JSON.stringify({ path: '/home/agent/workspace/result.txt', size: 2, data: Buffer.from('ok').toString('base64') }) };
+    return { exitCode: 0, stderr: '', stdout: JSON.stringify({ path: '/home/agent/workspace/result.txt', size: 2,
+      version: 'test-version', data: Buffer.from('ok').toString('base64') }) };
   }) as unknown as typeof sandbox.commands.run;
   const runtime = new ContainerCodexRuntime({ paths: runtimePaths, prepareRemote: async () => false, provider: fixture().provider, apiKey: '', sandboxes: projects });
   try {

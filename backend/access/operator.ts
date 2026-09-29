@@ -113,14 +113,15 @@ function safeReturnPath(input: string | null, publicOrigin: string): string {
   return url.pathname;
 }
 
-function safeLoginTarget(input: string | null, publicOrigin: string, token: string, previewSubdomains: boolean): string {
-  if (!input || !previewSubdomains || input.startsWith('/')) return safeReturnPath(input, publicOrigin);
+function safeLoginTarget(input: string | null, publicOrigin: string,
+  resolvePreviewHost?: (host: string) => unknown): string {
+  if (!input || !resolvePreviewHost || input.startsWith('/')) return safeReturnPath(input, publicOrigin);
   if (input.length > 16384 || /[\\\u0000-\u001f\u007f]/.test(input)) return '/';
   try {
     const url = new URL(input);
     const root = new URL(publicOrigin);
     if (url.protocol !== root.protocol || url.username || url.password || url.hash ||
-        !parseServiceHost(url.host, publicOrigin, token)) return '/';
+        !resolvePreviewHost(url.host)) return '/';
     return url.href;
   } catch { return '/'; }
 }
@@ -153,6 +154,10 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
   }
   const origin = publicUrl.origin;
   const host = publicUrl.host.toLowerCase();
+  const resolvePreviewHost = options.previewSubdomains
+    ? (requestHost: string) => parseServiceHost(requestHost, options.publicUrl, options.token,
+      options.projects().map(project => project.id))
+    : undefined;
   const setPreviewCookie = (c: Context) => {
     const expires = '0';
     setCookie(c, PREVIEW_COOKIE, `v1.${expires}.${sessionSignature(options.token, expires, 'preview')}`, {
@@ -167,7 +172,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     const path = new URL(c.req.url).pathname;
     const requestHost = (c.req.header('host') ?? new URL(c.req.url).host).toLowerCase();
     if (requestHost !== host) {
-      const target = options.previewSubdomains && parseServiceHost(requestHost, options.publicUrl, options.token);
+      const target = resolvePreviewHost?.(requestHost);
       if (!target || !options.serviceProxy) return c.text('Invalid host', 403);
       const serviceOrigin = `${publicUrl.protocol}//${requestHost}`;
       if (!isAuthenticatedPreviewRequest(c.req.raw.headers, options.token)) {
@@ -185,7 +190,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     const authenticated = isAuthenticatedOperatorRequest(c.req.raw.headers, options.token);
     if (!authenticated) {
       if (path === '/auth/preview' && options.previewSubdomains) {
-        const target = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, options.token, true);
+        const target = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, resolvePreviewHost);
         return c.redirect(`/auth/login?next=${encodeURIComponent(target)}`, 303);
       }
       if (path.startsWith('/api/') && path !== '/api/cellbox/authorize') {
@@ -204,7 +209,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
   app.use('/auth/login', bodyLimit({ maxSize: MAX_LOGIN_BYTES,
     onError: c => c.text('Request too large', 413) }));
   app.get('/auth/login', c => {
-    const nextPath = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, options.token, !!options.previewSubdomains);
+    const nextPath = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, resolvePreviewHost);
     c.header('Cache-Control', 'no-store');
     c.header('Content-Security-Policy', "default-src 'none'; form-action 'self'; base-uri 'none'");
     c.header('X-Content-Type-Options', 'nosniff');
@@ -222,7 +227,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     if (submitted.length !== 1 || !fixedEqual(submitted[0], options.token)) {
       return c.text('Invalid access token', 401);
     }
-    const nextPath = safeLoginTarget(form.get('next'), origin, options.token, !!options.previewSubdomains);
+    const nextPath = safeLoginTarget(form.get('next'), origin, resolvePreviewHost);
     const expires = '0';
     setCookie(c, COOKIE, `v1.${expires}.${sessionSignature(options.token, expires)}`, {
       path: '/', httpOnly: true, sameSite: 'Lax', secure: publicUrl.protocol === 'https:',
@@ -233,7 +238,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
   });
 
   if (options.previewSubdomains) app.get('/auth/preview', c => {
-    const target = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, options.token, true);
+    const target = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, resolvePreviewHost);
     setPreviewCookie(c);
     c.header('Cache-Control', 'no-store');
     return c.redirect(target, 303);

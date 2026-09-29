@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import test from 'node:test';
 import type { AppConfig } from '../../protocol/types.js';
 import { createApp } from '../app.js';
@@ -83,13 +84,14 @@ test('preview subdomain routes a signed project and port and grants browser acce
       assert.equal(id, projectId);
       assert.equal(port, 8765);
       assert.equal(path, '/verify.txt?check=1');
-      assert.equal(request.headers.get('cookie')?.includes('cocell_preview'), true);
+      if (!request.headers.get('authorization')) assert.equal(request.headers.get('cookie')?.includes('cocell_preview'), true);
       return new Response('verified', { headers: { location: 'http://localhost:8765/next', 'set-cookie': 'app=unsafe' } });
     },
   };
   const app = createApp(manager as never, { sandbox: { enabled: true } } as AppConfig,
     ['cocell.example.test'], { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },
-    undefined, undefined, undefined, { token, publicUrl, previewSubdomains: true, projects: () => [],
+    undefined, undefined, undefined, { token, publicUrl, previewSubdomains: true,
+      projects: () => [{ id: projectId, executionMode: 'sandbox', sandbox: { id: 'box-1' }, status: 'active' }],
       provider: {
         async getAccessRequest() { throw new Error('unused'); },
         async approveAccessRequest() { throw new Error('unused'); },
@@ -99,7 +101,8 @@ test('preview subdomain routes a signed project and port and grants browser acce
     { headers: { authorization: `Bearer ${token}` } });
   assert.equal(link.status, 302);
   const serviceUrl = link.headers.get('location')!;
-  assert.match(serviceUrl, /^https:\/\/p[0-9a-f]{48}\.cocell\.example\.test\/verify\.txt\?check=1$/);
+  assert.match(serviceUrl, /^https:\/\/p[0-9a-z]{1,4}-[0-9a-f]{12}\.cocell\.example\.test\/verify\.txt\?check=1$/);
+  assert.ok(new URL(serviceUrl).hostname.split('.')[0].length <= 18);
   const bootstrap = await app.request(serviceUrl);
   assert.equal(bootstrap.status, 303);
   assert.match(bootstrap.headers.get('location') ?? '', /^https:\/\/cocell\.example\.test\/auth\/preview\?next=/);
@@ -122,8 +125,12 @@ test('preview subdomain routes a signed project and port and grants browser acce
   assert.equal((await app.request(serviceUrl, { headers: { cookie: previewCookie.split(';')[0], origin: 'https://evil.example' } })).status, 403);
   const tampered = new URL(serviceUrl);
   const label = tampered.hostname.split('.')[0];
-  tampered.hostname = `${label.slice(0, 33)}${label[33] === '0' ? '1' : '0'}${label.slice(34)}.cocell.example.test`;
+  tampered.hostname = `${label.slice(0, -1)}${label.endsWith('0') ? '1' : '0'}.cocell.example.test`;
   assert.equal((await app.request(tampered.href, {
     headers: { authorization: `Bearer ${token}` },
   })).status, 403);
+  const oldPayload = projectId.replaceAll('-', '') + (8765).toString(16).padStart(4, '0');
+  const oldSignature = createHmac('sha256', token).update(`cocell-service-host-v1\0${oldPayload}`).digest('hex').slice(0, 12);
+  const oldUrl = `https://p${oldPayload}${oldSignature}.cocell.example.test/verify.txt?check=1`;
+  assert.equal((await app.request(oldUrl, { headers: { authorization: `Bearer ${token}` } })).status, 200);
 });

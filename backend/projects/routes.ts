@@ -3,10 +3,10 @@ import type { Context, Hono } from 'hono';
 import { z } from 'zod';
 import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
-import { workspaceDownload } from '../workspaces/download.js';
+import { workspaceFileResponse } from '../workspaces/http-files.js';
 import { serviceHost } from './service-host.js';
 
-type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFile' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
+type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
 
 export async function proxyProjectService(manager: Pick<SessionManager, 'projectService'>, projectId: string, port: number,
   path: string, request: Request, prefix: string, isolatedOrigin = false): Promise<Response> {
@@ -49,22 +49,14 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
   app.post('/api/projects/:id/sandbox/resume', async c => c.json(await manager.resumeProjectSandbox(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/checkpoint', async c => c.json(await manager.checkpointProjectSandbox(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/refresh-runtime', async c => c.json(await manager.refreshProjectSandboxRuntime(c.req.param('id')), 202));
-  app.get('/api/projects/:id/files', async c => {
+  const content = async (c: Context) => {
     const path = c.req.query('path');
     if (!path) throw new HttpError(400, '缺少文件路径');
-    const { file, data } = await manager.projectFile(c.req.param('id'), path);
-    const head = c.req.method === 'HEAD';
-    if (c.req.query('download') === '1') return workspaceDownload({ file, data }, head);
-    c.header('Cache-Control', 'no-store');
-    c.header('X-Content-Type-Options', 'nosniff');
-    if (c.req.query('raw') !== '1') return c.json(file);
-    if (file.kind !== 'image') return workspaceDownload({ file, data }, head);
-    c.header('Content-Type', file.mimeType);
-    c.header('Content-Disposition', `inline; filename="download"; filename*=UTF-8''${encodeURIComponent(file.name).replace(/['()*]/g, value => `%${value.charCodeAt(0).toString(16).toUpperCase()}`)}`);
-    c.header('Content-Security-Policy', "default-src 'none'; sandbox");
-    c.header('Content-Length', String(data.length));
-    return head ? c.body(null) : c.body(new Uint8Array(data));
-  });
+    const response = await manager.projectFileResponse(c.req.param('id')!, path, c.req.raw);
+    return workspaceFileResponse(response, path, c.req.query('download') === '1');
+  };
+  app.get('/api/projects/:id/files/content', content);
+  app.get('/api/projects/:id/files', content);
 
   app.get('/api/projects/:id/preview', async c => {
     const href = c.req.query('url');

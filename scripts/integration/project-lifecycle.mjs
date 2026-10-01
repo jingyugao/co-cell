@@ -38,7 +38,7 @@ async function request(path, { method = 'GET', body, timeoutMs = 30_000, expecte
     body: body === undefined ? undefined : JSON.stringify(body), redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await response.text(); // Drain responses to release service/usage leases before checkpoint.
-  const data = response.headers.get('content-type')?.includes('application/json') ? JSON.parse(text) : text;
+  const data = method !== 'HEAD' && response.headers.get('content-type')?.includes('application/json') ? JSON.parse(text) : text;
   if (response.status !== expectedStatus) throw new Error(redact(`${method} ${path}: HTTP ${response.status}; ${JSON.stringify(data).slice(0, 800)}`));
   return { data, response };
 }
@@ -109,12 +109,13 @@ async function turn(prompt) {
 }
 async function textFile(name, expected) {
   const path = `${workingDirectory}/${folder}/${name}`;
-  const file = await json(`/api/projects/${projectId}/files?path=${encodeURIComponent(path)}`);
-  assert.equal(file.kind, 'text'); assert.equal(typeof file.text, 'string');
-  if (expected !== undefined) assert.equal(file.text.trim(), expected);
-  const { data: raw } = await request(`/api/projects/${projectId}/files?path=${encodeURIComponent(path)}&raw=1`);
-  assert.equal(raw, file.text, 'Raw file download differs from the file API');
-  return { path, sha256: createHash('sha256').update(file.text).digest('hex'), size: file.size, text: file.text };
+  const url = `/api/projects/${projectId}/files/content?path=${encodeURIComponent(path)}`;
+  const { data: text } = await request(url);
+  if (expected !== undefined) assert.equal(text.trim(), expected);
+  const { response: head } = await request(url, { method: 'HEAD' });
+  const size = Number(head.headers.get('content-length'));
+  assert.equal(size, Buffer.byteLength(text));
+  return { path, sha256: createHash('sha256').update(text).digest('hex'), size, text };
 }
 async function health(expectedContent) {
   const challenge = randomUUID();

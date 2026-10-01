@@ -18,6 +18,7 @@ export interface ImageVersion {
   error?: string;
   cleanup?: { id: string; status: 'pending' | 'unknown' | 'failed'; operationId?: string; error?: string };
   deletedAt?: string;
+  deprecatedAt?: string;
 }
 export interface ManagedImage {
   id: string;

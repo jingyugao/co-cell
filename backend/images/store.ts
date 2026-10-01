@@ -6,7 +6,12 @@ export interface ImageVersionRecord extends ImageVersion {
   request: Omit<CellboxImportImageInput, 'registryAuth'>;
   requiresRegistryAuth: boolean;
 }
-export interface ImageRecord extends Omit<ManagedImage, 'versions'> { versions: ImageVersionRecord[] }
+export interface ImageRecord extends Omit<ManagedImage, 'versions'> {
+  versions: ImageVersionRecord[];
+  deletedAt?: string;
+  /** Local lifecycle flags for versions discovered through Cellbox. */
+  versionLifecycle?: Record<string, { deprecatedAt?: string }>;
+}
 export interface ImageCatalogStore {
   listImages(): Promise<ImageRecord[]>;
   saveImage(image: ImageRecord): Promise<void>;

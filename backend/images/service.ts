@@ -7,7 +7,7 @@ import { prepareImageRequest } from './build-command.js';
 import { HttpError } from '../../util/errors.js';
 import { DockerRegistryClient, normalizeRepository, registryImageReference, type ImageRegistry } from './registry.js';
 
-const publicImage = (record: ImageRecord): ManagedImage => ({ ...record,
+const publicImage = ({ versionLifecycle: _lifecycle, deletedAt: _deletedAt, ...record }: ImageRecord): ManagedImage => ({ ...record,
   versions: record.versions.filter(version => !version.deletedAt).map(({ request: _request, requiresRegistryAuth, ...version }) => ({ ...version, registryAuthRequired: requiresRegistryAuth })) });
 const usageLabels: Record<string, string> = {
   'boxes-reference-image': 'Cellbox 中仍有环境或 Checkpoint 引用此镜像',
@@ -36,6 +36,7 @@ export class ImageCatalog {
   }
   private async refresh() {
     for (const stored of this.records.values()) {
+      if (stored.deletedAt) continue;
       const record = structuredClone(stored);
       let changed = false;
       for (const version of record.versions) {
@@ -77,7 +78,7 @@ export class ImageCatalog {
         }
       }
       if (!record.defaultVersionId) {
-        const ready = record.versions.find(version => !version.deletedAt && !version.cleanup && version.status === 'succeeded' && version.projectReady !== false);
+        const ready = record.versions.find(version => !version.deletedAt && !version.deprecatedAt && !version.cleanup && version.status === 'succeeded' && version.projectReady !== false);
         if (ready) { record.defaultVersionId = ready.id; changed = true; }
       }
       if (changed) await this.save(record);
@@ -95,6 +96,7 @@ export class ImageCatalog {
       group.versions.push({ id: image.id, version: source.includes('@') ? source.split('@')[1] : source.slice(repository.length + 1) || 'latest',
         source, status: 'succeeded', importedImageId: image.id, image: image.image, resolvedSource: image.resolvedSource,
         projectReady: image.command[0] === '/usr/local/bin/node' && image.command[1] === '/opt/product/cocell/launcher.mjs',
+        deprecatedAt: this.records.get(id)?.versionLifecycle?.[image.id]?.deprecatedAt,
         warnings: image.warnings, createdAt: image.createdAt });
       groups.set(id, group);
     }
@@ -106,7 +108,7 @@ export class ImageCatalog {
     const profile = profiles.find(profile => profile.id === this.profileId);
     const builtin: ManagedImage[] = profile ? [{ id: 'default', name: '系统默认镜像', category: '系统', origin: 'profile',
       versions: [{ id: 'default', version: '当前配置', source: profile.image, image: profile.image, status: 'succeeded', createdAt: '' }] }] : [];
-    return [...builtin, ...[...this.records.values()].map(publicImage), ...this.external(images)];
+    return [...builtin, ...[...this.records.values()].filter(image => image.origin === 'managed' && !image.deletedAt).map(publicImage), ...this.external(images)];
   }
   list(): Promise<ManagedImage[]> {
     return this.exclusive(() => this.readImages());
@@ -115,8 +117,8 @@ export class ImageCatalog {
     return this.exclusive(async () => {
       const repository = normalizeRepository(input.repository);
       if (!input.name.trim() || !input.category.trim()) throw new HttpError(400, '请输入仓库名称和类型');
-      if ([...this.records.values()].some(image => image.repository === repository)) throw new HttpError(409, '该镜像仓库已添加，请进入仓库同步版本');
-      if ([...this.records.values()].some(image => image.name === input.name.trim() && image.category === input.category.trim())) throw new HttpError(409, '同类型仓库名称已存在');
+      if ([...this.records.values()].some(image => image.origin === 'managed' && !image.deletedAt && image.repository === repository)) throw new HttpError(409, '该镜像仓库已添加，请进入仓库同步版本');
+      if ([...this.records.values()].some(image => image.origin === 'managed' && !image.deletedAt && image.name === input.name.trim() && image.category === input.category.trim())) throw new HttpError(409, '同类型仓库名称已存在');
       // Validate the complete build command before saving the repository.
       await prepareImageRequest(registryImageReference(repository, 'latest'), input.buildCommand);
       const record: ImageRecord = { id: randomUUID(), name: input.name.trim(), category: input.category.trim(), repository,
@@ -128,7 +130,7 @@ export class ImageCatalog {
   }
   private repository(id: string, auth?: RegistryAuth) {
     const image = this.records.get(id);
-    if (!image?.repository) throw new HttpError(404, '镜像仓库不存在，请先添加仓库');
+    if (!image?.repository || image.deletedAt || image.origin !== 'managed') throw new HttpError(404, '镜像仓库不存在，请先添加仓库');
     if (image.registryAuthRequired && !auth) throw new HttpError(400, '请提供私有仓库用户名和 Token，平台不保存这些凭证');
     return image;
   }
@@ -201,6 +203,7 @@ export class ImageCatalog {
     const image = (await this.readImages()).find(image => image.id === imageId);
     const version = image?.versions.find(version => version.id === versionId);
     if (!image || !version) throw new HttpError(404, '镜像或版本不存在');
+    if (version.deprecatedAt) throw new HttpError(409, '镜像版本已弃用，请选择生效中的版本');
     if (version.cleanup) throw new HttpError(409, '镜像版本正在清理或清理结果待确认');
     if (version.status !== 'succeeded') throw new HttpError(409, '请选择已导入成功的镜像版本');
     if (version.projectReady === false) throw new HttpError(409, '此版本尚未配置 CoCell 启动器，请添加源仓库并同步对应版本');
@@ -237,7 +240,7 @@ export class ImageCatalog {
       const image = (await this.readImages()).find(image => image.id === project.imageSelection!.imageId);
       if (!image) throw new HttpError(409, '项目镜像仓库已不可用，请先同步可用版本');
       const selected = versionId ?? image.defaultVersionId ?? image.versions
-        .filter(value => value.status === 'succeeded' && !value.cleanup && value.projectReady !== false)
+        .filter(value => value.status === 'succeeded' && !value.deprecatedAt && !value.cleanup && value.projectReady !== false)
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]?.id;
       if (!selected) throw new HttpError(409, '仓库没有可恢复的镜像版本，请先同步版本');
       return this.reserve(await this.resolveAvailable(image.id, selected));
@@ -247,15 +250,57 @@ export class ImageCatalog {
     return this.exclusive(async () => {
       await this.resolveAvailable(imageId, versionId);
       const stored = this.records.get(imageId);
-      if (!stored) throw new HttpError(400, '只有平台管理的仓库可以设置默认版本');
+      if (!stored || stored.origin !== 'managed') throw new HttpError(400, '只有平台管理的仓库可以设置默认版本');
       const record = structuredClone(stored); record.defaultVersionId = versionId;
       await this.save(record); return publicImage(record);
+    });
+  }
+  setDeprecated(imageId: string, versionId: string, deprecated: boolean): Promise<ManagedImage> {
+    return this.exclusive(async () => {
+      const image = (await this.readImages()).find(value => value.id === imageId);
+      const version = image?.versions.find(value => value.id === versionId);
+      if (!image || !version) throw new HttpError(404, '镜像或版本不存在');
+      if (image.origin === 'profile') throw new HttpError(400, '系统默认镜像由平台配置管理');
+      if (version.cleanup) throw new HttpError(409, '镜像版本正在清理或清理结果待确认');
+      const deprecatedAt = deprecated ? version.deprecatedAt ?? new Date().toISOString() : undefined;
+      if (image.origin === 'cellbox') {
+        const record = structuredClone(this.records.get(imageId) ?? { ...image, versions: [] });
+        record.versionLifecycle ??= {};
+        if (deprecatedAt) record.versionLifecycle[versionId] = { deprecatedAt };
+        else delete record.versionLifecycle[versionId];
+        await this.save(record);
+        return { ...image, versions: image.versions.map(value => value.id === versionId ? { ...value, deprecatedAt } : value) };
+      }
+      const record = structuredClone(this.records.get(imageId)!);
+      const target = record.versions.find(value => value.id === versionId)!;
+      if (deprecatedAt) target.deprecatedAt = deprecatedAt;
+      else delete target.deprecatedAt;
+      if (record.defaultVersionId === versionId && deprecated) delete record.defaultVersionId;
+      if (!record.defaultVersionId) record.defaultVersionId = record.versions.find(value =>
+        !value.deletedAt && !value.deprecatedAt && !value.cleanup && value.status === 'succeeded' && value.projectReady !== false)?.id;
+      await this.save(record);
+      return publicImage(record);
+    });
+  }
+  removeRepository(imageId: string): Promise<void> {
+    return this.exclusive(async () => {
+      await this.refresh();
+      const stored = this.records.get(imageId);
+      if (!stored || stored.origin !== 'managed') throw new HttpError(404, '镜像仓库不存在');
+      if (stored.deletedAt) return;
+      if (stored.versions.some(version => !version.deletedAt)) throw new HttpError(409, '请先清理仓库的所有版本');
+      if (this.projects().some(project => project.imageSelection?.imageId === imageId))
+        throw new HttpError(409, '仍有项目引用此镜像仓库');
+      const record = structuredClone(stored);
+      record.deletedAt = new Date().toISOString();
+      delete record.defaultVersionId;
+      await this.save(record);
     });
   }
   private cleanupVersion(imageId: string, versionId: string) {
     const record = this.records.get(imageId);
     const version = record?.versions.find(value => value.id === versionId && !value.deletedAt);
-    if (!record || !version) throw new HttpError(404, '镜像或版本不存在');
+    if (!record || record.deletedAt || !version) throw new HttpError(404, '镜像或版本不存在');
     return { record, version };
   }
   private blockers(record: ImageRecord, version: ImageVersionRecord) {

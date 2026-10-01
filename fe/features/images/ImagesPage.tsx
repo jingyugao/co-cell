@@ -13,6 +13,7 @@ export default function ImagesPage({ onMenu, onBack }: { onMenu: () => void; onB
   const [error, setError] = useState('');
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState('');
+  const [lifecycle, setLifecycle] = useState('active');
   const [adding, setAdding] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
@@ -44,14 +45,20 @@ export default function ImagesPage({ onMenu, onBack }: { onMenu: () => void; onB
     } finally { if (alive.current) setBusy(false); }
   }
   const categories = [...new Set(images.map(image => image.category))];
-  const visible = images.filter(image => (!category || category === image.category) &&
+  const matchesLifecycle = (version: ManagedImage['versions'][number]) =>
+    lifecycle === 'all' || (lifecycle === 'deprecated') === Boolean(version.deprecatedAt);
+  const visible = images.filter(image => image.versions.some(matchesLifecycle) ||
+    lifecycle !== 'deprecated' && image.versions.length === 0)
+    .map(image => ({ ...image, versions: image.versions.filter(matchesLifecycle) }))
+    .filter(image => (!category || category === image.category) &&
     `${image.name} ${image.category} ${image.repository ?? ''} ${image.versions.map(version => version.version).join(' ')}`.toLowerCase().includes(query.toLowerCase()));
   const selected = images.find(image => image.id === selectedId);
   return <main className="main-pane projects-page images-page">
     <header className="topbar"><button className="icon-button mobile-only" aria-label="打开导航" onClick={onMenu}>☰</button><div className="breadcrumbs"><span>系统管理</span><span className="slash">/</span><strong>镜像仓库</strong>{selected && <><span className="slash">/</span><strong>{selected.name}</strong></>}</div><button className="secondary-button" onClick={onBack}>返回对话</button></header>
     <div className="projects-scroll">
       {error && <p className="project-error" role="alert">{error}</p>}
-      {selected ? <RepositoryDetails key={selected.id} image={selected} busy={busy} onBack={() => setSelectedId(null)}
+      {selected ? <RepositoryDetails key={selected.id} image={selected} busy={busy} initialLifecycle={lifecycle} onBack={() => setSelectedId(null)}
+        onDeprecated={async (versionId, deprecated) => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/${encodeURIComponent(versionId)}`, { deprecated }, 'PATCH'); }}
         onDefault={async versionId => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/${encodeURIComponent(versionId)}/default`, {}); }}
         onDelete={async versionId => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/${encodeURIComponent(versionId)}`, undefined, 'DELETE'); }}
         onSync={async (input: SyncImageVersionInput) => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/sync`, input); }}
@@ -61,8 +68,8 @@ export default function ImagesPage({ onMenu, onBack }: { onMenu: () => void; onB
           const next = await mutate('/api/images/repositories', input);
           if (next) { setAdding(false); setSelectedId(next.id); }
         }} /></div>}
-        <div className="projects-toolbar"><div className="image-filters"><input aria-label="搜索镜像仓库" placeholder="搜索仓库、类型或版本…" value={query} onChange={event => setQuery(event.target.value)} /><select aria-label="筛选镜像类型" value={category} onChange={event => setCategory(event.target.value)}><option value="">全部类型</option>{categories.map(value => <option key={value}>{value}</option>)}</select></div><button className="secondary-button" disabled={busy} onClick={() => void reload()}>刷新</button></div>
-        {loading ? <p className="projects-empty">正在读取仓库…</p> : !visible.length ? <p className="projects-empty">{query || category ? '没有匹配的仓库。' : '尚无镜像仓库，添加第一个开发环境。'}</p> : <div className="image-library">{visible.map(image => <article className="image-card" key={image.id}>
+        <div className="projects-toolbar"><div className="image-filters"><input aria-label="搜索镜像仓库" placeholder="搜索仓库、类型或版本…" value={query} onChange={event => setQuery(event.target.value)} /><select aria-label="筛选镜像类型" value={category} onChange={event => setCategory(event.target.value)}><option value="">全部类型</option>{categories.map(value => <option key={value}>{value}</option>)}</select><select aria-label="筛选镜像生效状态" value={lifecycle} onChange={event => setLifecycle(event.target.value)}><option value="active">生效中</option><option value="deprecated">已弃用</option><option value="all">全部</option></select></div><button className="secondary-button" disabled={busy} onClick={() => void reload()}>刷新</button></div>
+        {loading ? <p className="projects-empty">正在读取仓库…</p> : !visible.length ? <p className="projects-empty">{query || category || images.length ? '当前筛选下没有匹配的仓库。' : '尚无镜像仓库，添加第一个开发环境。'}</p> : <div className="image-library">{visible.map(image => <article className="image-card" key={image.id}>
           <header><div><span className="project-type-badge">{image.category}</span><h2>{image.name}</h2><span className="image-count">{new Set(image.versions.filter(version => version.status === 'succeeded').map(version => version.version)).size} 个已同步版本{image.origin === 'profile' ? ' · 系统配置' : image.origin === 'cellbox' ? ' · Cellbox 已有镜像' : ''}</span></div><button className="secondary-button" disabled={busy || adding} onClick={() => setSelectedId(image.id)}>{image.origin === 'managed' ? '进入仓库' : '查看版本'}</button></header>
           {image.repository && <div className="image-reference"><span>仓库</span><code>{image.repository}</code></div>}
           {image.versions.some(version => ['queued', 'running', 'submitting'].includes(version.status)) && <p className="project-form-hint">版本同步中…</p>}

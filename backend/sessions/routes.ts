@@ -21,7 +21,7 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   };
   app.get('/api/sessions', async c => {
     c.header('Cache-Control', 'no-store');
-    return c.json(await manager.listWithSandboxStatus());
+    return c.json(manager.list());
   });
   app.post('/api/sessions', async c => {
     const input = z.object({

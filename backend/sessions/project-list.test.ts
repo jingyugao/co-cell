@@ -4,12 +4,65 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { Hono } from 'hono';
-import type { Project, Settings } from '../../protocol/types.js';
+import type { AppConfig, Project, Session, Settings } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import type { ProjectService } from '../projects/service.js';
 import { installProjectsRoutes } from '../projects/routes.js';
+import { installSessionsRoutes } from './routes.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 import { SessionManager, type CodexClient } from './manager.js';
+
+test('five projects use one fresh batch query; session lists do not query the runtime', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-batch-list-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const at = '2026-10-01T00:00:00.000Z';
+  for (let i = 0; i < 5; i++) {
+    const project: Project = { id: `project-${i}`, name: `Project ${i}`, executionMode: 'sandbox',
+      workingDirectory: defaults.workingDirectory, requirementUrl: null, status: 'active', archivedAt: null,
+      createdAt: at, updatedAt: at, sandbox: { id: `box-${i}`, template: 'base', status: 'ready', workingDirectory: defaults.workingDirectory } };
+    await state.saveProject(project);
+    await state.saveSession({ id: `session-${i}`, projectId: project.id, title: 'Session', threadId: null,
+      settings: defaults, status: 'idle', startedAt: at, createdAt: at, updatedAt: at, archivedAt: null, turns: [], sandbox: project.sandbox } satisfies Session);
+  }
+  let batches = 0, failure = false;
+  let status: 'ready' | 'paused' = 'ready';
+  const runtime = { async close() {}, async querySandbox() { assert.fail('list performed a per-box query'); },
+    async querySandboxes(sandboxes: NonNullable<Project['sandbox']>[]) {
+      batches++;
+      assert.equal(sandboxes.length, 5);
+      if (failure) throw new Error('batch unavailable');
+      return sandboxes.map(sandbox => ({ ...sandbox, status }));
+    } } as unknown as SandboxRuntime;
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime);
+  const app = new Hono();
+  installProjectsRoutes(app, manager);
+  installSessionsRoutes(app, manager, { defaults } as AppConfig);
+  try {
+    await manager.init();
+    batches = 0;
+    const storedBeforeReads = await state.listProjects();
+    const readProjects = async () => {
+      const response = await app.request('/api/projects');
+      assert.equal(response.status, 200);
+      return await response.json() as Project[];
+    };
+    assert.ok((await readProjects()).every(project => project.sandbox?.status === 'ready'));
+    assert.equal(batches, 1);
+    const sessions = await app.request('/api/sessions');
+    assert.equal(sessions.status, 200);
+    assert.equal((await sessions.json() as Session[]).length, 5);
+    assert.equal(batches, 1, 'session list adds no runtime reads');
+    status = 'paused';
+    assert.ok((await readProjects()).every(project => project.sandbox?.status === 'paused'));
+    assert.equal(batches, 2, 'refresh reads the source again without caching');
+    failure = true;
+    assert.ok((await readProjects()).every(project => project.sandbox?.status === 'unknown'));
+    assert.equal(batches, 3, 'failure does not fall back to per-box queries');
+    assert.deepEqual(await state.listProjects(), storedBeforeReads, 'reads do not persist observations');
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
 
 test('project list and detail query live sandbox state without mutating lifecycle state', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-project-list-'));
@@ -24,11 +77,14 @@ test('project list and detail query live sandbox state without mutating lifecycl
   let providerStatus: 'ready' | 'paused' | 'unavailable' = 'paused';
   let queryFailure = false;
   let queries = 0, inspections = 0, rebuilds = 0, resumes = 0, verifications = 0, preparations = 0;
-  const runtime = { async close() {}, async querySandbox(sandbox: NonNullable<Project['sandbox']>) {
+  const observe = async (sandbox: NonNullable<Project['sandbox']>) => {
     queries++;
     if (queryFailure) throw new Error('provider query failed');
     return { ...sandbox, status: providerStatus };
-  }, async inspect() { inspections++; }, async rebuild() { rebuilds++; }, async resume() { resumes++; },
+  };
+  const runtime = { async close() {}, querySandbox: observe,
+  async querySandboxes(sandboxes: NonNullable<Project['sandbox']>[]) { return Promise.all(sandboxes.map(observe)); },
+  async inspect() { inspections++; }, async rebuild() { rebuilds++; }, async resume() { resumes++; },
   async verifySandbox() { verifications++; }, async prepare() { preparations++; } } as unknown as SandboxRuntime;
   const defaults: Settings = { executionMode: 'sandbox', workingDirectory, model: 'test', modelReasoningEffort: 'low',
     sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };

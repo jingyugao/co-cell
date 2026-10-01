@@ -284,21 +284,6 @@ export class SessionManager {
         ? Math.max(session.turnCount ?? 0, turns.filter(turn => turn.codexAccepted).length) : turns.length }));
   }
 
-  async listWithSandboxStatus(): Promise<SessionSummary[]> {
-    const list = this.list();
-    const observations = new Map<string, Promise<NonNullable<Session['sandbox']>>>();
-    for (let offset = 0; offset < list.length; offset += 4) await Promise.all(list.slice(offset, offset + 4).map(async session => {
-      if (!session.sandbox) return;
-      let pending = observations.get(session.sandbox.id);
-      if (!pending) {
-        pending = querySandbox(this.sandbox, session.sandbox, true);
-        observations.set(session.sandbox.id, pending);
-      }
-      session.sandbox = { ...session.sandbox, ...await pending };
-    }));
-    return list;
-  }
-
   private async liveProject(project: Project, allowUnknown = false): Promise<Project> {
     if (project.sandbox) project.sandbox = await querySandbox(this.sandbox, project.sandbox, allowUnknown);
     return project;
@@ -545,9 +530,18 @@ export class SessionManager {
 
   async listProjectsWithArchives(): Promise<ProjectSummary[]> {
     const summaries = this.listProjects();
-    // Queries have no lifecycle side effects and are safe during turns and maintenance.
-    for (let offset = 0; offset < summaries.length; offset += 4) await Promise.all(summaries.slice(offset, offset + 4)
-      .map(project => this.liveProject(project, true)));
+    const sandboxes = summaries.flatMap(project => project.sandbox ? [project.sandbox] : []);
+    if (sandboxes.length) {
+      let observations: Map<string, NonNullable<Project['sandbox']>>;
+      try {
+        if (!this.sandbox?.querySandboxes) throw new Error('Sandbox batch query unavailable');
+        observations = new Map((await this.sandbox.querySandboxes(sandboxes)).map(sandbox => [sandbox.id, sandbox]));
+      } catch {
+        observations = new Map();
+      }
+      for (const project of summaries) if (project.sandbox)
+        project.sandbox = observations.get(project.sandbox.id) ?? { ...project.sandbox, status: 'unknown' };
+    }
     return summaries.map(project => ({ ...project, archiveVersions: project.remoteArchives?.map((archive, index, all) => ({
       id: archive.id, version: all.length - index, createdAt: archive.createdAt,
       sizeBytes: archive.sizeBytes, label: `版本 ${all.length - index}`,

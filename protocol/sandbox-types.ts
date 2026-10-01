@@ -17,7 +17,8 @@ export interface SandboxState {
   lastActiveAt?: string;
   pausedAt?: string;
   id: string;
-  /** Derived from Cellbox for each query. unknown means the query did not succeed. */
+  /** Project reads observe Cellbox; session lists only include reference metadata.
+   * unknown means no live observation is available. */
   status: 'starting' | 'ready' | 'paused' | 'unavailable' | 'unknown';
   template: string;
   /** Optional for backward compatibility with Sandbox records created before image tracking. */

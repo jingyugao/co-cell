@@ -33,6 +33,7 @@ test('project creation returns a durable pending operation; checkpoint/resume re
       await preparation;
     },
     async querySandbox(sandbox) { queryCalls++; return { ...sandbox, status: providerBox.status }; },
+    async querySandboxes(sandboxes) { queryCalls++; return sandboxes.map(sandbox => ({ ...sandbox, status: providerBox.status })); },
     async verifySandbox() { verifications++; if (failVerification) throw new Error('App Server unavailable'); },
     async inspect() { inspections++; },
     async checkpoint(target) { assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'paused' }; return { ...providerBox }; },

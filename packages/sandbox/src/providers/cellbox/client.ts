@@ -14,7 +14,7 @@ export interface CellboxProfile {
   cpu: number; memoryMiB: number;
 }
 export type CellboxPhase = 'creating' | 'running' | 'freezing' | 'frozen' | 'unfreezing'
-  | 'suspending' | 'suspended' | 'resuming' | 'restoring' | 'staged' | 'deleting' | 'deleted' | 'failed';
+  | 'checkpointing' | 'suspending' | 'suspended' | 'resuming' | 'restoring' | 'staged' | 'deleting' | 'deleted' | 'failed';
 export interface CellboxBox {
   id: string; ownerKey: string; profileId: string; phase: CellboxPhase; generation: number;
   resourceVersion: number; importedImageId?: string; image: string; imageId?: string; workspace: string;
@@ -188,6 +188,7 @@ export class CellboxClient {
   deleteImage(id: string, key: string) { return this.request<CellboxOperation>('DELETE', `/v1/images/${this.id(id)}`, { key }); }
   listProfiles(signal?: AbortSignal) { return this.request<CellboxProfile[]>('GET', '/v1/profiles', { signal }); }
   listBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes', { signal }); }
+  listCheckpoints(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/checkpoints', { signal }); }
   getBox(id: string, signal?: AbortSignal) { return this.request<CellboxBox>('GET', `/v1/boxes/${this.id(id)}`, { signal }); }
   createBox(input: { profileId: string; ownerKey: string; importedImageId?: string }, key: string) {
     return this.request<CellboxOperation>('POST', '/v1/boxes', { body: input, key });

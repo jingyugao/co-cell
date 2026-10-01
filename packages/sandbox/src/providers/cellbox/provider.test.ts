@@ -15,6 +15,9 @@ async function fixture() {
   const calls: Array<{ method: string; path: string; key?: string; body: unknown }> = [];
   const boxes = new Map<string, Record<string, unknown>>();
   const keys = new Map<string, string>();
+  let activeInventory: Record<string, unknown>[] = [];
+  let checkpointInventory: Record<string, unknown>[] = [];
+  let checkpointsUnavailable = false;
   let counter = 0;
   let fileContents: Buffer = Buffer.from('content');
   let profileProvider = 'resumable-k8s-pod';
@@ -37,6 +40,11 @@ async function fixture() {
     const body = raw && req.headers['content-type'] === 'application/json' ? JSON.parse(raw) : raw;
     const url = new URL(req.url!, 'http://localhost');
     calls.push({ method: req.method!, path: url.pathname + url.search, key: req.headers['idempotency-key'] as string | undefined, body });
+    if (url.pathname === '/v1/boxes' && req.method === 'GET') { json(res, 200, activeInventory); return; }
+    if (url.pathname === '/v1/checkpoints' && req.method === 'GET') {
+      if (checkpointsUnavailable) { json(res, 503, { error: { code: 'UNAVAILABLE', message: 'Temporarily unavailable' } }); return; }
+      json(res, 200, checkpointInventory); return;
+    }
     if (url.pathname === '/v1/profiles') { json(res, 200, [{ id: 'k8s', provider: profileProvider, runtime: 'k8s', behavior: 'resumable', kind: 'k8s-resumable', capabilities,
       image: 'prepared:1', workspace: '/workspace', agent: { uid: 11000, gid: 11000 }, cpu: 1, memoryMiB: 1024 }]); return; }
     if (url.pathname === '/v1/boxes' && req.method === 'POST') {
@@ -101,6 +109,10 @@ async function fixture() {
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const address = server.address(); assert(address && typeof address !== 'string');
   return { baseUrl: `http://127.0.0.1:${address.port}`, calls, boxes, keys,
+    setInventory(active: Record<string, unknown>[], checkpoints: Record<string, unknown>[]) {
+      activeInventory = active; checkpointInventory = checkpoints;
+    },
+    setCheckpointsUnavailable(value: boolean) { checkpointsUnavailable = value; },
     setProfileProvider(value: string) { profileProvider = value; },
     setFileContents(value: Buffer) { fileContents = value; },
     setPending(value: boolean) { pending = value; },
@@ -109,6 +121,27 @@ async function fixture() {
     setExecState(value: 'exited' | 'unknown') { execState = value; },
     close: () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) };
 }
+
+test('inventory combines active boxes and paused checkpoints, preferring the active record', async () => {
+  const http = await fixture();
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s' });
+    const box = (id: string, phase: string, image: string) => ({ id, ownerKey: 'owner', profileId: 'k8s', phase,
+      generation: 1, resourceVersion: 1, image, workspace: '/workspace', capabilities,
+      createdAt: '2026-10-01T00:00:00.000Z' });
+    http.setInventory([box('duplicate', 'running', 'active-image'), box('active-only', 'running', 'active-only-image')],
+      [box('duplicate', 'suspended', 'stale-image'), box('paused-only', 'suspended', 'paused-image')]);
+
+    const rows = await provider.listBoxes();
+    assert.deepEqual(rows.map(row => row.id), ['duplicate', 'active-only', 'paused-only']);
+    assert.equal(rows[0].phase, 'running');
+    assert.equal(rows[0].image, 'active-image');
+    assert.deepEqual(http.calls.map(call => call.path).sort(), ['/v1/boxes', '/v1/checkpoints']);
+
+    http.setCheckpointsUnavailable(true);
+    await assert.rejects(provider.listBoxes(), (error: unknown) => error instanceof CellboxError && error.status === 503);
+  } finally { await http.close(); }
+});
 
 test('auth, Kubernetes profile validation, and durable create key adoption', async () => {
   const http = await fixture();

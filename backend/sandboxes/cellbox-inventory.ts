@@ -5,7 +5,9 @@ import type { SandboxInventoryReader } from './inventory.js';
 export class CellboxSandboxInventory implements SandboxInventoryReader {
     constructor(private readonly provider: CellboxSandboxProvider) { }
     async read(sessions: SessionSummary[], projects: ProjectSummary[] = []): Promise<SandboxInventory> {
-        const rows = await this.provider.listBoxes();
+        const inventory = await this.provider.listInventory();
+        const rows = [...inventory.boxes.map(row => ({ ...row, inventorySource: 'kubernetes' as const })),
+            ...inventory.checkpoints.map(row => ({ ...row, inventorySource: 'oss' as const }))];
         const byId = new Map(projects.map(project => [project.id, project]));
         const byBox = new Map(projects.filter(project => project.sandbox).map(project => [project.sandbox!.id, project]));
         const associations = new Map<string, NonNullable<SandboxRecord['sessions']>>();
@@ -17,10 +19,10 @@ export class CellboxSandboxInventory implements SandboxInventoryReader {
             entries.push({ id: session.id, title: session.title, status: session.status });
             associations.set(id, entries);
         }
-        return { enabled: true, fetchedAt: new Date().toISOString(), sandboxes: rows.filter(row => row.phase !== 'deleted').map(row => {
+        return { enabled: true, fetchedAt: new Date().toISOString(), sandboxes: rows.map(row => {
                 const project = byBox.get(row.id), linked = associations.get(row.id) ?? [];
                 const paused = row.phase === 'suspended';
-                return { id: row.id, template: row.profileId,
+                return { id: row.id, template: row.profileId, phase: row.phase, inventorySource: row.inventorySource,
                     image: { reference: row.image, id: row.imageId ?? row.image, repoDigests: [] },
                     state: row.phase === 'running' ? 'running' : paused ? 'paused' : 'unknown',
                     cpuCount: 0, memoryMB: 0, startedAt: row.createdAt, endAt: '',

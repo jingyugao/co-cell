@@ -268,3 +268,71 @@ test('a rejected cleanup retry retains the failed operation for safe retry', asy
   assert.equal(listed.versions.find(version => version.id === old.id)?.cleanup?.status, 'failed');
   await assert.rejects(catalog.resolve(repo.id, old.id), /正在清理/);
 });
+
+
+test('deprecation persists, blocks new selections and moves restore default without changing pinned projects', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'Go', category: '开发', repository: 'team/go' });
+  const first = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(first.operationId!, first.source);
+  const pinned = (await catalog.resolve(repo.id, first.id))!;
+  const second = (await catalog.sync(repo.id, { tag: 'v2' })).versions[0]; f.finish(second.operationId!, second.source);
+  const project: Project = { id: 'p', name: 'Pinned', requirementUrl: null, executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', status: 'active', imageSelection: pinned, createdAt: '', updatedAt: '' };
+  f.projects.push(project);
+  const app = new Hono();
+  app.onError((error, c) => c.json({ error: error.message }, error instanceof HttpError ? error.status as 400 : error instanceof z.ZodError ? 400 : 500));
+  installImageRoutes(app, catalog);
+  const patch = (body: unknown) => app.request(`/api/images/${repo.id}/versions/${first.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  assert.equal((await patch({ deprecated: 'true' })).status, 400);
+  assert.equal((await patch({ deprecated: true })).status, 200);
+  assert.equal((await catalog.list()).find(value => value.id === repo.id)?.defaultVersionId, second.id);
+  assert.deepEqual(project.imageSelection, pinned);
+  assert.equal(f.deletions.length, 0, 'deprecation must not delete the runtime image');
+  const restarted = f.catalog(); await restarted.init();
+  await assert.rejects(restarted.acquireSelection(repo.id, first.id), /已弃用/);
+  await assert.rejects(restarted.setDefault(repo.id, first.id), /已弃用/);
+  await assert.rejects(restarted.acquireRestoreSelection(project, first.id), /已弃用/);
+  const restore = await restarted.acquireRestoreSelection(project);
+  assert.equal(restore.selection?.versionId, second.id); restore.release();
+  await restarted.setDeprecated(repo.id, second.id, true);
+  assert.equal((await restarted.list()).find(value => value.id === repo.id)?.defaultVersionId, undefined);
+  await assert.rejects(restarted.acquireRestoreSelection(project), /没有可恢复/);
+  await restarted.setDeprecated(repo.id, first.id, false);
+  assert.deepEqual(await restarted.resolve(repo.id, first.id), pinned);
+  assert.equal((await restarted.list()).find(value => value.id === repo.id)?.defaultVersionId, first.id);
+});
+
+test('Cellbox-discovered image lifecycle flags survive restart without duplicating inventory or enabling repository sync', async () => {
+  const f = fixture();
+  f.operations.set('external', { id: 'external', kind: 'image-import', targetId: 'external', status: 'running', version: 1, createdAt: '' });
+  f.finish('external', 'docker.io/team/node:v1');
+  const catalog = f.catalog(); await catalog.init();
+  const image = (await catalog.list()).find(value => value.origin === 'cellbox')!;
+  await catalog.setDeprecated(image.id, 'external', true);
+  const restarted = f.catalog(); await restarted.init();
+  const inventory = (await restarted.list()).filter(value => value.id === image.id);
+  assert.equal(inventory.length, 1); assert.ok(inventory[0].versions[0].deprecatedAt);
+  await assert.rejects(restarted.resolve(image.id, 'external'), /已弃用/);
+  await assert.rejects(restarted.sync(image.id, { tag: 'v2' }), /镜像仓库不存在/);
+  await assert.rejects(restarted.setDeprecated('default', 'default', true), /平台配置/);
+  await restarted.setDeprecated(image.id, 'external', false);
+  assert.equal((await restarted.resolve(image.id, 'external'))?.importedImageId, 'external');
+  const repo = await restarted.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
+  assert.equal(repo.origin, 'managed', 'lifecycle flags must not prevent adding the upstream repository');
+});
+
+
+test('repository cleanup requires all versions removed and remains hidden across restart', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'Demo', category: '开发', repository: 'team/demo' });
+  const version = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(version.operationId!, version.source);
+  await assert.rejects(catalog.removeRepository(repo.id), /所有版本/);
+  await catalog.setDeprecated(repo.id, version.id, true);
+  await catalog.removeVersion(repo.id, version.id);
+  const operation = f.operations.get(f.deletions[0])!; operation.status = 'succeeded'; f.images.delete(operation.targetId);
+  await catalog.removeRepository(repo.id);
+  await catalog.removeRepository(repo.id);
+  const restarted = f.catalog(); await restarted.init();
+  assert.equal((await restarted.list()).some(image => image.id === repo.id), false);
+  await assert.rejects(restarted.sync(repo.id, { tag: 'v2' }), /镜像仓库不存在/);
+  await restarted.addRepository({ name: 'Demo', category: '开发', repository: 'team/demo' });
+});

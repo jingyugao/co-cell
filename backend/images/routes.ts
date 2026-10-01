@@ -17,6 +17,10 @@ export function installImageRoutes(app: Hono, images?: ImageCatalog) {
     try { return c.json(await requireImages().list()); }
     catch (error) { if (error instanceof CellboxError) throw new HttpError(502, '无法读取 Cellbox 镜像，请稍后重试'); throw error; }
   });
+  app.delete('/api/images/:id', async c => {
+    await requireImages().removeRepository(c.req.param('id'));
+    return c.json({ ok: true });
+  });
   app.post('/api/images/repositories', async c => c.json(await requireImages().addRepository(repositorySchema.parse(await c.req.json())), 201));
   app.post('/api/images/:id/tags', async c => {
     const input = z.object({ registryAuth: auth.optional(), last: tag.optional() }).strict().parse(await c.req.json());
@@ -31,6 +35,10 @@ export function installImageRoutes(app: Hono, images?: ImageCatalog) {
     return c.json(await requireImages().retry(c.req.param('id'), c.req.param('versionId'), input.registryAuth), 202);
   });
   app.post('/api/images/:id/versions/:versionId/default', async c => c.json(await requireImages().setDefault(c.req.param('id'), c.req.param('versionId'))));
+  app.patch('/api/images/:id/versions/:versionId', async c => {
+    const input = z.object({ deprecated: z.boolean() }).strict().parse(await c.req.json());
+    return c.json(await requireImages().setDeprecated(c.req.param('id'), c.req.param('versionId'), input.deprecated));
+  });
   app.get('/api/images/:id/versions/:versionId/usage', async c => c.json(await requireImages().usage(c.req.param('id'), c.req.param('versionId'))));
   app.delete('/api/images/:id/versions/:versionId', async c => c.json(await requireImages().removeVersion(c.req.param('id'), c.req.param('versionId')), 202));
 }

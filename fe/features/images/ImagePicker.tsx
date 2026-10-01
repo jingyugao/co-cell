@@ -17,7 +17,7 @@ export default function ImagePicker({ disabled, onChange }: {
       .catch(err => { if (alive) setError(err instanceof Error ? err.message : '镜像读取失败'); });
     return () => { alive = false; };
   }, []);
-  const ready = (version: ManagedImage['versions'][number]) => version.status === 'succeeded' && !version.cleanup && version.projectReady !== false;
+  const ready = (version: ManagedImage['versions'][number]) => version.status === 'succeeded' && !version.deprecatedAt && !version.cleanup && version.projectReady !== false;
   const usable = images.filter(image => image.origin !== 'profile' && image.versions.some(ready));
   const categories = [...new Set(usable.map(image => image.category))];
   const selected = usable.find(image => image.id === imageId);

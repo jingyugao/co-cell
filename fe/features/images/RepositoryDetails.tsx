@@ -4,12 +4,13 @@ import { api } from '../../lib/api';
 
 const statusLabels: Record<ImageVersion['status'], string> = { submitting: '提交中', queued: '等待构建', running: '同步中', succeeded: '已同步', failed: '同步失败', unknown: '结果待确认' };
 
-export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry, onDefault, onDelete }: {
-  image: ManagedImage; busy: boolean; onBack: () => void;
+export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry, onDefault, onDelete, onDeprecated, initialLifecycle = 'active' }: {
+  initialLifecycle?: string; image: ManagedImage; busy: boolean; onBack: () => void;
   onSync: (input: SyncImageVersionInput) => Promise<void>;
   onRetry: (versionId: string, auth?: RegistryAuth) => Promise<void>;
   onDefault: (versionId: string) => Promise<void>;
   onDelete: (versionId: string) => Promise<void>;
+  onDeprecated: (versionId: string, deprecated: boolean) => Promise<void>;
 }) {
   const [tags, setTags] = useState<string[]>([]);
   const [next, setNext] = useState<string>();
@@ -21,6 +22,7 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [lifecycle, setLifecycle] = useState(initialLifecycle);
   const alive = useRef(true);
   const pending = useRef(false);
   const sequence = useRef(0);
@@ -67,6 +69,7 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry
       await onDelete(version.id);
     }, '清理请求已处理，请查看版本状态。');
   }
+  const visibleVersions = image.versions.filter(version => lifecycle === 'all' || (lifecycle === 'deprecated') === Boolean(version.deprecatedAt));
   const visibleTags = tags.filter(tag => tag.toLowerCase().includes(query.toLowerCase()));
   return <div className="repository-details">
     <div className="projects-heading"><div><span className="projects-eyebrow">REPOSITORY VERSIONS</span><h1>{image.name}</h1><p>{image.repository ?? '系统默认开发环境'}</p></div><button className="secondary-button" disabled={busy} onClick={onBack}>返回仓库列表</button></div>
@@ -91,10 +94,11 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry
     </>}
     {error && <p className="project-error" role="alert">{error}</p>}
     {notice && <p className="project-form-hint" role="status">{notice}</p>}
-    <section className="image-card"><header><h2>已同步版本</h2><span className="image-count">{image.versions.length} 条同步记录</span></header>
+    <section className="image-card"><header><h2>已同步版本</h2><select aria-label="筛选版本生效状态" value={lifecycle} onChange={event => setLifecycle(event.target.value)}><option value="active">生效中</option><option value="deprecated">已弃用</option><option value="all">全部</option></select><span className="image-count">{visibleVersions.length} 条同步记录</span></header>
       {!image.versions.length && <p className="project-form-hint">尚未同步版本。同步成功后可在创建项目时选择。</p>}
-      {image.versions.map(version => <section className="image-version" key={version.id}>
-        <div className="image-version-heading"><strong>{version.version}</strong>{image.defaultVersionId === version.id && <span className="project-type-badge">默认 · 归档恢复</span>}<span className={`image-status ${version.status}`}>{version.cleanup ? version.cleanup.status === 'failed' ? '清理失败' : version.cleanup.status === 'unknown' ? '清理结果待确认' : '清理中' : version.projectReady === false ? '需配置运行环境' : statusLabels[version.status]}</span>{version.createdAt && <time>{new Date(version.createdAt).toLocaleString('zh-CN', { hour12: false })}</time>}</div>
+      {image.versions.length > 0 && !visibleVersions.length && <p className="project-form-hint">当前状态下没有版本。</p>}
+      {visibleVersions.map(version => <section className="image-version" key={version.id}>
+        <div className="image-version-heading"><strong>{version.version}</strong>{version.deprecatedAt && <span className="project-type-badge">已弃用</span>}{image.defaultVersionId === version.id && <span className="project-type-badge">默认 · 归档恢复</span>}<span className={`image-status ${version.status}`}>{version.cleanup ? version.cleanup.status === 'failed' ? '清理失败' : version.cleanup.status === 'unknown' ? '清理结果待确认' : '清理中' : version.projectReady === false ? '需配置运行环境' : statusLabels[version.status]}</span>{version.createdAt && <time>{new Date(version.createdAt).toLocaleString('zh-CN', { hour12: false })}</time>}</div>
         <div className="image-reference"><span>源镜像</span><code>{version.source}</code></div>
         {version.upstreamDigest && <div className="image-reference"><span>上游 digest</span><code>{version.upstreamDigest}</code></div>}
         {version.image && <div className="image-reference"><span>固定镜像</span><code>{version.image}</code></div>}
@@ -103,8 +107,14 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry
         {version.projectReady === false && <p className="project-form-hint">该镜像未配置 CoCell 启动器，请添加源仓库并同步对应版本。</p>}
         {version.warnings?.length ? <details><summary>同步说明</summary><ul>{version.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></details> : null}
         {version.status === 'unknown' && managed && <button className="secondary-button" disabled={blocked} onClick={() => void action(async () => { await onRetry(version.id, version.registryAuthRequired ? credentials() : undefined); }, '已使用原请求确认同步结果。')}>确认同步结果</button>}
+        {image.origin !== 'profile' && <div className="project-form-actions">
+          {!version.cleanup && <button className="secondary-button" disabled={blocked} onClick={() => void action(async () => {
+            if (!version.deprecatedAt && !window.confirm(`弃用 ${version.version}？已有项目继续使用，但新项目和归档恢复不能选择此版本。若它是默认版本，将切换到其他可用版本。`)) return;
+            await onDeprecated(version.id, !version.deprecatedAt);
+          }, version.deprecatedAt ? '版本已恢复生效。' : '版本已弃用，已有项目不受影响。')}>{version.deprecatedAt ? '恢复生效' : '标记弃用'}</button>}
+        </div>}
         {managed && <div className="project-form-actions">
-          {version.status === 'succeeded' && version.projectReady !== false && !version.cleanup && image.defaultVersionId !== version.id && <button className="secondary-button" disabled={blocked} onClick={() => void action(() => onDefault(version.id), '已设为默认版本，归档项目恢复时优先使用。')}>设为默认版本</button>}
+          {version.status === 'succeeded' && !version.deprecatedAt && version.projectReady !== false && !version.cleanup && image.defaultVersionId !== version.id && <button className="secondary-button" disabled={blocked} onClick={() => void action(() => onDefault(version.id), '已设为默认版本，归档项目恢复时优先使用。')}>设为默认版本</button>}
           {(['succeeded', 'failed'].includes(version.status) || version.cleanup) && image.defaultVersionId !== version.id && <button className="secondary-button" disabled={blocked || version.cleanup?.status === 'pending'} onClick={() => void remove(version)}>{version.cleanup ? '重试 / 确认清理' : '清理版本'}</button>}
         </div>}
       </section>)}

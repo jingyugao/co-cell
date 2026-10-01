@@ -9,16 +9,26 @@ export type CellboxRuntimeKind = 'docker-normal' | 'docker-resumable' | 'k8s-nor
 export type CellboxImplementedKind = Extract<CellboxRuntimeKind, 'docker-normal' | 'k8s-resumable'>;
 export interface CellboxProfile {
   id: string; provider: 'docker' | 'resumable-k8s-pod'; capabilities: CellboxCapabilities;
-  runtime?: 'docker' | 'k8s'; behavior?: 'normal' | 'resumable'; kind?: CellboxImplementedKind;
-  identityKind?: string;
-  image?: string; imageId?: string; workspace?: string; agent?: { uid: number; gid: number };
-  cpu?: number; memoryMiB?: number;
+  runtime: 'docker' | 'k8s'; behavior: 'normal' | 'resumable'; kind: CellboxImplementedKind;
+  image: string; workspace: string; agent: { uid: number; gid: number };
+  cpu: number; memoryMiB: number;
 }
+export type CellboxPhase = 'creating' | 'running' | 'freezing' | 'frozen' | 'unfreezing'
+  | 'suspending' | 'suspended' | 'resuming' | 'restoring' | 'staged' | 'deleting' | 'deleted' | 'failed';
 export interface CellboxBox {
-  id: string; ownerKey: string; profileId: string; state: string; generation: number;
-  resourceVersion: number; image: string; imageId?: string; workspace: string;
+  id: string; ownerKey: string; profileId: string; phase: CellboxPhase; generation: number;
+  resourceVersion: number; importedImageId?: string; image: string; imageId?: string; workspace: string;
   capabilities: CellboxCapabilities; operationId?: string; createdAt: string;
   error?: { code: string; message: string };
+}
+export interface CellboxImportedImage {
+  id: string; source: string; resolvedSource: string; image: string; platform: string;
+  command: string[]; env: Record<string, string>; workingDir: string;
+  buildCommand?: string; ports: number[]; warnings: string[]; key: string; createdAt: string;
+}
+export interface CellboxImportImageInput {
+  url: string; buildCommand?: string; runCommand?: string; platform?: 'linux/amd64';
+  registryAuth?: { username: string; password: string };
 }
 export interface CellboxOperation {
   id: string; kind: string; targetId: string; status: 'queued' | 'running' | 'succeeded' | 'failed';
@@ -89,6 +99,8 @@ export class CellboxClient {
       throw new CellboxError('INVALID_REQUEST', 'requestTimeoutMs must be a positive integer');
   }
   get origin() { return new URL(this.baseUrl).origin; }
+  /** Server-side access uses the configured API gateway, independent of public route DNS. */
+  serviceUrl(routeId: string) { return `${this.baseUrl}/s/${this.id(routeId)}/`; }
   private async request<T>(method: string, path: string, options: {
     body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
   } = {}): Promise<T> {
@@ -165,13 +177,18 @@ export class CellboxClient {
     return result;
   }
   private id(id: string) { return encodeURIComponent(id); }
+  importImage(input: CellboxImportImageInput, key: string) {
+    return this.request<CellboxOperation>('POST', '/v1/images:import', { body: input, key });
+  }
+  listImages() { return this.request<CellboxImportedImage[]>('GET', '/v1/images'); }
+  getImage(id: string) { return this.request<CellboxImportedImage>('GET', `/v1/images/${this.id(id)}`); }
   listProfiles(signal?: AbortSignal) { return this.request<CellboxProfile[]>('GET', '/v1/profiles', { signal }); }
   listBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes', { signal }); }
   getBox(id: string, signal?: AbortSignal) { return this.request<CellboxBox>('GET', `/v1/boxes/${this.id(id)}`, { signal }); }
-  createBox(input: { profileId: string; ownerKey: string }, key: string) {
+  createBox(input: { profileId: string; ownerKey: string; importedImageId?: string }, key: string) {
     return this.request<CellboxOperation>('POST', '/v1/boxes', { body: input, key });
   }
-  restoreBox(input: { profileId: string; ownerKey: string; archiveId: string }, key: string) {
+  restoreBox(input: { profileId: string; ownerKey: string; archiveId: string; importedImageId?: string }, key: string) {
     return this.request<CellboxOperation>('POST', '/v1/boxes:restore', { body: input, key });
   }
   actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile', key: string) {
@@ -190,10 +207,12 @@ export class CellboxClient {
       `/v1/boxes/${this.id(id)}/files?path=${encodeURIComponent(path)}&list=1`, { signal });
   }
   writeFile(id: string, path: string, bytes: Uint8Array, signal?: AbortSignal) {
+    if (bytes.byteLength > 16 * 1024 * 1024)
+      throw new CellboxError('INVALID_REQUEST', 'Cellbox files are limited to 16 MiB per transfer');
     return this.request<void>('PUT', `/v1/boxes/${this.id(id)}/files?path=${encodeURIComponent(path)}`, { bytes, signal, response: 'empty' });
   }
   writeCredential(boxId: string, slot: string, bytes: Uint8Array, signal?: AbortSignal) {
-    if (!slot || bytes.byteLength < 1 || bytes.byteLength > 65_536)
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(slot) || bytes.byteLength < 1 || bytes.byteLength > 65_536)
       throw new CellboxError('INVALID_REQUEST', 'Credential slot and 1..65536 bytes are required');
     return this.request<void>('PUT', `/v1/boxes/${this.id(boxId)}/credentials/${this.id(slot)}`,
       { bytes, signal, response: 'empty' });

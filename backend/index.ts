@@ -1,3 +1,4 @@
+import { ImageCatalog } from './images/service.js';
 import { createServer } from 'node:http';
 import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
@@ -91,6 +92,8 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   }, notifications);
 await manager.init();
+const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.env.CELLBOX_PROFILE!);
+await imageCatalog.init();
 const config: AppConfig = { sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
   ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}),
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
@@ -100,7 +103,7 @@ const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
-  inventory, undefined, connections, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,provider:cellboxProvider,projects:()=>manager.listProjects() });
+  inventory, undefined, connections, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,provider:cellboxProvider,projects:()=>manager.listProjects() }, imageCatalog);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }

@@ -18,7 +18,7 @@ import type { WorkspaceFileResult, WorkspaceFileReadOptions } from '../workspace
 
 export interface SandboxRuntime {
 	remoteArchives?: import('../archives/remote.js').RemoteArchives;
-  currentImageIdentity?(): Promise<SandboxImageIdentity>;
+  currentImageIdentity?(target?: WorkspaceTarget): Promise<SandboxImageIdentity>;
   track?(session: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): void;
   trackExecution?(session: Session, turn: Turn): void;
   run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
@@ -32,6 +32,7 @@ export interface SandboxRuntime {
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   resume?(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
+  checkpoint?(target: WorkspaceTarget): Promise<SandboxState>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
   verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
   fenceSandbox?(sandbox: SandboxState): Promise<void>;
@@ -106,7 +107,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private get node() { return this.options.paths.node; }
 
   track(target: WorkspaceTarget, notify: SaveSandbox) { this.sandboxes.track(target, notify); }
-  async currentImageIdentity(): Promise<SandboxImageIdentity> {
+  async currentImageIdentity(target?: WorkspaceTarget): Promise<SandboxImageIdentity> {
+    if (target?.imageSelection) return { reference: target.imageSelection.image, id: target.imageSelection.image, repoDigests: [target.imageSelection.image] };
     const provider = this.options.provider as SandboxProvider & { currentImageIdentity?: () => Promise<SandboxImageIdentity> };
     if (!provider.currentImageIdentity) throw new Error('Sandbox provider does not support image switching');
     return provider.currentImageIdentity();
@@ -530,6 +532,18 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   async rebuild(target: WorkspaceTarget, onSandbox: SaveSandbox) {
+    if (target.sandbox) {
+      let missing = false;
+      try { missing = (await this.options.provider.getInfo(target.sandbox.id)).metadata?.phase === 'deleted'; }
+      catch (error) {
+        if ((error as { code?: string }).code === 'NOT_FOUND') missing = true;
+        else throw error;
+      }
+      if (missing) {
+        await this.detachSandbox(target);
+        target.sandbox = undefined;
+      }
+    }
     const entry = await this.acquire(target,true,onSandbox);
     try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
   }
@@ -537,6 +551,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
     const entry = await this.acquire(target, false, onSandbox);
     try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
+  }
+
+  async checkpoint(target: WorkspaceTarget) {
+    if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
+    return this.sandboxes.checkpoint(target);
   }
 
   async verifySandbox(sandbox: SandboxState, timeoutMs?: number) {

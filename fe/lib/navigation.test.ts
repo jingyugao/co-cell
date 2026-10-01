@@ -7,6 +7,22 @@ const project = (id: string, archivedAt: string | null): ProjectSummary => ({
   id, name: id, requirementUrl: null, executionMode: 'sandbox', workingDirectory: '/home/agent/workspace',
   archivedAt, createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-01T00:00:00.000Z',
   sessionCount: 0, activeSessionId: null,
+  sandbox: { id: `sandbox-${id}`, status: 'ready', template: 'default', workingDirectory: '/home/agent/workspace' },
+});
+
+test('direct and default routes cannot enter pending, missing, or checkpointed sandboxes', () => {
+  storage.clear();
+  const pending = { ...project('pending', null), sandbox: undefined,
+    sandboxOperation: { kind: 'create' as const, status: 'running' as const, phase: '创建 Sandbox', updatedAt: '2026-09-30T00:00:00Z' } };
+  const paused = project('paused', null); paused.sandbox!.status = 'paused';
+  const ready = project('ready', null);
+  const route = { page: 'chat' as const, sessionId: null, projectId: null, explicit: false, invalid: false };
+  assert.equal(resolveSelection(route, [], [pending, paused, ready]).projectId, ready.id);
+  for (const value of [pending, paused, { ...pending, sandboxOperation: undefined }]) {
+    const result = resolveSelection({ ...route, projectId: value.id, explicit: true }, [], [value]);
+    assert.equal(result.projectId, null);
+    assert.match(result.error ?? '', /尚未就绪/);
+  }
 });
 
 const storage = new Map<string, string>();

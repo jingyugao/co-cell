@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { chmod, lstat, mkdir, open, unlink } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const DEFAULT_WORKSPACE = '/home/agent/workspace';
@@ -88,8 +88,18 @@ function delay(ms, signal) {
 }
 
 async function runCodex(config, { workspace, codex, codexHome, signal, log }) {
+  // Keep image-provided language environments (PATH, VIRTUAL_ENV, etc.) while
+  // withholding Cellbox control variables and Node process injection options.
+  const imageEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    !key.startsWith('CELLBOX_') && !key.startsWith('COCELL_LAUNCHER_') && key !== 'NODE_OPTIONS'));
+  // Cellbox's default workload PATH excludes /usr/local/bin. Codex's npm
+  // entrypoint uses /usr/bin/env node, so include the Node running this launcher.
+  const paths = (imageEnv.PATH || '/usr/local/bin:/usr/bin:/bin').split(':');
+  const nodeDirectory = dirname(process.execPath);
+  if (!paths.includes(nodeDirectory)) paths.unshift(nodeDirectory);
   const env = {
-    PATH: '/usr/local/bin:/usr/bin:/bin', HOME: '/home/agent', LANG: 'C.UTF-8',
+    ...imageEnv,
+    PATH: paths.join(':'), HOME: '/home/agent', LANG: imageEnv.LANG || 'C.UTF-8',
     CODEX_HOME: codexHome, ...config.env,
   };
   // Cellbox is the Sandbox boundary; Codex must not start its nested Linux sandbox.

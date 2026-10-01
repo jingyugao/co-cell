@@ -1,3 +1,4 @@
+import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { randomUUID } from 'node:crypto';
 import type { Project, ProjectStatus, ProjectType, Settings } from '../../protocol/types.js';
 import { projectWeekOf } from '../../util/project-types.js';
@@ -6,8 +7,8 @@ import { RecordWriteQueue } from '../infra/storage/record-write-queue.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import { readRequirementInfo } from './requirements.js';
 
-export type ProjectInput = { name?: string; requirementUrl?: string | null; type?: ProjectType };
-export type ProjectUpdate = Partial<ProjectInput> & { status?: ProjectStatus; backupRetentionCount?: number };
+export type ProjectInput = { name?: string; requirementUrl?: string | null; type?: ProjectType; imageSelection?: ProjectImageSelection };
+export type ProjectUpdate = Partial<Omit<ProjectInput, 'imageSelection'>> & { status?: ProjectStatus; backupRetentionCount?: number };
 
 /** Owns project records and guards operations against concurrent deletion. */
 export class ProjectService {
@@ -186,6 +187,7 @@ export class ProjectService {
       this.validate({ name });
       const now = this.now().toISOString();
       const project: Project = { id: randomUUID(), name, type, ...(weekOf ? { weekOf } : {}), requirementUrl, ...(info ? { requirementStatus: info.status } : {}),
+        ...(input.imageSelection ? { imageSelection: structuredClone(input.imageSelection) } : {}),
         executionMode: settings.executionMode ?? 'local', workingDirectory: settings.workingDirectory,
         status: 'active', completedAt: null, archivedAt: null, createdAt: now, updatedAt: now };
       await this.import(project);

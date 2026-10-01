@@ -10,6 +10,7 @@ import { ContainerCodexRuntime } from '../execution/container-runtime.js';
 import { runTurn } from '../execution/runner.js';
 import { ProjectSandboxes } from './project-sandboxes.js';
 import type { WorkspaceTarget } from './types.js';
+import { CellboxError } from '../../packages/sandbox/src/providers/cellbox/client.js';
 type TurnExecutionDependencies = Parameters<typeof runTurn>[3];
 const runtimePaths = { root: '/home/agent/workspace/.cocell', runtime: '/home/agent/workspace/.cocell/runtime',
   codexHome: '/home/agent/workspace/.cocell/codex', node: '/usr/local/bin/node' };
@@ -40,6 +41,36 @@ function fixture() {
   return { counts, sandbox, provider, manager, projects, target, record };
 }
 
+test('rebuild replaces a missing box but preserves the binding on a transport failure', async () => {
+  const { provider, manager, projects, target, sandbox, counts } = fixture();
+  target.sandbox = { id: 'removed-box', status: 'unavailable', template: 'base', workingDirectory: target.settings.workingDirectory };
+  const saved: SandboxState[] = [];
+  projects.track(target, async state => { saved.push(state); });
+  const originalInfo = provider.getInfo;
+  let transportError = true;
+  provider.getInfo = async id => {
+    if (id === 'removed-box') throw new CellboxError(transportError ? 'TRANSPORT' : 'NOT_FOUND', 'Box lookup failed');
+    return originalInfo(id);
+  };
+  sandbox.files.write = async () => {};
+  sandbox.files.rename = async () => {};
+  sandbox.files.remove = async () => {};
+  const runtime = new ContainerCodexRuntime({ paths: runtimePaths, prepareRemote: async () => false,
+    provider, apiKey: '', sandboxes: projects, sharedDataDirectory: new URL('file:///nonexistent-cocell-fixture/') });
+  try {
+    await assert.rejects(runtime.rebuild(target, async state => { saved.push(state); }), /Box lookup failed/);
+    assert.equal(counts.create, 0);
+    assert.equal(manager.peek(`project:${target.projectId}`)?.id, 'removed-box');
+    transportError = false;
+    await assert.rejects(projects.inspect(target), { code: 'not_accessible' });
+    await runtime.rebuild(target, async state => { saved.push(state); });
+    assert.equal(counts.create, 1);
+    assert.equal(counts.kill, 0);
+    assert.equal(manager.peek(`project:${target.projectId}`)?.id, sandbox.sandboxId);
+    assert.equal(saved.at(-1)?.id, sandbox.sandboxId);
+  } finally { await runtime.close(); }
+});
+
 test('sibling sessions share one sandbox and a stable project persistence callback', async () => {
   const { counts, manager, projects, target } = fixture();
   const sibling = { ...target, id: randomUUID() };
@@ -65,6 +96,23 @@ test('sibling sessions share one sandbox and a stable project persistence callba
     await second.release();
     await projects.delete(target);
     assert.equal(counts.kill, 1);
+  } finally { await manager.close(); }
+});
+
+test('project image selection reaches sandbox creation and overrides the default image identity', async () => {
+  const { provider, manager, projects, target, sandbox } = fixture();
+  const selection = { imageId: 'python', imageName: 'Python', category: '开发', versionId: 'v1', version: 'v1',
+    importedImageId: 'imported-python-v1', image: 'registry/python@sha256:pinned' };
+  target.imageSelection = selection;
+  provider.create = async (_template, options) => {
+    assert.equal(options.metadata?.cellboxImportedImageId, selection.importedImageId);
+    return sandbox;
+  };
+  const runtime = new ContainerCodexRuntime({ paths: runtimePaths, prepareRemote: async () => false, provider, apiKey: '', sandboxes: projects });
+  try {
+    const lease = await projects.acquire(target, { create: true, save: async () => {} });
+    assert.equal((await runtime.currentImageIdentity(target)).id, selection.image);
+    await lease.release();
   } finally { await manager.close(); }
 });
 

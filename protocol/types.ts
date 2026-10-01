@@ -1,3 +1,4 @@
+import type { ProjectImageSelection } from './image-types.js';
 import type { SandboxImageIdentity, SandboxState } from './sandbox-types.js';
 import type { ThreadEvent, ThreadItem, Usage } from './agent-protocol.js';
 
@@ -91,7 +92,7 @@ export type ProjectStatus = 'active' | 'completed' | 'archived';
 export interface ProjectSandboxOperation {
 	/** Persisted intention ID used for remote operation idempotency. */
 	id?: string;
-  kind: 'backup' | 'restore' | 'archive' | 'refresh' | 'resume';
+  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume';
   phase: string;
   status: 'running' | 'failed' | 'succeeded';
   error?: string;
@@ -121,6 +122,7 @@ export interface Project {
   /** `archivedAt` is retained for legacy records and archive grouping. */
   status?: ProjectStatus;
   completedAt?: string | null;
+  imageSelection?: ProjectImageSelection;
   sandbox?: SandboxState;
   /** Timestamp at which project archiving removed the previous sandbox. */
   sandboxReclaimedAt?: string;
@@ -185,6 +187,7 @@ export interface Session {
   turnCount?: number;
   /** Most recently observed model context length. */
   contextUsage?: ContextUsage;
+  imageSelection?: ProjectImageSelection;
   sandbox?: SandboxState;
 }
 export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };

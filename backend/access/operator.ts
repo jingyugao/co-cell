@@ -162,9 +162,10 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
   app.use('*', async (c, next) => {
     await next();
     if (publicUrl.protocol === 'https:') c.header('Strict-Transport-Security', 'max-age=86400');
-    c.header('Referrer-Policy', 'no-referrer');
-    c.header('X-Content-Type-Options', 'nosniff');
     const requestHost = (c.req.header('host') ?? new URL(c.req.url).host).toLowerCase();
+    // no-referrer makes browser form POSTs send Origin: null, breaking the CSRF checks.
+    c.header('Referrer-Policy', requestHost === host ? 'same-origin' : 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
     if (requestHost !== host) return;
     c.header('X-Frame-Options', 'DENY');
     if (c.res.headers.get('content-type')?.toLowerCase().includes('text/html') &&

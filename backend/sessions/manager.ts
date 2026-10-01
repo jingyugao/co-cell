@@ -196,6 +196,7 @@ export class SessionManager {
     // disappeared while its database reference remained.
     for (const project of this.projects.list()) {
       if (project.executionMode !== 'sandbox' || !project.sandbox || !this.sandbox?.inspect) continue;
+      if (project.sandboxOperation?.status === 'failed' && ['create', 'resume'].includes(project.sandboxOperation.kind)) continue;
       try { await this.sandbox.inspect(this.projectWorkspace(project)); }
       catch { /* inspect persists an unavailable state for missing containers */ }
     }
@@ -492,7 +493,11 @@ export class SessionManager {
   }
 
   private hydrate(session: Session): Session {
-    if (session.projectId) session.sandbox = structuredClone(this.projects.find(session.projectId)?.sandbox);
+    if (session.projectId) {
+      const project = this.projects.find(session.projectId);
+      session.sandbox = structuredClone(project?.sandbox);
+      session.imageSelection = structuredClone(project?.imageSelection);
+    }
     return session;
   }
 
@@ -500,9 +505,25 @@ export class SessionManager {
     return [...this.projects.list()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(project => this.projectSummary(project));
   }
 
-  async listProjectsWithArchives(): Promise<ProjectSummary[]> {
-    // Listing uses recorded state. Runtime operations inspect their Sandbox
-    // before acting, so a status refresh here would contend with backups.
+  async listProjectsWithArchives(refreshSandboxes = false): Promise<ProjectSummary[]> {
+    if (refreshSandboxes) {
+      const pending = this.projects.list().filter(project => project.executionMode === 'sandbox' && project.sandbox);
+      // Reserve idle projects during read-only inspection so maintenance cannot
+      // start between the idle check and the provider call. Never connect/resume.
+      const refresh = async (project: Project) => {
+        if (this.projects.isMaintaining(project.id) || this.projects.activeSessionId(project.id)
+          || (project.sandboxOperation?.status === 'failed' && ['create', 'resume', 'restore'].includes(project.sandboxOperation.kind))) return;
+        let release: (() => void) | undefined;
+        try {
+          release = this.projects.acquire(project.id);
+          await this.sandbox?.inspect?.(this.projectWorkspace(project));
+        } catch { /* Keep the last state on a transport error; missing boxes persist unavailable. */ }
+        finally { release?.(); }
+      };
+      // Bound fan-out on installations with many projects.
+      for (let offset = 0; offset < pending.length; offset += 4) await Promise.all(pending.slice(offset, offset + 4).map(refresh));
+    }
+    // The default listing uses snapshots; explicit refresh skips maintenance.
     const summaries = this.listProjects();
     return summaries.map(project => ({ ...project, archiveVersions: project.remoteArchives?.map((archive, index, all) => ({
       id: archive.id, version: all.length - index, createdAt: archive.createdAt,
@@ -522,7 +543,8 @@ export class SessionManager {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     const valid = await this.validateSettings(settings ?? { ...this.defaults, executionMode: 'sandbox', workingDirectory: this.defaults.executionMode === 'sandbox' ? this.defaults.workingDirectory : this.sandboxWorkingDirectory });
     const project = await this.projects.create(input, valid);
-    return this.projectSummary(project);
+    if (project.executionMode === 'sandbox') await this.submitProjectSandboxOperation(project.id, 'create');
+    return this.getProject(project.id);
   }
 
   async updateProject(id: string, input: ProjectUpdate): Promise<ProjectSummary> {
@@ -530,7 +552,12 @@ export class SessionManager {
   }
 
   async rebuildProjectSandbox(id: string): Promise<ProjectSummary> {
-    await this.runProjectSandboxOperation(id, 'restore');
+    const project = this.projects.get(id);
+    if (project.sandbox?.status === 'paused') throw new HttpError(409, 'Sandbox 已暂停，请恢复运行');
+    if (project.sandbox?.status === 'ready' && !(project.sandboxOperation?.status === 'failed' && ['create', 'resume'].includes(project.sandboxOperation.kind))) {
+      throw new HttpError(409, 'Sandbox 已就绪，无需重建');
+    }
+    await this.submitProjectSandboxOperation(id, project.remoteArchives?.length || project.status === 'archived' ? 'restore' : 'create');
     return this.getProject(id);
   }
 
@@ -540,8 +567,19 @@ export class SessionManager {
   }
 
   async resumeProjectSandbox(id: string): Promise<ProjectSummary> {
-    await this.runProjectSandboxOperation(id, 'resume');
+    await this.submitProjectSandboxOperation(id, 'resume');
     return this.getProject(id);
+  }
+
+  async checkpointProjectSandbox(id: string): Promise<ProjectSummary> {
+    await this.submitProjectSandboxOperation(id, 'checkpoint');
+    return this.getProject(id);
+  }
+
+  private async submitProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind']) {
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
+    await this.sandboxOperations.start(id, kind);
   }
 
   async refreshProjectSandboxRuntime(id: string): Promise<ProjectSummary> {
@@ -554,7 +592,7 @@ export class SessionManager {
     return this.getProject(id);
   }
 
-  private async runProjectSandboxOperation(id: string, kind: 'backup' | 'restore' | 'archive' | 'refresh' | 'resume',
+  private async runProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'],
     options: { useExistingBackup?: boolean } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
@@ -612,6 +650,10 @@ export class SessionManager {
     if (project.status === 'archived') {
       throw new HttpError(409, '项目已归档，请先点击“恢复项目”');
     }
+    if (project.sandbox?.status !== 'ready' || (project.sandboxOperation?.status === 'failed'
+      && ['create', 'resume'].includes(project.sandboxOperation.kind))) {
+      throw new HttpError(409, project.sandbox?.status === 'paused' ? 'Sandbox 已暂停，请先恢复运行' : 'Sandbox 尚未就绪，请先在项目管理中创建或恢复环境');
+    }
     if (!project.sandbox && (project.remoteArchives?.length)) {
       throw new HttpError(409, '项目环境尚未恢复，请先点击“恢复环境”；不会创建空环境');
     }
@@ -663,11 +705,14 @@ export class SessionManager {
 
   private async updateSandbox(projectId: string | undefined, sessionId: string, sandbox: NonNullable<Session['sandbox']>, restoreProject = false) {
     if (projectId) {
-      const replacing = this.projects.find(projectId)?.sandbox?.id !== sandbox.id;
+      const project = this.projects.find(projectId);
+      const replacing = project?.sandbox?.id !== sandbox.id;
+      const freshEnvironment = replacing && project?.sandboxOperation?.kind === 'create';
       if (!await this.projects.updateSandbox(projectId, sandbox, restoreProject)) return;
       for (const sibling of this.sessions.values()) {
         if (sibling.projectId !== projectId || this.deleting.has(sibling.id)) continue;
         sibling.sandbox = structuredClone(sandbox);
+        if (freshEnvironment) { sibling.threadId = null; delete sibling.contextUsage; }
         sibling.settings.workingDirectory = sandbox.workingDirectory;
         try { await this.save(sibling); }
         catch (error) {
@@ -719,7 +764,11 @@ export class SessionManager {
         ...(executionMode !== this.defaults.executionMode ? { networkAccessEnabled: executionMode === 'sandbox' } : {}), ...input.settings,
         ...(project ? { executionMode: project.executionMode, workingDirectory: project.workingDirectory } : {}), });
       if (!project && settings.executionMode === 'sandbox') {
-        project = await this.createProject({ name: input.title ?? '新项目' }, settings);
+        project = await this.projects.create({ name: input.title ?? '新项目' }, settings);
+        // A caller creating a session without a project waits for its implicit
+        // project's environment; explicit project creation returns for polling.
+        await this.runProjectSandboxOperation(project.id, 'create');
+        project = this.projects.get(project.id);
         release = this.projects.acquire(project.id);
       }
       const now = new Date().toISOString();
@@ -918,7 +967,7 @@ export class SessionManager {
 
   private projectWorkspace(project: Project): WorkspaceTarget {
     return { id: project.id, projectId: project.id, settings: { workingDirectory: project.workingDirectory },
-      sandbox: structuredClone(project.sandbox), updatedAt: project.updatedAt };
+      imageSelection: structuredClone(project.imageSelection), sandbox: structuredClone(project.sandbox), updatedAt: project.updatedAt };
   }
 
   async preview(projectId: string, href: string) {

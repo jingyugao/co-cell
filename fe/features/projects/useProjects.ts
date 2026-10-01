@@ -1,18 +1,26 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import type { ProjectSandboxOperation, ProjectStatus, ProjectSummary, ProjectType } from '../../../protocol/types';
 import { api } from '../../lib/api';
 
-export type ProjectValues = { name: string; requirementUrl: string | null; type: ProjectType };
-export type ProjectUpdate = Partial<ProjectValues> & { status?: ProjectStatus; backupRetentionCount?: number };
+export type ProjectValues = { name: string; requirementUrl: string | null; type: ProjectType; imageId?: string; imageVersionId?: string };
+export type ProjectUpdate = Partial<Omit<ProjectValues, 'imageId' | 'imageVersionId'>> & { status?: ProjectStatus; backupRetentionCount?: number };
 
 export function useProjects() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const refreshProjects = useCallback(async () => {
-    const list = await api<ProjectSummary[]>('/api/projects');
-    setProjects(list);
-    return list;
+  const sequence = useRef(0);
+  const refreshing = useRef<Promise<ProjectSummary[]> | null>(null);
+  const refreshProjects = useCallback(() => {
+    if (refreshing.current) return refreshing.current;
+    const current = ++sequence.current;
+    const request = api<ProjectSummary[]>('/api/projects?refreshSandboxes=1').then(list => {
+      if (current === sequence.current) setProjects(list);
+      return list;
+    }).finally(() => { if (refreshing.current === request) refreshing.current = null; });
+    refreshing.current = request;
+    return request;
   }, []);
   const storeProject = useCallback((project: ProjectSummary) => {
+    sequence.current++;
     setProjects(current => [project, ...current.filter(item => item.id !== project.id)]
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
     return project;
@@ -24,19 +32,29 @@ export function useProjects() {
     await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(values) }),
   ), [storeProject]);
   const runSandboxOperation = useCallback(async (id: string, kind: ProjectSandboxOperation['kind'], request: () => Promise<ProjectSummary>) => {
+    sequence.current++;
     const operation: ProjectSandboxOperation = { kind, phase: '提交请求', status: 'running', updatedAt: new Date().toISOString() };
     setProjects(current => current.map(project => project.id === id ? { ...project, sandboxOperation: operation } : project));
     try { return storeProject(await request()); }
+    catch (error) {
+      setProjects(current => current.map(project => project.id === id ? { ...project, sandboxOperation: {
+        ...operation, status: 'failed', error: error instanceof Error ? error.message : '请求失败，请刷新状态后重试。',
+      } } : project));
+      throw error;
+    }
     finally { await refreshProjects().catch(() => undefined); }
   }, [refreshProjects, storeProject]);
-  const rebuildSandbox = useCallback((id: string) => runSandboxOperation(id, 'restore', () =>
+  const rebuildSandbox = useCallback((id: string) => runSandboxOperation(id, projects.find(project => project.id === id)?.remoteArchives?.length ? 'restore' : 'create', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST' }),
-  ), [runSandboxOperation]);
+  ), [projects, runSandboxOperation]);
   const backupProject = useCallback((id: string) => runSandboxOperation(id, 'backup', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/backup`, { method: 'POST' }),
   ), [runSandboxOperation]);
   const resumeSandbox = useCallback((id: string) => runSandboxOperation(id, 'resume', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/resume`, { method: 'POST' }),
   ), [runSandboxOperation]);
-  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox, backupProject, resumeSandbox };
+  const checkpointSandbox = useCallback((id: string) => runSandboxOperation(id, 'checkpoint', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/checkpoint`, { method: 'POST' }),
+  ), [runSandboxOperation]);
+  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox, backupProject, resumeSandbox, checkpointSandbox };
 }

@@ -49,7 +49,7 @@ test('resume reconnects a paused Sandbox without replacing its binding', async (
     detached: async () => {} });
   try {
     await operations.run(id, 'resume');
-    assert.deepEqual(calls, ['inspect', 'resume:same-sandbox']);
+    assert.deepEqual(calls, ['inspect', 'resume:same-sandbox', 'verify']);
     assert.equal(f.projects.get(id).sandbox?.id, 'same-sandbox');
     assert.equal(f.projects.get(id).sandbox?.status, 'ready');
     assert.equal(f.projects.get(id).sandboxOperation?.status, 'succeeded');

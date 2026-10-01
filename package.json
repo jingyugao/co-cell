@@ -12,6 +12,7 @@
     "build": "pnpm typecheck && vite build",
     "start": "NODE_ENV=production tsx backend/index.ts",
     "typecheck": "tsc --noEmit",
+    "test:integration": "node scripts/integration/project-lifecycle.mjs",
     "capture:http": "tsx backend/infra/diagnostics/capture-demo.ts",
     "credentials:import": "tsx backend/connections/import-local.ts",
     "credentials:migrate": "tsx backend/connections/migrate-credentials.ts",

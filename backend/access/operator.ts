@@ -8,7 +8,7 @@ import { parseServiceHost } from '../projects/service-host.js';
 const COOKIE = 'cocell_operator';
 const PREVIEW_COOKIE = 'cocell_preview';
 const MAX_LOGIN_BYTES = 4096;
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const REQUEST_ID = /^[A-Za-z0-9_-]{1,200}$/;
 
 interface AccessRequest {
@@ -92,7 +92,7 @@ function isAuthenticatedPreviewRequest(headers: AuthHeaders, token: string): boo
 export function isAuthenticatedDevRequest(request: Pick<IncomingMessage, 'url' | 'method' | 'headers'>,
   publicHost: string, token: string): boolean {
   if (!request.url?.startsWith('/') || request.url.startsWith('//') ||
-      !['GET', 'HEAD'].includes(request.method ?? '') || request.headers.upgrade) return false;
+    !['GET', 'HEAD'].includes(request.method ?? '') || request.headers.upgrade) return false;
   let path: string;
   try { path = new URL(request.url, 'http://unused.invalid').pathname; } catch { return false; }
   if (['/api', '/mcp', '/auth'].some(prefix => path === prefix || path.startsWith(`${prefix}/`))) return false;
@@ -102,7 +102,7 @@ export function isAuthenticatedDevRequest(request: Pick<IncomingMessage, 'url' |
 
 function safeReturnPath(input: string | null, publicOrigin: string): string {
   if (!input || input.length > 2048 || !input.startsWith('/') || input.startsWith('//') ||
-      /[\\\u0000-\u001f\u007f]/.test(input)) return '/';
+    /[\\\u0000-\u001f\u007f]/.test(input)) return '/';
   let url: URL;
   try { url = new URL(input, publicOrigin); } catch { return '/'; }
   if (url.origin !== publicOrigin || url.hash) return '/';
@@ -122,7 +122,7 @@ function safeLoginTarget(input: string | null, publicOrigin: string,
     const url = new URL(input);
     const root = new URL(publicOrigin);
     if (url.protocol !== root.protocol || url.username || url.password || url.hash ||
-        !resolvePreviewHost(url.host)) return '/';
+      !resolvePreviewHost(url.host)) return '/';
     return url.href;
   } catch { return '/'; }
 }
@@ -146,8 +146,8 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
   catch { throw new Error('COCELL_PUBLIC_URL must be an HTTPS origin or loopback HTTP origin'); }
   const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(publicUrl.hostname);
   if ((publicUrl.protocol !== 'https:' && !(publicUrl.protocol === 'http:' && loopback)) ||
-      publicUrl.username || publicUrl.password || publicUrl.pathname !== '/' ||
-      publicUrl.search || publicUrl.hash) {
+    publicUrl.username || publicUrl.password || publicUrl.pathname !== '/' ||
+    publicUrl.search || publicUrl.hash) {
     throw new Error('COCELL_PUBLIC_URL must be an HTTPS origin or loopback HTTP origin');
   }
   if (options.previewSubdomains && (publicUrl.protocol !== 'https:' || !publicUrl.hostname.includes('.'))) {
@@ -169,7 +169,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     if (requestHost !== host) return;
     c.header('X-Frame-Options', 'DENY');
     if (c.res.headers.get('content-type')?.toLowerCase().includes('text/html') &&
-        !c.res.headers.has('content-security-policy')) {
+      !c.res.headers.has('content-security-policy')) {
       c.header('Content-Security-Policy', "script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
     }
   });
@@ -180,8 +180,10 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     });
   };
 
-  if (options.previewSubdomains) app.use('*', bodyLimit({ maxSize: 12 * 1024 * 1024,
-    onError: c => c.text('Request too large', 413) }));
+  if (options.previewSubdomains) app.use('*', bodyLimit({
+    maxSize: 12 * 1024 * 1024,
+    onError: c => c.text('Request too large', 413)
+  }));
 
   app.use('*', async (c, next) => {
     const path = new URL(c.req.url).pathname;
@@ -221,8 +223,10 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     return next();
   });
 
-  app.use('/auth/login', bodyLimit({ maxSize: MAX_LOGIN_BYTES,
-    onError: c => c.text('Request too large', 413) }));
+  app.use('/auth/login', bodyLimit({
+    maxSize: MAX_LOGIN_BYTES,
+    onError: c => c.text('Request too large', 413)
+  }));
   app.get('/auth/login', c => {
     const nextPath = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, resolvePreviewHost);
     c.header('Cache-Control', 'no-store');
@@ -259,14 +263,16 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     return c.redirect(target, 303);
   });
 
-  app.use('/api/cellbox/authorize', bodyLimit({ maxSize: MAX_LOGIN_BYTES,
-    onError: c => c.text('Request too large', 413) }));
+  app.use('/api/cellbox/authorize', bodyLimit({
+    maxSize: MAX_LOGIN_BYTES,
+    onError: c => c.text('Request too large', 413)
+  }));
   const pendingAccess = async (c: Context, id: string) => {
     let access: AccessRequest;
     try { access = await options.provider.getAccessRequest(id); }
     catch { return { error: c.text('Access request unavailable', 502) }; }
     if (access.id !== id || access.approved || access.consumed ||
-        !Number.isFinite(Date.parse(access.expiresAt)) || Date.parse(access.expiresAt) <= Date.now()) {
+      !Number.isFinite(Date.parse(access.expiresAt)) || Date.parse(access.expiresAt) <= Date.now()) {
       return { error: c.text('Access request unavailable', 409) };
     }
     const project = options.projects().find(project => project.executionMode === 'sandbox' &&

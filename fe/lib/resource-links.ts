@@ -124,5 +124,5 @@ export function fileViewUrl(projectId: string, path: string, line?: number, frag
 }
 
 export function fileContentUrl(projectId: string, path: string): string {
-  return `/api/projects/${encodeURIComponent(projectId)}/files?${new URLSearchParams({ path, raw: '1' })}`;
+  return `/api/projects/${encodeURIComponent(projectId)}/files/content?${new URLSearchParams({ path })}`;
 }

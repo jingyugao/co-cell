@@ -11,6 +11,31 @@ import { CellboxSandboxProvider } from './provider.js';
 const capabilities = { exec: true, files: true, http: true, websocket: true, pty: false,
   reconnectExec: false, freeze: false, suspend: 'same-node-checkpoint', archives: 'workspace-best-effort', protectedTools: false };
 
+test('file transport streams ranges and preserves HTTP statuses without forwarding browser credentials', async () => {
+  for (const status of [206, 304, 412, 416]) {
+    let cancelled = false;
+    const client = new CellboxClient({ baseUrl: 'http://cellbox.test', token: 'operator-token', fetch: async (input, init) => {
+      assert.match(String(input), /files\?path=source%2Ffile.txt$/);
+      const headers = new Headers(init?.headers);
+      assert.equal(headers.get('authorization'), 'Bearer operator-token');
+      assert.equal(headers.get('cookie'), null);
+      assert.equal(headers.get('accept-encoding'), 'identity');
+      assert.equal(headers.get('range'), 'bytes=0-4');
+      assert.equal(headers.get('if-range'), '"version"');
+      const body = status === 304 ? null : new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new TextEncoder().encode('hello')); },
+        cancel() { cancelled = true; },
+      });
+      return new Response(body, { status, headers: { 'Content-Range': 'bytes 0-4/13' } });
+    } });
+    const response = await client.fileResponse('box', 'source/file.txt', { headers: new Headers({
+      Range: 'bytes=0-4', 'If-Range': '"version"', Authorization: 'browser-token', Cookie: 'browser-cookie',
+    }) });
+    assert.equal(response.status, status);
+    if (response.body) { await response.body.cancel(); assert.equal(cancelled, true); }
+  }
+});
+
 async function fixture() {
   const calls: Array<{ method: string; path: string; key?: string; body: unknown }> = [];
   const boxes = new Map<string, Record<string, unknown>>();

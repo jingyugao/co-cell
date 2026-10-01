@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CellboxError, type SandboxHandle } from '@co-cell/sandbox';
-import { readCellboxWorkspaceFile } from './cellbox-files.js';
+import { readCellboxWorkspaceFile, cellboxWorkspaceFileResponse } from './cellbox-files.js';
 
 function fixture() {
   const paths: string[] = [];
@@ -33,4 +33,21 @@ test('native transfer limit and missing file errors are returned as useful HTTP 
     sandbox.files.readBytes = async () => { throw error; };
     await assert.rejects(readCellboxWorkspaceFile(sandbox, '/workspace', '/workspace/file'), { status });
   }
+});
+
+test('streamed file requests enforce workspace confinement before reaching the native API', async () => {
+  const { sandbox, paths } = fixture();
+  const request = new Request('http://localhost/files', { headers: { Range: 'bytes=0-4' } });
+  sandbox.files.readResponse = async (path, options) => {
+    paths.push(path);
+    assert.equal(options?.signal, request.signal);
+    assert.equal(options?.headers?.get('range'), 'bytes=0-4');
+    return new Response('hello', { status: 206 });
+  };
+  const response = await cellboxWorkspaceFileResponse(sandbox, '/workspace', '/workspace/source/main.go', request);
+  assert.equal(response.status, 206); assert.equal(await response.text(), 'hello');
+  for (const path of ['/shared/file', '/workspace-other/file', '/workspace/../private/file', 'relative.go']) {
+    await assert.rejects(cellboxWorkspaceFileResponse(sandbox, '/workspace', path, request));
+  }
+  assert.deepEqual(paths, ['/workspace/source/main.go']);
 });

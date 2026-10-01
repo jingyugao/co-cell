@@ -170,6 +170,41 @@ test('workspace file reads use a protected lease without requiring Codex or a mo
   } finally { finishRead(); await runtime.close(); await manager.close(); }
 });
 
+test('file streaming retains the sandbox lease until completion, cancellation or disconnect', async () => {
+  for (const ending of ['complete', 'cancel', 'disconnect'] as const) {
+    const { sandbox, provider, manager, projects, target, record } = fixture();
+    target.sandbox = record;
+    projects.track(target, async () => {});
+    let source!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    sandbox.files.readResponse = async (path, options) => {
+      assert.equal(path, '/home/agent/workspace/file.txt');
+      assert.equal(options?.headers?.get('range'), 'bytes=0-4');
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) { source = controller; controller.enqueue(Buffer.from('hello')); },
+        cancel() { cancelled = true; },
+      }), { status: 206, headers: { 'Content-Range': 'bytes 0-4/10' } });
+    };
+    const runtime = new ContainerCodexRuntime({ paths: runtimePaths, prepareRemote: async () => false, provider, apiKey: '', sandboxes: projects });
+    const abort = new AbortController();
+    const request = new Request('http://localhost/files', { signal: abort.signal, headers: { Range: 'bytes=0-4' } });
+    try {
+      const response = await runtime.fileResponse(target, '/home/agent/workspace/file.txt', request);
+      assert.equal(response.status, 206);
+      await assert.rejects(runtime.delete(target), { code: 'busy' });
+      if (ending === 'complete') { source.close(); assert.equal(await response.text(), 'hello'); }
+      else if (ending === 'cancel') { await response.body!.cancel(); assert.equal(cancelled, true); }
+      else {
+        abort.abort();
+        // Allow the asynchronous stream cancellation to finish releasing the lease.
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(cancelled, true);
+      }
+      await runtime.delete(target);
+    } finally { abort.abort(); await runtime.close(); await manager.close(); }
+  }
+});
+
 test('a user stop remains cancelled when App Server reports its interrupted turn as failed', async () => {
   const now = new Date().toISOString();
   const turn: Turn = { id: 'turn', prompt: 'stop me', images: [], items: [], status: 'running', startedAt: now };

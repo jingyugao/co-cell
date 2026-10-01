@@ -6,7 +6,8 @@ import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
 import type { SandboxHandle, SandboxProvider, SandboxLease, SandboxRecord, CellboxServiceAccess } from '@co-cell/sandbox';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
-import { readCellboxWorkspaceFile } from '../sandboxes/cellbox-files.js';
+import { readCellboxWorkspaceFile, cellboxWorkspaceFileResponse } from '../sandboxes/cellbox-files.js';
+import { holdResponse } from '../../util/http-stream.js';
 import type { AgentEvent } from '../../protocol/types.js';
 import type { Session, SubagentConversation, Turn } from '../../protocol/types.js';
 import type { NativeHistory } from './native-history.mjs';
@@ -26,6 +27,7 @@ export interface SandboxRuntime {
   detach(turn: Turn): void;
   service?(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response>;
   file(session: WorkspaceTarget, path: string): Promise<WorkspaceFileResult>;
+  fileResponse?(session: WorkspaceTarget, path: string, request: Request): Promise<Response>;
   inspect?(target: WorkspaceTarget): Promise<unknown>;
   /** Read Cellbox without connecting, preparing, persisting, or renewing activity. */
   querySandbox?(sandbox: SandboxState): Promise<SandboxState>;
@@ -468,6 +470,22 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       });
       return new Response(stream, { status: upstream.status, headers: outHeaders });
     } catch (error) { await release(); throw error; }
+  }
+
+  async fileResponse(session: WorkspaceTarget, path: string, request: Request): Promise<Response> {
+    if (this.closing) throw new HttpError(503, 'Sandbox 运行时正在关闭');
+    let entry: Entry;
+    try { entry = await this.acquire(session, false); }
+    catch (error) { throw new HttpError(502, this.safeError(error).message); }
+    try {
+      const response = await cellboxWorkspaceFileResponse(entry.sandbox, session.settings.workingDirectory, path, request);
+      if (!response.body) { await this.release(entry, false); return response; }
+      return holdResponse(response, () => this.release(entry, false), request.signal);
+    } catch (error) {
+      await this.release(entry, true);
+      if (error instanceof HttpError) throw error;
+      throw new HttpError(502, this.safeError(error).message);
+    }
   }
 
   async file(session: WorkspaceTarget, path: string): Promise<WorkspaceFileResult> {

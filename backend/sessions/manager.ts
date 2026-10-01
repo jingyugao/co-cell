@@ -10,6 +10,7 @@ import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 import { pruneRemoteArchives } from '../archives/retention.js';
 
 import { HttpError } from '../../util/errors.js';
+import { holdResponse } from '../../util/http-stream.js';
 import { ProjectService, type ProjectInput, type ProjectUpdate } from '../projects/service.js';
 import { RecordWriteQueue } from '../infra/storage/record-write-queue.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
@@ -1035,6 +1036,17 @@ export class SessionManager {
       });
       return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
     } catch (error) { done(); throw error; }
+  }
+
+  async projectFileResponse(projectId: string, path: string, request: Request): Promise<Response> {
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    await this.ensureProjectSandbox(projectId);
+    const project = this.projects.get(projectId);
+    if (!project.sandbox || !this.sandbox?.fileResponse) throw new HttpError(503, 'Sandbox 文件流接口未配置');
+    const release = this.projects.acquire(project.id);
+    try {
+      return holdResponse(await this.sandbox.fileResponse(this.projectWorkspace(project), path, request), release, request.signal);
+    } catch (error) { release(); throw error; }
   }
 
   async projectFile(projectId: string, path: string) {

@@ -24,6 +24,8 @@ export interface SandboxHandle {
     }): Promise<SandboxCommandResult>;
   };
   files: {
+    /** Stream a workspace file with standard HTTP range and conditional semantics. */
+    readResponse?(path: string, options?: { user?: string; signal?: AbortSignal; method?: 'GET' | 'HEAD'; headers?: Headers }): Promise<Response>;
     /** Native workspace file read; rejects paths outside the workspace. */
     readBytes(path: string, options?: { user?: string; signal?: AbortSignal }): Promise<Uint8Array>;
     read(path: string, options?: { user?: string; signal?: AbortSignal }): Promise<string>;

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Project } from '../../../protocol/types';
-import type { WorkspaceFile } from '../../../protocol/workspace-types';
+import type { WorkspaceFilePreview } from '../../../protocol/workspace-types';
+import { loadWorkspaceFile } from '../../lib/workspace-files';
 import { api, errorMessage } from '../../lib/api';
 import { fileContentUrl, fileViewUrl } from '../../lib/resource-links';
 import Markdown, { type FileSelection } from '../chat/Markdown';
@@ -12,7 +13,7 @@ export type ProjectFileSelection = FileSelection & { projectId: string; workingD
 export function WorkspaceFileView({ file, onOpenFile, onClose }: {
   file: ProjectFileSelection; onOpenFile: (file: ProjectFileSelection) => void; onClose?: () => void;
 }) {
-  const [result, setResult] = useState<WorkspaceFile | null>(null);
+  const [result, setResult] = useState<WorkspaceFilePreview | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [retry, setRetry] = useState(0);
@@ -21,7 +22,7 @@ export function WorkspaceFileView({ file, onOpenFile, onClose }: {
   useEffect(() => {
     const controller = new AbortController();
     setResult(null); setError(''); setLoading(true);
-    void api<WorkspaceFile>(`/api/projects/${encodeURIComponent(file.projectId)}/files?path=${encodeURIComponent(file.path)}`, { signal: controller.signal })
+    void loadWorkspaceFile(file.projectId, file.path, controller.signal)
       .then(value => { if (!controller.signal.aborted) setResult(value); })
       .catch(reason => { if (!controller.signal.aborted) setError(errorMessage(reason)); })
       .finally(() => { if (!controller.signal.aborted) { setLoading(false); } });
@@ -48,6 +49,7 @@ export function WorkspaceFileView({ file, onOpenFile, onClose }: {
     <div className="workspace-file-toolbar">
       {result?.kind === 'text' && markdown && <button onClick={() => setSource(value => !value)}>{source ? '阅读模式' : '查看源码'}</button>}
       <button onClick={() => setRetry(value => value + 1)} disabled={loading}>刷新</button>
+      <a href={fileContentUrl(file.projectId, file.path)} target="_blank" rel="noopener noreferrer">浏览器查看 ↗</a>
       <a href={download} download={result?.name || file.path.split('/').pop()}>下载</a>
       {onClose && <a href={fileViewUrl(file.projectId, file.path, file.line, file.fragment)} target="_blank" rel="noopener noreferrer">独立打开 ↗</a>}
       {result && <span>{result.size.toLocaleString()} 字节 · 当前文件</span>}
@@ -55,12 +57,13 @@ export function WorkspaceFileView({ file, onOpenFile, onClose }: {
     <div className="workspace-file-body" ref={body}>
       {loading && <p role="status"><span className="spinner" />正在读取文件…</p>}
       {error && <div className="inline-error" role="alert">{error}</div>}
+      {!loading && result?.kind === 'text' && result.truncated && <p role="status">仅预览前 1 MiB 内容，下载可查看完整文件。</p>}
       {!loading && result?.kind === 'image' && <img className="workspace-file-image" src={fileContentUrl(file.projectId, file.path)} alt={result.name} />}
       {!loading && result?.kind === 'text' && (markdown && !source
         ? <Markdown text={result.text ?? ''} projectId={file.projectId} workingDirectory={file.workingDirectory}
             baseDirectory={file.path.slice(0, file.path.lastIndexOf('/')) || '/'} onOpenFile={next => onOpenFile({ ...next, projectId: file.projectId, workingDirectory: file.workingDirectory })} />
         : <pre className="workspace-file-source">{(result.text ?? '').split('\n').map((line, index) => <div key={index} data-line={index + 1} className={file.line === index + 1 ? 'selected' : undefined}><span className="workspace-line-number" aria-hidden="true">{index + 1}</span><code>{line || '\n'}</code></div>)}</pre>)}
-      {!loading && result?.kind === 'binary' && <p>该文件暂不支持预览，请下载查看。</p>}
+      {!loading && result?.kind === 'binary' && <p>该文件暂不支持页面内预览，可点击“浏览器查看”或下载查看。</p>}
     </div>
   </section>;
 }

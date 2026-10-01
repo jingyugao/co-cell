@@ -204,6 +204,31 @@ export class CellboxClient {
   }
   getOperation(id: string, signal?: AbortSignal) { return this.request<CellboxOperation>('GET', `/v1/operations/${this.id(id)}`, { signal }); }
   getExec(id: string, signal?: AbortSignal) { return this.request<CellboxExecution>('GET', `/v1/execs/${this.id(id)}`, { signal }); }
+  async fileResponse(id: string, path: string, options: { method?: 'GET' | 'HEAD'; headers?: Headers; signal?: AbortSignal } = {}): Promise<Response> {
+    const headers = new Headers({ Authorization: `Bearer ${this.token}`, 'Accept-Encoding': 'identity' });
+    for (const name of ['range', 'if-range', 'if-match', 'if-unmodified-since', 'if-none-match', 'if-modified-since']) {
+      const value = options.headers?.get(name);
+      if (value !== undefined && value !== null) headers.set(name, value);
+    }
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), this.requestTimeoutMs);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}/v1/boxes/${this.id(id)}/files?path=${encodeURIComponent(path)}`, {
+        method: options.method ?? 'GET', headers, redirect: 'error',
+        signal: options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal,
+      });
+    } catch (cause) { throw new CellboxError('TRANSPORT', 'Cellbox file request failed', undefined, undefined, { cause }); }
+    finally { clearTimeout(timer); }
+    if (!response.ok && response.status !== 304 && response.status !== 416 && response.status !== 412) {
+      let error: { code?: string; message?: string } | undefined;
+      try { error = JSON.parse(Buffer.from(await this.readBounded(response, 1024 * 1024)).toString()).error; }
+      catch { /* Preserve the HTTP status. */ }
+      throw new CellboxError(error?.code ?? statusCode(response.status), error?.message ?? `Cellbox HTTP ${response.status}`, response.status);
+    }
+    return response;
+  }
+
   readFile(id: string, path: string, signal?: AbortSignal) {
     return this.request<Uint8Array>('GET', `/v1/boxes/${this.id(id)}/files?path=${encodeURIComponent(path)}`, { signal, response: 'bytes' });
   }

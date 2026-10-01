@@ -1,92 +1,86 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Hono } from 'hono';
-import type { WorkspaceFile } from '../../protocol/workspace-types.js';
-import type { WorkspaceFileResult } from '../workspaces/files.js';
 import { installProjectsRoutes } from './routes.js';
 
-function fixture(contents: Buffer, image = false) {
+function fixture(upstream: (request: Request) => Response, filePath = '/workspace/test.html') {
   let calls = 0;
-  const file: WorkspaceFile = {
-    path: `/home/agent/workspace/${image ? 'pixel.png' : 'export.tsv'}`,
-    name: image ? 'pixel.png' : 'export.tsv',
-    size: contents.length,
-    kind: image ? 'image' : 'binary',
-    mimeType: image ? 'image/png' : 'application/octet-stream',
-  };
-  const projectFile = async (projectId: string, path: string): Promise<WorkspaceFileResult> => {
-    assert.equal(projectId, 'test-project');
-    assert.equal(path, file.path);
-    calls++;
-    return { file, data: contents };
-  };
   const app = new Hono();
-  installProjectsRoutes(app, { projectFile } as Parameters<typeof installProjectsRoutes>[1]);
-  const url = `/api/projects/test-project/files?path=${encodeURIComponent(file.path)}`;
-  return { app, url, file, calls: () => calls };
+  installProjectsRoutes(app, { projectFileResponse: async (id: string, path: string, request: Request) => {
+    assert.equal(id, 'test-project'); assert.equal(path, filePath);
+    calls++; return upstream(request);
+  } } as unknown as Parameters<typeof installProjectsRoutes>[1]);
+  return { app, url: `/api/projects/test-project/files/content?path=${encodeURIComponent(filePath)}`, calls: () => calls };
 }
 
-function exportContents() {
-  const contents = Buffer.alloc(2 * 1024 * 1024 + 37, 'x');
-  contents.write('id\tvalue\n1\tfirst\n');
-  contents.write('\nlast\tcomplete\n', contents.length - 15);
-  return contents;
-}
-
-test('download returns the already-read complete attachment with one project file read', async () => {
-  const contents = exportContents();
-  const { app, url, calls } = fixture(contents);
-  const response = await app.request(`${url}&download=1`);
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get('content-length'), String(contents.length));
-  assert.equal(response.headers.get('content-type'), 'application/octet-stream');
-  assert.match(response.headers.get('content-disposition')!, /^attachment;/);
-  assert.ok(Buffer.from(await response.arrayBuffer()).equals(contents), 'raw attachment must include every byte');
-  assert.equal(calls(), 1);
+test('file content is streamed as safe bytes, including the legacy URL', async () => {
+  for (const legacy of [false, true]) {
+    const { app, url, calls } = fixture(() => new Response('<script>example</script>', {
+      headers: { 'Content-Type': 'text/html', 'Content-Length': '24', 'Last-Modified': 'Thu, 01 Oct 2026 00:00:00 GMT' },
+    }));
+    const response = await app.request(legacy ? url.replace('/content', '') : url);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-type'), 'text/plain; charset=utf-8');
+    assert.match(response.headers.get('content-disposition')!, /^inline;/);
+    assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; sandbox");
+    assert.equal(await response.text(), '<script>example</script>');
+    assert.equal(calls(), 1);
+  }
 });
 
-test('HEAD downloads read once, preserve size and return no body', async () => {
-  const contents = exportContents();
-  const { app, url, calls } = fixture(contents);
-  const response = await app.request(`${url}&download=1`, { method: 'HEAD' });
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get('content-length'), String(contents.length));
+test('HEAD forwards the method and returns full length without a body', async () => {
+  const { app, url } = fixture(request => {
+    assert.equal(request.method, 'HEAD');
+    return new Response(null, { headers: { 'Content-Length': '20000000', 'Accept-Ranges': 'bytes' } });
+  });
+  const response = await app.request(url, { method: 'HEAD' });
+  assert.equal(response.headers.get('content-length'), '20000000');
   assert.equal(response.body, null);
-  assert.equal(calls(), 1);
 });
 
-test('ordinary preview returns JSON metadata from a single full file read', async () => {
-  const { app, url, file, calls } = fixture(exportContents());
-  const response = await app.request(url);
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get('content-type')!, /^application\/json/);
-  assert.deepEqual(await response.json(), file);
-  assert.equal(calls(), 1);
+test('Range and conditional responses preserve upstream status and headers', async () => {
+  for (const status of [206, 304, 416]) {
+    const { app, url } = fixture(request => {
+      assert.equal(request.headers.get('range'), 'bytes=0-4');
+      assert.equal(request.headers.get('if-range'), '"version"');
+      return new Response(status === 304 ? null : status === 206 ? 'hello' : '', { status,
+        headers: { 'Content-Range': status === 416 ? 'bytes */13' : 'bytes 0-4/13', 'Accept-Ranges': 'bytes', ETag: '"version"' } });
+    });
+    const response = await app.request(url, { headers: { Range: 'bytes=0-4', 'If-Range': '"version"' } });
+    assert.equal(response.status, status);
+    assert.equal(response.headers.get('etag'), '"version"');
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.equal(response.headers.get('content-range'), status === 416 ? 'bytes */13' : 'bytes 0-4/13');
+    if (status === 304) assert.equal(response.headers.get('content-disposition'), null);
+    if (status === 206) assert.equal(await response.text(), 'hello');
+  }
 });
 
-test('raw binary previews reuse one read for the attachment response', async () => {
-  const contents = Buffer.from('binary data');
-  const { app, url, calls } = fixture(contents);
-  const response = await app.request(`${url}&raw=1`);
-  assert.equal(response.status, 200);
+test('downloads preserve the entire stream above the old 16 MiB limit', async () => {
+  const contents = Buffer.alloc(17 * 1024 * 1024, 'x');
+  const { app, url } = fixture(() => new Response(contents, { headers: { 'Content-Length': String(contents.length) } }));
+  const response = await app.request(url + '&download=1');
   assert.match(response.headers.get('content-disposition')!, /^attachment;/);
-  assert.deepEqual(Buffer.from(await response.arrayBuffer()), contents);
-  assert.equal(calls(), 1);
+  assert.ok(Buffer.from(await response.arrayBuffer()).equals(contents));
 });
 
-test('raw PNG previews preserve inline image content and MIME type', async () => {
-  const contents = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aV1kAAAAASUVORK5CYII=', 'base64');
-  const { app, url, calls } = fixture(contents, true);
-  const response = await app.request(`${url}&raw=1`);
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get('content-type'), 'image/png');
-  assert.equal(response.headers.get('content-length'), String(contents.length));
-  assert.match(response.headers.get('content-disposition')!, /^inline;/);
-  assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; sandbox");
-  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
-  assert.equal(response.headers.get('cache-control'), 'no-store');
-  assert.ok(Buffer.from(await response.arrayBuffer()).equals(contents));
-  assert.equal(calls(), 1);
+test('native PDF and media viewing is inline, preserves ranges, and allows forced download', async () => {
+  for (const mime of ['application/pdf', 'audio/mpeg', 'video/mp4']) {
+    for (const download of [false, true]) {
+      const { app, url } = fixture(() => new Response('hello', { status: 206, headers: {
+        'Content-Type': mime, 'Content-Range': 'bytes 0-4/100', 'Content-Length': '5', 'Accept-Ranges': 'bytes',
+      } }), '/workspace/view.pdf');
+      const response = await app.request(url + (download ? '&download=1' : ''), { headers: { Range: 'bytes=0-4' } });
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('content-type'), mime);
+      assert.match(response.headers.get('content-disposition')!, download ? /^attachment;/ : /^inline;/);
+      assert.equal(response.headers.get('content-range'), 'bytes 0-4/100');
+      assert.equal(response.headers.get('content-length'), '5');
+      assert.ok(!response.headers.get('content-security-policy')!.includes('sandbox'));
+      assert.match(response.headers.get('content-security-policy')!, /media-src 'self' blob:/);
+      assert.equal(await response.text(), 'hello');
+    }
+  }
 });
 
 test('rebuild endpoint returns the newly bound Sandbox for an archived project', async () => {

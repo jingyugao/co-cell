@@ -19,23 +19,25 @@ test('project creation returns a durable pending operation; checkpoint/resume re
   const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
     modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
   const box: SandboxState = { id: 'project-box', status: 'ready', template: 'default', workingDirectory: defaults.workingDirectory };
+  let providerBox = { ...box };
   let finishPreparation!: () => void;
   const preparation = new Promise<void>(resolve => { finishPreparation = resolve; });
   let saveBinding!: (value: SandboxState) => Promise<void>;
-  let verifications = 0, inspections = 0, createCalls = 0;
+  let verifications = 0, inspections = 0, createCalls = 0, resumeCalls = 0, queryCalls = 0;
   let failVerification = false;
   const runtime = {
     async close() {},
     async rebuild(_target, save) {
-      createCalls++; saveBinding = save;
+      createCalls++; saveBinding = save; providerBox = { ...box, status: 'ready' };
       await save({ ...box });
       await preparation;
     },
+    async querySandbox(sandbox) { queryCalls++; return { ...sandbox, status: providerBox.status }; },
     async verifySandbox() { verifications++; if (failVerification) throw new Error('App Server unavailable'); },
     async inspect() { inspections++; },
-    async checkpoint(target) { assert.equal(target.sandbox?.id, box.id); return { ...box, status: 'paused' }; },
-    async resume(target, save) { assert.equal(target.sandbox?.id, box.id); await save({ ...box }); },
-    async delete(target) { assert.equal(target.sandbox?.id, box.id); await saveBinding({ ...box, status: 'unavailable' }); },
+    async checkpoint(target) { assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'paused' }; return { ...providerBox }; },
+    async resume(target, save) { resumeCalls++; assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'ready' }; await save({ ...providerBox }); },
+    async delete(target) { assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'unavailable' }; await saveBinding({ ...providerBox }); },
   } satisfies Partial<SandboxRuntime>;
   const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
   const app = new Hono(); installProjectsRoutes(app, manager);
@@ -51,47 +53,70 @@ test('project creation returns a durable pending operation; checkpoint/resume re
     assert.equal((await state.listProjects())[0].sandboxOperation?.id, created.sandboxOperation?.id);
     assert.equal(canEnterProject(created), false);
     const duringCreate = await (await app.request('/api/projects?refreshSandboxes=1')).json() as ProjectSummary[];
-    assert.equal(inspections, 0, 'polling must not contend with the creation lock or resume a box');
+    assert.equal(duringCreate[0].sandbox?.status, 'ready', 'live provider status is returned during creation maintenance');
+    assert.equal(inspections, 0, 'polling must not inspect, prepare, resume, or verify the Sandbox');
+    assert.equal(resumeCalls, 0);
+    assert.equal(verifications, 0);
     assert.equal(canEnterProject(duringCreate[0]), false);
     await assert.rejects(manager.checkpointProjectSandbox(created.id), /维护/);
     finishPreparation(); await operations().close();
     assert.equal(createCalls, 1);
     assert.equal(verifications, 1);
-    assert.equal(canEnterProject(manager.getProject(created.id)), true);
+    const readyAfterCreate = await manager.readProject(created.id);
+    assert.equal(readyAfterCreate.sandbox?.status, 'ready');
+    assert.equal(canEnterProject(readyAfterCreate), true);
     // The persistent runtime callback must use current lifecycle state after creation.
-    await saveBinding({ ...box, status: 'paused' });
-    assert.equal(manager.getProject(created.id).sandbox?.status, 'paused');
-    await saveBinding({ ...box });
-    assert.equal(manager.getProject(created.id).sandbox?.status, 'ready');
+    providerBox = { ...box, status: 'paused' };
+    await saveBinding({ ...providerBox });
+    assert.equal((await manager.readProject(created.id)).sandbox?.status, 'paused');
+    providerBox = { ...box, status: 'ready' };
+    await saveBinding({ ...providerBox });
+    assert.equal((await manager.readProject(created.id)).sandbox?.status, 'ready');
     const projects = (manager as unknown as { projects: ProjectService }).projects;
     const finishTask = projects.startSession(created.id, 'active-task');
-    try { await assert.rejects(manager.checkpointProjectSandbox(created.id), /正在使用/); }
+    try {
+      await assert.rejects(manager.checkpointProjectSandbox(created.id), /正在使用/);
+      const beforePoll = { inspections, rebuilds: createCalls, resumes: resumeCalls, verifications };
+      const activeList = await manager.listProjectsWithArchives();
+      assert.equal(activeList[0].sandbox?.status, 'ready');
+      assert.deepEqual({ inspections, rebuilds: createCalls, resumes: resumeCalls, verifications }, beforePoll,
+        'read-only polling during an active task does not start lifecycle work');
+    }
     finally { finishTask(); }
     const checkpoint = await app.request(`/api/projects/${created.id}/sandbox/checkpoint`, { method: 'POST' });
     assert.equal(checkpoint.status, 202);
     await operations().close();
-    assert.equal(manager.getProject(created.id).sandbox?.status, 'paused');
-    assert.equal(canEnterProject(manager.getProject(created.id)), false);
+    const pausedAfterCheckpoint = await manager.readProject(created.id);
+    assert.equal(pausedAfterCheckpoint.sandbox?.status, 'paused');
+    assert.equal(canEnterProject(pausedAfterCheckpoint), false);
     const resumed = await app.request(`/api/projects/${created.id}/sandbox/resume`, { method: 'POST' });
     assert.equal(resumed.status, 202);
     await operations().close();
     assert.equal(verifications, 3, 'checkpoint inspects health and resume verifies the restored application');
-    assert.equal(manager.getProject(created.id).sandbox?.id, box.id);
+    assert.equal((await manager.readProject(created.id)).sandbox?.id, box.id);
     assert.equal(createCalls, 1, 'resume must not provision a second sandbox');
-    assert.equal(canEnterProject(manager.getProject(created.id)), true);
-    await saveBinding({ ...box, status: 'paused' });
+    assert.equal(canEnterProject(await manager.readProject(created.id)), true);
+    providerBox = { ...box, status: 'paused' };
+    await saveBinding({ ...providerBox });
     failVerification = true;
     await manager.resumeProjectSandbox(created.id); await operations().close();
-    const failed = manager.getProject(created.id);
+    const failed = await manager.readProject(created.id);
     assert.equal(failed.sandboxOperation?.status, 'failed');
     assert.equal(canEnterProject(failed), false);
-    const beforeFailedPoll = inspections;
-    await manager.listProjectsWithArchives(true);
-    assert.equal(inspections, beforeFailedPoll, 'runtime running alone cannot erase a failed readiness check');
+    const beforeFailedPoll = { queries: queryCalls, inspections, resumes: resumeCalls, verifications };
+    const failedPoll = await manager.listProjectsWithArchives();
+    assert.equal(failedPoll[0].sandbox?.status, 'ready', 'provider state is refreshed even after a failed readiness operation');
+    assert.equal(failedPoll[0].sandboxOperation?.status, 'failed');
+    assert.equal(canEnterProject(failedPoll[0]), false, 'a successful provider query does not erase the failed-operation gate');
+    assert.equal(queryCalls, beforeFailedPoll.queries + 1);
+    assert.deepEqual({ inspections, resumes: resumeCalls, verifications }, {
+      inspections: beforeFailedPoll.inspections, resumes: beforeFailedPoll.resumes, verifications: beforeFailedPoll.verifications,
+    }, 'polling after failed readiness only queries provider status');
     failVerification = false;
     await manager.rebuildProjectSandbox(created.id); await operations().close();
-    assert.equal(canEnterProject(manager.getProject(created.id)), true);
-    assert.equal(manager.getProject(created.id).sandbox?.id, box.id);
+    const rebuilt = await manager.readProject(created.id);
+    assert.equal(canEnterProject(rebuilt), true);
+    assert.equal(rebuilt.sandbox?.id, box.id);
     // Runtime persistence during deletion must respect the deletion guard
     // without failing or resurrecting the project.
     await manager.deleteProject(created.id);

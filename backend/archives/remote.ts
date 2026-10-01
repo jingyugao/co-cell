@@ -22,5 +22,6 @@ export interface RemoteArchives {
 export function matchesRemoteArchive(reference: RemoteArchiveRef, metadata: RemoteArchiveMetadata): boolean {
   return metadata.id === reference.id && metadata.createdAt === reference.createdAt
     && metadata.sizeBytes === reference.sizeBytes && metadata.sha256 === reference.sha256
-    && metadata.imageId === reference.imageId && metadata.sourceSandboxId === reference.sourceSandboxId;
+    && metadata.imageId === reference.imageId && metadata.sourceSandboxId === reference.sourceSandboxId
+    && Boolean(metadata.portable) === Boolean(reference.portable);
 }

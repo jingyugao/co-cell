@@ -24,6 +24,8 @@ export interface SandboxHandle {
     }): Promise<SandboxCommandResult>;
   };
   files: {
+    /** Native workspace file read; rejects paths outside the workspace. */
+    readBytes(path: string, options?: { user?: string; signal?: AbortSignal }): Promise<Uint8Array>;
     read(path: string, options?: { user?: string; signal?: AbortSignal }): Promise<string>;
     write(path: string, value: Uint8Array | ArrayBuffer | string, options?: { user?: string; signal?: AbortSignal }): Promise<void>;
     exists(path: string, options?: { user?: string }): Promise<boolean>;

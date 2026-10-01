@@ -6,7 +6,6 @@ import type { Project, ProjectSummary, Session, SessionSummary, SessionTurnPage,
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
-import type { WorkspaceFileReadOptions } from '../workspaces/files.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 import { pruneRemoteArchives } from '../archives/retention.js';
 
@@ -20,6 +19,9 @@ import { readNativeHistory, readSubagentConversations } from '../execution/nativ
 import type { NotificationStore } from '../notifications/store.js';
 import { estimateSessionCosts, type SessionCostBreakdown } from '../../util/billing.js';
 import { MODEL_TOKEN_RATES } from '../../util/model-costs.js';
+import type { ImageCatalog } from '../images/service.js';
+import type { ProjectImageSelection } from '../../protocol/image-types.js';
+import { querySandbox } from '../sandboxes/status.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -48,6 +50,7 @@ export class SessionManager {
   private notifications?: NotificationStore;
   private projects: ProjectService;
   private sandboxOperations?: ProjectSandboxOperations;
+  private imageCatalog?: ImageCatalog;
   private danglingDeletions = new Map<string, Promise<void>>();
   private sessions = new Map<string, Session>();
   private active = new Map<string, ActiveExecution>();
@@ -78,7 +81,10 @@ export class SessionManager {
       this.sandboxOperations = new ProjectSandboxOperations({
         projects: this.projects, runtime: sandbox,
         threadIds: id => [...this.sessions.values()].filter(session => session.projectId === id).flatMap(session => session.threadId ? [session.threadId] : []),
-        saveSandbox: (id, value, restore) => this.updateSandbox(id, id, value, restore),
+        saveSandbox: (id, value, restore, image) => this.updateSandbox(id, id, value, restore, image),
+        selectRestoreImage: async (project, versionId) => this.imageCatalog
+          ? this.imageCatalog.acquireRestoreSelection(project, versionId)
+          : { selection: project.imageSelection, release() {} },
         logger: this.logger,
         detached: async id => {
           for (const session of this.sessions.values()) {
@@ -91,13 +97,14 @@ export class SessionManager {
       });
       this.lifecycle = new SandboxLifecycleService({
         ...lifecycleOptions,
-        listProjects: () => this.projects.list(),
+        listProjects: () => this.listProjectsWithArchives(),
         reclaim: id => this.archiveProjectNow(id).then(() => {}),
       });
     }
   }
 
 	get remoteArchives() { return this.sandbox?.remoteArchives; }
+  setImageCatalog(catalog: ImageCatalog) { this.imageCatalog = catalog; }
 
   async init() {
     await this.state.init();
@@ -192,13 +199,13 @@ export class SessionManager {
       if (project.updatedAt > owner.updatedAt) owner.updatedAt = project.updatedAt;
       this.sandbox?.track?.(owner, sandbox => this.updateSandbox(project.id, owner.id, sandbox));
     }
-    // Reconcile persisted project bindings with Cellbox. A Pod may have
-    // disappeared while its database reference remained.
+    // Initialize the lifecycle controller's in-memory observations. Project
+    // records retain references only; API responses always query Cellbox.
     for (const project of this.projects.list()) {
       if (project.executionMode !== 'sandbox' || !project.sandbox || !this.sandbox?.inspect) continue;
       if (project.sandboxOperation?.status === 'failed' && ['create', 'resume'].includes(project.sandboxOperation.kind)) continue;
       try { await this.sandbox.inspect(this.projectWorkspace(project)); }
-      catch { /* inspect persists an unavailable state for missing containers */ }
+      catch { /* A later query or lifecycle pass can retry provider inspection. */ }
     }
     for (const session of this.sessions.values()) {
       if (session.projectId || session.settings.executionMode !== 'sandbox' || !session.sandbox) continue;
@@ -276,6 +283,36 @@ export class SessionManager {
         ? Math.max(session.turnCount ?? 0, turns.filter(turn => turn.codexAccepted).length) : turns.length }));
   }
 
+  async listWithSandboxStatus(): Promise<SessionSummary[]> {
+    const list = this.list();
+    const observations = new Map<string, Promise<NonNullable<Session['sandbox']>>>();
+    for (let offset = 0; offset < list.length; offset += 4) await Promise.all(list.slice(offset, offset + 4).map(async session => {
+      if (!session.sandbox) return;
+      let pending = observations.get(session.sandbox.id);
+      if (!pending) {
+        pending = querySandbox(this.sandbox, session.sandbox, true);
+        observations.set(session.sandbox.id, pending);
+      }
+      session.sandbox = { ...session.sandbox, ...await pending };
+    }));
+    return list;
+  }
+
+  private async liveProject(project: Project, allowUnknown = false): Promise<Project> {
+    if (project.sandbox) project.sandbox = await querySandbox(this.sandbox, project.sandbox, allowUnknown);
+    return project;
+  }
+
+  async readProject(id: string): Promise<ProjectSummary> {
+    return this.projectSummary(await this.liveProject(this.projects.get(id), true));
+  }
+
+  async snapshot(id: string): Promise<Session> {
+    const session = this.get(id);
+    if (session.sandbox) session.sandbox = await querySandbox(this.sandbox, session.sandbox, true);
+    return session;
+  }
+
   get(id: string): Session {
     const session = this.lookup(id);
     const turns = session.settings.executionMode === 'sandbox' ? session.turns.slice(-1) : session.turns;
@@ -284,7 +321,7 @@ export class SessionManager {
   async read(id: string): Promise<Session> {
     const session = this.lookup(id);
     if (session.settings.executionMode === 'sandbox') {
-      const snapshot = this.get(id);
+      const snapshot = await this.snapshot(id);
       if (!session.threadId) {
         this.historyErrors.delete(id);
         return { ...snapshot, turns: session.turns.filter(turn => turn.status === 'running'), historyNextCursor: null,
@@ -505,26 +542,11 @@ export class SessionManager {
     return [...this.projects.list()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(project => this.projectSummary(project));
   }
 
-  async listProjectsWithArchives(refreshSandboxes = false): Promise<ProjectSummary[]> {
-    if (refreshSandboxes) {
-      const pending = this.projects.list().filter(project => project.executionMode === 'sandbox' && project.sandbox);
-      // Reserve idle projects during read-only inspection so maintenance cannot
-      // start between the idle check and the provider call. Never connect/resume.
-      const refresh = async (project: Project) => {
-        if (this.projects.isMaintaining(project.id) || this.projects.activeSessionId(project.id)
-          || (project.sandboxOperation?.status === 'failed' && ['create', 'resume', 'restore'].includes(project.sandboxOperation.kind))) return;
-        let release: (() => void) | undefined;
-        try {
-          release = this.projects.acquire(project.id);
-          await this.sandbox?.inspect?.(this.projectWorkspace(project));
-        } catch { /* Keep the last state on a transport error; missing boxes persist unavailable. */ }
-        finally { release?.(); }
-      };
-      // Bound fan-out on installations with many projects.
-      for (let offset = 0; offset < pending.length; offset += 4) await Promise.all(pending.slice(offset, offset + 4).map(refresh));
-    }
-    // The default listing uses snapshots; explicit refresh skips maintenance.
+  async listProjectsWithArchives(): Promise<ProjectSummary[]> {
     const summaries = this.listProjects();
+    // Queries have no lifecycle side effects and are safe during turns and maintenance.
+    for (let offset = 0; offset < summaries.length; offset += 4) await Promise.all(summaries.slice(offset, offset + 4)
+      .map(project => this.liveProject(project, true)));
     return summaries.map(project => ({ ...project, archiveVersions: project.remoteArchives?.map((archive, index, all) => ({
       id: archive.id, version: all.length - index, createdAt: archive.createdAt,
       sizeBytes: archive.sizeBytes, label: `版本 ${all.length - index}`,
@@ -544,52 +566,54 @@ export class SessionManager {
     const valid = await this.validateSettings(settings ?? { ...this.defaults, executionMode: 'sandbox', workingDirectory: this.defaults.executionMode === 'sandbox' ? this.defaults.workingDirectory : this.sandboxWorkingDirectory });
     const project = await this.projects.create(input, valid);
     if (project.executionMode === 'sandbox') await this.submitProjectSandboxOperation(project.id, 'create');
-    return this.getProject(project.id);
+    return this.readProject(project.id);
   }
 
   async updateProject(id: string, input: ProjectUpdate): Promise<ProjectSummary> {
-    return this.projectSummary(await this.projects.update(id, input));
+    await this.projects.update(id, input);
+    return this.readProject(id);
   }
 
-  async rebuildProjectSandbox(id: string): Promise<ProjectSummary> {
-    const project = this.projects.get(id);
+  async rebuildProjectSandbox(id: string, imageVersionId?: string): Promise<ProjectSummary> {
+    const project = await this.liveProject(this.projects.get(id));
     if (project.sandbox?.status === 'paused') throw new HttpError(409, 'Sandbox 已暂停，请恢复运行');
+    if (project.sandbox?.status === 'starting') throw new HttpError(409, 'Sandbox 正在切换状态，请稍后重试');
     if (project.sandbox?.status === 'ready' && !(project.sandboxOperation?.status === 'failed' && ['create', 'resume'].includes(project.sandboxOperation.kind))) {
       throw new HttpError(409, 'Sandbox 已就绪，无需重建');
     }
-    await this.submitProjectSandboxOperation(id, project.remoteArchives?.length || project.status === 'archived' ? 'restore' : 'create');
-    return this.getProject(id);
+    await this.submitProjectSandboxOperation(id, project.remoteArchives?.length || project.status === 'archived' ? 'restore' : 'create', { imageVersionId });
+    return this.readProject(id);
   }
 
   async backupProjectNow(id: string): Promise<ProjectSummary> {
     await this.runProjectSandboxOperation(id, 'backup');
-    return this.getProject(id);
+    return this.readProject(id);
   }
 
   async resumeProjectSandbox(id: string): Promise<ProjectSummary> {
     await this.submitProjectSandboxOperation(id, 'resume');
-    return this.getProject(id);
+    return this.readProject(id);
   }
 
   async checkpointProjectSandbox(id: string): Promise<ProjectSummary> {
     await this.submitProjectSandboxOperation(id, 'checkpoint');
-    return this.getProject(id);
+    return this.readProject(id);
   }
 
-  private async submitProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind']) {
+  private async submitProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'], options: { imageVersionId?: string } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-    await this.sandboxOperations.start(id, kind);
+    await this.sandboxOperations.start(id, kind, options);
   }
 
   async refreshProjectSandboxRuntime(id: string): Promise<ProjectSummary> {
     await this.runProjectSandboxOperation(id, 'refresh');
-    return this.getProject(id);
+    return this.readProject(id);
   }
 
   async archiveProjectNow(id: string, options: { useExistingBackup?: boolean } = {}): Promise<ProjectSummary> {
     await this.runProjectSandboxOperation(id, 'archive', options);
-    return this.getProject(id);
+    return this.readProject(id);
   }
 
   private async runProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'],
@@ -600,7 +624,7 @@ export class SessionManager {
   }
 
   async scheduledArchiveForProject(id: string) {
-    const project = this.projects.get(id);
+    const project = await this.liveProject(this.projects.get(id));
     if (!project.sandbox || project.status === 'archived' || project.sandbox.status !== 'ready') return;
     await this.backupProjectNow(id);
   }
@@ -645,8 +669,8 @@ export class SessionManager {
   }
 
   private async ensureProjectSandbox(id: string): Promise<void> {
-    const project = this.projects.get(id);
     if (this.projects.isMaintaining(id)) throw new HttpError(409, '项目环境正在维护，请稍后重试');
+    const project = await this.liveProject(this.projects.get(id));
     if (project.status === 'archived') {
       throw new HttpError(409, '项目已归档，请先点击“恢复项目”');
     }
@@ -703,12 +727,12 @@ export class SessionManager {
     this.writer.forget(id);
   }
 
-  private async updateSandbox(projectId: string | undefined, sessionId: string, sandbox: NonNullable<Session['sandbox']>, restoreProject = false) {
+  private async updateSandbox(projectId: string | undefined, sessionId: string, sandbox: NonNullable<Session['sandbox']>, restoreProject = false, restoreImage?: ProjectImageSelection) {
     if (projectId) {
       const project = this.projects.find(projectId);
       const replacing = project?.sandbox?.id !== sandbox.id;
       const freshEnvironment = replacing && project?.sandboxOperation?.kind === 'create';
-      if (!await this.projects.updateSandbox(projectId, sandbox, restoreProject)) return;
+      if (!await this.projects.updateSandbox(projectId, sandbox, restoreProject, restoreImage)) return;
       for (const sibling of this.sessions.values()) {
         if (sibling.projectId !== projectId || this.deleting.has(sibling.id)) continue;
         sibling.sandbox = structuredClone(sandbox);
@@ -775,7 +799,7 @@ export class SessionManager {
       const session: Session = { id: randomUUID(), ...(project ? { projectId: project.id, ...(project.sandbox ? { sandbox: structuredClone(project.sandbox) } : {}) } : {}), threadId: input.threadId ?? null, title: input.title ?? '新任务', settings, status: 'idle', startedAt: now, archivedAt: null, createdAt: now, updatedAt: now, turns: [] };
       await this.save(session);
       this.sessions.set(session.id, session);
-      return this.get(session.id);
+      return this.snapshot(session.id);
     } finally { release(); }
   }
 
@@ -797,7 +821,7 @@ export class SessionManager {
     session.updatedAt = new Date().toISOString();
     await this.save(session);
     this.publish(id, { type: 'state', session: this.get(id) });
-    return this.get(id);
+    return this.snapshot(id);
   }
 
   async delete(id: string) {
@@ -880,7 +904,7 @@ export class SessionManager {
       throw new HttpError(409, this.projects.get(session.projectId).status === 'completed'
         ? '项目已完成，请先恢复为使用中再继续对话' : '项目已归档，请先恢复项目后再继续对话');
     }
-    if (session.projectId && !this.projects.get(session.projectId).sandbox) {
+    if (session.projectId && session.settings.executionMode === 'sandbox') {
       await this.ensureProjectSandbox(session.projectId);
       if (this.closing) throw new HttpError(503, '服务正在关闭');
       session = this.lookup(id);
@@ -1013,14 +1037,14 @@ export class SessionManager {
     } catch (error) { done(); throw error; }
   }
 
-  async projectFile(projectId: string, path: string, options?: WorkspaceFileReadOptions) {
+  async projectFile(projectId: string, path: string) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
     if (project.executionMode !== 'sandbox' || !this.sandbox) throw new HttpError(400, '此项目不使用 Sandbox 沙箱');
     if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先发送一条消息');
     const release = this.projects.acquire(project.id);
-    try { return await this.sandbox.file(this.projectWorkspace(project), path, options); }
+    try { return await this.sandbox.file(this.projectWorkspace(project), path); }
     finally { release(); }
   }
 

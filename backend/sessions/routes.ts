@@ -19,7 +19,10 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   const requireAllowedExecution = (mode: string | undefined) => {
     if (config.sandbox?.enabled && mode !== 'sandbox') throw new HttpError(403, '已启用容器执行，本机会话仅供查看历史；请在 Sandbox 项目中创建会话');
   };
-  app.get('/api/sessions', c => c.json(manager.list()));
+  app.get('/api/sessions', async c => {
+    c.header('Cache-Control', 'no-store');
+    return c.json(await manager.listWithSandboxStatus());
+  });
   app.post('/api/sessions', async c => {
     const input = z.object({
       projectId: z.string().uuid().optional(), settings: settingsSchema.optional(), threadId: z.string().uuid().optional(), title: z.string().trim().min(1).max(100).optional(),
@@ -31,7 +34,10 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
     if (input.settings?.executionMode) requireAllowedExecution(input.settings.executionMode);
     return c.json(await manager.create(input), 201);
   });
-  app.get('/api/sessions/:id', async c => c.json(await manager.read(c.req.param('id'))));
+  app.get('/api/sessions/:id', async c => {
+    c.header('Cache-Control', 'no-store');
+    return c.json(await manager.read(c.req.param('id')));
+  });
   app.get('/api/sessions/:id/subagents', async c => c.json(await manager.subagents(c.req.param('id'))));
   app.get('/api/sessions/:id/turns', async c => {
     const cursor = z.string().min(1).max(4096).parse(c.req.query('cursor'));
@@ -68,6 +74,11 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
       const disconnected = new Promise<void>(resolve => { finish = resolve; });
       const send = (message: StreamMessage) => {
         queue = queue.then(async () => {
+          if (closed) return;
+          if (message.type === 'snapshot' || message.type === 'state') {
+            const live = await manager.snapshot(id);
+            message = { ...message, session: { ...message.session, sandbox: live.sandbox } };
+          }
           if (!closed) await stream.writeSSE({ data: JSON.stringify(message) });
         }).catch(() => { closed = true; finish(); });
       };

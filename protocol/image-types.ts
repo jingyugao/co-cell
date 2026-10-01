@@ -8,6 +8,7 @@ export interface ImageVersion {
   importedImageId?: string;
   image?: string;
   resolvedSource?: string;
+  upstreamDigest?: string;
   operationId?: string;
   registryAuthRequired?: boolean;
   projectReady?: boolean;
@@ -15,14 +16,21 @@ export interface ImageVersion {
   runCommand?: string;
   warnings?: string[];
   error?: string;
+  cleanup?: { id: string; status: 'pending' | 'unknown' | 'failed'; operationId?: string; error?: string };
+  deletedAt?: string;
 }
 export interface ManagedImage {
   id: string;
   name: string;
   category: string;
   origin: 'managed' | 'cellbox' | 'profile';
+  repository?: string;
+  buildCommand?: string;
+  registryAuthRequired?: boolean;
+  defaultVersionId?: string;
   versions: ImageVersion[];
 }
+export interface ImageVersionUsage { deletable: boolean; blockers: string[]; manifestShared: boolean }
 export interface ProjectImageSelection {
   imageId: string;
   imageName: string;
@@ -32,12 +40,16 @@ export interface ProjectImageSelection {
   importedImageId: string;
   image: string;
 }
-export interface ImportImageInput {
-  imageId?: string;
-  name?: string;
-  category?: string;
-  version: string;
-  url: string;
+export interface RegistryAuth { username: string; password: string }
+export interface AddImageRepositoryInput {
+  name: string;
+  category: string;
+  repository: string;
   buildCommand?: string;
-  registryAuth?: { username: string; password: string };
+  registryAuthRequired?: boolean;
+}
+export interface RegistryTagsPage { tags: string[]; next?: string }
+export interface SyncImageVersionInput {
+  tag: string;
+  registryAuth?: RegistryAuth;
 }

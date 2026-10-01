@@ -17,17 +17,15 @@ export function WorkspaceFileView({ file, onOpenFile, onClose }: {
   const [loading, setLoading] = useState(true);
   const [retry, setRetry] = useState(0);
   const [source, setSource] = useState(Boolean(file.line));
-  const [slow, setSlow] = useState(false);
   const body = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const controller = new AbortController();
-    setResult(null); setError(''); setLoading(true); setSlow(false);
-    const timer = setTimeout(() => setSlow(true), 1500);
+    setResult(null); setError(''); setLoading(true);
     void api<WorkspaceFile>(`/api/projects/${encodeURIComponent(file.projectId)}/files?path=${encodeURIComponent(file.path)}`, { signal: controller.signal })
       .then(value => { if (!controller.signal.aborted) setResult(value); })
       .catch(reason => { if (!controller.signal.aborted) setError(errorMessage(reason)); })
-      .finally(() => { if (!controller.signal.aborted) { setLoading(false); clearTimeout(timer); } });
-    return () => { controller.abort(); clearTimeout(timer); };
+      .finally(() => { if (!controller.signal.aborted) { setLoading(false); } });
+    return () => { controller.abort(); };
   }, [file.projectId, file.path, retry]);
   useEffect(() => { setSource(Boolean(file.line)); }, [file.path, file.line]);
   useEffect(() => {
@@ -55,7 +53,7 @@ export function WorkspaceFileView({ file, onOpenFile, onClose }: {
       {result && <span>{result.size.toLocaleString()} 字节 · 当前文件</span>}
     </div>
     <div className="workspace-file-body" ref={body}>
-      {loading && <p role="status"><span className="spinner" />{slow ? '正在连接沙箱并读取文件；沙箱暂停时会自动恢复…' : '正在读取文件…'}</p>}
+      {loading && <p role="status"><span className="spinner" />正在读取文件…</p>}
       {error && <div className="inline-error" role="alert">{error}</div>}
       {!loading && result?.kind === 'image' && <img className="workspace-file-image" src={fileContentUrl(file.projectId, file.path)} alt={result.name} />}
       {!loading && result?.kind === 'text' && (markdown && !source

@@ -23,7 +23,8 @@ export class ProjectSandboxes {
   async replace(target: WorkspaceTarget, replacement: SandboxState) {
     const binding = this.track(target);
     const { workingDirectory: _directory, image, ...record } = replacement;
-    const managerRecord = { ...record, ...(image ? { templateIdentity: structuredClone(image) } : {}) };
+    const managerRecord = { ...record, status: record.status === 'unknown' ? 'unavailable' as const : record.status,
+      ...(image ? { templateIdentity: structuredClone(image) } : {}) };
     if (target.sandbox) {
       await this.manager.replace(resourceKey(target), target.sandbox.id, managerRecord);
     } else {
@@ -81,6 +82,7 @@ export class ProjectSandboxes {
       const activeAt = Date.parse(record.lastActiveAt ?? target.updatedAt);
       this.manager.track(key, {
         ...persisted,
+        status: persisted.status === 'unknown' ? 'unavailable' : persisted.status,
         ...(image ? { templateIdentity: structuredClone(image) } : {}),
         lastActiveAt: new Date(Number.isFinite(activeAt) ? activeAt : Date.now()).toISOString(),
       }, binding.persist);

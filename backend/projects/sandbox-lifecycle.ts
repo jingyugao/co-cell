@@ -4,7 +4,7 @@ const DAY = 24 * 60 * 60 * 1000;
 const MINUTE = 60 * 1000;
 
 export interface SandboxLifecycleOptions {
-  listProjects: () => Project[];
+  listProjects: () => Project[] | Promise<Project[]>;
   /** Resolves only after the reclaim operation has reached a terminal state. */
   reclaim: (projectId: string) => Promise<void>;
   archivedReclaimAfterMs?: number;
@@ -48,7 +48,7 @@ export class SandboxLifecycleService {
 
   private async runSweep(): Promise<void> {
     const cutoff = this.now() - this.archivedReclaimAfterMs;
-    const eligible = this.options.listProjects().filter(project => {
+    const eligible = (await this.options.listProjects()).filter(project => {
       if (project.executionMode !== 'sandbox') return false;
       if (project.status !== 'completed') return false;
       // An unhealthy/missing environment needs explicit confirmation to archive

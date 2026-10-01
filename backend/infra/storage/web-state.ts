@@ -1,11 +1,54 @@
 import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import type { Project, Session, Turn } from '../../../protocol/types.js';
+import type { SandboxState } from '../../../protocol/sandbox-types.js';
 
 export interface WebStateStore {
   init(): Promise<void>; listProjects(): Promise<Project[]>; listSessions(): Promise<Session[]>;
   saveProject(project: Project): Promise<void>; saveSession(session: Session): Promise<void>;
   deleteProject(id: string): Promise<void>; deleteSession(id: string): Promise<void>; close(): Promise<void>;
+}
+
+type PersistedSandbox = Omit<SandboxState, 'status'>;
+type SandboxWithTransientError = SandboxState & { statusError?: unknown };
+
+function persistedSandbox(sandbox: SandboxState): PersistedSandbox {
+  const { status: _status, statusError: _statusError, ...metadata } = sandbox as SandboxWithTransientError;
+  return metadata;
+}
+
+function hydrateSandbox(value: SandboxState | undefined): SandboxState | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const { status: _oldStatus, statusError: _statusError, ...metadata } = value as SandboxWithTransientError;
+  // The provider is the source of truth for status. Stored status values predate
+  // this rule and are deliberately ignored on every load.
+  return { ...metadata, status: 'unknown' } as SandboxState;
+}
+
+function persistedProject(project: Project) {
+  const { sandbox, pendingSandboxCleanup, ...metadata } = project;
+  return {
+    ...metadata,
+    ...(sandbox ? { sandbox: persistedSandbox(sandbox) } : {}),
+    ...(pendingSandboxCleanup ? { pendingSandboxCleanup: pendingSandboxCleanup.map(persistedSandbox) } : {}),
+  };
+}
+
+function hydrateProject(project: Project): Project {
+  return {
+    ...project,
+    ...(project.sandbox ? { sandbox: hydrateSandbox(project.sandbox) } : {}),
+    ...(project.pendingSandboxCleanup ? { pendingSandboxCleanup: project.pendingSandboxCleanup.map(sandbox => hydrateSandbox(sandbox)!) } : {}),
+  };
+}
+
+function persistedSession(session: Session) {
+  const { sandbox, ...metadata } = session;
+  return { ...metadata, ...(sandbox ? { sandbox: persistedSandbox(sandbox) } : {}) };
+}
+
+function hydrateSession<T extends Session>(session: T): T {
+  return { ...session, ...(session.sandbox ? { sandbox: hydrateSandbox(session.sandbox) } : {}) } as T;
 }
 
 function requireMySqlUrl(value: string | undefined): string {
@@ -34,12 +77,12 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS projects (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL, requirement_url TEXT NULL, execution_mode ENUM('sandbox','local') NOT NULL, working_directory TEXT NOT NULL, archived_at DATETIME(3) NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sessions (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NULL, thread_id VARCHAR(191) NULL, title VARCHAR(255) NOT NULL, status ENUM('idle','running','completed','failed','cancelled') NOT NULL, archived_at DATETIME(3) NULL, started_at DATETIME(3) NOT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL, INDEX sessions_project_updated (project_id, updated_at), CONSTRAINT sessions_project_fk FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
   }
-  async listProjects(): Promise<Project[]> { const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects'); return rows.map(row => this.document<Project>(row.document)); }
+  async listProjects(): Promise<Project[]> { const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects'); return rows.map(row => hydrateProject(this.document<Project>(row.document))); }
   async listSessions(): Promise<Session[]> {
     const [rows] = await this.pool.query<Array<RowDataPacket & { document: Session | string }>>('SELECT document FROM sessions');
     const sessions: Session[] = [];
     for (const row of rows) {
-      const stored = this.document<Session & { pendingTurns?: Turn[] }>(row.document);
+      const stored = hydrateSession(this.document<Session & { pendingTurns?: Turn[] }>(row.document));
       if (stored.settings.executionMode !== 'sandbox') { sessions.push(stored); continue; }
       const oldTurns = stored.turns ?? [];
       const pendingTurns = stored.pendingTurns ?? oldTurns.filter(turn => turn.codexAccepted && turn.status === 'running');
@@ -62,10 +105,10 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   async close() { await this.pool.end(); }
   private document<T>(value: T | string): T { return typeof value === 'string' ? JSON.parse(value) as T : value; }
   private async saveProjectWith(executor: Pick<Pool, 'query'>, project: Project) {
-    await executor.query(`INSERT INTO projects (id,name,requirement_url,execution_mode,working_directory,archived_at,created_at,updated_at,document) VALUES (?,?,?,?,?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE name=VALUES(name),requirement_url=VALUES(requirement_url),execution_mode=VALUES(execution_mode),working_directory=VALUES(working_directory),archived_at=VALUES(archived_at),updated_at=VALUES(updated_at),document=VALUES(document)`, [project.id, project.name, project.requirementUrl, project.executionMode, project.workingDirectory, this.mysqlDate(project.archivedAt), this.mysqlDate(project.createdAt), this.mysqlDate(project.updatedAt), JSON.stringify(project)]);
+    await executor.query(`INSERT INTO projects (id,name,requirement_url,execution_mode,working_directory,archived_at,created_at,updated_at,document) VALUES (?,?,?,?,?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE name=VALUES(name),requirement_url=VALUES(requirement_url),execution_mode=VALUES(execution_mode),working_directory=VALUES(working_directory),archived_at=VALUES(archived_at),updated_at=VALUES(updated_at),document=VALUES(document)`, [project.id, project.name, project.requirementUrl, project.executionMode, project.workingDirectory, this.mysqlDate(project.archivedAt), this.mysqlDate(project.createdAt), this.mysqlDate(project.updatedAt), JSON.stringify(persistedProject(project))]);
   }
   private async saveSessionWith(executor: Pick<Pool, 'query'>, session: Session) {
-    const document = session.settings.executionMode === 'sandbox' ? this.compactSandboxSession(session) : session;
+    const document = session.settings.executionMode === 'sandbox' ? this.compactSandboxSession(session) : persistedSession(session);
     await executor.query(`INSERT INTO sessions (id,project_id,thread_id,title,status,archived_at,started_at,created_at,updated_at,document) VALUES (?,?,?,?,?,?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE project_id=VALUES(project_id),thread_id=VALUES(thread_id),title=VALUES(title),status=VALUES(status),archived_at=VALUES(archived_at),started_at=VALUES(started_at),updated_at=VALUES(updated_at),document=VALUES(document)`, [session.id, session.projectId ?? null, session.threadId, session.title, session.status, this.mysqlDate(session.archivedAt), this.mysqlDate(session.startedAt), this.mysqlDate(session.createdAt), this.mysqlDate(session.updatedAt), JSON.stringify(document)]);
   }
   private compactSandboxSession(session: Session) {
@@ -73,9 +116,9 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     const pendingTurns = turns.filter(turn => turn.codexAccepted && turn.status === 'running')
       .map(turn => ({ ...turn, images: [], items: [], itemTimestamps: {},
         contextUsage: undefined, sdkUsage: undefined, usage: undefined }));
-    return { ...metadata, turnCount: Math.max(session.turnCount ?? 0,
+    return persistedSession({ ...metadata, turnCount: Math.max(session.turnCount ?? 0,
       turns.filter(turn => turn.codexAccepted || turn.nativeTurnId).length),
-      ...(pendingTurns.length ? { pendingTurns } : {}) };
+      ...(pendingTurns.length ? { pendingTurns } : {}) } as Session);
   }
   private mysqlDate(value: string | null | undefined): string | null {
     if (!value) return null;

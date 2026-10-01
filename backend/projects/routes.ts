@@ -6,7 +6,7 @@ import type { SessionManager } from '../sessions/manager.js';
 import { workspaceDownload } from '../workspaces/download.js';
 import { serviceHost } from './service-host.js';
 
-type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFile' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
+type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFile' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
 
 export async function proxyProjectService(manager: Pick<SessionManager, 'projectService'>, projectId: string, port: number,
   path: string, request: Request, prefix: string, isolatedOrigin = false): Promise<Response> {
@@ -39,25 +39,31 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
     return c.json(await manager.archiveProjectNow(c.req.param('id'), input), 202);
   });
   app.post('/api/projects/:id/backup', async c => c.json(await manager.backupProjectNow(c.req.param('id')), 202));
-  app.post('/api/projects/:id/sandbox/rebuild', async c => c.json(await manager.rebuildProjectSandbox(c.req.param('id')), 202));
+  app.post('/api/projects/:id/sandbox/rebuild', async c => {
+    const body = await c.req.text();
+    let parsed: unknown;
+    try { parsed = body ? JSON.parse(body) : {}; } catch { throw new HttpError(400, '请求 JSON 无效'); }
+    const input = z.object({ imageVersionId: z.string().min(1).max(256).optional() }).strict().parse(parsed);
+    return c.json(await manager.rebuildProjectSandbox(c.req.param('id'), input.imageVersionId), 202);
+  });
   app.post('/api/projects/:id/sandbox/resume', async c => c.json(await manager.resumeProjectSandbox(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/checkpoint', async c => c.json(await manager.checkpointProjectSandbox(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/refresh-runtime', async c => c.json(await manager.refreshProjectSandboxRuntime(c.req.param('id')), 202));
   app.get('/api/projects/:id/files', async c => {
     const path = c.req.query('path');
     if (!path) throw new HttpError(400, '缺少文件路径');
-    const download = () => workspaceDownload(options => manager.projectFile(c.req.param('id'), path, options), c.req.header('Range'), c.req.header('If-Range'), c.req.method === 'HEAD');
-    if (c.req.query('download') === '1') return download();
     const { file, data } = await manager.projectFile(c.req.param('id'), path);
+    const head = c.req.method === 'HEAD';
+    if (c.req.query('download') === '1') return workspaceDownload({ file, data }, head);
     c.header('Cache-Control', 'no-store');
     c.header('X-Content-Type-Options', 'nosniff');
     if (c.req.query('raw') !== '1') return c.json(file);
-    if (file.kind !== 'image') return download();
+    if (file.kind !== 'image') return workspaceDownload({ file, data }, head);
     c.header('Content-Type', file.mimeType);
     c.header('Content-Disposition', `inline; filename="download"; filename*=UTF-8''${encodeURIComponent(file.name).replace(/['()*]/g, value => `%${value.charCodeAt(0).toString(16).toUpperCase()}`)}`);
     c.header('Content-Security-Policy', "default-src 'none'; sandbox");
     c.header('Content-Length', String(data.length));
-    return c.body(new Uint8Array(data));
+    return head ? c.body(null) : c.body(new Uint8Array(data));
   });
 
   app.get('/api/projects/:id/preview', async c => {
@@ -86,17 +92,25 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
   app.all('/api/projects/:id/service/:port/*', service);
 
   const projectSchema = z.object({ name: z.string().trim().min(1).max(100), requirementUrl: z.string().trim().max(4096).url().refine(value => /^https?:\/\//i.test(value), '仅支持 HTTP 或 HTTPS 链接').nullable().optional() }).strict();
-  app.get('/api/projects', async c => c.json(await manager.listProjectsWithArchives(c.req.query('refreshSandboxes') === '1')));
+  app.get('/api/projects', async c => {
+    c.header('Cache-Control', 'no-store');
+    return c.json(await manager.listProjectsWithArchives());
+  });
   const createSchema = projectSchema.extend({ imageId: z.string().min(1).max(4096).optional(), imageVersionId: z.string().min(1).max(200).optional(), name: z.string().trim().max(100).optional(), type: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional() })
     .refine(input => Boolean(input.name || input.requirementUrl), '请输入项目名称或绑定飞书需求')
     .refine(input => Boolean(input.imageId) === Boolean(input.imageVersionId), '镜像和版本必须一起选择');
   app.post('/api/projects', async c => {
     const { imageId, imageVersionId, ...input } = createSchema.parse(await c.req.json());
     if (imageId && !images) throw new HttpError(503, '镜像管理尚未初始化');
-    const imageSelection = imageId ? await images!.resolve(imageId, imageVersionId!) : undefined;
-    return c.json(await manager.createProject({ ...input, ...(imageSelection ? { imageSelection } : {}) }), 201);
+    const reservation = imageId ? await images!.acquireSelection(imageId, imageVersionId!) : undefined;
+    try {
+      return c.json(await manager.createProject({ ...input, ...(reservation?.selection ? { imageSelection: reservation.selection } : {}) }), 201);
+    } finally { reservation?.release(); }
   });
-  app.get('/api/projects/:id', c => c.json(manager.getProject(c.req.param('id'))));
+  app.get('/api/projects/:id', async c => {
+    c.header('Cache-Control', 'no-store');
+    return c.json(await manager.readProject(c.req.param('id')));
+  });
   app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional(), backupRetentionCount: z.number().int().min(2).max(100).optional() }).parse(await c.req.json()))));
   app.delete('/api/projects/:id', async c => { await manager.deleteProject(c.req.param('id')); return c.json({ ok: true }); });
 }

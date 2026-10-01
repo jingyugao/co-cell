@@ -1,4 +1,5 @@
 import ImagePicker from '../images/ImagePicker';
+import RestoreVersionPicker from '../images/RestoreVersionPicker';
 import { useEffect, useRef, useState } from 'react';
 import type { AppConfig, ProjectSummary, ProjectType } from '../../../protocol/types';
 import { SandboxVersion } from '../../components/SandboxVersion';
@@ -16,7 +17,7 @@ type Props = {
   onRefresh: () => Promise<unknown>;
   onCreate: (values: ProjectValues) => Promise<ProjectSummary>;
   onUpdate: (id: string, values: ProjectUpdate) => Promise<ProjectSummary>;
-  onRebuildSandbox: (id: string) => Promise<ProjectSummary>;
+  onRebuildSandbox: (id: string, imageVersionId?: string) => Promise<ProjectSummary>;
   onBackup: (id: string) => Promise<ProjectSummary>;
   onResumeSandbox: (id: string) => Promise<ProjectSummary>;
   onCheckpointSandbox: (id: string) => Promise<ProjectSummary>;
@@ -29,7 +30,7 @@ type Props = {
   initialView?: 'active' | 'completed' | 'archived';
 };
 
-const states = { starting: '准备中', ready: '就绪', paused: '已暂停（Checkpoint）', unavailable: '异常' };
+const states = { starting: '准备中', ready: '就绪', paused: '已暂停（Checkpoint）', unavailable: '异常', unknown: '状态未知' };
 const operationLabels = { create: '创建 Sandbox', checkpoint: 'Checkpoint', backup: '备份', restore: '恢复环境', resume: '恢复运行', refresh: '刷新运行环境', archive: '归档' };
 const date = (value: string) => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) : '—';
 const backupDate = (value: string) => {
@@ -90,6 +91,8 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const pending = useRef(false);
+  const [chooseRestoreVersion, setChooseRestoreVersion] = useState(false);
+  const [restoreVersionId, setRestoreVersionId] = useState('');
   const status = project.status ?? (project.archivedAt ? 'archived' : 'active');
   const archived = status === 'archived';
   const completed = status === 'completed';
@@ -101,10 +104,11 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
   const sandboxNormal = project.executionMode === 'sandbox' && project.sandbox?.status === 'ready'
     && !(operation?.status === 'failed' && ['create', 'resume'].includes(operation.kind));
   const sandboxPaused = project.executionMode === 'sandbox' && project.sandbox?.status === 'paused';
-  const sandboxBroken = project.executionMode === 'sandbox' && Boolean(project.sandbox) && !sandboxNormal && !sandboxPaused;
+  const sandboxBroken = project.executionMode === 'sandbox' && Boolean(project.sandbox)
+    && ['unavailable', 'ready'].includes(project.sandbox!.status) && !sandboxNormal;
   const sandboxMissing = project.executionMode === 'sandbox' && !project.sandbox;
   const latestImage = project.imageSelection ? { reference: project.imageSelection.image, id: project.imageSelection.image, repoDigests: [] } : config?.sandbox?.imageIdentity;
-  const canRestore = project.executionMode === 'sandbox' && (archived || (!sandboxNormal && !sandboxPaused)) && Boolean(backup) && !hasTask && !operating;
+  const canRestore = project.executionMode === 'sandbox' && (archived || sandboxMissing || sandboxBroken) && Boolean(backup) && !hasTask && !operating;
   const typeLabel = projectTypeLabel(project.type, project.weekOf);
   const displayName = projectDisplayName(project);
 
@@ -125,8 +129,8 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
   function restore() {
     if (!backup || !canRestore) return;
     const action = archived ? '恢复项目' : '恢复环境';
-    if (!window.confirm(`将使用 ${date(backup.createdAt)} 的最新备份${action}。该时间之后未备份的文件和对话上下文可能无法恢复。`)) return;
-    void run(action, () => onRebuildSandbox(project.id));
+    if (!window.confirm(`将使用 ${date(backup.createdAt)} 的最新备份${action}。${archived ? '使用所选版本或仓库默认版本创建新环境，服务进程需要重新启动。' : ''}该时间之后未备份的文件和对话上下文可能无法恢复。`)) return;
+    void run(action, () => onRebuildSandbox(project.id, archived && restoreVersionId ? restoreVersionId : undefined));
   }
   const openDisabled = !canEnterProject(project);
   const sandboxDescription = project.executionMode === 'local' ? '本地运行'
@@ -134,6 +138,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
     : sandboxNormal ? <span className="project-sandbox-detail"><span>就绪</span><code title={project.sandbox!.id} aria-label={`Sandbox ID ${project.sandbox!.id}`}>{project.sandbox!.id.slice(0, 6)}</code><SandboxVersion image={project.sandbox!.image} latestImage={latestImage} /></span>
     : sandboxPaused ? <span className="project-sandbox-detail"><span>已暂停（Checkpoint）</span><code title={project.sandbox!.id} aria-label={`Sandbox ID ${project.sandbox!.id}`}>{project.sandbox!.id.slice(0, 6)}</code><SandboxVersion image={project.sandbox!.image} latestImage={latestImage} /></span>
     : project.sandbox?.status === 'starting' ? '准备中'
+    : project.sandbox?.status === 'unknown' ? '状态查询失败，请稍后刷新'
     : sandboxBroken ? '异常'
     : '无 Sandbox';
 
@@ -157,6 +162,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
         <div className="project-card-actions">
           {sandboxPaused ? <button className="secondary-button" disabled={busy || operating || hasTask} onClick={() => void run('恢复运行', () => onResumeSandbox(project.id))}>恢复运行</button>
             : sandboxNormal ? <><button className="secondary-button" disabled={busy || operating || hasTask} onClick={() => void run('Checkpoint', () => onCheckpointSandbox(project.id))}>Checkpoint · 暂停</button><button className="secondary-button" disabled={busy || operating || hasTask} onClick={() => void run('立即备份', () => onBackup(project.id))}>立即备份</button></>
+            : !sandboxBroken && !sandboxMissing ? <span className="project-action-note">等待状态就绪后操作</span>
             : backup ? <button className="secondary-button" disabled={busy || operating || hasTask} onClick={restore}>恢复环境</button>
             : <button className="secondary-button" disabled={busy || operating || hasTask} onClick={() => void run('重建 Sandbox', () => onRebuildSandbox(project.id))}>重建 Sandbox</button>}
         </div>
@@ -164,6 +170,11 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
     </div>
     {operation && !(operation.kind === 'backup' && operation.status === 'succeeded') && <p className={`project-operation ${operation.status === 'failed' ? 'failed' : ''}`} role={operation.status === 'failed' ? 'alert' : 'status'}><strong>{operationLabels[operation.kind]}：{operation.status === 'running' ? operation.phase : operation.status === 'succeeded' ? '已完成' : '失败'}</strong>{operation.error && <span>{operation.error}</span>}</p>}
     {sandboxPaused && !operating && <p className="project-rebuild-hint">Checkpoint 已保存，恢复运行并验证就绪后可进入项目。</p>}
+    {archived && project.executionMode === 'sandbox' && <div className="project-rebuild-hint">
+      <p>恢复时优先使用{project.imageSelection ? '原仓库默认版本' : '当前系统默认镜像'}；文件和对话历史从备份恢复，服务需要重新启动。</p>
+      {project.imageSelection && <><button className="secondary-button" disabled={busy || operating} onClick={() => setChooseRestoreVersion(value => !value)}>选择恢复版本</button>
+        {chooseRestoreVersion && <RestoreVersionPicker imageId={project.imageSelection.imageId} disabled={busy || operating} value={restoreVersionId} onChange={setRestoreVersionId} />}</>}
+    </div>}
     {cleanupPending && !operating && <p className="project-rebuild-hint" role="status">旧环境待清理，系统将自动重试。</p>}
     {!operation && sandboxMissing && backup && <p className="project-rebuild-hint">当前没有 Sandbox，可使用最新备份恢复环境。</p>}
     {error && <p className="project-error" role="alert">{error}</p>}

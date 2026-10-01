@@ -146,8 +146,10 @@ test('imported images skip credentials, use native archives and restore with the
   };
   const imageSelection = { imageId: 'python', imageName: 'Python', category: '开发', versionId: 'v1', version: 'v1',
     importedImageId: 'imported-python-v1', image: 'image@sha256:abc' };
+  fake.archive.portable = true;
   fake.provider.client.restoreBox = async input => {
     assert.equal(input.importedImageId, imageSelection.importedImageId);
+    assert.equal(input.acceptImageChange, true);
     return { id: 'restore', targetId: 'box-1' } as never;
   };
   const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {},
@@ -158,6 +160,7 @@ test('imported images skip credentials, use native archives and restore with the
     assert.equal(fake.credentialWrites.length, 0);
     const archive = await runtime.remoteArchives.capture({ ...target, imageSelection }, 'capture-imported');
     assert.equal(archive.id, fake.archive.id);
+    assert.equal(archive.portable, true);
     const candidate = await runtime.remoteArchives.restore({ ...target, imageSelection }, { ...archive, threadIds: [] }, 'restore-imported', async () => {});
     assert.equal(candidate.image?.reference, imageSelection.image);
   } finally {

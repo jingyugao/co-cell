@@ -10,9 +10,17 @@ import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 
 const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
   modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+const providerSandboxes = new Map<string, NonNullable<Session['sandbox']>>();
 const provisioning = {
   async rebuild(_target: Parameters<SandboxRuntime['rebuild']>[0], save: Parameters<SandboxRuntime['rebuild']>[1]) {
-    await save({ id: 'test-sandbox', template: 'test', status: 'ready', workingDirectory: defaults.workingDirectory });
+    const sandbox = { id: 'test-sandbox', template: 'test', status: 'ready' as const, workingDirectory: defaults.workingDirectory };
+    providerSandboxes.set(sandbox.id, sandbox);
+    await save(sandbox);
+  },
+  async querySandbox(sandbox: NonNullable<Session['sandbox']>) {
+    const provider = providerSandboxes.get(sandbox.id);
+    if (!provider) throw new Error('Sandbox provider state unavailable');
+    return { ...sandbox, status: provider.status };
   },
   async verifySandbox() {},
 };
@@ -68,6 +76,7 @@ test('an accepted App Server turn is recovered after restart without submitting 
     const session = await first.create();
     await first.close();
     const sandbox = { id: 'test-sandbox', template: 'test', status: 'ready' as const, workingDirectory: defaults.workingDirectory };
+    providerSandboxes.set(sandbox.id, sandbox);
     const project = (await state.listProjects()).find(value => value.id === session.projectId)!;
     project.sandbox = sandbox;
     await state.saveProject(project);

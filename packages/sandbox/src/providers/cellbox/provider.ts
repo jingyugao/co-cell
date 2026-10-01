@@ -348,6 +348,12 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
       setTimeout: async timeoutMs => { if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new CellboxError('INVALID_REQUEST', 'Timeout must be positive'); commandTimeout = Math.min(timeoutMs, 300_000); },
       commands: { run: execute as SandboxHandle['commands']['run'] },
       files: {
+        readBytes: async (path, options = {}) => {
+          validAgent(options.user);
+          const relative = workspacePath(path, workspace);
+          if (relative === undefined) throw new CellboxError('FORBIDDEN', 'File must be within the workspace', 403);
+          return this.client.readFile(id, relative, options.signal);
+        },
         read: async (path, options = {}) => { validAgent(options.user); return Buffer.from(await fileBytes(path, options.signal)).toString(); },
         write: async (path, value, options = {}) => {
           validAgent(options.user);

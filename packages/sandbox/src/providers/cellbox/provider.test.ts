@@ -16,6 +16,7 @@ async function fixture() {
   const boxes = new Map<string, Record<string, unknown>>();
   const keys = new Map<string, string>();
   let counter = 0;
+  let fileContents: Buffer = Buffer.from('content');
   let profileProvider = 'resumable-k8s-pod';
   let pending = false;
   let execResult = { stdout: '', stderr: '', exitCode: 0, truncated: false };
@@ -79,7 +80,7 @@ async function fixture() {
         result: execResult }); return;
     }
     if (url.pathname.endsWith('/files') && req.method === 'PUT') { res.writeHead(204); res.end(); return; }
-    if (url.pathname.endsWith('/files') && req.method === 'GET') { res.writeHead(200); res.end('content'); return; }
+    if (url.pathname.endsWith('/files') && req.method === 'GET') { res.writeHead(200); res.end(fileContents); return; }
     if (url.pathname.endsWith('/credentials/glab_token') && req.method === 'PUT') { res.writeHead(204); res.end(); return; }
     if (url.pathname === '/v1/routes') { json(res, 201, { id: 'route-1', boxId: (body as { boxId: string }).boxId,
       port: (body as { port: number }).port, url: 'https://route-1.example.test/' }); return; }
@@ -101,6 +102,7 @@ async function fixture() {
   const address = server.address(); assert(address && typeof address !== 'string');
   return { baseUrl: `http://127.0.0.1:${address.port}`, calls, boxes, keys,
     setProfileProvider(value: string) { profileProvider = value; },
+    setFileContents(value: Buffer) { fileContents = value; },
     setPending(value: boolean) { pending = value; },
     setExecResult(value: typeof execResult) { execResult = value; },
     setExecOperationFails(value: boolean) { execOperationFails = value; },
@@ -293,5 +295,22 @@ test('archive downloads enforce the streamed byte cap', async () => {
     const client = new CellboxClient({ baseUrl: http.baseUrl, token: 'test-client-token' });
     await assert.rejects(client.downloadArchive('archive-1', 4),
       (error: unknown) => error instanceof CellboxError && error.code === 'INVALID_REQUEST');
+  } finally { await http.close(); }
+});
+
+test('native file reads preserve binary bytes and reject external paths without exec fallback', async () => {
+  const http = await fixture();
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s', pollIntervalMs: 1 });
+    const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { cellboxOwnerKey: 'p', cellboxIdempotencyKey: 'native-file-test' } });
+    const contents = Buffer.from([0, 0xff, 0xfe, 0x80]);
+    http.setFileContents(contents);
+    assert.deepEqual(Buffer.from(await box.files.readBytes('/workspace/source/file.bin')), contents);
+    assert.equal(http.calls.filter(call => call.path.includes('/files?')).length, 1);
+    assert.equal(http.calls.find(call => call.path.includes('/files?'))!.path, '/v1/boxes/box-1/files?path=source%2Ffile.bin');
+    await assert.rejects(box.files.readBytes('/shared/docs/file.md'), { code: 'FORBIDDEN' });
+    await assert.rejects(box.files.readBytes('/workspace/../private/file'), { code: 'INVALID_REQUEST' });
+    assert.equal(http.calls.filter(call => call.path.endsWith('/execs')).length, 0);
   } finally { await http.close(); }
 });

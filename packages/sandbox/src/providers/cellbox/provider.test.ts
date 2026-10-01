@@ -43,7 +43,7 @@ async function fixture() {
       let id = keys.get(key);
       if (!id) {
         id = `box-${++counter}`; keys.set(key, id);
-        boxes.set(id, { id, ownerKey: (body as { ownerKey: string }).ownerKey, profileId: 'k8s', state: 'ready', generation: 1,
+        boxes.set(id, { id, ownerKey: (body as { ownerKey: string }).ownerKey, profileId: 'k8s', phase: 'running', generation: 1,
           resourceVersion: 1, image: 'prepared:1', imageId: 'sha256:1', workspace: '/workspace', capabilities,
           createdAt: new Date().toISOString() });
       }
@@ -56,7 +56,7 @@ async function fixture() {
       if (req.method === 'GET') { json(res, 200, box); return; }
       if (boxMatch[2]) {
         const action = boxMatch[2];
-        box.state = action === 'suspend' ? 'suspended' : action === 'resume' ? 'ready' : 'deleted';
+        box.phase = action === 'suspend' ? 'suspended' : action === 'resume' ? 'running' : 'deleted';
         if (action === 'resume') box.generation = (box.generation as number) + 1;
         const value = op(action, boxMatch[1], { boxId: boxMatch[1] }); operations.set(value.id, value); json(res, 202, value); return;
       }
@@ -80,7 +80,7 @@ async function fixture() {
     }
     if (url.pathname.endsWith('/files') && req.method === 'PUT') { res.writeHead(204); res.end(); return; }
     if (url.pathname.endsWith('/files') && req.method === 'GET') { res.writeHead(200); res.end('content'); return; }
-    if (url.pathname.endsWith('/credentials/glab-token') && req.method === 'PUT') { res.writeHead(204); res.end(); return; }
+    if (url.pathname.endsWith('/credentials/glab_token') && req.method === 'PUT') { res.writeHead(204); res.end(); return; }
     if (url.pathname === '/v1/routes') { json(res, 201, { id: 'route-1', boxId: (body as { boxId: string }).boxId,
       port: (body as { port: number }).port, url: 'https://route-1.example.test/' }); return; }
     if (url.pathname === '/v1/routes/route-1/grants') { json(res, 201, { grant: { id: 'grant-1', routeId: 'route-1',
@@ -122,26 +122,38 @@ test('auth, Kubernetes profile validation, and durable create key adoption', asy
     await provider.initialize();
     assert.deepEqual(await provider.currentImageIdentity(), { reference: 'prepared:1', id: 'prepared:1', repoDigests: [] });
     const options = { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause' as const, autoResume: false as const },
-      metadata: { projectId: 'project-one', sessionId: 'conversation-one' } };
+      metadata: { projectId: 'project-one', sessionId: 'conversation-one', cellboxImportedImageId: 'imported-one' } };
     const first = await provider.create('k8s', options);
-    http.boxes.get(first.sandboxId)!.state = 'staged';
+    http.boxes.get(first.sandboxId)!.phase = 'staged';
     await assert.rejects(provider.connect(first.sandboxId), (error: unknown) => error instanceof CellboxError && error.code === 'CONFLICT');
     assert.equal((await provider.connectForSetup(first.sandboxId)).sandboxId, first.sandboxId);
-    http.boxes.get(first.sandboxId)!.state = 'suspended';
+    http.boxes.get(first.sandboxId)!.phase = 'suspended';
     const second = await provider.create('k8s', { ...options, metadata: { ...options.metadata, sessionId: 'conversation-two' } });
     assert.equal(first.sandboxId, second.sandboxId);
-    assert.equal(http.boxes.get(first.sandboxId)!.state, 'ready');
+    assert.equal(http.boxes.get(first.sandboxId)!.phase, 'running');
     const creates = http.calls.filter(call => call.path === '/v1/boxes' && call.method === 'POST');
     assert.equal(creates.length, 2);
     assert.equal(creates[0].key, creates[1].key);
     assert.equal((creates[0].body as { ownerKey: string }).ownerKey, 'project:project-one');
+    assert.equal((creates[0].body as { importedImageId: string }).importedImageId, 'imported-one');
     assert.equal(http.keys.size, 1);
     await provider.kill(first.sandboxId);
     const third = await provider.create('k8s', options);
     assert.notEqual(third.sandboxId, first.sandboxId);
     assert.equal(http.keys.size, 2);
-    await provider.client.writeCredential(third.sandboxId, 'glab-token', Buffer.from('secret'));
-    assert(http.calls.some(call => call.path.endsWith('/credentials/glab-token') && call.body === 'secret'));
+    await provider.client.writeCredential(third.sandboxId, 'glab_token', Buffer.from('secret'));
+    assert(http.calls.some(call => call.path.endsWith('/credentials/glab_token') && call.body === 'secret'));
+    http.boxes.delete(third.sandboxId);
+    const fourth = await provider.create('k8s', options);
+    assert.notEqual(fourth.sandboxId, third.sandboxId);
+    http.boxes.get(fourth.sandboxId)!.phase = 'failed';
+    http.boxes.get(fourth.sandboxId)!.operationId = 'op-still-pending';
+    await assert.rejects(provider.create('k8s', options), (error: unknown) => error instanceof CellboxError && error.code === 'CONFLICT');
+    assert.equal(http.keys.size, 3, 'an active or uncertain operation must keep its original create key');
+    delete http.boxes.get(fourth.sandboxId)!.operationId;
+    const retry = await provider.create('k8s', options);
+    assert.notEqual(retry.sandboxId, fourth.sandboxId);
+    assert.equal(http.keys.size, 4, 'a terminally failed creation can be retried with a new key');
   } finally { await http.close(); await rm(stateDirectory, { recursive: true, force: true }); }
 });
 
@@ -187,7 +199,8 @@ test('exec checks generation, shell quotes outside-workspace paths, and does not
     await provider.pause(box.sandboxId);
     await provider.connect(box.sandboxId);
     const access = await provider.getServiceAccess(box.sandboxId, 3000, 'product-user', 60);
-    assert.equal(access.url, 'https://route-1.example.test/');
+    assert.equal(access.url, `${http.baseUrl}/s/route-1/`);
+    assert.equal(await box.getServiceUrl!(3000), 'https://route-1.example.test/');
     assert.equal(access.headers.Authorization, 'Bearer grant-secret');
     assert.match(await access.renew(60), /^\d{4}-/);
     await access.revoke();

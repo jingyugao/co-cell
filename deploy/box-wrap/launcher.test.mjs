@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { parseConfig, startLauncher } from './launcher.mjs';
 
@@ -28,6 +28,10 @@ process.on('SIGTERM', () => process.exit(0));
 setInterval(() => {}, 1000);
 `, { mode: 0o755 });
   const stop = new AbortController();
+  const previousEnv = { PATH: process.env.PATH, CELLBOX_TOKEN: process.env.CELLBOX_TOKEN, VIRTUAL_ENV: process.env.VIRTUAL_ENV };
+  process.env.PATH = `/opt/project-tools/bin:${process.env.PATH}`;
+  process.env.CELLBOX_TOKEN = 'internal-token';
+  process.env.VIRTUAL_ENV = '/opt/project-venv';
   try {
     const launched = startLauncher({ workspace, startupDirectory, codex: fakeCodex, pollMs: 20,
       signal: stop.signal, log: () => {} });
@@ -45,6 +49,8 @@ setInterval(() => {}, 1000);
     assert.equal(first.env.HOME, '/home/agent');
     assert.equal(first.env.OPENAI_API_KEY, 'test-secret');
     assert.equal(first.env.CELLBOX_TOKEN, undefined);
+    assert.equal(first.env.PATH, process.env.PATH);
+    assert.equal(first.env.VIRTUAL_ENV, '/opt/project-venv');
     assert.equal(await stat(configPath).catch(() => null), null);
     assert.equal((await stat(join(workspace, '.cocell', 'codex'))).mode & 0o777, 0o700);
     await writeFile(configPath, JSON.stringify({ version: 1, appServerArgs: [], env: {} }), { mode: 0o600 });
@@ -54,6 +60,9 @@ setInterval(() => {}, 1000);
     assert.equal(await launched, 0);
   } finally {
     stop.abort();
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -78,6 +87,39 @@ test('rejects an insecure config file and remote listener overrides', async () =
       appServerArgs: [], env: { CELLBOX_TOKEN: 'private' } })), /invalid provisioning/);
   } finally {
     stop.abort();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('starts the npm Codex entrypoint when workload PATH cannot find Node', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-launcher-path-'));
+  const workspace = join(root, 'workspace');
+  const startupDirectory = join(root, 'startup');
+  const report = join(root, 'report.json');
+  const fakeCodex = join(root, 'codex.mjs');
+  const originalPath = process.env.PATH;
+  const stop = new AbortController();
+  let launched;
+  try {
+    await mkdir(workspace);
+    await mkdir(startupDirectory);
+    await writeFile(fakeCodex, `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(report)}, JSON.stringify({ path: process.env.PATH }));
+process.on('SIGTERM', () => process.exit(0));
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+    await writeFile(join(startupDirectory, 'config.json'), JSON.stringify({ version: 1, appServerArgs: [], env: {} }), { mode: 0o600 });
+    process.env.PATH = '/opt/project-tools/without-node';
+    launched = startLauncher({ workspace, startupDirectory, codex: fakeCodex, signal: stop.signal, log: () => {} });
+    await until(async () => (await stat(report).catch(() => null)) !== null);
+    assert.equal(JSON.parse(await readFile(report, 'utf8')).path, `${dirname(process.execPath)}:/opt/project-tools/without-node`);
+    stop.abort();
+    assert.equal(await launched, 0);
+  } finally {
+    stop.abort();
+    if (launched) await launched;
+    if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -11,7 +11,7 @@ import { matchesRemoteArchive } from '../archives/remote.js';
 import { pruneRemoteArchives } from '../archives/retention.js';
 
 const target = (project: Project): WorkspaceTarget => ({ id: project.id, projectId: project.id,
-  settings: { workingDirectory: project.workingDirectory }, sandbox: project.sandbox, updatedAt: project.updatedAt });
+  settings: { workingDirectory: project.workingDirectory }, imageSelection: project.imageSelection, sandbox: project.sandbox, updatedAt: project.updatedAt });
 
 export class ProjectSandboxOperations {
   private tasks = new Set<Promise<void>>();
@@ -49,14 +49,25 @@ export class ProjectSandboxOperations {
     return reference;
   }
 
-  run(id: string, kind: ProjectSandboxOperation['kind'], options: { useExistingBackup?: boolean } = {}): Promise<void> {
+  async run(id: string, kind: ProjectSandboxOperation['kind'], options: { useExistingBackup?: boolean } = {}): Promise<void> {
+    const { done } = await this.start(id, kind, options);
+    await done;
+  }
+
+  /** Persist acceptance before returning; the caller can poll while the task runs. */
+  async start(id: string, kind: ProjectSandboxOperation['kind'], options: { useExistingBackup?: boolean } = {}): Promise<{ done: Promise<void> }> {
     const project = this.deps.projects.get(id);
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
     const release = this.deps.projects.beginMaintenance(id);
-    const task = (async () => {
+    try {
+      await this.deps.projects.updateSandboxOperation(id, { id: randomUUID(), kind,
+        phase: kind === 'create' ? '创建 Sandbox' : '检查环境', status: 'running', updatedAt: new Date().toISOString() });
+    } catch (error) { release(); throw error; }
+    const task = Promise.resolve().then(async () => {
       try {
-        await this.deps.projects.updateSandboxOperation(id, { id: randomUUID(), kind, phase: '检查环境', status: 'running', updatedAt: new Date().toISOString() });
-        if (kind === 'restore') await this.restore(id);
+        if (kind === 'create') await this.create(id);
+        else if (kind === 'checkpoint') await this.checkpoint(id);
+        else if (kind === 'restore') await this.restore(id);
         else if (kind === 'resume') await this.resume(id);
         else if (kind === 'backup') {
           if (project.status === 'archived') throw new HttpError(409, '已归档项目不能立即备份');
@@ -81,10 +92,59 @@ export class ProjectSandboxOperations {
           status: 'failed', error: error instanceof HttpError ? error.message : '操作失败，请重试；详细原因请查看服务端日志。', updatedAt: new Date().toISOString() });
         throw error;
       } finally { release(); }
-    })();
+    });
     this.tasks.add(task);
     void task.finally(() => this.tasks.delete(task)).catch(() => {});
-    return task;
+    return { done: task };
+  }
+
+  private async create(id: string) {
+    const { projects, runtime } = this.deps;
+    const project = projects.get(id);
+    if (project.status === 'archived') throw new HttpError(409, '已归档项目须从备份恢复');
+    if (project.remoteArchives?.length) throw new HttpError(409, '项目已有备份，请使用恢复环境');
+    // A failed preparation can retry the same box. The provider's durable create
+    // journal also reuses an accepted box when the initial response was lost.
+    await this.phase(id, '创建并准备环境');
+    try {
+      await runtime.rebuild(target(project), sandbox => this.persistReadiness(id, sandbox));
+      const candidate = projects.get(id).sandbox;
+      if (!candidate) throw new Error('创建操作没有返回 Sandbox');
+      await this.phase(id, '验证环境');
+      if (!runtime.verifySandbox) throw new HttpError(503, 'Sandbox 不支持就绪验证');
+      await runtime.verifySandbox(candidate);
+      await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, false);
+    } catch (error) {
+      const candidate = projects.get(id).sandbox;
+      if (candidate) await this.deps.saveSandbox(id, { ...candidate, status: 'unavailable' }, false);
+      throw error;
+    }
+  }
+
+  private async persistReadiness(id: string, sandbox: SandboxState) {
+    // Runtime bindings keep this callback after preparation. Read the current
+    // operation rather than capturing "starting" for future lifecycle updates.
+    // Deletion holds the project guard while the runtime persists its final
+    // state. Reading that state must not reject the deletion itself.
+    const operation = this.deps.projects.find(id)?.sandboxOperation;
+    const preparing = operation && ['create', 'resume'].includes(operation.kind);
+    const status = sandbox.status === 'ready' && preparing
+      ? operation.status === 'running' ? 'starting' : operation.status === 'failed' ? 'unavailable' : 'ready'
+      : sandbox.status;
+    await this.deps.saveSandbox(id, { ...sandbox, status }, false);
+  }
+
+  private async checkpoint(id: string) {
+    const { projects, runtime } = this.deps;
+    if (projects.get(id).status === 'archived') throw new HttpError(409, '已归档项目不能暂停');
+    await this.inspect(id);
+    const project = projects.get(id);
+    if (project.sandbox?.status !== 'ready') throw new HttpError(409, '仅运行中的 Sandbox 可以创建 Checkpoint');
+    if (!runtime.checkpoint) throw new HttpError(503, 'Sandbox 不支持 Checkpoint');
+    await this.phase(id, '保存 Checkpoint 并暂停');
+    const paused = await runtime.checkpoint(target(project));
+    if (paused.status !== 'paused') throw new Error('Checkpoint 完成后 Sandbox 未暂停');
+    await this.deps.saveSandbox(id, paused, false);
   }
 
   private async inspect(id: string) {
@@ -147,8 +207,18 @@ export class ProjectSandboxOperations {
     if (current.sandbox?.status !== 'paused') throw new HttpError(409, 'Sandbox 未暂停，无需恢复运行');
     if (!runtime.resume) throw new HttpError(503, 'Sandbox 不支持恢复运行');
     await this.phase(id, '恢复运行');
-    await runtime.resume(target(current), sandbox => this.deps.saveSandbox(id, sandbox, false));
-    if (projects.get(id).sandbox?.status !== 'ready') throw new Error('Sandbox 恢复后未就绪');
+    try {
+      await runtime.resume(target(current), sandbox => this.persistReadiness(id, sandbox));
+      const resumed = projects.get(id).sandbox;
+      if (!resumed || !runtime.verifySandbox) throw new HttpError(503, 'Sandbox 不支持就绪验证');
+      await this.phase(id, '验证环境');
+      await runtime.verifySandbox(resumed);
+      await this.deps.saveSandbox(id, { ...resumed, status: 'ready' }, false);
+    } catch (error) {
+      const resumed = projects.get(id).sandbox;
+      if (resumed) await this.deps.saveSandbox(id, { ...resumed, status: 'unavailable' }, false);
+      throw error;
+    }
   }
 
   private async rememberCleanup(id: string, sandbox: SandboxState) {
@@ -178,7 +248,7 @@ export class ProjectSandboxOperations {
     if (!runtime.verifySandbox || !runtime.fenceSandbox || !runtime.detachSandbox) {
       throw new HttpError(503, 'Sandbox 不支持安全恢复');
     }
-    const currentImage = await runtime.currentImageIdentity?.();
+    const currentImage = await runtime.currentImageIdentity?.(target(projects.get(id)));
     if (reference.storageType !== 'oss' && currentImage && currentImage.id !== reference.imageId) {
       throw new HttpError(409, 'Cellbox 归档只能恢复到相同镜像，当前镜像已变化');
     }
@@ -242,7 +312,7 @@ export class ProjectSandboxOperations {
     const { projects, runtime } = this.deps;
     const project = projects.get(id);
     if (project.status === 'archived' || project.sandbox?.status !== 'ready') throw new HttpError(409, '仅可刷新正常运行的项目 Sandbox');
-    const currentImage = await runtime.currentImageIdentity?.();
+    const currentImage = await runtime.currentImageIdentity?.(target(project));
     if (!currentImage || project.sandbox.image?.id !== currentImage.id) {
       throw new HttpError(409, 'Cellbox 归档只能恢复到相同镜像，无法切换镜像版本');
     }

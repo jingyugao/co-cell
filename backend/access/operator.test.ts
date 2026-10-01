@@ -51,6 +51,7 @@ test('protects UI and API, then issues a signed HttpOnly session', async () => {
   const loginPage = await app.request(`${origin}/auth/login`);
   assert.equal(loginPage.headers.get('strict-transport-security'), 'max-age=86400');
   assert.equal(loginPage.headers.get('x-frame-options'), 'DENY');
+  assert.equal(loginPage.headers.get('referrer-policy'), 'same-origin');
   assert.match(loginPage.headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/);
   const signedIn = await login(app);
   assert.equal(signedIn.status, 303);
@@ -76,10 +77,13 @@ test('protects UI and API, then issues a signed HttpOnly session', async () => {
 
 test('rejects tampered cookies, login CSRF, and cookie write CSRF', async () => {
   const { app } = setup();
-  assert.equal((await app.request(`${origin}/auth/login`, { method: 'POST',
-    headers: { origin: 'https://evil.example', 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ token }).toString(),
-  })).status, 403);
+  for (const requestOrigin of ['https://evil.example', 'null', undefined]) {
+    assert.equal((await app.request(`${origin}/auth/login`, { method: 'POST',
+      headers: { ...(requestOrigin === undefined ? {} : { origin: requestOrigin }),
+        'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token }).toString(),
+    })).status, 403);
+  }
   const cookie = (await login(app)).headers.get('set-cookie')!;
   const pair = cookie.split(';')[0];
   const tampered = pair.slice(0, -1) + (pair.endsWith('A') ? 'B' : 'A');
@@ -111,6 +115,7 @@ test('preserves pending Cellbox request through login and requires a same-origin
     cookie: signedIn.headers.get('set-cookie')!,
   } });
   assert.equal(confirmation.status, 200);
+  assert.equal(confirmation.headers.get('referrer-policy'), 'same-origin');
   assert.match(await confirmation.text(), /Approve Sandbox access\?/);
   assert.deepEqual(calls, ['get:request-1']);
   const body = new URLSearchParams({ request_id: 'request-1' }).toString();

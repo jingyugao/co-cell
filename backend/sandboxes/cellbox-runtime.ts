@@ -39,7 +39,7 @@ export class CellboxRuntimeIntegration {
         capture: async (target, key) => {
                 if (!target.sandbox)
                     throw new Error('Project has no Cellbox');
-                if (ossArchiveEndpoint) {
+                if (ossArchiveEndpoint && (await options.provider.client.getBox(target.sandbox.id)).capabilities.protectedTools) {
                     const suffix = `${target.projectId ?? target.id}/${key.replace(/[^A-Za-z0-9._/-]/g, '_')}.tar.gz`;
                     // The protected tool runs as Cellbox's debug identity with the
                     // agent group. Codex keeps its state in owner-only directories;
@@ -66,6 +66,7 @@ export class CellboxRuntimeIntegration {
             },
             restore: async (target, ref, key, onCandidate) => {
                 if (ref.storageType === 'oss') {
+                    if (target.imageSelection) throw new Error('Imported images cannot restore protected OSS archives');
                     if (!ossArchiveEndpoint) throw new Error('OSS restore endpoint is unavailable');
                     const candidateHandle = await options.provider.create(options.profileId, { timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false }, metadata: { projectId: target.projectId ?? target.id, cellboxOwnerKey: `project:${target.projectId ?? target.id}:oss-restore:${key}`, cellboxIdempotencyKey: key } });
                     const candidate: SandboxState = { id: candidateHandle.sandboxId, template: options.profileId, status: 'starting', workingDirectory: workspace };
@@ -76,12 +77,12 @@ export class CellboxRuntimeIntegration {
                     candidate.image = await options.provider.currentImageIdentity(candidate.id);
                     return candidate;
                 }
-                const op = await options.provider.client.restoreBox({ profileId: options.profileId, ownerKey: `project:${target.projectId ?? target.id}:restore:${key}`, archiveId: ref.id }, key);
+                const op = await options.provider.client.restoreBox({ profileId: options.profileId, ownerKey: `project:${target.projectId ?? target.id}:restore:${key}`, archiveId: ref.id, ...(target.imageSelection ? { importedImageId: target.imageSelection.importedImageId } : {}) }, key);
                 const candidate: SandboxState = { id: op.targetId, template: options.profileId, status: 'starting', workingDirectory: target.settings.workingDirectory };
                 await onCandidate(candidate);
                 await options.provider.waitForOperation(op);
                 const box = await options.provider.client.getBox(candidate.id);
-                if (box.state !== 'staged')
+                if (box.phase !== 'staged')
                     throw new Error('Cellbox did not return a staged restore candidate');
                 candidate.image = { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] };
                 return candidate;
@@ -90,8 +91,8 @@ export class CellboxRuntimeIntegration {
                 const handle = await options.provider.connectForSetup(candidate.id);
                 await this.prepare(handle, { id: candidate.id, settings: { workingDirectory: candidate.workingDirectory }, sandbox: candidate, updatedAt: new Date().toISOString() }, AbortSignal.timeout(120000), false);
                 const box = await options.provider.client.getBox(candidate.id);
-                if (box.state === 'staged') await options.provider.activateBox(candidate.id, `cocell-activate-${candidate.id}`);
-                else if (box.state !== 'ready') throw new Error(`Cellbox restore candidate is ${box.state}`);
+                if (box.phase === 'staged') await options.provider.activateBox(candidate.id, `cocell-activate-${candidate.id}`);
+                else if (box.phase !== 'running') throw new Error(`Cellbox restore candidate is ${box.phase}`);
                 await this.waitForAppServer(handle, AbortSignal.timeout(30000));
             },
             download: async (ref, destination) => {
@@ -120,7 +121,7 @@ export class CellboxRuntimeIntegration {
         let fresh = false;
         const current = previous.catch(() => { }).then(async () => {
             const box = await this.options.provider.client.getBox(handle.sandboxId);
-            if (box.state !== 'ready' && box.state !== 'staged') throw new Error(`Cellbox is ${box.state}`);
+            if (box.phase !== 'running' && box.phase !== 'staged') throw new Error(`Cellbox is ${box.phase}`);
             const cached = this.prepared.get(handle.sandboxId);
             fresh = !cached || cached.generation !== box.generation || cached.workspace !== target.settings.workingDirectory;
             if (fresh) await this.prepareOnce(handle, target, signal, wait, box.generation);
@@ -139,7 +140,7 @@ export class CellboxRuntimeIntegration {
     }
     private async prepareOnce(handle: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal, wait: boolean, generation: number) {
         if (posix.normalize(target.settings.workingDirectory) !== target.settings.workingDirectory || (target.settings.workingDirectory !== workspace && !target.settings.workingDirectory.startsWith(workspace + '/')))
-            throw new Error(`Cellbox project workspace must be inside ${workspace}; existing projects require explicit data migration`);
+            throw new Error(`Cellbox project workspace must be inside ${workspace}`);
         signal.throwIfAborted();
         const root = CELLBOX_PRODUCT_PATHS.root, runtime = CELLBOX_PRODUCT_PATHS.startup;
         const setup = `const fs=require('node:fs'),path=require('node:path');for(const p of ${JSON.stringify([root, CELLBOX_PRODUCT_PATHS.runtime, runtime, CELLBOX_PRODUCT_PATHS.codexHome, target.settings.workingDirectory])}){let current='/';for(const part of p.split('/').filter(Boolean)){current=path.join(current,part);try{fs.mkdirSync(current,{mode:0o700})}catch(e){if(e.code!=='EEXIST')throw e}const s=fs.lstatSync(current);if(!s.isDirectory()||s.isSymbolicLink())throw Error('Unsafe runtime directory');}if(fs.statSync(p).uid!==process.getuid())throw Error('Unsafe runtime owner');}fs.chmodSync(${JSON.stringify(root)},0o700);fs.chmodSync(${JSON.stringify(runtime)},0o700);`;
@@ -174,6 +175,7 @@ export class CellboxRuntimeIntegration {
         const mapping = this.options.credentialSlots ?? {};
         if (!Object.keys(mapping).length || !this.options.connections)
             return;
+        if (!(await this.options.provider.client.getBox(boxId)).capabilities.protectedTools) return;
         const bundle = await this.options.connections.readRuntimeBundle();
         const files: Record<string, Uint8Array> = {
             'glab/config.yml': Buffer.from(bundle?.glabConfig ?? ''), 'gitconfig': Buffer.from(bundle?.gitConfig ?? ''),
@@ -192,10 +194,13 @@ export class CellboxRuntimeIntegration {
             this.credentialDigests.set(boxId, cached);
         }
         for (const [source, slot] of Object.entries(mapping)) {
-            if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(slot))
+            if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(slot))
                 throw new Error('Invalid Cellbox credential slot mapping');
             // Clearing a configured connection must not retain its old secret.
-            const bytes = files[source] ?? new Uint8Array();
+            // Cellbox requires a nonempty credential. Replace a cleared secret
+            // with an inert newline so its previous value cannot survive.
+            const value = files[source];
+            const bytes = value?.byteLength ? value : Buffer.from('\n');
             const digest = createHash('sha256').update(bytes).digest('hex');
             if (cached.slots.get(slot) === digest) continue;
             await this.options.provider.client.writeCredential(boxId, slot, bytes);

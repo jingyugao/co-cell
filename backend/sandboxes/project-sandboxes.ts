@@ -105,6 +105,7 @@ export class ProjectSandboxes {
       ...(options.create ? { create: {
         template: this.template,
         metadata: {
+          ...(target.imageSelection ? { cellboxImportedImageId: target.imageSelection.importedImageId } : {}),
           app: 'codex-web', sessionId: target.id, workingDirectory: target.settings.workingDirectory,
           ...(target.projectId ? { projectId: target.projectId } : {}),
         },
@@ -117,6 +118,13 @@ export class ProjectSandboxes {
   async inspect(target: WorkspaceTarget) {
     this.track(target);
     return this.manager.inspect(resourceKey(target));
+  }
+
+  async checkpoint(target: WorkspaceTarget) {
+    const binding = this.track(target);
+    const record = await this.manager.pause(resourceKey(target));
+    target.sandbox = this.project(record, binding.workingDirectory);
+    return target.sandbox;
   }
 
   holdUsage(target: WorkspaceTarget, usageId: string) {

@@ -1,9 +1,10 @@
 import type { ProjectSummary, SessionSummary } from '../../protocol/types';
+import { canEnterProject } from '../../util/project-sandbox';
 
-export type Page = 'chat' | 'sandboxes' | 'projects' | 'files' | 'connections';
+export type Page = 'chat' | 'sandboxes' | 'projects' | 'files' | 'connections' | 'images';
 export type Selection = { sessionId: string | null; projectId: string | null };
 const isActiveProject = (project: ProjectSummary) => (project.status ?? (project.archivedAt ? 'archived' : 'active')) === 'active';
-const pages: Page[] = ['sandboxes', 'projects', 'files', 'connections'];
+const pages: Page[] = ['sandboxes', 'projects', 'files', 'connections', 'images'];
 
 export function readRoute(location = window.location) {
   const page: Page = pages.includes(location.hash.slice(1) as Page) ? location.hash.slice(1) as Page : 'chat';
@@ -34,16 +35,22 @@ export function resolveSelection(route: ReturnType<typeof readRoute>, sessions: 
     if (!isActiveProject(project)) {
       return { sessionId: null, projectId: null, error: '项目已归档或未处于使用中状态，请先在项目管理中恢复。' };
     }
+    if (route.page === 'chat' && !canEnterProject(project)) {
+      return { sessionId: null, projectId: null, error: '项目 Sandbox 尚未就绪，请先在项目管理中创建或恢复环境。' };
+    }
     return { sessionId: session.id, projectId: session.projectId! };
   }
   if (route.projectId) {
     const project = projects.find(item => item.id === route.projectId);
     if (!project) return { sessionId: null, projectId: null, error: '链接中的项目不存在或已删除，请从项目列表选择项目。' };
+    if (route.page === 'chat' && isActiveProject(project) && !canEnterProject(project)) {
+      return { sessionId: null, projectId: null, error: '项目 Sandbox 尚未就绪，请先在项目管理中创建或恢复环境。' };
+    }
     return !isActiveProject(project)
       ? { sessionId: null, projectId: null, error: '项目已归档或未处于使用中状态，请先在项目管理中恢复。' }
       : { sessionId: null, projectId: route.projectId };
   }
-  const activeProjects = projects.filter(isActiveProject);
+  const activeProjects = projects.filter(canEnterProject);
   const saved = sessions.find(item => item.id === localStorage.getItem('codex-session')
     && activeProjects.some(project => project.id === item.projectId));
   return {

@@ -14,9 +14,9 @@ import type { ConnectionStore } from '../connections/store.js';
 import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import { CELLBOX_PRODUCT_PATHS, CellboxRuntimeIntegration } from './cellbox-runtime.js';
 
-const target = { id: 'project-1', projectId: 'project-1', settings: { workingDirectory: '/workspace/project-1' },
+const target = { id: 'project-1', projectId: 'project-1', settings: { workingDirectory: '/home/agent/workspace/project-1' },
   updatedAt: new Date().toISOString(), sandbox: { id: 'box-1', template: 'k8s', status: 'ready' as const,
-    workingDirectory: '/workspace/project-1' } };
+    workingDirectory: '/home/agent/workspace/project-1' } };
 const result = { stdout: '', stderr: '', exitCode: 0 };
 
 function fakeHandle() {
@@ -76,7 +76,7 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
       writeCredential: async (boxId: string, slot: string, bytes: Uint8Array) => { credentialWrites.push({ boxId, slot, bytes: Buffer.from(bytes) }); },
       restoreBox: async () => { events.push('restore-submit'); return { id: 'op-restore', targetId: 'box-1',
         kind: 'restore', status: 'running', version: 1, createdAt: new Date().toISOString() }; },
-      getBox: async () => { events.push('inspect-staged'); return { state: 'staged', image: 'image@sha256:abc', imageId: 'image@sha256:abc' }; },
+      getBox: async () => { events.push('inspect-staged'); return { phase: 'staged', capabilities: { protectedTools: true }, image: 'image@sha256:abc', imageId: 'image@sha256:abc' }; },
       getArchive: async () => archive,
       downloadArchive: async (_id: string, maxBytes: number) => { assert.equal(maxBytes, 256 * 1024 * 1024); return archiveBytes; },
       deleteArchive: async () => {},
@@ -112,9 +112,58 @@ test('setup stays in the agent workspace, writes 0600 startup config, and instal
   assert(commands.some(call => call.command.includes('Startup config was not consumed')));
   assert.equal(files.has(`${CELLBOX_PRODUCT_PATHS.startup}/config.json`), false);
   assert.deepEqual(credentialWrites.map(write => [write.boxId, write.slot, write.bytes.toString()]), [
-    ['box-1', 'glab_slot', 'glab-secret'], ['box-1', 'cli_slot', 'cli-secret'], ['box-1', 'unused_slot', ''],
+    ['box-1', 'glab_slot', 'glab-secret'], ['box-1', 'cli_slot', 'cli-secret'], ['box-1', 'unused_slot', '\n'],
   ]);
   await runtime.close();
+});
+
+test('clearing a connection replaces its remote credential without submitting an empty payload', async () => {
+  const { handle } = fakeHandle();
+  const { provider, credentialWrites } = fakeProvider();
+  let glabConfig = 'previous-secret';
+  const connections = { readRuntimeBundle: async () => ({ glabConfig }) } as unknown as ConnectionStore;
+  const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {},
+    connections, credentialSlots: { 'glab/config.yml': 'glab_slot' } });
+  try {
+    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    glabConfig = '';
+    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    assert.deepEqual(credentialWrites.map(write => write.bytes.toString()), ['previous-secret', '\n']);
+  } finally { await runtime.close(); }
+});
+
+test('imported images skip credentials, use native archives and restore with the pinned image', async () => {
+  const previousEndpoint = process.env.OSS_ENDPOINT;
+  process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
+  const { handle } = fakeHandle();
+  const fake = fakeProvider();
+  fake.provider.client.getBox = async () => ({ phase: 'staged', generation: 1, image: 'image@sha256:abc',
+    capabilities: { protectedTools: false } }) as never;
+  fake.provider.captureArchive = async (_id, key) => {
+    assert.equal(key, 'capture-imported');
+    return { result: { archiveId: fake.archive.id } } as never;
+  };
+  const imageSelection = { imageId: 'python', imageName: 'Python', category: '开发', versionId: 'v1', version: 'v1',
+    importedImageId: 'imported-python-v1', image: 'image@sha256:abc' };
+  fake.provider.client.restoreBox = async input => {
+    assert.equal(input.importedImageId, imageSelection.importedImageId);
+    return { id: 'restore', targetId: 'box-1' } as never;
+  };
+  const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {},
+    connections: { readRuntimeBundle: async () => { assert.fail('must not read operator credentials for an imported image'); } } as unknown as ConnectionStore,
+    credentialSlots: { __ossAccessKey: 'oss_access' } });
+  try {
+    await runtime.prepare(handle, { ...target, imageSelection }, AbortSignal.timeout(5000));
+    assert.equal(fake.credentialWrites.length, 0);
+    const archive = await runtime.remoteArchives.capture({ ...target, imageSelection }, 'capture-imported');
+    assert.equal(archive.id, fake.archive.id);
+    const candidate = await runtime.remoteArchives.restore({ ...target, imageSelection }, { ...archive, threadIds: [] }, 'restore-imported', async () => {});
+    assert.equal(candidate.image?.reference, imageSelection.image);
+  } finally {
+    await runtime.close();
+    if (previousEndpoint === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previousEndpoint;
+  }
 });
 
 test('grant and lease access renew while active and revoke or release on close', async t => {
@@ -149,7 +198,7 @@ test('OSS backup grants the agent group read access before running its protected
   fake.provider.client.runTool = async (_boxId, tool, args) => {
     assert.equal(tool, 'cocell_archive_backup');
     assert.deepEqual(args, ['project-1/capture-key.tar.gz']);
-    assert(commands.some(call => call.command === 'chmod -R g+rX -- /workspace'));
+    assert(commands.some(call => call.command === 'chmod -R g+rX -- /home/agent/workspace'));
     return { ...result, stdout: JSON.stringify({ storageType: 'oss', objectKey: 'legacy-archives/project-1/capture-key.tar.gz',
       createdAt: '2026-09-27T00:00:00.000Z', sizeBytes: 10, sha256: 'a'.repeat(64) }) };
   };
@@ -193,7 +242,7 @@ test('restore records candidate before waiting, activates after setup, and verif
   } finally { await rm(directory, { recursive: true, force: true }); await runtime.close(); }
 });
 
-test('OSS restore provisions admitted credentials before invoking the tool and migrates the workspace path', async () => {
+test('OSS restore provisions admitted credentials before invoking the tool and uses the product workspace', async () => {
   const previous = { endpoint: process.env.OSS_ENDPOINT, access: process.env.OSS_ACCESS_KEY, secret: process.env.OSS_SECRET_KEY };
   process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
   process.env.OSS_ACCESS_KEY = 'test-access';
@@ -218,9 +267,9 @@ test('OSS restore provisions admitted credentials before invoking the tool and m
       storageType: 'oss', metadata: { objectKey: 'legacy-archives/archive.tar.gz' } };
     const candidate = await runtime.remoteArchives.restore({ ...target,
       settings: { workingDirectory: '/home/agent/workspace' } }, ref, 'restore-key', async value => {
-      assert.equal(value.workingDirectory, '/workspace');
+      assert.equal(value.workingDirectory, '/home/agent/workspace');
     });
-    assert.equal(candidate.workingDirectory, '/workspace');
+    assert.equal(candidate.workingDirectory, '/home/agent/workspace');
   } finally {
     await runtime.close();
     for (const [key, value] of Object.entries({ OSS_ENDPOINT: previous.endpoint,

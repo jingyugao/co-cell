@@ -42,3 +42,32 @@ test('project listing does not inspect Sandboxes or contend with backup maintena
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('new sessions and restarted projects retain their selected image version', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-project-image-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test', modelReasoningEffort: 'low',
+    sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const runtime = { async close() {}, async rebuild(target: Parameters<SandboxRuntime['rebuild']>[0], save: Parameters<SandboxRuntime['rebuild']>[1]) {
+    assert.deepEqual(target.imageSelection, selection);
+    await save({ id: 'python-box', template: 'default', status: 'ready', workingDirectory: defaults.workingDirectory });
+  }, async verifySandbox() {} } as unknown as SandboxRuntime;
+  const selection = { imageId: 'python', imageName: 'Python', category: '开发', versionId: 'v1', version: 'v1',
+    importedImageId: 'imported-v1', image: 'registry/python@sha256:pinned' };
+  let manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime);
+  try {
+    await manager.init();
+    const project = await manager.createProject({ name: 'Python project', imageSelection: selection });
+    await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
+    const session = await manager.create({ projectId: project.id });
+    assert.deepEqual(session.imageSelection, selection);
+    assert.deepEqual((await state.listProjects())[0].imageSelection, selection);
+    await manager.close();
+    manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime);
+    await manager.init();
+    assert.deepEqual(manager.get(session.id).imageSelection, selection);
+    assert.deepEqual(manager.getProject(project.id).imageSelection, selection);
+    const sibling = await manager.create({ projectId: project.id });
+    assert.deepEqual(sibling.imageSelection, selection);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});

@@ -10,6 +10,12 @@ import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 
 const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
   modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+const provisioning = {
+  async rebuild(_target: Parameters<SandboxRuntime['rebuild']>[0], save: Parameters<SandboxRuntime['rebuild']>[1]) {
+    await save({ id: 'test-sandbox', template: 'test', status: 'ready', workingDirectory: defaults.workingDirectory });
+  },
+  async verifySandbox() {},
+};
 const tick = () => new Promise(resolve => setTimeout(resolve, 5));
 async function until(check: () => boolean) {
   for (let i = 0; i < 400; i++) { if (check()) return; await tick(); }
@@ -18,7 +24,7 @@ async function until(check: () => boolean) {
 
 test('legacy running turns are cancelled on restart instead of resubmitted', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'hive-legacy-'));
-  const runtime = { async close() {}, async *run() { assert.fail('must not resubmit'); }, async *recover() { assert.fail('legacy cannot recover'); } } as unknown as SandboxRuntime;
+  const runtime = { ...provisioning, async close() {}, async *run() { assert.fail('must not resubmit'); }, async *recover() { assert.fail('legacy cannot recover'); } } as unknown as SandboxRuntime;
   const state = new MemoryWebStateStore();
   const first = new SessionManager({} as CodexClient, directory, defaults, state, runtime);
   const second = new SessionManager({} as CodexClient, directory, defaults, state, runtime);
@@ -42,6 +48,7 @@ test('an accepted App Server turn is recovered after restart without submitting 
   const directory = await mkdtemp(join(tmpdir(), 'hive-app-server-recovery-'));
   let recoveries = 0, launches = 0, tracked = 0;
   const runtime = {
+    ...provisioning,
     async close() {},
     trackExecution(_session: Session, turn: Turn) { tracked++; assert.equal(turn.nativeTurnId, 'native-turn'); },
     async *run() { launches++; assert.fail('must not resubmit an accepted App Server turn'); },
@@ -94,6 +101,7 @@ test('closing Web detaches an accepted App Server turn without aborting it', asy
   let observedSignal: AbortSignal | undefined;
   let detachCalls = 0;
   const runtime = {
+    ...provisioning,
     async close() {},
     detach(turn: Turn) { detachCalls++; assert.equal(turn.nativeTurnId, 'native-turn'); detach(); },
     async *run(_session: Session, _turn: Turn, signal: AbortSignal, onSandbox: (value: Session['sandbox']) => Promise<void>) {

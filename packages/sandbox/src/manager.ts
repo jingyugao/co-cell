@@ -711,7 +711,8 @@ export class SandboxManager {
   }
 
   private notFound(error: unknown): boolean {
-    return /not found|no such (?:container|object)|404/i.test(String(error));
+    return (error as { code?: string })?.code === 'NOT_FOUND'
+      || /not found|no such (?:container|object)|404/i.test(String(error));
   }
 
   private safeMessage(error: unknown): string {

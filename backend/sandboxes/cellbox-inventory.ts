@@ -17,12 +17,12 @@ export class CellboxSandboxInventory implements SandboxInventoryReader {
             entries.push({ id: session.id, title: session.title, status: session.status });
             associations.set(id, entries);
         }
-        return { enabled: true, fetchedAt: new Date().toISOString(), sandboxes: rows.filter(row => row.state !== 'deleted').map(row => {
+        return { enabled: true, fetchedAt: new Date().toISOString(), sandboxes: rows.filter(row => row.phase !== 'deleted').map(row => {
                 const project = byBox.get(row.id), linked = associations.get(row.id) ?? [];
-                const paused = row.state === 'suspended';
+                const paused = row.phase === 'suspended';
                 return { id: row.id, template: row.profileId,
                     image: { reference: row.image, id: row.imageId ?? row.image, repoDigests: [] },
-                    state: row.state === 'ready' ? 'running' : paused ? 'paused' : 'unknown',
+                    state: row.phase === 'running' ? 'running' : paused ? 'paused' : 'unknown',
                     cpuCount: 0, memoryMB: 0, startedAt: row.createdAt, endAt: '',
                     sessions: linked, session: linked[0] ?? null,
                     metrics: null, metricsSource: 'cellbox', metricsStatus: paused ? 'paused' : 'unavailable',

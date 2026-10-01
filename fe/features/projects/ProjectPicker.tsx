@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef } from 'react';
 import type { ProjectSummary } from '../../../protocol/types';
 import { projectDisplayName, projectTypeLabel } from '../../../util/project-types';
+import { canEnterProject } from '../../../util/project-sandbox';
 import { Icon } from '../../components/Icon';
 import './ProjectPicker.css';
 
@@ -22,6 +23,7 @@ export default function ProjectPicker({ projects, selected, onSelect }: {
     return () => document.removeEventListener('pointerdown', closeOutside);
   }, []);
   const option = (project: ProjectSummary) => <button key={project.id} type="button"
+    disabled={!canEnterProject(project)}
     className="project-switcher-option" aria-pressed={project.id === selected} title={projectDisplayName(project)}
     onClick={() => {
       onSelect(project.id);

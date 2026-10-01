@@ -6,7 +6,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 crane="${CRANE_BIN:-crane}"
 base="${COCELL_DEMO_BASE_IMAGE:-node:22.18.0-bookworm-slim}"
 payload="${COCELL_DEMO_PAYLOAD_IMAGE:-cocell-demo-product:local}"
-guest="${CELLBOX_GUEST_BINARY:-$repo_root/../cell-box/dist/release/cellbox-guest}"
+guest="${CELLBOX_GUEST_BINARY:-$repo_root/../cell-box/dist/release/cellbox-container-agent}"
 port="${COCELL_DEMO_REGISTRY_PORT:-15002}"
 registry="127.0.0.1:$port"
 registry_container=""
@@ -45,8 +45,8 @@ docker cp "$payload_container:/opt/product/cocell" "$work/cocell/opt/product/coc
 docker cp "$payload_container:/opt/cellbox/tools" "$work/cocell/opt/cellbox/tools"
 docker rm "$payload_container" >/dev/null
 payload_container=""
-cp "$guest" "$work/cellbox/opt/cellbox/bin/cellbox-guest"
-chmod 0755 "$work/cellbox/opt/cellbox/bin/cellbox-guest"
+cp "$guest" "$work/cellbox/opt/cellbox/bin/cellbox-container-agent"
+chmod 0755 "$work/cellbox/opt/cellbox/bin/cellbox-container-agent"
 
 for layer in user cocell cellbox; do
   tar --sort=name --owner=0 --group=0 --numeric-owner -cf "$work/$layer.tar" -C "$work/$layer" .
@@ -72,6 +72,6 @@ final_image="$registry/cocell-crane-demo:final"
 
 docker pull "$final_image" >/dev/null
 docker run --rm --network none --entrypoint /bin/sh "$final_image" -c \
-  'user-base-command; codex --version; test -x /opt/product/cocell/launcher.mjs && echo cocell-launcher-present; test -x /opt/cellbox/bin/cellbox-guest && echo cellbox-guest-present'
+  'user-base-command; codex --version; test -x /opt/product/cocell/launcher.mjs && echo cocell-launcher-present; test -x /opt/cellbox/bin/cellbox-container-agent && echo cellbox-container-agent-present'
 "$crane" config --insecure "$final_image" | jq -e '.config.Labels["cocell.demo"] == "crane"' >/dev/null
 printf 'Crane composition passed: %s\nArtifacts: %s\n' "$final_image" "$work"

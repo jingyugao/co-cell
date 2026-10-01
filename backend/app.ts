@@ -1,3 +1,5 @@
+import { installImageRoutes } from './images/routes.js';
+import type { ImageCatalog } from './images/service.js';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
@@ -19,7 +21,7 @@ import { installArchiveRoutes } from './routes/archives.js';
 import { installOperatorAccess, type OperatorAccessOptions } from './access/operator.js';
 import { proxyProjectService } from './projects/routes.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog) {
   const app = new Hono();
   if (operatorAccess) installOperatorAccess(app, {
     ...operatorAccess,
@@ -52,12 +54,13 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
 
   app.get('/api/config', c => c.json(config));
   installProjectsRoutes(app, manager, operatorAccess?.previewSubdomains
-    ? { publicUrl: operatorAccess.publicUrl, token: operatorAccess.token } : undefined);
+    ? { publicUrl: operatorAccess.publicUrl, token: operatorAccess.token } : undefined, images);
   installSessionsRoutes(app, manager, config);
   installNotificationRoutes(app, notifications);
   installArchiveRoutes(app, manager);
   installSandboxesRoutes(app, sandboxes, manager);
   installConnectionsRoutes(app, connections);
+  installImageRoutes(app, images);
   installSharedFilesRoutes(app, sharedFiles);
   app.all('/api/*', c => c.json({ error: '接口不存在' }, 404));
   return app;

@@ -16,6 +16,10 @@ async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), 'hive-history-'));
   const runtime = {
     async close() {},
+    async rebuild(_target: Parameters<SandboxRuntime['rebuild']>[0], save: Parameters<SandboxRuntime['rebuild']>[1]) {
+      await save({ id: 'test-sandbox', template: 'test', status: 'ready', workingDirectory: defaults.workingDirectory });
+    },
+    async verifySandbox() {},
     async *run(_session: Session, _turn: Turn, _signal: AbortSignal, onSandbox: (value: Session['sandbox']) => Promise<void>) {
       await onSandbox({ id: 'test-sandbox', template: 'test', status: 'ready', workingDirectory: defaults.workingDirectory });
       yield { type: 'thread.started' as const, thread_id: 'original-thread' };

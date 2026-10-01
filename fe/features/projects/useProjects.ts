@@ -12,7 +12,7 @@ export function useProjects() {
   const refreshProjects = useCallback(() => {
     if (refreshing.current) return refreshing.current;
     const current = ++sequence.current;
-    const request = api<ProjectSummary[]>('/api/projects?refreshSandboxes=1').then(list => {
+    const request = api<ProjectSummary[]>('/api/projects').then(list => {
       if (current === sequence.current) setProjects(list);
       return list;
     }).finally(() => { if (refreshing.current === request) refreshing.current = null; });
@@ -44,8 +44,8 @@ export function useProjects() {
     }
     finally { await refreshProjects().catch(() => undefined); }
   }, [refreshProjects, storeProject]);
-  const rebuildSandbox = useCallback((id: string) => runSandboxOperation(id, projects.find(project => project.id === id)?.remoteArchives?.length ? 'restore' : 'create', () =>
-    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST' }),
+  const rebuildSandbox = useCallback((id: string, imageVersionId?: string) => runSandboxOperation(id, projects.find(project => project.id === id)?.remoteArchives?.length ? 'restore' : 'create', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST', body: JSON.stringify(imageVersionId ? { imageVersionId } : {}) }),
   ), [projects, runSandboxOperation]);
   const backupProject = useCallback((id: string) => runSandboxOperation(id, 'backup', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/backup`, { method: 'POST' }),

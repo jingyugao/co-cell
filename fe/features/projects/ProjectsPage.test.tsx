@@ -49,6 +49,12 @@ test('abnormal and missing sandboxes use the recovery-or-first-create paths', ()
   assert.match(broken, /恢复环境/);
   assert.doesNotMatch(broken, /立即备份/);
 
+  const unknown = page([project({ sandbox: { id: 'query-failed', status: 'unknown', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);
+  assert.match(unknown, /状态未知/);
+  assert.match(unknown, /状态查询失败/);
+  assert.match(unknown, /<button class="primary-button" disabled="">进入项目/);
+  assert.doesNotMatch(unknown, /恢复环境|重建 Sandbox|立即备份|>异常</);
+
   const missing = page([project()]);
   assert.match(missing, /无 Sandbox/);
   assert.match(missing, /进入项目/);

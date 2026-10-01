@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Hono } from 'hono';
 import type { WorkspaceFile } from '../../protocol/workspace-types.js';
-import { MAX_FILE_BYTES, type WorkspaceFileReadOptions, type WorkspaceFileResult } from '../workspaces/files.js';
+import type { WorkspaceFileResult } from '../workspaces/files.js';
 import { installProjectsRoutes } from './routes.js';
 
 function fixture(contents: Buffer, image = false) {
-  const calls: Array<WorkspaceFileReadOptions | undefined> = [];
+  let calls = 0;
   const file: WorkspaceFile = {
     path: `/home/agent/workspace/${image ? 'pixel.png' : 'export.tsv'}`,
     name: image ? 'pixel.png' : 'export.tsv',
@@ -14,67 +14,64 @@ function fixture(contents: Buffer, image = false) {
     kind: image ? 'image' : 'binary',
     mimeType: image ? 'image/png' : 'application/octet-stream',
   };
-  const projectFile = async (projectId: string, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult> => {
+  const projectFile = async (projectId: string, path: string): Promise<WorkspaceFileResult> => {
     assert.equal(projectId, 'test-project');
     assert.equal(path, file.path);
-    calls.push(options);
-    const version = 'test-file-version';
-    if (options?.metadataOnly || (!options && contents.length > MAX_FILE_BYTES)) {
-      return { file, data: Buffer.alloc(0), version };
-    }
-    if (options?.offset !== undefined) {
-      assert.equal(options.version, version);
-      assert.ok(options.length! > 0 && options.length! <= 1024 * 1024);
-      return { file, data: contents.subarray(options.offset, options.offset + options.length!), version };
-    }
-    return { file, data: contents, version };
+    calls++;
+    return { file, data: contents };
   };
   const app = new Hono();
   installProjectsRoutes(app, { projectFile } as Parameters<typeof installProjectsRoutes>[1]);
   const url = `/api/projects/test-project/files?path=${encodeURIComponent(file.path)}`;
-  return { app, url, file, calls };
+  return { app, url, file, calls: () => calls };
 }
 
-function largeExport() {
-  const contents = Buffer.alloc(MAX_FILE_BYTES + 37, 'x');
+function exportContents() {
+  const contents = Buffer.alloc(2 * 1024 * 1024 + 37, 'x');
   contents.write('id\tvalue\n1\tfirst\n');
   contents.write('\nlast\tcomplete\n', contents.length - 15);
   return contents;
 }
 
-test('raw large files stream the complete attachment instead of an empty preview buffer', async () => {
-  const contents = largeExport();
+test('download returns the already-read complete attachment with one project file read', async () => {
+  const contents = exportContents();
   const { app, url, calls } = fixture(contents);
-  const response = await app.request(`${url}&raw=1`);
+  const response = await app.request(`${url}&download=1`);
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('content-length'), String(contents.length));
   assert.equal(response.headers.get('content-type'), 'application/octet-stream');
-  assert.equal(response.headers.get('accept-ranges'), 'bytes');
   assert.match(response.headers.get('content-disposition')!, /^attachment;/);
   assert.ok(Buffer.from(await response.arrayBuffer()).equals(contents), 'raw attachment must include every byte');
-  assert.ok(calls.some(options => options?.metadataOnly));
-  assert.ok(calls.some(options => options?.offset !== undefined));
+  assert.equal(calls(), 1);
 });
 
-test('raw non-image attachments honor Range and return the requested bytes', async () => {
-  const contents = largeExport();
-  const { app, url } = fixture(contents);
-  const start = MAX_FILE_BYTES - 4;
-  const end = MAX_FILE_BYTES + 12;
-  const response = await app.request(`${url}&raw=1`, { headers: { Range: `bytes=${start}-${end}` } });
-  assert.equal(response.status, 206);
-  assert.equal(response.headers.get('content-range'), `bytes ${start}-${end}/${contents.length}`);
-  assert.equal(response.headers.get('content-length'), String(end - start + 1));
-  assert.ok(Buffer.from(await response.arrayBuffer()).equals(contents.subarray(start, end + 1)));
+test('HEAD downloads read once, preserve size and return no body', async () => {
+  const contents = exportContents();
+  const { app, url, calls } = fixture(contents);
+  const response = await app.request(`${url}&download=1`, { method: 'HEAD' });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-length'), String(contents.length));
+  assert.equal(response.body, null);
+  assert.equal(calls(), 1);
 });
 
-test('ordinary large-file preview still returns JSON metadata without reading chunks', async () => {
-  const { app, url, file, calls } = fixture(largeExport());
+test('ordinary preview returns JSON metadata from a single full file read', async () => {
+  const { app, url, file, calls } = fixture(exportContents());
   const response = await app.request(url);
   assert.equal(response.status, 200);
   assert.match(response.headers.get('content-type')!, /^application\/json/);
   assert.deepEqual(await response.json(), file);
-  assert.deepEqual(calls, [undefined]);
+  assert.equal(calls(), 1);
+});
+
+test('raw binary previews reuse one read for the attachment response', async () => {
+  const contents = Buffer.from('binary data');
+  const { app, url, calls } = fixture(contents);
+  const response = await app.request(`${url}&raw=1`);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-disposition')!, /^attachment;/);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), contents);
+  assert.equal(calls(), 1);
 });
 
 test('raw PNG previews preserve inline image content and MIME type', async () => {
@@ -85,8 +82,11 @@ test('raw PNG previews preserve inline image content and MIME type', async () =>
   assert.equal(response.headers.get('content-type'), 'image/png');
   assert.equal(response.headers.get('content-length'), String(contents.length));
   assert.match(response.headers.get('content-disposition')!, /^inline;/);
+  assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; sandbox");
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(response.headers.get('cache-control'), 'no-store');
   assert.ok(Buffer.from(await response.arrayBuffer()).equals(contents));
-  assert.deepEqual(calls, [undefined]);
+  assert.equal(calls(), 1);
 });
 
 test('rebuild endpoint returns the newly bound Sandbox for an archived project', async () => {

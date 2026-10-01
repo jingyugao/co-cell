@@ -41,6 +41,33 @@ function fixture() {
   return { counts, sandbox, provider, manager, projects, target, record };
 }
 
+test('live Sandbox queries ignore reference status without preparing, connecting or persisting', async () => {
+  const { provider, projects, counts, target, record } = fixture();
+  let writes = 0;
+  target.sandbox = { ...record, status: 'unknown' };
+  projects.track(target, async () => { writes++; });
+  const runtime = new ContainerCodexRuntime({ paths: runtimePaths, prepareRemote: async () => { assert.fail('query prepared the runtime'); },
+    provider, apiKey: '', sandboxes: projects });
+  const source = { ...record, status: 'unavailable' as const };
+  const original = provider.getInfo;
+  try {
+    assert.equal((await runtime.querySandbox(source)).status, 'ready');
+    assert.equal(source.status, 'unavailable');
+    for (const phase of ['creating', 'resuming', 'suspending', 'staged']) {
+      provider.getInfo = async id => ({ ...await original(id), state: 'unknown', metadata: { phase } });
+      assert.equal((await runtime.querySandbox(source)).status, 'starting');
+    }
+    provider.getInfo = async id => ({ ...await original(id), state: 'paused', metadata: { phase: 'suspended' } });
+    assert.equal((await runtime.querySandbox(source)).status, 'paused');
+    provider.getInfo = async () => { throw new CellboxError('NOT_FOUND', 'gone'); };
+    assert.equal((await runtime.querySandbox(source)).status, 'unavailable');
+    provider.getInfo = async () => { throw new CellboxError('TRANSPORT', 'unreachable'); };
+    await assert.rejects(runtime.querySandbox(source), /unreachable/);
+    assert.equal(writes, 0);
+    assert.deepEqual(counts, { create: 0, connect: 0, kill: 0, renew: 0 });
+  } finally { await runtime.close(); }
+});
+
 test('rebuild replaces a missing box but preserves the binding on a transport failure', async () => {
   const { provider, manager, projects, target, sandbox, counts } = fixture();
   target.sandbox = { id: 'removed-box', status: 'unavailable', template: 'base', workingDirectory: target.settings.workingDirectory };

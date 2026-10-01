@@ -8,6 +8,8 @@ export interface RemoteArchiveRef {
   sourceSandboxId: string;
   threadIds: string[];
   storageType?: 'cellbox' | 'oss';
+  /** Verified workspace archive that can be restored with another image. */
+  portable?: boolean;
   metadata?: Record<string, unknown>;
 }
 

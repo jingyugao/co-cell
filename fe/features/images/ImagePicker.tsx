@@ -17,16 +17,17 @@ export default function ImagePicker({ disabled, onChange }: {
       .catch(err => { if (alive) setError(err instanceof Error ? err.message : '镜像读取失败'); });
     return () => { alive = false; };
   }, []);
-  const ready = (version: ManagedImage['versions'][number]) => version.status === 'succeeded' && version.projectReady !== false;
+  const ready = (version: ManagedImage['versions'][number]) => version.status === 'succeeded' && !version.cleanup && version.projectReady !== false;
   const usable = images.filter(image => image.origin !== 'profile' && image.versions.some(ready));
   const categories = [...new Set(usable.map(image => image.category))];
   const selected = usable.find(image => image.id === imageId);
-  const versions = selected?.versions.filter(ready) ?? [];
+  const versions = selected?.versions.filter(ready).filter((version, index, all) =>
+    all.findIndex(value => value.version === version.version) === index) ?? [];
   return <fieldset className="image-picker" disabled={disabled}><legend>项目镜像</legend>
     <label>镜像类型<select aria-label="镜像类型" value={category} onChange={event => { setCategory(event.target.value); setImageId(''); setVersionId(''); onChange(undefined); }}><option value="">系统默认镜像</option>{categories.map(value => <option key={value}>{value}</option>)}</select></label>
     {category && <><label>镜像<select aria-label="镜像" required value={imageId} onChange={event => {
       const image = usable.find(image => image.id === event.target.value);
-      const version = image?.versions.find(ready);
+      const version = image?.versions.find(value => value.id === image.defaultVersionId && ready(value)) ?? image?.versions.find(ready);
       setImageId(image?.id ?? ''); setVersionId(version?.id ?? '');
       onChange(image && version ? { imageId: image.id, imageVersionId: version.id } : undefined);
     }}><option value="">请选择镜像</option>{usable.filter(image => image.category === category).map(image => <option key={image.id} value={image.id}>{image.name}</option>)}</select></label>

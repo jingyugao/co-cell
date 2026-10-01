@@ -36,6 +36,7 @@ export class ProjectService {
         project.sandboxOperation = { ...project.sandboxOperation, status: 'failed', error: '服务重启，操作未确认完成，请重试。', updatedAt: new Date().toISOString() };
         migratedStatus = true;
       }
+      this.clearSandboxStatus(project);
       this.records.set(project.id, project);
       if (migratedStatus) await this.save(project);
     }
@@ -56,6 +57,8 @@ export class ProjectService {
 
   /** Import legacy records before attaching their existing sessions. */
   async import(project: Project): Promise<void> {
+    project = structuredClone(project);
+    this.clearSandboxStatus(project);
     await this.save(project);
     this.records.set(project.id, structuredClone(project));
   }
@@ -137,11 +140,13 @@ export class ProjectService {
       // advance updatedAt; failed maintenance is not fresh user activity.
       if (next.sandbox && !next.sandbox.lastActiveAt) next.sandbox.lastActiveAt = current.updatedAt;
       mutate(next);
+      this.clearSandboxStatus(next);
       next.updatedAt = new Date().toISOString();
       await this.state.saveProject(next);
       // Commit only the fields this operation owns; an unrelated edit may have
       // reserved its own write while storage was pending.
       current.sandbox = next.sandbox;
+      current.imageSelection = next.imageSelection;
       current.workingDirectory = next.workingDirectory;
       current.latestBackup = next.latestBackup;
 	  current.remoteArchives = next.remoteArchives;
@@ -156,6 +161,12 @@ export class ProjectService {
       }
       current.updatedAt = next.updatedAt;
     });
+  }
+
+  /** Project records hold references. Only request-local Cellbox observations have a status. */
+  private clearSandboxStatus(project: Project) {
+    if (project.sandbox) project.sandbox.status = 'unknown';
+    for (const sandbox of project.pendingSandboxCleanup ?? []) sandbox.status = 'unknown';
   }
 
   private validate(input: Partial<ProjectInput>) {
@@ -254,13 +265,14 @@ export class ProjectService {
     } finally { release(); }
   }
 
-  async updateSandbox(id: string, sandbox: NonNullable<Project['sandbox']>, restoreProject = false): Promise<boolean> {
+  async updateSandbox(id: string, sandbox: NonNullable<Project['sandbox']>, restoreProject = false, restoreImage?: ProjectImageSelection): Promise<boolean> {
     const project = this.records.get(id);
     if (!project || this.deleting.has(id)) return false;
     await this.mutateSandboxMetadata(id, next => {
       delete next.sandboxReclaimedAt;
       next.sandbox = structuredClone(sandbox);
       next.workingDirectory = sandbox.workingDirectory;
+      if (restoreProject) next.imageSelection = restoreImage ? structuredClone(restoreImage) : undefined;
       if (restoreProject && next.status === 'archived') {
         const at = new Date().toISOString();
         next.status = 'active';

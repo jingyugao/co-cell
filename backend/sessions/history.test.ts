@@ -14,14 +14,24 @@ const answer = { id: 'answer', type: 'agent_message' as const, text: '2' };
 
 async function fixture() {
   const directory = await mkdtemp(join(tmpdir(), 'hive-history-'));
+  const providerSandboxes = new Map<string, NonNullable<Session['sandbox']>>();
   const runtime = {
     async close() {},
     async rebuild(_target: Parameters<SandboxRuntime['rebuild']>[0], save: Parameters<SandboxRuntime['rebuild']>[1]) {
-      await save({ id: 'test-sandbox', template: 'test', status: 'ready', workingDirectory: defaults.workingDirectory });
+      const sandbox = { id: 'test-sandbox', template: 'test', status: 'ready' as const, workingDirectory: defaults.workingDirectory };
+      providerSandboxes.set(sandbox.id, sandbox);
+      await save(sandbox);
+    },
+    async querySandbox(sandbox: NonNullable<Session['sandbox']>) {
+      const provider = providerSandboxes.get(sandbox.id);
+      if (!provider) throw new Error('Sandbox provider state unavailable');
+      return { ...sandbox, status: provider.status };
     },
     async verifySandbox() {},
     async *run(_session: Session, _turn: Turn, _signal: AbortSignal, onSandbox: (value: Session['sandbox']) => Promise<void>) {
-      await onSandbox({ id: 'test-sandbox', template: 'test', status: 'ready', workingDirectory: defaults.workingDirectory });
+      const sandbox = { id: 'test-sandbox', template: 'test', status: 'ready' as const, workingDirectory: defaults.workingDirectory };
+      providerSandboxes.set(sandbox.id, sandbox);
+      await onSandbox(sandbox);
       yield { type: 'thread.started' as const, thread_id: 'original-thread' };
       yield { type: 'turn.started' as const, turn_id: 'native-turn' };
       yield { type: 'item.completed' as const, item: answer };

@@ -12,12 +12,13 @@ export interface SandboxImageIdentity {
   createdAt?: string;
 }
 
-/** Persisted sandbox metadata; independent of conversation history. */
+/** Sandbox reference and live observation; status is never persisted by CoCell. */
 export interface SandboxState {
   lastActiveAt?: string;
   pausedAt?: string;
   id: string;
-  status: 'starting' | 'ready' | 'paused' | 'unavailable';
+  /** Derived from Cellbox for each query. unknown means the query did not succeed. */
+  status: 'starting' | 'ready' | 'paused' | 'unavailable' | 'unknown';
   template: string;
   /** Optional for backward compatibility with Sandbox records created before image tracking. */
   image?: SandboxImageIdentity;

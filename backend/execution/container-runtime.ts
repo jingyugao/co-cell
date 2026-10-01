@@ -14,7 +14,7 @@ import { readSubagentConversations } from './native-history.mjs';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 import { HttpError } from '../../util/errors.js';
-import type { WorkspaceFileResult, WorkspaceFileReadOptions } from '../workspaces/files.js';
+import type { WorkspaceFileResult } from '../workspaces/files.js';
 
 export interface SandboxRuntime {
 	remoteArchives?: import('../archives/remote.js').RemoteArchives;
@@ -25,8 +25,10 @@ export interface SandboxRuntime {
   recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
   detach(turn: Turn): void;
   service?(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response>;
-  file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult>;
+  file(session: WorkspaceTarget, path: string): Promise<WorkspaceFileResult>;
   inspect?(target: WorkspaceTarget): Promise<unknown>;
+  /** Read Cellbox without connecting, preparing, persisting, or renewing activity. */
+  querySandbox?(sandbox: SandboxState): Promise<SandboxState>;
   history(session: Session, options?: { cursor?: string; limit?: number }): Promise<NativeHistory>;
   subagents?(session: Session): Promise<SubagentConversation[]>;
   delete(session: WorkspaceTarget): Promise<void>;
@@ -468,7 +470,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     } catch (error) { await release(); throw error; }
   }
 
-  async file(session: WorkspaceTarget, path: string, options?: WorkspaceFileReadOptions): Promise<WorkspaceFileResult> {
+  async file(session: WorkspaceTarget, path: string): Promise<WorkspaceFileResult> {
     if (this.closing) throw new HttpError(503, 'Sandbox 运行时正在关闭');
     let entry: Entry;
     try { entry = await this.acquire(session, false); }
@@ -476,7 +478,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     let failed = false;
     try {
       return await readCellboxWorkspaceFile(entry.sandbox,
-        this.node, session.settings.workingDirectory, path, options, this.sharedDocs);
+        session.settings.workingDirectory, path);
     } catch (error) {
       failed = true;
       if (error instanceof HttpError) throw error;
@@ -529,6 +531,19 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   async inspect(target: WorkspaceTarget) {
     return this.sandboxes.inspect(target);
+  }
+
+  async querySandbox(sandbox: SandboxState): Promise<SandboxState> {
+    try {
+      const info = await this.options.provider.getInfo(sandbox.id);
+      const phase = info.metadata?.phase;
+      const status = info.state === 'running' ? 'ready' : info.state === 'paused' ? 'paused'
+        : ['creating', 'resuming', 'suspending', 'staged'].includes(phase ?? '') ? 'starting' : 'unavailable';
+      return { ...sandbox, status, ...(info.templateIdentity ? { image: info.templateIdentity } : {}) };
+    } catch (error) {
+      if (['NOT_FOUND', 'not_found'].includes((error as { code?: string }).code ?? '')) return { ...sandbox, status: 'unavailable' };
+      throw error;
+    }
   }
 
   async rebuild(target: WorkspaceTarget, onSandbox: SaveSandbox) {

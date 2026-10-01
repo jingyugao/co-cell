@@ -25,6 +25,7 @@ export interface CellboxImportedImage {
   id: string; source: string; resolvedSource: string; image: string; platform: string;
   command: string[]; env: Record<string, string>; workingDir: string;
   buildCommand?: string; ports: number[]; warnings: string[]; key: string; createdAt: string;
+  deleting?: boolean;
 }
 export interface CellboxImportImageInput {
   url: string; buildCommand?: string; runCommand?: string; platform?: 'linux/amd64';
@@ -45,6 +46,7 @@ export interface CellboxArchive {
   id: string; sourceBoxId: string; profileId: string; imageId: string;
   agent: { uid: number; gid: number }; sha256: string; size: number;
   consistency: string; createdAt: string;
+  portable?: boolean;
 }
 export interface CellboxLease { id: string; boxId: string; purpose: string; expiresAt: string }
 export interface CellboxAccessRequest {
@@ -182,13 +184,15 @@ export class CellboxClient {
   }
   listImages() { return this.request<CellboxImportedImage[]>('GET', '/v1/images'); }
   getImage(id: string) { return this.request<CellboxImportedImage>('GET', `/v1/images/${this.id(id)}`); }
+  imageUsage(id: string) { return this.request<{ deletable: boolean; blockers: string[]; manifestShared: boolean }>('GET', `/v1/images/${this.id(id)}/usage`); }
+  deleteImage(id: string, key: string) { return this.request<CellboxOperation>('DELETE', `/v1/images/${this.id(id)}`, { key }); }
   listProfiles(signal?: AbortSignal) { return this.request<CellboxProfile[]>('GET', '/v1/profiles', { signal }); }
   listBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes', { signal }); }
   getBox(id: string, signal?: AbortSignal) { return this.request<CellboxBox>('GET', `/v1/boxes/${this.id(id)}`, { signal }); }
   createBox(input: { profileId: string; ownerKey: string; importedImageId?: string }, key: string) {
     return this.request<CellboxOperation>('POST', '/v1/boxes', { body: input, key });
   }
-  restoreBox(input: { profileId: string; ownerKey: string; archiveId: string; importedImageId?: string }, key: string) {
+  restoreBox(input: { profileId: string; ownerKey: string; archiveId: string; importedImageId?: string; acceptImageChange?: boolean }, key: string) {
     return this.request<CellboxOperation>('POST', '/v1/boxes:restore', { body: input, key });
   }
   actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile', key: string) {

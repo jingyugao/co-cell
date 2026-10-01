@@ -15,7 +15,7 @@ const q = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const node = '/usr/local/bin/node';
 const workspace = '/home/agent/workspace';
 export const CELLBOX_PRODUCT_PATHS = { root: `${workspace}/.cocell`, runtime: `${workspace}/.cocell/runtime`, codexHome: `${workspace}/.cocell/codex`, startup: '/home/agent/.cocell-startup', node };
-const metadata = (a: CellboxArchive): RemoteArchiveMetadata => ({ id: a.id, createdAt: a.createdAt, sizeBytes: a.size, sha256: a.sha256, imageId: a.imageId, sourceSandboxId: a.sourceBoxId });
+const metadata = (a: CellboxArchive): RemoteArchiveMetadata => ({ id: a.id, createdAt: a.createdAt, sizeBytes: a.size, sha256: a.sha256, imageId: a.imageId, sourceSandboxId: a.sourceBoxId, ...(a.portable ? { portable: true } : {}) });
 export interface CellboxRuntimeIntegrationOptions {
     provider: CellboxSandboxProvider;
     profileId: string;
@@ -77,7 +77,7 @@ export class CellboxRuntimeIntegration {
                     candidate.image = await options.provider.currentImageIdentity(candidate.id);
                     return candidate;
                 }
-                const op = await options.provider.client.restoreBox({ profileId: options.profileId, ownerKey: `project:${target.projectId ?? target.id}:restore:${key}`, archiveId: ref.id, ...(target.imageSelection ? { importedImageId: target.imageSelection.importedImageId } : {}) }, key);
+                const op = await options.provider.client.restoreBox({ profileId: options.profileId, ownerKey: `project:${target.projectId ?? target.id}:restore:${key}`, archiveId: ref.id, ...(target.imageSelection ? { importedImageId: target.imageSelection.importedImageId } : {}), ...(ref.portable ? { acceptImageChange: true } : {}) }, key);
                 const candidate: SandboxState = { id: op.targetId, template: options.profileId, status: 'starting', workingDirectory: target.settings.workingDirectory };
                 await onCandidate(candidate);
                 await options.provider.waitForOperation(op);

@@ -151,12 +151,12 @@ test('workspace file reads use a protected lease without requiring Codex or a mo
   let startRead!: () => void;
   const reading = new Promise<void>(resolve => { startRead = resolve; });
   const finished = new Promise<void>(resolve => { finishRead = resolve; });
-  sandbox.commands.run = (async () => {
+  sandbox.files.readBytes = async () => {
     startRead();
     await finished;
-    return { exitCode: 0, stderr: '', stdout: JSON.stringify({ path: '/home/agent/workspace/result.txt', size: 2,
-      version: 'test-version', data: Buffer.from('ok').toString('base64') }) };
-  }) as unknown as typeof sandbox.commands.run;
+    return Buffer.from('ok');
+  };
+  sandbox.commands.run = (async () => { assert.fail('file reads must use the native API'); }) as typeof sandbox.commands.run;
   const runtime = new ContainerCodexRuntime({ paths: runtimePaths, prepareRemote: async () => false, provider: fixture().provider, apiKey: '', sandboxes: projects });
   try {
     const result = runtime.file(target, '/home/agent/workspace/result.txt');

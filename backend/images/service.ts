@@ -292,7 +292,8 @@ export class ImageCatalog {
         version.deletedAt = new Date().toISOString();
         await this.save(record); return publicImage(record);
       }
-      const freshAttempt = !version.cleanup || version.cleanup.status === 'failed';
+      const previousCleanup = version.cleanup;
+      const freshAttempt = !previousCleanup || previousCleanup.status === 'failed';
       if (!version.cleanup || version.cleanup.status === 'failed') version.cleanup = { id: randomUUID(), status: 'unknown' };
       await this.save(record);
       try {
@@ -308,8 +309,9 @@ export class ImageCatalog {
         } else if (freshAttempt && error instanceof CellboxError && error.status && error.status >= 400 && error.status < 500
           && ['CONFLICT', 'BUSY', 'INVALID_REQUEST', 'UNAUTHENTICATED', 'FORBIDDEN', 'UNSUPPORTED_CAPABILITY'].includes(error.code)) {
           // These responses reject a fresh request before an operation starts.
-          // Keep the version usable rather than inventing a deletion in progress.
-          delete version.cleanup;
+          // A rejected retry must retain the previous failed operation: Cellbox
+          // may still fence this image after a failed registry deletion.
+          version.cleanup = previousCleanup;
           await this.save(record);
           throw new HttpError(error.code === 'CONFLICT' || error.code === 'BUSY' ? 409 : 502,
             error.code === 'CONFLICT' || error.code === 'BUSY' ? 'Cellbox 检测到镜像仍被引用或其他镜像操作正在执行，请刷新后重试' : 'Cellbox 无法执行镜像清理，请检查接口和 Registry 配置');

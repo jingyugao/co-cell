@@ -251,11 +251,11 @@ test('project API resolves selections on the server and rejects incomplete or fo
   assert.equal((await sync({ tag: 'v1' })).status, 202);
 });
 
-test('a rejected new cleanup attempt after a failed operation leaves the image usable', async () => {
+test('a rejected cleanup retry retains the failed operation for safe retry', async () => {
   const f = fixture(); const catalog = f.catalog(); await catalog.init();
   const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
   const old = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(old.operationId!, old.source);
-  const pinned = await catalog.resolve(repo.id, old.id);
+  await catalog.resolve(repo.id, old.id);
   const next = (await catalog.sync(repo.id, { tag: 'v2' })).versions[0]; f.finish(next.operationId!, next.source);
   await catalog.setDefault(repo.id, next.id);
   await catalog.removeVersion(repo.id, old.id);
@@ -264,5 +264,7 @@ test('a rejected new cleanup attempt after a failed operation leaves the image u
   await catalog.list();
   f.rejectDeletion(true);
   await assert.rejects(catalog.removeVersion(repo.id, old.id), /镜像仍被引用/);
-  assert.deepEqual(await catalog.resolve(repo.id, old.id), pinned);
+  const listed = (await catalog.list()).find(image => image.id === repo.id)!;
+  assert.equal(listed.versions.find(version => version.id === old.id)?.cleanup?.status, 'failed');
+  await assert.rejects(catalog.resolve(repo.id, old.id), /正在清理/);
 });

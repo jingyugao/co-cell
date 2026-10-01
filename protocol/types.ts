@@ -210,6 +210,9 @@ export interface SandboxRecord {
   template: string;
   image?: SandboxImageIdentity;
   state: 'running' | 'paused' | 'unknown';
+  /** Lifecycle phase returned by the inventory source. */
+  phase?: string;
+  inventorySource?: 'kubernetes' | 'oss';
   pausedAt?: string;
   cpuCount: number;
   memoryMB: number;

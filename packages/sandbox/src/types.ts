@@ -106,6 +106,8 @@ export interface SandboxProvider {
   }): Promise<SandboxHandle>;
   connect(sandboxId: string, options: { timeoutMs: number }): Promise<SandboxHandle>;
   getInfo(sandboxId: string): Promise<SandboxInfo>;
+  /** Display-only batch observation; missing IDs are omitted and state may be eventually consistent. */
+  getInfos?(sandboxIds: string[]): Promise<SandboxInfo[]>;
   pause(sandboxId: string): Promise<boolean>;
   kill(sandboxId: string): Promise<boolean>;
 }

@@ -168,6 +168,33 @@ test('inventory combines active boxes and paused checkpoints, preferring the act
   } finally { await http.close(); }
 });
 
+test('batch status reads one resource inventory without per-box or checkpoint requests', async () => {
+  const http = await fixture();
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s' });
+    await provider.initialize();
+    const box = (id: string, phase: string) => ({ id, ownerKey: 'owner', profileId: 'k8s', phase,
+      generation: 1, resourceVersion: 1, image: 'prepared:1', workspace: '/workspace', capabilities,
+      createdAt: '2026-10-01T00:00:00.000Z' });
+    const rows = [box('one', 'running'), box('two', 'suspended'), box('three', 'creating'),
+      box('four', 'restoring'), box('five', 'failed'), box('unrelated', 'running')];
+    http.setInventory(rows, []);
+    http.setCheckpointsUnavailable(true);
+    http.calls.length = 0;
+    const ids = rows.slice(0, 5).map(box => box.id);
+    const infos = await provider.getInfos([...ids, 'missing']);
+    assert.equal(infos.length, 5);
+    assert.equal(infos[0].state, 'running');
+    assert.equal(infos[1].state, 'paused');
+    assert.equal(infos[3].metadata?.phase, 'restoring');
+    assert.deepEqual(http.calls.map(call => call.path), ['/v1/boxes?observation=resource']);
+    await provider.getInfos(ids);
+    assert.equal(http.calls.length, 2, 'every refresh reads the source');
+    assert.deepEqual(await provider.getInfos([]), []);
+    assert.equal(http.calls.length, 2, 'empty lists do not read inventory');
+  } finally { await http.close(); }
+});
+
 test('auth, Kubernetes profile validation, and durable create key adoption', async () => {
   const http = await fixture();
   const stateDirectory = await mkdtemp(join(tmpdir(), 'cellbox-adapter-'));

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { AppServerEventAdapter, Codex, CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
-import type { SandboxHandle, SandboxProvider, SandboxLease, SandboxRecord, CellboxServiceAccess } from '@co-cell/sandbox';
+import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxLease, SandboxRecord, CellboxServiceAccess } from '@co-cell/sandbox';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import { readCellboxWorkspaceFile, cellboxWorkspaceFileResponse } from '../sandboxes/cellbox-files.js';
 import { holdResponse } from '../../util/http-stream.js';
@@ -31,6 +31,8 @@ export interface SandboxRuntime {
   inspect?(target: WorkspaceTarget): Promise<unknown>;
   /** Read Cellbox without connecting, preparing, persisting, or renewing activity. */
   querySandbox?(sandbox: SandboxState): Promise<SandboxState>;
+  /** Display-only batch observation; does not perform execution validation. */
+  querySandboxes?(sandboxes: SandboxState[]): Promise<SandboxState[]>;
   history(session: Session, options?: { cursor?: string; limit?: number }): Promise<NativeHistory>;
   subagents?(session: Session): Promise<SubagentConversation[]>;
   delete(session: WorkspaceTarget): Promise<void>;
@@ -554,14 +556,27 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async querySandbox(sandbox: SandboxState): Promise<SandboxState> {
     try {
       const info = await this.options.provider.getInfo(sandbox.id);
-      const phase = info.metadata?.phase;
-      const status = info.state === 'running' ? 'ready' : info.state === 'paused' ? 'paused'
-        : ['creating', 'resuming', 'suspending', 'staged'].includes(phase ?? '') ? 'starting' : 'unavailable';
-      return { ...sandbox, status, ...(info.templateIdentity ? { image: info.templateIdentity } : {}) };
+      return this.sandboxObservation(sandbox, info);
     } catch (error) {
       if (['NOT_FOUND', 'not_found'].includes((error as { code?: string }).code ?? '')) return { ...sandbox, status: 'unavailable' };
       throw error;
     }
+  }
+
+  async querySandboxes(sandboxes: SandboxState[]): Promise<SandboxState[]> {
+    if (!sandboxes.length) return [];
+    if (!this.options.provider.getInfos) throw new HttpError(503, 'Sandbox 批量状态查询未配置');
+    const infos = await this.options.provider.getInfos([...new Set(sandboxes.map(sandbox => sandbox.id))]);
+    const byId = new Map(infos.map(info => [info.sandboxId, info]));
+    return sandboxes.map(sandbox => this.sandboxObservation(sandbox, byId.get(sandbox.id)));
+  }
+
+  private sandboxObservation(sandbox: SandboxState, info?: SandboxInfo): SandboxState {
+    if (!info) return { ...sandbox, status: 'unavailable' };
+    const phase = info.metadata?.phase;
+    const status = info.state === 'running' ? 'ready' : info.state === 'paused' ? 'paused'
+      : ['creating', 'resuming', 'restoring', 'checkpointing', 'suspending', 'staged'].includes(phase ?? '') ? 'starting' : 'unavailable';
+    return { ...sandbox, status, ...(info.templateIdentity ? { image: info.templateIdentity } : {}) };
   }
 
   async rebuild(target: WorkspaceTarget, onSandbox: SaveSandbox) {

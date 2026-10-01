@@ -210,8 +210,19 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   async getInfo(id: string): Promise<SandboxInfo> {
     await this.ready();
     const box = await this.box(id);
+    return this.boxInfo(box);
+  }
+  async getInfos(ids: string[]): Promise<SandboxInfo[]> {
+    if (!ids.length) return [];
+    await this.ready();
+    const wanted = new Set(ids);
+    const boxes = await this.client.listResourceBoxes();
+    return boxes.filter(box => wanted.has(box.id) && box.profileId === this.profileId)
+      .map(box => this.boxInfo(box));
+  }
+  private boxInfo(box: CellboxBox): SandboxInfo {
     const startedAt = new Date(box.createdAt);
-    return { sandboxId: id, state: box.phase === 'running' ? 'running' : box.phase === 'suspended' ? 'paused' : 'unknown',
+    return { sandboxId: box.id, state: box.phase === 'running' ? 'running' : box.phase === 'suspended' ? 'paused' : 'unknown',
       startedAt, endAt: new Date('9999-12-31T23:59:59.999Z'),
       metadata: { ownerKey: box.ownerKey, profileId: box.profileId, generation: String(box.generation), phase: box.phase },
       templateIdentity: { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] } };

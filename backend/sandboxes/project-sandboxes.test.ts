@@ -68,6 +68,29 @@ test('live Sandbox queries ignore reference status without preparing, connecting
   } finally { await runtime.close(); }
 });
 
+test('batch observations map missing and transitional boxes without per-box reads', async () => {
+  const { provider, projects, record } = fixture();
+  let calls = 0;
+  provider.getInfo = async () => { assert.fail('batch used per-box inspection'); };
+  provider.getInfos = async ids => {
+    calls++;
+    assert.deepEqual(ids, ['running', 'paused', 'restoring', 'checkpointing', 'missing']);
+    return ['running', 'paused', 'restoring', 'checkpointing'].map(id => ({ sandboxId: id,
+      state: id === 'running' ? 'running' as const : id === 'paused' ? 'paused' as const : 'unknown' as const,
+      startedAt: new Date(), endAt: new Date(), metadata: { phase: id } }));
+  };
+  const runtime = new ContainerCodexRuntime({ paths: runtimePaths, provider, apiKey: '', sandboxes: projects,
+    prepareRemote: async () => { assert.fail('batch prepared runtime'); } });
+  try {
+    const ids = ['running', 'paused', 'restoring', 'checkpointing', 'missing', 'running'];
+    const observed = await runtime.querySandboxes(ids.map(id => ({ ...record, id })));
+    assert.deepEqual(observed.map(box => box.status), ['ready', 'paused', 'starting', 'starting', 'unavailable', 'ready']);
+    assert.equal(calls, 1);
+    provider.getInfos = async () => { throw new Error('source unavailable'); };
+    await assert.rejects(runtime.querySandboxes([record]), /source unavailable/);
+  } finally { await runtime.close(); }
+});
+
 test('rebuild replaces a missing box but preserves the binding on a transport failure', async () => {
   const { provider, manager, projects, target, sandbox, counts } = fixture();
   target.sandbox = { id: 'removed-box', status: 'unavailable', template: 'base', workingDirectory: target.settings.workingDirectory };

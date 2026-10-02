@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import type { ProjectToolGrantInput, ProxyTool, SecretInput, SecretMetadata, ToolInvocationSetup } from '../../protocol/secret-types.js';
+import { PROXY_TOOLS, type ProjectToolGrant, type ProjectToolGrantInput, type ProjectToolSelection, type ProxyTool, type SecretInput, type SecretUpdate, type SecretMetadata, type ToolInvocationSetup } from '../../protocol/secret-types.js';
+import { defaultCredentialPath } from '../../util/tool-secrets.js';
 import { HttpError } from '../../util/errors.js';
 import { SecretCrypto } from './crypto.js';
 import { credentialPath, validateToolArgs } from './policy.js';
@@ -27,7 +28,33 @@ export class SecretService {
   }
   async list() {
     const [secrets, grants] = await Promise.all([this.repository.list(), this.repository.allGrants()]);
-    return secrets.map(secret => this.metadata(secret, [...new Set(grants.filter(g => g.files.some(f => f.secretId === secret.id)).map(g => g.projectId))]));
+    return secrets.map(secret => this.metadata(this.withLegacyConfig(secret, grants), [...new Set(grants.filter(g => g.files.some(f => f.secretId === secret.id)).map(g => g.projectId))]));
+  }
+  private withLegacyConfig(secret: StoredSecret, grants: ProjectToolGrant[]): StoredSecret {
+    if (secret.tool) return secret;
+    const bindings = grants.flatMap(grant => grant.files.filter(file => file.secretId === secret.id)
+      .map(file => ({ tool: grant.tool, path: file.path, alias: grant.alias })));
+    const unique = [...new Map(bindings.map(value => [JSON.stringify(value), value])).values()];
+    return unique.length === 1 ? { ...secret, ...unique[0] } : secret;
+  }
+  private validateConfig(secret: StoredSecret, bytes: Buffer) {
+    if (!secret.tool) {
+      if (secret.path || secret.alias) throw new HttpError(400, '请先选择密钥所属工具');
+      return;
+    }
+    if (!PROXY_TOOLS.includes(secret.tool)) throw new HttpError(400, '工具类型无效');
+    const path = credentialPath(secret.path ?? '');
+    if (!/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(secret.alias ?? '')) throw new HttpError(400, '连接名称无效');
+    const supported = secret.tool === 'mysql' ? ['.mylogin.cnf', '.my.cnf'].includes(path)
+      : secret.tool === 'kubectl' ? path === '.kube/config'
+      : secret.tool === 'glab' ? path.startsWith('.config/glab-cli/')
+      : secret.tool === 'meegle' ? path.startsWith('.meegle/')
+      : /^(?:\.lark-cli\/|\.config\/lark-cli\/|\.local\/share\/lark-cli\/)/.test(path);
+    if (!supported || (secret.tool === 'kubectl' && secret.format !== 'json')) throw new HttpError(400, '认证文件类型或路径与工具不匹配');
+    if (secret.tool === 'mysql' && ((path === '.mylogin.cnf' && secret.format !== 'binary') || (path === '.my.cnf' && secret.format === 'binary')))
+      throw new HttpError(400, 'MySQL 登录文件使用 binary，.my.cnf 使用 JSON 或文本');
+    if (['mysql', 'kubectl'].includes(secret.tool) && secret.mutable) throw new HttpError(400, 'MySQL 和 Kubernetes 配置由管理员维护');
+    materialize(secret.tool, path, secret.alias!, secret, bytes);
   }
   private async requireSecret(id: string) { const secret = await this.repository.get(id); if (!secret) throw new HttpError(404, 'Secret 不存在'); return secret; }
   async content(id: string) {
@@ -36,46 +63,62 @@ export class SecretService {
   }
   async create(input: SecretInput) {
     const id = randomUUID(), versionId = randomUUID(), now = new Date().toISOString();
-    const ciphertext = this.crypto.seal(id, versionId, secretBytes(input.format, input.content));
-    const secret: StoredSecret = { id, name: input.name, format: input.format, mutable: input.mutable, enabled: true, version: 0, currentVersionId: versionId, ciphertext, createdAt: now, updatedAt: now };
+    const bytes = secretBytes(input.format, input.content), ciphertext = this.crypto.seal(id, versionId, bytes);
+    const secret: StoredSecret = { id, name: input.name, format: input.format, mutable: input.mutable, enabled: true, version: 0, currentVersionId: versionId, ciphertext, createdAt: now, updatedAt: now,
+      tool: input.tool ?? null, path: input.path ?? (input.tool ? defaultCredentialPath(input.tool, input.format) : null), alias: input.alias ?? (input.tool ? 'default' : null) };
+    this.validateConfig(secret, bytes);
     await this.repository.save(secret, { id: versionId, secretId: id, ciphertext, source: 'operator', baseVersion: null, createdAt: now, projectId: null, invocationId: null, changes: ['created'] });
     return this.metadata(await this.requireSecret(id));
   }
-  async update(id: string, input: { name?: string; mutable?: boolean; enabled?: boolean; content?: string }) {
+  async update(id: string, input: SecretUpdate) {
     const secret = await this.requireSecret(id), now = new Date().toISOString();
+    const next: StoredSecret = { ...secret, ...input,
+      path: input.path ?? (input.tool && input.tool !== secret.tool ? defaultCredentialPath(input.tool, secret.format) : secret.path),
+      alias: input.alias ?? (input.tool && !secret.alias ? 'default' : secret.alias), updatedAt: now };
     const changes = Object.keys(input).filter(key => key === 'content' || input[key as keyof typeof input] !== secret[key as keyof StoredSecret]);
     if (!changes.length) return this.metadata(secret);
     const bytes = input.content === undefined ? this.crypto.open(id, secret.currentVersionId, secret.ciphertext) : secretBytes(secret.format, input.content);
+    this.validateConfig(next, bytes);
+    if (changes.some(key => ['tool', 'path', 'alias'].includes(key))) {
+      const incompatible = (await this.repository.allGrants()).some(grant => grant.files.some(file => file.secretId === id
+        && (grant.tool !== next.tool || file.path !== next.path || grant.alias !== next.alias)));
+      if (incompatible) throw new HttpError(400, '密钥已被项目使用，不能更改工具或认证文件配置');
+    }
     const versionId = randomUUID(), ciphertext = this.crypto.seal(id, versionId, bytes);
     const version: StoredVersion = { id: versionId, secretId: id, ciphertext, source: 'operator', baseVersion: secret.version, createdAt: now, projectId: null, invocationId: null, changes };
-    await this.repository.save({ ...secret, name: input.name ?? secret.name, mutable: input.mutable ?? secret.mutable, enabled: input.enabled ?? secret.enabled, updatedAt: now }, version);
+    const { content: _content, ...stored } = next as StoredSecret & { content?: string };
+    await this.repository.save(stored, version);
     return this.metadata(await this.requireSecret(id));
   }
   async versions(id: string) { await this.requireSecret(id); return (await this.repository.versions(id)).map(({ ciphertext: _ciphertext, secretId: _id, ...metadata }) => metadata); }
   grants(projectId: string) { return this.repository.grants(projectId); }
   async saveGrant(projectId: string, input: ProjectToolGrantInput) {
-    const paths = input.files.map(file => credentialPath(file.path));
-    if (new Set(paths).size !== paths.length || new Set(input.files.map(file => file.secretId)).size !== input.files.length)
-      throw new HttpError(400, '认证文件路径和 Secret 不可重复绑定');
-    for (let i = 0; i < paths.length; i++) {
-      const secret = await this.requireSecret(input.files[i].secretId);
-      const supported = input.tool === 'mysql' ? ['.mylogin.cnf', '.my.cnf'].includes(paths[i])
-        : input.tool === 'kubectl' ? paths[i] === '.kube/config'
-        : input.tool === 'glab' ? paths[i].startsWith('.config/glab-cli/')
-        : input.tool === 'meegle' ? paths[i].startsWith('.meegle/')
-        : /^(?:\.lark-cli\/|\.config\/lark-cli\/|\.local\/share\/lark-cli\/)/.test(paths[i]);
-      if (!supported || (input.tool === 'kubectl' && secret.format !== 'json')) throw new HttpError(400, 'Secret 类型或文件路径与工具不匹配');
-      if (input.tool === 'mysql' && ((paths[i] === '.mylogin.cnf' && secret.format !== 'binary') || (paths[i] === '.my.cnf' && secret.format === 'binary')))
-        throw new HttpError(400, 'MySQL 登录文件使用 binary，.my.cnf 使用 JSON 或文本');
-      if (['mysql', 'kubectl'].includes(input.tool) && secret.mutable) throw new HttpError(400, 'MySQL 和 Kubernetes 配置由管理员维护，请关闭工具更新');
-      materialize(input.tool, paths[i], input.alias, secret, this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext));
-    }
-    if (['mysql', 'kubectl'].includes(input.tool) && input.files.length !== 1) throw new HttpError(400, '该工具必须绑定一份认证文件');
-    if (!['mysql', 'kubectl'].includes(input.tool) && !input.policy.commandPrefixes.length) throw new HttpError(400, '请配置允许的工具命令前缀');
+    if (input.files.length !== 1) throw new HttpError(400, '每种工具只能选择一个密钥');
+    const file = input.files[0], path = credentialPath(file.path), secret = await this.requireSecret(file.secretId);
+    if (secret.tool && (secret.tool !== input.tool || secret.path !== path || secret.alias !== input.alias)) throw new HttpError(400, '密钥所属工具或连接配置不匹配');
+    this.validateConfig({ ...secret, tool: input.tool, path, alias: input.alias }, this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext));
     const existing = (await this.repository.grants(projectId)).find(g => g.tool === input.tool && g.alias === input.alias);
-    const grant = { ...input, id: existing?.id ?? randomUUID(), projectId, updatedAt: new Date().toISOString() };
+    const { policy: _legacy, ...binding } = input;
+    const grant = { ...binding, id: existing?.id ?? randomUUID(), projectId, updatedAt: new Date().toISOString() };
     await this.repository.saveGrant(grant);
     return (await this.repository.grants(projectId)).find(value => value.tool === input.tool && value.alias === input.alias)!;
+  }
+  async saveSelections(projectId: string, selections: ProjectToolSelection[]) {
+    if (selections.length !== PROXY_TOOLS.length || new Set(selections.map(value => value.tool)).size !== PROXY_TOOLS.length
+      || selections.some(value => !PROXY_TOOLS.includes(value.tool))) throw new HttpError(400, '每种工具必须且只能配置一次');
+    const [current, all] = await Promise.all([this.repository.grants(projectId), this.repository.allGrants()]);
+    const grants: ProjectToolGrant[] = [];
+    for (const { tool, secretId } of selections) {
+      if (!secretId) continue;
+      const secret = this.withLegacyConfig(await this.requireSecret(secretId), all);
+      if (!secret.enabled || secret.tool !== tool) throw new HttpError(400, '请选择该工具已启用的密钥');
+      this.validateConfig(secret, this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext));
+      const files = [{ secretId, path: secret.path! }];
+      const previous = current.find(grant => grant.tool === tool && grant.alias === secret.alias && JSON.stringify(grant.files) === JSON.stringify(files));
+      grants.push({ id: previous?.id ?? randomUUID(), projectId, tool, alias: secret.alias!, files, enabled: true, updatedAt: new Date().toISOString() });
+    }
+    await this.repository.replaceGrants(projectId, grants);
+    return this.repository.grants(projectId);
   }
   deleteGrant(projectId: string, id: string) { return this.repository.deleteGrant(projectId, id); }
   async registerRuntime(boxId: string, projectId: string, generation: number) {
@@ -93,9 +136,11 @@ export class SecretService {
   }
   async start(token: string, tool: ProxyTool, alias: string | undefined, args: string[]): Promise<ToolInvocationSetup> {
     const identity = await this.authorize(token);
-    const grants = (await this.repository.grants(identity.projectId)).filter(g => g.enabled && g.tool === tool && (!alias || g.alias === alias));
-    if (grants.length !== 1) throw new HttpError(403, grants.length ? '请使用 --connection=连接别名 选择连接' : '项目未授权此工具连接');
+    const grants = (await this.repository.grants(identity.projectId)).filter(g => g.enabled && g.tool === tool);
+    if (grants.length !== 1) throw new HttpError(403, grants.length ? '工具存在旧的多密钥配置，请重新选择一个密钥' : '项目未授权此工具连接');
     const grant = grants[0], checked = validateToolArgs(tool, args, grant);
+    if (alias && alias !== grant.alias) throw new HttpError(403, '连接别名与项目所选密钥不匹配');
+    if (grant.files.length !== 1) throw new HttpError(403, '每种工具只能使用一个密钥，请重新配置');
     const setup: ToolInvocationSetup = { id: randomUUID(), tool, args: checked, files: [] };
     const snapshots = [];
     for (const binding of grant.files) {

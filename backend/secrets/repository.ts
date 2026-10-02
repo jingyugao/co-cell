@@ -1,9 +1,10 @@
 import type { Pool, RowDataPacket, ResultSetHeader } from 'mysql2/promise';
-import type { ProjectToolGrant, SecretFormat, SecretVersion } from '../../protocol/secret-types.js';
+import type { ProjectToolGrant, ProxyTool, SecretFormat, SecretVersion } from '../../protocol/secret-types.js';
 
 export interface StoredSecret {
   id: string; name: string; format: SecretFormat; mutable: boolean; enabled: boolean;
   version: number; currentVersionId: string; ciphertext: string; createdAt: string; updatedAt: string;
+  tool: ProxyTool | null; path: string | null; alias: string | null;
 }
 export interface StoredVersion extends SecretVersion { secretId: string; ciphertext: string }
 export interface StoredInvocation {
@@ -19,6 +20,7 @@ export interface SecretRepository {
   grants(projectId: string): Promise<ProjectToolGrant[]>;
   allGrants(): Promise<ProjectToolGrant[]>;
   saveGrant(grant: ProjectToolGrant): Promise<void>; deleteGrant(projectId: string, id: string): Promise<void>;
+  replaceGrants(projectId: string, grants: ProjectToolGrant[]): Promise<void>;
   registerRuntime(boxId: string, projectId: string, generation: number): Promise<void>;
   runtime(boxId: string): Promise<{ projectId: string; generation: number } | null>;
   runtimeConfig(boxId: string, generation: number): Promise<Record<string, string>>;
@@ -35,6 +37,7 @@ export class MySqlSecretRepository implements SecretRepository {
   constructor(private pool: Pool) {}
   async init() {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS secrets (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL, format VARCHAR(10) NOT NULL, mutable BOOLEAN NOT NULL, enabled BOOLEAN NOT NULL, version BIGINT UNSIGNED NOT NULL, current_version_id CHAR(36) NOT NULL, ciphertext MEDIUMTEXT NOT NULL, created_at VARCHAR(30) NOT NULL, updated_at VARCHAR(30) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS secret_tool_configs (secret_id CHAR(36) PRIMARY KEY, tool VARCHAR(32) NOT NULL, path VARCHAR(256) NOT NULL, alias VARCHAR(64) NOT NULL, CONSTRAINT secret_tool_config_secret_fk FOREIGN KEY(secret_id) REFERENCES secrets(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS secret_versions (id CHAR(36) PRIMARY KEY, secret_id CHAR(36) NOT NULL, source VARCHAR(10) NOT NULL, base_version BIGINT UNSIGNED NULL, created_at VARCHAR(30) NOT NULL, project_id CHAR(36) NULL, invocation_id CHAR(36) NULL, changes_json JSON NOT NULL, ciphertext MEDIUMTEXT NOT NULL, INDEX secret_history(secret_id,created_at), CONSTRAINT secret_versions_secret_fk FOREIGN KEY(secret_id) REFERENCES secrets(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS project_tool_grants (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, tool VARCHAR(32) NOT NULL, alias VARCHAR(64) NOT NULL, document JSON NOT NULL, UNIQUE KEY project_tool_alias(project_id,tool,alias), CONSTRAINT tool_grants_project_fk FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS project_tool_runtimes (box_id VARCHAR(200) PRIMARY KEY, project_id CHAR(36) NOT NULL, generation BIGINT UNSIGNED NOT NULL, CONSTRAINT tool_runtimes_project_fk FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
@@ -42,10 +45,10 @@ export class MySqlSecretRepository implements SecretRepository {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS tool_invocations (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, document JSON NOT NULL, completed_at DATETIME(3) NULL, exit_code INT NULL, INDEX invocation_project(project_id,completed_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
   }
   private secret(row: RowDataPacket): StoredSecret {
-    return { id: row.id, name: row.name, format: row.format, mutable: Boolean(row.mutable), enabled: Boolean(row.enabled), version: Number(row.version), currentVersionId: row.current_version_id, ciphertext: row.ciphertext, createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, name: row.name, format: row.format, mutable: Boolean(row.mutable), enabled: Boolean(row.enabled), version: Number(row.version), currentVersionId: row.current_version_id, ciphertext: row.ciphertext, createdAt: row.created_at, updatedAt: row.updated_at, tool: row.tool ?? null, path: row.path ?? null, alias: row.alias ?? null };
   }
-  async list() { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT * FROM secrets ORDER BY updated_at DESC'); return rows.map(row => this.secret(row)); }
-  async get(id: string) { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT * FROM secrets WHERE id=?', [id]); return rows[0] ? this.secret(rows[0]) : null; }
+  async list() { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT s.*,c.tool,c.path,c.alias FROM secrets s LEFT JOIN secret_tool_configs c ON c.secret_id=s.id ORDER BY s.updated_at DESC'); return rows.map(row => this.secret(row)); }
+  async get(id: string) { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT s.*,c.tool,c.path,c.alias FROM secrets s LEFT JOIN secret_tool_configs c ON c.secret_id=s.id WHERE s.id=?', [id]); return rows[0] ? this.secret(rows[0]) : null; }
   async save(secret: StoredSecret, version: StoredVersion | null) {
     const connection = await this.pool.getConnection();
     try {
@@ -58,6 +61,7 @@ export class MySqlSecretRepository implements SecretRepository {
         const contentChanged = version?.changes.includes('content');
         await connection.query(`UPDATE secrets SET name=?,mutable=?,enabled=?,updated_at=?${contentChanged ? ',version=version+1,current_version_id=?,ciphertext=?' : ''} WHERE id=?`, [secret.name, secret.mutable, secret.enabled, secret.updatedAt, ...(contentChanged ? [version!.id, version!.ciphertext] : []), secret.id]);
       }
+      if (secret.tool) await connection.query('INSERT INTO secret_tool_configs(secret_id,tool,path,alias) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE tool=VALUES(tool),path=VALUES(path),alias=VALUES(alias)', [secret.id, secret.tool, secret.path, secret.alias]);
       if (version) await this.insertVersion(connection, version);
       await connection.commit();
     } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
@@ -72,7 +76,19 @@ export class MySqlSecretRepository implements SecretRepository {
   async grants(projectId: string) { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT document FROM project_tool_grants WHERE project_id=? ORDER BY tool,alias', [projectId]); return rows.map(row => parse<ProjectToolGrant>(row.document)); }
   async allGrants() { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT document FROM project_tool_grants'); return rows.map(row => parse<ProjectToolGrant>(row.document)); }
   async saveGrant(grant: ProjectToolGrant) {
-    await this.pool.query("INSERT INTO project_tool_grants(id,project_id,tool,alias,document) VALUES(?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE document=JSON_SET(VALUES(document),'$.id',id)", [grant.id, grant.projectId, grant.tool, grant.alias, JSON.stringify(grant)]);
+    await this.writeGrants(grant.projectId, [grant], grant.tool);
+  }
+  async replaceGrants(projectId: string, grants: ProjectToolGrant[]) { await this.writeGrants(projectId, grants); }
+  private async writeGrants(projectId: string, grants: ProjectToolGrant[], tool?: ProxyTool) {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      // Serialize configuration saves per project, including legacy POSTs.
+      await connection.query('SELECT id FROM projects WHERE id=? FOR UPDATE', [projectId]);
+      await connection.query(`DELETE FROM project_tool_grants WHERE project_id=?${tool ? ' AND tool=?' : ''}`, [projectId, ...(tool ? [tool] : [])]);
+      for (const grant of grants) await connection.query('INSERT INTO project_tool_grants(id,project_id,tool,alias,document) VALUES(?,?,?,?,CAST(? AS JSON))', [grant.id, projectId, grant.tool, grant.alias, JSON.stringify(grant)]);
+      await connection.commit();
+    } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
   }
   async deleteGrant(projectId: string, id: string) { await this.pool.query('DELETE FROM project_tool_grants WHERE project_id=? AND id=?', [projectId, id]); }
   async registerRuntime(boxId: string, projectId: string, generation: number) {

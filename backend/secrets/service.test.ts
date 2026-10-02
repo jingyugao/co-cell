@@ -5,7 +5,7 @@ import { Hono } from 'hono';
 import { installOperatorAccess } from '../access/operator.js';
 import { installSecretRoutes } from './routes.js';
 import { HttpError } from '../../util/errors.js';
-import type { ProjectToolGrant } from '../../protocol/secret-types.js';
+import { PROXY_TOOLS, type ProjectToolGrant, type ProxyTool } from '../../protocol/secret-types.js';
 import { SecretCrypto } from './crypto.js';
 import { validateToolArgs } from './policy.js';
 import { SecretService } from './service.js';
@@ -27,7 +27,14 @@ export class MemorySecrets implements SecretRepository {
   async versions(id: string) { return this.history.filter(version => version.secretId === id); }
   async grants(projectId: string) { return [...this.bindings.values()].filter(grant => grant.projectId === projectId); }
   async allGrants() { return [...this.bindings.values()]; }
-  async saveGrant(grant: ProjectToolGrant) { this.bindings.set(grant.id, grant); }
+  async saveGrant(grant: ProjectToolGrant) {
+    for (const [id, previous] of this.bindings) if (previous.projectId === grant.projectId && previous.tool === grant.tool) this.bindings.delete(id);
+    this.bindings.set(grant.id, grant);
+  }
+  async replaceGrants(projectId: string, grants: ProjectToolGrant[]) {
+    for (const [id, previous] of this.bindings) if (previous.projectId === projectId) this.bindings.delete(id);
+    for (const grant of grants) this.bindings.set(grant.id, grant);
+  }
   async deleteGrant(projectId: string, id: string) { if (this.bindings.get(id)?.projectId === projectId) this.bindings.delete(id); }
   async registerRuntime(boxId: string, projectId: string, generation: number) { this.runtimes.set(boxId, { projectId, generation }); }
   readonly configs = new Map<string, Record<string, string>>();
@@ -84,12 +91,19 @@ test('Secrets are encrypted and concurrent stale snapshots use last commit wins 
   await service.deleteGrant(projectId, grant.id);
   await assert.rejects(service.start(token, 'meegle', 'dev', ['workitem', 'list']), /未授权/);
 });
-test('SQL comment tricks and kubectl scope/endpoint overrides fail closed', () => {
-  const grant: ProjectToolGrant = { id: randomUUID(), projectId: randomUUID(), tool: 'mysql', alias: 'doris', enabled: true, files: [], policy: { namespaces: ['staging'], resources: ['pods', 'pods/log'], commandPrefixes: [] }, updatedAt: new Date().toISOString() };
-  assert.deepEqual(validateToolArgs('mysql', ['--login-path=doris', '-e', 'SELECT 1'], grant), ['--login-path=doris', '-e', 'SELECT 1']);
-  for (const sql of ["SELECT 1 INTO/**/OUTFILE '/tmp/x'", 'EXPLAIN INSERT INTO x VALUES(1)', 'SELECT 1; SELECT 2', 'SELECT GET_LOCK("x", 1)']) assert.throws(() => validateToolArgs('mysql', ['--login-path=doris', '-e', sql], grant));
-  for (const args of [['get', 'pods', '-s', 'https://example.invalid'], ['get', 'secrets'], ['get', 'pods', '-A'], ['get', 'pods', '-n', 'prod'], ['get', 'pods', '--token=x'], ['delete', 'pods', 'x']]) assert.throws(() => validateToolArgs('kubectl', args, grant));
-  assert.deepEqual(validateToolArgs('kubectl', ['get', 'pods'], grant), ['--namespace', 'staging', 'get', 'pods']);
+test('coarse authorization delegates operations to credentials while preventing connection overrides', () => {
+  const grant: ProjectToolGrant = { id: randomUUID(), projectId: randomUUID(), tool: 'mysql', alias: 'doris', enabled: true, files: [], policy: { namespaces: ['staging'], resources: ['pods'], commandPrefixes: [['issue', 'list']] }, updatedAt: new Date().toISOString() };
+  for (const sql of ['SELECT 1', 'SELECT 1; SELECT 2', 'UPDATE example SET value=1']) {
+    const checked = validateToolArgs('mysql', ['-e', sql], grant);
+    assert.deepEqual(checked, ['--login-path=doris', '--binary-mode', '--local-infile=0', '-e', sql]);
+  }
+  for (const args of [['get', 'secrets', '-A'], ['delete', 'pods', 'example', '-n', 'prod']])
+    assert.deepEqual(validateToolArgs('kubectl', args, grant), args);
+  assert.deepEqual(validateToolArgs('glab', ['issue', 'create', '--title', 'Example'], grant), ['issue', 'create', '--title', 'Example']);
+  for (const args of [['get', 'pods', '-s', 'https://example.invalid'], ['get', 'pods', '--token=x'], ['--context=other', 'get', 'pods']])
+    assert.throws(() => validateToolArgs('kubectl', args, grant));
+  assert.throws(() => validateToolArgs('mysql', ['--login-path=other', '-e', 'SELECT 1'], grant));
+  assert.throws(() => validateToolArgs('glab', ['issue', 'list', '--token=x'], grant));
 });
 test('internal broker accepts only scoped runtime tokens and cannot access operator Secret APIs', async () => {
   const { service, projectId } = fixture();
@@ -112,4 +126,78 @@ test('internal broker accepts only scoped runtime tokens and cannot access opera
   assert.equal((await app.request(`${origin}/api/secrets/${secret.id}/content`, { headers: { Authorization: `Bearer ${operatorToken}` } })).status, 200);
   const list = await app.request(`${origin}/api/secrets`, { headers: { Authorization: `Bearer ${operatorToken}` } });
   assert.ok(!(await list.text()).includes('password-sensitive'));
+});
+
+const selections = (tool: ProxyTool, secretId: string | null) => PROXY_TOOLS.map(value => ({ tool: value, secretId: value === tool ? secretId : null }));
+
+test('a single selection replaces the previous key, revokes in-flight writeback, and can be cleared', async () => {
+  const { service, projectId } = fixture();
+  const create = (name: string) => service.create({ name, tool: 'meegle', format: 'json', mutable: true, content: '{"access_token":"fixture"}' });
+  const a = await create('Key A'), b = await create('Key B');
+  assert.equal(a.path, '.meegle/credentials.json');
+  await service.saveSelections(projectId, selections('meegle', a.id));
+  const token = await service.registerRuntime('box-a', projectId, 1);
+  const started = await service.start(token, 'meegle', undefined, ['workitem', 'update']);
+  await service.saveSelections(projectId, selections('meegle', b.id));
+  const grants = await service.grants(projectId);
+  assert.equal(grants.length, 1);
+  assert.equal(grants[0].files[0].secretId, b.id);
+  assert.equal(grants[0].policy, undefined);
+  await assert.rejects(service.complete(token, started.id, [{ secretId: a.id, content: Buffer.from('{"access_token":"changed"}').toString('base64') }], 0), /撤销或变更/);
+  const next = await service.start(token, 'meegle', undefined, ['workitem', 'update']);
+  assert.equal(next.files[0].secretId, b.id);
+  await service.saveSelections(projectId, selections('meegle', null));
+  await assert.rejects(service.start(token, 'meegle', undefined, ['workitem', 'list']), /未授权/);
+});
+
+test('invalid or duplicate selections leave the whole project configuration unchanged', async () => {
+  const { service, projectId } = fixture();
+  const secret = await service.create({ name: 'Meegle', tool: 'meegle', format: 'json', mutable: true, content: '{}' });
+  await service.saveSelections(projectId, selections('meegle', secret.id));
+  const original = await service.grants(projectId);
+  await assert.rejects(service.saveSelections(projectId, selections('mysql', secret.id)), /该工具/);
+  const duplicated = selections('meegle', secret.id);
+  duplicated[0] = duplicated[1];
+  await assert.rejects(service.saveSelections(projectId, duplicated), /只能配置一次/);
+  await service.update(secret.id, { enabled: false });
+  await assert.rejects(service.saveSelections(projectId, selections('meegle', secret.id)), /已启用/);
+  assert.deepEqual(await service.grants(projectId), original);
+  await assert.rejects(service.update(secret.id, { tool: 'lark-cli' }), /已被项目使用/);
+});
+
+test('legacy grants classify secrets and multiple keys fail closed even with an explicit alias', async () => {
+  const { repository, service, projectId } = fixture();
+  const secret = await service.create({ name: 'Legacy', format: 'json', mutable: true, content: '{}' });
+  const old = await service.saveGrant(projectId, { tool: 'meegle', alias: 'legacy', enabled: true, files: [{ secretId: secret.id, path: '.meegle/credentials.json' }] });
+  const list = await service.list();
+  assert.equal(list[0].tool, 'meegle');
+  assert.equal(list[0].alias, 'legacy');
+  repository.bindings.set('legacy-duplicate', { ...old, id: 'legacy-duplicate' });
+  const token = await service.registerRuntime('box-a', projectId, 1);
+  await assert.rejects(service.start(token, 'meegle', 'legacy', ['workitem', 'list']), /多密钥/);
+  await service.saveSelections(projectId, selections('meegle', secret.id));
+  assert.equal((await service.grants(projectId)).length, 1);
+  await assert.rejects(service.saveGrant(projectId, { ...old, files: [...old.files, ...old.files] }), /只能选择一个/);
+});
+
+test('selection API accepts only operator access and persists or clears one key per tool', async () => {
+  const { service, projectId } = fixture();
+  const operatorToken = 'operator-' + 'x'.repeat(32), origin = 'https://cocell.example.test';
+  const app = new Hono();
+  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [], provider: {
+    getAccessRequest: async () => { throw Error(); }, approveAccessRequest: async () => { throw Error(); },
+  } });
+  app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'invalid' }, error instanceof HttpError ? error.status as 400 : 400));
+  installSecretRoutes(app, service, id => id === projectId);
+  const secret = await service.create({ name: 'Meegle', tool: 'meegle', format: 'json', mutable: true, content: '{}' });
+  const token = await service.registerRuntime('box-a', projectId, 1);
+  const put = (bearer: string, chosen: ReturnType<typeof selections>) => app.request(`${origin}/api/projects/${projectId}/tool-grants`, {
+    method: 'PUT', headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ selections: chosen }),
+  });
+  assert.equal((await put(token, selections('meegle', secret.id))).status, 401);
+  const response = await put(operatorToken, selections('meegle', secret.id));
+  assert.equal(response.status, 200);
+  assert.equal((await response.json())[0].files[0].secretId, secret.id);
+  assert.equal((await put(operatorToken, selections('meegle', null))).status, 200);
+  assert.equal((await service.grants(projectId)).length, 0);
 });

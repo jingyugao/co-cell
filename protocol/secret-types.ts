@@ -1,10 +1,17 @@
 export type SecretFormat = 'json' | 'text' | 'binary';
-export type ProxyTool = 'mysql' | 'kubectl' | 'glab' | 'lark-cli' | 'meegle';
+export const PROXY_TOOLS = ['mysql', 'kubectl', 'glab', 'lark-cli', 'meegle'] as const;
+export type ProxyTool = typeof PROXY_TOOLS[number];
 export interface SecretMetadata {
   id: string; name: string; format: SecretFormat; mutable: boolean; enabled: boolean;
   version: number; createdAt: string; updatedAt: string; projectIds: string[];
+  tool: ProxyTool | null; path: string | null; alias: string | null;
 }
-export interface SecretInput { name: string; format: SecretFormat; mutable: boolean; content: string }
+export interface SecretInput {
+  name: string; format: SecretFormat; mutable: boolean; content: string;
+  /** Optional only for credentials created through the legacy API. */
+  tool?: ProxyTool; path?: string; alias?: string;
+}
+export interface SecretUpdate { name?: string; mutable?: boolean; enabled?: boolean; content?: string; tool?: ProxyTool; path?: string; alias?: string }
 export interface SecretVersion {
   id: string; source: 'operator' | 'tool'; baseVersion: number | null;
   createdAt: string; projectId: string | null; invocationId: string | null;
@@ -16,9 +23,12 @@ export interface ToolPolicy {
 }
 export interface ProjectToolGrant {
   id: string; projectId: string; tool: ProxyTool; alias: string; enabled: boolean;
-  files: SecretFileBinding[]; policy: ToolPolicy; updatedAt: string;
+  files: SecretFileBinding[]; updatedAt: string;
+  /** Legacy documents can retain this field; authorization no longer uses it. */
+  policy?: ToolPolicy;
 }
 export type ProjectToolGrantInput = Omit<ProjectToolGrant, 'id' | 'projectId' | 'updatedAt'>;
+export interface ProjectToolSelection { tool: ProxyTool; secretId: string | null }
 /** Only the protected tool runner receives this response, never the agent. */
 export interface ToolInvocationSetup {
   id: string; tool: ProxyTool; args: string[];

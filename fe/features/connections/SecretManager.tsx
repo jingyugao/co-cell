@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import type { SecretFormat, SecretMetadata, SecretVersion } from '../../../protocol/secret-types';
+import { PROXY_TOOLS, type ProxyTool, type SecretFormat, type SecretMetadata, type SecretVersion } from '../../../protocol/secret-types';
+import { defaultCredentialPath, TOOL_LABELS } from '../../../util/tool-secrets';
 import { api, errorMessage } from '../../lib/api';
 import './SecretManager.css';
 
@@ -9,6 +10,7 @@ export default function SecretManager() {
   const [editing, setEditing] = useState<SecretMetadata | 'new' | null>(null);
   const [name, setName] = useState(''), [format, setFormat] = useState<SecretFormat>('json'), [mutable, setMutable] = useState(false);
   const [content, setContent] = useState(''), [original, setOriginal] = useState('');
+  const [tool, setTool] = useState<ProxyTool | ''>('mysql'), [path, setPath] = useState('.my.cnf'), [alias, setAlias] = useState('default');
   const [history, setHistory] = useState<{ name: string; rows: SecretVersion[] } | null>(null);
   async function refresh() { setItems(await api<SecretMetadata[]>('/api/secrets')); }
   useEffect(() => {
@@ -22,6 +24,7 @@ export default function SecretManager() {
     try {
       const value = item ? await api<{ content: string }>(`/api/secrets/${item.id}/content`) : { content: '' };
       setName(item?.name ?? ''); setFormat(item?.format ?? 'json'); setMutable(item?.mutable ?? false);
+      setTool(item ? item.tool ?? '' : 'mysql'); setPath(item?.path ?? (item?.tool ? defaultCredentialPath(item.tool, item.format) : '.my.cnf')); setAlias(item?.alias ?? 'default');
       setContent(value.content); setOriginal(value.content); setEditing(item ?? 'new'); setHistory(null);
     } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
   }
@@ -39,23 +42,32 @@ export default function SecretManager() {
     {editing && <form className="secret-form" onSubmit={async event => {
       event.preventDefault(); setBusy(true); setError('');
       try {
-        if (editing === 'new') await api('/api/secrets', { method: 'POST', body: JSON.stringify({ name, format, mutable, content }) });
-        else await api(`/api/secrets/${editing.id}`, { method: 'PATCH', body: JSON.stringify({ name, mutable, ...(content !== original ? { content } : {}) }) });
+        const config = { tool, path, alias };
+        if (editing === 'new') await api('/api/secrets', { method: 'POST', body: JSON.stringify({ name, format, mutable, content, ...config }) });
+        else await api(`/api/secrets/${editing.id}`, { method: 'PATCH', body: JSON.stringify({ name, mutable, ...config, ...(content !== original ? { content } : {}) }) });
         close(); await refresh();
       } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
     }}>
       <h2>{editing === 'new' ? '新建 Secret' : `编辑 ${editing.name}`}</h2>
       <label>名称<input required maxLength={100} value={name} onChange={e => setName(e.target.value)} /></label>
-      <label>格式<select value={format} disabled={editing !== 'new'} onChange={e => { setFormat(e.target.value as SecretFormat); setContent(''); }}><option value="json">JSON 对象</option><option value="text">文本文件</option><option value="binary">二进制文件 / base64</option></select></label>
+      <label>所属工具<select required value={tool} onChange={event => {
+        const next = event.target.value as ProxyTool; setTool(next);
+        const nextFormat = editing === 'new' ? next === 'glab' ? 'text' : 'json' : format;
+        setFormat(nextFormat); setPath(defaultCredentialPath(next, nextFormat)); setAlias('default');
+        if (['mysql', 'kubectl'].includes(next)) setMutable(false);
+      }}><option value="" disabled>选择工具</option>{PROXY_TOOLS.map(value => <option key={value} value={value}>{TOOL_LABELS[value]}</option>)}</select></label>
+      <label>格式<select value={format} disabled={editing !== 'new'} onChange={e => { const value = e.target.value as SecretFormat; setFormat(value); if (tool) setPath(defaultCredentialPath(tool, value)); setContent(''); }}><option value="json">JSON 对象</option><option value="text">文本文件</option><option value="binary">二进制文件 / base64</option></select></label>
+      {tool && !['mysql', 'kubectl'].includes(tool) && <label>认证文件路径<input required maxLength={256} value={path} onChange={event => setPath(event.target.value)} /></label>}
+      {tool === 'mysql' && format === 'binary' && <label>登录配置名称<input required maxLength={64} pattern="[A-Za-z][A-Za-z0-9_.-]*" value={alias} onChange={event => setAlias(event.target.value)} /><span>填写上传的 .mylogin.cnf 中的 login-path 名称。</span></label>}
       <label>上传文件<input type="file" onChange={e => void upload(e.target.files?.[0])} /></label>
       <label>认证内容<textarea required spellCheck={false} autoComplete="off" rows={12} value={content} onChange={e => setContent(e.target.value)} placeholder={format === 'json' ? '{"access_token":"...","refresh_token":"..."}' : '文件内容'} /></label>
-      <label className="secret-checkbox"><input type="checkbox" checked={mutable} onChange={e => setMutable(e.target.checked)} />允许指定工具更新此文件</label>
+      <label className="secret-checkbox"><input type="checkbox" checked={mutable} disabled={tool === 'mysql' || tool === 'kubectl'} onChange={e => setMutable(e.target.checked)} />允许指定工具更新此文件</label>
       <p>更新后最后保存的内容生效。MySQL 和 Kubernetes 配置由管理员维护。</p>
       <div className="secret-actions"><button className="primary-button" disabled={busy}>{busy ? '保存中…' : '保存'}</button><button type="button" className="secondary-button" disabled={busy} onClick={close}>取消</button></div>
     </form>}
     {loading ? <p role="status">正在读取 Secret…</p> : !items.length ? <div className="connections-empty">尚未创建 Secret。新建后，在项目的“工具权限”中绑定。</div> : <div className="secret-list">{items.map(item => <article className="connection-card" key={item.id}>
       <div className="connection-profile-title"><strong>{item.name}</strong><span>{item.enabled ? '启用' : '停用'}</span></div>
-      <p>{item.format} · v{item.version} · {item.mutable ? '工具可更新' : '管理员维护'} · {item.projectIds.length} 个项目</p>
+      <p>{item.tool ? TOOL_LABELS[item.tool] : '待选择工具'} · {item.format} · v{item.version} · {item.mutable ? '工具可更新' : '管理员维护'} · {item.projectIds.length} 个项目</p>
       <p>最近更新 {new Date(item.updatedAt).toLocaleString()}</p>
       <div className="secret-actions"><button className="secondary-button" disabled={busy} onClick={() => void edit(item)}>编辑</button><button className="secondary-button" disabled={busy} onClick={async () => {
         setBusy(true); setError(''); try { await api(`/api/secrets/${item.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !item.enabled }) }); await refresh(); } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }

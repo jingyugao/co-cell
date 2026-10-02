@@ -16,7 +16,7 @@ function sensitiveValues(bytes) {
       if (typeof value === 'string' && /token|password|secret|(?:private|client).?key/i.test(key) && value.length) values.push(value);
       else if (value && typeof value === 'object') for (const [name, child] of Object.entries(value)) visit(child, name);
     }
-    visit(JSON.parse(bytes.toString('utf8')));
+    visit(JSON.parse(bytes.toString('utf8').replace(/^\uFEFF/, '')));
   } catch {
     for (const line of bytes.toString('utf8').split('\n')) {
       const match = /^\s*([^:=\s]+)\s*[:=]\s*["']?(.+?)["']?\s*$/.exec(line);

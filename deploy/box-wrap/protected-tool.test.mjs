@@ -1,9 +1,63 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { runProtectedTool } from './protected-tool.mjs';
+
+test('provisioned local files survive repeated calls, writeback failure and central deletion without authorization', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-local-files-'));
+  const binaryRoot = join(root, 'bin'), tempRoot = join(root, 'homes');
+  await mkdir(binaryRoot);
+  const raw = '\uFEFF{"access_token":"local-original","refresh_token":"refresh-original"}\r\n';
+  const path = '.config/测试工具/auth file.json';
+  const refreshed = '{"access_token":"local-refreshed","refresh_token":"refresh-next"}';
+  await writeFile(join(binaryRoot, 'custom.cli'), `#!${process.execPath}
+const fs=require('node:fs'),path=require('node:path');
+const file=path.join(process.env.HOME,${JSON.stringify(path)}),raw=fs.readFileSync(file,'utf8');
+if(raw!==(process.argv[2]==='refresh'?${JSON.stringify(raw)}:${JSON.stringify(refreshed)}))process.exit(2);
+if(process.argv[2]==='refresh')fs.writeFileSync(file,${JSON.stringify(refreshed)});
+console.log('local-refreshed');console.log('refresh-original');console.log('local tool works');
+`, { mode: 0o755 });
+  let output = '', requests = 0;
+  const sink = { write(value) { output += value; } };
+  const options = { config: { mode: 'files', generation: 1, url: 'http://unused.invalid', token: 'runtime-secret', files: [{ tool: 'custom.cli', path, secretId: 'local-secret', version: 1, mutable: true, content: Buffer.from(raw).toString('base64') }] }, binaryRoot, tempRoot, stdout: sink, stderr: sink,
+    fetch: async (url, init) => {
+      assert.equal(new URL(url).pathname, '/api/tool-runtime/files');
+      const body = JSON.parse(init.body);
+      assert.deepEqual(body.updates, [{ secretId: 'local-secret', content: Buffer.from(refreshed).toString('base64'), baseVersion: 1 }]);
+      requests++;
+      if (requests === 1) throw new Error('offline');
+      return Response.json({ saved: false, discarded: true });
+    },
+  };
+  try {
+    assert.equal(await runProtectedTool('custom.cli', ['refresh'], options), 0);
+    assert.equal(requests, 1);
+    assert.ok(output.includes('local file retained for retry'));
+    assert.equal(await runProtectedTool('custom.cli', ['read'], options), 0);
+    assert.equal(requests, 2);
+    assert.equal(await runProtectedTool('custom.cli', ['read'], options), 0);
+    assert.equal(requests, 2);
+    const snapshots = await readdir(join(tempRoot, 'custom.cli'));
+    assert.equal(await readFile(join(tempRoot, 'custom.cli', snapshots[0], 'home', path), 'utf8'), refreshed);
+    assert.ok(output.includes('local tool works'));
+    assert.ok(!output.includes('local-refreshed') && !output.includes('refresh-original'));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('tools with no selected file run locally without broker requests', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-no-file-'));
+  await writeFile(join(root, 'custom.cli'), `#!${process.execPath}\nconsole.log('tool version 1');\n`, { mode: 0o755 });
+  let output = '';
+  const options = { config: { mode: 'files', generation: 1, files: [], url: 'http://unused.invalid', token: 'runtime-secret' }, binaryRoot: root, tempRoot: join(root, 'homes'), stdout: { write(value) { output += value; } },
+    fetch: async () => { assert.fail('CLI execution must not request authorization'); },
+  };
+  try {
+    assert.equal(await runProtectedTool('custom.cli', ['--version'], options), 0);
+    assert.equal(output, 'tool version 1\n');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('parallel CLI calls get isolated files and persist refreshes after business failure without leaking tokens', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-secret-runner-'));

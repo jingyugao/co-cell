@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, normalize } from 'node:path';
@@ -55,6 +56,65 @@ async function execute(executable, args, env, cwd) {
     child.once('close', (code, signal) => { clearTimeout(timer); resolve({ exitCode: signal ? 124 : code ?? 1, stdout, stderr }); });
   });
 }
+async function writeInitial(path, bytes) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  try { await writeFile(path, bytes, { mode: 0o600, flag: 'wx' }); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+}
+async function runFileTool(tool, args, config, options, request) {
+  if (!Array.isArray(config.files)) throw new Error('Invalid local file configuration');
+  const files = config.files.filter(file => file.tool === tool);
+  if (files.length > 1) throw new Error('Only one credential file per tool is supported');
+  const snapshot = createHash('sha256').update(JSON.stringify({ generation: config.generation, files })).digest('hex');
+  const state = join(options.tempRoot ?? '/var/lib/cellbox/debug/tool-homes', tool, snapshot);
+  const root = join(state, 'home');
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const masks = [config.token];
+  const persisted = new Map();
+  for (const file of files) {
+    if (!safePath(file.path)) throw new Error('Invalid tool file');
+    const bytes = Buffer.from(file.content, 'base64');
+    if (!bytes.length || bytes.length > LIMIT) throw new Error('Invalid tool credential');
+    // Keep refreshed local files across calls. A different provisioned snapshot
+    // gets a new HOME; no execution lock or remote authorization is needed.
+    await writeInitial(join(root, file.path), bytes);
+    const marker = join(state, 'synced', createHash('sha256').update(file.path).digest('hex'));
+    await writeInitial(marker, bytes);
+    persisted.set(file.path, { marker, bytes: await readFile(marker) });
+    masks.push(...sensitiveValues(bytes), ...sensitiveValues(await readCredential(root, file.path)));
+  }
+  const env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: root, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(root, '.config'), XDG_DATA_HOME: join(root, '.local/share') };
+  if (files[0]) {
+    const credential = join(root, files[0].path);
+    if (tool === 'kubectl') env.KUBECONFIG = credential;
+    if (tool === 'glab') env.GLAB_CONFIG_DIR = dirname(credential);
+    if (tool === 'mysql') args = [`--defaults-file=${credential}`, ...args];
+  }
+  const result = await execute(join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool), args, env, root);
+  const updates = [];
+  for (const file of files) {
+    const bytes = await readCredential(root, file.path);
+    masks.push(...sensitiveValues(bytes));
+    if (file.mutable && !bytes.equals(persisted.get(file.path).bytes))
+      updates.push({ secretId: file.secretId, content: bytes.toString('base64'), baseVersion: file.version });
+  }
+  if (updates.length) {
+    try {
+      await request('/api/tool-runtime/files', { tool, updates, exitCode: result.exitCode });
+      for (const update of updates) {
+        const file = files.find(file => file.secretId === update.secretId);
+        await writeFile(persisted.get(file.path).marker, Buffer.from(update.content, 'base64'), { mode: 0o600 });
+      }
+    } catch {
+      // Retain the native CLI result and retry the unsaved content next time.
+      (options.stderr ?? process.stderr).write('Secret update failed; local file retained for retry\n');
+    }
+  }
+  const redact = text => masks.sort((a, b) => b.length - a.length).reduce((value, secret) => secret ? value.replaceAll(secret, '[REDACTED]') : value, text);
+  (options.stdout ?? process.stdout).write(redact(result.stdout));
+  (options.stderr ?? process.stderr).write(redact(result.stderr));
+  return result.exitCode;
+}
 /** Injectable paths/transport support isolated tests without host credentials. */
 export async function runProtectedTool(tool, inputArgs, options = {}) {
   if (!toolName.test(tool)) throw new Error('Invalid protected tool name');
@@ -64,9 +124,11 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   const transport = options.fetch ?? fetch;
   const request = async (path, body) => {
     const response = await transport(new URL(path, base), { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(4000), headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.token}` }, body: JSON.stringify(body) });
-    if (!response.ok) throw new Error('Project authorization or Secret update failed');
+    if (!response.ok) throw new Error('Secret request failed');
     return response.json();
   };
+  if (config.mode === 'files') return runFileTool(tool, inputArgs, config, options, request);
+  // Compatibility for Sandboxes provisioned with older executor images.
   const setup = await request('/api/tool-runtime/start', { tool, args: inputArgs });
   if (setup.tool !== tool || !Array.isArray(setup.files) || setup.files.length !== 1) throw new Error('Invalid tool setup');
   const parent = options.tempRoot ?? '/var/lib/cellbox/debug/tool-runs';

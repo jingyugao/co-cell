@@ -70,6 +70,43 @@ export function fixture() {
   const service = new SecretService(repository, crypto, async () => ({ generation: 1, phase: 'running' }), (project, box) => project === projectId && box === 'box-a');
   return { repository, service, projectId, crypto };
 }
+test('local file provisioning and last commit wins sync do not check current selections or live Sandbox status', async () => {
+  const { repository, projectId, crypto } = fixture();
+  const service = new SecretService(repository, crypto, async () => { assert.fail('File sync must not inspect live Sandbox state'); }, (project, box) => project === projectId && box === 'box-a');
+  const raw = '\uFEFF{"access_token":"original","refresh_token":"fixture"}\r\n';
+  const secret = await service.create({ name: 'Local fixture', tool: 'custom.cli', path: '.config/测试/auth file.json', format: 'text', mutable: true, content: raw });
+  await service.saveSelections(projectId, selections('custom.cli', secret.id));
+  const files = await service.provision(projectId);
+  assert.equal(files.length, 1);
+  assert.equal(Buffer.from(files[0].content, 'base64').toString(), raw);
+  assert.equal(files[0].path, '.config/测试/auth file.json');
+  const token = await service.registerRuntime('box-a', projectId, 1);
+  await service.saveSelections(projectId, []);
+  await service.update(secret.id, { content: '{"refresh_token":"operator"}' });
+  const updates = (value: string) => [{ secretId: secret.id, content: Buffer.from(value).toString('base64'), baseVersion: files[0].version }];
+  assert.deepEqual(await service.syncFiles(token, 'custom.cli', updates('{"refresh_token":"tool-first"}'), 1), { saved: true });
+  assert.deepEqual(await service.syncFiles(token, 'custom.cli', updates('{"refresh_token":"tool-last"}'), 0), { saved: true });
+  assert.equal((await service.content(secret.id)).content, '{"refresh_token":"tool-last"}');
+  assert.equal((await service.versions(secret.id)).at(-1)?.baseVersion, 1);
+  assert.deepEqual(await service.provision(projectId), []);
+  const operatorToken = 'operator-' + 'x'.repeat(32), origin = 'https://cocell.example.test';
+  const app = new Hono();
+  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [], provider: {
+    getAccessRequest: async () => { throw Error(); }, approveAccessRequest: async () => { throw Error(); },
+  } });
+  app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'invalid' }, error instanceof HttpError ? error.status as 400 : 400));
+  installSecretRoutes(app, service, value => value === projectId);
+  const sync = (bearer: string) => app.request(`${origin}/api/tool-runtime/files`, { method: 'POST', headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ tool: 'custom.cli', updates: updates('{"refresh_token":"via-api"}'), exitCode: 0 }) });
+  assert.equal((await sync(operatorToken)).status, 401);
+  assert.equal((await sync(token)).status, 200);
+  assert.equal((await service.content(secret.id)).content, '{"refresh_token":"via-api"}');
+  await service.delete(secret.id);
+  await assert.rejects(service.syncFiles(token + 'invalid', 'custom.cli', updates('after deletion'), 0), /认证/);
+  assert.deepEqual(await service.syncFiles(token, 'custom.cli', updates('after deletion'), 0), { saved: false, discarded: true });
+  assert.deepEqual(await (await sync(token)).json(), { saved: false, discarded: true });
+  assert.equal(await repository.get(secret.id), null);
+  assert.deepEqual(await repository.versions(secret.id), []);
+});
 test('Secrets are encrypted and concurrent stale snapshots use last commit wins without replay', async () => {
   const { repository, service, projectId, crypto } = fixture();
   const secret = await service.create({ name: 'OAuth', tool: 'meegle', path: '.meegle/credentials.json', format: 'text', mutable: true, content: '{"access_token":"access-original","refresh_token":"refresh-original"}' });

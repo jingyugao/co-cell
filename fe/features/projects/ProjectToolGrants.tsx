@@ -53,7 +53,7 @@ export default function ProjectToolGrants({ projectId, name, onClose }: { projec
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
       }}>
       <div className="tool-secret-heading"><h2>{name} · 工具密钥</h2><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>关闭</button></div>
-      <p className="tool-secret-description">每种工具最多选择一个密钥。取消勾选即不授权，保存后下一次调用生效。</p>
+      <p className="tool-secret-description">每种工具最多选择一个密钥，在 Sandbox 创建、恢复或刷新配置时下发。已下发的文件不会实时收回。</p>
       {error && <p className="connections-error" role="alert">{error}</p>}
       {!loading && loaded && !tools.length && <p className="tool-secret-note">暂无工具资源，可先在 Secret 管理中填写工具名并新建。</p>}
       {loading ? <p role="status">正在读取密钥…</p> : tools.map(tool => {

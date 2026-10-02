@@ -26,6 +26,10 @@ export function installSecretRoutes(app: Hono, secrets: SecretService, projectEx
   });
   app.delete('/api/projects/:id/tool-grants/:grantId', async c => { await secrets.deleteGrant(project(c.req.param('id')), id.parse(c.req.param('grantId'))); return c.json({ ok: true }); });
   const token = (header: string | undefined) => { if (!header?.startsWith('Bearer ')) throw new HttpError(401, '工具认证无效'); return header.slice(7); };
+  app.post('/api/tool-runtime/files', async c => {
+    const input = z.object({ tool, updates: z.array(z.object({ secretId: id, content: z.string().max(90000), baseVersion: z.number().int().min(1) }).strict()).max(10), exitCode: z.number().int().min(-1).max(255) }).strict().parse(await c.req.json());
+    return c.json(await secrets.syncFiles(token(c.req.header('authorization')), input.tool, input.updates, input.exitCode));
+  });
   app.post('/api/tool-runtime/start', async c => {
     const input = z.object({ tool, alias: alias.optional(), args: z.array(z.string().max(8192)).max(32) }).strict().parse(await c.req.json());
     return c.json(await secrets.start(token(c.req.header('authorization')), input.tool, input.alias, input.args));

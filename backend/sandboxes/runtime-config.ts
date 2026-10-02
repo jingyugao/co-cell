@@ -3,6 +3,7 @@ import type { SandboxExtension, SandboxLifecycleContext } from '@co-cell/sandbox
 import type { CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import type { ConnectionStore } from '../connections/store.js';
 import type { SecretService } from '../secrets/service.js';
+import type { ToolRuntimeConfig } from '../../protocol/secret-types.js';
 
 export interface SandboxRuntimeConfigOptions {
   provider: CellboxSandboxProvider;
@@ -54,12 +55,19 @@ export class SandboxRuntimeConfig {
       if (!projectId) throw new Error('Project identity is required for tool credentials');
       if (!this.options.toolBrokerUrl) throw new Error('COCELL_TOOL_BROKER_URL is required');
       const token = await this.options.secrets.registerRuntime(boxId, projectId, generation);
+      applied = await repository!.runtimeConfig(boxId, generation);
       slots = {
-        cocell_tool_runtime: Buffer.from(JSON.stringify({ token, url: this.options.toolBrokerUrl })),
         cocell_oss_access_key: Buffer.from(process.env.OSS_ACCESS_KEY || '\n'),
         cocell_oss_secret_key: Buffer.from(process.env.OSS_SECRET_KEY || '\n'),
       };
-      applied = await repository!.runtimeConfig(boxId, generation);
+      // Connecting or restarting the service must not replace an existing
+      // generation's file snapshot after a resource was removed centrally.
+      if (context.action !== 'connect' || !applied.cocell_tool_runtime) {
+        const config: ToolRuntimeConfig = { mode: 'files', generation, token, url: this.options.toolBrokerUrl, files: await this.options.secrets.provision(projectId) };
+        const bytes = Buffer.from(JSON.stringify(config));
+        if (bytes.length > 1024 * 1024) throw new Error('Selected credential files exceed the 1 MiB Sandbox configuration limit');
+        slots = { cocell_tool_runtime: bytes, ...slots };
+      }
     } else {
       slots = await this.legacySlots();
       const key = `${boxId}:${generation}`;

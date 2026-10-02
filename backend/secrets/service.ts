@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ProjectToolGrant, ProjectToolGrantInput, ProjectToolSelection, ProxyTool, SecretInput, SecretUpdate, SecretMetadata, SecretDeleteResult, ToolInvocationSetup, ToolCompletionResult } from '../../protocol/secret-types.js';
+import type { ProjectToolGrant, ProjectToolGrantInput, ProjectToolSelection, ProxyTool, SecretInput, SecretUpdate, SecretMetadata, SecretDeleteResult, ToolInvocationSetup, ToolCompletionResult, ProvisionedToolFile, ToolFileUpdate } from '../../protocol/secret-types.js';
 import { HttpError } from '../../util/errors.js';
 import { SecretCrypto } from './crypto.js';
 import { credentialPath, toolName, validateToolArgs } from './policy.js';
@@ -103,18 +103,65 @@ export class SecretService {
     return this.repository.grants(projectId);
   }
   deleteGrant(projectId: string, id: string) { return this.repository.deleteGrant(projectId, id); }
+  /** Resolve selected files at provisioning time, never on the CLI execution path. */
+  async provision(projectId: string): Promise<ProvisionedToolFile[]> {
+    const grants = (await this.repository.grants(projectId)).filter(grant => grant.enabled);
+    const files: ProvisionedToolFile[] = [];
+    for (const grant of grants) {
+      if (grant.files.length !== 1 || grants.filter(value => value.tool === grant.tool).length !== 1) continue;
+      const binding = grant.files[0], secret = await this.repository.get(binding.secretId);
+      if (!secret?.enabled || secret.format !== 'text') continue;
+      if (secret.tool && (secret.tool !== grant.tool || secret.path !== binding.path)) continue;
+      toolName(grant.tool); credentialPath(binding.path);
+      const content = this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('base64');
+      files.push({ tool: grant.tool, secretId: secret.id, path: binding.path, content, mutable: secret.mutable, version: secret.version });
+    }
+    return files.sort((a, b) => a.tool.localeCompare(b.tool));
+  }
   async registerRuntime(boxId: string, projectId: string, generation: number) {
     await this.repository.registerRuntime(boxId, projectId, generation);
     return this.crypto.runtimeToken(boxId, generation);
   }
-  private async authorize(token: string) {
+  private async runtimeIdentity(token: string) {
     const identity = this.crypto.verifyRuntimeToken(token);
     if (!identity) throw new HttpError(401, '工具认证无效');
     const runtime = await this.repository.runtime(identity.boxId);
     if (!runtime || runtime.generation !== identity.generation || !this.ownsRuntime(runtime.projectId, identity.boxId)) throw new HttpError(403, 'Sandbox 未绑定当前项目');
+    return { ...identity, projectId: runtime.projectId };
+  }
+  private async authorize(token: string) {
+    const identity = await this.runtimeIdentity(token);
     const live = await this.liveRuntime(identity.boxId);
     if (live.generation !== identity.generation || live.phase !== 'running') throw new HttpError(403, 'Sandbox 运行身份已失效');
-    return { ...identity, projectId: runtime.projectId };
+    return identity;
+  }
+  /** Persist modified local files without checking the project's current selection. */
+  async syncFiles(token: string, tool: ProxyTool, updates: ToolFileUpdate[], exitCode: number): Promise<ToolCompletionResult> {
+    const identity = await this.runtimeIdentity(token), now = new Date().toISOString(), id = randomUUID();
+    if (new Set(updates.map(update => update.secretId)).size !== updates.length) throw new HttpError(400, 'Secret 更新不可重复');
+    const changes: Array<{ secret: StoredSecret; version: StoredVersion }> = [];
+    for (const update of updates) {
+      const secret = await this.repository.get(update.secretId);
+      if (!secret?.enabled || !secret.mutable || secret.format !== 'text') continue;
+      const raw = Buffer.from(update.content, 'base64');
+      if (raw.toString('base64') !== update.content) throw new HttpError(400, 'Secret 更新编码无效');
+      if (!Buffer.from(raw.toString('utf8')).equals(raw)) throw new HttpError(400, '认证文件必须使用 UTF-8 编码');
+      const bytes = secretBytes('text', raw.toString('utf8')), versionId = randomUUID();
+      changes.push({ secret, version: { id: versionId, secretId: secret.id, ciphertext: this.crypto.seal(secret.id, versionId, bytes), source: 'tool', baseVersion: update.baseVersion, createdAt: now, projectId: identity.projectId, invocationId: id, changes: ['content'] } });
+    }
+    if (!changes.length) return { saved: false, discarded: true };
+    const invocation = { id, ...identity,
+      grant: { id, projectId: identity.projectId, tool, alias: 'default', enabled: true, files: changes.map(({ secret }) => ({ secretId: secret.id, path: secret.path! })), updatedAt: now },
+      files: changes.map(({ secret, version }) => ({ secretId: secret.id, path: secret.path!, version: version.baseVersion!, versionId: secret.currentVersionId })),
+      createdAt: now, completedAt: now };
+    await this.repository.startInvocation({ ...invocation, completedAt: null });
+    try { return { saved: await this.repository.completeInvocation(invocation, changes, exitCode) }; }
+    catch (error) {
+      const resources = await Promise.all(changes.map(({ secret }) => this.repository.get(secret.id)));
+      if (resources.every(secret => secret?.enabled && secret.mutable && secret.format === 'text')) throw error;
+      await this.repository.completeInvocation(invocation, [], exitCode);
+      return { saved: false, discarded: true };
+    }
   }
   async start(token: string, tool: ProxyTool, _alias: string | undefined, args: string[]): Promise<ToolInvocationSetup> {
     const identity = await this.authorize(token);

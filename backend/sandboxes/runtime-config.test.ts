@@ -4,9 +4,11 @@ import { SandboxLifecycle } from '@co-cell/sandbox';
 import type { CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import type { SecretService } from '../secrets/service.js';
 import { SandboxRuntimeConfig } from './runtime-config.js';
+import type { ProvisionedToolFile } from '../../protocol/secret-types.js';
 
 function fixture() {
   let generation = 1;
+  let files: ProvisionedToolFile[] = [], provisions = 0;
   const acknowledgements = new Map<string, Record<string, string>>();
   const writes: Array<{ slot: string; bytes: string }> = [];
   const repository = {
@@ -22,14 +24,32 @@ function fixture() {
     getBox: async () => ({ phase: 'running', generation, capabilities: { protectedTools: true } }),
     writeCredential: async (_id: string, slot: string, bytes: Uint8Array) => { writes.push({ slot, bytes: Buffer.from(bytes).toString() }); },
   } } as unknown as CellboxSandboxProvider;
-  const secrets = { repository, registerRuntime: async (_id: string, projectId: string, gen: number) => {
+  const secrets = { repository, provision: async () => { provisions++; return files; }, registerRuntime: async (_id: string, projectId: string, gen: number) => {
     assert.equal(projectId, 'project-one'); return `runtime-${gen}`;
   } } as unknown as SecretService;
   const options = { provider, secrets, toolBrokerUrl: 'http://broker.example.test' };
   const lifecycle = () => new SandboxLifecycle([new SandboxRuntimeConfig(options).extension]);
   const reconcile = (host = lifecycle()) => host.run({ action: 'reconcile', resourceKey: 'project:project-one', sandboxId: 'box-one' }, async () => {});
-  return { provider, options, lifecycle, reconcile, acknowledgements, writes, setGeneration: (value: number) => { generation = value; } };
+  return { provider, options, lifecycle, reconcile, acknowledgements, writes, setGeneration: (value: number) => { generation = value; }, setFiles: (value: ProvisionedToolFile[]) => { files = value; }, provisions: () => provisions };
 }
+
+test('connect preserves already provisioned files after central deletion; resume applies a fresh snapshot', async () => {
+  const fake = fixture();
+  const file = { tool: 'custom.cli', secretId: 'secret', path: 'auth.json', content: Buffer.from('{"token":"fixture"}').toString('base64'), mutable: true, version: 1 };
+  fake.setFiles([file]);
+  const run = (action: 'create' | 'connect' | 'resume') => fake.lifecycle().run({ action, resourceKey: 'project:project-one', sandboxId: 'box-one' }, async () => {});
+  await run('create');
+  assert.deepEqual(JSON.parse(fake.writes[0].bytes).files, [file]);
+  fake.setFiles([]);
+  await run('connect');
+  assert.equal(fake.writes.length, 3);
+  assert.equal(fake.provisions(), 1);
+  fake.setGeneration(2);
+  await run('resume');
+  assert.equal(fake.writes.length, 6);
+  assert.equal(fake.provisions(), 2);
+  assert.deepEqual(JSON.parse(fake.writes[3].bytes).files, []);
+});
 
 test('durable acknowledgements skip writes across restarts and refresh only changed slots or generations', async () => {
   const fake = fixture();

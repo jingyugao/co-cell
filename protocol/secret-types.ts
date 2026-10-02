@@ -12,6 +12,13 @@ export interface SecretInput {
 export interface SecretUpdate { name?: string; mutable?: boolean; enabled?: boolean; content?: string; tool?: ProxyTool; path?: string }
 export interface SecretDeleteResult { ok: true }
 export interface ToolCompletionResult { saved: boolean; discarded?: boolean }
+export interface ProvisionedToolFile {
+  tool: ProxyTool; secretId: string; path: string; content: string; mutable: boolean; version: number;
+}
+export interface ToolRuntimeConfig {
+  mode: 'files'; generation: number; token: string; url: string; files: ProvisionedToolFile[];
+}
+export interface ToolFileUpdate { secretId: string; content: string; baseVersion: number }
 export interface SecretVersion {
   id: string; source: 'operator' | 'tool'; baseVersion: number | null;
   createdAt: string; projectId: string | null; invocationId: string | null;

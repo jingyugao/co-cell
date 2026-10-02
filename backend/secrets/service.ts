@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ProjectToolGrant, ProjectToolGrantInput, ProjectToolSelection, ProxyTool, SecretInput, SecretUpdate, SecretMetadata, ToolInvocationSetup } from '../../protocol/secret-types.js';
+import type { ProjectToolGrant, ProjectToolGrantInput, ProjectToolSelection, ProxyTool, SecretInput, SecretUpdate, SecretMetadata, SecretDeleteResult, ToolInvocationSetup, ToolCompletionResult } from '../../protocol/secret-types.js';
 import { HttpError } from '../../util/errors.js';
 import { SecretCrypto } from './crypto.js';
 import { credentialPath, toolName, validateToolArgs } from './policy.js';
@@ -71,6 +71,7 @@ export class SecretService {
     return this.metadata(await this.requireSecret(id));
   }
   async versions(id: string) { await this.requireSecret(id); return (await this.repository.versions(id)).map(({ ciphertext: _ciphertext, secretId: _id, ...metadata }) => metadata); }
+  async delete(id: string): Promise<SecretDeleteResult> { await this.repository.delete(id); return { ok: true }; }
   grants(projectId: string) { return this.repository.grants(projectId); }
   async saveGrant(projectId: string, input: ProjectToolGrantInput) {
     if (input.files.length !== 1) throw new HttpError(400, '每种工具只能选择一个密钥');
@@ -135,28 +136,38 @@ export class SecretService {
     await this.repository.startInvocation({ id: setup.id, ...identity, grant, files: snapshots, createdAt: new Date().toISOString(), completedAt: null });
     return setup;
   }
-  async complete(token: string, id: string, updates: Array<{ secretId: string; content: string }>, exitCode: number) {
+  async complete(token: string, id: string, updates: Array<{ secretId: string; content: string }>, exitCode: number): Promise<ToolCompletionResult> {
     const identity = await this.authorize(token), invocation = await this.repository.invocation(id);
     if (!invocation || invocation.boxId !== identity.boxId || invocation.generation !== identity.generation || invocation.projectId !== identity.projectId) throw new HttpError(403, '工具调用不属于该 Sandbox');
     if (invocation.completedAt) return { saved: false };
-    const grant = (await this.repository.grants(identity.projectId)).find(g => g.id === invocation.grant.id);
-    if (!grant?.enabled || JSON.stringify(grant.files) !== JSON.stringify(invocation.grant.files)) throw new HttpError(403, '工具授权已撤销或变更');
-    if (new Set(updates.map(update => update.secretId)).size !== updates.length) throw new HttpError(400, 'Secret 更新不可重复');
-    const now = new Date().toISOString(), changes = [];
-    for (const update of updates) {
-      const snapshot = invocation.files.find(file => file.secretId === update.secretId);
-      if (!snapshot) throw new HttpError(403, '不能更新未绑定的 Secret');
-      const secret = await this.requireSecret(update.secretId);
-      if (!secret.enabled || !secret.mutable) throw new HttpError(403, 'Secret 不允许工具更新');
-      this.validateConfig({ ...secret, tool: invocation.grant.tool, path: snapshot.path });
-      if (secret.tool && (secret.tool !== invocation.grant.tool || secret.path !== snapshot.path)) throw new HttpError(403, '密钥所属工具或文件路径已变更');
-      const raw = Buffer.from(update.content, 'base64');
-      if (raw.toString('base64') !== update.content) throw new HttpError(400, 'Secret 更新编码无效');
-      if (!Buffer.from(raw.toString('utf8')).equals(raw)) throw new HttpError(400, '认证文件必须使用 UTF-8 编码');
-      const bytes = secretBytes('text', raw.toString('utf8'));
-      const versionId = randomUUID(), ciphertext = this.crypto.seal(secret.id, versionId, bytes);
-      changes.push({ secret, version: { id: versionId, secretId: secret.id, ciphertext, source: 'tool' as const, baseVersion: snapshot.version, createdAt: now, projectId: identity.projectId, invocationId: id, changes: ['content'] } });
+    try {
+      const grant = (await this.repository.grants(identity.projectId)).find(g => g.id === invocation.grant.id);
+      if (!grant?.enabled || JSON.stringify(grant.files) !== JSON.stringify(invocation.grant.files)) throw new HttpError(403, '工具授权已撤销或变更');
+      if (new Set(updates.map(update => update.secretId)).size !== updates.length) throw new HttpError(400, 'Secret 更新不可重复');
+      const now = new Date().toISOString(), changes = [];
+      for (const update of updates) {
+        const snapshot = invocation.files.find(file => file.secretId === update.secretId);
+        if (!snapshot) throw new HttpError(403, '不能更新未绑定的 Secret');
+        const secret = await this.requireSecret(update.secretId);
+        if (!secret.enabled || !secret.mutable) throw new HttpError(403, 'Secret 不允许工具更新');
+        this.validateConfig({ ...secret, tool: invocation.grant.tool, path: snapshot.path });
+        if (secret.tool && (secret.tool !== invocation.grant.tool || secret.path !== snapshot.path)) throw new HttpError(403, '密钥所属工具或文件路径已变更');
+        const raw = Buffer.from(update.content, 'base64');
+        if (raw.toString('base64') !== update.content) throw new HttpError(400, 'Secret 更新编码无效');
+        if (!Buffer.from(raw.toString('utf8')).equals(raw)) throw new HttpError(400, '认证文件必须使用 UTF-8 编码');
+        const bytes = secretBytes('text', raw.toString('utf8'));
+        const versionId = randomUUID(), ciphertext = this.crypto.seal(secret.id, versionId, bytes);
+        changes.push({ secret, version: { id: versionId, secretId: secret.id, ciphertext, source: 'tool' as const, baseVersion: snapshot.version, createdAt: now, projectId: identity.projectId, invocationId: id, changes: ['content'] } });
+      }
+      return { saved: await this.repository.completeInvocation({ ...invocation, completedAt: now }, changes, exitCode) };
+    } catch (error) {
+      const resources = await Promise.all(invocation.files.map(file => this.repository.get(file.secretId)));
+      if (resources.every(Boolean)) throw error;
+      // Acknowledge a deleted resource without accepting its refresh. Existing
+      // runners then remove their private files instead of retaining tokens for
+      // retry. Invocation identity was verified before entering this block.
+      await this.repository.completeInvocation({ ...invocation, completedAt: new Date().toISOString() }, [], exitCode);
+      return { saved: false, discarded: true };
     }
-    return { saved: await this.repository.completeInvocation({ ...invocation, completedAt: now }, changes, exitCode) };
   }
 }

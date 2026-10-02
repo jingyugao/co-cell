@@ -10,6 +10,8 @@ export interface SecretInput {
   tool: ProxyTool; path: string;
 }
 export interface SecretUpdate { name?: string; mutable?: boolean; enabled?: boolean; content?: string; tool?: ProxyTool; path?: string }
+export interface SecretDeleteResult { ok: true }
+export interface ToolCompletionResult { saved: boolean; discarded?: boolean }
 export interface SecretVersion {
   id: string; source: 'operator' | 'tool'; baseVersion: number | null;
   createdAt: string; projectId: string | null; invocationId: string | null;

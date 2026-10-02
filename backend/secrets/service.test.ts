@@ -18,6 +18,11 @@ export class MemorySecrets implements SecretRepository {
   async init() {}
   async list() { return [...this.records.values()]; }
   async get(id: string) { return this.records.get(id) ?? null; }
+  async delete(id: string) {
+    this.records.delete(id);
+    this.history = this.history.filter(version => version.secretId !== id);
+    for (const [key, grant] of this.bindings) if (grant.files.some(file => file.secretId === id)) this.bindings.delete(key);
+  }
   async save(secret: StoredSecret, version: StoredVersion | null) {
     const previous = this.records.get(secret.id);
     const changed = version?.changes.some(field => ['created', 'content'].includes(field));
@@ -259,4 +264,64 @@ test('old non-text secrets retain ciphertext until explicitly reimported and can
   await service.update(oldJson.id, { content: jsonText });
   assert.equal(repository.records.get(oldJson.id)!.format, 'text');
   assert.equal((await service.content(oldJson.id)).content, jsonText);
+});
+
+test('operator deletion removes history and every project binding while discarding in-flight refreshes', async () => {
+  const { repository, service, projectId } = fixture();
+  const otherProject = randomUUID();
+  const secret = await service.create({ name: 'Delete fixture', tool: 'custom.cli', path: 'auth.json', format: 'text', mutable: true, content: '{"refresh_token":"original"}' });
+  const preserved = await service.create({ name: 'Keep fixture', tool: 'mysql', path: '.my.cnf', format: 'text', mutable: false, content: '[client]\nuser=fixture\n' });
+  await service.saveSelections(projectId, [{ tool: 'custom.cli', secretId: secret.id }, { tool: 'mysql', secretId: preserved.id }]);
+  await service.saveSelections(otherProject, selections('custom.cli', secret.id));
+  const token = await service.registerRuntime('box-a', projectId, 1);
+  const started = await service.start(token, 'custom.cli', undefined, ['refresh']);
+  const runtime = await repository.runtime('box-a');
+  const operatorToken = 'operator-' + 'x'.repeat(32), origin = 'https://cocell.example.test';
+  const app = new Hono();
+  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [], provider: {
+    getAccessRequest: async () => { throw Error(); }, approveAccessRequest: async () => { throw Error(); },
+  } });
+  app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'invalid' }, error instanceof HttpError ? error.status as 400 : 400));
+  installSecretRoutes(app, service, value => value === projectId || value === otherProject);
+  const remove = (bearer: string, id = secret.id) => app.request(`${origin}/api/secrets/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${bearer}` } });
+  assert.equal((await remove(token)).status, 401);
+  assert.ok(await repository.get(secret.id));
+  assert.equal((await remove(operatorToken, 'not-a-uuid')).status, 400);
+  const response = await remove(operatorToken);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true });
+  assert.equal(await repository.get(secret.id), null);
+  assert.deepEqual(await repository.versions(secret.id), []);
+  assert.equal((await service.list()).some(item => item.id === secret.id), false);
+  assert.deepEqual((await service.grants(projectId)).map(grant => grant.files[0].secretId), [preserved.id]);
+  assert.deepEqual(await service.grants(otherProject), []);
+  assert.deepEqual(await repository.runtime('box-a'), runtime);
+  for (const suffix of ['/content', '/versions']) {
+    assert.equal((await app.request(`${origin}/api/secrets/${secret.id}${suffix}`, { headers: { Authorization: `Bearer ${operatorToken}` } })).status, 404);
+  }
+  await assert.rejects(service.start(token, 'custom.cli', undefined, ['refresh']), /未授权/);
+  const update = [{ secretId: secret.id, content: Buffer.from('{"refresh_token":"after-deletion"}').toString('base64') }];
+  await assert.rejects(service.complete(token + 'x', started.id, update, 0), /认证/);
+  assert.deepEqual(await service.complete(token, started.id, update, 0), { saved: false, discarded: true });
+  assert.ok(repository.runs.get(started.id)?.completedAt);
+  assert.equal(await repository.get(secret.id), null);
+  assert.deepEqual(await repository.versions(secret.id), []);
+  assert.equal((await remove(operatorToken)).status, 200);
+
+  // Deletion can also win after authorization and before the storage write.
+  const racing = await service.create({ name: 'Racing fixture', tool: 'race.cli', path: 'auth', format: 'text', mutable: true, content: 'original' });
+  await service.saveGrant(projectId, { tool: 'race.cli', alias: 'default', enabled: true, files: [{ secretId: racing.id, path: 'auth' }] });
+  const inFlight = await service.start(token, 'race.cli', undefined, []);
+  const complete = repository.completeInvocation.bind(repository);
+  repository.completeInvocation = async (invocation, changes, code) => {
+    if (changes.some(change => change.secret.id === racing.id)) {
+      await repository.delete(racing.id);
+      throw new Error('Secret is no longer writable');
+    }
+    return complete(invocation, changes, code);
+  };
+  assert.deepEqual(await service.complete(token, inFlight.id, [{ secretId: racing.id, content: Buffer.from('refreshed').toString('base64') }], 1), { saved: false, discarded: true });
+  assert.equal(await repository.get(racing.id), null);
+  assert.deepEqual(await repository.versions(racing.id), []);
+  assert.equal((await service.grants(projectId))[0].files[0].secretId, preserved.id);
 });

@@ -72,3 +72,31 @@ console.log('original-secret');console.log('refreshed-secret');console.log('cust
     await assert.rejects(runProtectedTool('../tool', [], options), /Invalid protected tool/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('acknowledging a deleted resource discards refreshed files with existing runner behavior', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-deleted-resource-'));
+  const binaryRoot = join(root, 'bin'), tempRoot = join(root, 'runs');
+  await mkdir(binaryRoot);
+  await writeFile(join(binaryRoot, 'custom.cli'), `#!${process.execPath}
+const fs=require('node:fs'),path=require('node:path');
+fs.writeFileSync(path.join(process.env.HOME,'auth.json'),'{"refresh_token":"refreshed-after-deletion"}');
+console.log('refreshed-after-deletion');
+`, { mode: 0o755 });
+  let completed = false, output = '';
+  const options = { config: { url: 'http://unused.invalid', token: 'runtime-secret' }, binaryRoot, tempRoot,
+    stdout: { write(value) { output += value; } }, stderr: { write(value) { output += value; } },
+    fetch: async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (String(url).endsWith('/start')) return Response.json({ id: 'deleted', tool: body.tool, args: body.args, files: [{ path: 'auth.json', secretId: 'deleted-secret', version: 1, mutable: true, content: Buffer.from('{"refresh_token":"original"}').toString('base64') }] });
+      assert.equal(body.updates[0].secretId, 'deleted-secret');
+      completed = true;
+      return Response.json({ saved: false, discarded: true });
+    },
+  };
+  try {
+    assert.equal(await runProtectedTool('custom.cli', [], options), 0);
+    assert.equal(completed, true);
+    assert.ok(output.includes('[REDACTED]') && !output.includes('refreshed-after-deletion'));
+    assert.deepEqual(await readdir(tempRoot), []);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

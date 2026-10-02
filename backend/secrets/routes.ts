@@ -16,6 +16,7 @@ export function installSecretRoutes(app: Hono, secrets: SecretService, projectEx
   app.post('/api/secrets', async c => c.json(await secrets.create(z.object({ name: z.string().trim().min(1).max(100), format: z.literal('text').default('text'), mutable: z.boolean().default(false), content, tool, path }).strict().parse(await c.req.json())), 201));
   app.get('/api/secrets/:id/content', async c => c.json(await secrets.content(id.parse(c.req.param('id')))));
   app.patch('/api/secrets/:id', async c => c.json(await secrets.update(id.parse(c.req.param('id')), z.object({ name: z.string().trim().min(1).max(100).optional(), mutable: z.boolean().optional(), enabled: z.boolean().optional(), content: content.optional(), tool: tool.optional(), path: path.optional() }).strict().parse(await c.req.json()))));
+  app.delete('/api/secrets/:id', async c => c.json(await secrets.delete(id.parse(c.req.param('id')))));
   app.get('/api/secrets/:id/versions', async c => c.json(await secrets.versions(id.parse(c.req.param('id')))));
   app.get('/api/projects/:id/tool-grants', async c => c.json(await secrets.grants(project(c.req.param('id')))));
   app.post('/api/projects/:id/tool-grants', async c => c.json(await secrets.saveGrant(project(c.req.param('id')), grant.parse(await c.req.json()))));

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { SecretMetadata, SecretVersion } from '../../../protocol/secret-types';
+import type { SecretDeleteResult, SecretMetadata, SecretVersion } from '../../../protocol/secret-types';
 import { TOOL_NAME_PATTERN } from '../../../util/tool-secrets';
 import { api, errorMessage } from '../../lib/api';
 import './SecretManager.css';
@@ -11,7 +11,7 @@ export default function SecretManager() {
   const [name, setName] = useState(''), [mutable, setMutable] = useState(false);
   const [content, setContent] = useState(''), [original, setOriginal] = useState('');
   const [tool, setTool] = useState(''), [path, setPath] = useState('');
-  const [history, setHistory] = useState<{ name: string; rows: SecretVersion[] } | null>(null);
+  const [history, setHistory] = useState<{ id: string; name: string; rows: SecretVersion[] } | null>(null);
   async function refresh() { setItems(await api<SecretMetadata[]>('/api/secrets')); }
   useEffect(() => {
     const controller = new AbortController();
@@ -19,6 +19,15 @@ export default function SecretManager() {
     return () => controller.abort();
   }, []);
   function close() { setEditing(null); setContent(''); setOriginal(''); }
+  async function remove(item: SecretMetadata) {
+    setBusy(true); setError('');
+    try {
+      await api<SecretDeleteResult>(`/api/secrets/${item.id}`, { method: 'DELETE' });
+      if (editing !== null && editing !== 'new' && editing.id === item.id) close();
+      if (history?.id === item.id) setHistory(null);
+      setItems(previous => previous.filter(value => value.id !== item.id));
+    } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
+  }
   async function edit(item?: SecretMetadata) {
     setError(''); setBusy(true);
     try {
@@ -68,8 +77,8 @@ export default function SecretManager() {
       <div className="secret-actions"><button className="secondary-button" disabled={busy} onClick={() => void edit(item)}>编辑</button><button className="secondary-button" disabled={busy} onClick={async () => {
         setBusy(true); setError(''); try { await api(`/api/secrets/${item.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !item.enabled }) }); await refresh(); } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
       }}>{item.enabled ? '停用' : '启用'}</button><button className="secondary-button" disabled={busy} onClick={async () => {
-        setBusy(true); setError(''); try { setHistory({ name: item.name, rows: await api<SecretVersion[]>(`/api/secrets/${item.id}/versions`) }); } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
-      }}>更新记录</button></div>
+        setBusy(true); setError(''); try { setHistory({ id: item.id, name: item.name, rows: await api<SecretVersion[]>(`/api/secrets/${item.id}/versions`) }); } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
+      }}>更新记录</button><button className="secondary-button" disabled={busy} onClick={() => void remove(item)}>删除</button></div>
     </article>)}</div>}
     {history && <section className="secret-form"><div className="secret-actions"><h2>{history.name} · 更新记录</h2><button className="secondary-button" onClick={() => setHistory(null)}>关闭</button></div><table><thead><tr><th>提交时间</th><th>来源</th><th>修改项</th><th>基础版本</th><th>项目</th></tr></thead><tbody>{history.rows.map(row => <tr key={row.id}><td>{new Date(row.createdAt).toLocaleString()}</td><td>{row.source === 'operator' ? '管理员' : '工具回写'}</td><td>{row.changes.join(', ')}</td><td>{row.baseVersion ?? '新建'}</td><td>{row.projectId ?? '—'}</td></tr>)}</tbody></table></section>}
   </>;

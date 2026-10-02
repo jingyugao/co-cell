@@ -1,5 +1,6 @@
 import type { Pool, RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import type { ProjectToolGrant, ProxyTool, SecretFormat, SecretVersion } from '../../protocol/secret-types.js';
+import { HttpError } from '../../util/errors.js';
 
 export interface StoredSecret {
   /** Old formats remain readable until the operator replaces their contents. */
@@ -17,6 +18,7 @@ export interface SecretRepository {
   init(): Promise<void>;
   list(): Promise<StoredSecret[]>; get(id: string): Promise<StoredSecret | null>;
   save(secret: StoredSecret, version: StoredVersion | null): Promise<void>;
+  delete(id: string): Promise<void>;
   versions(id: string): Promise<StoredVersion[]>;
   grants(projectId: string): Promise<ProjectToolGrant[]>;
   allGrants(): Promise<ProjectToolGrant[]>;
@@ -50,6 +52,23 @@ export class MySqlSecretRepository implements SecretRepository {
   }
   async list() { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT s.*,c.tool,c.path,c.alias FROM secrets s LEFT JOIN secret_tool_configs c ON c.secret_id=s.id ORDER BY s.updated_at DESC'); return rows.map(row => this.secret(row)); }
   async get(id: string) { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT s.*,c.tool,c.path,c.alias FROM secrets s LEFT JOIN secret_tool_configs c ON c.secret_id=s.id WHERE s.id=?', [id]); return rows[0] ? this.secret(rows[0]) : null; }
+  async delete(id: string) {
+    const connection = await this.pool.getConnection();
+    const contains = "JSON_CONTAINS(document, CAST(? AS JSON), '$.files')";
+    const binding = JSON.stringify({ secretId: id });
+    try {
+      await connection.beginTransaction();
+      const [projects] = await connection.query<RowDataPacket[]>(`SELECT DISTINCT project_id FROM project_tool_grants WHERE ${contains} ORDER BY project_id`, [binding]);
+      // Use the same project-before-secret lock order as grant saves.
+      for (const project of projects) await connection.query('SELECT id FROM projects WHERE id=? FOR UPDATE', [project.project_id]);
+      await connection.query('SELECT id FROM secrets WHERE id=? FOR UPDATE', [id]);
+      await connection.query(`DELETE FROM project_tool_grants WHERE ${contains}`, [binding]);
+      await connection.query('DELETE FROM secret_versions WHERE secret_id=?', [id]);
+      // secret_tool_configs is removed by its ON DELETE CASCADE foreign key.
+      await connection.query('DELETE FROM secrets WHERE id=?', [id]);
+      await connection.commit();
+    } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+  }
   async save(secret: StoredSecret, version: StoredVersion | null) {
     const connection = await this.pool.getConnection();
     try {
@@ -86,6 +105,13 @@ export class MySqlSecretRepository implements SecretRepository {
       await connection.beginTransaction();
       // Serialize configuration saves per project, including legacy POSTs.
       await connection.query('SELECT id FROM projects WHERE id=? FOR UPDATE', [projectId]);
+      const secretIds = [...new Set(grants.flatMap(grant => grant.files.map(file => file.secretId)))].sort();
+      // Recheck inside the transaction so a concurrent deletion cannot leave a
+      // newly saved binding to a resource that no longer exists.
+      for (const id of secretIds) {
+        const [rows] = await connection.query<RowDataPacket[]>('SELECT id FROM secrets WHERE id=? LOCK IN SHARE MODE', [id]);
+        if (!rows.length) throw new HttpError(400, '所选资源已删除，请刷新列表');
+      }
       await connection.query(`DELETE FROM project_tool_grants WHERE project_id=?${tool ? ' AND tool=?' : ''}`, [projectId, ...(tool ? [tool] : [])]);
       for (const grant of grants) await connection.query('INSERT INTO project_tool_grants(id,project_id,tool,alias,document) VALUES(?,?,?,?,CAST(? AS JSON))', [grant.id, projectId, grant.tool, grant.alias, JSON.stringify(grant)]);
       await connection.commit();

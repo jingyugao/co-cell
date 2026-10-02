@@ -11,6 +11,7 @@ import type { SandboxHandle } from '@co-cell/sandbox';
 import type { CellboxArchive, CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import type { ConnectionStore } from '../connections/store.js';
+import type { SecretService } from '../secrets/service.js';
 import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import { CELLBOX_PRODUCT_PATHS, CellboxRuntimeIntegration } from './cellbox-runtime.js';
 
@@ -338,5 +339,42 @@ test('CodexAppServerClient sends Authorization on the WebSocket upgrade', async 
     await client?.close();
     for (const socket of sockets) socket.destroy();
     await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('scoped credential writes survive preparation retries and refresh on content or generation changes', async () => {
+  const { handle } = fakeHandle();
+  const { provider, credentialWrites } = fakeProvider();
+  let generation = 1;
+  provider.client.getBox = async () => ({ phase: 'running', generation, capabilities: { protectedTools: true } }) as never;
+  const secrets = { repository: { runtime: async () => ({ projectId: target.projectId }) },
+    registerRuntime: async (_boxId: string, _projectId: string, version: number) => `runtime-token-${version}` } as unknown as SecretService;
+  const options = { provider, profileId: 'k8s', appServerArgs: [], env: {}, secrets, toolBrokerUrl: 'http://broker.example.test' };
+  const runtime = new CellboxRuntimeIntegration(options);
+  const previous = [process.env.OSS_ACCESS_KEY, process.env.OSS_SECRET_KEY];
+  process.env.OSS_ACCESS_KEY = 'fixture-access'; process.env.OSS_SECRET_KEY = 'fixture-secret';
+  const originalRun = handle.commands.run.bind(handle.commands);
+  let fail = true;
+  handle.commands.run = (async (command: string, runOptions?: { user?: string; signal?: AbortSignal; timeoutMs?: number }) => {
+    if (fail && command.includes('.connect(4500,')) { fail = false; throw new Error('preparation timed out'); }
+    return originalRun(command, runOptions);
+  }) as typeof handle.commands.run;
+  try {
+    await assert.rejects(runtime.prepare(handle, target, AbortSignal.timeout(5_000)), /preparation timed out/);
+    assert.equal(credentialWrites.length, 3);
+    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    assert.equal(credentialWrites.length, 3, 'readiness retries do not resend unchanged credentials');
+    options.toolBrokerUrl = 'http://new-broker.example.test';
+    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    assert.equal(credentialWrites.length, 4);
+    assert.equal(JSON.parse(credentialWrites[3].bytes.toString()).url, options.toolBrokerUrl);
+    generation = 2;
+    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    assert.equal(credentialWrites.length, 7, 'a new generation receives every configured slot');
+  } finally {
+    for (const [i, name] of ['OSS_ACCESS_KEY', 'OSS_SECRET_KEY'].entries()) {
+      if (previous[i] === undefined) delete process.env[name]; else process.env[name] = previous[i];
+    }
   }
 });

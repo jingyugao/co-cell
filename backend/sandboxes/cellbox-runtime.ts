@@ -186,10 +186,24 @@ export class CellboxRuntimeIntegration {
             if (!owner) throw new Error('Project identity is required for tool credentials');
             const token = await this.options.secrets.registerRuntime(boxId, owner, generation);
             if (!this.options.toolBrokerUrl) throw new Error('COCELL_TOOL_BROKER_URL is required');
-            await this.options.provider.client.writeCredential(boxId, 'cocell_tool_runtime', Buffer.from(JSON.stringify({ token, url: this.options.toolBrokerUrl })));
+            let cached = this.credentialDigests.get(boxId);
+            if (!cached || cached.generation !== generation) {
+                cached = { generation, slots: new Map() };
+                this.credentialDigests.set(boxId, cached);
+            }
             // Only platform archive credentials retain the legacy slot transport.
-            for (const [slot, value] of [['cocell_oss_access_key', process.env.OSS_ACCESS_KEY], ['cocell_oss_secret_key', process.env.OSS_SECRET_KEY]]) {
-                if (value) await this.options.provider.client.writeCredential(boxId, slot!, Buffer.from(value));
+            const slots = [
+                ['cocell_tool_runtime', JSON.stringify({ token, url: this.options.toolBrokerUrl })],
+                ['cocell_oss_access_key', process.env.OSS_ACCESS_KEY],
+                ['cocell_oss_secret_key', process.env.OSS_SECRET_KEY],
+            ];
+            for (const [slot, value] of slots) {
+                if (!value) continue;
+                const bytes = Buffer.from(value), digest = createHash('sha256').update(bytes).digest('hex');
+                if (cached.slots.get(slot!) === digest) continue;
+                await this.options.provider.client.writeCredential(boxId, slot!, bytes);
+                // Keep successful writes even if a later readiness probe times out.
+                cached.slots.set(slot!, digest);
             }
             return;
         }

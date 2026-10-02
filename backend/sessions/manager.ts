@@ -311,7 +311,7 @@ export class SessionManager {
     const session = this.lookup(id);
     for (const [index, source] of session.turns.entries()) for (const request of source.userInputRequests ?? []) {
       if (request.status !== 'queued' || !request.answer) continue;
-      const prompt = source.userInputRequests?.length === 1 ? request.answer : `对之前问题的回答：\n${request.answer}`;
+      const prompt = request.questions.length === 1 ? request.answer : `对之前问题的回答：\n${request.answer}`;
       const existing = session.turns.slice(index + 1).find(turn => turn.prompt === prompt && Date.parse(turn.startedAt) >= Date.parse(request.answeredAt ?? request.createdAt));
       const answerTurnId = existing?.id ?? await this.startTurn(id, prompt);
       request.status = 'answered'; request.answerTurnId = answerTurnId; session.updatedAt = new Date().toISOString();

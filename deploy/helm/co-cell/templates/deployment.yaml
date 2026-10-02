@@ -94,6 +94,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.existingSecret | quote }}
                   key: MYSQL_URL
+            - name: COCELL_SECRET_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret | quote }}
+                  key: COCELL_SECRET_MASTER_KEY
+            - name: COCELL_TOOL_BROKER_URL
+              value: {{ default (printf "http://%s.%s.svc.cluster.local.:%v" (include "co-cell.fullname" .) .Release.Namespace .Values.service.port) .Values.config.toolBrokerUrl | quote }}
             {{- range $key := list "CODEX_API_KEY" "OPENAI_API_KEY" "OSS_ACCESS_KEY" "OSS_SECRET_KEY" }}
             - name: {{ $key }}
               valueFrom:

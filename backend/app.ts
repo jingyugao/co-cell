@@ -20,8 +20,10 @@ import type { NotificationStore } from './notifications/store.js';
 import { installArchiveRoutes } from './routes/archives.js';
 import { installOperatorAccess, type OperatorAccessOptions } from './access/operator.js';
 import { proxyProjectService } from './projects/routes.js';
+import type { SecretService } from './secrets/service.js';
+import { installSecretRoutes } from './secrets/routes.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService) {
   const app = new Hono();
   if (operatorAccess) installOperatorAccess(app, {
     ...operatorAccess,
@@ -60,6 +62,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   installArchiveRoutes(app, manager);
   installSandboxesRoutes(app, sandboxes, manager);
   installConnectionsRoutes(app, connections);
+  if (secrets) installSecretRoutes(app, secrets, id => manager.listProjects().some(project => project.id === id));
   installImageRoutes(app, images);
   installSharedFilesRoutes(app, sharedFiles);
   app.all('/api/*', c => c.json({ error: '接口不存在' }, 404));

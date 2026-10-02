@@ -9,6 +9,7 @@ import type { ProjectValues, ProjectUpdate } from './useProjects';
 import { groupArchivedProjectsByWeek } from './project-groups';
 import ArchiveVersionBadge from './ArchiveVersionBadge';
 import './ProjectsPage.css';
+import ProjectToolGrants from './ProjectToolGrants';
 
 type Props = {
   projects: ProjectSummary[];
@@ -89,6 +90,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
   onStatus: (name: string, status: 'active' | 'completed') => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [showToolGrants, setShowToolGrants] = useState(false);
   const [error, setError] = useState('');
   const pending = useRef(false);
   const [chooseRestoreVersion, setChooseRestoreVersion] = useState(false);
@@ -151,6 +153,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
       <section className="project-action-group" aria-label="项目操作">
         <h3>项目操作</h3>
         <div className="project-card-actions">
+          <button className="secondary-button" onClick={() => setShowToolGrants(true)}>工具权限</button>
           {archived && backup ? <button className="primary-button" disabled={busy || operating || hasTask} onClick={restore}>恢复项目</button>
             : archived ? <span className="project-action-note">暂无可恢复备份</span>
             : <button className="primary-button" disabled={openDisabled || busy || operating} onClick={() => onOpenProject(project.id)}>进入项目 <span aria-hidden="true">→</span></button>}
@@ -178,6 +181,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
     {cleanupPending && !operating && <p className="project-rebuild-hint" role="status">旧环境待清理，系统将自动重试。</p>}
     {!operation && sandboxMissing && backup && <p className="project-rebuild-hint">当前没有 Sandbox，可使用最新备份恢复环境。</p>}
     {error && <p className="project-error" role="alert">{error}</p>}
+    {showToolGrants && <ProjectToolGrants projectId={project.id} name={displayName} onClose={() => setShowToolGrants(false)} />}
   </article>;
 }
 

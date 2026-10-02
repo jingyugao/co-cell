@@ -25,10 +25,11 @@ ARG COCELL_PROXY_TOOLS=""
 RUN mkdir -p /opt/cellbox/debug-bin \
   && for tool in $COCELL_PROXY_TOOLS; do \
        binary="$(command -v "$tool")" || { echo "Proxy tool is missing: $tool" >&2; exit 1; }; \
-       cp -L "$binary" "/opt/cellbox/debug-bin/$tool"; \
+       if test -L "$binary"; then ln -s "$(readlink -f "$binary")" "/opt/cellbox/debug-bin/$tool"; \
+       else cp -L "$binary" "/opt/cellbox/debug-bin/$tool"; fi; \
      done
 COPY --chmod=0755 launcher.mjs oss-archive-backup.mjs oss-archive-restore.mjs /opt/product/cocell/
-COPY --chmod=0755 tool-client.mjs /opt/product/cocell/tool-client.mjs
+COPY --chmod=0755 tool-client.mjs protected-tool.mjs /opt/product/cocell/
 COPY --chmod=0755 tools/cocell-archive-backup /opt/cellbox/tools/cocell-archive-backup
 COPY --chmod=0755 tools/cocell-archive-restore /opt/cellbox/tools/cocell-archive-restore
 COPY --chmod=0755 tools/cocell-proxy /opt/cellbox/tools/cocell-proxy

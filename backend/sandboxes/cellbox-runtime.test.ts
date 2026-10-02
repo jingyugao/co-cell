@@ -7,10 +7,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import type { Socket } from 'node:net';
-import type { SandboxHandle } from '@co-cell/sandbox';
+import { SandboxLifecycle, type SandboxHandle } from '@co-cell/sandbox';
 import type { CellboxArchive, CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import type { ConnectionStore } from '../connections/store.js';
+import type { SecretService } from '../secrets/service.js';
 import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import { CELLBOX_PRODUCT_PATHS, CellboxRuntimeIntegration } from './cellbox-runtime.js';
 
@@ -104,6 +105,7 @@ test('setup stays in the agent workspace, writes 0600 startup config, and instal
   const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: ['--feature', 'x'],
     env: { COCELL_TEST_MODE: 'yes' }, connections,
     credentialSlots: { 'glab/config.yml': 'glab_slot', 'cli/tool': 'cli_slot', 'missing': 'unused_slot' } });
+  await runtime.reconcile(target);
   await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
   assert(commands.every(call => call.options.user === 'agent'));
   assert(commands.every(call => !/\b(?:docker|kubectl|mount)\b/.test(call.command)));
@@ -125,10 +127,10 @@ test('clearing a connection replaces its remote credential without submitting an
   const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {},
     connections, credentialSlots: { 'glab/config.yml': 'glab_slot' } });
   try {
-    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    await runtime.reconcile(target);
     glabConfig = '';
-    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
-    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    await runtime.reconcile(target);
+    await runtime.reconcile(target);
     assert.deepEqual(credentialWrites.map(write => write.bytes.toString()), ['previous-secret', '\n']);
   } finally { await runtime.close(); }
 });
@@ -167,6 +169,30 @@ test('imported images skip credentials, use native archives and restore with the
     await runtime.close();
     if (previousEndpoint === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previousEndpoint;
   }
+});
+
+test('startup reconciliation leaves paused sandboxes asleep and archive workflows expose restore/activate hooks', async () => {
+  const fake = fakeProvider({ handle: fakeHandle().handle });
+  const hooks: string[] = [];
+  const lifecycle = new SandboxLifecycle([{ name: 'observer',
+    pre: async context => { hooks.push(`pre:${context.action}`); },
+    post: async context => { hooks.push(`post:${context.action}`); },
+  }]);
+  const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {}, lifecycle });
+  const originalBox = fake.provider.client.getBox;
+  fake.provider.client.getBox = async () => ({ phase: 'suspended' }) as never;
+  try {
+    await runtime.reconcile(target);
+    assert.deepEqual(hooks, []);
+    assert.equal(fake.credentialWrites.length, 0);
+    fake.provider.client.getBox = originalBox;
+    const ref: RemoteArchiveRef = { id: fake.archive.id, createdAt: fake.archive.createdAt,
+      sizeBytes: fake.archive.size, sha256: fake.archive.sha256, imageId: fake.archive.imageId,
+      sourceSandboxId: fake.archive.sourceBoxId, threadIds: [] };
+    const candidate = await runtime.remoteArchives.restore(target, ref, 'key', async () => {});
+    await runtime.remoteArchives.activate(candidate);
+    assert.deepEqual(hooks, ['pre:restore', 'post:restore', 'pre:activate', 'post:activate']);
+  } finally { await runtime.close(); }
 });
 
 test('grant and lease access renew while active and revoke or release on close', async t => {
@@ -339,4 +365,24 @@ test('CodexAppServerClient sends Authorization on the WebSocket upgrade', async 
     for (const socket of sockets) socket.destroy();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
+});
+
+test('environment preparation and readiness retries never distribute credentials', async () => {
+  const { handle } = fakeHandle();
+  const { provider, credentialWrites } = fakeProvider();
+  const secrets = { registerRuntime: async () => { assert.fail('prepare must not register tool runtimes'); } } as unknown as SecretService;
+  const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {},
+    secrets, toolBrokerUrl: 'http://broker.example.test' });
+  const originalRun = handle.commands.run.bind(handle.commands);
+  let fail = true;
+  handle.commands.run = (async (command: string, runOptions?: { user?: string; signal?: AbortSignal; timeoutMs?: number }) => {
+    if (fail && command.includes('.connect(4500,')) { fail = false; throw new Error('preparation timed out'); }
+    return originalRun(command, runOptions);
+  }) as typeof handle.commands.run;
+  try {
+    await assert.rejects(runtime.prepare(handle, target, AbortSignal.timeout(5_000)), /preparation timed out/);
+    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+    assert.equal(credentialWrites.length, 0);
+  } finally { await runtime.close(); }
 });

@@ -1,39 +1,37 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { posix } from 'node:path';
-import type { SandboxHandle } from '@co-cell/sandbox';
+import { SandboxLifecycle, type SandboxHandle, type SandboxLifecycleContext } from '@co-cell/sandbox';
 import { CellboxError, CellboxSandboxProvider, type CellboxArchive } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import type { AppServerEndpoint } from '../execution/container-runtime.js';
-import type { ConnectionStore } from '../connections/store.js';
 import type { RemoteArchives } from '../archives/remote.js';
 import type { RemoteArchiveMetadata, RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import { downloadOssArchive } from '../archives/oss-download.js';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
+import { SandboxRuntimeConfig, type SandboxRuntimeConfigOptions } from './runtime-config.js';
 const q = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const node = '/usr/local/bin/node';
 const workspace = '/home/agent/workspace';
 export const CELLBOX_PRODUCT_PATHS = { root: `${workspace}/.cocell`, runtime: `${workspace}/.cocell/runtime`, codexHome: `${workspace}/.cocell/codex`, startup: '/home/agent/.cocell-startup', node };
 const metadata = (a: CellboxArchive): RemoteArchiveMetadata => ({ id: a.id, createdAt: a.createdAt, sizeBytes: a.size, sha256: a.sha256, imageId: a.imageId, sourceSandboxId: a.sourceBoxId, ...(a.portable ? { portable: true } : {}) });
-export interface CellboxRuntimeIntegrationOptions {
-    provider: CellboxSandboxProvider;
+export interface CellboxRuntimeIntegrationOptions extends SandboxRuntimeConfigOptions {
     profileId: string;
     appServerArgs: string[];
     env: Record<string, string>;
-    connections?: ConnectionStore;
-    /** Runtime bundle paths mapped only to explicitly admitted debug slots. */
-    credentialSlots?: Record<string, string>;
+    lifecycle?: SandboxLifecycle;
     onRenewalFailure?: (error: unknown) => void;
 }
 /** Product initialization. Cellbox retains ownership of identities, forwarding and archive bytes. */
 export class CellboxRuntimeIntegration {
+    readonly lifecycle: SandboxLifecycle;
     readonly remoteArchives: RemoteArchives;
     private readonly preparations = new Map<string, Promise<void>>();
     private readonly prepared = new Map<string, { generation: number; workspace: string }>();
-    private readonly credentialDigests = new Map<string, { generation: number; slots: Map<string, string> }>();
     private readonly releases = new Set<() => Promise<void>>();
     constructor(private readonly options: CellboxRuntimeIntegrationOptions) {
+        this.lifecycle = options.lifecycle ?? new SandboxLifecycle([new SandboxRuntimeConfig(options).extension]);
         const ossArchiveEndpoint = process.env.OSS_ENDPOINT;
         this.remoteArchives = {
         capture: async (target, key) => {
@@ -65,35 +63,46 @@ export class CellboxRuntimeIntegration {
                 return metadata(await options.provider.client.getArchive(ref.id));
             },
             restore: async (target, ref, key, onCandidate) => {
-                if (ref.storageType === 'oss') {
-                    if (target.imageSelection) throw new Error('Imported images cannot restore protected OSS archives');
-                    if (!ossArchiveEndpoint) throw new Error('OSS restore endpoint is unavailable');
-                    const candidateHandle = await options.provider.create(options.profileId, { timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false }, metadata: { projectId: target.projectId ?? target.id, cellboxOwnerKey: `project:${target.projectId ?? target.id}:oss-restore:${key}`, cellboxIdempotencyKey: key } });
-                    const candidate: SandboxState = { id: candidateHandle.sandboxId, template: options.profileId, status: 'starting', workingDirectory: workspace };
+                const context: SandboxLifecycleContext = { action: 'restore', resourceKey: `project:${target.projectId ?? target.id}` };
+                return this.lifecycle.run(context, async () => {
+                    if (ref.storageType === 'oss') {
+                        if (target.imageSelection) throw new Error('Imported images cannot restore protected OSS archives');
+                        if (!ossArchiveEndpoint) throw new Error('OSS restore endpoint is unavailable');
+                        const createContext: SandboxLifecycleContext = { action: 'create', resourceKey: context.resourceKey };
+                        let candidate!: SandboxState;
+                        await this.lifecycle.run(createContext, async () => {
+                            const handle = await options.provider.create(options.profileId, { timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false }, metadata: { projectId: target.projectId ?? target.id, cellboxOwnerKey: `project:${target.projectId ?? target.id}:oss-restore:${key}`, cellboxIdempotencyKey: key } });
+                            candidate = { id: handle.sandboxId, template: options.profileId, status: 'starting', workingDirectory: workspace };
+                            await onCandidate(candidate);
+                            createContext.sandboxId = context.sandboxId = candidate.id;
+                            createContext.sandbox = handle;
+                        });
+                        const result = await options.provider.client.runTool(candidate.id, 'cocell_archive_restore', [JSON.stringify(ref.metadata), ossArchiveEndpoint], 5 * 60_000);
+                        if (result.exitCode !== 0) throw new Error(result.stderr || `OSS archive restore exited ${result.exitCode}`);
+                        candidate.image = await options.provider.currentImageIdentity(candidate.id);
+                        return candidate;
+                    }
+                    const op = await options.provider.client.restoreBox({ profileId: options.profileId, ownerKey: `project:${target.projectId ?? target.id}:restore:${key}`, archiveId: ref.id, ...(target.imageSelection ? { importedImageId: target.imageSelection.importedImageId } : {}), ...(ref.portable ? { acceptImageChange: true } : {}) }, key);
+                    const candidate: SandboxState = { id: op.targetId, template: options.profileId, status: 'starting', workingDirectory: target.settings.workingDirectory };
                     await onCandidate(candidate);
-                    await this.syncCredentials(candidate.id, (await options.provider.client.getBox(candidate.id)).generation);
-                    const result = await options.provider.client.runTool(candidate.id, 'cocell_archive_restore', [JSON.stringify(ref.metadata), ossArchiveEndpoint], 5 * 60_000);
-                    if (result.exitCode !== 0) throw new Error(result.stderr || `OSS archive restore exited ${result.exitCode}`);
-                    candidate.image = await options.provider.currentImageIdentity(candidate.id);
+                    context.sandboxId = candidate.id;
+                    await options.provider.waitForOperation(op);
+                    const box = await options.provider.client.getBox(candidate.id);
+                    if (box.phase !== 'staged')
+                        throw new Error('Cellbox did not return a staged restore candidate');
+                    candidate.image = { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] };
                     return candidate;
-                }
-                const op = await options.provider.client.restoreBox({ profileId: options.profileId, ownerKey: `project:${target.projectId ?? target.id}:restore:${key}`, archiveId: ref.id, ...(target.imageSelection ? { importedImageId: target.imageSelection.importedImageId } : {}), ...(ref.portable ? { acceptImageChange: true } : {}) }, key);
-                const candidate: SandboxState = { id: op.targetId, template: options.profileId, status: 'starting', workingDirectory: target.settings.workingDirectory };
-                await onCandidate(candidate);
-                await options.provider.waitForOperation(op);
-                const box = await options.provider.client.getBox(candidate.id);
-                if (box.phase !== 'staged')
-                    throw new Error('Cellbox did not return a staged restore candidate');
-                candidate.image = { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] };
-                return candidate;
+                });
             },
             activate: async (candidate) => {
-                const handle = await options.provider.connectForSetup(candidate.id);
-                await this.prepare(handle, { id: candidate.id, settings: { workingDirectory: candidate.workingDirectory }, sandbox: candidate, updatedAt: new Date().toISOString() }, AbortSignal.timeout(120000), false);
-                const box = await options.provider.client.getBox(candidate.id);
-                if (box.phase === 'staged') await options.provider.activateBox(candidate.id, `cocell-activate-${candidate.id}`);
-                else if (box.phase !== 'running') throw new Error(`Cellbox restore candidate is ${box.phase}`);
-                await this.waitForAppServer(handle, AbortSignal.timeout(30000));
+                await this.lifecycle.run({ action: 'activate', resourceKey: `sandbox:${candidate.id}`, sandboxId: candidate.id }, async () => {
+                    const handle = await options.provider.connectForSetup(candidate.id);
+                    await this.prepare(handle, { id: candidate.id, settings: { workingDirectory: candidate.workingDirectory }, sandbox: candidate, updatedAt: new Date().toISOString() }, AbortSignal.timeout(120000), false);
+                    const box = await options.provider.client.getBox(candidate.id);
+                    if (box.phase === 'staged') await options.provider.activateBox(candidate.id, `cocell-activate-${candidate.id}`);
+                    else if (box.phase !== 'running') throw new Error(`Cellbox restore candidate is ${box.phase}`);
+                    await this.waitForAppServer(handle, AbortSignal.timeout(30000));
+                });
             },
             download: async (ref, destination) => {
                 if (ref.sizeBytes > 256 * 1024 * 1024)
@@ -124,8 +133,7 @@ export class CellboxRuntimeIntegration {
             if (box.phase !== 'running' && box.phase !== 'staged') throw new Error(`Cellbox is ${box.phase}`);
             const cached = this.prepared.get(handle.sandboxId);
             fresh = !cached || cached.generation !== box.generation || cached.workspace !== target.settings.workingDirectory;
-            if (fresh) await this.prepareOnce(handle, target, signal, wait, box.generation);
-            else await this.syncCredentials(handle.sandboxId, box.generation);
+            if (fresh) await this.prepareOnce(handle, target, signal, wait);
             if (wait) this.prepared.set(handle.sandboxId, { generation: box.generation, workspace: target.settings.workingDirectory });
         });
         this.preparations.set(handle.sandboxId, current);
@@ -138,14 +146,13 @@ export class CellboxRuntimeIntegration {
         }
         return fresh;
     }
-    private async prepareOnce(handle: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal, wait: boolean, generation: number) {
+    private async prepareOnce(handle: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal, wait: boolean) {
         if (posix.normalize(target.settings.workingDirectory) !== target.settings.workingDirectory || (target.settings.workingDirectory !== workspace && !target.settings.workingDirectory.startsWith(workspace + '/')))
             throw new Error(`Cellbox project workspace must be inside ${workspace}`);
         signal.throwIfAborted();
         const root = CELLBOX_PRODUCT_PATHS.root, runtime = CELLBOX_PRODUCT_PATHS.startup;
         const setup = `const fs=require('node:fs'),path=require('node:path');for(const p of ${JSON.stringify([root, CELLBOX_PRODUCT_PATHS.runtime, runtime, CELLBOX_PRODUCT_PATHS.codexHome, target.settings.workingDirectory])}){let current='/';for(const part of p.split('/').filter(Boolean)){current=path.join(current,part);try{fs.mkdirSync(current,{mode:0o700})}catch(e){if(e.code!=='EEXIST')throw e}const s=fs.lstatSync(current);if(!s.isDirectory()||s.isSymbolicLink())throw Error('Unsafe runtime directory');}if(fs.statSync(p).uid!==process.getuid())throw Error('Unsafe runtime owner');}fs.chmodSync(${JSON.stringify(root)},0o700);fs.chmodSync(${JSON.stringify(runtime)},0o700);`;
         await handle.commands.run(`${node} -e ${q(setup)}`, { user: 'agent', signal, timeoutMs: 30000 });
-        await this.syncCredentials(handle.sandboxId, generation);
         const probe = `const n=require('node:net').connect(4500,'127.0.0.1');n.on('connect',()=>{n.end();process.exit(0)});n.on('error',()=>process.exit(1));n.setTimeout(1000,()=>process.exit(1));`;
         const running = await handle.commands.run(`${node} -e ${q(probe)}`, { user: 'agent', signal, timeoutMs: 2000 }).then(() => true, error => { if ((error as {
             exitCode?: number;
@@ -171,41 +178,13 @@ export class CellboxRuntimeIntegration {
             await handle.files.remove(temp, { user: 'agent' }).catch(() => { });
         }
     }
-    private async syncCredentials(boxId: string, generation: number) {
-        const mapping = this.options.credentialSlots ?? {};
-        if (!Object.keys(mapping).length || !this.options.connections)
-            return;
-        if (!(await this.options.provider.client.getBox(boxId)).capabilities.protectedTools) return;
-        const bundle = await this.options.connections.readRuntimeBundle();
-        const files: Record<string, Uint8Array> = {
-            'glab/config.yml': Buffer.from(bundle?.glabConfig ?? ''), 'gitconfig': Buffer.from(bundle?.gitConfig ?? ''),
-            'git-credentials': Buffer.from(bundle?.gitCredentials ?? ''), '.mylogin.cnf': Buffer.from(bundle?.mysqlLogin ?? '', 'base64'),
-            ...Object.fromEntries(Object.entries(bundle?.cliFiles ?? {}).map(([name, value]) => [name, Buffer.from(value, 'base64')])),
-            __ossAccessKey: Buffer.from(process.env.OSS_ACCESS_KEY ?? ''),
-            __ossSecretKey: Buffer.from(process.env.OSS_SECRET_KEY ?? ''),
-            __mysqlLogin: Buffer.from(bundle?.mysqlLogin ?? '', 'base64'),
-        };
-        for (const [name, value] of Object.entries(bundle?.cliFiles ?? {})) {
-            if (/^(kubernetes|meegle|lark-config|lark-data)\//.test(name)) files[`__${name.replaceAll('/', '_')}`] = Buffer.from(value, 'base64');
-        }
-        let cached = this.credentialDigests.get(boxId);
-        if (!cached || cached.generation !== generation) {
-            cached = { generation, slots: new Map() };
-            this.credentialDigests.set(boxId, cached);
-        }
-        for (const [source, slot] of Object.entries(mapping)) {
-            if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(slot))
-                throw new Error('Invalid Cellbox credential slot mapping');
-            // Clearing a configured connection must not retain its old secret.
-            // Cellbox requires a nonempty credential. Replace a cleared secret
-            // with an inert newline so its previous value cannot survive.
-            const value = files[source];
-            const bytes = value?.byteLength ? value : Buffer.from('\n');
-            const digest = createHash('sha256').update(bytes).digest('hex');
-            if (cached.slots.get(slot) === digest) continue;
-            await this.options.provider.client.writeCredential(boxId, slot, bytes);
-            cached.slots.set(slot, digest);
-        }
+    /** Reconcile active instances after operator configuration changes; never wake paused boxes. */
+    async reconcile(target: WorkspaceTarget): Promise<void> {
+        if (!target.sandbox) return;
+        const box = await this.options.provider.client.getBox(target.sandbox.id);
+        if (box.phase !== 'running' && box.phase !== 'staged') return;
+        await this.lifecycle.run({ action: 'reconcile', resourceKey: `project:${target.projectId ?? target.id}`,
+            sandboxId: target.sandbox.id }, async () => {});
     }
     private async waitForAppServer(handle: SandboxHandle, signal: AbortSignal) {
         const script = `const fs=require('node:fs'),net=require('node:net');const until=Date.now()+25000;function poll(){const s=net.connect(4500,'127.0.0.1');s.once('connect',()=>{s.end();if(fs.existsSync('${CELLBOX_PRODUCT_PATHS.startup}/config.json')){console.error('Startup config was not consumed');process.exit(1)}process.exit(0)});s.once('error',()=>{s.destroy();if(Date.now()>until){console.error('App Server did not become ready');process.exit(1)}setTimeout(poll,200)});s.setTimeout(500,()=>s.destroy(new Error('timeout')))}poll();`;
@@ -244,6 +223,5 @@ export class CellboxRuntimeIntegration {
     async close() {
         await Promise.allSettled([...this.releases].map(release => release()));
         this.prepared.clear();
-        this.credentialDigests.clear();
     }
 }

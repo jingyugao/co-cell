@@ -20,7 +20,8 @@ import { RuntimeLog } from './infra/diagnostics/runtime-log.js';
 import { installProductionStatic } from './infra/http/static-files.js';
 import { modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
-import { ConnectionStore } from './connections/store.js';
+import { SecretCrypto } from './secrets/crypto.js';
+import { SecretService } from './secrets/service.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 const mysqlUrl = process.env.MYSQL_URL?.trim() ?? '';
@@ -42,9 +43,11 @@ const codex = new Codex({ ...(apiKey ? { apiKey } : {}), ...(process.env.CODEX_P
 
 const runtimeLog = new RuntimeLog({ ...(process.env.RUNTIME_LOG_DIRECTORY ? { directory: resolve(process.env.RUNTIME_LOG_DIRECTORY) } : {}),
   secrets: [apiKey,process.env.CELLBOX_API_TOKEN,process.env.COCELL_ACCESS_TOKEN].filter((value): value is string => Boolean(value)) });
-// Tests and parallel local instances can isolate their capability token and
-// credential runtime files without touching the primary Web service's state.
-const connections = new ConnectionStore(process.env.CONNECTIONS_DATA_DIR ? { directory: resolve(process.env.CONNECTIONS_DATA_DIR) } : undefined);
+const secretCrypto = new SecretCrypto(process.env.COCELL_SECRET_MASTER_KEY ?? '');
+const toolBrokerUrl = process.env.COCELL_TOOL_BROKER_URL;
+if (!toolBrokerUrl) throw new Error('COCELL_TOOL_BROKER_URL must be an HTTP(S) origin reachable from Sandboxes');
+const brokerOrigin = new URL(toolBrokerUrl);
+if (!['http:', 'https:'].includes(brokerOrigin.protocol) || brokerOrigin.username || brokerOrigin.password || brokerOrigin.search || brokerOrigin.hash || brokerOrigin.pathname !== '/') throw new Error('COCELL_TOOL_BROKER_URL must be an HTTP(S) origin');
 if (process.env.SANDBOX_PROVIDER && process.env.SANDBOX_PROVIDER !== 'cellbox') {
   throw new Error('SANDBOX_PROVIDER=docker is unsupported; CoCell requires Cellbox Kubernetes');
 }
@@ -55,10 +58,14 @@ for(const name of ['CELLBOX_API_URL','CELLBOX_API_TOKEN','CELLBOX_PROFILE','COCE
 if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOKEN must contain at least 32 bytes');
 const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,token:process.env.CELLBOX_API_TOKEN!,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',stateDirectory:resolve('data/cellbox-operations')});
 await cellboxProvider.initialize();
-const credentialSlots=process.env.CELLBOX_CREDENTIAL_SLOTS_JSON?JSON.parse(process.env.CELLBOX_CREDENTIAL_SLOTS_JSON):{};
-if(!credentialSlots||Array.isArray(credentialSlots)||typeof credentialSlots!=='object'||Object.values(credentialSlots).some(v=>typeof v!=='string'))throw new Error('CELLBOX_CREDENTIAL_SLOTS_JSON must map source paths to admitted slot names');
+let manager: SessionManager;
+const secrets = new SecretService(webState.secretRepository, secretCrypto, id => cellboxProvider.client.getBox(id), (projectId, boxId) => {
+  const project = manager?.listProjects().find(project => project.id === projectId);
+  return Boolean(project && project.status !== 'archived' && project.sandbox?.id === boxId);
+});
 const cellboxRuntime=new CellboxRuntimeIntegration({provider:cellboxProvider,profileId:process.env.CELLBOX_PROFILE!,appServerArgs:appServerArguments,
-  env:{...(apiKey?{CODEX_API_KEY:apiKey}:{}),...(process.env.OPENAI_BASE_URL?{OPENAI_BASE_URL:process.env.OPENAI_BASE_URL}:{})},connections,credentialSlots,
+  env:{...(apiKey?{CODEX_API_KEY:apiKey}:{}),...(process.env.OPENAI_BASE_URL?{OPENAI_BASE_URL:process.env.OPENAI_BASE_URL}:{})},
+  secrets, toolBrokerUrl,
   onRenewalFailure:error=>{void runtimeLog.write({event:'sandbox.cellbox_renewal_failed',error});}});
 const provider = cellboxProvider;
 const inventory = new CellboxSandboxInventory(cellboxProvider);
@@ -70,11 +77,10 @@ const localWorkingDirectory=resolve(process.env.CODEX_WORKSPACE||process.cwd());
 const defaults:Settings={executionMode:'sandbox',workingDirectory:sandboxWorkingDirectory,model:process.env.CODEX_MODEL||DEFAULT_MODEL,modelReasoningEffort:'medium',sandboxMode:'danger-full-access',webSearchMode:'cached',networkAccessEnabled:true};
 const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_MS ?? 60 * 60 * 1000);
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
-const sandboxManager = new SandboxManager({ provider, logger: runtimeLog, policy: { autoCheckpointAfterMs } });
+const sandboxManager = new SandboxManager({ provider, logger: runtimeLog, policy: { autoCheckpointAfterMs }, lifecycle: cellboxRuntime.lifecycle });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
 const notifications = new NotificationStore(process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
 await notifications.init();
-let manager: SessionManager;
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
   logger: runtimeLog, baseUrl: process.env.OPENAI_BASE_URL, modelConfig, configOverrides,
   ...(process.env.SHARED_DATA_DIRECTORY ? { sharedDataDirectory: pathToFileURL(`${resolve(process.env.SHARED_DATA_DIRECTORY)}/`) } : {}),
@@ -91,7 +97,18 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
     archivedReclaimAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   }, notifications);
+// Project tables must exist before the Secret schema's foreign keys are created.
+await webState.init();
+await secrets.init();
 await manager.init();
+// Paused instances are configured on resume. Running instances survive a web
+// service restart; compare their durable acknowledgements before writing slots.
+for (const project of manager.listProjects()) {
+  if (project.status === 'archived' || !project.sandbox) continue;
+  try { await cellboxRuntime.reconcile({ id: project.id, projectId: project.id, updatedAt: project.updatedAt,
+    settings: { workingDirectory: project.sandbox.workingDirectory }, sandbox: project.sandbox }); }
+  catch (error) { runtimeLog.write({ event: 'sandbox.runtime_config_reconcile_failed', projectId: project.id, error }); }
+}
 const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.env.CELLBOX_PROFILE!, undefined, () => manager.listProjects());
 await imageCatalog.init();
 manager.setImageCatalog(imageCatalog);
@@ -104,7 +121,7 @@ const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
-  inventory, undefined, connections, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,provider:cellboxProvider,projects:()=>manager.listProjects() }, imageCatalog);
+  inventory, undefined, undefined, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,provider:cellboxProvider,projects:()=>manager.listProjects() }, imageCatalog, secrets);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }

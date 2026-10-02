@@ -105,6 +105,8 @@ export interface SandboxProvider {
     metadata?: Record<string, string>;
   }): Promise<SandboxHandle>;
   connect(sandboxId: string, options: { timeoutMs: number }): Promise<SandboxHandle>;
+  /** Connect to an already running/staged instance without resuming it. */
+  connectForSetup?(sandboxId: string): Promise<SandboxHandle>;
   getInfo(sandboxId: string): Promise<SandboxInfo>;
   /** Display-only batch observation; missing IDs are omitted and state may be eventually consistent. */
   getInfos?(sandboxIds: string[]): Promise<SandboxInfo[]>;
@@ -118,6 +120,28 @@ export interface SandboxManagerOptions {
   provider: SandboxProvider;
   logger?: SandboxLogger;
   policy?: Partial<SandboxPolicy>;
+  lifecycle?: import('./lifecycle.js').SandboxLifecycle;
+  /** Use lifecycle when sharing the same hook host with provider-specific workflows. */
+  extensions?: readonly SandboxExtension[];
+}
+
+export type SandboxLifecycleAction = 'create' | 'connect' | 'resume' | 'pause' | 'checkpoint' | 'destroy' | 'restore' | 'activate' | 'reconcile';
+export interface SandboxLifecycleContext {
+  action: SandboxLifecycleAction;
+  resourceKey: string;
+  sandboxId?: string;
+  sandbox?: SandboxHandle;
+  record?: SandboxRecord;
+  metadata?: Record<string, string>;
+}
+/** Hooks are awaited in registration order. A failed pre hook prevents the operation. */
+export interface SandboxExtension {
+  name: string;
+  pre?(context: Readonly<SandboxLifecycleContext>): Promise<void>;
+  /** Runs only after a successful operation, before the manager reports readiness. */
+  post?(context: Readonly<SandboxLifecycleContext>): Promise<void>;
+  /** Best-effort notification; it never replaces the original failure. */
+  error?(context: Readonly<SandboxLifecycleContext>, error: unknown): Promise<void>;
 }
 
 export interface AcquireSandboxOptions {

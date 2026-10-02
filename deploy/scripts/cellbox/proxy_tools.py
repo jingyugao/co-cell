@@ -5,7 +5,7 @@ import tomllib
 from pathlib import Path
 
 
-NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 TOOL_ID = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
 
 
@@ -62,6 +62,7 @@ def load_proxy_tools(config_path: str, base_image: str, *, required: bool = Fals
                 "executable": "/opt/cellbox/tools/cocell-proxy",
                 "args": [name, policy_path.name if policy_path else "-"],
                 "passThroughArgs": True,
+                "credentialEnv": {"COCELL_TOOL_RUNTIME": "cocell_tool_runtime"},
             },
         })
     if not managed:

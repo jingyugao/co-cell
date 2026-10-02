@@ -77,7 +77,7 @@ const localWorkingDirectory=resolve(process.env.CODEX_WORKSPACE||process.cwd());
 const defaults:Settings={executionMode:'sandbox',workingDirectory:sandboxWorkingDirectory,model:process.env.CODEX_MODEL||DEFAULT_MODEL,modelReasoningEffort:'medium',sandboxMode:'danger-full-access',webSearchMode:'cached',networkAccessEnabled:true};
 const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_MS ?? 60 * 60 * 1000);
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
-const sandboxManager = new SandboxManager({ provider, logger: runtimeLog, policy: { autoCheckpointAfterMs } });
+const sandboxManager = new SandboxManager({ provider, logger: runtimeLog, policy: { autoCheckpointAfterMs }, lifecycle: cellboxRuntime.lifecycle });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
 const notifications = new NotificationStore(process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
 await notifications.init();
@@ -101,6 +101,14 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
 await webState.init();
 await secrets.init();
 await manager.init();
+// Paused instances are configured on resume. Running instances survive a web
+// service restart; compare their durable acknowledgements before writing slots.
+for (const project of manager.listProjects()) {
+  if (project.status === 'archived' || !project.sandbox) continue;
+  try { await cellboxRuntime.reconcile({ id: project.id, projectId: project.id, updatedAt: project.updatedAt,
+    settings: { workingDirectory: project.sandbox.workingDirectory }, sandbox: project.sandbox }); }
+  catch (error) { runtimeLog.write({ event: 'sandbox.runtime_config_reconcile_failed', projectId: project.id, error }); }
+}
 const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.env.CELLBOX_PROFILE!, undefined, () => manager.listProjects());
 await imageCatalog.init();
 manager.setImageCatalog(imageCatalog);

@@ -21,6 +21,9 @@ export interface SecretRepository {
   saveGrant(grant: ProjectToolGrant): Promise<void>; deleteGrant(projectId: string, id: string): Promise<void>;
   registerRuntime(boxId: string, projectId: string, generation: number): Promise<void>;
   runtime(boxId: string): Promise<{ projectId: string; generation: number } | null>;
+  runtimeConfig(boxId: string, generation: number): Promise<Record<string, string>>;
+  markRuntimeConfig(boxId: string, generation: number, slot: string, digest: string): Promise<void>;
+  forgetRuntime(boxId: string): Promise<void>;
   startInvocation(value: StoredInvocation): Promise<void>;
   invocation(id: string): Promise<StoredInvocation | null>;
   completeInvocation(value: StoredInvocation, changes: Array<{ secret: StoredSecret; version: StoredVersion }>, exitCode: number): Promise<boolean>;
@@ -35,6 +38,7 @@ export class MySqlSecretRepository implements SecretRepository {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS secret_versions (id CHAR(36) PRIMARY KEY, secret_id CHAR(36) NOT NULL, source VARCHAR(10) NOT NULL, base_version BIGINT UNSIGNED NULL, created_at VARCHAR(30) NOT NULL, project_id CHAR(36) NULL, invocation_id CHAR(36) NULL, changes_json JSON NOT NULL, ciphertext MEDIUMTEXT NOT NULL, INDEX secret_history(secret_id,created_at), CONSTRAINT secret_versions_secret_fk FOREIGN KEY(secret_id) REFERENCES secrets(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS project_tool_grants (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, tool VARCHAR(32) NOT NULL, alias VARCHAR(64) NOT NULL, document JSON NOT NULL, UNIQUE KEY project_tool_alias(project_id,tool,alias), CONSTRAINT tool_grants_project_fk FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS project_tool_runtimes (box_id VARCHAR(200) PRIMARY KEY, project_id CHAR(36) NOT NULL, generation BIGINT UNSIGNED NOT NULL, CONSTRAINT tool_runtimes_project_fk FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS sandbox_runtime_configs (box_id VARCHAR(200) NOT NULL, generation BIGINT UNSIGNED NOT NULL, slot VARCHAR(64) NOT NULL, digest CHAR(64) NOT NULL, applied_at VARCHAR(30) NOT NULL, PRIMARY KEY(box_id,generation,slot), CONSTRAINT runtime_configs_box_fk FOREIGN KEY(box_id) REFERENCES project_tool_runtimes(box_id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS tool_invocations (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, document JSON NOT NULL, completed_at DATETIME(3) NULL, exit_code INT NULL, INDEX invocation_project(project_id,completed_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
   }
   private secret(row: RowDataPacket): StoredSecret {
@@ -75,6 +79,14 @@ export class MySqlSecretRepository implements SecretRepository {
     await this.pool.query('INSERT INTO project_tool_runtimes(box_id,project_id,generation) VALUES(?,?,?) ON DUPLICATE KEY UPDATE project_id=VALUES(project_id),generation=VALUES(generation)', [boxId, projectId, generation]);
   }
   async runtime(boxId: string) { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT project_id,generation FROM project_tool_runtimes WHERE box_id=?', [boxId]); return rows[0] ? { projectId: rows[0].project_id as string, generation: Number(rows[0].generation) } : null; }
+  async runtimeConfig(boxId: string, generation: number) {
+    const [rows] = await this.pool.query<RowDataPacket[]>('SELECT slot,digest FROM sandbox_runtime_configs WHERE box_id=? AND generation=?', [boxId, generation]);
+    return Object.fromEntries(rows.map(row => [row.slot as string, row.digest as string]));
+  }
+  async markRuntimeConfig(boxId: string, generation: number, slot: string, digest: string) {
+    await this.pool.query('INSERT INTO sandbox_runtime_configs(box_id,generation,slot,digest,applied_at) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE digest=VALUES(digest),applied_at=VALUES(applied_at)', [boxId, generation, slot, digest, new Date().toISOString()]);
+  }
+  async forgetRuntime(boxId: string) { await this.pool.query('DELETE FROM project_tool_runtimes WHERE box_id=?', [boxId]); }
   async startInvocation(value: StoredInvocation) { await this.pool.query('INSERT INTO tool_invocations(id,project_id,document) VALUES(?,?,CAST(? AS JSON))', [value.id, value.projectId, JSON.stringify(value)]); }
   async invocation(id: string) { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT document FROM tool_invocations WHERE id=?', [id]); return rows[0] ? parse<StoredInvocation>(rows[0].document) : null; }
   async completeInvocation(value: StoredInvocation, changes: Array<{ secret: StoredSecret; version: StoredVersion }>, exitCode: number) {

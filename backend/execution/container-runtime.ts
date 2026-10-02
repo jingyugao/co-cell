@@ -632,8 +632,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private async verifySandboxOnce(sandbox: SandboxState, timeoutMs: number) {
     const info = await this.options.provider.getInfo(sandbox.id);
     if (info.state !== 'running') throw new HttpError(502, 'Sandbox 尚未就绪');
-    const handle = await this.options.provider.connect(sandbox.id, { timeoutMs });
-    await this.options.prepareRemote(handle, { id: sandbox.id, settings: { workingDirectory: sandbox.workingDirectory }, sandbox, updatedAt: new Date().toISOString() }, AbortSignal.timeout(timeoutMs));
+    const handle = this.options.provider.connectForSetup
+      ? await this.options.provider.connectForSetup(sandbox.id)
+      : await this.options.provider.connect(sandbox.id, { timeoutMs });
     await handle.commands.run(`test -d ${quote(sandbox.workingDirectory)} && test -d ${quote(this.codexHome)}`, { timeoutMs });
     if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
     const endpoint = await this.options.appServer(sandbox.id);
@@ -652,11 +653,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async fenceSandbox(sandbox: SandboxState) {
     const provider = this.options.provider as SandboxProvider & { stop?: (id: string) => Promise<void> };
     try {
-      if (provider.stop) await provider.stop(sandbox.id);
-      else {
-        const info = await provider.getInfo(sandbox.id);
-        if (info.state !== 'paused') await provider.pause(sandbox.id);
-      }
+      if (!provider.stop && (await provider.getInfo(sandbox.id)).state === 'paused') return;
+      await this.sandboxes.manager.lifecycle.run({ action: 'pause', resourceKey: `sandbox:${sandbox.id}`, sandboxId: sandbox.id }, async () => {
+        if (provider.stop) await provider.stop(sandbox.id);
+        else await provider.pause(sandbox.id);
+      });
     } catch (error) {
       // A missing or terminally failed box cannot run work. Transport errors
       // are not proof that the old environment has stopped.
@@ -671,14 +672,18 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   async pauseDanglingSandbox(sandboxId: string) {
-    await this.options.provider.pause(sandboxId).catch(error => {
-      if (!/not found|no such container/i.test(String(error))) throw this.safeError(error);
+    await this.sandboxes.manager.lifecycle.run({ action: 'pause', resourceKey: `sandbox:${sandboxId}`, sandboxId }, async () => {
+      await this.options.provider.pause(sandboxId).catch(error => {
+        if (!/not found|no such container/i.test(String(error))) throw this.safeError(error);
+      });
     });
   }
 
   async deleteDanglingSandbox(sandboxId: string) {
-    await this.options.provider.kill(sandboxId).catch(error => {
-      if (!/not found|no such container/i.test(String(error))) throw this.safeError(error);
+    await this.sandboxes.manager.lifecycle.run({ action: 'destroy', resourceKey: `sandbox:${sandboxId}`, sandboxId }, async () => {
+      await this.options.provider.kill(sandboxId).catch(error => {
+        if (!/not found|no such container/i.test(String(error))) throw this.safeError(error);
+      });
     });
   }
 

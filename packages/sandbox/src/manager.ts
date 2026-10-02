@@ -1,4 +1,5 @@
 import { SandboxBusyError, SandboxManagerError, SandboxPersistenceError } from './errors.js';
+import { SandboxLifecycle, SandboxExtensionError } from './lifecycle.js';
 import type {
   AcquireSandboxOptions,
   SandboxManagerOptions,
@@ -12,6 +13,7 @@ import type {
   SandboxStatus,
   SandboxInfo,
   SandboxHandle,
+  SandboxLifecycleContext,
   CheckpointableSandboxProvider,
 } from './types.js';
 
@@ -29,6 +31,7 @@ type Entry = {
   persist: PersistSandboxRecord;
   persistencePending: boolean;
   sandbox?: SandboxHandle;
+  generation?: string;
   usages: Map<string, Usage>;
   invalidation: AbortController;
   lastRenewedAt: number;
@@ -62,6 +65,7 @@ const assertUsageId = (usageId: string) => {
  * this package.
  */
 export class SandboxManager {
+  readonly lifecycle: SandboxLifecycle;
   private readonly entries = new Map<string, Entry>();
   private readonly locks = new Map<string, Promise<void>>();
   private readonly policy: SandboxPolicy;
@@ -72,6 +76,8 @@ export class SandboxManager {
   private closed = false;
 
   constructor(private readonly options: SandboxManagerOptions) {
+    if (options.lifecycle && options.extensions) throw new Error('Use either lifecycle or extensions for Sandbox hooks');
+    this.lifecycle = options.lifecycle ?? new SandboxLifecycle(options.extensions);
     this.policy = { ...DEFAULT_SANDBOX_POLICY, ...options.policy };
     for (const [name, value] of Object.entries(this.policy)) {
       if (!Number.isFinite(value) || value <= 0) {
@@ -357,17 +363,22 @@ export class SandboxManager {
       if (entry.record.status === 'deleted') {
         throw new SandboxManagerError('not_accessible', `Sandbox resource ${resourceKey} was deleted`);
       }
-      if (entry.record.status === 'paused') return cloneRecord(entry.record);
+      if (entry.record.status === 'paused' && entry.record.error?.code !== 'extension_failed') return cloneRecord(entry.record);
       await this.change(resourceKey, entry, { operation: 'pausing' });
       try {
-        await this.provider.pause(entry.record.id);
-        entry.sandbox = undefined;
-        await this.change(resourceKey, entry, {
-          status: 'paused', operation: undefined, pausedAt: new Date().toISOString(), error: undefined,
+        const context = this.context('pause', resourceKey, entry);
+        await this.lifecycle.run(context, async () => {
+          await this.provider.pause(entry.record.id);
+          entry.sandbox = undefined;
+          await this.change(resourceKey, entry, {
+            status: 'paused', operation: undefined, pausedAt: new Date().toISOString(), error: undefined,
+          });
+          context.record = cloneRecord(entry.record);
         });
         return cloneRecord(entry.record);
       } catch (error) {
-        await this.recordFailure(resourceKey, entry, 'unavailable', error);
+        if (entry.record.status === 'paused') await this.change(resourceKey, entry, { error: this.errorRecord('extension_failed', error) });
+        else await this.recordFailure(resourceKey, entry, 'unavailable', error);
         const detail = this.safeMessage(error);
         throw new SandboxManagerError('unavailable', `Sandbox ${entry.record.id} pause failed: ${detail}`, { cause: new Error(detail) });
       }
@@ -380,20 +391,24 @@ export class SandboxManager {
     await this.lock(resourceKey, async () => {
       const entry = this.required(resourceKey);
       this.assertIdle(resourceKey, entry);
-      if (entry.record.status === 'deleted') return;
+      if (entry.record.status === 'deleted' && entry.record.error?.code !== 'extension_failed') return;
       await this.change(resourceKey, entry, { operation: 'deleting' });
       try {
-        await this.provider.kill(entry.record.id);
+        const context = this.context('destroy', resourceKey, entry);
+        await this.lifecycle.run(context, async () => {
+          try { await this.provider.kill(entry.record.id); }
+          catch (error) { if (!this.notFound(error)) throw error; }
+          entry.sandbox = undefined;
+          entry.invalidation.abort(new SandboxManagerError('not_accessible', `Sandbox resource ${resourceKey} was deleted`));
+          await this.change(resourceKey, entry, { status: 'deleted', operation: undefined, error: undefined });
+          context.record = cloneRecord(entry.record);
+        });
       } catch (error) {
-        if (!this.notFound(error)) {
-          await this.recordFailure(resourceKey, entry, 'unavailable', error);
-          const detail = this.safeMessage(error);
-          throw new SandboxManagerError('unavailable', `Sandbox ${entry.record.id} deletion failed: ${detail}`, { cause: new Error(detail) });
-        }
+        if (entry.record.status === 'deleted') await this.change(resourceKey, entry, { error: this.errorRecord('extension_failed', error) });
+        else await this.recordFailure(resourceKey, entry, 'unavailable', error);
+        const detail = this.safeMessage(error);
+        throw new SandboxManagerError('unavailable', `Sandbox ${entry.record.id} deletion failed: ${detail}`, { cause: new Error(detail) });
       }
-      entry.sandbox = undefined;
-      entry.invalidation.abort(new SandboxManagerError('not_accessible', `Sandbox resource ${resourceKey} was deleted`));
-      await this.change(resourceKey, entry, { status: 'deleted', operation: undefined, error: undefined });
     });
   }
 
@@ -420,38 +435,53 @@ export class SandboxManager {
     persist: PersistSandboxRecord,
   ): Promise<Entry> {
     if (!create.template.trim()) throw new SandboxManagerError('invalid', 'Sandbox image is required');
-    let sandbox: SandboxHandle;
+    let entry: Entry | undefined;
+    const context: SandboxLifecycleContext = { action: 'create', resourceKey, metadata: create.metadata };
     try {
-      sandbox = await this.provider.create(create.template, {
-        timeoutMs: this.policy.timeoutMs,
-        lifecycle: { onTimeout: 'pause', autoResume: false },
-        metadata: create.metadata,
+      await this.lifecycle.run(context, async () => {
+        const sandbox = await this.provider.create(create.template, {
+          timeoutMs: this.policy.timeoutMs,
+          lifecycle: { onTimeout: 'pause', autoResume: false },
+          metadata: create.metadata,
+        });
+        let templateIdentity: SandboxRecord['templateIdentity'];
+        try {
+          const info = await this.provider.getInfo(sandbox.sandboxId);
+          templateIdentity = info.templateIdentity;
+          context.metadata = { ...create.metadata, ...info.metadata };
+        } catch (error) {
+          // Identity enrichment must not turn a successfully-created remote
+          // resource into an orphan when an inspect call is temporarily flaky.
+          this.log({ event: 'sandbox.identity_inspect_failed', sandboxId: sandbox.sandboxId, message: this.safeMessage(error) });
+        }
+        const now = new Date().toISOString();
+        entry = this.entry({
+          id: sandbox.sandboxId, template: create.template, status: 'starting',
+          lastActiveAt: now, version: 0,
+          ...(templateIdentity ? { templateIdentity } : {}),
+        }, persist);
+        entry.persistencePending = true;
+        this.entries.set(resourceKey, entry);
+        // Persist the remote identity before post hooks so a failed setup is retried,
+        // rather than creating a second remote resource on the next acquire.
+        await this.persist(resourceKey, entry);
+        context.sandboxId = sandbox.sandboxId;
+        context.sandbox = sandbox;
+        context.record = cloneRecord(entry.record);
       });
+      entry!.sandbox = context.sandbox;
+      entry!.generation = context.metadata?.generation;
+      entry!.lastRenewedAt = Date.now();
+      await this.change(resourceKey, entry!, { status: 'ready', error: undefined });
     } catch (error) {
+      if (entry && !(error instanceof SandboxPersistenceError)) await this.recordFailure(resourceKey, entry, 'unavailable', error);
+      if (error instanceof SandboxPersistenceError) throw error;
       const detail = this.safeMessage(error);
       throw new SandboxManagerError('unavailable', `Sandbox creation failed: ${detail}`, { cause: new Error(detail) });
     }
-    let templateIdentity: SandboxRecord['templateIdentity'];
-    try {
-      templateIdentity = (await this.provider.getInfo(sandbox.sandboxId)).templateIdentity;
-    } catch (error) {
-      // Identity enrichment must not turn a successfully-created remote
-      // resource into an orphan when an inspect call is temporarily flaky.
-      this.log({ event: 'sandbox.identity_inspect_failed', sandboxId: sandbox.sandboxId, message: this.safeMessage(error) });
-    }
-    const now = new Date().toISOString();
-    const entry = this.entry({
-      id: sandbox.sandboxId, template: create.template, status: 'ready',
-      lastActiveAt: now, version: 0,
-      ...(templateIdentity ? { templateIdentity } : {}),
-    }, persist);
-    entry.sandbox = sandbox;
-    entry.lastRenewedAt = Date.now();
-    entry.persistencePending = true;
-    this.entries.set(resourceKey, entry);
-    await this.persist(resourceKey, entry);
+    const sandbox = context.sandbox!;
     this.log({ event: 'sandbox.created', resourceKey, sandboxId: sandbox.sandboxId, template: create.template });
-    return entry;
+    return entry!;
   }
 
   private async connect(resourceKey: string, entry: Entry): Promise<SandboxHandle> {
@@ -468,7 +498,7 @@ export class SandboxManager {
       throw new SandboxManagerError('unavailable', `Sandbox ${entry.record.id} inspection failed: ${detail}`, { cause: new Error(detail) });
     }
 
-    if (info.state === 'running' && entry.sandbox) {
+    if (info.state === 'running' && entry.sandbox && entry.generation === info.metadata?.generation) {
       await this.applyObservation(resourceKey, entry, info);
       if (Date.now() - entry.lastRenewedAt >= this.policy.renewalIntervalMs) await this.renew(resourceKey, entry);
       return entry.sandbox;
@@ -483,22 +513,31 @@ export class SandboxManager {
     }
     await this.change(resourceKey, entry, { operation });
     try {
-      // A checkpointed provider has no runnable instance until restore. Do
-      // this before connect: providers correctly reject a stopped instance.
-      if (entry.record.checkpoint && this.checkpointProvider) {
-        await this.checkpointProvider.restore(entry.record.id, entry.record.checkpoint.id);
-        await this.change(resourceKey, entry, { checkpoint: undefined });
-      }
-      const sandbox = await this.provider.connect(entry.record.id, {
-        timeoutMs: this.policy.timeoutMs,
+      const context = this.context(operation === 'resuming' ? 'resume' : 'connect', resourceKey, entry);
+      const sandbox = await this.lifecycle.run(context, async () => {
+        // A checkpointed provider has no runnable instance until restore. Do
+        // this before connect: providers correctly reject a stopped instance.
+        if (entry.record.checkpoint && this.checkpointProvider) {
+          await this.checkpointProvider.restore(entry.record.id, entry.record.checkpoint.id);
+          await this.change(resourceKey, entry, { checkpoint: undefined });
+        }
+        const connected = await this.provider.connect(entry.record.id, {
+          timeoutMs: this.policy.timeoutMs,
+        });
+        context.sandbox = connected;
+        context.record = cloneRecord(entry.record);
+        context.metadata = (await this.provider.getInfo(entry.record.id)).metadata;
+        return connected;
       });
       entry.sandbox = sandbox;
+      entry.generation = context.metadata?.generation;
       entry.lastRenewedAt = Date.now();
       await this.change(resourceKey, entry, {
         status: 'ready', operation: undefined, pausedAt: undefined, error: undefined,
       });
       return sandbox;
     } catch (error) {
+      entry.sandbox = undefined;
       await this.recordFailure(resourceKey, entry, this.notFound(error) ? 'not_accessible' : 'unavailable', error);
       const code = this.notFound(error) ? 'not_accessible' : 'unavailable';
       const detail = this.safeMessage(error);
@@ -572,9 +611,14 @@ export class SandboxManager {
             if (checkpoint && entry.record.status === 'ready' && Number.isFinite(idleAt)
               && Date.now() - idleAt >= this.policy.autoCheckpointAfterMs && !entry.record.checkpoint) {
               try {
-                const saved = await checkpoint.call(this.checkpointProvider, entry.record.id);
-                await this.change(resourceKey, entry, { checkpoint: saved, status: 'paused', pausedAt: new Date().toISOString() });
-                entry.sandbox = undefined;
+                const context = this.context('checkpoint', resourceKey, entry);
+                const saved = await this.lifecycle.run(context, async () => {
+                  const saved = await checkpoint.call(this.checkpointProvider, entry.record.id);
+                  await this.change(resourceKey, entry, { checkpoint: saved, status: 'paused', pausedAt: new Date().toISOString() });
+                  entry.sandbox = undefined;
+                  context.record = cloneRecord(entry.record);
+                  return saved;
+                });
                 this.log({ event: 'sandbox.checkpointed', resourceKey, sandboxId: entry.record.id, checkpointId: saved.id });
               } catch (error) {
                 this.log({ event: 'sandbox.checkpoint_failed', resourceKey, sandboxId: entry.record.id, message: this.safeMessage(error) });
@@ -603,6 +647,8 @@ export class SandboxManager {
   }
 
   private async applyObservation(resourceKey: string, entry: Entry, info: SandboxInfo): Promise<void> {
+    // A running container is not proof that its required post hooks completed.
+    if (info.state === 'running' && (entry.record.status === 'starting' || entry.record.error?.code === 'extension_failed')) return;
     const status: SandboxStatus = info.state === 'paused' ? 'paused' : info.state === 'running' ? 'ready' : 'unavailable';
     const pausedAt = status === 'paused' ? entry.record.pausedAt ?? new Date().toISOString() : undefined;
     const identityChanged = info.templateIdentity
@@ -630,6 +676,10 @@ export class SandboxManager {
     }
   }
 
+  private context(action: SandboxLifecycleContext['action'], resourceKey: string, entry: Entry): SandboxLifecycleContext {
+    return { action, resourceKey, sandboxId: entry.record.id, sandbox: entry.sandbox, record: cloneRecord(entry.record) };
+  }
+
   private async persist(resourceKey: string, entry: Entry): Promise<void> {
     try {
       await entry.persist(cloneRecord(entry.record));
@@ -642,7 +692,7 @@ export class SandboxManager {
 
   private async recordFailure(resourceKey: string, entry: Entry, code: 'not_accessible' | 'unavailable', error: unknown): Promise<void> {
     await this.change(resourceKey, entry, {
-      status: 'unavailable', operation: undefined, error: this.errorRecord(code, error),
+      status: 'unavailable', operation: undefined, error: this.errorRecord(error instanceof SandboxExtensionError ? 'extension_failed' : code, error),
     });
   }
 

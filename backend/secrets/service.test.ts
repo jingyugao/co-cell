@@ -30,6 +30,16 @@ export class MemorySecrets implements SecretRepository {
   async saveGrant(grant: ProjectToolGrant) { this.bindings.set(grant.id, grant); }
   async deleteGrant(projectId: string, id: string) { if (this.bindings.get(id)?.projectId === projectId) this.bindings.delete(id); }
   async registerRuntime(boxId: string, projectId: string, generation: number) { this.runtimes.set(boxId, { projectId, generation }); }
+  readonly configs = new Map<string, Record<string, string>>();
+  async runtimeConfig(boxId: string, generation: number) { return { ...this.configs.get(`${boxId}:${generation}`) }; }
+  async markRuntimeConfig(boxId: string, generation: number, slot: string, digest: string) {
+    const key = `${boxId}:${generation}`;
+    this.configs.set(key, { ...this.configs.get(key), [slot]: digest });
+  }
+  async forgetRuntime(boxId: string) {
+    this.runtimes.delete(boxId);
+    for (const key of this.configs.keys()) if (key.startsWith(`${boxId}:`)) this.configs.delete(key);
+  }
   async runtime(boxId: string) { return this.runtimes.get(boxId) ?? null; }
   async startInvocation(value: StoredInvocation) { this.runs.set(value.id, value); }
   async invocation(id: string) { return this.runs.get(id) ?? null; }

@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { SandboxHandle, SandboxInfo } from './index.js';
 import {
   SandboxManager,
+  SandboxLifecycle,
   SandboxBusyError,
   SandboxPersistenceError,
   type SandboxProvider,
@@ -48,6 +49,111 @@ const record = (status: SandboxRecord['status'] = 'paused'): SandboxRecord => ({
   id: 'sandbox-1', template: 'template-1', status,
   lastActiveAt: new Date(0).toISOString(),
   ...(status === 'paused' ? { pausedAt: new Date(0).toISOString() } : {}),
+});
+
+test('lifecycle hooks surround transitions while acquire reuse and inspection stay read-only', async () => {
+  const fake = fixture('running');
+  const calls: string[] = [];
+  const lifecycle = new SandboxLifecycle([{ name: 'test',
+    pre: async context => { calls.push(`pre:${context.action}`); },
+    post: async context => {
+      calls.push(`post:${context.action}`);
+      if (context.action === 'create') assert.equal(fake.counts.create, 1);
+      if (context.action === 'pause') assert.equal(context.record?.status, 'paused');
+      if (context.action === 'destroy') assert.equal(context.record?.status, 'deleted');
+    },
+  }]);
+  const manager = new SandboxManager({ provider: fake.provider, lifecycle });
+  try {
+    const first = await manager.acquire('project:one', { usageId: 'one', create: { template: 'image' }, persist: async () => {} });
+    await first.release();
+    await manager.inspect('project:one');
+    const second = await manager.acquire('project:one', { usageId: 'two' });
+    await second.release();
+    assert.deepEqual(calls, ['pre:create', 'post:create']);
+    await manager.pause('project:one');
+    const resumed = await manager.acquire('project:one', { usageId: 'three' });
+    await resumed.release();
+    await manager.destroy('project:one');
+    assert.deepEqual(calls, ['pre:create', 'post:create', 'pre:pause', 'post:pause', 'pre:resume', 'post:resume', 'pre:destroy', 'post:destroy']);
+  } finally { await manager.close(); }
+});
+
+test('a pre hook veto prevents remote creation and error hooks cannot mask the failure', async () => {
+  const fake = fixture();
+  let posts = 0, errors = 0;
+  const manager = new SandboxManager({ provider: fake.provider, lifecycle: new SandboxLifecycle([{ name: 'policy',
+    pre: async () => { throw new Error('veto'); },
+    post: async () => { posts++; },
+    error: async () => { errors++; throw new Error('notification failed'); },
+  }]) });
+  try {
+    await assert.rejects(manager.acquire('project:one', { usageId: 'one', create: { template: 'image' }, persist: async () => {} }), /policy pre failed/);
+    assert.equal(fake.counts.create, 0);
+    assert.equal(manager.peek('project:one'), undefined);
+    assert.equal(posts, 0);
+    assert.equal(errors, 1);
+  } finally { await manager.close(); }
+});
+
+test('a failed post hook retains the remote identity and gates readiness until reconnect succeeds', async () => {
+  const fake = fixture();
+  let fail = true;
+  const saved: SandboxRecord[] = [];
+  const manager = new SandboxManager({ provider: fake.provider, lifecycle: new SandboxLifecycle([{ name: 'config',
+    post: async () => { if (fail) throw new Error('delivery failed'); },
+  }]) });
+  try {
+    await assert.rejects(manager.acquire('project:one', { usageId: 'one', create: { template: 'image' },
+      persist: async value => { saved.push(value); } }), /config post failed/);
+    assert.equal(manager.peek('project:one')?.id, fake.handle.sandboxId);
+    assert.equal(manager.peek('project:one')?.status, 'unavailable');
+    assert.equal(saved[0].status, 'starting');
+    assert.equal((await manager.inspect('project:one')).record.status, 'unavailable');
+    fail = false;
+    const lease = await manager.acquire('project:one', { usageId: 'two', create: { template: 'image' } });
+    assert.equal(lease.record.status, 'ready');
+    assert.equal(fake.counts.create, 1);
+    assert.equal(fake.counts.connect, 1);
+    await lease.release();
+  } finally { await manager.close(); }
+});
+
+test('failed destroy post hooks preserve deleted state and can retry cleanup', async () => {
+  const fake = fixture('running');
+  let fail = true, completed = 0;
+  const manager = new SandboxManager({ provider: fake.provider, extensions: [{ name: 'cleanup', post: async context => {
+    if (context.action !== 'destroy') return;
+    if (fail) throw new Error('cleanup failed');
+    completed++;
+  } }] });
+  manager.track('resource', record('ready'), async () => {});
+  try {
+    await assert.rejects(manager.destroy('resource'), /cleanup post failed/);
+    assert.equal(manager.peek('resource')?.status, 'deleted');
+    fail = false;
+    await manager.destroy('resource');
+    assert.equal(completed, 1);
+    assert.equal(manager.peek('resource')?.error, undefined);
+  } finally { await manager.close(); }
+});
+
+test('an externally resumed generation runs connect hooks instead of reusing a stale handle', async () => {
+  const fake = fixture('running');
+  let generation = '1', posts = 0;
+  const originalInfo = fake.provider.getInfo;
+  fake.provider.getInfo = async id => ({ ...await originalInfo(id), metadata: { generation } });
+  const manager = new SandboxManager({ provider: fake.provider, lifecycle: new SandboxLifecycle([{ name: 'config', post: async () => { posts++; } }]) });
+  manager.track('resource', record('ready'), async () => {});
+  try {
+    const first = await manager.acquire('resource', { usageId: 'one' });
+    await first.release();
+    generation = '2';
+    const second = await manager.acquire('resource', { usageId: 'two' });
+    await second.release();
+    assert.equal(posts, 2);
+    assert.equal(fake.counts.connect, 2);
+  } finally { await manager.close(); }
 });
 
 test('concurrent acquire connects once and registers both usages', async () => {
@@ -140,12 +246,18 @@ test('checkpointed sandbox restores before reconnecting and clears its checkpoin
     checkpoint: async () => { calls.push('checkpoint'); state = 'paused'; return { id: 'checkpoint-1', createdAt: new Date().toISOString() }; },
     restore: async () => { calls.push('restore'); state = 'running'; },
   };
-  const manager = new SandboxManager({ provider, policy: { autoCheckpointAfterMs: 1, scanIntervalMs: 2 } });
+  const hooks: string[] = [];
+  const lifecycle = new SandboxLifecycle([{ name: 'observer',
+    pre: async context => { hooks.push(`pre:${context.action}`); },
+    post: async context => { hooks.push(`post:${context.action}`); },
+  }]);
+  const manager = new SandboxManager({ provider, lifecycle, policy: { autoCheckpointAfterMs: 1, scanIntervalMs: 2 } });
   manager.track('resource', { ...record('ready'), lastActiveAt: new Date(0).toISOString() }, async () => {});
   await waitUntil(() => manager.peek('resource')?.checkpoint?.id === 'checkpoint-1');
   assert.equal(manager.peek('resource')?.status, 'paused');
   const lease = await manager.acquire('resource', { usageId: 'turn-1' });
   assert.deepEqual(calls, ['checkpoint', 'restore', 'connect']);
+  assert.deepEqual(hooks, ['pre:checkpoint', 'post:checkpoint', 'pre:resume', 'post:resume']);
   assert.equal(manager.peek('resource')?.checkpoint, undefined);
   await lease.release();
   await manager.close();

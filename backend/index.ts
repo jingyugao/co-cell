@@ -55,7 +55,7 @@ if (process.env.SANDBOX_PROVIDER && process.env.SANDBOX_PROVIDER !== 'cellbox') 
 const cellboxKind=process.env.CELLBOX_KIND??'k8s-resumable';
 if(cellboxKind!=='k8s-resumable')throw new Error('This CoCell Cellbox adapter requires CELLBOX_KIND=k8s-resumable');
 const cocellPublicUrl = process.env.COCELL_PUBLIC_URL || `http://127.0.0.1:${port}`;
-const userInputMcpUrl = `${toolBrokerUrl}mcp/user-input`;
+const userInputMcpUrl = new URL('/mcp/user-input', `${toolBrokerUrl}/`).href;
 const appServerArguments=appServerArgs(modelConfig, [
   ...(configOverrides ?? []),
   `mcp_servers.cocell_user_input.url=${JSON.stringify(userInputMcpUrl)}`,

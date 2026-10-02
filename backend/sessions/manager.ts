@@ -532,6 +532,7 @@ export class SessionManager {
         prompt: turn.prompt || stored.prompt,
         images: turn.images.length ? turn.images : stored.images,
         items: [...turn.items, ...storedOnlyItems],
+        userInputRequests: stored.userInputRequests,
         itemTimestamps: { ...stored.itemTimestamps, ...turn.itemTimestamps },
         contextUsage: turn.contextUsage?.map(call => {
           const old = stored.contextUsage?.find(value => call.responseId && value.responseId === call.responseId);
@@ -913,6 +914,7 @@ export class SessionManager {
       prompt: turn.prompt,
       images: turn.images,
       items: turn.items,
+      userInputRequests: turn.userInputRequests,
       itemTimestamps: turn.itemTimestamps,
       usage: turn.usage, sdkUsage: turn.sdkUsage,
       contextUsage: turn.contextUsage?.map(({ blockEstimates, blockTokenizer, blockTexts, ...call }) => call),

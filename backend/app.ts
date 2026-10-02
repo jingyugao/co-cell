@@ -22,8 +22,9 @@ import { installOperatorAccess, type OperatorAccessOptions } from './access/oper
 import { proxyProjectService } from './projects/routes.js';
 import type { SecretService } from './secrets/service.js';
 import { installSecretRoutes } from './secrets/routes.js';
+import { installUserInputMcpRoutes, type UserInputMcpService } from './user-input/mcp.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, userInput?: UserInputMcpService) {
   const app = new Hono();
   if (operatorAccess) installOperatorAccess(app, {
     ...operatorAccess,
@@ -63,6 +64,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   installSandboxesRoutes(app, sandboxes, manager);
   installConnectionsRoutes(app, connections);
   if (secrets) installSecretRoutes(app, secrets, id => manager.listProjects().some(project => project.id === id));
+  if (userInput) installUserInputMcpRoutes(app, userInput);
   installImageRoutes(app, images);
   installSharedFilesRoutes(app, sharedFiles);
   app.all('/api/*', c => c.json({ error: '接口不存在' }, 404));

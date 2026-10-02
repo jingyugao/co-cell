@@ -1,6 +1,7 @@
 import type { ProjectImageSelection } from './image-types.js';
 import type { SandboxImageIdentity, SandboxState } from './sandbox-types.js';
 import type { ThreadEvent, ThreadItem, Usage } from './agent-protocol.js';
+import type { UserInputRequest } from './user-input-types.js';
 
 export type SessionStatus = 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
 export interface RetryState {
@@ -87,6 +88,7 @@ export interface Turn {
   /** One entry for each completed model request in this turn. */
   contextUsage?: ContextUsage[];
   retry?: RetryState;
+  userInputRequests?: UserInputRequest[];
 }
 export type ProjectStatus = 'active' | 'completed' | 'archived';
 export interface ProjectSandboxOperation {

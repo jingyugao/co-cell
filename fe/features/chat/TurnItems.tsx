@@ -4,12 +4,16 @@ import type { MarkdownResources } from './Markdown';
 import ItemView from './ItemView';
 import SubagentConversations from './SubagentConversations';
 import ReasoningSummary, { groupThreadItems } from './ReasoningSummary';
+import UserInputCard from './UserInputCard';
+import type { Session } from '../../../protocol/types';
 
 /** Place decisions at their tool call, so later execution and replies stay below them. */
 export default function TurnItems({ turn, highlightedItemIds, subagents = [], ...resources }: {
   turn: Turn;
   highlightedItemIds?: string[];
   subagents?: SubagentConversation[];
+  sessionId?: string;
+  onUserInputAnswered?: (session: Session) => void;
 } & MarkdownResources) {
   const firstSubagentAt = subagents[0]?.startedAt;
   const timedSubagentIndex = firstSubagentAt && turn.itemTimestamps
@@ -31,5 +35,6 @@ export default function TurnItems({ turn, highlightedItemIds, subagents = [], ..
     })}
     {turn.compactions?.filter(boundary => boundary.beforeItemIndex >= turn.items.length).map(boundary => <div key={boundary.segment} className="compact-divider" role="separator">上下文已压缩 · 第 {boundary.segment + 1} 段对话 · 后续重新计费</div>)}
     {subagentIndex < 0 && <SubagentConversations agents={subagents} {...resources} />}
+    {resources.sessionId && turn.userInputRequests?.map(request => <UserInputCard key={request.id} request={request} sessionId={resources.sessionId!} turnId={turn.id} onAnswered={resources.onUserInputAnswered ?? (() => {})} />)}
   </>;
 }

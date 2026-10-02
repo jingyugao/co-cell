@@ -158,6 +158,23 @@ try {
     assert(result.commands > 0, 'Agent did not execute any tool commands');
     return { sessionId, threadId, ...result };
   });
+  await step('Ask the agent to use request_user_input_async and answer from the API', async () => {
+    const prompt = `这是平台集成测试。必须调用 request_user_input_async，发送一个问题“集成测试继续吗？”并提供两个选项“继续”和“停止”。不要把问题当普通文字输出。调用成功后简短汇报。`;
+    const result = await turn(prompt);
+    const session = await json(`/api/sessions/${sessionId}`);
+    const source = session.turns.find(t => t.id === result.turnId || t.nativeTurnId === result.nativeTurnId);
+    assert(source?.userInputRequests?.length, 'request_user_input_async did not create a persisted request');
+    const request = source.userInputRequests.at(-1);
+    assert.equal(request.status, 'pending');
+    const answered = await json(`/api/sessions/${sessionId}/turns/${source.id}/user-input/${request.id}`, {
+      method: 'POST', body: { answer: '继续' }, expectedStatus: 200,
+    });
+    const updated = answered.turns.find(t => t.id === source.id);
+    assert.equal(updated?.userInputRequests?.at(-1)?.status, 'answered');
+    assert(updated.userInputRequests.at(-1).answerTurnId, 'answer turn was not created');
+    await waitIdle();
+    return { requestId: request.id, answerTurnId: updated.userInputRequests.at(-1).answerTurnId };
+  });
   let source, firstHealth;
   await step('Verify workspace file API, raw downloads, and proxied Go HTTP', async () => {
     source = await textFile('main.go'); assert(source.text.includes('package main'));

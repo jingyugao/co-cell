@@ -8,7 +8,7 @@ export default function SecretManager() {
   const [items, setItems] = useState<SecretMetadata[]>([]);
   const [loading, setLoading] = useState(true), [busy, setBusy] = useState(false), [error, setError] = useState('');
   const [editing, setEditing] = useState<SecretMetadata | 'new' | null>(null);
-  const [name, setName] = useState(''), [format, setFormat] = useState<SecretFormat>('json'), [mutable, setMutable] = useState(false);
+  const [name, setName] = useState(''), [format, setFormat] = useState<SecretFormat>('text'), [mutable, setMutable] = useState(false);
   const [content, setContent] = useState(''), [original, setOriginal] = useState('');
   const [tool, setTool] = useState<ProxyTool | ''>('mysql'), [path, setPath] = useState('.my.cnf'), [alias, setAlias] = useState('default');
   const [history, setHistory] = useState<{ name: string; rows: SecretVersion[] } | null>(null);
@@ -23,7 +23,7 @@ export default function SecretManager() {
     setError(''); setBusy(true);
     try {
       const value = item ? await api<{ content: string }>(`/api/secrets/${item.id}/content`) : { content: '' };
-      setName(item?.name ?? ''); setFormat(item?.format ?? 'json'); setMutable(item?.mutable ?? false);
+      setName(item?.name ?? ''); setFormat(item?.format ?? 'text'); setMutable(item?.mutable ?? false);
       setTool(item ? item.tool ?? '' : 'mysql'); setPath(item?.path ?? (item?.tool ? defaultCredentialPath(item.tool, item.format) : '.my.cnf')); setAlias(item?.alias ?? 'default');
       setContent(value.content); setOriginal(value.content); setEditing(item ?? 'new'); setHistory(null);
     } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
@@ -34,7 +34,7 @@ export default function SecretManager() {
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
       setContent(format === 'binary' ? btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join('')) : new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-    } catch { setError('文件编码无效；二进制文件请选择 binary'); }
+    } catch { setError(tool === 'mysql' && format === 'text' ? '请上传 UTF-8 编码的 .my.cnf 明文文件' : '文件编码无效；二进制文件请选择 binary'); }
   }
   return <>
     <div className="connections-heading"><div><h1>Secret 管理</h1><p>创建认证文件，并在项目中明确授权。可更新文件由工具自动回写。</p></div><button className="primary-button" disabled={busy} onClick={() => void edit()}>新建 Secret</button></div>
@@ -52,15 +52,16 @@ export default function SecretManager() {
       <label>名称<input required maxLength={100} value={name} onChange={e => setName(e.target.value)} /></label>
       <label>所属工具<select required value={tool} onChange={event => {
         const next = event.target.value as ProxyTool; setTool(next);
-        const nextFormat = editing === 'new' ? next === 'glab' ? 'text' : 'json' : format;
+        const nextFormat = editing === 'new' ? ['mysql', 'glab'].includes(next) ? 'text' : 'json' : format;
         setFormat(nextFormat); setPath(defaultCredentialPath(next, nextFormat)); setAlias('default');
         if (['mysql', 'kubectl'].includes(next)) setMutable(false);
       }}><option value="" disabled>选择工具</option>{PROXY_TOOLS.map(value => <option key={value} value={value}>{TOOL_LABELS[value]}</option>)}</select></label>
-      <label>格式<select value={format} disabled={editing !== 'new'} onChange={e => { const value = e.target.value as SecretFormat; setFormat(value); if (tool) setPath(defaultCredentialPath(tool, value)); setContent(''); }}><option value="json">JSON 对象</option><option value="text">文本文件</option><option value="binary">二进制文件 / base64</option></select></label>
+      {tool === 'mysql' && format === 'text' ? <p>认证文件：.my.cnf（明文文本）。直接粘贴或上传原始文件内容。</p>
+        : <label>格式<select value={format} disabled={editing !== 'new'} onChange={e => { const value = e.target.value as SecretFormat; setFormat(value); if (tool) setPath(defaultCredentialPath(tool, value)); setContent(''); }}><option value="json">JSON 对象</option><option value="text">文本文件</option><option value="binary">二进制文件 / base64</option></select></label>}
       {tool && !['mysql', 'kubectl'].includes(tool) && <label>认证文件路径<input required maxLength={256} value={path} onChange={event => setPath(event.target.value)} /></label>}
       {tool === 'mysql' && format === 'binary' && <label>登录配置名称<input required maxLength={64} pattern="[A-Za-z][A-Za-z0-9_.-]*" value={alias} onChange={event => setAlias(event.target.value)} /><span>填写上传的 .mylogin.cnf 中的 login-path 名称。</span></label>}
       <label>上传文件<input type="file" onChange={e => void upload(e.target.files?.[0])} /></label>
-      <label>认证内容<textarea required spellCheck={false} autoComplete="off" rows={12} value={content} onChange={e => setContent(e.target.value)} placeholder={format === 'json' ? '{"access_token":"...","refresh_token":"..."}' : '文件内容'} /></label>
+      <label>认证内容<textarea required spellCheck={false} autoComplete="off" rows={12} value={content} onChange={e => setContent(e.target.value)} placeholder={tool === 'mysql' && format === 'text' ? '[client]\nhost="db.example.com"\nport=3306\nuser="app_user"\npassword="你的密码"\ndatabase="app_db"' : format === 'json' ? '{"access_token":"...","refresh_token":"..."}' : '文件内容'} /></label>
       <label className="secret-checkbox"><input type="checkbox" checked={mutable} disabled={tool === 'mysql' || tool === 'kubectl'} onChange={e => setMutable(e.target.checked)} />允许指定工具更新此文件</label>
       <p>更新后最后保存的内容生效。MySQL 和 Kubernetes 配置由管理员维护。</p>
       <div className="secret-actions"><button className="primary-button" disabled={busy}>{busy ? '保存中…' : '保存'}</button><button type="button" className="secondary-button" disabled={busy} onClick={close}>取消</button></div>

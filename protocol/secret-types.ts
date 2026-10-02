@@ -1,17 +1,15 @@
-export type SecretFormat = 'json' | 'text' | 'binary';
-export const PROXY_TOOLS = ['mysql', 'kubectl', 'glab', 'lark-cli', 'meegle'] as const;
-export type ProxyTool = typeof PROXY_TOOLS[number];
+export type SecretFormat = 'text';
+export type ProxyTool = string;
 export interface SecretMetadata {
   id: string; name: string; format: SecretFormat; mutable: boolean; enabled: boolean;
   version: number; createdAt: string; updatedAt: string; projectIds: string[];
-  tool: ProxyTool | null; path: string | null; alias: string | null;
+  tool: ProxyTool | null; path: string | null; requiresTextImport: boolean;
 }
 export interface SecretInput {
   name: string; format: SecretFormat; mutable: boolean; content: string;
-  /** Optional only for credentials created through the legacy API. */
-  tool?: ProxyTool; path?: string; alias?: string;
+  tool: ProxyTool; path: string;
 }
-export interface SecretUpdate { name?: string; mutable?: boolean; enabled?: boolean; content?: string; tool?: ProxyTool; path?: string; alias?: string }
+export interface SecretUpdate { name?: string; mutable?: boolean; enabled?: boolean; content?: string; tool?: ProxyTool; path?: string }
 export interface SecretVersion {
   id: string; source: 'operator' | 'tool'; baseVersion: number | null;
   createdAt: string; projectId: string | null; invocationId: string | null;

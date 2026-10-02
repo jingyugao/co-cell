@@ -4,23 +4,23 @@ import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'nod
 import { dirname, join, normalize } from 'node:path';
 
 const LIMIT = 65536;
-const tools = new Set(['mysql', 'kubectl', 'glab', 'lark-cli', 'meegle']);
+const toolName = /^[A-Za-z][A-Za-z0-9_.\-]{0,63}$/;
 function safePath(path) {
-  return typeof path === 'string' && !path.startsWith('/') && normalize(path) === path &&
-    path.split('/').every(part => part && part !== '..' && /^[A-Za-z0-9_.-]+$/.test(part));
+  return typeof path === 'string' && path.length > 0 && path.length <= 256 && !path.startsWith('/') && normalize(path) === path &&
+    !/[\\\u0000-\u001f\u007f]/.test(path) && path.split('/').every(part => part && part !== '.' && part !== '..');
 }
 function sensitiveValues(bytes) {
   const values = bytes.length >= 6 ? [bytes.toString('utf8')] : [];
   try {
     function visit(value, key = '') {
-      if (typeof value === 'string' && /token|password|secret|private.?key/i.test(key) && value.length) values.push(value);
+      if (typeof value === 'string' && /token|password|secret|(?:private|client).?key/i.test(key) && value.length) values.push(value);
       else if (value && typeof value === 'object') for (const [name, child] of Object.entries(value)) visit(child, name);
     }
     visit(JSON.parse(bytes.toString('utf8')));
   } catch {
     for (const line of bytes.toString('utf8').split('\n')) {
-      const match = /^\s*(?:password|token|secret)\s*[:=]\s*["']?(.+?)["']?\s*$/.exec(line);
-      if (match?.[1]?.length) values.push(match[1]);
+      const match = /^\s*([^:=\s]+)\s*[:=]\s*["']?(.+?)["']?\s*$/.exec(line);
+      if (match?.[2]?.length && /token|password|secret|(?:private|client).?key/i.test(match[1])) values.push(match[2]);
     }
   }
   return values.filter(Boolean);
@@ -57,7 +57,7 @@ async function execute(executable, args, env, cwd) {
 }
 /** Injectable paths/transport support isolated tests without host credentials. */
 export async function runProtectedTool(tool, inputArgs, options = {}) {
-  if (!tools.has(tool)) throw new Error('Unsupported protected tool');
+  if (!toolName.test(tool)) throw new Error('Invalid protected tool name');
   const config = options.config ?? JSON.parse(await readFile(process.env.COCELL_TOOL_RUNTIME, 'utf8'));
   const base = new URL(config.url);
   if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash || base.pathname !== '/') throw new Error('Invalid broker origin');
@@ -67,18 +67,8 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
     if (!response.ok) throw new Error('Project authorization or Secret update failed');
     return response.json();
   };
-  let alias;
-  const args = inputArgs.filter(arg => {
-    if (!arg.startsWith('--connection=')) return true;
-    if (alias) throw new Error('Duplicate connection alias'); alias = arg.slice(13); return false;
-  });
-  if (!alias && tool === 'mysql') alias = args.find(arg => arg.startsWith('--login-path='))?.slice(13);
-  if (!alias && tool === 'kubectl') {
-    const inline = args.find(arg => arg.startsWith('--context=')), index = args.indexOf('--context');
-    alias = inline?.slice(10) ?? (index >= 0 ? args[index + 1] : undefined);
-  }
-  const setup = await request('/api/tool-runtime/start', { tool, alias, args });
-  if (setup.tool !== tool || !Array.isArray(setup.files) || !setup.files.length || setup.files.length > 10) throw new Error('Invalid tool setup');
+  const setup = await request('/api/tool-runtime/start', { tool, args: inputArgs });
+  if (setup.tool !== tool || !Array.isArray(setup.files) || setup.files.length !== 1) throw new Error('Invalid tool setup');
   const parent = options.tempRoot ?? '/var/lib/cellbox/debug/tool-runs';
   await mkdir(parent, { recursive: true, mode: 0o700 }); await chmod(parent, 0o700);
   const root = await mkdtemp(join(parent, 'run-'));
@@ -95,12 +85,10 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
     }
     const env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: root, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(root, '.config'), XDG_DATA_HOME: join(root, '.local/share') };
     let argv = setup.args;
-    if (tool === 'kubectl') env.KUBECONFIG = join(root, '.kube/config');
-    if (tool === 'glab') env.GLAB_CONFIG_DIR = join(root, '.config/glab-cli');
-    if (tool === 'mysql') {
-      if (originals.has('.my.cnf')) argv = [`--defaults-file=${join(root, '.my.cnf')}`, ...argv.filter(arg => !arg.startsWith('--login-path='))];
-      else env.MYSQL_TEST_LOGIN_FILE = join(root, '.mylogin.cnf');
-    }
+    const credential = join(root, setup.files[0].path);
+    if (tool === 'kubectl') env.KUBECONFIG = credential;
+    if (tool === 'glab') env.GLAB_CONFIG_DIR = dirname(credential);
+    if (tool === 'mysql') argv = [`--defaults-file=${credential}`, ...argv];
     retain = setup.files.some(file => file.mutable);
     const result = await execute(join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool), argv, env, root);
     const updates = [];

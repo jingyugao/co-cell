@@ -5,9 +5,9 @@ import { Hono } from 'hono';
 import { installOperatorAccess } from '../access/operator.js';
 import { installSecretRoutes } from './routes.js';
 import { HttpError } from '../../util/errors.js';
-import { PROXY_TOOLS, type ProjectToolGrant, type ProxyTool } from '../../protocol/secret-types.js';
+import type { ProjectToolGrant, ProxyTool } from '../../protocol/secret-types.js';
 import { SecretCrypto } from './crypto.js';
-import { validateToolArgs } from './policy.js';
+import { credentialPath, toolName, validateToolArgs } from './policy.js';
 import { SecretService } from './service.js';
 import type { SecretRepository, StoredInvocation, StoredSecret, StoredVersion } from './repository.js';
 
@@ -67,7 +67,7 @@ export function fixture() {
 }
 test('Secrets are encrypted and concurrent stale snapshots use last commit wins without replay', async () => {
   const { repository, service, projectId, crypto } = fixture();
-  const secret = await service.create({ name: 'OAuth', format: 'json', mutable: true, content: '{"access_token":"access-original","refresh_token":"refresh-original"}' });
+  const secret = await service.create({ name: 'OAuth', tool: 'meegle', path: '.meegle/credentials.json', format: 'text', mutable: true, content: '{"access_token":"access-original","refresh_token":"refresh-original"}' });
   assert.ok(!JSON.stringify(await service.list()).includes('refresh-original'));
   assert.ok(!repository.records.get(secret.id)!.ciphertext.includes('refresh-original'));
   const sealed = repository.records.get(secret.id)!;
@@ -95,12 +95,13 @@ test('coarse authorization delegates operations to credentials while preventing 
   const grant: ProjectToolGrant = { id: randomUUID(), projectId: randomUUID(), tool: 'mysql', alias: 'doris', enabled: true, files: [], policy: { namespaces: ['staging'], resources: ['pods'], commandPrefixes: [['issue', 'list']] }, updatedAt: new Date().toISOString() };
   for (const sql of ['SELECT 1', 'SELECT 1; SELECT 2', 'UPDATE example SET value=1']) {
     const checked = validateToolArgs('mysql', ['-e', sql], grant);
-    assert.deepEqual(checked, ['--login-path=doris', '--binary-mode', '--local-infile=0', '-e', sql]);
+    assert.deepEqual(checked, ['--binary-mode', '--local-infile=0', '-e', sql]);
   }
   for (const args of [['get', 'secrets', '-A'], ['delete', 'pods', 'example', '-n', 'prod']])
     assert.deepEqual(validateToolArgs('kubectl', args, grant), args);
   assert.deepEqual(validateToolArgs('glab', ['issue', 'create', '--title', 'Example'], grant), ['issue', 'create', '--title', 'Example']);
-  for (const args of [['get', 'pods', '-s', 'https://example.invalid'], ['get', 'pods', '--token=x'], ['--context=other', 'get', 'pods']])
+  assert.deepEqual(validateToolArgs('kubectl', ['--context=other', 'get', 'pods'], grant), ['--context=other', 'get', 'pods']);
+  for (const args of [['get', 'pods', '-s', 'https://example.invalid'], ['get', 'pods', '--token=x']])
     assert.throws(() => validateToolArgs('kubectl', args, grant));
   assert.throws(() => validateToolArgs('mysql', ['--login-path=other', '-e', 'SELECT 1'], grant));
   assert.throws(() => validateToolArgs('glab', ['issue', 'list', '--token=x'], grant));
@@ -115,9 +116,9 @@ test('internal broker accepts only scoped runtime tokens and cannot access opera
   app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'failed' }, error instanceof HttpError ? error.status as 400 : 500));
   installSecretRoutes(app, service, id => id === projectId);
   const token = await service.registerRuntime('box-a', projectId, 1);
-  const secret = await service.create({ name: 'doris', format: 'json', mutable: false, content: '{"host":"db.example.test","user":"project-a","password":"password-sensitive"}' });
+  const secret = await service.create({ name: 'doris', tool: 'mysql', path: '.my.cnf', format: 'text', mutable: false, content: '[client]\nhost=db.example.test\nuser=project-a\npassword=password-sensitive\n' });
   await service.saveGrant(projectId, { tool: 'mysql', alias: 'doris', enabled: true, files: [{ secretId: secret.id, path: '.my.cnf' }], policy: { namespaces: [], resources: [], commandPrefixes: [] } });
-  const start = (bearer: string) => app.request('http://cocell.internal/api/tool-runtime/start', { method: 'POST', headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ tool: 'mysql', alias: 'doris', args: ['--login-path=doris', '-e', 'SELECT 1'] }) });
+  const start = (bearer: string) => app.request('http://cocell.internal/api/tool-runtime/start', { method: 'POST', headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ tool: 'mysql', args: ['-e', 'SELECT 1'] }) });
   assert.equal((await start(operatorToken)).status, 401);
   assert.equal((await start(token + 'x')).status, 401);
   const allowed = await start(token); assert.equal(allowed.status, 200);
@@ -128,11 +129,11 @@ test('internal broker accepts only scoped runtime tokens and cannot access opera
   assert.ok(!(await list.text()).includes('password-sensitive'));
 });
 
-const selections = (tool: ProxyTool, secretId: string | null) => PROXY_TOOLS.map(value => ({ tool: value, secretId: value === tool ? secretId : null }));
+const selections = (tool: ProxyTool, secretId: string | null) => [{ tool, secretId }];
 
 test('a single selection replaces the previous key, revokes in-flight writeback, and can be cleared', async () => {
   const { service, projectId } = fixture();
-  const create = (name: string) => service.create({ name, tool: 'meegle', format: 'json', mutable: true, content: '{"access_token":"fixture"}' });
+  const create = (name: string) => service.create({ name, tool: 'meegle', path: '.meegle/credentials.json', format: 'text', mutable: true, content: '{"access_token":"fixture"}' });
   const a = await create('Key A'), b = await create('Key B');
   assert.equal(a.path, '.meegle/credentials.json');
   await service.saveSelections(projectId, selections('meegle', a.id));
@@ -152,12 +153,12 @@ test('a single selection replaces the previous key, revokes in-flight writeback,
 
 test('invalid or duplicate selections leave the whole project configuration unchanged', async () => {
   const { service, projectId } = fixture();
-  const secret = await service.create({ name: 'Meegle', tool: 'meegle', format: 'json', mutable: true, content: '{}' });
+  const secret = await service.create({ name: 'Meegle', tool: 'meegle', path: '.meegle/credentials.json', format: 'text', mutable: true, content: '{}' });
   await service.saveSelections(projectId, selections('meegle', secret.id));
   const original = await service.grants(projectId);
   await assert.rejects(service.saveSelections(projectId, selections('mysql', secret.id)), /该工具/);
   const duplicated = selections('meegle', secret.id);
-  duplicated[0] = duplicated[1];
+  duplicated.push({ ...duplicated[0] });
   await assert.rejects(service.saveSelections(projectId, duplicated), /只能配置一次/);
   await service.update(secret.id, { enabled: false });
   await assert.rejects(service.saveSelections(projectId, selections('meegle', secret.id)), /已启用/);
@@ -167,11 +168,13 @@ test('invalid or duplicate selections leave the whole project configuration unch
 
 test('legacy grants classify secrets and multiple keys fail closed even with an explicit alias', async () => {
   const { repository, service, projectId } = fixture();
-  const secret = await service.create({ name: 'Legacy', format: 'json', mutable: true, content: '{}' });
+  const secret = await service.create({ name: 'Legacy', tool: 'meegle', path: '.meegle/credentials.json', format: 'text', mutable: true, content: '{}' });
+  repository.records.set(secret.id, { ...repository.records.get(secret.id)!, tool: null, path: null, alias: null });
+  await service.update(secret.id, { name: 'Legacy renamed' });
   const old = await service.saveGrant(projectId, { tool: 'meegle', alias: 'legacy', enabled: true, files: [{ secretId: secret.id, path: '.meegle/credentials.json' }] });
   const list = await service.list();
   assert.equal(list[0].tool, 'meegle');
-  assert.equal(list[0].alias, 'legacy');
+  assert.equal(list[0].path, '.meegle/credentials.json');
   repository.bindings.set('legacy-duplicate', { ...old, id: 'legacy-duplicate' });
   const token = await service.registerRuntime('box-a', projectId, 1);
   await assert.rejects(service.start(token, 'meegle', 'legacy', ['workitem', 'list']), /多密钥/);
@@ -189,15 +192,71 @@ test('selection API accepts only operator access and persists or clears one key 
   } });
   app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'invalid' }, error instanceof HttpError ? error.status as 400 : 400));
   installSecretRoutes(app, service, id => id === projectId);
-  const secret = await service.create({ name: 'Meegle', tool: 'meegle', format: 'json', mutable: true, content: '{}' });
+  const create = (body: unknown) => app.request(`${origin}/api/secrets`, { method: 'POST', headers: { Authorization: `Bearer ${operatorToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const raw = '# original\naccess_token: fixture\n';
+  const created = await create({ name: 'Custom API', tool: 'custom-api', path: '.config/custom/auth.yaml', content: raw });
+  assert.equal(created.status, 201);
+  const secret = await created.json();
+  assert.equal(secret.format, 'text');
+  assert.equal((await service.content(secret.id)).content, raw);
+  for (const format of ['json', 'binary']) assert.equal((await create({ name: 'Invalid', tool: 'custom-api', path: 'auth', format, content: raw })).status, 400);
+  assert.equal((await create({ name: 'Invalid path', tool: 'custom-api', path: '../auth', content: raw })).status, 400);
   const token = await service.registerRuntime('box-a', projectId, 1);
   const put = (bearer: string, chosen: ReturnType<typeof selections>) => app.request(`${origin}/api/projects/${projectId}/tool-grants`, {
     method: 'PUT', headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ selections: chosen }),
   });
-  assert.equal((await put(token, selections('meegle', secret.id))).status, 401);
-  const response = await put(operatorToken, selections('meegle', secret.id));
+  assert.equal((await put(token, selections('custom-api', secret.id))).status, 401);
+  const response = await put(operatorToken, selections('custom-api', secret.id));
   assert.equal(response.status, 200);
   assert.equal((await response.json())[0].files[0].secretId, secret.id);
-  assert.equal((await put(operatorToken, selections('meegle', null))).status, 200);
+  assert.equal((await put(operatorToken, [])).status, 200);
   assert.equal((await service.grants(projectId)).length, 0);
+});
+
+test('arbitrary tools and paths use unchanged text, including YAML, and refresh through the same boundary', async () => {
+  const { service, projectId } = fixture();
+  const original = '# 保留注释\r\naccess_token: original-token\r\nextra: [a, b]\r\n';
+  const custom = await service.create({ name: 'Custom', tool: 'custom.cli', path: '.config/自定义工具/auth.yaml', format: 'text', mutable: true, content: original });
+  const kube = await service.create({ name: 'Kube YAML', tool: 'kubectl', path: 'configs/user kube.yaml', format: 'text', mutable: false, content: 'apiVersion: v1\nkind: Config\n' });
+  await service.saveSelections(projectId, [{ tool: 'custom.cli', secretId: custom.id }, { tool: 'kubectl', secretId: kube.id }]);
+  const token = await service.registerRuntime('box-a', projectId, 1);
+  const started = await service.start(token, 'custom.cli', undefined, ['inspect']);
+  assert.equal(Buffer.from(started.files[0].content, 'base64').toString(), original);
+  assert.equal(started.files[0].path, '.config/自定义工具/auth.yaml');
+  const rawKube = await service.start(token, 'kubectl', undefined, ['config', 'current-context']);
+  assert.equal(Buffer.from(rawKube.files[0].content, 'base64').toString(), 'apiVersion: v1\nkind: Config\n');
+  const updated = 'access_token: refreshed-token\n';
+  await service.complete(token, started.id, [{ secretId: custom.id, content: Buffer.from(updated).toString('base64') }], 1);
+  assert.equal((await service.content(custom.id)).content, updated);
+  await service.saveSelections(projectId, []);
+  await assert.rejects(service.start(token, 'custom.cli', undefined, ['inspect']), /未授权/);
+  for (const value of ['../tool', '/bin/tool', 'tool/child', 'tool\0']) assert.throws(() => toolName(value));
+  for (const value of ['../auth', '/etc/auth', '.config/../auth', './auth', 'auth\\file', '.']) assert.throws(() => credentialPath(value));
+});
+
+test('old non-text secrets retain ciphertext until explicitly reimported and cannot reach tool execution', async () => {
+  const { repository, service, projectId } = fixture();
+  const secret = await service.create({ name: 'Old format', tool: 'mysql', path: '.my.cnf', format: 'text', mutable: false, content: '[client]\nuser=fixture\n' });
+  await service.saveSelections(projectId, selections('mysql', secret.id));
+  const original = repository.records.get(secret.id)!;
+  repository.records.set(secret.id, { ...original, format: 'binary' });
+  assert.equal((await service.list())[0].requiresTextImport, true);
+  assert.equal((await service.content(secret.id)).content, '');
+  await service.update(secret.id, { name: 'Old renamed' });
+  assert.equal(repository.records.get(secret.id)!.ciphertext, original.ciphertext);
+  const token = await service.registerRuntime('box-a', projectId, 1);
+  await assert.rejects(service.start(token, 'mysql', undefined, ['-e', 'SELECT 1']), /重新导入/);
+  const raw = '[client]\nuser=reimported\n';
+  await service.update(secret.id, { content: raw });
+  assert.equal(repository.records.get(secret.id)!.format, 'text');
+  assert.equal((await service.list())[0].requiresTextImport, false);
+  const started = await service.start(token, 'mysql', undefined, ['-e', 'SELECT 1']);
+  assert.equal(Buffer.from(started.files[0].content, 'base64').toString(), raw);
+  const jsonText = '{"refresh_token":"old-json-token"}';
+  const oldJson = await service.create({ name: 'Old JSON', tool: 'custom-cli', path: '.config/auth.json', format: 'text', mutable: true, content: jsonText });
+  repository.records.set(oldJson.id, { ...repository.records.get(oldJson.id)!, format: 'json' });
+  assert.equal((await service.content(oldJson.id)).content, jsonText);
+  await service.update(oldJson.id, { content: jsonText });
+  assert.equal(repository.records.get(oldJson.id)!.format, 'text');
+  assert.equal((await service.content(oldJson.id)).content, jsonText);
 });

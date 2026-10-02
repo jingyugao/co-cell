@@ -2,7 +2,8 @@ import type { Pool, RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import type { ProjectToolGrant, ProxyTool, SecretFormat, SecretVersion } from '../../protocol/secret-types.js';
 
 export interface StoredSecret {
-  id: string; name: string; format: SecretFormat; mutable: boolean; enabled: boolean;
+  /** Old formats remain readable until the operator replaces their contents. */
+  id: string; name: string; format: SecretFormat | 'json' | 'binary'; mutable: boolean; enabled: boolean;
   version: number; currentVersionId: string; ciphertext: string; createdAt: string; updatedAt: string;
   tool: ProxyTool | null; path: string | null; alias: string | null;
 }
@@ -59,7 +60,7 @@ export class MySqlSecretRepository implements SecretRepository {
         // Renaming or disabling a Secret must not write an old content snapshot
         // over a concurrently refreshed token. Content writes alone use LWW.
         const contentChanged = version?.changes.includes('content');
-        await connection.query(`UPDATE secrets SET name=?,mutable=?,enabled=?,updated_at=?${contentChanged ? ',version=version+1,current_version_id=?,ciphertext=?' : ''} WHERE id=?`, [secret.name, secret.mutable, secret.enabled, secret.updatedAt, ...(contentChanged ? [version!.id, version!.ciphertext] : []), secret.id]);
+        await connection.query(`UPDATE secrets SET name=?,mutable=?,enabled=?,updated_at=?${contentChanged ? ',format=?,version=version+1,current_version_id=?,ciphertext=?' : ''} WHERE id=?`, [secret.name, secret.mutable, secret.enabled, secret.updatedAt, ...(contentChanged ? [secret.format, version!.id, version!.ciphertext] : []), secret.id]);
       }
       if (secret.tool) await connection.query('INSERT INTO secret_tool_configs(secret_id,tool,path,alias) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE tool=VALUES(tool),path=VALUES(path),alias=VALUES(alias)', [secret.id, secret.tool, secret.path, secret.alias]);
       if (version) await this.insertVersion(connection, version);

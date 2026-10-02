@@ -188,6 +188,9 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
   app.use('*', async (c, next) => {
     const path = new URL(c.req.url).pathname;
     const requestHost = (c.req.header('host') ?? new URL(c.req.url).host).toLowerCase();
+    // These two endpoints authenticate scoped Sandbox tokens in SecretService.
+    // Operator cookies and the platform access token do not authorize them.
+    if (c.req.method === 'POST' && (/^\/api\/tool-runtime\/start$/.test(path) || /^\/api\/tool-runtime\/[0-9a-f-]{36}\/complete$/.test(path))) return next();
     if (requestHost !== host) {
       const target = resolvePreviewHost?.(requestHost);
       if (!target || !options.serviceProxy) return c.text('Invalid host', 403);

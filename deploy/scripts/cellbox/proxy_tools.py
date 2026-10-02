@@ -32,6 +32,12 @@ def load_proxy_tools(config_path: str, base_image: str, *, required: bool = Fals
     tools = []
     ids = set()
     for name, spec in sorted(configured_tools.items()):
+        # Connection metadata is provided by CoCell, never by exposing the
+        # complete native credential store to the agent.
+        if name == "mysql_config_editor":
+            continue
+        if name not in {"mysql", "kubectl", "glab", "lark-cli", "meegle"}:
+            raise ValueError(f"unsupported protected proxy tool: {name}")
         if not NAME.fullmatch(name) or not isinstance(spec, dict):
             raise ValueError(f"invalid proxy tool name: {name!r}")
         unknown = set(spec) - {"id", "policy", "allow_unrestricted"}
@@ -62,6 +68,7 @@ def load_proxy_tools(config_path: str, base_image: str, *, required: bool = Fals
                 "executable": "/opt/cellbox/tools/cocell-proxy",
                 "args": [name, policy_path.name if policy_path else "-"],
                 "passThroughArgs": True,
+                "credentialEnv": {"COCELL_TOOL_RUNTIME": "cocell_tool_runtime"},
             },
         })
     if not managed:

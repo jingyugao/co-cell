@@ -4,7 +4,6 @@
 from copy import deepcopy
 import json
 import os
-import posixpath
 import re
 import sys
 
@@ -29,27 +28,14 @@ with open(sample_path, encoding="utf-8") as stream:
 proxy_tools, owned_ids = load_proxy_tools(proxy_config, base_image, required=bool(os.environ.get("COCELL_PROXY_TOOLS_CONFIG")))
 read_only_path = os.environ.get("COCELL_DEBUG_READ_ONLY_HOST_PATH", "")
 read_write_path = os.environ.get("COCELL_DEBUG_READ_WRITE_HOST_PATH", "")
-if read_only_path and read_write_path:
-    raise SystemExit("Configure only one debug host mount mode")
-for name, value in (("COCELL_DEBUG_READ_ONLY_HOST_PATH", read_only_path), ("COCELL_DEBUG_READ_WRITE_HOST_PATH", read_write_path)):
-    if value and (not value.startswith("/") or value == "/" or posixpath.normpath(value) != value or any(char in value for char in "\x00\r\n")):
-        raise SystemExit(f"{name} must be a clean absolute directory path")
+if read_only_path or read_write_path:
+    raise SystemExit("Project Secret management requires isolated debug homes; remove debug host mount options")
+profile.pop("debugReadOnlyHostPath", None)
+profile.pop("debugReadWriteHostPath", None)
 guest = profile.setdefault("guest", {})
 guest.setdefault("agent", sample["guest"]["agent"])
-if not guest.get("debug", {}).get("uid"):
-    guest["debug"] = sample["guest"]["debug"]
-if read_write_path:
-    uid, gid = os.environ.get("COCELL_DEBUG_HOST_UID", ""), os.environ.get("COCELL_DEBUG_HOST_GID", "")
-    if not uid.isdecimal() or not gid.isdecimal() or not 0 < int(uid) < 2**32 or not 0 < int(gid) < 2**32:
-        raise SystemExit("Set COCELL_DEBUG_HOST_UID and COCELL_DEBUG_HOST_GID to the host home owner")
-    if int(uid) == guest["agent"]["uid"] or int(gid) == guest["agent"]["gid"]:
-        raise SystemExit("Debug host identity must differ from the agent identity")
-    guest["debug"] = {"uid": int(uid), "gid": int(gid)}
-    profile.pop("debugReadOnlyHostPath", None)
-    profile["debugReadWriteHostPath"] = read_write_path
-elif read_only_path:
-    profile.pop("debugReadWriteHostPath", None)
-    profile["debugReadOnlyHostPath"] = read_only_path
+guest["debug"] = sample["guest"]["debug"]
+guest.pop("debugHome", None)
 guest["workspace"] = sample["guest"]["workspace"]
 guest["command"] = sample["guest"]["command"]
 guest["tools"] = [tool for tool in guest.get("tools", []) if tool["id"] not in owned_ids] + [tool["profile"] for tool in proxy_tools]

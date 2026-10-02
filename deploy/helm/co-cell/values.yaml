@@ -7,7 +7,8 @@ image:
 imagePullSecrets: []
 
 # Existing Secret in the release namespace. Required keys: CELLBOX_API_TOKEN,
-# COCELL_ACCESS_TOKEN, MYSQL_URL. Optional keys: CODEX_API_KEY, OPENAI_API_KEY.
+# COCELL_ACCESS_TOKEN, MYSQL_URL, COCELL_SECRET_MASTER_KEY.
+# Optional keys: CODEX_API_KEY, OPENAI_API_KEY.
 existingSecret: ""
 
 cellbox:
@@ -18,6 +19,8 @@ cellbox:
 publicUrl: ""
 
 config:
+  # Defaults to this release's internal service origin.
+  toolBrokerUrl: ""
   ossEndpoint: ""
   codexModel: ""
   openaiBaseUrl: ""

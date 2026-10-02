@@ -11,6 +11,7 @@ import type { RemoteArchiveMetadata, RemoteArchiveRef } from '../../protocol/rem
 import { downloadOssArchive } from '../archives/oss-download.js';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
+import type { SecretService } from '../secrets/service.js';
 const q = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const node = '/usr/local/bin/node';
 const workspace = '/home/agent/workspace';
@@ -24,6 +25,8 @@ export interface CellboxRuntimeIntegrationOptions {
     connections?: ConnectionStore;
     /** Runtime bundle paths mapped only to explicitly admitted debug slots. */
     credentialSlots?: Record<string, string>;
+    secrets?: SecretService;
+    toolBrokerUrl?: string;
     onRenewalFailure?: (error: unknown) => void;
 }
 /** Product initialization. Cellbox retains ownership of identities, forwarding and archive bytes. */
@@ -71,7 +74,7 @@ export class CellboxRuntimeIntegration {
                     const candidateHandle = await options.provider.create(options.profileId, { timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false }, metadata: { projectId: target.projectId ?? target.id, cellboxOwnerKey: `project:${target.projectId ?? target.id}:oss-restore:${key}`, cellboxIdempotencyKey: key } });
                     const candidate: SandboxState = { id: candidateHandle.sandboxId, template: options.profileId, status: 'starting', workingDirectory: workspace };
                     await onCandidate(candidate);
-                    await this.syncCredentials(candidate.id, (await options.provider.client.getBox(candidate.id)).generation);
+                    await this.syncCredentials(candidate.id, (await options.provider.client.getBox(candidate.id)).generation, target.projectId ?? target.id);
                     const result = await options.provider.client.runTool(candidate.id, 'cocell_archive_restore', [JSON.stringify(ref.metadata), ossArchiveEndpoint], 5 * 60_000);
                     if (result.exitCode !== 0) throw new Error(result.stderr || `OSS archive restore exited ${result.exitCode}`);
                     candidate.image = await options.provider.currentImageIdentity(candidate.id);
@@ -85,6 +88,8 @@ export class CellboxRuntimeIntegration {
                 if (box.phase !== 'staged')
                     throw new Error('Cellbox did not return a staged restore candidate');
                 candidate.image = { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] };
+                if (this.options.secrets && box.capabilities.protectedTools)
+                    await this.options.secrets.registerRuntime(candidate.id, target.projectId ?? target.id, box.generation);
                 return candidate;
             },
             activate: async (candidate) => {
@@ -125,7 +130,7 @@ export class CellboxRuntimeIntegration {
             const cached = this.prepared.get(handle.sandboxId);
             fresh = !cached || cached.generation !== box.generation || cached.workspace !== target.settings.workingDirectory;
             if (fresh) await this.prepareOnce(handle, target, signal, wait, box.generation);
-            else await this.syncCredentials(handle.sandboxId, box.generation);
+            else await this.syncCredentials(handle.sandboxId, box.generation, target.projectId ?? target.id);
             if (wait) this.prepared.set(handle.sandboxId, { generation: box.generation, workspace: target.settings.workingDirectory });
         });
         this.preparations.set(handle.sandboxId, current);
@@ -145,7 +150,7 @@ export class CellboxRuntimeIntegration {
         const root = CELLBOX_PRODUCT_PATHS.root, runtime = CELLBOX_PRODUCT_PATHS.startup;
         const setup = `const fs=require('node:fs'),path=require('node:path');for(const p of ${JSON.stringify([root, CELLBOX_PRODUCT_PATHS.runtime, runtime, CELLBOX_PRODUCT_PATHS.codexHome, target.settings.workingDirectory])}){let current='/';for(const part of p.split('/').filter(Boolean)){current=path.join(current,part);try{fs.mkdirSync(current,{mode:0o700})}catch(e){if(e.code!=='EEXIST')throw e}const s=fs.lstatSync(current);if(!s.isDirectory()||s.isSymbolicLink())throw Error('Unsafe runtime directory');}if(fs.statSync(p).uid!==process.getuid())throw Error('Unsafe runtime owner');}fs.chmodSync(${JSON.stringify(root)},0o700);fs.chmodSync(${JSON.stringify(runtime)},0o700);`;
         await handle.commands.run(`${node} -e ${q(setup)}`, { user: 'agent', signal, timeoutMs: 30000 });
-        await this.syncCredentials(handle.sandboxId, generation);
+        await this.syncCredentials(handle.sandboxId, generation, target.projectId ?? target.id);
         const probe = `const n=require('node:net').connect(4500,'127.0.0.1');n.on('connect',()=>{n.end();process.exit(0)});n.on('error',()=>process.exit(1));n.setTimeout(1000,()=>process.exit(1));`;
         const running = await handle.commands.run(`${node} -e ${q(probe)}`, { user: 'agent', signal, timeoutMs: 2000 }).then(() => true, error => { if ((error as {
             exitCode?: number;
@@ -171,7 +176,23 @@ export class CellboxRuntimeIntegration {
             await handle.files.remove(temp, { user: 'agent' }).catch(() => { });
         }
     }
-    private async syncCredentials(boxId: string, generation: number) {
+    private async syncCredentials(boxId: string, generation: number, projectId?: string) {
+        if (this.options.secrets) {
+            if (!(await this.options.provider.client.getBox(boxId)).capabilities.protectedTools) return;
+            // Restore activation can address a candidate by box ID. Reuse only
+            // its server-side registration rather than inventing project identity.
+            const previous = await this.options.secrets.repository.runtime(boxId);
+            const owner = projectId === boxId ? previous?.projectId : projectId;
+            if (!owner) throw new Error('Project identity is required for tool credentials');
+            const token = await this.options.secrets.registerRuntime(boxId, owner, generation);
+            if (!this.options.toolBrokerUrl) throw new Error('COCELL_TOOL_BROKER_URL is required');
+            await this.options.provider.client.writeCredential(boxId, 'cocell_tool_runtime', Buffer.from(JSON.stringify({ token, url: this.options.toolBrokerUrl })));
+            // Only platform archive credentials retain the legacy slot transport.
+            for (const [slot, value] of [['cocell_oss_access_key', process.env.OSS_ACCESS_KEY], ['cocell_oss_secret_key', process.env.OSS_SECRET_KEY]]) {
+                if (value) await this.options.provider.client.writeCredential(boxId, slot!, Buffer.from(value));
+            }
+            return;
+        }
         const mapping = this.options.credentialSlots ?? {};
         if (!Object.keys(mapping).length || !this.options.connections)
             return;

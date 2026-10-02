@@ -2,6 +2,7 @@ import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import type { Project, Session, Turn } from '../../../protocol/types.js';
 import type { SandboxState } from '../../../protocol/sandbox-types.js';
+import { MySqlSecretRepository } from '../../secrets/repository.js';
 
 export interface WebStateStore {
   init(): Promise<void>; listProjects(): Promise<Project[]>; listSessions(): Promise<Session[]>;
@@ -64,7 +65,8 @@ function requireMySqlUrl(value: string | undefined): string {
 /** Web metadata and sandbox-local ~/.codex are intentionally separate. */
 export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   private pool: Pool;
-  constructor(url: string) { this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' }); }
+  readonly secretRepository: MySqlSecretRepository;
+  constructor(url: string) { this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' }); this.secretRepository = new MySqlSecretRepository(this.pool); }
   async listImages(): Promise<ImageRecord[]> {
     const [rows] = await this.pool.query<Array<RowDataPacket & { document: ImageRecord | string }>>('SELECT document FROM managed_images');
     return rows.map(row => this.document<ImageRecord>(row.document));
@@ -128,4 +130,4 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   }
 }
 
-export function createWebStateStore(mysqlUrl?: string): WebStateStore & ImageCatalogStore { return new MySqlWebStateStore(requireMySqlUrl(mysqlUrl)); }
+export function createWebStateStore(mysqlUrl?: string) { return new MySqlWebStateStore(requireMySqlUrl(mysqlUrl)); }

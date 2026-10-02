@@ -42,6 +42,7 @@ test('connect preserves already provisioned files after central deletion; resume
   assert.deepEqual(JSON.parse(fake.writes[0].bytes).files, [file]);
   fake.setFiles([]);
   await run('connect');
+  await fake.reconcile();
   assert.equal(fake.writes.length, 3);
   assert.equal(fake.provisions(), 1);
   fake.setGeneration(2);
@@ -58,7 +59,7 @@ test('durable acknowledgements skip writes across restarts and refresh only chan
   await fake.reconcile(); // New host/extension simulates a service restart.
   assert.equal(fake.writes.length, 3);
   fake.options.toolBrokerUrl = 'http://new-broker.example.test';
-  await fake.reconcile();
+  await fake.lifecycle().run({ action: 'resume', resourceKey: 'project:project-one', sandboxId: 'box-one' }, async () => {});
   assert.equal(fake.writes.length, 4);
   assert.equal(fake.writes[3].slot, 'cocell_tool_runtime');
   assert.equal(JSON.parse(fake.writes[3].bytes).url, fake.options.toolBrokerUrl);

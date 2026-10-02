@@ -62,7 +62,7 @@ export class SandboxRuntimeConfig {
       };
       // Connecting or restarting the service must not replace an existing
       // generation's file snapshot after a resource was removed centrally.
-      if (context.action !== 'connect' || !applied.cocell_tool_runtime) {
+      if (!['connect', 'reconcile'].includes(context.action) || !applied.cocell_tool_runtime) {
         const config: ToolRuntimeConfig = { mode: 'files', generation, token, url: this.options.toolBrokerUrl, files: await this.options.secrets.provision(projectId) };
         const bytes = Buffer.from(JSON.stringify(config));
         if (bytes.length > 1024 * 1024) throw new Error('Selected credential files exceed the 1 MiB Sandbox configuration limit');

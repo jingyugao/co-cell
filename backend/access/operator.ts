@@ -188,6 +188,11 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
   app.use('*', async (c, next) => {
     const path = new URL(c.req.url).pathname;
     const requestHost = (c.req.header('host') ?? new URL(c.req.url).host).toLowerCase();
+    if (c.req.method === 'POST' && path === '/mcp/user-input') {
+      const authorization = c.req.header('authorization') ?? '';
+      if (authorization.startsWith('Bearer ') && fixedEqual(authorization.slice(7), options.token)) return next();
+      return c.json({ error: 'Authentication required' }, 401);
+    }
     // These two endpoints authenticate scoped Sandbox tokens in SecretService.
     // Operator cookies and the platform access token do not authorize them.
     if (c.req.method === 'POST' && (/^\/api\/tool-runtime\/(start|files)$/.test(path) || /^\/api\/tool-runtime\/[0-9a-f-]{36}\/complete$/.test(path) || path === '/mcp/user-input')) return next();

@@ -172,7 +172,7 @@ try {
     let updated = answered.turns.find(t => t.id === source.id);
     const deadline = Date.now() + 120_000;
     while (updated?.userInputRequests?.at(-1)?.status !== 'answered' && Date.now() < deadline) {
-      await sleep(1000);
+      await delay(1000);
       const current = await json(`/api/sessions/${sessionId}`);
       updated = current.turns.find(t => t.id === source.id);
     }

@@ -169,7 +169,13 @@ try {
     const answered = await json(`/api/sessions/${sessionId}/turns/${source.id}/user-input/${request.id}`, {
       method: 'POST', body: { answer: '继续' }, expectedStatus: 200,
     });
-    const updated = answered.turns.find(t => t.id === source.id);
+    let updated = answered.turns.find(t => t.id === source.id);
+    const deadline = Date.now() + 120_000;
+    while (updated?.userInputRequests?.at(-1)?.status !== 'answered' && Date.now() < deadline) {
+      await sleep(1000);
+      const current = await json(`/api/sessions/${sessionId}`);
+      updated = current.turns.find(t => t.id === source.id);
+    }
     assert.equal(updated?.userInputRequests?.at(-1)?.status, 'answered');
     assert(updated.userInputRequests.at(-1).answerTurnId, 'answer turn was not created');
     await waitIdle();

@@ -15,6 +15,63 @@ type TurnExecutionDependencies = Parameters<typeof runTurn>[3];
 const runtimePaths = { root: '/home/agent/workspace/.cocell', runtime: '/home/agent/workspace/.cocell/runtime',
   codexHome: '/home/agent/workspace/.cocell/codex', node: '/usr/local/bin/node' };
 
+test('history and descendant transcripts use only a shared App Server connection, including archived and paginated children', async t => {
+  const { provider, projects, counts, target, record, manager } = fixture();
+  const session: Session = { ...target, sandbox: record, title: 'test', threadId: 'root', status: 'completed',
+    startedAt: target.updatedAt, createdAt: target.updatedAt, archivedAt: null, turns: [],
+    settings: { ...target.settings, executionMode: 'sandbox', model: 'test', modelReasoningEffort: 'low',
+      sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: false } };
+  let connects = 0, grants = 0, releases = 0, historyPages = 0;
+  t.mock.method(CodexAppServerClient.prototype, 'connect', async () => { connects++; });
+  const child = (id: string, parent: string, depth: number, createdAt: number) => ({ id, createdAt,
+    source: { subAgent: { thread_spawn: { parent_thread_id: parent, agent_path: `/root/${id}`,
+      agent_nickname: `${id}-nickname`, depth } } } });
+  t.mock.method(CodexAppServerClient.prototype, 'request', async (method: string, params: any) => {
+    if (method === 'thread/list') {
+      assert.equal(params.ancestorThreadId, 'root');
+      assert.deepEqual(params.sourceKinds, ['subAgentThreadSpawn']);
+      assert.equal(params.useStateDbOnly, true);
+      if (params.archived) return { data: [child('grandchild', 'child', 2, 3)] };
+      return params.cursor ? { data: [child('other', 'unrelated-root', 1, 0)] }
+        : { data: [child('child', 'root', 1, 2)], nextCursor: 'thread-page-2' };
+    }
+    assert.equal(method, 'thread/turns/list');
+    assert.equal(params.itemsView, 'full');
+    if (params.threadId === 'root') {
+      historyPages++;
+      assert.equal(params.sortDirection, 'desc');
+      assert.equal(params.limit, 20);
+      assert.equal(params.cursor, 'older');
+      return { data: [], nextCursor: 'even-older' };
+    }
+    assert(['child', 'grandchild'].includes(params.threadId), 'unrelated history must not be read');
+    assert.equal(params.sortDirection, 'asc');
+    return { data: [{ id: `${params.threadId}-${params.cursor ?? 'first'}`, status: 'completed', startedAt: 4,
+      items: [{ type: 'userMessage', id: 'injected', content: [{ type: 'text', text: 'private injected prompt' }] },
+        { type: 'agentMessage', id: 'answer', text: 'visible answer' }] }],
+      nextCursor: params.threadId === 'child' && !params.cursor ? 'turn-page-2' : null };
+  });
+  const runtime = new ContainerCodexRuntime({ paths: runtimePaths, sandboxes: projects, provider, apiKey: '',
+    prepareRemote: async () => { assert.fail('reads must not prepare the Sandbox'); },
+    acquireRemoteUsage: async () => { assert.fail('reads must not lease the Sandbox'); },
+    appServer: async () => { grants++; return { url: 'ws://app-server.test', release: async () => { releases++; } }; } });
+  try {
+    const [history, agents] = await Promise.all([runtime.history(session, { cursor: 'older' }), runtime.subagents(session)]);
+    assert.equal(history.nextCursor, 'even-older');
+    assert.equal(historyPages, 1);
+    assert.deepEqual(agents.map(agent => [agent.threadId, agent.parentThreadId, agent.depth, agent.turns.length]),
+      [['child', 'root', 1, 2], ['grandchild', 'child', 2, 1]]);
+    assert.equal(agents[0].path, '/root/child');
+    assert.equal(agents[0].nickname, 'child-nickname');
+    assert(agents.every(agent => agent.turns.every(turn => turn.prompt === '' && turn.items[0].type === 'agent_message')));
+    assert.equal(connects, 1);
+    assert.equal(grants, 1);
+    assert.equal(releases, 0);
+    assert.deepEqual(counts, { create: 0, connect: 0, kill: 0, renew: 0 });
+  } finally { await runtime.close(); await manager.close(); }
+  assert.equal(releases, 1);
+});
+
 function fixture() {
   const counts = { create: 0, connect: 0, kill: 0, renew: 0 };
   const sandbox = {

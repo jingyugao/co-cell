@@ -12,7 +12,7 @@ import { holdResponse } from '../../util/http-stream.js';
 import type { AgentEvent } from '../../protocol/types.js';
 import type { Session, SubagentConversation, Turn } from '../../protocol/types.js';
 import type { NativeHistory } from './native-history.mjs';
-import { readSubagentConversations } from './native-history.mjs';
+import { AppServerReader, type AppServerEndpoint } from './app-server-reader.js';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 import { HttpError } from '../../util/errors.js';
@@ -48,7 +48,7 @@ export interface SandboxRuntime {
   deleteDanglingSandbox?(sandboxId: string): Promise<void>;
   close(): Promise<void>;
 }
-export interface AppServerEndpoint { url: string; token?: string; headers?: Record<string,string>; release?: () => Promise<void> }
+export type { AppServerEndpoint } from './app-server-reader.js';
 const endpointHeaders = (endpoint: AppServerEndpoint) => endpoint.headers ?? (endpoint.token ? { Authorization: 'Bearer ' + endpoint.token } : {});
 export interface ContainerRuntimeOptions {
   paths: { root: string; runtime: string; codexHome: string; node: string };
@@ -101,9 +101,14 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private appServerObservers = new Map<string, { close(): Promise<void> }>();
   private detachRequests = new Set<string>();
   private readonly sandboxes: ProjectSandboxes;
+  private readonly reader: AppServerReader;
 
   constructor(private options: ContainerRuntimeOptions) {
     this.sandboxes = options.sandboxes;
+    this.reader = new AppServerReader(async id => {
+      if (!options.appServer) throw new Error('Sandbox App Server endpoint is not configured');
+      return options.appServer(id);
+    }, error => { void options.logger?.write({ event: 'sandbox.access_release_failed', error: this.safeError(error).message }); });
   }
 
   get remoteArchives() { return this.options.remoteArchives; }
@@ -511,39 +516,69 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async history(session: Session, options: { cursor?: string; limit?: number } = {}): Promise<NativeHistory> {
     if (!session.threadId) return { turns: [] };
     if (!session.sandbox) throw new Error('Codex 会话对应的沙箱不可用');
-    if (!this.options.appServer) throw new Error('Sandbox App Server endpoint is not configured');
-    let entry: Entry | undefined;
-    let client: CodexAppServerClient | undefined;
-    let endpoint: AppServerEndpoint | undefined;
-    let failed = false;
-    try {
-      entry = await this.acquire(session, false);
-      endpoint = await this.options.appServer(entry.metadata.id);
-      client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: endpointHeaders(endpoint), requestTimeoutMs: 120_000 });
+    return this.reader.read(session.sandbox.id, async client => {
       const response = await client.request('thread/turns/list', { threadId: session.threadId,
         itemsView: 'full', sortDirection: 'desc', limit: options.limit ?? 20,
         ...(options.cursor ? { cursor: options.cursor } : {}) });
       return { turns: (response.data ?? []).map((rawTurn: any) => this.mapAppServerTurn(rawTurn)), nextCursor: response.nextCursor ?? null };
-    } catch (error) { failed = true; throw this.safeError(error); }
-    finally {
-      await client?.close();
-      await this.releaseEndpoint(endpoint);
-      if (entry) await this.release(entry, failed);
-    }
+    }).catch(error => { throw this.safeError(error); });
   }
   async subagents(session: Session): Promise<SubagentConversation[]> {
     if (!session.threadId) return [];
     if (!session.sandbox) return [];
-    const entry = await this.acquire(session, false);
-    try {
-      const signal = AbortSignal.timeout(120_000);
-      const helper = this.runtimeDirectory + '/native-history.mjs';
-      await this.command(entry, `mkdir -p -- ${quote(this.runtimeDirectory)}`, signal);
-      await this.writeAtomic(entry, helper, await readFile(new URL('./native-history.mjs', import.meta.url), 'utf8'), signal);
-      const script = `import {readSubagentConversations} from ${JSON.stringify(helper)};console.log(JSON.stringify(await readSubagentConversations(${JSON.stringify(session.threadId)},${JSON.stringify(this.codexHome)})));`;
-      const output = await this.command(entry, `${this.node} --input-type=module -e ${quote(script)}`, signal, { timeoutMs: 120_000 });
-      return JSON.parse(output.stdout);
-    } finally { await this.release(entry); }
+    return this.reader.read(session.sandbox.id, async client => {
+      type Spawn = { parent_thread_id: string; agent_path?: string; agent_nickname?: string; depth: number };
+      type Thread = { id: string; createdAt: number; agentNickname?: string; source?: { subAgent?: { thread_spawn?: Spawn } } };
+      const threads = new Map<string, Thread>();
+      for (const archived of [false, true]) {
+        let cursor: string | null = null;
+        const seen = new Set<string>();
+        do {
+          const page: { data: Thread[]; nextCursor?: string | null } = await client.request('thread/list', {
+            ancestorThreadId: session.threadId, sourceKinds: ['subAgentThreadSpawn'], archived,
+            useStateDbOnly: true, limit: 100, ...(cursor ? { cursor } : {}),
+          });
+          for (const thread of page.data) threads.set(thread.id, thread);
+          cursor = page.nextCursor ?? null;
+          if (cursor && seen.has(cursor)) throw new Error('App Server returned a repeated thread cursor');
+          if (cursor) seen.add(cursor);
+        } while (cursor);
+      }
+      // Verify ancestry as well as filtering the RPC. Never expose an unrelated
+      // thread if a server ignores the ancestor filter.
+      const descendants = new Set([session.threadId!]);
+      const children: Array<{ thread: Thread; spawn: Spawn }> = [];
+      let changed: boolean;
+      do {
+        changed = false;
+        for (const thread of threads.values()) {
+          const spawn = thread.source?.subAgent?.thread_spawn;
+          if (!spawn || !descendants.has(spawn.parent_thread_id) || descendants.has(thread.id)) continue;
+          descendants.add(thread.id);
+          children.push({ thread, spawn });
+          changed = true;
+        }
+      } while (changed);
+      const result: SubagentConversation[] = [];
+      for (const { thread, spawn } of children) {
+        const turns: Turn[] = [];
+        let cursor: string | null = null;
+        const seen = new Set<string>();
+        do {
+          const page: { data: any[]; nextCursor?: string | null } = await client.request('thread/turns/list', { threadId: thread.id, itemsView: 'full',
+            sortDirection: 'asc', limit: 100, ...(cursor ? { cursor } : {}) });
+          turns.push(...(page.data ?? []).map((raw: any) => ({ ...this.mapAppServerTurn(raw), prompt: '' })));
+          cursor = page.nextCursor ?? null;
+          if (cursor && seen.has(cursor)) throw new Error('App Server returned a repeated turn cursor');
+          if (cursor) seen.add(cursor);
+        } while (cursor);
+        const nickname = spawn.agent_nickname ?? thread.agentNickname;
+        result.push({ threadId: thread.id, parentThreadId: spawn.parent_thread_id,
+          path: spawn.agent_path ?? thread.id, ...(nickname ? { nickname } : {}), depth: spawn.depth,
+          startedAt: new Date(thread.createdAt * 1000).toISOString(), turns });
+      }
+      return result.sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+    }).catch(error => { throw this.safeError(error); });
   }
   async delete(session: WorkspaceTarget) {
     await this.sandboxes.delete(session);
@@ -690,6 +725,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   async close() {
     this.closing = true;
+    await this.reader.close();
     await this.sandboxes.close();
   }
 }

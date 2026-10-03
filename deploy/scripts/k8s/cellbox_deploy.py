@@ -73,7 +73,6 @@ class CellboxRelease:
         api = self.values["api"]
         secret = json.loads(run(*self.kube("get", "secret", api["configSecret"], "-o", "json", namespace=self.api_namespace), capture=True))
         config = json.loads(base64.b64decode(secret["data"]["config.json"]))
-        tokens = json.loads(run(*self.kube("get", "secret", api["clientTokensSecret"], "-o", "json", namespace=self.api_namespace), capture=True))["data"]
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -92,18 +91,15 @@ class CellboxRelease:
                     if attempt == 49:
                         raise RuntimeError("Cellbox API did not respond to the operation check")
                     time.sleep(0.1)
-            count = 0
-            for client in config["clients"]:
-                token = base64.b64decode(tokens[client["tokenEnv"]]).decode()
-                request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/boxes", headers={"Authorization": f"Bearer {token}"})
-                with opener.open(request, timeout=30) as response:
-                    boxes = json.load(response)
-                if not isinstance(boxes, list):
-                    raise RuntimeError("Unexpected response from Cellbox box list")
-                if any(box.get("operationId") for box in boxes):
-                    raise RuntimeError("Cellbox has pending box operations; rollout stopped")
-                count += len(boxes)
-            print(f"No pending box operations across {count} boxes", flush=True)
+            client = config.get("clientId") or "internal"
+            request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/boxes", headers={"X-Cellbox-Client-ID": client})
+            with opener.open(request, timeout=30) as response:
+                boxes = json.load(response)
+            if not isinstance(boxes, list):
+                raise RuntimeError("Unexpected response from Cellbox box list")
+            if any(box.get("operationId") for box in boxes):
+                raise RuntimeError("Cellbox has pending box operations; rollout stopped")
+            print(f"No pending box operations across {len(boxes)} boxes", flush=True)
         finally:
             forward.terminate()
             try:

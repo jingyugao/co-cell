@@ -2,20 +2,18 @@ import { AppServerRpcError, CodexAppServerClient } from '../../packages/agentcor
 
 export interface AppServerEndpoint {
   url: string;
-  token?: string;
   headers?: Record<string, string>;
-  release?: () => Promise<void>;
 }
 
 type Connection = {
-  ready: Promise<{ client: CodexAppServerClient; endpoint: AppServerEndpoint }>;
+  ready: Promise<CodexAppServerClient>;
   users: number;
   retired: boolean;
   timer?: ReturnType<typeof setTimeout>;
   disposal?: Promise<void>;
 };
 
-/** Read RPCs share a connection and grant, without acquiring or waking a Sandbox. */
+/** Read RPCs share a connection, without acquiring or waking a Sandbox. */
 export class AppServerReader {
   private connections = new Map<string, Connection>();
   private disposals = new Set<Promise<void>>();
@@ -36,7 +34,7 @@ export class AppServerReader {
     clearTimeout(connection.timer);
     connection.users++;
     try {
-      const { client } = await connection.ready;
+      const client = await connection.ready;
       return await action(client);
     } catch (error) {
       // An RPC rejection does not break the transport; other failures need a
@@ -58,7 +56,7 @@ export class AppServerReader {
   private async open(id: string, connection: Connection) {
     const endpoint = await this.endpoint(id);
     const client = new CodexAppServerClient({ url: endpoint.url,
-      headers: endpoint.headers ?? (endpoint.token ? { Authorization: `Bearer ${endpoint.token}` } : {}),
+      headers: endpoint.headers,
       requestTimeoutMs: 30_000 });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -66,10 +64,9 @@ export class AppServerReader {
         timer = setTimeout(() => reject(new Error('App Server connection timed out')), 30_000);
       })]);
       client.once('closed', () => this.retire(id, connection));
-      return { client, endpoint };
+      return client;
     } catch (error) {
       try { await client.close(); } catch (cleanupError) { this.onCleanupError(cleanupError); }
-      try { await endpoint.release?.(); } catch (cleanupError) { this.onCleanupError(cleanupError); }
       throw error;
     } finally { clearTimeout(timer); }
   }
@@ -84,10 +81,9 @@ export class AppServerReader {
   private dispose(connection: Connection) {
     if (connection.disposal) return;
     connection.disposal = (async () => {
-      let value;
-      try { value = await connection.ready; } catch { return; }
-      try { await value.client.close(); } catch (error) { this.onCleanupError(error); }
-      try { await value.endpoint.release?.(); } catch (error) { this.onCleanupError(error); }
+      let client;
+      try { client = await connection.ready; } catch { return; }
+      try { await client.close(); } catch (error) { this.onCleanupError(error); }
     })();
     this.disposals.add(connection.disposal);
     void connection.disposal.finally(() => this.disposals.delete(connection.disposal!));

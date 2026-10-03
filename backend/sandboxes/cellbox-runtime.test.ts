@@ -89,11 +89,8 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
     agent: { uid: 11000, gid: 11000 }, sha256: createHash('sha256').update(archiveBytes).digest('hex'),
     size: archiveBytes.length, consistency: 'workspace-best-effort', createdAt: new Date().toISOString(),
   };
-  let renews = 0, revokes = 0, leaseRenews = 0, leaseReleases = 0;
-  const access = { url: 'https://route-1.boxes.example.test/', headers: { Authorization: 'Bearer grant-secret' },
-    routeId: 'route-1', grantId: 'grant-1', expiresAt: new Date(Date.now() + 180_000).toISOString(),
-    renew: async () => { renews++; return new Date(Date.now() + 180_000).toISOString(); },
-    revoke: async () => { revokes++; } };
+  let leaseRenews = 0, leaseReleases = 0;
+  const access = { url: 'http://cellbox.test/v1/boxes/box-1/services/4500/', headers: {} };
   const provider = {
     client: {
       writeCredential: async (boxId: string, slot: string, bytes: Uint8Array) => { credentialWrites.push({ boxId, slot, bytes: Buffer.from(bytes) }); },
@@ -109,14 +106,13 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
     activateBox: async () => { events.push('activate'); },
     captureArchive: async () => ({ result: { archiveId: archive.id } }),
     getServiceAccess: async () => access,
-    getInternalServiceAccess: async () => undefined,
     createLease: async () => ({ id: 'lease-1' }),
     renewLease: async () => { leaseRenews++; },
     releaseLease: async () => { leaseReleases++; },
     ...overrides,
   } as unknown as CellboxSandboxProvider;
   return { provider, events, credentialWrites, archive, archiveBytes,
-    counts: () => ({ renews, revokes, leaseRenews, leaseReleases }) };
+    counts: () => ({ leaseRenews, leaseReleases }) };
 }
 
 test('setup stays in the agent workspace, writes 0600 startup config, and installs mapped slots only', async () => {
@@ -218,7 +214,7 @@ test('startup reconciliation leaves paused sandboxes asleep and archive workflow
   } finally { await runtime.close(); }
 });
 
-test('grant and lease access renew while active and revoke or release on close', async t => {
+test('only usage leases renew; anonymous App Server access needs no timer', async t => {
   const callbacks: Array<() => void> = [];
   t.mock.method(globalThis, 'setInterval', ((callback: () => void) => {
     callbacks.push(callback);
@@ -228,31 +224,16 @@ test('grant and lease access renew while active and revoke or release on close',
   const { provider, counts } = fakeProvider();
   const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {} });
   const endpoint = await runtime.appServer('box-1');
-  assert.equal(endpoint.url, 'wss://route-1.boxes.example.test/');
-  assert.deepEqual(endpoint.headers, { Authorization: 'Bearer grant-secret' });
+  assert.equal(endpoint.url, 'ws://cellbox.test/v1/boxes/box-1/services/4500/');
+  assert.deepEqual(endpoint.headers, {});
   const releaseLease = await runtime.acquireUsage('box-1');
-  assert.equal(callbacks.length, 2);
+  assert.equal(callbacks.length, 1);
   callbacks.forEach(callback => callback());
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(counts(), { renews: 1, revokes: 0, leaseRenews: 1, leaseReleases: 0 });
-  await endpoint.release?.();
+  assert.deepEqual(counts(), { leaseRenews: 1, leaseReleases: 0 });
   await releaseLease();
   await runtime.close();
-  assert.deepEqual(counts(), { renews: 1, revokes: 1, leaseRenews: 1, leaseReleases: 1 });
-});
-
-test('backend App Server access creates no browser grant or renewal timer', async () => {
-  const { provider, counts } = fakeProvider({
-    getInternalServiceAccess: async () => ({ url: 'http://cellbox.test/v1/boxes/box-1/services/4500/', headers: { Authorization: 'Bearer backend-client' } }),
-    getServiceAccess: async () => { assert.fail('internal connection created a browser grant'); },
-  });
-  const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {} });
-  const endpoint = await runtime.appServer('box-1');
-  assert.equal(endpoint.url, 'ws://cellbox.test/v1/boxes/box-1/services/4500/');
-  assert.deepEqual(endpoint.headers, { Authorization: 'Bearer backend-client' });
-  assert.equal(endpoint.release, undefined);
-  await runtime.close();
-  assert.deepEqual(counts(), { renews: 0, revokes: 0, leaseRenews: 0, leaseReleases: 0 });
+  assert.deepEqual(counts(), { leaseRenews: 1, leaseReleases: 1 });
 });
 
 test('mounted default-workspace initialization skips an empty remote lease; execution and custom setup retain it', async () => {

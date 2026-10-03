@@ -6,13 +6,14 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
-# Existing Secret in the release namespace. Required keys: CELLBOX_API_TOKEN,
-# COCELL_ACCESS_TOKEN, MYSQL_URL, COCELL_SECRET_MASTER_KEY.
+# Existing Secret in the release namespace. Required keys: COCELL_ACCESS_TOKEN, MYSQL_URL, COCELL_SECRET_MASTER_KEY.
 # Optional keys: CODEX_API_KEY, OPENAI_API_KEY.
 existingSecret: ""
 
 cellbox:
   apiUrl: ""
+  # Optional data namespace. Empty uses the Cellbox API's configured default.
+  clientId: ""
   profile: ""
 
 # HTTPS origin (or loopback HTTP origin). It must have no path, query, or hash.

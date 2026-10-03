@@ -73,6 +73,10 @@ spec:
               value: k8s-resumable
             - name: CELLBOX_API_URL
               value: {{ .Values.cellbox.apiUrl | quote }}
+            {{- if .Values.cellbox.clientId }}
+            - name: CELLBOX_CLIENT_ID
+              value: {{ .Values.cellbox.clientId | quote }}
+            {{- end }}
             - name: CELLBOX_PROFILE
               value: {{ .Values.cellbox.profile | quote }}
             - name: COCELL_PUBLIC_URL
@@ -91,11 +95,6 @@ spec:
               value: /etc/co-cell/mounts/mounts.json
             - name: NOTIFICATIONS_DATA_PATH
               value: /app/data/notifications.json
-            - name: CELLBOX_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.existingSecret | quote }}
-                  key: CELLBOX_API_TOKEN
             - name: COCELL_ACCESS_TOKEN
               valueFrom:
                 secretKeyRef:

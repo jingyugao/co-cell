@@ -51,7 +51,7 @@
     },
     "existingSecret": {
       "$ref": "#/definitions/kubernetesName",
-      "description": "Existing Secret in the release namespace with CELLBOX_API_TOKEN, COCELL_ACCESS_TOKEN, and MYSQL_URL."
+      "description": "Existing Secret in the release namespace with COCELL_ACCESS_TOKEN, and MYSQL_URL."
     },
     "cellbox": {
       "type": "object",
@@ -64,6 +64,11 @@
         "apiUrl": {
           "type": "string",
           "pattern": "^https?://[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]{1,5})?/?$"
+        },
+        "clientId": {
+          "type": "string",
+          "pattern": "^([a-zA-Z0-9][a-zA-Z0-9_-]{0,79})?$",
+          "description": "Optional data namespace, not an authentication credential."
         },
         "profile": {
           "type": "string",

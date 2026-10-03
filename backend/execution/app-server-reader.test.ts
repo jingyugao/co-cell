@@ -3,14 +3,15 @@ import test from 'node:test';
 import { AppServerRpcError, CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import { AppServerReader } from './app-server-reader.js';
 
-test('concurrent reads share a connection and grant; idle cleanup never delays results', async t => {
-  let connects = 0, grants = 0, releases = 0;
+test('concurrent reads share a connection; idle cleanup never delays results', async t => {
+  let connects = 0, endpoints = 0, closes = 0;
   let finishCleanup!: () => void;
   const cleanup = new Promise<void>(resolve => { finishCleanup = resolve; });
   t.mock.method(CodexAppServerClient.prototype, 'connect', async () => { connects++; });
+  t.mock.method(CodexAppServerClient.prototype, 'close', async () => { closes++; await cleanup; });
   const reader = new AppServerReader(async () => {
-    grants++;
-    return { url: 'ws://app-server.test', release: async () => { releases++; await cleanup; } };
+    endpoints++;
+    return { url: 'ws://app-server.test' };
   }, error => assert.fail(String(error)), 10);
   try {
     const values = await Promise.all([
@@ -18,21 +19,22 @@ test('concurrent reads share a connection and grant; idle cleanup never delays r
     ]);
     assert.equal(values[0], values[1]);
     assert.equal(connects, 1);
-    assert.equal(grants, 1);
-    assert.equal(releases, 0);
+    assert.equal(endpoints, 1);
+    assert.equal(closes, 0);
     await new Promise(resolve => setTimeout(resolve, 25));
-    assert.equal(releases, 1);
+    assert.equal(closes, 1);
     await reader.read('box-1', async () => 'reconnected after idle');
     assert.equal(connects, 2);
-    assert.equal(grants, 2);
+    assert.equal(endpoints, 2);
   } finally { finishCleanup(); await reader.close(); }
-  assert.equal(releases, 2);
+  assert.equal(closes, 2);
 });
 
 test('RPC errors retain a connection; transport failure retires it without replaying a read', async t => {
-  let connects = 0, releases = 0, calls = 0;
+  let connects = 0, closes = 0, calls = 0;
   t.mock.method(CodexAppServerClient.prototype, 'connect', async () => { connects++; });
-  const reader = new AppServerReader(async () => ({ url: 'ws://app-server.test', release: async () => { releases++; } }),
+  t.mock.method(CodexAppServerClient.prototype, 'close', async () => { closes++; });
+  const reader = new AppServerReader(async () => ({ url: 'ws://app-server.test' }),
     error => assert.fail(String(error)));
   try {
     await assert.rejects(reader.read('box-1', async () => {
@@ -51,6 +53,6 @@ test('RPC errors retain a connection; transport failure retires it without repla
     await reader.read('box-1', async () => 'new connection after remote close');
     assert.equal(connects, 3);
   } finally { await reader.close(); }
-  assert.equal(releases, 3);
+  assert.equal(closes, 3);
   await assert.rejects(reader.read('box-1', async () => undefined), /closed/);
 });

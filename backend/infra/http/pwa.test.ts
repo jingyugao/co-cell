@@ -12,10 +12,7 @@ function setup() {
   const app = new Hono();
   installOperatorAccess(app, {
     publicUrl: origin, token: 'pwa-test-token-with-at-least-32-characters', projects: () => [],
-    provider: {
-      async getAccessRequest() { throw new Error('unused'); },
-      async approveAccessRequest() { throw new Error('unused'); },
-    },
+
   });
   installPwaAssets(app, resolve('public'));
   app.get('/', c => c.text('private workspace'));

@@ -1,4 +1,4 @@
-/** The public Cellbox REST contract. Tokens and grants must stay on the server. */
+/** The internal Cellbox REST contract. Calls require no Cellbox credential. */
 export interface CellboxCapabilities {
   exec: boolean; files: boolean; http: boolean; websocket: boolean;
   pty: boolean; reconnectExec: boolean; freeze: boolean;
@@ -45,7 +45,6 @@ export interface CellboxExecution {
   result?: { stdout: string; stderr: string; exitCode: number; truncated?: boolean };
 }
 export interface CellboxRoute { id: string; boxId: string; port: number; url: string }
-export interface CellboxGrant { id: string; routeId: string; subject: string; expiresAt: string; revoked: boolean }
 export interface CellboxArchive {
   id: string; sourceBoxId: string; profileId: string; imageId: string;
   agent: { uid: number; gid: number }; sha256: string; size: number;
@@ -53,11 +52,6 @@ export interface CellboxArchive {
   portable?: boolean;
 }
 export interface CellboxLease { id: string; boxId: string; purpose: string; expiresAt: string }
-export interface CellboxAccessRequest {
-  id: string; routeId: string; boxId: string; callbackUrl: string;
-  expiresAt: string; approved: boolean; consumed: boolean;
-}
-
 export type CellboxErrorCode =
   | 'INVALID_REQUEST' | 'UNAUTHENTICATED' | 'FORBIDDEN' | 'NOT_FOUND' | 'CONFLICT' | 'BUSY'
   | 'STALE_GENERATION' | 'UNSUPPORTED_CAPABILITY' | 'TIMEOUT' | 'ARCHIVE_INCOMPATIBLE'
@@ -84,21 +78,28 @@ function statusCode(status: number): CellboxErrorCode {
   }
 }
 
-export interface CellboxClientOptions { baseUrl: string; token: string; fetch?: typeof fetch; requestTimeoutMs?: number }
+export interface CellboxClientOptions {
+  baseUrl: string;
+  /** Data/idempotency namespace; defaults to the API's configured clientId. */
+  clientId?: string;
+  fetch?: typeof fetch;
+  requestTimeoutMs?: number;
+}
 
 /** No mutation is retried automatically. A transport failure after submission has an unknown outcome. */
 export class CellboxClient {
   private readonly baseUrl: string;
-  private readonly token: string;
+  private readonly clientId?: string;
   private readonly fetchImpl: typeof fetch;
   private readonly requestTimeoutMs: number;
   constructor(options: CellboxClientOptions) {
     const url = new URL(options.baseUrl);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
       throw new CellboxError('INVALID_REQUEST', 'Cellbox baseUrl must be an HTTP(S) origin or path without credentials');
-    if (!options.token) throw new CellboxError('INVALID_REQUEST', 'Cellbox client token is required');
     this.baseUrl = url.toString().replace(/\/$/, '');
-    this.token = options.token;
+    this.clientId = options.clientId;
+    if (this.clientId !== undefined && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(this.clientId))
+      throw new CellboxError('INVALID_REQUEST', 'Invalid Cellbox client namespace');
     this.fetchImpl = options.fetch ?? fetch;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     if (!Number.isInteger(this.requestTimeoutMs) || this.requestTimeoutMs < 1)
@@ -107,17 +108,20 @@ export class CellboxClient {
   get origin() { return new URL(this.baseUrl).origin; }
   /** Server-side access uses the configured API gateway, independent of public route DNS. */
   serviceUrl(routeId: string) { return `${this.baseUrl}/s/${this.id(routeId)}/`; }
-  /** Operator credentials must stay in the backend; never expose this to browsers. */
+  private clientHeaders(): Record<string, string> {
+    return this.clientId ? { 'X-Cellbox-Client-ID': this.clientId } : {};
+  }
+  /** Direct access needs no route registration, grant, or token. */
   internalService(boxId: string, port: number) {
     if (!Number.isInteger(port) || port < 1 || port > 65535 || port === 40000)
       throw new CellboxError('INVALID_REQUEST', 'Invalid internal service port');
-    return { url: `${this.baseUrl}/v1/boxes/${this.id(boxId)}/services/${port}/`, headers: { Authorization: `Bearer ${this.token}` } };
+    return { url: `${this.baseUrl}/v1/boxes/${this.id(boxId)}/services/${port}/`, headers: this.clientHeaders() };
   }
   private async request<T>(method: string, path: string, options: {
     body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
   } = {}): Promise<T> {
     if (options.signal?.aborted) throw new CellboxError('TRANSPORT', 'Cellbox request was cancelled before submission');
-    const headers = new Headers({ Authorization: `Bearer ${this.token}` });
+    const headers = new Headers(this.clientHeaders());
     if (options.key !== undefined) {
       if (!options.key || options.key.length > 200) throw new CellboxError('INVALID_REQUEST', 'Idempotency key must contain 1..200 characters');
       headers.set('Idempotency-Key', options.key);
@@ -216,7 +220,7 @@ export class CellboxClient {
   getOperation(id: string, signal?: AbortSignal) { return this.request<CellboxOperation>('GET', `/v1/operations/${this.id(id)}`, { signal }); }
   getExec(id: string, signal?: AbortSignal) { return this.request<CellboxExecution>('GET', `/v1/execs/${this.id(id)}`, { signal }); }
   async fileResponse(id: string, path: string, options: { method?: 'GET' | 'HEAD'; headers?: Headers; signal?: AbortSignal } = {}): Promise<Response> {
-    const headers = new Headers({ Authorization: `Bearer ${this.token}`, 'Accept-Encoding': 'identity' });
+    const headers = new Headers({ ...this.clientHeaders(), 'Accept-Encoding': 'identity' });
     for (const name of ['range', 'if-range', 'if-match', 'if-unmodified-since', 'if-none-match', 'if-modified-since']) {
       const value = options.headers?.get(name);
       if (value !== undefined && value !== null) headers.set(name, value);
@@ -274,17 +278,6 @@ export class CellboxClient {
       `/v1/boxes/${this.id(boxId)}/tools/${this.id(tool)}`, { body: { args, timeoutMs }, timeoutMs: timeoutMs + 30_000 });
   }
   createRoute(boxId: string, port: number) { return this.request<CellboxRoute>('POST', '/v1/routes', { body: { boxId, port } }); }
-  createGrant(routeId: string, subject: string, ttlSeconds = 900) {
-    return this.request<{ grant: CellboxGrant; token: string }>('POST', `/v1/routes/${this.id(routeId)}/grants`, { body: { subject, ttlSeconds } });
-  }
-  renewGrant(id: string, ttlSeconds = 900) {
-    return this.request<CellboxGrant>('PATCH', `/v1/grants/${this.id(id)}`, { body: { ttlSeconds } });
-  }
-  revokeGrant(id: string) { return this.request<void>('DELETE', `/v1/grants/${this.id(id)}`, { response: 'empty' }); }
-  getAccessRequest(id: string) { return this.request<CellboxAccessRequest>('GET', `/v1/access-requests/${this.id(id)}`); }
-  approveAccessRequest(id: string, subject: string, ttlSeconds = 900) {
-    return this.request<{ redirectUrl: string }>('POST', `/v1/access-requests/${this.id(id)}:approve`, { body: { subject, ttlSeconds } });
-  }
   createLease(boxId: string, purpose: string, ttlSeconds = 60) {
     return this.request<CellboxLease>('POST', `/v1/boxes/${this.id(boxId)}/leases`, { body: { purpose, ttlSeconds } });
   }

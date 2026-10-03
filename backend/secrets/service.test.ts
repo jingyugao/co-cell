@@ -95,9 +95,7 @@ test('local file provisioning and last commit wins sync do not check current sel
   assert.deepEqual(await service.provision(projectId), []);
   const operatorToken = 'operator-' + 'x'.repeat(32), origin = 'https://cocell.example.test';
   const app = new Hono();
-  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [], provider: {
-    getAccessRequest: async () => { throw Error(); }, approveAccessRequest: async () => { throw Error(); },
-  } });
+  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [] });
   app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'invalid' }, error instanceof HttpError ? error.status as 400 : 400));
   installSecretRoutes(app, service, value => value === projectId);
   const sync = (bearer: string) => app.request(`${origin}/api/tool-runtime/files`, { method: 'POST', headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ tool: 'custom.cli', updates: updates('{"refresh_token":"via-api"}'), exitCode: 0 }) });
@@ -156,9 +154,7 @@ test('internal broker accepts only scoped runtime tokens and cannot access opera
   const { service, projectId } = fixture();
   const operatorToken = 'operator-token-' + 'x'.repeat(32), origin = 'https://cocell.example.test';
   const app = new Hono();
-  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [], provider: {
-    getAccessRequest: async () => { throw Error(); }, approveAccessRequest: async () => { throw Error(); },
-  } });
+  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [] });
   app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'failed' }, error instanceof HttpError ? error.status as 400 : 500));
   installSecretRoutes(app, service, id => id === projectId);
   const token = await service.registerRuntime('box-a', projectId, 1);
@@ -233,9 +229,7 @@ test('selection API accepts only operator access and persists or clears one key 
   const { service, projectId } = fixture();
   const operatorToken = 'operator-' + 'x'.repeat(32), origin = 'https://cocell.example.test';
   const app = new Hono();
-  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [], provider: {
-    getAccessRequest: async () => { throw Error(); }, approveAccessRequest: async () => { throw Error(); },
-  } });
+  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [] });
   app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'invalid' }, error instanceof HttpError ? error.status as 400 : 400));
   installSecretRoutes(app, service, id => id === projectId);
   const create = (body: unknown) => app.request(`${origin}/api/secrets`, { method: 'POST', headers: { Authorization: `Bearer ${operatorToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -319,9 +313,7 @@ test('operator deletion removes history and every project binding while discardi
   const runtime = await repository.runtime('box-a');
   const operatorToken = 'operator-' + 'x'.repeat(32), origin = 'https://cocell.example.test';
   const app = new Hono();
-  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [], provider: {
-    getAccessRequest: async () => { throw Error(); }, approveAccessRequest: async () => { throw Error(); },
-  } });
+  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [] });
   app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'invalid' }, error instanceof HttpError ? error.status as 400 : 400));
   installSecretRoutes(app, service, value => value === projectId || value === otherProject);
   const remove = (bearer: string, id = secret.id) => app.request(`${origin}/api/secrets/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${bearer}` } });

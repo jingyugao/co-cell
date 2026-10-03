@@ -25,12 +25,7 @@ type RunOptions = {
 };
 export interface CellboxServiceAccess {
   url: string;
-  headers: { Authorization: string };
-  routeId: string;
-  grantId: string;
-  expiresAt: string;
-  renew(ttlSeconds?: number): Promise<string>;
-  revoke(): Promise<void>;
+  headers: Record<string, string>;
 }
 
 const inside = (path: string, root: string) => path === root || path.startsWith(`${root}/`);
@@ -284,31 +279,16 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   createLease(boxId: string, purpose: string, ttlSeconds = 60) { return this.client.createLease(boxId, purpose, ttlSeconds); }
   renewLease(id: string, purpose: string, ttlSeconds = 60) { return this.client.renewLease(id, purpose, ttlSeconds); }
   releaseLease(id: string) { return this.client.releaseLease(id); }
-  renewGrant(id: string, ttlSeconds = 900) { return this.client.renewGrant(id, ttlSeconds); }
-  revokeGrant(id: string) { return this.client.revokeGrant(id); }
-  getAccessRequest(id: string) { return this.client.getAccessRequest(id); }
-  approveAccessRequest(id: string, subject: string, ttlSeconds = 900) { return this.client.approveAccessRequest(id, subject, ttlSeconds); }
   private async serviceRoute(id: string, port: number) {
     if (!Number.isInteger(port) || port < 1 || port > 65535 || port === 40000)
       throw new CellboxError('INVALID_REQUEST', 'Service port must be 1..65535 excluding 40000');
     return this.client.createRoute(id, port);
   }
-  /** Backend connections use client authentication; previews still use scoped grants. */
-  async getInternalServiceAccess(id: string, port: number) {
-    await this.ready();
-    return this.profile?.capabilities.internalServices ? this.client.internalService(id, port) : undefined;
+  /** Backend and preview connections both use the direct internal endpoint. */
+  async getServiceAccess(id: string, port: number): Promise<CellboxServiceAccess> {
+    return this.client.internalService(id, port);
   }
-  async getServiceAccess(id: string, port: number, subject: string, ttlSeconds = 900): Promise<CellboxServiceAccess> {
-    if (!subject) throw new CellboxError('INVALID_REQUEST', 'Grant subject is required');
-    const route = await this.serviceRoute(id, port);
-    const { grant, token } = await this.client.createGrant(route.id, subject, ttlSeconds);
-    const access: CellboxServiceAccess = { url: this.client.serviceUrl(route.id), headers: { Authorization: `Bearer ${token}` }, routeId: route.id, grantId: grant.id,
-      expiresAt: grant.expiresAt,
-      renew: async (ttl = 900) => { const refreshed = await this.client.renewGrant(grant.id, ttl); access.expiresAt = refreshed.expiresAt; return access.expiresAt; },
-      revoke: () => this.client.revokeGrant(grant.id) };
-    return access;
-  }
-  private handle(box: CellboxBox): SandboxHandle & { getServiceAccess(port: number, subject: string, ttlSeconds?: number): Promise<CellboxServiceAccess> } {
+  private handle(box: CellboxBox): SandboxHandle & { getServiceAccess(port: number): Promise<CellboxServiceAccess> } {
     const id = box.id;
     const workspace = box.workspace;
     let commandTimeout = 30_000;
@@ -370,7 +350,7 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     };
     return { sandboxId: id, getHost: () => new URL(this.client.origin).hostname,
       getServiceUrl: async port => (await this.serviceRoute(id, port)).url,
-      getServiceAccess: (port, subject, ttlSeconds) => this.getServiceAccess(id, port, subject, ttlSeconds),
+      getServiceAccess: port => this.getServiceAccess(id, port),
       setTimeout: async timeoutMs => { if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new CellboxError('INVALID_REQUEST', 'Timeout must be positive'); commandTimeout = Math.min(timeoutMs, 300_000); },
       commands: { run: execute as SandboxHandle['commands']['run'] },
       files: {

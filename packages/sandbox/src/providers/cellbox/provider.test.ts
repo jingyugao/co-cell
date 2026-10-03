@@ -14,10 +14,10 @@ const capabilities = { exec: true, files: true, http: true, websocket: true, pty
 test('file transport streams ranges and preserves HTTP statuses without forwarding browser credentials', async () => {
   for (const status of [206, 304, 412, 416]) {
     let cancelled = false;
-    const client = new CellboxClient({ baseUrl: 'http://cellbox.test', token: 'operator-token', fetch: async (input, init) => {
+    const client = new CellboxClient({ baseUrl: 'http://cellbox.test', fetch: async (input, init) => {
       assert.match(String(input), /files\?path=source%2Ffile.txt$/);
       const headers = new Headers(init?.headers);
-      assert.equal(headers.get('authorization'), 'Bearer operator-token');
+      assert.equal(headers.get('authorization'), null);
       assert.equal(headers.get('cookie'), null);
       assert.equal(headers.get('accept-encoding'), 'identity');
       assert.equal(headers.get('range'), 'bytes=0-4');
@@ -58,7 +58,7 @@ async function fixture() {
       createdAt: new Date().toISOString(), result });
   const operations = new Map<string, ReturnType<typeof op>>();
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
-    if (req.headers.authorization !== 'Bearer test-client-token') { json(res, 401, { error: { code: 'UNAUTHENTICATED', message: 'Invalid token' } }); return; }
+    assert.equal(req.headers.authorization, undefined, 'Cellbox requests must not need a token');
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
     const raw = Buffer.concat(chunks).toString();
@@ -117,14 +117,6 @@ async function fixture() {
     if (url.pathname.endsWith('/credentials/glab_token') && req.method === 'PUT') { res.writeHead(204); res.end(); return; }
     if (url.pathname === '/v1/routes') { json(res, 201, { id: 'route-1', boxId: (body as { boxId: string }).boxId,
       port: (body as { port: number }).port, url: 'https://route-1.example.test/' }); return; }
-    if (url.pathname === '/v1/routes/route-1/grants') { json(res, 201, { grant: { id: 'grant-1', routeId: 'route-1',
-      subject: (body as { subject: string }).subject, expiresAt: new Date(Date.now() + 30_000).toISOString(), revoked: false },
-      token: 'grant-secret' }); return; }
-    if (url.pathname === '/v1/grants/grant-1' && req.method === 'PATCH') {
-      json(res, 200, { id: 'grant-1', routeId: 'route-1', subject: 'product-user',
-        expiresAt: new Date(Date.now() + 60_000).toISOString(), revoked: false }); return;
-    }
-    if (url.pathname === '/v1/grants/grant-1') { res.writeHead(204); res.end(); return; }
     if (url.pathname === '/v1/archives/archive-1/content') {
       res.writeHead(200, { 'Content-Type': 'application/gzip' }); res.write('abc'); res.end('def'); return;
     }
@@ -150,7 +142,7 @@ async function fixture() {
 test('inventory combines active boxes and paused checkpoints, preferring the active record', async () => {
   const http = await fixture();
   try {
-    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s' });
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
     const box = (id: string, phase: string, image: string) => ({ id, ownerKey: 'owner', profileId: 'k8s', phase,
       generation: 1, resourceVersion: 1, image, workspace: '/workspace', capabilities,
       createdAt: '2026-10-01T00:00:00.000Z' });
@@ -171,7 +163,7 @@ test('inventory combines active boxes and paused checkpoints, preferring the act
 test('batch status reads one resource inventory without per-box or checkpoint requests', async () => {
   const http = await fixture();
   try {
-    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s' });
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
     await provider.initialize();
     const box = (id: string, phase: string) => ({ id, ownerKey: 'owner', profileId: 'k8s', phase,
       generation: 1, resourceVersion: 1, image: 'prepared:1', workspace: '/workspace', capabilities,
@@ -195,13 +187,13 @@ test('batch status reads one resource inventory without per-box or checkpoint re
   } finally { await http.close(); }
 });
 
-test('auth, Kubernetes profile validation, and durable create key adoption', async () => {
+test('anonymous access, Kubernetes profile validation, and durable create key adoption', async () => {
   const http = await fixture();
   const stateDirectory = await mkdtemp(join(tmpdir(), 'cellbox-adapter-'));
   try {
-    const bad = new CellboxClient({ baseUrl: http.baseUrl, token: 'wrong' });
-    await assert.rejects(bad.listProfiles(), (error: unknown) => error instanceof CellboxError && error.code === 'UNAUTHENTICATED');
-    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s',
+    const anonymous = new CellboxClient({ baseUrl: http.baseUrl });
+    assert.equal((await anonymous.listProfiles()).length, 1);
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s',
       workspace: '/workspace', stateDirectory, pollIntervalMs: 1 });
     http.setProfileProvider('docker');
     await assert.rejects(provider.initialize(), (error: unknown) => error instanceof CellboxError && error.code === 'UNSUPPORTED_CAPABILITY');
@@ -247,7 +239,7 @@ test('auth, Kubernetes profile validation, and durable create key adoption', asy
 test('exec checks generation, shell quotes outside-workspace paths, and does not offer cancellation', async () => {
   const http = await fixture();
   try {
-    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s', pollIntervalMs: 1 });
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s', pollIntervalMs: 1 });
     const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
       metadata: { cellboxOwnerKey: 'p', cellboxIdempotencyKey: 'create-p' } });
     await box.commands.run('printf hello', { idempotencyKey: 'exec-one', cwd: '/workspace/source' } as never);
@@ -285,19 +277,19 @@ test('exec checks generation, shell quotes outside-workspace paths, and does not
     assert.equal((await provider.getInfo(box.sandboxId)).state, 'running');
     await provider.pause(box.sandboxId);
     await provider.connect(box.sandboxId);
-    const access = await provider.getServiceAccess(box.sandboxId, 3000, 'product-user', 60);
-    assert.equal(access.url, `${http.baseUrl}/s/route-1/`);
+    const beforeAccess = http.calls.length;
+    const access = await provider.getServiceAccess(box.sandboxId, 3000);
+    assert.equal(http.calls.length, beforeAccess, 'preview access requires no route or grant API calls');
+    assert.equal(access.url, `${http.baseUrl}/v1/boxes/${box.sandboxId}/services/3000/`);
     assert.equal(await box.getServiceUrl!(3000), 'https://route-1.example.test/');
-    assert.equal(access.headers.Authorization, 'Bearer grant-secret');
-    assert.match(await access.renew(60), /^\d{4}-/);
-    await access.revoke();
-    assert(http.calls.some(call => call.path === '/v1/grants/grant-1' && call.method === 'DELETE'));
+    assert.deepEqual(access.headers, {});
+    assert(!http.calls.some(call => call.path.includes('/grants')), 'preview access must not create or renew grants');
   } finally { await http.close(); }
 });
 
 test('a lost mutation response reports unknown outcome without replay', async () => {
   let requests = 0;
-  const client = new CellboxClient({ baseUrl: 'http://127.0.0.1:1', token: 'secret',
+  const client = new CellboxClient({ baseUrl: 'http://127.0.0.1:1',
     fetch: async () => { requests++; throw new Error('socket reset'); } });
   await assert.rejects(client.createBox({ profileId: 'k8s', ownerKey: 'p' }, 'durable-key'),
     (error: unknown) => error instanceof CellboxError && error.code === 'UNKNOWN_OUTCOME' && error.idempotencyKey === 'durable-key');
@@ -305,7 +297,7 @@ test('a lost mutation response reports unknown outcome without replay', async ()
 });
 
 test('admitted tool HTTP deadline covers its execution timeout', async () => {
-  const client = new CellboxClient({ baseUrl: 'http://127.0.0.1:1', token: 'secret', requestTimeoutMs: 1,
+  const client = new CellboxClient({ baseUrl: 'http://127.0.0.1:1', requestTimeoutMs: 1,
     fetch: async (_input, init) => {
       await new Promise(resolve => setTimeout(resolve, 10));
       assert.equal(init?.signal?.aborted, false);
@@ -315,11 +307,11 @@ test('admitted tool HTTP deadline covers its execution timeout', async () => {
 });
 
 test('malformed mutation responses preserve uncertain outcomes and HTTP errors retain codes', async () => {
-  const broken = new CellboxClient({ baseUrl: 'http://127.0.0.1:1', token: 'secret',
+  const broken = new CellboxClient({ baseUrl: 'http://127.0.0.1:1',
     fetch: async () => new Response('{', { status: 202, headers: { 'Content-Type': 'application/json' } }) });
   await assert.rejects(broken.createBox({ profileId: 'k8s', ownerKey: 'p' }, 'same-key'),
     (error: unknown) => error instanceof CellboxError && error.code === 'UNKNOWN_OUTCOME' && error.idempotencyKey === 'same-key');
-  const conflict = new CellboxClient({ baseUrl: 'http://127.0.0.1:1', token: 'secret',
+  const conflict = new CellboxClient({ baseUrl: 'http://127.0.0.1:1',
     fetch: async () => new Response('broken', { status: 409 }) });
   await assert.rejects(conflict.createBox({ profileId: 'k8s', ownerKey: 'p' }, 'same-key'),
     (error: unknown) => error instanceof CellboxError && error.code === 'CONFLICT' && error.status === 409);
@@ -330,7 +322,7 @@ test('create reuses a journaled key after the HTTP response is lost', async () =
   const stateDirectory = await mkdtemp(join(tmpdir(), 'cellbox-lost-create-'));
   try {
     let dropped = false;
-    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s',
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s',
       stateDirectory, fetch: async (input, init) => {
         const response = await fetch(input, init);
         if (!dropped && init?.method === 'POST' && String(input).endsWith('/v1/boxes')) {
@@ -342,7 +334,7 @@ test('create reuses a journaled key after the HTTP response is lost', async () =
       metadata: { sessionId: 'lost-response' } };
     await assert.rejects(provider.create('k8s', options),
       (error: unknown) => error instanceof CellboxError && error.code === 'UNKNOWN_OUTCOME');
-    const restarted = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s', stateDirectory });
+    const restarted = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s', stateDirectory });
     const recovered = await restarted.create('k8s', options);
     assert(http.boxes.has(recovered.sandboxId));
     assert.equal(http.keys.size, 1);
@@ -355,7 +347,7 @@ test('create reuses a journaled key after the HTTP response is lost', async () =
 test('exec distinguishes a nonzero exit, timeout, and incomplete output', async () => {
   const http = await fixture();
   try {
-    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s' });
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
     const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
       metadata: { cellboxOwnerKey: 'p', cellboxIdempotencyKey: 'create-p' } });
     http.setExecResult({ stdout: '', stderr: 'bad', exitCode: 7, truncated: false });
@@ -377,7 +369,7 @@ test('exec distinguishes a nonzero exit, timeout, and incomplete output', async 
 test('archive downloads enforce the streamed byte cap', async () => {
   const http = await fixture();
   try {
-    const client = new CellboxClient({ baseUrl: http.baseUrl, token: 'test-client-token' });
+    const client = new CellboxClient({ baseUrl: http.baseUrl });
     await assert.rejects(client.downloadArchive('archive-1', 4),
       (error: unknown) => error instanceof CellboxError && error.code === 'INVALID_REQUEST');
   } finally { await http.close(); }
@@ -386,7 +378,7 @@ test('archive downloads enforce the streamed byte cap', async () => {
 test('native file reads preserve binary bytes and reject external paths without exec fallback', async () => {
   const http = await fixture();
   try {
-    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, token: 'test-client-token', profileId: 'k8s', pollIntervalMs: 1 });
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s', pollIntervalMs: 1 });
     const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
       metadata: { cellboxOwnerKey: 'p', cellboxIdempotencyKey: 'native-file-test' } });
     const contents = Buffer.from([0, 0xff, 0xfe, 0x80]);

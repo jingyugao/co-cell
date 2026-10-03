@@ -216,17 +216,10 @@ export class CellboxRuntimeIntegration {
             () => handle.commands.run(`${node} -e ${q(script)}`, { user: 'agent', signal, timeoutMs: 30000 }));
     }
     async appServer(boxId: string): Promise<AppServerEndpoint> {
-        const internal = await this.options.provider.getInternalServiceAccess(boxId, 4500);
-        if (internal) {
-            const url = new URL(internal.url);
-            url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-            return { url: url.href, headers: internal.headers };
-        }
-        const access = await this.options.provider.getServiceAccess(boxId, 4500, 'cocell-app-server', 180);
-        const release = this.keepAlive(() => access.renew(180).then(() => { }), () => access.revoke());
+        const access = await this.options.provider.getServiceAccess(boxId, 4500);
         const url = new URL(access.url);
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-        return { url: url.href, headers: access.headers, release };
+        return { url: url.href, headers: access.headers };
     }
     async acquireUsage(boxId: string, initializationDirectory?: string): Promise<() => Promise<void>> {
         // Mounted default-workspace initialization does no remote I/O. The
@@ -265,7 +258,6 @@ export class CellboxRuntimeIntegration {
     }
     finally {
         await client?.close();
-        await endpoint.release?.();
     } }); }
     async close() {
         await Promise.allSettled([...this.releases].map(release => release()));

@@ -1,6 +1,6 @@
 # Example only. Replace the Docker Hub account, image version, URLs, and profile.
 # Supply the named Secrets separately; credentials must never go in this file.
-# The runtime Secret must contain CELLBOX_API_TOKEN, COCELL_ACCESS_TOKEN,
+# The runtime Secret must contain COCELL_ACCESS_TOKEN,
 # and MYSQL_URL for the application to start.
 image:
   repository: docker.io/your-dockerhub-account/co-cell

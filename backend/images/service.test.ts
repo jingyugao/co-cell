@@ -22,7 +22,7 @@ function fixture() {
   let rejectDeletion = false;
   const store = { listImages: async () => structuredClone([...documents.values()]),
     saveImage: async (image: ImageRecord) => { documents.set(image.id, structuredClone(image)); } };
-  const client = new CellboxClient({ baseUrl: 'http://cellbox.test', token: 'server-token', fetch: async (input, init) => {
+  const client = new CellboxClient({ baseUrl: 'http://cellbox.test', fetch: async (input, init) => {
     const path = new URL(String(input)).pathname;
     const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200 });
     if (path === '/v1/profiles') return json([{ id: 'cocell', image: 'registry/default@sha256:default' }]);

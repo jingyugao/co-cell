@@ -11,26 +11,11 @@ const PREVIEW_COOKIE = 'cocell_preview';
 const MAX_LOGIN_BYTES = 4096;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_RENEW_INTERVAL_MS = 24 * 60 * 60 * 1000;
-const REQUEST_ID = /^[A-Za-z0-9_-]{1,200}$/;
-
-interface AccessRequest {
-  id: string;
-  boxId: string;
-  callbackUrl: string;
-  expiresAt: string;
-  approved: boolean;
-  consumed: boolean;
-}
-
 export interface OperatorAccessOptions {
   token: string;
   publicUrl: string;
   previewSubdomains?: boolean;
   serviceProxy?: (projectId: string, port: number, path: string, request: Request) => Promise<Response>;
-  provider: {
-    getAccessRequest(id: string): Promise<AccessRequest>;
-    approveAccessRequest(id: string, subject: string): Promise<{ redirectUrl: string }>;
-  };
   projects: () => Array<{
     id: string;
     executionMode: string;
@@ -100,11 +85,6 @@ function safeReturnPath(input: string | null, publicOrigin: string): string {
   try { url = new URL(input, publicOrigin); } catch { return '/'; }
   if (url.origin !== publicOrigin || url.hash) return '/';
   if (url.pathname === '/auth/login') return '/';
-  if (url.pathname === '/api/cellbox/authorize') {
-    const ids = url.searchParams.getAll('request_id');
-    if (ids.length !== 1 || !REQUEST_ID.test(ids[0])) return '/';
-    return `/api/cellbox/authorize?request_id=${encodeURIComponent(ids[0])}`;
-  }
   return url.pathname;
 }
 
@@ -123,14 +103,6 @@ function safeLoginTarget(input: string | null, publicOrigin: string,
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
-}
-
-function callbackUrl(value: string): URL | null {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== 'https:' || url.username || url.password || url.hash) return null;
-    return url;
-  } catch { return null; }
 }
 
 export function installOperatorAccess(app: Hono, options: OperatorAccessOptions): void {
@@ -223,7 +195,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
         const target = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, resolvePreviewHost);
         return c.redirect(`/auth/login?next=${encodeURIComponent(target)}`, 303);
       }
-      if (path.startsWith('/api/') && path !== '/api/cellbox/authorize') {
+      if (path.startsWith('/api/')) {
         return c.json({ error: 'Authentication required' }, 401);
       }
       const requested = new URL(c.req.url);
@@ -291,58 +263,5 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     setSessionCookie(c, 'preview');
     c.header('Cache-Control', 'no-store');
     return c.redirect(target, 303);
-  });
-
-  app.use('/api/cellbox/authorize', bodyLimit({
-    maxSize: MAX_LOGIN_BYTES,
-    onError: c => c.text('Request too large', 413)
-  }));
-  const pendingAccess = async (c: Context, id: string) => {
-    let access: AccessRequest;
-    try { access = await options.provider.getAccessRequest(id); }
-    catch { return { error: c.text('Access request unavailable', 502) }; }
-    if (access.id !== id || access.approved || access.consumed ||
-      !Number.isFinite(Date.parse(access.expiresAt)) || Date.parse(access.expiresAt) <= Date.now()) {
-      return { error: c.text('Access request unavailable', 409) };
-    }
-    const project = options.projects().find(project => project.executionMode === 'sandbox' &&
-      project.status !== 'archived' && project.status !== 'deleted' &&
-      project.sandbox?.id === access.boxId);
-    if (!project) return { error: c.text('Access request denied', 403) };
-    const callback = callbackUrl(access.callbackUrl);
-    if (!callback) return { error: c.text('Invalid access callback', 502) };
-    return { callback, project };
-  };
-
-  app.get('/api/cellbox/authorize', async c => {
-    const ids = new URL(c.req.url).searchParams.getAll('request_id');
-    if (ids.length !== 1 || !REQUEST_ID.test(ids[0])) return c.text('Invalid access request', 400);
-    const pending = await pendingAccess(c, ids[0]);
-    if ('error' in pending) return pending.error;
-    c.header('Cache-Control', 'no-store');
-    c.header('Content-Security-Policy', "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
-    return c.html(`<!doctype html><html><head><meta charset="utf-8"><title>CoCell access request</title></head><body><main><h1>Approve Sandbox access?</h1><p>Project: ${escapeHtml(pending.project.id)}</p><p>Destination: ${escapeHtml(pending.callback.host)}</p><form method="post" action="/api/cellbox/authorize"><input type="hidden" name="request_id" value="${escapeHtml(ids[0])}"><button type="submit">Approve access</button></form></main></body></html>`);
-  });
-
-  app.post('/api/cellbox/authorize', async c => {
-    if (c.req.header('origin') !== origin) return c.text('Invalid origin', 403);
-    if (!(c.req.header('content-type') ?? '').toLowerCase().startsWith('application/x-www-form-urlencoded')) {
-      return c.text('Unsupported content type', 415);
-    }
-    const body = await c.req.raw.text();
-    if (Buffer.byteLength(body) > MAX_LOGIN_BYTES) return c.text('Request too large', 413);
-    const ids = new URLSearchParams(body).getAll('request_id');
-    if (ids.length !== 1 || !REQUEST_ID.test(ids[0])) return c.text('Invalid access request', 400);
-    const pending = await pendingAccess(c, ids[0]);
-    if ('error' in pending) return pending.error;
-    let approved: { redirectUrl: string };
-    try { approved = await options.provider.approveAccessRequest(ids[0], 'operator'); }
-    catch { return c.text('Access approval failed', 502); }
-    const redirect = callbackUrl(approved.redirectUrl);
-    if (!redirect || redirect.origin !== pending.callback.origin || redirect.pathname !== pending.callback.pathname) {
-      return c.text('Invalid access callback', 502);
-    }
-    c.header('Cache-Control', 'no-store');
-    return c.redirect(redirect.href, 303);
   });
 }

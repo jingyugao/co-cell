@@ -21,8 +21,9 @@ test('history and descendant transcripts use only a shared App Server connection
     startedAt: target.updatedAt, createdAt: target.updatedAt, archivedAt: null, turns: [],
     settings: { ...target.settings, executionMode: 'sandbox', model: 'test', modelReasoningEffort: 'low',
       sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: false } };
-  let connects = 0, grants = 0, releases = 0, historyPages = 0;
+  let connects = 0, endpoints = 0, closes = 0, historyPages = 0;
   t.mock.method(CodexAppServerClient.prototype, 'connect', async () => { connects++; });
+  t.mock.method(CodexAppServerClient.prototype, 'close', async () => { closes++; });
   const child = (id: string, parent: string, depth: number, createdAt: number) => ({ id, createdAt,
     source: { subAgent: { thread_spawn: { parent_thread_id: parent, agent_path: `/root/${id}`,
       agent_nickname: `${id}-nickname`, depth } } } });
@@ -54,7 +55,7 @@ test('history and descendant transcripts use only a shared App Server connection
   const runtime = new ContainerCodexRuntime({ paths: runtimePaths, sandboxes: projects, provider, apiKey: '',
     prepareRemote: async () => { assert.fail('reads must not prepare the Sandbox'); },
     acquireRemoteUsage: async () => { assert.fail('reads must not lease the Sandbox'); },
-    appServer: async () => { grants++; return { url: 'ws://app-server.test', release: async () => { releases++; } }; } });
+    appServer: async () => { endpoints++; return { url: 'ws://app-server.test' }; } });
   try {
     const [history, agents] = await Promise.all([runtime.history(session, { cursor: 'older' }), runtime.subagents(session)]);
     assert.equal(history.nextCursor, 'even-older');
@@ -65,11 +66,11 @@ test('history and descendant transcripts use only a shared App Server connection
     assert.equal(agents[0].nickname, 'child-nickname');
     assert(agents.every(agent => agent.turns.every(turn => turn.prompt === '' && turn.items[0].type === 'agent_message')));
     assert.equal(connects, 1);
-    assert.equal(grants, 1);
-    assert.equal(releases, 0);
+    assert.equal(endpoints, 1);
+    assert.equal(closes, 0);
     assert.deepEqual(counts, { create: 0, connect: 0, kill: 0, renew: 0 });
   } finally { await runtime.close(); await manager.close(); }
-  assert.equal(releases, 1);
+  assert.equal(closes, 1);
 });
 
 function fixture() {

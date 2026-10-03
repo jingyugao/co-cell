@@ -15,10 +15,7 @@ test('Cellbox mode protects existing API routes, accepts its HTTPS origin, and d
     ['localhost:3000', 'cocell.example.test'], { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },
     undefined, undefined, undefined, {
       token, publicUrl, projects: () => [],
-      provider: {
-        async getAccessRequest() { throw new Error('unused'); },
-        async approveAccessRequest() { throw new Error('unused'); },
-      },
+
     });
   assert.equal((await app.request(`${publicUrl}/api/config`)).status, 401);
   assert.equal((await app.request(`${publicUrl}/api/config`, { headers: {
@@ -61,10 +58,7 @@ test('Cellbox service preview requires operator access and isolates sandbox head
     ['cocell.example.test'], { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },
     undefined, undefined, undefined, {
       token, publicUrl, projects: () => [],
-      provider: {
-        async getAccessRequest() { throw new Error('unused'); },
-        async approveAccessRequest() { throw new Error('unused'); },
-      },
+
     });
   const path = `${publicUrl}/api/projects/${projectId}/service/8765/verify.txt?check=1`;
   assert.equal((await app.request(path)).status, 401);
@@ -95,10 +89,7 @@ test('preview subdomain routes a signed project and port and grants browser acce
     ['cocell.example.test'], { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },
     undefined, undefined, undefined, { token, publicUrl, previewSubdomains: true,
       projects: () => [{ id: projectId, executionMode: 'sandbox', sandbox: { id: 'box-1' }, status: 'active' }],
-      provider: {
-        async getAccessRequest() { throw new Error('unused'); },
-        async approveAccessRequest() { throw new Error('unused'); },
-      },
+
     });
   const link = await app.request(`${publicUrl}/api/projects/${projectId}/preview?url=http%3A%2F%2Flocalhost%3A8765%2Fverify.txt%3Fcheck%3D1`,
     { headers: { authorization: `Bearer ${token}` } });

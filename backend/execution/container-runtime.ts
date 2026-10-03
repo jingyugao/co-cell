@@ -49,7 +49,6 @@ export interface SandboxRuntime {
   close(): Promise<void>;
 }
 export type { AppServerEndpoint } from './app-server-reader.js';
-const endpointHeaders = (endpoint: AppServerEndpoint) => endpoint.headers ?? (endpoint.token ? { Authorization: 'Bearer ' + endpoint.token } : {});
 export interface ContainerRuntimeOptions {
   paths: { root: string; runtime: string; codexHome: string; node: string };
   prepareRemote: (sandbox: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal) => Promise<boolean>;
@@ -135,15 +134,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     let message = error instanceof Error ? error.message : String(error);
     if (this.options.apiKey) message = message.replaceAll(this.options.apiKey, '[REDACTED]');
     return new Error(message);
-  }
-
-  private async releaseEndpoint(endpoint?: AppServerEndpoint) {
-    try { await endpoint?.release?.(); }
-    catch (error) {
-      // The grant also expires remotely; cleanup failure must not lose the
-      // execution result or prevent releasing the local sandbox usage.
-      void this.options.logger?.write({ event: 'sandbox.access_release_failed', error: this.safeError(error).message });
-    }
   }
 
   private async acquire(target: WorkspaceTarget, create: boolean, notify?: SaveSandbox, usageId?: string, signal?: AbortSignal, initialization = false): Promise<Entry> {
@@ -266,7 +256,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const startupSignal = AbortSignal.any([signal, observer.signal]);
     let entry: Entry | undefined;
     let codex: Codex | undefined;
-    let endpoint: AppServerEndpoint | undefined;
     let failed = false;
     let detached = false;
     try {
@@ -274,7 +263,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       // Publish the global AGENTS.md and shared docs before every turn.
       await this.prepareEnvironment(session, entry, startupSignal);
       observer.signal.throwIfAborted();
-      endpoint = await this.options.appServer(entry.metadata.id);
+      const endpoint = await this.options.appServer(entry.metadata.id);
       const images: string[] = [];
       if (turn.images.length) {
         await entry.sandbox.commands.run(`mkdir -p ${quote(`${this.root}/images`)}`, { user: 'user', timeoutMs: 30_000 });
@@ -286,7 +275,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       }
       codex = new Codex({ apiKey: this.options.apiKey, baseUrl: this.options.baseUrl, config: this.options.modelConfig,
         configOverrides: this.options.configOverrides, appServerUrl: endpoint.url,
-        appServerHeaders: endpointHeaders(endpoint) });
+        appServerHeaders: endpoint.headers });
       this.appServerObservers.set(turn.id, codex);
       observer.signal.throwIfAborted();
       const options = { workingDirectory: session.settings.workingDirectory, ...(session.settings.model ? { model: session.settings.model } : {}),
@@ -307,7 +296,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       if (this.appServerObservers.get(turn.id) === codex) this.appServerObservers.delete(turn.id);
       this.detachRequests.delete(turn.id);
       await codex?.close();
-      await this.releaseEndpoint(endpoint);
       if (entry) await this.release(entry, failed, detached);
     }
   }
@@ -355,7 +343,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const observerSignal = AbortSignal.any([signal, detached.signal]);
     let entry: Entry | undefined;
     let client: CodexAppServerClient | undefined;
-    let endpoint: AppServerEndpoint | undefined;
     let observerDetached = false;
     let failed = false;
     let interruptSent = false;
@@ -369,8 +356,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     };
     try {
       entry = await this.acquire(session, false, onSandbox, turn.id, observerSignal);
-      endpoint = await this.options.appServer(entry.metadata.id);
-      client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: endpointHeaders(endpoint), requestTimeoutMs: 120_000 });
+      const endpoint = await this.options.appServer(entry.metadata.id);
+      client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: endpoint.headers, requestTimeoutMs: 120_000 });
       this.appServerObservers.set(turn.id, client);
       signal.addEventListener('abort', interrupt, { once: true });
       if (signal.aborted) interrupt();
@@ -420,7 +407,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       signal.removeEventListener('abort', interrupt);
       this.detachRequests.delete(turn.id);
       await client?.close();
-      await this.releaseEndpoint(endpoint);
       if (entry) await this.release(entry, failed, observerDetached);
     }
   }
@@ -438,17 +424,14 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async service(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response> {
     if (!this.options.serviceAccess) throw new HttpError(503, 'Sandbox 服务代理未配置');
     const entry = await this.acquire(session, false);
-    let access: CellboxServiceAccess | undefined;
     let released = false;
     const release = async () => {
       if (released) return;
       released = true;
-      try { await access?.revoke(); }
-      catch (error) { void this.options.logger?.write({ event: 'sandbox.access_release_failed', error: this.safeError(error).message }); }
       await this.release(entry, true);
     };
     try {
-      access = await this.options.serviceAccess(entry.sandbox.sandboxId, port);
+      const access = await this.options.serviceAccess(entry.sandbox.sandboxId, port);
       const headers = new Headers(access.headers);
       for (const name of ['accept', 'accept-language', 'content-type', 'range', 'if-none-match', 'if-modified-since']) {
         const value = request.headers.get(name);
@@ -659,11 +642,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (!threadIds.length) return;
     if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
     const endpoint = await this.options.appServer(sandbox.id);
-    const client = new CodexAppServerClient({ url: endpoint.url, headers: endpointHeaders(endpoint), requestTimeoutMs: 10_000 });
+    const client = new CodexAppServerClient({ url: endpoint.url, headers: endpoint.headers, requestTimeoutMs: 10_000 });
     try {
       await client.connect();
       for (const threadId of [...new Set(threadIds)].slice(0, 3)) await client.request('thread/read', { threadId, includeTurns: true });
-    } finally { try { await client.close(); } finally { await this.releaseEndpoint(endpoint); } }
+    } finally { await client.close(); }
   }
 
   private async verifySandboxOnce(sandbox: SandboxState, timeoutMs: number) {
@@ -677,14 +660,14 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     }
     if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
     const endpoint = await this.options.appServer(sandbox.id);
-    const client = new CodexAppServerClient({ url: endpoint.url, headers: endpointHeaders(endpoint), requestTimeoutMs: timeoutMs });
+    const client = new CodexAppServerClient({ url: endpoint.url, headers: endpoint.headers, requestTimeoutMs: timeoutMs });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
         client.connect(), // connect includes a real initialize RPC and protocol validation.
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new HttpError(502, 'Sandbox 服务验证超时')), timeoutMs); }),
       ]);
-    } finally { if (timer) clearTimeout(timer); try { await client.close(); } finally { await this.releaseEndpoint(endpoint); } }
+    } finally { if (timer) clearTimeout(timer); await client.close(); }
     sandbox.status = 'ready';
     sandbox.image = info.templateIdentity;
   }

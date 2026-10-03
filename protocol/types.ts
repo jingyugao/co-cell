@@ -239,6 +239,8 @@ export interface SandboxInventory {
   sandboxes: SandboxRecord[];
 }
 export interface AppConfig {
+  /** Models discovered from the configured upstream, when available. */
+  models?: string[];
   localWorkingDirectory?: string;
   sandbox?: {
     provider?: 'cellbox';

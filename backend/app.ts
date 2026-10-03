@@ -22,6 +22,7 @@ import { installOperatorAccess, type OperatorAccessOptions } from './access/oper
 import { proxyProjectService } from './projects/routes.js';
 import type { SecretService } from './secrets/service.js';
 import { installSecretRoutes } from './secrets/routes.js';
+import { installPwaAssets } from './infra/http/pwa.js';
 
 export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService) {
   const app = new Hono();
@@ -30,6 +31,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
     serviceProxy: (projectId, port, path, request) =>
       proxyProjectService(manager, projectId, port, path, request, '', true),
   });
+  installPwaAssets(app);
 
   app.use('/api/*', async (c, next) => {
     const host = c.req.header('host');

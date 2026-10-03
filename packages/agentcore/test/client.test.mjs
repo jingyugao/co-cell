@@ -70,3 +70,11 @@ test('facade captures events arriving before turn/start response and resumes sam
   assert.equal(resumed.id, thread.id);
  } finally { await codex.close(); await rm(directory, { recursive: true, force: true }); }
 });
+test('native async questions survive live events and history conversion', () => {
+ const adapter = new AppServerEventAdapter();
+ const native = { type: 'agentMessage', id: 'call_native', text: '继续吗？', delivery: 'async', questions: [{ title: '继续吗？', options: ['继续', '停止'] }] };
+ const event = adapter.accept({ method: 'item/completed', params: { item: native } })[0];
+ assert.equal(event.item.delivery, 'async');
+ assert.deepEqual(event.item.questions, native.questions);
+ assert.deepEqual(new AppServerEventAdapter().convert(native), event.item);
+});

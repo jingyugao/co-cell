@@ -23,7 +23,7 @@ import { MODEL_TOKEN_RATES } from '../../util/model-costs.js';
 import type { ImageCatalog } from '../images/service.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
-import type { UserInputQuestion, UserInputRequest } from '../../protocol/user-input-types.js';
+import { withNativeUserInput } from '../../util/user-input.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -283,23 +283,24 @@ export class SessionManager {
     void running.catch(error => console.error('Session persistence failed:', error instanceof Error ? error.message : 'unknown error'));
   }
 
-  async requestUserInput(id: string, turnId: string, projectId: string | null, requestId: string, questions: UserInputQuestion[]): Promise<UserInputRequest> {
+  async answerUserInput(id: string, turnId: string, requestId: string, answer: string, answers?: string[]): Promise<Session> {
     const session = this.lookup(id);
-    if ((session.projectId ?? null) !== projectId) throw new HttpError(403, '提问来源项目不匹配');
-    const turn = session.turns.find(item => item.id === turnId);
-    if (!turn || this.active.get(id)?.turnId !== turnId || turn.status !== 'running') throw new HttpError(409, '来源任务已结束，不能发送问题');
-    const existing = turn.userInputRequests?.find(item => item.id === requestId);
-    if (existing) return structuredClone(existing);
-    const request: UserInputRequest = { id: requestId, questions, status: 'pending', createdAt: new Date().toISOString() };
-    (turn.userInputRequests ??= []).push(request); session.updatedAt = request.createdAt;
-    await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
-    return structuredClone(request);
-  }
-
-  async answerUserInput(id: string, turnId: string, requestId: string, answer: string): Promise<Session> {
-    const session = this.lookup(id); const request = session.turns.find(turn => turn.id === turnId)?.userInputRequests?.find(item => item.id === requestId);
+    const history = await this.read(id);
+    const source = history.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId);
+    if (source) {
+      const index = session.turns.findIndex(turn => turn.id === source.id || turn.nativeTurnId === source.id);
+      if (index >= 0) {
+        const current = session.turns[index];
+        const requests = source.userInputRequests?.map(request => current.userInputRequests?.find(old => old.id === request.id) ?? request);
+        current.userInputRequests = requests;
+      } else session.turns.push(source);
+    }
+    const request = session.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId)?.userInputRequests?.find(item => item.id === requestId);
     if (!request) throw new HttpError(404, '问题不存在');
     if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
+    if (answers && answers.length !== request.questions.length) throw new HttpError(400, '请回答所有问题');
+    if (!answers && request.questions.length > 1) throw new HttpError(400, '请分别回答所有问题');
+    request.answers = answers ?? [answer];
     request.status = 'queued'; request.answer = answer; request.answeredAt = new Date().toISOString(); session.updatedAt = request.answeredAt;
     await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
     if (!this.active.has(id)) await this.startQueuedUserInput(id);
@@ -311,20 +312,17 @@ export class SessionManager {
     const session = this.lookup(id);
     for (const [index, source] of session.turns.entries()) for (const request of source.userInputRequests ?? []) {
       if (request.status !== 'queued' || !request.answer) continue;
-      const prompt = request.questions.length === 1 ? request.answer : `对之前问题的回答：\n${request.answer}`;
+      const prompt = `<send_user_message_question_reply>\n${JSON.stringify(request.questions.map((question, index) => ({
+        answer: request.answers?.[index] ?? request.answer,
+        question: question.title,
+        questionItemId: JSON.stringify(['request_user_input_async', request.id, index]),
+      })))}\n</send_user_message_question_reply>`;
       const existing = session.turns.slice(index + 1).find(turn => turn.prompt === prompt && Date.parse(turn.startedAt) >= Date.parse(request.answeredAt ?? request.createdAt));
       const answerTurnId = existing?.id ?? await this.startTurn(id, prompt);
       request.status = 'answered'; request.answerTurnId = answerTurnId; session.updatedAt = new Date().toISOString();
       await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
       if (!existing) return;
     }
-  }
-
-  findSessionByThreadId(threadId: string): { sessionId: string; turnId: string; projectId: string | null } | null {
-    for (const session of this.sessions.values()) if (session.threadId === threadId) {
-      const execution = this.active.get(session.id); if (execution?.turnId) return { sessionId: session.id, turnId: execution.turnId, projectId: session.projectId ?? null };
-    }
-    return null;
   }
 
   list(): SessionSummary[] {
@@ -373,9 +371,9 @@ export class SessionManager {
         this.historyErrors.delete(id);
         const turns = page.turns.map(native => {
           const current = session.turns.find(turn => turn.nativeTurnId === native.id || turn.id === native.id);
-          return current ? { ...native, ...current, nativeTurnId: native.id,
-            prompt: current.prompt || native.prompt, items: current.items.length ? current.items : native.items,
-            ...(current.userInputRequests ? { userInputRequests: current.userInputRequests } : {}) } : native;
+          return withNativeUserInput(current ? { ...native, ...current, nativeTurnId: native.id,
+            prompt: current.prompt || native.prompt, items: native.items.map(item => ({ ...current.items.find(old => old.id === item.id), ...item })).concat(current.items.filter(item => !native.items.some(other => other.id === item.id))),
+            ...(current.userInputRequests ? { userInputRequests: current.userInputRequests } : {}) } : native);
         });
         const live = session.turns.filter(turn => turn.status === 'running');
         for (const turn of live) if (!turns.some(candidate => candidate.id === turn.id)) turns.push(turn);
@@ -397,7 +395,9 @@ export class SessionManager {
     if (session.settings.executionMode !== 'sandbox' || !session.threadId) throw new HttpError(400, '此会话没有可分页的 Sandbox 历史');
     if (session.projectId && this.projects.isMaintaining(session.projectId)) throw new HttpError(409, '项目正在维护，请稍后重试');
     const page = await this.readSandboxHistory(session, { cursor, limit: 20 });
-    return { turns: page.turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt)), nextCursor: page.nextCursor ?? null };
+    return { turns: page.turns.map(turn => withNativeUserInput({ ...turn,
+      userInputRequests: session.turns.find(old => old.id === turn.id || old.nativeTurnId === turn.id)?.userInputRequests ?? turn.userInputRequests,
+    })).sort((left, right) => left.startedAt.localeCompare(right.startedAt)), nextCursor: page.nextCursor ?? null };
   }
 
   async subagents(id: string): Promise<SubagentConversation[]> {
@@ -553,7 +553,7 @@ export class SessionManager {
       await this.save(session);
       return;
     }
-    session.turns = mapped;
+    session.turns = mapped.map(withNativeUserInput);
     session.status = live ? live.status : mapped.at(-1)?.status ?? 'idle';
     session.contextUsage = mapped.flatMap(turn => turn.contextUsage ?? []).at(-1);
     await this.save(session);

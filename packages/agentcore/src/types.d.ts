@@ -64,6 +64,8 @@ export type McpToolCallItem = {
 export type AgentMessageItem = {
     id: string;
     type: "agent_message";
+    delivery?: string;
+    questions?: Array<{ title: string; options?: string[] }>;
     /** Either natural-language text or JSON when structured output is requested. */
     text: string;
 };

@@ -4,21 +4,7 @@ import { Icon } from '../../components/Icon';
 import './ReasoningSummary.css';
 
 type ReasoningItem = Extract<ThreadItem, { type: 'reasoning' }>;
-type ItemGroup = { type: 'reasoning'; startIndex: number; items: ReasoningItem[] }
-  | { type: 'item'; startIndex: number; item: ThreadItem };
-
-/** Keep tools, replies, compactions and child work in their original order. */
-export function groupThreadItems(items: ThreadItem[], boundaries: ReadonlySet<number> = new Set()): ItemGroup[] {
-  const groups: ItemGroup[] = [];
-  items.forEach((item, index) => {
-    const previous = groups.at(-1);
-    if (item.type === 'reasoning') {
-      if (previous?.type === 'reasoning' && !boundaries.has(index)) previous.items.push(item);
-      else groups.push({ type: 'reasoning', startIndex: index, items: [item] });
-    } else groups.push({ type: 'item', startIndex: index, item });
-  });
-  return groups;
-}
+export { groupThreadItems } from '../../../util/thread-item-groups';
 
 export default function ReasoningSummary({ entries, pending = false, ...resources }: {
   entries: { item: ReasoningItem; timestamp?: string; anchorId?: string; highlighted?: boolean }[];

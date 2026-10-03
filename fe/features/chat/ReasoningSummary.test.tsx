@@ -41,7 +41,7 @@ test('grouping never crosses tools, replies, compaction or child-work boundaries
     { id: 'tool', type: 'command_execution', command: 'pwd', aggregated_output: '', status: 'completed', exit_code: 0 },
     reasoning('d', 'd'), reasoning('e', 'e'), { id: 'reply', type: 'agent_message', text: 'done' }, reasoning('f', 'f')];
   const groups = groupThreadItems(items, new Set([2, 5]));
-  assert.deepEqual(groups.map(group => group.type === 'reasoning' ? group.items.map(item => item.id) : [group.item.id]),
+  assert.deepEqual(groups.map(group => group.type === 'item' ? [group.item.id] : group.items.map(item => item.id)),
     [['a', 'b'], ['c'], ['tool'], ['d'], ['e'], ['reply'], ['f']]);
   assert.deepEqual(groups.map(group => group.startIndex), [0, 2, 3, 4, 5, 6, 7]);
 });

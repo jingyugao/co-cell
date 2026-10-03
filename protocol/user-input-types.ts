@@ -6,5 +6,6 @@ export interface UserInputRequest {
   createdAt: string;
   answeredAt?: string;
   answer?: string;
+  answers?: string[];
   answerTurnId?: string;
 }

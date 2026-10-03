@@ -144,7 +144,7 @@ export class AppServerEventAdapter {
   convert(item) {
     const previous = this.items.get(item.id);
     switch (item.type) {
-      case 'agentMessage': return { id: item.id, type: 'agent_message', text: item.text ?? previous?.text ?? '' };
+      case 'agentMessage': return { id: item.id, type: 'agent_message', text: item.text ?? previous?.text ?? '', ...(item.delivery ? { delivery: item.delivery } : {}), ...(item.questions ? { questions: item.questions } : {}) };
       case 'reasoning': return { id: item.id, type: 'reasoning', text: (item.summary?.length ? item.summary : item.content)?.join('\n') || previous?.text || '' };
       case 'commandExecution': return { id: item.id, type: 'command_execution', command: item.command, aggregated_output: item.aggregatedOutput ?? previous?.aggregated_output ?? '', ...(item.exitCode != null ? { exit_code: item.exitCode } : {}), status: status(item.status) };
       case 'fileChange': return { id: item.id, type: 'file_change', changes: item.changes.map(change => ({ path: change.path, kind: typeof change.kind === 'string' ? change.kind : change.kind.type })), status: item.status === 'failed' || item.status === 'declined' ? 'failed' : 'completed' };

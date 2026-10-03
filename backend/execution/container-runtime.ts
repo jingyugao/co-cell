@@ -1,3 +1,4 @@
+import { withNativeUserInput } from '../../util/user-input.js';
 import type { SandboxImageIdentity, SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -327,7 +328,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       const converted = adapter.convert(item);
       if (converted) turn.items.push(converted);
     }
-    return turn;
+    return withNativeUserInput(turn);
   }
 
   private async readAppServerTurns(client: CodexAppServerClient, threadId: string, latestOnly = false): Promise<Turn[]> {

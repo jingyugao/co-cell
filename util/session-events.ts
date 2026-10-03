@@ -1,4 +1,5 @@
 import type { AgentEvent, Session, Turn } from '../protocol/types.js';
+import { withNativeUserInput } from './user-input.js';
 import { sumRequestUsage } from './usage.js';
 
 /** Apply agent lifecycle events consistently in persistent state and the browser. */
@@ -27,7 +28,7 @@ export function applyTurnEvent(turn: Turn, event: AgentEvent): Turn {
       // message/tool segment started without mutating the item shape.
       const itemTimestamps = { ...(turn.itemTimestamps ?? {}) };
       if (!itemTimestamps[event.item.id]) itemTimestamps[event.item.id] = new Date().toISOString();
-      return { ...turn, items, itemTimestamps, phase: turn.phase === 'finalizing' ? 'finalizing' : 'running' };
+      return withNativeUserInput({ ...turn, items, itemTimestamps, phase: turn.phase === 'finalizing' ? 'finalizing' : 'running' });
     }
     case 'turn.completed':
       return { ...turn, status: 'completed', phase: 'finalizing', sdkUsage: event.usage, usage: sumRequestUsage(turn.contextUsage), error: undefined, retry: undefined };

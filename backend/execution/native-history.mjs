@@ -98,7 +98,7 @@ export function parseNativeHistory(source, includeBlocks = false) {
         turn.prompt = text(item.content);
         turn.images = (item.content ?? []).filter(part => part.type === 'local_image').map(part => part.path);
         confirmed.add(turn.id);
-      } else if (item.type === 'AgentMessage') upsert(turn, { id, type: 'agent_message', text: text(item.content) }, timestamp);
+      } else if (item.type === 'AgentMessage') upsert(turn, { id, type: 'agent_message', text: text(item.content), ...(item.delivery ? { delivery: item.delivery } : {}), ...(item.questions ? { questions: item.questions } : {}) }, timestamp);
       else if (item.type === 'Reasoning') {
         const summary = item.summary_text ?? item.summary ?? item.content;
         const summaryText = Array.isArray(summary) && summary.every(part => typeof part === 'string') ? summary.join('\n') : text(summary);

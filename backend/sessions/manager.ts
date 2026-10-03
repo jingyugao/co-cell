@@ -23,7 +23,7 @@ import { MODEL_TOKEN_RATES } from '../../util/model-costs.js';
 import type { ImageCatalog } from '../images/service.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
-import { withNativeUserInput } from '../../util/user-input.js';
+import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../util/user-input.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -62,6 +62,7 @@ export class SessionManager {
   private uploads = new Map<string, Set<Promise<string>>>();
   private closing = false;
   private historyReads = new Map<string, Promise<void>>();
+  private userInputAnswers = new Map<string, { threadId: Session['threadId']; answers: NativeUserInputAnswers }>();
   private historyErrors = new Map<string, string>();
   private billingReads = new Map<string, Promise<SessionCostBreakdown>>();
 
@@ -286,17 +287,28 @@ export class SessionManager {
   async answerUserInput(id: string, turnId: string, requestId: string, answer: string, answers?: string[]): Promise<Session> {
     const session = this.lookup(id);
     const history = await this.read(id);
-    const source = history.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId);
+    const matches = (turn: Turn) => turn.id === turnId || turn.nativeTurnId === turnId || turn.userInputRequests?.some(request => request.id === requestId);
+    let source = history.turns.find(matches);
+    let cursor = history.historyNextCursor;
+    const seen = new Set<string>();
+    while (!source && cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      const page = await this.olderTurns(id, cursor);
+      source = page.turns.find(matches);
+      cursor = page.nextCursor;
+    }
     if (source) {
       const index = session.turns.findIndex(turn => turn.id === source.id || turn.nativeTurnId === source.id);
       if (index >= 0) {
         const current = session.turns[index];
-        const requests = source.userInputRequests?.map(request => current.userInputRequests?.find(old => old.id === request.id) ?? request);
+        const requests = source.userInputRequests?.map(request => request.status === 'answered' ? request
+          : current.userInputRequests?.find(old => old.id === request.id) ?? request);
         current.userInputRequests = requests;
       } else session.turns.push(source);
     }
-    const request = session.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId)?.userInputRequests?.find(item => item.id === requestId);
-    if (!request) throw new HttpError(404, '问题不存在');
+    const questionTurn = session.turns.find(matches);
+    const request = questionTurn?.userInputRequests?.find(item => item.id === requestId);
+    if (!questionTurn || !request) throw new HttpError(404, '问题不存在');
     if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
     if (answers && answers.length !== request.questions.length) throw new HttpError(400, '请回答所有问题');
     if (!answers && request.questions.length > 1) throw new HttpError(400, '请分别回答所有问题');
@@ -304,7 +316,11 @@ export class SessionManager {
     request.status = 'queued'; request.answer = answer; request.answeredAt = new Date().toISOString(); session.updatedAt = request.answeredAt;
     await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
     if (!this.active.has(id)) await this.startQueuedUserInput(id);
-    return this.get(id);
+    const snapshot = this.get(id);
+    // Starting the reply makes it the latest turn. Return the updated question
+    // too, so clients can replace the form they just submitted.
+    if (!snapshot.turns.some(turn => turn.id === questionTurn.id)) snapshot.turns.unshift(structuredClone(questionTurn));
+    return snapshot;
   }
 
   private async startQueuedUserInput(id: string) {
@@ -378,7 +394,7 @@ export class SessionManager {
         const live = session.turns.filter(turn => turn.status === 'running');
         for (const turn of live) if (!turns.some(candidate => candidate.id === turn.id)) turns.push(turn);
         turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
-        return { ...snapshot, turns, historyNextCursor: page.nextCursor ?? null, historyError: undefined };
+        return { ...snapshot, turns: this.withUserInputHistory(session, turns), historyNextCursor: page.nextCursor ?? null, historyError: undefined };
       } catch (error) {
         console.error('Native history read failed:', error instanceof Error ? error.message : 'unknown error');
         const historyError = '历史消息暂时无法从 Sandbox 加载，请确认项目 Sandbox 可用后刷新重试。';
@@ -395,9 +411,21 @@ export class SessionManager {
     if (session.settings.executionMode !== 'sandbox' || !session.threadId) throw new HttpError(400, '此会话没有可分页的 Sandbox 历史');
     if (session.projectId && this.projects.isMaintaining(session.projectId)) throw new HttpError(409, '项目正在维护，请稍后重试');
     const page = await this.readSandboxHistory(session, { cursor, limit: 20 });
-    return { turns: page.turns.map(turn => withNativeUserInput({ ...turn,
+    return { turns: this.withUserInputHistory(session, page.turns.map(turn => withNativeUserInput({ ...turn,
       userInputRequests: session.turns.find(old => old.id === turn.id || old.nativeTurnId === turn.id)?.userInputRequests ?? turn.userInputRequests,
-    })).sort((left, right) => left.startedAt.localeCompare(right.startedAt)), nextCursor: page.nextCursor ?? null };
+    })).sort((left, right) => left.startedAt.localeCompare(right.startedAt))), nextCursor: page.nextCursor ?? null };
+  }
+
+  private withUserInputHistory(session: Session, turns: Turn[]): Turn[] {
+    let cached = this.userInputAnswers.get(session.id);
+    if (!cached || cached.threadId !== session.threadId) {
+      cached = { threadId: session.threadId, answers: new Map() };
+      this.userInputAnswers.set(session.id, cached);
+    }
+    // Newest-first pagination sees replies before older questions. Retain only
+    // this derived index in memory; App Server history owns the durable state.
+    collectNativeUserInputAnswers(turns, cached.answers);
+    return turns.map(turn => withNativeUserInput(turn, cached.answers));
   }
 
   async subagents(id: string): Promise<SubagentConversation[]> {
@@ -553,7 +581,7 @@ export class SessionManager {
       await this.save(session);
       return;
     }
-    session.turns = mapped.map(withNativeUserInput);
+    session.turns = this.withUserInputHistory(session, mapped);
     session.status = live ? live.status : mapped.at(-1)?.status ?? 'idle';
     session.contextUsage = mapped.flatMap(turn => turn.contextUsage ?? []).at(-1);
     await this.save(session);
@@ -769,6 +797,7 @@ export class SessionManager {
       .map(directory => rm(directory, { recursive: true, force: true })));
     this.sessions.delete(id);
     this.historyErrors.delete(id);
+    this.userInputAnswers.delete(id);
     this.subscribers.delete(id);
     this.writer.forget(id);
   }

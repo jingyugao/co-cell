@@ -19,6 +19,7 @@ const target = (project: Project): WorkspaceTarget => ({ id: project.id, project
 
 export class ProjectSandboxOperations {
   private tasks = new Set<Promise<void>>();
+  private timings = new Map<string, { operationId: string; kind: string; started: number; phaseStarted: number; phase: string }>();
   constructor(private deps: {
     projects: ProjectService;
     runtime: SandboxRuntime;
@@ -32,6 +33,20 @@ export class ProjectSandboxOperations {
   private async phase(id: string, phase: string) {
     const operation = this.deps.projects.get(id).sandboxOperation!;
     await this.deps.projects.updateSandboxOperation(id, { ...operation, phase, updatedAt: new Date().toISOString() });
+    this.recordTiming(id, 'running', phase);
+  }
+
+  private recordTiming(id: string, status: string, nextPhase?: string) {
+    const timing = this.timings.get(id);
+    if (!timing) return;
+    const now = Date.now();
+    void this.deps.logger?.write({ event: 'sandbox.operation_phase', projectId: id,
+      operationId: timing.operationId, operation: timing.kind, phase: timing.phase, status,
+      startedAt: new Date(timing.phaseStarted).toISOString(), finishedAt: new Date(now).toISOString(),
+      durationMs: now - timing.phaseStarted, totalDurationMs: now - timing.started,
+      sandboxId: this.deps.projects.get(id).sandbox?.id });
+    if (nextPhase) { timing.phase = nextPhase; timing.phaseStarted = now; }
+    else this.timings.delete(id);
   }
 
   private operationKey(id: string, step: 'capture' | 'restore'): string {
@@ -70,6 +85,11 @@ export class ProjectSandboxOperations {
       if (kind === 'restore' && project.status === 'archived' && this.deps.selectRestoreImage) reservation = await this.deps.selectRestoreImage(project, options.imageVersionId);
       await this.deps.projects.updateSandboxOperation(id, { id: randomUUID(), kind,
         phase: kind === 'create' ? '创建 Sandbox' : '检查环境', status: 'running', updatedAt: new Date().toISOString() });
+      const accepted = this.deps.projects.get(id).sandboxOperation!;
+      const now = Date.now();
+      this.timings.set(id, { operationId: accepted.id!, kind, started: now, phaseStarted: now, phase: accepted.phase });
+      void this.deps.logger?.write({ event: 'sandbox.operation_started', projectId: id,
+        operationId: accepted.id, operation: kind, startedAt: new Date(now).toISOString(), sandboxId: project.sandbox?.id });
     } catch (error) { reservation?.release(); release(); throw error; }
     const task = Promise.resolve().then(async () => {
       try {
@@ -99,7 +119,10 @@ export class ProjectSandboxOperations {
         await this.deps.projects.updateSandboxOperation(id, { ...this.deps.projects.get(id).sandboxOperation!, kind, phase: this.deps.projects.get(id).sandboxOperation?.phase ?? '检查环境',
           status: 'failed', error: error instanceof HttpError ? error.message : '操作失败，请重试；详细原因请查看服务端日志。', updatedAt: new Date().toISOString() });
         throw error;
-      } finally { reservation?.release(); release(); }
+      } finally {
+        this.recordTiming(id, this.deps.projects.get(id).sandboxOperation?.status ?? 'failed');
+        reservation?.release(); release();
+      }
     });
     this.tasks.add(task);
     void task.finally(() => this.tasks.delete(task)).catch(() => {});
@@ -232,7 +255,12 @@ export class ProjectSandboxOperations {
     try {
       await this.phase(id, '恢复数据');
       const candidate = await remote.restore(target(restoredProject), reference, this.operationKey(id, 'restore'),
-        async sandbox => { replacement = sandbox; await this.rememberCleanup(id, sandbox); });
+        async sandbox => {
+          replacement = sandbox;
+          await this.rememberCleanup(id, sandbox);
+          void this.deps.logger?.write({ event: 'sandbox.operation_candidate', projectId: id,
+            operationId: projects.get(id).sandboxOperation?.id, sandboxId: sandbox.id });
+        });
       replacement = candidate;
       await this.rememberCleanup(id, candidate);
       if (restoredProject.imageSelection && candidate.image?.id !== restoredProject.imageSelection.image) {

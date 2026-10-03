@@ -4,11 +4,13 @@ import { Hono, type Context } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { setCookie } from 'hono/cookie';
 import { parseServiceHost } from '../projects/service-host.js';
+import { isPublicPwaAsset } from '../../util/pwa-assets.js';
 
 const COOKIE = 'cocell_operator';
 const PREVIEW_COOKIE = 'cocell_preview';
 const MAX_LOGIN_BYTES = 4096;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_RENEW_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const REQUEST_ID = /^[A-Za-z0-9_-]{1,200}$/;
 
 interface AccessRequest {
@@ -47,13 +49,13 @@ function sessionSignature(token: string, expires: string, scope = 'operator'): s
   return createHmac('sha256', token).update(`cocell-${scope}-v1\0${expires}`).digest('base64url');
 }
 
-function validSession(value: string | undefined, token: string, scope = 'operator'): boolean {
-  if (!value) return false;
+function sessionExpiry(value: string | undefined, token: string, scope = 'operator'): number | undefined {
+  if (!value) return undefined;
   const parts = /^v1\.(\d{1,13})\.([A-Za-z0-9_-]{43})$/.exec(value);
-  if (!parts) return false;
+  if (!parts) return undefined;
   const expires = Number(parts[1]);
-  if (!Number.isSafeInteger(expires) || expires <= Date.now()) return false;
-  return fixedEqual(parts[2], sessionSignature(token, parts[1], scope));
+  if (!Number.isSafeInteger(expires) || expires <= Date.now()) return undefined;
+  return fixedEqual(parts[2], sessionSignature(token, parts[1], scope)) ? expires : undefined;
 }
 
 type AuthHeaders = Headers | { authorization?: string | string[]; cookie?: string | string[] };
@@ -76,16 +78,7 @@ export function isAuthenticatedOperatorRequest(headers: AuthHeaders, token: stri
     const bearer = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
     return fixedEqual(bearer, token);
   }
-  return validSession(sessionCookie(header(headers, 'cookie')), token);
-}
-
-function isAuthenticatedPreviewRequest(headers: AuthHeaders, token: string): boolean {
-  const authorization = header(headers, 'authorization');
-  if (authorization !== undefined) {
-    const bearer = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
-    return fixedEqual(bearer, token);
-  }
-  return validSession(sessionCookie(header(headers, 'cookie'), PREVIEW_COOKIE), token, 'preview');
+  return sessionExpiry(sessionCookie(header(headers, 'cookie')), token) !== undefined;
 }
 
 /** Vite must only receive authenticated asset requests in Cellbox mode. */
@@ -106,6 +99,7 @@ function safeReturnPath(input: string | null, publicOrigin: string): string {
   let url: URL;
   try { url = new URL(input, publicOrigin); } catch { return '/'; }
   if (url.origin !== publicOrigin || url.hash) return '/';
+  if (url.pathname === '/auth/login') return '/';
   if (url.pathname === '/api/cellbox/authorize') {
     const ids = url.searchParams.getAll('request_id');
     if (ids.length !== 1 || !REQUEST_ID.test(ids[0])) return '/';
@@ -173,11 +167,21 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
       c.header('Content-Security-Policy', "script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
     }
   });
-  const setPreviewCookie = (c: Context) => {
+  const setSessionCookie = (c: Context, scope: 'operator' | 'preview') => {
     const expires = String(Date.now() + SESSION_TTL_MS);
-    setCookie(c, PREVIEW_COOKIE, `v1.${expires}.${sessionSignature(options.token, expires, 'preview')}`, {
-      path: '/', domain: publicUrl.hostname, httpOnly: true, sameSite: 'Lax', secure: publicUrl.protocol === 'https:',
+    // Initialize the context response so Hono preserves these headers when a
+    // downstream file or preview handler returns a raw Response.
+    c.res.headers.set('Cache-Control', 'no-store');
+    setCookie(c, scope === 'operator' ? COOKIE : PREVIEW_COOKIE, `v1.${expires}.${sessionSignature(options.token, expires, scope)}`, {
+      path: '/', ...(scope === 'preview' ? { domain: publicUrl.hostname } : {}),
+      httpOnly: true, sameSite: 'Lax', secure: publicUrl.protocol === 'https:', maxAge: SESSION_TTL_MS / 1000,
     });
+  };
+  const renewSessionCookie = (c: Context, scope: 'operator' | 'preview') => {
+    const expires = sessionExpiry(sessionCookie(c.req.header('cookie'), scope === 'operator' ? COOKIE : PREVIEW_COOKIE), options.token, scope);
+    if (expires !== undefined && expires - Date.now() <= SESSION_TTL_MS - SESSION_RENEW_INTERVAL_MS) {
+      setSessionCookie(c, scope);
+    }
   };
 
   if (options.previewSubdomains) app.use('*', bodyLimit({
@@ -195,14 +199,20 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
       const target = resolvePreviewHost?.(requestHost);
       if (!target || !options.serviceProxy) return c.text('Invalid host', 403);
       const serviceOrigin = `${publicUrl.protocol}//${requestHost}`;
-      if (!isAuthenticatedPreviewRequest(c.req.raw.headers, options.token)) {
+      const authorization = c.req.header('authorization');
+      const authenticated = authorization === undefined
+        ? sessionExpiry(sessionCookie(c.req.header('cookie'), PREVIEW_COOKIE), options.token, 'preview') !== undefined
+        : isAuthenticatedOperatorRequest(c.req.raw.headers, options.token);
+      if (!authenticated) {
         const returnUrl = `${serviceOrigin}${path}${new URL(c.req.url).search}`;
         return c.redirect(`${origin}/auth/preview?next=${encodeURIComponent(returnUrl)}`, 303);
       }
       const requestOrigin = c.req.header('origin');
       if (requestOrigin && requestOrigin !== serviceOrigin) return c.text('Invalid origin', 403);
+      if (authorization === undefined) renewSessionCookie(c, 'preview');
       return options.serviceProxy(target.projectId, target.port, path + new URL(c.req.url).search, c.req.raw);
     }
+    if (isPublicPwaAsset(path, c.req.method)) return next();
     if (path === '/auth/login' && ['GET', 'POST'].includes(c.req.method)) {
       return next();
     }
@@ -223,6 +233,10 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     if (authorization === undefined && !['GET', 'HEAD', 'OPTIONS'].includes(c.req.method) && c.req.header('origin') !== origin) {
       return c.json({ error: 'Invalid origin' }, 403);
     }
+    if (authorization === undefined) {
+      renewSessionCookie(c, 'operator');
+      if (options.previewSubdomains) renewSessionCookie(c, 'preview');
+    }
     return next();
   });
 
@@ -233,9 +247,25 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
   app.get('/auth/login', c => {
     const nextPath = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, resolvePreviewHost);
     c.header('Cache-Control', 'no-store');
+    if (isAuthenticatedOperatorRequest(c.req.raw.headers, options.token)) {
+      if (c.req.header('authorization') === undefined) {
+        renewSessionCookie(c, 'operator');
+        if (options.previewSubdomains) renewSessionCookie(c, 'preview');
+      }
+      return c.redirect(nextPath, 303);
+    }
     c.header('Content-Security-Policy', "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     c.header('X-Content-Type-Options', 'nosniff');
-    return c.html(`<!doctype html><html><head><meta charset="utf-8"><title>CoCell sign in</title></head><body><main><h1>CoCell sign in</h1><form method="post" action="/auth/login"><label>Access token <input type="password" name="token" autocomplete="current-password" required></label><input type="hidden" name="next" value="${escapeHtml(nextPath)}"><button type="submit">Sign in</button></form></main></body></html>`);
+    return c.html(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="theme-color" content="#f8f8f7"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="CoCell"><link rel="manifest" href="/manifest.webmanifest"><link rel="icon" type="image/svg+xml" href="/icons/icon.svg"><link rel="apple-touch-icon" href="/icons/apple-touch-icon.png"><title>CoCell sign in</title></head>
+<body><main><h1>CoCell sign in</h1>
+<form id="login-form" method="post" action="/auth/login" autocomplete="on">
+  <p><label for="username">Account</label> <input id="username" type="text" name="username" value="operator" autocomplete="username" autocapitalize="none" spellcheck="false" readonly></p>
+  <p><label for="password">Access token</label> <input id="password" type="password" name="token" autocomplete="current-password" required></p>
+  <input type="hidden" name="next" value="${escapeHtml(nextPath)}">
+  <button type="submit">Sign in</button>
+</form>
+<p>Save this login in your browser to fill the access token next time.</p>
+</main></body></html>`);
   });
   app.post('/auth/login', async c => {
     if (c.req.header('origin') !== origin) return c.text('Invalid origin', 403);
@@ -250,18 +280,15 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
       return c.text('Invalid access token', 401);
     }
     const nextPath = safeLoginTarget(form.get('next'), origin, resolvePreviewHost);
-    const expires = String(Date.now() + SESSION_TTL_MS);
-    setCookie(c, COOKIE, `v1.${expires}.${sessionSignature(options.token, expires)}`, {
-      path: '/', httpOnly: true, sameSite: 'Lax', secure: publicUrl.protocol === 'https:',
-    });
-    if (options.previewSubdomains) setPreviewCookie(c);
+    setSessionCookie(c, 'operator');
+    if (options.previewSubdomains) setSessionCookie(c, 'preview');
     c.header('Cache-Control', 'no-store');
     return c.redirect(nextPath, 303);
   });
 
   if (options.previewSubdomains) app.get('/auth/preview', c => {
     const target = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, resolvePreviewHost);
-    setPreviewCookie(c);
+    setSessionCookie(c, 'preview');
     c.header('Cache-Control', 'no-store');
     return c.redirect(target, 303);
   });

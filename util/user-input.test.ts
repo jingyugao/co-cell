@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { userInputReplyDisplayText } from './user-input.js';
+import { collectNativeUserInputAnswers, userInputReplyDisplayText, withNativeUserInput, type NativeUserInputAnswers } from './user-input.js';
+import type { Turn } from '../protocol/types.js';
 
 const reply = { answer: '网络与容器信息', question: '你想让我接下来查看哪类环境信息？',
   questionItemId: JSON.stringify(['request_user_input_async', 'call_async_question', 0]) };
@@ -33,4 +34,40 @@ test('ordinary messages and incomplete or invalid envelopes remain verbatim', ()
     envelope([{ ...reply, answer: 42 }]), envelope([reply, { question: '第二题', answer: '答案' }]),
   ];
   for (const value of unchanged) assert.equal(userInputReplyDisplayText(value), value);
+});
+
+test('native reply IDs resolve each async question after history reconstruction', () => {
+  const title = reply.question;
+  const source: Turn = { id: 'source', prompt: '', images: [], status: 'completed', codexAccepted: true,
+    startedAt: '2026-10-03T00:00:00.000Z', items: [{ id: 'call_async_question', type: 'agent_message', text: '', delivery: 'async',
+      questions: [{ title }, { title: '检查哪些接口？' }] }] };
+  const answerTurn: Turn = { ...source, id: 'reply', items: [], startedAt: '2026-10-03T00:01:00.000Z',
+    prompt: envelope([reply, { question: '检查哪些接口？', answer: 'eth0',
+      questionItemId: JSON.stringify(['request_user_input_async', 'call_async_question', 1]) }]) };
+  const answers: NativeUserInputAnswers = new Map();
+  assert.equal(withNativeUserInput(source).userInputRequests?.[0].status, 'pending');
+  collectNativeUserInputAnswers([answerTurn], answers);
+  const request = withNativeUserInput(source, answers).userInputRequests![0];
+  assert.equal(request.status, 'answered');
+  assert.deepEqual(request.answers, [reply.answer, 'eth0']);
+  assert.equal(request.answeredAt, answerTurn.startedAt);
+  assert.equal(request.answerTurnId, 'reply');
+  assert.equal(source.userInputRequests, undefined);
+});
+
+test('unaccepted, unrelated, malformed and partial native replies cannot answer a question', () => {
+  const source: Turn = { id: 'source', prompt: '', images: [], status: 'completed', codexAccepted: true,
+    startedAt: '2026-10-03T00:00:00.000Z', items: [{ id: 'call_async_question', type: 'agent_message', text: '', delivery: 'async',
+      questions: [{ title: reply.question }, { title: 'Second?' }] }] };
+  const answerTurn = { ...source, id: 'reply', items: [], startedAt: '2026-10-03T00:01:00.000Z' };
+  for (const prompt of [envelope([reply]), envelope([{ ...reply, questionItemId: 'invalid' }]),
+    envelope([{ ...reply, questionItemId: JSON.stringify(['other', 'call_async_question', 0]) }]),
+    envelope([{ ...reply, question: 'Other?' }])]) {
+    const answers: NativeUserInputAnswers = new Map();
+    collectNativeUserInputAnswers([{ ...answerTurn, prompt }], answers);
+    assert.equal(withNativeUserInput(source, answers).userInputRequests?.[0].status, 'pending');
+  }
+  const answers: NativeUserInputAnswers = new Map();
+  collectNativeUserInputAnswers([{ ...answerTurn, prompt: envelope([reply]), codexAccepted: false }], answers);
+  assert.equal(answers.size, 0);
 });

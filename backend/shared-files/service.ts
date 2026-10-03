@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, link, lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HttpError } from '../../util/errors.js';
@@ -14,7 +14,8 @@ function decode(bytes: Uint8Array): string | undefined {
 }
 export class SharedFiles {
   private tail: Promise<unknown> = Promise.resolve();
-  constructor(private root = fileURLToPath(new URL('../../data/', import.meta.url))) {}
+  constructor(private root = process.env.SHARED_DATA_DIRECTORY || fileURLToPath(new URL('../../data/', import.meta.url)),
+    private mounted = false) {}
   private serial<T>(action: () => Promise<T>): Promise<T> {
     const next = this.tail.then(action);
     this.tail = next.catch(() => {});
@@ -110,16 +111,16 @@ export class SharedFiles {
       const temp = join(dirname(location), `.shared-write-${randomUUID()}`);
       try {
         const handle = await open(temp, 'wx', 0o600);
-        try { await handle.writeFile(bytes); } finally { await handle.close(); }
+        try {
+          await handle.writeFile(bytes);
+          if (this.mounted || path === 'AGENTS.md') await handle.chmod(0o644);
+        } finally { await handle.close(); }
         if (expectedVersion === undefined) {
           await link(temp, location).catch(error => {
             if (error.code === 'EEXIST') throw new HttpError(409, '同名文件已存在，请选择其他路径或打开该文件');
             throw error;
           });
         } else await rename(temp, location);
-        // This file is read-only bind-mounted into every Sandbox as the
-        // global Codex instruction source; it must be readable by uid 1000.
-        if (path === 'AGENTS.md') await chmod(location, 0o644);
       } finally { await unlink(temp).catch(error => { if (!missing(error)) throw error; }); }
       return { path, content, version: version(bytes) };
     });

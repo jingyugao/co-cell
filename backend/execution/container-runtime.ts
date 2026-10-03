@@ -53,7 +53,7 @@ const endpointHeaders = (endpoint: AppServerEndpoint) => endpoint.headers ?? (en
 export interface ContainerRuntimeOptions {
   paths: { root: string; runtime: string; codexHome: string; node: string };
   prepareRemote: (sandbox: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal) => Promise<boolean>;
-  acquireRemoteUsage?: (sandboxId: string) => Promise<() => Promise<void>>;
+  acquireRemoteUsage?: (sandboxId: string, initializationDirectory?: string) => Promise<() => Promise<void>>;
   remoteArchives?: import('../archives/remote.js').RemoteArchives;
   sandboxes: ProjectSandboxes;
   provider: SandboxProvider;
@@ -62,6 +62,7 @@ export interface ContainerRuntimeOptions {
   modelConfig?: Record<string, unknown>;
   configOverrides?: string[];
   sharedDataDirectory?: URL;
+  sharedFilesMounted?: (sandboxId: string) => boolean;
   logger?: RuntimeLog;
   appServer?: (sandboxId: string) => Promise<AppServerEndpoint>;
   serviceAccess?: (sandboxId: string, port: number) => Promise<CellboxServiceAccess>;
@@ -145,7 +146,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     }
   }
 
-  private async acquire(target: WorkspaceTarget, create: boolean, notify?: SaveSandbox, usageId?: string, signal?: AbortSignal): Promise<Entry> {
+  private async acquire(target: WorkspaceTarget, create: boolean, notify?: SaveSandbox, usageId?: string, signal?: AbortSignal, initialization = false): Promise<Entry> {
     if (this.closing) throw new Error('Sandbox 运行时正在关闭');
     const lease = await this.sandboxes.acquire(target, { create, save: notify, usageId, signal });
     let preparation = this.runtimePreparations.get(lease.record.id);
@@ -154,7 +155,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       this.runtimePreparations.set(lease.record.id, preparation);
     }
     let releaseRemote: (() => Promise<void>) | undefined;
-    try { releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id); }
+    try { releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id, initialization ? target.settings.workingDirectory : undefined); }
     catch (error) { await lease.release(); throw error; }
     return { sandbox: lease.sandbox, get metadata() { return lease.record; }, lease, preparation, releaseRemote };
   }
@@ -209,11 +210,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   private async prepareEnvironment(target: WorkspaceTarget, entry: Entry, executionSignal: AbortSignal) {
     return this.prepare(entry, executionSignal, async () => {
-      // Shared documents are read on every turn, including resumed threads.
-      // Global AGENTS.md is a required host mount on all supported Sandboxes.
+      const fresh = await this.options.prepareRemote(entry.sandbox, target, executionSignal);
+      if (this.options.sharedFilesMounted?.(entry.sandbox.sandboxId)) return;
+      // Older instances without the directory mount still receive snapshots.
       const sharedData = this.options.sharedDataDirectory ?? SHARED_DATA;
       const sharedDocs = await loadAgentDocs(new URL('docs/', sharedData));
-      const fresh = await this.options.prepareRemote(entry.sandbox, target, executionSignal);
       if (fresh) {
         entry.preparation.sharedDocPaths = undefined;
         entry.preparation.sharedDocDigests = undefined;
@@ -628,12 +629,12 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         target.sandbox = undefined;
       }
     }
-    const entry = await this.acquire(target,true,onSandbox);
+    const entry = await this.acquire(target, true, onSandbox, undefined, undefined, true);
     try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
   }
   async resume(target: WorkspaceTarget, onSandbox: SaveSandbox) {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
-    const entry = await this.acquire(target, false, onSandbox);
+    const entry = await this.acquire(target, false, onSandbox, undefined, undefined, true);
     try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
   }
 
@@ -668,17 +669,19 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private async verifySandboxOnce(sandbox: SandboxState, timeoutMs: number) {
     const info = await this.options.provider.getInfo(sandbox.id);
     if (info.state !== 'running') throw new HttpError(502, 'Sandbox 尚未就绪');
-    const handle = this.options.provider.connectForSetup
-      ? await this.options.provider.connectForSetup(sandbox.id)
-      : await this.options.provider.connect(sandbox.id, { timeoutMs });
-    await handle.commands.run(`test -d ${quote(sandbox.workingDirectory)} && test -d ${quote(this.codexHome)}`, { timeoutMs });
+    if (!this.options.sharedFilesMounted?.(sandbox.id)) {
+      const handle = this.options.provider.connectForSetup
+        ? await this.options.provider.connectForSetup(sandbox.id)
+        : await this.options.provider.connect(sandbox.id, { timeoutMs });
+      await handle.commands.run(`test -d ${quote(sandbox.workingDirectory)} && test -d ${quote(this.codexHome)}`, { timeoutMs });
+    }
     if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
     const endpoint = await this.options.appServer(sandbox.id);
     const client = new CodexAppServerClient({ url: endpoint.url, headers: endpointHeaders(endpoint), requestTimeoutMs: timeoutMs });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        (async () => { await client.connect(); await client.request('thread/list', { limit: 1 }); })(),
+        client.connect(), // connect includes a real initialize RPC and protocol validation.
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new HttpError(502, 'Sandbox 服务验证超时')), timeoutMs); }),
       ]);
     } finally { if (timer) clearTimeout(timer); try { await client.close(); } finally { await this.releaseEndpoint(endpoint); } }

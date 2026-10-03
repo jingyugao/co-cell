@@ -35,7 +35,7 @@ function setup(overrides: Partial<OperatorAccessOptions> = {}) {
 function login(app: Hono, next = '/') {
   return app.request(`${origin}/auth/login`, { method: 'POST',
     headers: { origin, 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ token, next }).toString(),
+    body: new URLSearchParams({ username: 'operator', token, next }).toString(),
   });
 }
 
@@ -60,11 +60,12 @@ test('protects UI and API, then issues a signed HttpOnly session', async () => {
   assert.match(cookie, /HttpOnly/);
   assert.match(cookie, /SameSite=Lax/);
   assert.match(cookie, /Secure/);
-  assert.doesNotMatch(cookie, /Max-Age|Expires=/);
+  assert.match(cookie, /Max-Age=2592000/);
+  assert.doesNotMatch(cookie, /Domain=/);
   assert.doesNotMatch(cookie, new RegExp(token));
   const signedExpiry = /^cocell_operator=v1\.(\d+)\./.exec(cookie)?.[1];
   assert.ok(signedExpiry && Number(signedExpiry) > Date.now());
-  assert.ok(Number(signedExpiry) <= Date.now() + 12 * 60 * 60 * 1000);
+  assert.ok(Number(signedExpiry) <= Date.now() + 30 * 24 * 60 * 60 * 1000);
   assert.equal((await app.request(`${origin}/api/data`, { headers: { cookie } })).status, 200);
   const page = await app.request(`${origin}/page`, { headers: { cookie } });
   assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'self'/);
@@ -73,6 +74,57 @@ test('protects UI and API, then issues a signed HttpOnly session', async () => {
   assert.equal((await app.request(`${origin}/api/data`, { headers: {
     cookie, authorization: 'Bearer wrong',
   } })).status, 401);
+});
+
+test('renews active sessions daily, accepts legacy sessions, and expires inactive or revoked sessions', async t => {
+  const day = 24 * 60 * 60 * 1000;
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const { app } = setup();
+  const initialCookie = (await login(app)).headers.get('set-cookie')!.split(';')[0];
+  const initialExpiry = Number(initialCookie.split('.')[1]);
+  const fresh = await app.request(`${origin}/api/data`, { headers: { cookie: initialCookie } });
+  assert.equal(fresh.headers.get('set-cookie'), null);
+
+  now += day;
+  const denied = await app.request(`${origin}/api/write`, { method: 'POST', headers: { cookie: initialCookie } });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.headers.get('set-cookie'), null);
+  const bearer = await app.request(`${origin}/api/data`, { headers: { authorization: `Bearer ${token}`, cookie: initialCookie } });
+  assert.equal(bearer.headers.get('set-cookie'), null);
+  const active = await app.request(`${origin}/api/data`, { headers: { cookie: initialCookie } });
+  assert.equal(active.status, 200);
+  assert.equal(active.headers.get('cache-control'), 'no-store');
+  const renewedCookie = active.headers.get('set-cookie')!.split(';')[0];
+  assert.match(active.headers.get('set-cookie')!, /Max-Age=2592000/);
+  assert.equal(Number(renewedCookie.split('.')[1]), now + 30 * day);
+
+  const legacyExpiry = String(now + 12 * 60 * 60 * 1000);
+  const legacySignature = createHmac('sha256', token).update(`cocell-operator-v1\0${legacyExpiry}`).digest('base64url');
+  const legacy = await app.request(`${origin}/api/data`, { headers: { cookie: `cocell_operator=v1.${legacyExpiry}.${legacySignature}` } });
+  assert.equal(legacy.status, 200);
+  assert.match(legacy.headers.get('set-cookie')!, /Max-Age=2592000/);
+
+  now = initialExpiry;
+  const expired = await app.request(`${origin}/api/data`, { headers: { cookie: initialCookie } });
+  assert.equal(expired.status, 401);
+  assert.equal(expired.headers.get('set-cookie'), null);
+  assert.equal((await app.request(`${origin}/api/data`, { headers: { cookie: renewedCookie } })).status, 200);
+  const rotated = setup({ token: 'rotated-operator-token-with-at-least-32-characters' });
+  const revoked = await rotated.app.request(`${origin}/api/data`, { headers: { cookie: renewedCookie } });
+  assert.equal(revoked.status, 401);
+  assert.equal(revoked.headers.get('set-cookie'), null);
+});
+
+test('an authenticated browser skips the login form and keeps a safe return target', async () => {
+  const { app } = setup();
+  const cookie = (await login(app)).headers.get('set-cookie')!.split(';')[0];
+  for (const [next, expected] of [['/page', '/page'], ['/auth/login', '/'], ['//evil.example/path', '/']]) {
+    const response = await app.request(`${origin}/auth/login?next=${encodeURIComponent(next)}`, { headers: { cookie } });
+    assert.equal(response.status, 303);
+    assert.equal(response.headers.get('location'), expected);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+  }
 });
 
 test('rejects tampered cookies, login CSRF, and cookie write CSRF', async () => {

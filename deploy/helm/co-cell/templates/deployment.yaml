@@ -1,5 +1,13 @@
+{{- $shared := .Values.sharedDirectory | default (dict "enabled" false "hostPath" "" "nodeName" "") -}}
 {{- if and (not .Values.image.tag) (not .Values.image.digest) -}}
 {{- fail "Set image.tag or image.digest" -}}
+{{- end -}}
+{{- if $shared.enabled -}}
+{{- $_ := required "Set sharedDirectory.hostPath" $shared.hostPath -}}
+{{- $_ := required "Set sharedDirectory.nodeName to the Cellbox profile node" $shared.nodeName -}}
+{{- if and (index .Values.nodeSelector "kubernetes.io/hostname") (ne (index .Values.nodeSelector "kubernetes.io/hostname") $shared.nodeName) -}}
+{{- fail "nodeSelector hostname must match sharedDirectory.nodeName" -}}
+{{- end -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -16,6 +24,8 @@ spec:
       {{- include "co-cell.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      annotations:
+        checksum/mounts: {{ dict "sharedDirectory" $shared | toJson | sha256sum | quote }}
       labels:
         {{- include "co-cell.selectorLabels" . | nindent 8 }}
     spec:
@@ -77,6 +87,8 @@ spec:
               value: /app/data/credentials
             - name: RUNTIME_LOG_DIRECTORY
               value: /app/data/logs
+            - name: COCELL_MOUNTS_CONFIG
+              value: /etc/co-cell/mounts/mounts.json
             - name: NOTIFICATIONS_DATA_PATH
               value: /app/data/notifications.json
             - name: CELLBOX_API_TOKEN
@@ -147,17 +159,37 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            - name: mounts-config
+              mountPath: /etc/co-cell/mounts
+              readOnly: true
             - name: data
               mountPath: /app/data
             - name: tmp
               mountPath: /tmp
+            {{- if $shared.enabled }}
+            - name: shared
+              mountPath: /app/shared
+            {{- end }}
       volumes:
+        - name: mounts-config
+          configMap:
+            name: {{ include "co-cell.fullname" . }}-mounts
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "co-cell.pvcName" . }}
         - name: tmp
           emptyDir: {}
-      {{- with .Values.nodeSelector }}
+        {{- if $shared.enabled }}
+        - name: shared
+          hostPath:
+            path: {{ $shared.hostPath | quote }}
+            type: Directory
+        {{- end }}
+      {{- $selectors := deepCopy .Values.nodeSelector }}
+      {{- if $shared.enabled }}
+      {{- $_ := set $selectors "kubernetes.io/hostname" $shared.nodeName }}
+      {{- end }}
+      {{- with $selectors }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}

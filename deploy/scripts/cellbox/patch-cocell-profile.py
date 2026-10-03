@@ -8,6 +8,7 @@ import re
 import sys
 
 from proxy_tools import load_proxy_tools
+from mount_config import load_mount_config
 
 profile_id, image, sample_path, proxy_config, base_image = sys.argv[1:]
 if not re.fullmatch(r"[^\s@]+@sha256:[a-f0-9]{64}", image):
@@ -30,6 +31,14 @@ read_only_path = os.environ.get("COCELL_DEBUG_READ_ONLY_HOST_PATH", "")
 read_write_path = os.environ.get("COCELL_DEBUG_READ_WRITE_HOST_PATH", "")
 if read_only_path or read_write_path:
     raise SystemExit("Project Secret management requires isolated debug homes; remove debug host mount options")
+shared = load_mount_config()
+if shared is not None:
+    if shared["enabled"]:
+        if shared["nodeName"] != profile["nodeName"]:
+            raise SystemExit("Mount config nodeName must match the Cellbox profile nodeName")
+        profile["sharedReadOnlyHostPath"] = shared["hostPath"]
+    else:
+        profile.pop("sharedReadOnlyHostPath", None)
 profile.pop("debugReadOnlyHostPath", None)
 profile.pop("debugReadWriteHostPath", None)
 guest = profile.setdefault("guest", {})
@@ -38,6 +47,10 @@ guest["debug"] = sample["guest"]["debug"]
 guest.pop("debugHome", None)
 guest["workspace"] = sample["guest"]["workspace"]
 guest["command"] = sample["guest"]["command"]
+if profile.get("sharedReadOnlyHostPath"):
+    guest.setdefault("env", {})["COCELL_LAUNCHER_SHARED_DIRECTORY"] = "/var/lib/cellbox/shared"
+else:
+    guest.setdefault("env", {}).pop("COCELL_LAUNCHER_SHARED_DIRECTORY", None)
 guest["tools"] = [tool for tool in guest.get("tools", []) if tool["id"] not in owned_ids] + [tool["profile"] for tool in proxy_tools]
 profile["image"] = image
 json.dump({} if profile == before else {"api": {"config": config}}, sys.stdout)

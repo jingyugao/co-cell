@@ -34,7 +34,7 @@ if [[ -z "$image_tag" ]]; then
   image_tag="k8s-$(date -u +%Y%m%d-%H%M%S)-${git_sha}"
 fi
 
-for command in curl docker helm git kubectl; do
+for command in curl docker helm git kubectl uv; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "required command not found: $command" >&2
     exit 1

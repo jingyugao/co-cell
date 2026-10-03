@@ -22,6 +22,9 @@ import { modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
 import { SecretCrypto } from './secrets/crypto.js';
 import { SecretService } from './secrets/service.js';
+import { SharedFiles } from './shared-files/service.js';
+import { publishSharedDirectory } from './shared-files/mount.js';
+import { loadSharedMountConfig } from './shared-files/config.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 const mysqlUrl = process.env.MYSQL_URL?.trim() ?? '';
@@ -55,6 +58,10 @@ const cellboxKind=process.env.CELLBOX_KIND??'k8s-resumable';
 if(cellboxKind!=='k8s-resumable')throw new Error('This CoCell Cellbox adapter requires CELLBOX_KIND=k8s-resumable');
 const cocellPublicUrl = process.env.COCELL_PUBLIC_URL || `http://127.0.0.1:${port}`;
 const appServerArguments=appServerArgs(modelConfig, configOverrides).slice(1);
+const appServerEnv = {...(apiKey?{CODEX_API_KEY:apiKey}:{}),...(process.env.OPENAI_BASE_URL?{OPENAI_BASE_URL:process.env.OPENAI_BASE_URL}:{})};
+const sharedDirectory = await loadSharedMountConfig();
+const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
+if (sharedDirectory) await publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
 for(const name of ['CELLBOX_API_URL','CELLBOX_API_TOKEN','CELLBOX_PROFILE','COCELL_ACCESS_TOKEN'])if(!process.env[name])throw new Error(name+' is required for Cellbox Kubernetes mode');
 if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOKEN must contain at least 32 bytes');
 const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,token:process.env.CELLBOX_API_TOKEN!,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',stateDirectory:resolve('data/cellbox-operations')});
@@ -65,8 +72,8 @@ const secrets = new SecretService(webState.secretRepository, secretCrypto, id =>
   return Boolean(project && project.status !== 'archived' && project.sandbox?.id === boxId);
 });
 const cellboxRuntime=new CellboxRuntimeIntegration({provider:cellboxProvider,profileId:process.env.CELLBOX_PROFILE!,appServerArgs:appServerArguments,
-  env:{...(apiKey?{CODEX_API_KEY:apiKey}:{}),...(process.env.OPENAI_BASE_URL?{OPENAI_BASE_URL:process.env.OPENAI_BASE_URL}:{})},
-  secrets, toolBrokerUrl,
+  env:appServerEnv, sharedDirectory,
+  secrets, toolBrokerUrl, logger: runtimeLog,
   onRenewalFailure:error=>{void runtimeLog.write({event:'sandbox.cellbox_renewal_failed',error});}});
 const provider = cellboxProvider;
 const inventory = new CellboxSandboxInventory(cellboxProvider);
@@ -88,7 +95,6 @@ if (process.env.OPENAI_BASE_URL) {
     } else runtimeLog.write({ event: 'models.discovery_failed', status: response.status });
   } catch (error) { runtimeLog.write({ event: 'models.discovery_failed', error }); }
 }
-
 const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_MS ?? 60 * 60 * 1000);
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
 const sandboxManager = new SandboxManager({ provider, logger: runtimeLog, policy: { autoCheckpointAfterMs }, lifecycle: cellboxRuntime.lifecycle });
@@ -97,9 +103,10 @@ const notifications = new NotificationStore(process.env.NOTIFICATIONS_DATA_PATH 
 await notifications.init();
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
   logger: runtimeLog, baseUrl: process.env.OPENAI_BASE_URL, modelConfig, configOverrides,
-  ...(process.env.SHARED_DATA_DIRECTORY ? { sharedDataDirectory: pathToFileURL(`${resolve(process.env.SHARED_DATA_DIRECTORY)}/`) } : {}),
+  sharedDataDirectory: pathToFileURL(`${sharedDataRoot}/`),
+  ...(sharedDirectory ? { sharedFilesMounted: (id: string) => cellboxRuntime.usesSharedDirectory(id) } : {}),
   appServer, paths:CELLBOX_PRODUCT_PATHS, prepareRemote:(handle,target,signal)=>cellboxRuntime.prepare(handle,target,signal),
-  acquireRemoteUsage:id=>cellboxRuntime.acquireUsage(id), remoteArchives:cellboxRuntime.remoteArchives,
+  acquireRemoteUsage:(id, initializationDirectory)=>cellboxRuntime.acquireUsage(id, initializationDirectory), remoteArchives:cellboxRuntime.remoteArchives,
   serviceAccess:(id:string,port:number)=>cellboxProvider.getServiceAccess(id,port,'cocell-preview',120) });
 const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || 'data/web-state');
 const webImagesDirectory = resolve(process.env.CODEX_WEB_IMAGES_DIR || 'data/images');
@@ -135,7 +142,7 @@ const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
-  inventory, undefined, undefined, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,provider:cellboxProvider,projects:()=>manager.listProjects() }, imageCatalog, secrets);
+  inventory, new SharedFiles(sharedDataRoot, sharedDirectory), undefined, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,provider:cellboxProvider,projects:()=>manager.listProjects() }, imageCatalog, secrets);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }

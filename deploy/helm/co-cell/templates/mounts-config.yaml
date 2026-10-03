@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "co-cell.fullname" . }}-mounts
+  labels:
+    {{- include "co-cell.labels" . | nindent 4 }}
+data:
+  mounts.json: {{ dict "sharedDirectory" (.Values.sharedDirectory | default (dict "enabled" false "hostPath" "" "nodeName" "")) | toJson | quote }}

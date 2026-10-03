@@ -75,7 +75,10 @@ test('Cellbox service preview requires operator access and isolates sandbox head
   assert.match(response.headers.get('content-security-policy') ?? '', /^sandbox /);
 });
 
-test('preview subdomain routes a signed project and port and grants browser access without exposing the operator cookie', async () => {
+test('preview subdomain routes a signed project and port and grants browser access without exposing the operator cookie', async t => {
+  const day = 24 * 60 * 60 * 1000;
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
   const projectId = '11111111-1111-4111-8111-111111111111';
   const manager = {
     dataDirectory: '/tmp/cocell-access-test', listProjects: () => [],
@@ -115,6 +118,7 @@ test('preview subdomain routes a signed project and port and grants browser acce
   assert.equal(previewGrant.headers.get('location'), serviceUrl);
   const previewCookie = previewGrant.headers.getSetCookie().find(value => value.startsWith('cocell_preview='))!;
   assert.match(previewCookie, /Domain=cocell\.example\.test/i);
+  assert.match(previewCookie, /Max-Age=2592000/);
   const response = await app.request(serviceUrl, { headers: { cookie: previewCookie.split(';')[0] } });
   assert.equal(response.status, 200);
   assert.equal(await response.text(), 'verified');
@@ -134,4 +138,30 @@ test('preview subdomain routes a signed project and port and grants browser acce
   const oldSignature = createHmac('sha256', token).update(`cocell-service-host-v1\0${oldPayload}`).digest('hex').slice(0, 12);
   const oldUrl = `https://p${oldPayload}${oldSignature}.cocell.example.test/verify.txt?check=1`;
   assert.equal((await app.request(oldUrl, { headers: { authorization: `Bearer ${token}` } })).status, 200);
+
+  now += day;
+  const renewed = await app.request(serviceUrl, { headers: { cookie: previewCookie.split(';')[0] } });
+  assert.equal(renewed.status, 200);
+  assert.equal(await renewed.text(), 'verified');
+  const renewedCookies = renewed.headers.getSetCookie();
+  assert.equal(renewedCookies.length, 1);
+  assert.match(renewedCookies[0], /^cocell_preview=/);
+  assert.match(renewedCookies[0], /Domain=cocell\.example\.test/i);
+  assert.match(renewedCookies[0], /Max-Age=2592000/);
+  assert.equal(Number(renewedCookies[0].split('.')[1]), now + 30 * day);
+  assert.equal(renewed.headers.get('cache-control'), 'no-store');
+
+  const root = await app.request(`${publicUrl}/api/config`, { headers: {
+    cookie: `${operatorCookie}; ${previewCookie.split(';')[0]}`,
+  } });
+  assert.equal(root.status, 200);
+  const rootCookies = root.headers.getSetCookie();
+  assert.equal(rootCookies.length, 2);
+  assert.doesNotMatch(rootCookies.find(value => value.startsWith('cocell_operator='))!, /Domain=/i);
+  assert.match(rootCookies.find(value => value.startsWith('cocell_preview='))!, /Domain=cocell\.example\.test/i);
+
+  now += 30 * day;
+  const expired = await app.request(serviceUrl, { headers: { cookie: renewedCookies[0].split(';')[0] } });
+  assert.equal(expired.status, 303);
+  assert.equal(expired.headers.get('set-cookie'), null);
 });

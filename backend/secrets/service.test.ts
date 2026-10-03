@@ -48,6 +48,10 @@ export class MemorySecrets implements SecretRepository {
     const key = `${boxId}:${generation}`;
     this.configs.set(key, { ...this.configs.get(key), [slot]: digest });
   }
+  async markRuntimeConfigs(boxId: string, generation: number, digests: Record<string, string>) {
+    const key = `${boxId}:${generation}`;
+    this.configs.set(key, { ...this.configs.get(key), ...digests });
+  }
   async forgetRuntime(boxId: string) {
     this.runtimes.delete(boxId);
     for (const key of this.configs.keys()) if (key.startsWith(`${boxId}:`)) this.configs.delete(key);

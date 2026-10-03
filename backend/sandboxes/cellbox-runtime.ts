@@ -11,6 +11,7 @@ import { downloadOssArchive } from '../archives/oss-download.js';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
 import { SandboxRuntimeConfig, type SandboxRuntimeConfigOptions } from './runtime-config.js';
+import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 const q = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const node = '/usr/local/bin/node';
 const workspace = '/home/agent/workspace';
@@ -22,6 +23,8 @@ export interface CellboxRuntimeIntegrationOptions extends SandboxRuntimeConfigOp
     env: Record<string, string>;
     lifecycle?: SandboxLifecycle;
     onRenewalFailure?: (error: unknown) => void;
+    logger?: RuntimeLog;
+    sharedDirectory?: boolean;
 }
 /** Product initialization. Cellbox retains ownership of identities, forwarding and archive bytes. */
 export class CellboxRuntimeIntegration {
@@ -29,21 +32,26 @@ export class CellboxRuntimeIntegration {
     readonly remoteArchives: RemoteArchives;
     private readonly preparations = new Map<string, Promise<void>>();
     private readonly prepared = new Map<string, { generation: number; workspace: string }>();
+    private readonly sharedMounts = new Set<string>();
     private readonly releases = new Set<() => Promise<void>>();
     constructor(private readonly options: CellboxRuntimeIntegrationOptions) {
-        this.lifecycle = options.lifecycle ?? new SandboxLifecycle([new SandboxRuntimeConfig(options).extension]);
+        const runtimeConfig = new SandboxRuntimeConfig(options);
+        this.lifecycle = options.lifecycle ?? new SandboxLifecycle([runtimeConfig.extension]);
         const ossArchiveEndpoint = process.env.OSS_ENDPOINT;
         this.remoteArchives = {
         capture: async (target, key) => {
                 if (!target.sandbox)
                     throw new Error('Project has no Cellbox');
-                if (ossArchiveEndpoint && (await options.provider.client.getBox(target.sandbox.id)).capabilities.protectedTools) {
+                const capabilities = ossArchiveEndpoint ? (await options.provider.client.getBox(target.sandbox.id)).capabilities : undefined;
+                if (capabilities?.protectedTools) {
+                    await runtimeConfig.ensureArchiveCredentials(target.sandbox.id);
                     const suffix = `${target.projectId ?? target.id}/${key.replace(/[^A-Za-z0-9._/-]/g, '_')}.tar.gz`;
-                    // The protected tool runs as Cellbox's debug identity with the
-                    // agent group. Codex keeps its state in owner-only directories;
-                    // grant that group read access after readiness preparation.
-                    const handle = await options.provider.connectForSetup(target.sandbox.id);
-                    await handle.commands.run(`chmod -R g+rX -- ${workspace}`, { timeoutMs: 120_000 });
+                    // Root debug reads private Codex state directly. Existing
+                    // non-root debug boxes still require agent-group read access.
+                    if (!capabilities.rootDebug) {
+                        const handle = await options.provider.connectForSetup(target.sandbox.id);
+                        await handle.commands.run(`chmod -R g+rX -- ${workspace}`, { timeoutMs: 120_000 });
+                    }
                     const result = await options.provider.client.runTool(target.sandbox.id, 'cocell_archive_backup', [suffix], 5 * 60_000);
                     if (result.exitCode !== 0) throw new Error(result.stderr || `OSS archive backup exited ${result.exitCode}`);
                     const value = JSON.parse(result.stdout.trim());
@@ -71,14 +79,17 @@ export class CellboxRuntimeIntegration {
                         const createContext: SandboxLifecycleContext = { action: 'create', resourceKey: context.resourceKey };
                         let candidate!: SandboxState;
                         await this.lifecycle.run(createContext, async () => {
-                            const handle = await options.provider.create(options.profileId, { timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false }, metadata: { projectId: target.projectId ?? target.id, cellboxOwnerKey: `project:${target.projectId ?? target.id}:oss-restore:${key}`, cellboxIdempotencyKey: key } });
+                            const handle = await options.provider.create(options.profileId, { timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false }, metadata: { projectId: target.projectId ?? target.id, cellboxOwnerKey: `project:${target.projectId ?? target.id}:oss-restore:${key}`, cellboxIdempotencyKey: key, ...(options.sharedDirectory ? { cellboxStaged: 'true' } : {}) } });
                             candidate = { id: handle.sandboxId, template: options.profileId, status: 'starting', workingDirectory: workspace };
                             await onCandidate(candidate);
                             createContext.sandboxId = context.sandboxId = candidate.id;
                             createContext.sandbox = handle;
                         });
-                        const result = await options.provider.client.runTool(candidate.id, 'cocell_archive_restore', [JSON.stringify(ref.metadata), ossArchiveEndpoint], 5 * 60_000);
-                        if (result.exitCode !== 0) throw new Error(result.stderr || `OSS archive restore exited ${result.exitCode}`);
+                        await this.timed('archive.restore_oss', candidate.id, async () => {
+                            await runtimeConfig.ensureArchiveCredentials(candidate.id);
+                            const result = await options.provider.client.runTool(candidate.id, 'cocell_archive_restore', [JSON.stringify(ref.metadata), ossArchiveEndpoint], 5 * 60_000);
+                            if (result.exitCode !== 0) throw new Error(result.stderr || `OSS archive restore exited ${result.exitCode}`);
+                        });
                         candidate.image = await options.provider.currentImageIdentity(candidate.id);
                         return candidate;
                     }
@@ -86,7 +97,7 @@ export class CellboxRuntimeIntegration {
                     const candidate: SandboxState = { id: op.targetId, template: options.profileId, status: 'starting', workingDirectory: target.settings.workingDirectory };
                     await onCandidate(candidate);
                     context.sandboxId = candidate.id;
-                    await options.provider.waitForOperation(op);
+                    await this.timed('cellbox.restore_operation', candidate.id, () => options.provider.waitForOperation(op));
                     const box = await options.provider.client.getBox(candidate.id);
                     if (box.phase !== 'staged')
                         throw new Error('Cellbox did not return a staged restore candidate');
@@ -99,9 +110,10 @@ export class CellboxRuntimeIntegration {
                     const handle = await options.provider.connectForSetup(candidate.id);
                     await this.prepare(handle, { id: candidate.id, settings: { workingDirectory: candidate.workingDirectory }, sandbox: candidate, updatedAt: new Date().toISOString() }, AbortSignal.timeout(120000), false);
                     const box = await options.provider.client.getBox(candidate.id);
-                    if (box.phase === 'staged') await options.provider.activateBox(candidate.id, `cocell-activate-${candidate.id}`);
+                    if (box.phase === 'staged') await this.timed('cellbox.activate', candidate.id,
+                        () => options.provider.activateBox(candidate.id, `cocell-activate-${candidate.id}`));
                     else if (box.phase !== 'running') throw new Error(`Cellbox restore candidate is ${box.phase}`);
-                    await this.waitForAppServer(handle, AbortSignal.timeout(30000));
+                    if (!this.usesSharedDirectory(candidate.id)) await this.waitForAppServer(handle, AbortSignal.timeout(30000));
                 });
             },
             download: async (ref, destination) => {
@@ -131,6 +143,8 @@ export class CellboxRuntimeIntegration {
         const current = previous.catch(() => { }).then(async () => {
             const box = await this.options.provider.client.getBox(handle.sandboxId);
             if (box.phase !== 'running' && box.phase !== 'staged') throw new Error(`Cellbox is ${box.phase}`);
+            if (this.options.sharedDirectory && box.capabilities.sharedDirectory) this.sharedMounts.add(handle.sandboxId);
+            else this.sharedMounts.delete(handle.sandboxId);
             const cached = this.prepared.get(handle.sandboxId);
             fresh = !cached || cached.generation !== box.generation || cached.workspace !== target.settings.workingDirectory;
             if (fresh) await this.prepareOnce(handle, target, signal, wait);
@@ -138,7 +152,7 @@ export class CellboxRuntimeIntegration {
         });
         this.preparations.set(handle.sandboxId, current);
         try {
-            await current;
+            await this.timed('product.prepare', handle.sandboxId, () => current);
         }
         finally {
             if (this.preparations.get(handle.sandboxId) === current)
@@ -150,6 +164,15 @@ export class CellboxRuntimeIntegration {
         if (posix.normalize(target.settings.workingDirectory) !== target.settings.workingDirectory || (target.settings.workingDirectory !== workspace && !target.settings.workingDirectory.startsWith(workspace + '/')))
             throw new Error(`Cellbox project workspace must be inside ${workspace}`);
         signal.throwIfAborted();
+        if (this.usesSharedDirectory(handle.sandboxId)) {
+            // Guest/Launcher prepare standard directories and read the shared
+            // startup config locally. Only a custom project subdirectory needs exec.
+            if (target.settings.workingDirectory !== workspace) {
+                const script = `const fs=require('node:fs'),path=require('node:path');let p=${JSON.stringify(workspace)};for(const part of ${JSON.stringify(target.settings.workingDirectory.slice(workspace.length + 1).split('/'))}){p=path.join(p,part);try{fs.mkdirSync(p,{mode:0o700})}catch(e){if(e.code!=='EEXIST')throw e}const s=fs.lstatSync(p);if(!s.isDirectory()||s.isSymbolicLink()||s.uid!==process.getuid())throw Error('Unsafe project directory');}`;
+                await handle.commands.run(`${node} -e ${q(script)}`, { user: 'agent', signal, timeoutMs: 30000 });
+            }
+            return;
+        }
         const root = CELLBOX_PRODUCT_PATHS.root, runtime = CELLBOX_PRODUCT_PATHS.startup;
         const setup = `const fs=require('node:fs'),path=require('node:path');for(const p of ${JSON.stringify([root, CELLBOX_PRODUCT_PATHS.runtime, runtime, CELLBOX_PRODUCT_PATHS.codexHome, target.settings.workingDirectory])}){let current='/';for(const part of p.split('/').filter(Boolean)){current=path.join(current,part);try{fs.mkdirSync(current,{mode:0o700})}catch(e){if(e.code!=='EEXIST')throw e}const s=fs.lstatSync(current);if(!s.isDirectory()||s.isSymbolicLink())throw Error('Unsafe runtime directory');}if(fs.statSync(p).uid!==process.getuid())throw Error('Unsafe runtime owner');}fs.chmodSync(${JSON.stringify(root)},0o700);fs.chmodSync(${JSON.stringify(runtime)},0o700);`;
         await handle.commands.run(`${node} -e ${q(setup)}`, { user: 'agent', signal, timeoutMs: 30000 });
@@ -178,6 +201,7 @@ export class CellboxRuntimeIntegration {
             await handle.files.remove(temp, { user: 'agent' }).catch(() => { });
         }
     }
+    usesSharedDirectory(boxId: string): boolean { return this.sharedMounts.has(boxId); }
     /** Reconcile active instances after operator configuration changes; never wake paused boxes. */
     async reconcile(target: WorkspaceTarget): Promise<void> {
         if (!target.sandbox) return;
@@ -188,16 +212,28 @@ export class CellboxRuntimeIntegration {
     }
     private async waitForAppServer(handle: SandboxHandle, signal: AbortSignal) {
         const script = `const fs=require('node:fs'),net=require('node:net');const until=Date.now()+25000;function poll(){const s=net.connect(4500,'127.0.0.1');s.once('connect',()=>{s.end();if(fs.existsSync('${CELLBOX_PRODUCT_PATHS.startup}/config.json')){console.error('Startup config was not consumed');process.exit(1)}process.exit(0)});s.once('error',()=>{s.destroy();if(Date.now()>until){console.error('App Server did not become ready');process.exit(1)}setTimeout(poll,200)});s.setTimeout(500,()=>s.destroy(new Error('timeout')))}poll();`;
-        await handle.commands.run(`${node} -e ${q(script)}`, { user: 'agent', signal, timeoutMs: 30000 });
+        await this.timed('product.appserver_ready', handle.sandboxId,
+            () => handle.commands.run(`${node} -e ${q(script)}`, { user: 'agent', signal, timeoutMs: 30000 }));
     }
     async appServer(boxId: string): Promise<AppServerEndpoint> {
+        const internal = await this.options.provider.getInternalServiceAccess(boxId, 4500);
+        if (internal) {
+            const url = new URL(internal.url);
+            url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+            return { url: url.href, headers: internal.headers };
+        }
         const access = await this.options.provider.getServiceAccess(boxId, 4500, 'cocell-app-server', 180);
         const release = this.keepAlive(() => access.renew(180).then(() => { }), () => access.revoke());
         const url = new URL(access.url);
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         return { url: url.href, headers: access.headers, release };
     }
-    async acquireUsage(boxId: string): Promise<() => Promise<void>> {
+    async acquireUsage(boxId: string, initializationDirectory?: string): Promise<() => Promise<void>> {
+        // Mounted default-workspace initialization does no remote I/O. The
+        // project usage remains held locally; the subsequent RPC holds an API
+        // stream fence. Custom directories, legacy setup and execution keep leases.
+        if (initializationDirectory === workspace && this.options.sharedDirectory &&
+            (await this.options.provider.client.getBox(boxId)).capabilities.sharedDirectory) return async () => {};
         const lease = await this.options.provider.createLease(boxId, 'cocell-product', 180);
         return this.keepAlive(() => this.options.provider.renewLease(lease.id, 'cocell-product', 180).then(() => { }), () => this.options.provider.releaseLease(lease.id));
     }
@@ -212,14 +248,25 @@ export class CellboxRuntimeIntegration {
         this.releases.add(release);
         return release;
     }
-    async verify(boxId: string) { const endpoint = await this.appServer(boxId); let client: CodexAppServerClient | undefined; try {
+    private async timed<T>(phase: string, sandboxId: string, action: () => Promise<T>): Promise<T> {
+        const startedAt = new Date().toISOString();
+        const started = performance.now();
+        let status = 'succeeded';
+        try { return await action(); }
+        catch (error) { status = 'failed'; throw error; }
+        finally {
+            void this.options.logger?.write({ event: 'sandbox.runtime_stage', phase, sandboxId, status,
+                startedAt, finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - started) });
+        }
+    }
+    async verify(boxId: string) { return this.timed('product.verify', boxId, async () => {
+      const endpoint = await this.appServer(boxId); let client: CodexAppServerClient | undefined; try {
         client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: endpoint.headers, requestTimeoutMs: 10000 });
-        await client.request('thread/list', { limit: 1 });
     }
     finally {
         await client?.close();
         await endpoint.release?.();
-    } }
+    } }); }
     async close() {
         await Promise.allSettled([...this.releases].map(release => release()));
         this.prepared.clear();

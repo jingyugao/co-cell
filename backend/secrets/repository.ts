@@ -28,6 +28,7 @@ export interface SecretRepository {
   runtime(boxId: string): Promise<{ projectId: string; generation: number } | null>;
   runtimeConfig(boxId: string, generation: number): Promise<Record<string, string>>;
   markRuntimeConfig(boxId: string, generation: number, slot: string, digest: string): Promise<void>;
+  markRuntimeConfigs(boxId: string, generation: number, digests: Record<string, string>): Promise<void>;
   forgetRuntime(boxId: string): Promise<void>;
   startInvocation(value: StoredInvocation): Promise<void>;
   invocation(id: string): Promise<StoredInvocation | null>;
@@ -127,7 +128,14 @@ export class MySqlSecretRepository implements SecretRepository {
     return Object.fromEntries(rows.map(row => [row.slot as string, row.digest as string]));
   }
   async markRuntimeConfig(boxId: string, generation: number, slot: string, digest: string) {
-    await this.pool.query('INSERT INTO sandbox_runtime_configs(box_id,generation,slot,digest,applied_at) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE digest=VALUES(digest),applied_at=VALUES(applied_at)', [boxId, generation, slot, digest, new Date().toISOString()]);
+    await this.markRuntimeConfigs(boxId, generation, { [slot]: digest });
+  }
+  async markRuntimeConfigs(boxId: string, generation: number, digests: Record<string, string>) {
+    const entries = Object.entries(digests);
+    if (!entries.length) return;
+    const now = new Date().toISOString();
+    await this.pool.query(`INSERT INTO sandbox_runtime_configs(box_id,generation,slot,digest,applied_at) VALUES ${entries.map(() => '(?,?,?,?,?)').join(',')} ON DUPLICATE KEY UPDATE digest=VALUES(digest),applied_at=VALUES(applied_at)`,
+      entries.flatMap(([slot, digest]) => [boxId, generation, slot, digest, now]));
   }
   async forgetRuntime(boxId: string) { await this.pool.query('DELETE FROM project_tool_runtimes WHERE box_id=?', [boxId]); }
   async startInvocation(value: StoredInvocation) { await this.pool.query('INSERT INTO tool_invocations(id,project_id,document) VALUES(?,?,CAST(? AS JSON))', [value.id, value.projectId, JSON.stringify(value)]); }

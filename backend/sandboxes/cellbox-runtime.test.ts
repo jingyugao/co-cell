@@ -20,6 +20,28 @@ const target = { id: 'project-1', projectId: 'project-1', settings: { workingDir
     workingDirectory: '/home/agent/workspace/project-1' } };
 const result = { stdout: '', stderr: '', exitCode: 0 };
 
+test('mounted startup does no remote config transfer or default-directory preparation; old boxes still work', async () => {
+  const { handle, commands, files } = fakeHandle();
+  let mounted = true;
+  const { provider } = fakeProvider();
+  provider.client.getBox = async () => ({ phase: 'running', generation: 1,
+    capabilities: { sharedDirectory: mounted } }) as Awaited<ReturnType<typeof provider.client.getBox>>;
+  const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {}, sharedDirectory: true });
+  const rootTarget = { ...target, settings: { workingDirectory: '/home/agent/workspace' } };
+  await runtime.prepare(handle, rootTarget, AbortSignal.timeout(5_000));
+  assert.equal(runtime.usesSharedDirectory('box-1'), true);
+  assert.equal(commands.length, 0);
+  assert.equal(files.size, 0);
+  await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
+  assert.equal(commands.length, 1);
+  assert(commands[0].command.includes('Unsafe project directory'));
+  mounted = false;
+  await runtime.prepare(handle, rootTarget, AbortSignal.timeout(5_000));
+  assert.equal(runtime.usesSharedDirectory('box-1'), false);
+  assert(commands.some(call => call.command.includes('Startup config was not consumed')));
+  await runtime.close();
+});
+
 function fakeHandle() {
   const commands: Array<{ command: string; options: Record<string, unknown> }> = [];
   const files = new Map<string, { bytes: Buffer; mode?: number }>();
@@ -87,6 +109,7 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
     activateBox: async () => { events.push('activate'); },
     captureArchive: async () => ({ result: { archiveId: archive.id } }),
     getServiceAccess: async () => access,
+    getInternalServiceAccess: async () => undefined,
     createLease: async () => ({ id: 'lease-1' }),
     renewLease: async () => { leaseRenews++; },
     releaseLease: async () => { leaseReleases++; },
@@ -218,16 +241,47 @@ test('grant and lease access renew while active and revoke or release on close',
   assert.deepEqual(counts(), { renews: 1, revokes: 1, leaseRenews: 1, leaseReleases: 1 });
 });
 
-test('OSS backup grants the agent group read access before running its protected tool', async () => {
+test('backend App Server access creates no browser grant or renewal timer', async () => {
+  const { provider, counts } = fakeProvider({
+    getInternalServiceAccess: async () => ({ url: 'http://cellbox.test/v1/boxes/box-1/services/4500/', headers: { Authorization: 'Bearer backend-client' } }),
+    getServiceAccess: async () => { assert.fail('internal connection created a browser grant'); },
+  });
+  const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {} });
+  const endpoint = await runtime.appServer('box-1');
+  assert.equal(endpoint.url, 'ws://cellbox.test/v1/boxes/box-1/services/4500/');
+  assert.deepEqual(endpoint.headers, { Authorization: 'Bearer backend-client' });
+  assert.equal(endpoint.release, undefined);
+  await runtime.close();
+  assert.deepEqual(counts(), { renews: 0, revokes: 0, leaseRenews: 0, leaseReleases: 0 });
+});
+
+test('mounted default-workspace initialization skips an empty remote lease; execution and custom setup retain it', async () => {
+  let leases = 0;
+  const { provider } = fakeProvider({
+    client: { getBox: async () => ({ capabilities: { sharedDirectory: true } }) },
+    createLease: async () => { leases++; return { id: 'lease-1' }; },
+  });
+  const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {}, sharedDirectory: true });
+  await (await runtime.acquireUsage('box-1', '/home/agent/workspace'))();
+  assert.equal(leases, 0);
+  await (await runtime.acquireUsage('box-1', '/home/agent/workspace/project'))();
+  await (await runtime.acquireUsage('box-1'))();
+  assert.equal(leases, 2);
+  await runtime.close();
+});
+
+test('OSS backup skips permission changes for root debug and supports existing non-root boxes', async () => {
   const previous = process.env.OSS_ENDPOINT;
   process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
   const { handle, commands } = fakeHandle();
   const fake = fakeProvider({ handle });
+  let rootDebug = true;
+  fake.provider.client.getBox = async () => ({ phase: 'running', generation: 1, capabilities: { protectedTools: true, rootDebug } }) as Awaited<ReturnType<typeof fake.provider.client.getBox>>;
   fake.provider.currentImageIdentity = async () => ({ reference: 'prepared:test', id: 'sha256:prepared', repoDigests: [] });
   fake.provider.client.runTool = async (_boxId, tool, args) => {
     assert.equal(tool, 'cocell_archive_backup');
     assert.deepEqual(args, ['project-1/capture-key.tar.gz']);
-    assert(commands.some(call => call.command === 'chmod -R g+rX -- /home/agent/workspace'));
+    assert.equal(commands.some(call => call.command === 'chmod -R g+rX -- /home/agent/workspace'), !rootDebug);
     return { ...result, stdout: JSON.stringify({ storageType: 'oss', objectKey: 'legacy-archives/project-1/capture-key.tar.gz',
       createdAt: '2026-09-27T00:00:00.000Z', sizeBytes: 10, sha256: 'a'.repeat(64) }) };
   };
@@ -236,6 +290,9 @@ test('OSS backup grants the agent group read access before running its protected
     const archive = await runtime.remoteArchives.capture(target, 'capture-key');
     assert.equal(archive.storageType, 'oss');
     assert.equal(archive.sourceSandboxId, target.sandbox.id);
+    assert.equal(commands.length, 0);
+    rootDebug = false;
+    await runtime.remoteArchives.capture(target, 'capture-key');
   } finally {
     await runtime.close();
     if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;
@@ -271,23 +328,32 @@ test('restore records candidate before waiting, activates after setup, and verif
   } finally { await rm(directory, { recursive: true, force: true }); await runtime.close(); }
 });
 
-test('OSS restore provisions admitted credentials before invoking the tool and uses the product workspace', async () => {
+test('mounted OSS restore holds startup until extraction completes and provisions tools first', async () => {
   const previous = { endpoint: process.env.OSS_ENDPOINT, access: process.env.OSS_ACCESS_KEY, secret: process.env.OSS_SECRET_KEY };
   process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
   process.env.OSS_ACCESS_KEY = 'test-access';
   process.env.OSS_SECRET_KEY = 'test-secret';
-  const fake = fakeProvider();
-  const { handle } = fakeHandle();
-  fake.provider.create = async () => handle;
+  const { handle, commands } = fakeHandle();
+  const fake = fakeProvider({ handle });
+  fake.provider.client.getBox = async () => ({ phase: 'staged', generation: 1,
+    capabilities: { protectedTools: true, sharedDirectory: true } }) as Awaited<ReturnType<typeof fake.provider.client.getBox>>;
+  fake.provider.create = async (_profile, options) => {
+    assert.equal(options?.metadata?.cellboxStaged, 'true');
+    fake.events.push('create-staged');
+    return handle;
+  };
   fake.provider.currentImageIdentity = async () => ({ reference: 'prepared:test', id: 'sha256:prepared', repoDigests: [] });
   fake.provider.client.runTool = async (_boxId, tool) => {
     assert.equal(tool, 'cocell_archive_restore');
     assert.deepEqual(fake.credentialWrites.map(write => [write.slot, write.bytes.toString()]), [
       ['oss_access', 'test-access'], ['oss_secret', 'test-secret'],
     ]);
+    assert(!fake.events.includes('activate'));
+    fake.events.push('extract');
     return result;
   };
   const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {},
+    sharedDirectory: true,
     connections: { readRuntimeBundle: async () => null } as unknown as ConnectionStore,
     credentialSlots: { __ossAccessKey: 'oss_access', __ossSecretKey: 'oss_secret' } });
   try {
@@ -299,6 +365,9 @@ test('OSS restore provisions admitted credentials before invoking the tool and u
       assert.equal(value.workingDirectory, '/home/agent/workspace');
     });
     assert.equal(candidate.workingDirectory, '/home/agent/workspace');
+    await runtime.remoteArchives.activate(candidate);
+    assert(fake.events.indexOf('extract') < fake.events.indexOf('activate'));
+    assert.equal(commands.length, 0);
   } finally {
     await runtime.close();
     for (const [key, value] of Object.entries({ OSS_ENDPOINT: previous.endpoint,

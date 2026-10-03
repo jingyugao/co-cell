@@ -1,0 +1,7 @@
+{
+  "sharedDirectory": {
+    "enabled": false,
+    "hostPath": "/var/lib/co-cell/shared",
+    "nodeName": "REPLACE_WITH_CELLBOX_NODE"
+  }
+}

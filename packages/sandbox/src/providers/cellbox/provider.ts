@@ -180,13 +180,14 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     if (!ownerKey) throw new CellboxError('INVALID_REQUEST', 'Create requires a project, session, or explicit Cellbox owner key');
     const journal = options.metadata?.cellboxIdempotencyKey ? undefined : await this.createJournal(ownerKey);
     const key = options.metadata?.cellboxIdempotencyKey ?? journal!.record.key;
-    const op = await this.client.createBox({ profileId: this.profileId, ownerKey, ...(options.metadata?.cellboxImportedImageId ? { importedImageId: options.metadata.cellboxImportedImageId } : {}) }, key);
+    const staged = options.metadata?.cellboxStaged === 'true';
+    const op = await this.client.createBox({ profileId: this.profileId, ownerKey, ...(staged ? { staged: true } : {}), ...(options.metadata?.cellboxImportedImageId ? { importedImageId: options.metadata.cellboxImportedImageId } : {}) }, key);
     if (journal && journal.record.boxId !== op.targetId)
       await this.saveCreateJournal(journal.path, { key, boxId: op.targetId });
     await this.wait(op);
     const box = await this.box(op.targetId);
     if (box.phase === 'suspended') return this.connect(box.id);
-    if (box.phase !== 'running') throw new CellboxError('CONFLICT', `Created box ${box.id} is ${box.phase}`);
+    if (box.phase !== 'running' && !(staged && box.phase === 'staged')) throw new CellboxError('CONFLICT', `Created box ${box.id} is ${box.phase}`);
     return this.handle(box);
   }
   async connect(id: string): Promise<SandboxHandle> {
@@ -291,6 +292,11 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     if (!Number.isInteger(port) || port < 1 || port > 65535 || port === 40000)
       throw new CellboxError('INVALID_REQUEST', 'Service port must be 1..65535 excluding 40000');
     return this.client.createRoute(id, port);
+  }
+  /** Backend connections use client authentication; previews still use scoped grants. */
+  async getInternalServiceAccess(id: string, port: number) {
+    await this.ready();
+    return this.profile?.capabilities.internalServices ? this.client.internalService(id, port) : undefined;
   }
   async getServiceAccess(id: string, port: number, subject: string, ttlSeconds = 900): Promise<CellboxServiceAccess> {
     if (!subject) throw new CellboxError('INVALID_REQUEST', 'Grant subject is required');

@@ -35,7 +35,7 @@ function setup(overrides: Partial<OperatorAccessOptions> = {}) {
 function login(app: Hono, next = '/') {
   return app.request(`${origin}/auth/login`, { method: 'POST',
     headers: { origin, 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ token, next }).toString(),
+    body: new URLSearchParams({ username: 'operator', token, next }).toString(),
   });
 }
 

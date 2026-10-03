@@ -256,7 +256,16 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     }
     c.header('Content-Security-Policy', "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     c.header('X-Content-Type-Options', 'nosniff');
-    return c.html(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="theme-color" content="#f8f8f7"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="CoCell"><link rel="manifest" href="/manifest.webmanifest"><link rel="icon" type="image/svg+xml" href="/icons/icon.svg"><link rel="apple-touch-icon" href="/icons/apple-touch-icon.png"><title>CoCell sign in</title></head><body><main><h1>CoCell sign in</h1><form method="post" action="/auth/login"><label>Access token <input type="password" name="token" autocomplete="current-password" required></label><input type="hidden" name="next" value="${escapeHtml(nextPath)}"><button type="submit">Sign in</button></form></main></body></html>`);
+    return c.html(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="theme-color" content="#f8f8f7"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="CoCell"><link rel="manifest" href="/manifest.webmanifest"><link rel="icon" type="image/svg+xml" href="/icons/icon.svg"><link rel="apple-touch-icon" href="/icons/apple-touch-icon.png"><title>CoCell sign in</title></head>
+<body><main><h1>CoCell sign in</h1>
+<form id="login-form" method="post" action="/auth/login" autocomplete="on">
+  <p><label for="username">Account</label> <input id="username" type="text" name="username" value="operator" autocomplete="username" autocapitalize="none" spellcheck="false" readonly></p>
+  <p><label for="password">Access token</label> <input id="password" type="password" name="token" autocomplete="current-password" required></p>
+  <input type="hidden" name="next" value="${escapeHtml(nextPath)}">
+  <button type="submit">Sign in</button>
+</form>
+<p>Save this login in your browser to fill the access token next time.</p>
+</main></body></html>`);
   });
   app.post('/auth/login', async c => {
     if (c.req.header('origin') !== origin) return c.text('Invalid origin', 403);

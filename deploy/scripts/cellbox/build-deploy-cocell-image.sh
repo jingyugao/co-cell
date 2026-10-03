@@ -38,7 +38,6 @@ namespace="${COCELL_CELLBOX_NAMESPACE:-cell-box}"
 release="${COCELL_CELLBOX_RELEASE:-cellbox}"
 cellbox_source="${CELLBOX_SOURCE_DIR:?Set CELLBOX_SOURCE_DIR to the Cellbox source directory}"
 profile_id="${COCELL_CELLBOX_PROFILE:-cocell-k8s-resumable}"
-shared_enabled="$(uv run --no-project python "$repo_root/deploy/scripts/cellbox/mount_config.py")"
 
 for command in curl jq kubectl uv helm docker; do
   command -v "$command" >/dev/null 2>&1 || { echo "required command not found: $command" >&2; exit 1; }
@@ -87,13 +86,6 @@ if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
   exit 1
 fi
 immutable_image="${image_repository}@${digest}"
-if [[ "$shared_enabled" == 1 ]]; then
-  kubectl --context "$kube_context" get crd cellboxes.cellbox.local -o json |
-    jq -e '.spec.versions[] | select(.name == "v1alpha1") | .schema.openAPIV3Schema.properties.spec.properties.sharedReadOnlyHostPath' >/dev/null || {
-      echo "Deploy the Cellbox controller/CRD with sharedReadOnlyHostPath support first" >&2
-      exit 1
-    }
-fi
 
 profile_patch="$(helm get values "$release" --kube-context "$kube_context" --namespace "$namespace" --all --output json |
   COCELL_DEBUG_READ_ONLY_HOST_PATH="${COCELL_DEBUG_READ_ONLY_HOST_PATH:-}" \

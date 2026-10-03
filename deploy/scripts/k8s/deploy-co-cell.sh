@@ -62,15 +62,6 @@ else
   exit 1
 fi
 preview_args=()
-mount_args=()
-mount_config="${COCELL_MOUNTS_CONFIG:-$repo_root/deploy/local/mounts.json}"
-if [[ -f "$mount_config" ]]; then
-  uv run --no-project python "$repo_root/deploy/scripts/cellbox/mount_config.py" >/dev/null
-  mount_args=(--values "$mount_config")
-elif [[ -n "${COCELL_MOUNTS_CONFIG:-}" ]]; then
-  echo "Mount configuration file not found: $mount_config" >&2
-  exit 1
-fi
 if [[ -n "${COCELL_PREVIEW_SUBDOMAINS:-}" ]]; then
   case "$COCELL_PREVIEW_SUBDOMAINS" in
     0) preview_args=(--set ingress.previewSubdomains=false) ;;
@@ -98,7 +89,6 @@ helm upgrade "$release" "$chart" \
   --namespace "$namespace" \
   "${values_args[@]}" \
   "${preview_args[@]}" \
-  "${mount_args[@]}" \
   --set-string "image.repository=${image_repository}" \
   --set-string "image.tag=${image_tag}" \
   --set-string image.digest= \

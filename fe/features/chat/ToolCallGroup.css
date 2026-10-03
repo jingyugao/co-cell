@@ -1,0 +1,17 @@
+.tool-call-group { min-width: 0; margin: 10px 0; border: 1px solid #e4e7dc; border-radius: 10px; background: #fafbf6; overflow: hidden; }
+.tool-call-group > summary { display: block; min-height: 44px; padding: 10px 12px; cursor: pointer; list-style: none; }
+.tool-call-group > summary::-webkit-details-marker { display: none; }
+.tool-call-group-heading { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 12px; }
+.tool-call-group-heading > svg { flex-shrink: 0; color: #859270; }
+.tool-call-group-heading > strong { font-weight: 500; white-space: nowrap; }
+.tool-call-count { color: #909980; white-space: nowrap; }
+.tool-call-group-state { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 5px; margin-left: auto; font-size: 11px; color: #7b8968; }
+.tool-call-failures { color: #b06854; }
+.tool-call-group.failed { border-color: #e5c8be; }
+.tool-call-group-heading > svg:last-child { transition: transform .15s; }
+.tool-call-group[open] > summary .tool-call-group-heading > svg:last-child { transform: rotate(90deg); }
+.tool-call-group-preview { display: block; margin-top: 5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #909980; font-family: monospace; font-size: 11px; }
+.tool-call-group-content { border-top: 1px solid #e4e7dc; padding: 0 8px; }
+.tool-call-group-content .tool-card > summary { min-height: 44px; }
+.tool-call-group-content .tool-card { background: #fff; }
+@media (prefers-reduced-motion: reduce) { .tool-call-group-heading > svg:last-child { transition: none; } }

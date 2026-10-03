@@ -10,7 +10,7 @@ import { CellboxSandboxProvider } from '../packages/sandbox/src/providers/cellbo
 import { CellboxRuntimeIntegration, CELLBOX_PRODUCT_PATHS } from './sandboxes/cellbox-runtime.js';
 import { CellboxSandboxInventory } from './sandboxes/cellbox-inventory.js';
 import type { AppConfig, Settings } from '../protocol/types.js';
-import { DEFAULT_MODEL } from '../util/models.js';
+import { DEFAULT_MODEL, MODEL_OPTIONS } from '../util/models.js';
 import { NotificationStore } from './notifications/store.js';
 import { createApp } from './app.js';
 import { SessionManager } from './sessions/manager.js';
@@ -76,6 +76,19 @@ const sandboxImageIdentity = await cellboxProvider.currentImageIdentity();
 const appServer = (id: string) => cellboxRuntime.appServer(id);
 const localWorkingDirectory=resolve(process.env.CODEX_WORKSPACE||process.cwd());
 const defaults:Settings={executionMode:'sandbox',workingDirectory:sandboxWorkingDirectory,model:process.env.CODEX_MODEL||DEFAULT_MODEL,modelReasoningEffort:'medium',sandboxMode:'danger-full-access',webSearchMode:'cached',networkAccessEnabled:true};
+let availableModels = [...MODEL_OPTIONS];
+if (process.env.OPENAI_BASE_URL) {
+  try {
+    const modelsUrl = new URL('models', `${process.env.OPENAI_BASE_URL.replace(/\/+$/, '')}/`);
+    const response = await fetch(modelsUrl, { headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {} });
+    if (response.ok) {
+      const body = await response.json() as { data?: Array<{ id?: unknown }> };
+      const discovered = (body.data ?? []).map(item => typeof item.id === 'string' ? item.id.trim() : '').filter(Boolean);
+      if (discovered.length) availableModels = [...new Set(discovered)];
+    } else runtimeLog.write({ event: 'models.discovery_failed', status: response.status });
+  } catch (error) { runtimeLog.write({ event: 'models.discovery_failed', error }); }
+}
+
 const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_MS ?? 60 * 60 * 1000);
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
 const sandboxManager = new SandboxManager({ provider, logger: runtimeLog, policy: { autoCheckpointAfterMs }, lifecycle: cellboxRuntime.lifecycle });
@@ -113,7 +126,7 @@ for (const project of manager.listProjects()) {
 const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.env.CELLBOX_PROFILE!, undefined, () => manager.listProjects());
 await imageCatalog.init();
 manager.setImageCatalog(imageCatalog);
-const config: AppConfig = { sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
+const config: AppConfig = { models: availableModels, sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
   ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}),
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };

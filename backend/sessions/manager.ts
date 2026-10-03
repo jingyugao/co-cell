@@ -23,6 +23,7 @@ import { MODEL_TOKEN_RATES } from '../../util/model-costs.js';
 import type { ImageCatalog } from '../images/service.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
+import type { UserInputQuestion, UserInputRequest } from '../../protocol/user-input-types.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -220,6 +221,9 @@ export class SessionManager {
     for (const { session, turn } of recoverable) this.sandbox?.trackExecution?.(session, turn);
     for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
     for (const session of this.sessions.values()) {
+      if (session.turns.some(turn => turn.userInputRequests?.some(request => request.status === 'queued')) && !this.active.has(session.id)) void this.startQueuedUserInput(session.id);
+    }
+    for (const session of this.sessions.values()) {
     }
     this.lifecycle?.start();
   }
@@ -263,6 +267,7 @@ export class SessionManager {
         }
       }
       execution.finish();
+      void this.startQueuedUserInput(id).catch(error => console.error('Queued user input failed:', error));
       if (this.notifications && turn.status !== 'running') {
         const type = turn.status === 'completed' ? 'turn_completed'
           : turn.status === 'cancelled' ? 'turn_cancelled' : 'turn_failed';
@@ -276,6 +281,50 @@ export class SessionManager {
       }
     });
     void running.catch(error => console.error('Session persistence failed:', error instanceof Error ? error.message : 'unknown error'));
+  }
+
+  async requestUserInput(id: string, turnId: string, projectId: string | null, requestId: string, questions: UserInputQuestion[]): Promise<UserInputRequest> {
+    const session = this.lookup(id);
+    if ((session.projectId ?? null) !== projectId) throw new HttpError(403, '提问来源项目不匹配');
+    const turn = session.turns.find(item => item.id === turnId);
+    if (!turn || this.active.get(id)?.turnId !== turnId || turn.status !== 'running') throw new HttpError(409, '来源任务已结束，不能发送问题');
+    const existing = turn.userInputRequests?.find(item => item.id === requestId);
+    if (existing) return structuredClone(existing);
+    const request: UserInputRequest = { id: requestId, questions, status: 'pending', createdAt: new Date().toISOString() };
+    (turn.userInputRequests ??= []).push(request); session.updatedAt = request.createdAt;
+    await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
+    return structuredClone(request);
+  }
+
+  async answerUserInput(id: string, turnId: string, requestId: string, answer: string): Promise<Session> {
+    const session = this.lookup(id); const request = session.turns.find(turn => turn.id === turnId)?.userInputRequests?.find(item => item.id === requestId);
+    if (!request) throw new HttpError(404, '问题不存在');
+    if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
+    request.status = 'queued'; request.answer = answer; request.answeredAt = new Date().toISOString(); session.updatedAt = request.answeredAt;
+    await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
+    if (!this.active.has(id)) await this.startQueuedUserInput(id);
+    return this.get(id);
+  }
+
+  private async startQueuedUserInput(id: string) {
+    if (this.active.has(id)) return;
+    const session = this.lookup(id);
+    for (const [index, source] of session.turns.entries()) for (const request of source.userInputRequests ?? []) {
+      if (request.status !== 'queued' || !request.answer) continue;
+      const prompt = request.questions.length === 1 ? request.answer : `对之前问题的回答：\n${request.answer}`;
+      const existing = session.turns.slice(index + 1).find(turn => turn.prompt === prompt && Date.parse(turn.startedAt) >= Date.parse(request.answeredAt ?? request.createdAt));
+      const answerTurnId = existing?.id ?? await this.startTurn(id, prompt);
+      request.status = 'answered'; request.answerTurnId = answerTurnId; session.updatedAt = new Date().toISOString();
+      await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
+      if (!existing) return;
+    }
+  }
+
+  findSessionByThreadId(threadId: string): { sessionId: string; turnId: string; projectId: string | null } | null {
+    for (const session of this.sessions.values()) if (session.threadId === threadId) {
+      const execution = this.active.get(session.id); if (execution?.turnId) return { sessionId: session.id, turnId: execution.turnId, projectId: session.projectId ?? null };
+    }
+    return null;
   }
 
   list(): SessionSummary[] {
@@ -322,12 +371,13 @@ export class SessionManager {
       try {
         const page = await this.readSandboxHistory(session, { limit: 20 });
         this.historyErrors.delete(id);
-        const live = session.turns.filter(turn => turn.status === 'running');
         const turns = page.turns.map(native => {
-          const current = live.find(turn => turn.nativeTurnId === native.id || turn.id === native.id);
+          const current = session.turns.find(turn => turn.nativeTurnId === native.id || turn.id === native.id);
           return current ? { ...native, ...current, nativeTurnId: native.id,
-            prompt: current.prompt || native.prompt, items: current.items.length ? current.items : native.items } : native;
+            prompt: current.prompt || native.prompt, items: current.items.length ? current.items : native.items,
+            ...(current.userInputRequests ? { userInputRequests: current.userInputRequests } : {}) } : native;
         });
+        const live = session.turns.filter(turn => turn.status === 'running');
         for (const turn of live) if (!turns.some(candidate => candidate.id === turn.id)) turns.push(turn);
         turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
         return { ...snapshot, turns, historyNextCursor: page.nextCursor ?? null, historyError: undefined };
@@ -482,6 +532,7 @@ export class SessionManager {
         prompt: turn.prompt || stored.prompt,
         images: turn.images.length ? turn.images : stored.images,
         items: [...turn.items, ...storedOnlyItems],
+        userInputRequests: stored.userInputRequests,
         itemTimestamps: { ...stored.itemTimestamps, ...turn.itemTimestamps },
         contextUsage: turn.contextUsage?.map(call => {
           const old = stored.contextUsage?.find(value => call.responseId && value.responseId === call.responseId);
@@ -863,6 +914,7 @@ export class SessionManager {
       prompt: turn.prompt,
       images: turn.images,
       items: turn.items,
+      userInputRequests: turn.userInputRequests,
       itemTimestamps: turn.itemTimestamps,
       usage: turn.usage, sdkUsage: turn.sdkUsage,
       contextUsage: turn.contextUsage?.map(({ blockEstimates, blockTokenizer, blockTexts, ...call }) => call),

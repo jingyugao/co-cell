@@ -10,8 +10,8 @@ RUN apt-get update \
   && test "$(node --version)" = "v22.18.0"
 
 # CoCell owns the agent and archive CLIs; the user base supplies project tools.
-RUN npm install --global @openai/codex@0.156.1 \
-  && test "$(codex --version)" = "codex-cli 0.156.1"
+RUN npm install --global @openai/codex@latest \
+  && codex --version | grep -E '^codex-cli [0-9]+\.[0-9]+\.[0-9]+$'
 RUN curl --fail --silent --show-error --location \
     https://github.com/restic/restic/releases/download/v0.18.1/restic_0.18.1_linux_amd64.bz2 \
     --output /tmp/restic.bz2 \

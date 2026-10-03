@@ -22,6 +22,7 @@ import { modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
 import { SecretCrypto } from './secrets/crypto.js';
 import { SecretService } from './secrets/service.js';
+import { UserInputMcpService } from './user-input/mcp.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 const mysqlUrl = process.env.MYSQL_URL?.trim() ?? '';
@@ -53,7 +54,17 @@ if (process.env.SANDBOX_PROVIDER && process.env.SANDBOX_PROVIDER !== 'cellbox') 
 }
 const cellboxKind=process.env.CELLBOX_KIND??'k8s-resumable';
 if(cellboxKind!=='k8s-resumable')throw new Error('This CoCell Cellbox adapter requires CELLBOX_KIND=k8s-resumable');
-const appServerArguments=appServerArgs(modelConfig,configOverrides??[]).slice(1);
+const cocellPublicUrl = process.env.COCELL_PUBLIC_URL || `http://127.0.0.1:${port}`;
+const userInputMcpUrl = new URL('/mcp/user-input', `${toolBrokerUrl}/`).href;
+const appServerArguments=appServerArgs(modelConfig, [
+  ...(configOverrides ?? []),
+  `mcp_servers.cocell_user_input.url=${JSON.stringify(userInputMcpUrl)}`,
+  `mcp_servers.cocell_user_input.http_headers.Authorization=${JSON.stringify(`Bearer ${process.env.COCELL_ACCESS_TOKEN ?? ''}`)}`,
+  'mcp_servers.cocell_user_input.enabled=true',
+  'mcp_servers.cocell_user_input.required=true',
+  'mcp_servers.cocell_user_input.enabled_tools=["request_user_input_async"]',
+  'mcp_servers.cocell_user_input.startup_timeout_sec=10',
+]).slice(1);
 for(const name of ['CELLBOX_API_URL','CELLBOX_API_TOKEN','CELLBOX_PROFILE','COCELL_ACCESS_TOKEN'])if(!process.env[name])throw new Error(name+' is required for Cellbox Kubernetes mode');
 if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOKEN must contain at least 32 bytes');
 const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,token:process.env.CELLBOX_API_TOKEN!,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',stateDirectory:resolve('data/cellbox-operations')});
@@ -112,16 +123,17 @@ for (const project of manager.listProjects()) {
 const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.env.CELLBOX_PROFILE!, undefined, () => manager.listProjects());
 await imageCatalog.init();
 manager.setImageCatalog(imageCatalog);
+const userInputMcp = new UserInputMcpService(process.env.COCELL_ACCESS_TOKEN!, manager);
 const config: AppConfig = { sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
   ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}),
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };
-const publicUrl=process.env.COCELL_PUBLIC_URL||`http://127.0.0.1:${port}`;
+const publicUrl=cocellPublicUrl;
 const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
-  inventory, undefined, undefined, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,provider:cellboxProvider,projects:()=>manager.listProjects() }, imageCatalog, secrets);
+  inventory, undefined, undefined, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,provider:cellboxProvider,projects:()=>manager.listProjects() }, imageCatalog, secrets, userInputMcp);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }

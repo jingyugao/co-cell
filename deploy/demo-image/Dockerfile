@@ -6,9 +6,9 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install --global @openai/codex@0.156.1 \
+RUN npm install --global @openai/codex@latest \
   && npm cache clean --force \
-  && test "$(codex --version)" = "codex-cli 0.156.1"
+  && codex --version | grep -E '^codex-cli [0-9]+\.[0-9]+\.[0-9]+$'
 
 RUN curl --fail --silent --show-error --location --retry 3 \
     https://go.dev/dl/go1.25.1.linux-amd64.tar.gz -o /tmp/go.tar.gz \

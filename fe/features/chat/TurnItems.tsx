@@ -3,12 +3,17 @@ import type { SubagentConversation, Turn } from '../../../protocol/types';
 import type { MarkdownResources } from './Markdown';
 import ItemView from './ItemView';
 import SubagentConversations from './SubagentConversations';
+import ReasoningSummary, { groupThreadItems } from './ReasoningSummary';
+import UserInputCard from './UserInputCard';
+import type { Session } from '../../../protocol/types';
 
 /** Place decisions at their tool call, so later execution and replies stay below them. */
 export default function TurnItems({ turn, highlightedItemIds, subagents = [], ...resources }: {
   turn: Turn;
   highlightedItemIds?: string[];
   subagents?: SubagentConversation[];
+  sessionId?: string;
+  onUserInputAnswered?: (session: Session) => void;
 } & MarkdownResources) {
   const firstSubagentAt = subagents[0]?.startedAt;
   const timedSubagentIndex = firstSubagentAt && turn.itemTimestamps
@@ -18,11 +23,18 @@ export default function TurnItems({ turn, highlightedItemIds, subagents = [], ..
   // parent's final reply in that case.
   const subagentIndex = firstSubagentAt && timedSubagentIndex < 0
     ? turn.items.reduce((last, item, index) => item.type === 'agent_message' ? index : last, -1) : timedSubagentIndex;
+  const boundaries = new Set(turn.compactions?.map(boundary => boundary.beforeItemIndex));
+  if (subagentIndex >= 0) boundaries.add(subagentIndex);
   return <>
-    {turn.items.map((item, index) => {
-      return <Fragment key={item.id}>{index === subagentIndex && <SubagentConversations agents={subagents} {...resources} />}{turn.compactions?.filter(boundary => boundary.beforeItemIndex === index).map(boundary => <div key={boundary.segment} className="compact-divider" role="separator">上下文已压缩 · 第 {boundary.segment + 1} 段对话 · 后续重新计费</div>)}<div id={`turn-${turn.id}-item-${item.id}`} className={highlightedItemIds?.includes(item.id) ? 'billing-item-selected' : undefined}><ItemView item={item} turnStatus={turn.status} timestamp={turn.itemTimestamps?.[item.id] || turn.startedAt} {...resources} /></div></Fragment>;
+    {groupThreadItems(turn.items, boundaries).map(group => {
+      const index = group.startIndex;
+      const first = group.type === 'reasoning' ? group.items[0] : group.item;
+      return <Fragment key={first.id}>{index === subagentIndex && <SubagentConversations agents={subagents} {...resources} />}{turn.compactions?.filter(boundary => boundary.beforeItemIndex === index).map(boundary => <div key={boundary.segment} className="compact-divider" role="separator">上下文已压缩 · 第 {boundary.segment + 1} 段对话 · 后续重新计费</div>)}{group.type === 'reasoning'
+        ? <ReasoningSummary pending={turn.status === 'running' && index + group.items.length === turn.items.length} entries={group.items.map(item => ({ item, timestamp: turn.itemTimestamps?.[item.id] || turn.startedAt, anchorId: `turn-${turn.id}-item-${item.id}`, highlighted: highlightedItemIds?.includes(item.id) }))} {...resources} />
+        : <div id={`turn-${turn.id}-item-${group.item.id}`} className={highlightedItemIds?.includes(group.item.id) ? 'billing-item-selected' : undefined}><ItemView item={group.item} turnStatus={turn.status} timestamp={turn.itemTimestamps?.[group.item.id] || turn.startedAt} {...resources} /></div>}</Fragment>;
     })}
     {turn.compactions?.filter(boundary => boundary.beforeItemIndex >= turn.items.length).map(boundary => <div key={boundary.segment} className="compact-divider" role="separator">上下文已压缩 · 第 {boundary.segment + 1} 段对话 · 后续重新计费</div>)}
     {subagentIndex < 0 && <SubagentConversations agents={subagents} {...resources} />}
+    {resources.sessionId && turn.userInputRequests?.map(request => <UserInputCard key={request.id} request={request} sessionId={resources.sessionId!} turnId={turn.id} onAnswered={resources.onUserInputAnswered ?? (() => {})} />)}
   </>;
 }

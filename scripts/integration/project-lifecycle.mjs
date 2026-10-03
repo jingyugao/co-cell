@@ -14,6 +14,9 @@ assert(['http:', 'https:'].includes(base.protocol) && !base.username && !base.pa
   'COCELL_E2E_BASE_URL must be an HTTP(S) URL without credentials, query, or fragment');
 const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}`;
 const model = 'gpt-6-luna';
+const suite = process.env.COCELL_E2E_SUITE ?? 'all';
+assert(['all', 'user-input'].includes(suite), 'Unknown integration suite');
+
 const port = 18080;
 const folder = 'lifecycle-http';
 const marker = `service-${randomUUID()}`;
@@ -149,6 +152,7 @@ try {
     const session = await json('/api/sessions', { method: 'POST', body: { projectId, title: 'Go HTTP lifecycle integration',
       settings: { model, modelReasoningEffort: 'low', webSearchMode: 'disabled' } }, expectedStatus: 201 });
     sessionId = report.sessionId = session.id; await persist(); assert.equal(session.settings.model, model);
+    if (suite === 'user-input') return { sessionId, model };
     const result = await turn(`这是平台集成测试，请直接执行，不要只提供代码。只修改工作目录下 ${folder}/，不读写凭证，不安装或下载软件，不使用子 agent。
 只在对话中记住验证码 ${memory}，不要把这个验证码写入任何文件。后续会检验你是否记得。
 使用预装 Go（/usr/local/go/bin/go），用标准库编写 ${folder}/main.go 和启动脚本 ${folder}/start.mjs。不要依赖任何外部 Go 模块。创建 continuity.txt，内容为 ${initialContent} 加换行。
@@ -159,13 +163,18 @@ try {
     return { sessionId, threadId, ...result };
   });
   await step('Ask the agent to use request_user_input_async and answer from the API', async () => {
-    const prompt = `这是平台集成测试。必须调用 request_user_input_async，发送一个问题“集成测试继续吗？”并提供两个选项“继续”和“停止”。不要把问题当普通文字输出。调用成功后简短汇报。`;
+    const prompt = `这是平台集成测试。必须调用 Codex 内置 request_user_input_async（禁止使用任何 MCP 工具），发送一个问题“集成测试继续吗？”并提供两个选项“继续”和“停止”。不要把问题当普通文字输出。调用成功后简短汇报。`;
     const result = await turn(prompt);
     const session = await json(`/api/sessions/${sessionId}`);
     const source = session.turns.find(t => t.id === result.turnId || t.nativeTurnId === result.nativeTurnId);
     assert(source?.userInputRequests?.length, 'request_user_input_async did not create a persisted request');
     const request = source.userInputRequests.at(-1);
     assert.equal(request.status, 'pending');
+    const native = source.items.find(item => item.id === request.id);
+    assert.equal(native?.type, 'agent_message');
+    assert.equal(native.delivery, 'async');
+    assert.deepEqual(native.questions, request.questions);
+    assert(!source.items.some(item => item.type === 'mcp_tool_call'), 'Must use the native tool, not MCP');
     const answered = await json(`/api/sessions/${sessionId}/turns/${source.id}/user-input/${request.id}`, {
       method: 'POST', body: { answer: '继续' }, expectedStatus: 200,
     });
@@ -179,8 +188,16 @@ try {
     assert.equal(updated?.userInputRequests?.at(-1)?.status, 'answered');
     assert(updated.userInputRequests.at(-1).answerTurnId, 'answer turn was not created');
     await waitIdle();
+    const refreshed = await json(`/api/sessions/${sessionId}`);
+    const saved = refreshed.turns.find(t => t.id === source.id)?.userInputRequests?.find(r => r.id === request.id);
+    assert.equal(saved?.status, 'answered', 'Answer state lost on reload');
+    const reply = refreshed.turns.find(t => t.id === saved.answerTurnId);
+    assert(reply?.prompt.includes('send_user_message_question_reply'));
+    assert(reply.prompt.includes(request.id), 'Reply lost native call ID');
+    assert.equal(reply.status, 'completed');
     return { requestId: request.id, answerTurnId: updated.userInputRequests.at(-1).answerTurnId };
   });
+  if (suite === 'all') {
   let source, firstHealth;
   await step('Verify workspace file API, raw downloads, and proxied Go HTTP', async () => {
     source = await textFile('main.go'); assert(source.text.includes('package main'));
@@ -249,6 +266,7 @@ try {
     const session = await json(`/api/sessions/${sessionId}`); assert.equal(session.threadId, threadId); assert(session.turnCount >= 3);
     return { sandboxId: report.restoredSandboxId, sourceSha256: source.sha256, fileSha256: file.sha256, http: current, turnCount: session.turnCount };
   });
+  }
   if (process.env.COCELL_E2E_KEEP_PROJECT !== '1') {
     await step('Clean up only this test project', async () => {
       await json(`/api/projects/${projectId}`, { method: 'DELETE', timeoutMs: operationTimeout });

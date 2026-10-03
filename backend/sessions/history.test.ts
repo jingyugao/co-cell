@@ -7,12 +7,13 @@ import type { Session, Settings, Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SessionManager, type CodexClient } from './manager.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
+import { MySqlWebStateStore } from '../infra/storage/web-state.js';
 
 const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
   modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
 const answer = { id: 'answer', type: 'agent_message' as const, text: '2' };
 
-async function fixture() {
+async function fixture(state = new MemoryWebStateStore()) {
   const directory = await mkdtemp(join(tmpdir(), 'hive-history-'));
   const providerSandboxes = new Map<string, NonNullable<Session['sandbox']>>();
   const runtime = {
@@ -40,7 +41,6 @@ async function fixture() {
     },
     async history() { throw new Error('Sandbox is unavailable'); },
   } as unknown as SandboxRuntime;
-  const state = new MemoryWebStateStore();
   const managers: SessionManager[] = [];
   const start = async () => {
     const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime);
@@ -53,6 +53,61 @@ async function fixture() {
     await rm(directory, { recursive: true, force: true });
   } };
 }
+
+test('async answers recover from native history across reload and pagination without new MySQL state', async () => {
+  let document: unknown;
+  const sql = Object.create(MySqlWebStateStore.prototype) as MySqlWebStateStore;
+  (sql as unknown as { pool: { query: (query: string, values?: unknown[]) => Promise<unknown> } }).pool = {
+    async query(query, values) {
+      if (query.startsWith('SELECT document FROM sessions')) return [document ? [{ document }] : [], []];
+      document = JSON.parse(String(values?.[9]));
+      return [[], []];
+    },
+  };
+  const state = new MemoryWebStateStore();
+  state.saveSession = sql.saveSession.bind(sql);
+  state.listSessions = sql.listSessions.bind(sql);
+  const f = await fixture(state);
+  try {
+    let launches = 0;
+    const question = { id: 'question', type: 'agent_message' as const, delivery: 'async', text: '',
+      questions: [{ title: '检查哪项？', options: ['网络', '容器'] }] };
+    f.runtime.run = async function* () {
+      const count = ++launches;
+      yield { type: 'thread.started', thread_id: 'original-thread' };
+      yield { type: 'turn.started', turn_id: `native-${count}` };
+      yield { type: 'item.completed', item: count === 1 ? question : answer };
+      yield { type: 'turn.completed', usage: { input_tokens: 1, cached_input_tokens: 0, cache_write_input_tokens: 0,
+        output_tokens: 1, reasoning_output_tokens: 0 } };
+    };
+    const first = await f.start();
+    const session = await first.create();
+    const turnId = await first.startTurn(session.id, '检查环境');
+    await first.waitForIdle(session.id);
+    const nativeQuestion = { ...first.get(session.id).turns[0], id: 'native-1', userInputRequests: undefined };
+    f.runtime.history = async () => ({ turns: [nativeQuestion] });
+    const posted = await first.answerUserInput(session.id, turnId, question.id, '网络', ['网络']);
+    await first.waitForIdle(session.id);
+    assert.equal(posted.turns.find(turn => turn.id === turnId)?.userInputRequests?.[0].status, 'answered');
+    const nativeReply = { ...first.get(session.id).turns[0], id: 'native-2', userInputRequests: undefined };
+    f.runtime.history = async () => ({ turns: [nativeReply, nativeQuestion] });
+    assert.equal((await first.read(session.id)).turns.find(turn => turn.items.some(item => item.id === question.id))?.userInputRequests?.[0].status, 'answered');
+    await first.close();
+    assert.equal('userInputTurns' in (document as object), false);
+    assert.deepEqual((await state.listSessions())[0].turns, []);
+
+    f.runtime.history = async (_session, options) => options?.cursor
+      ? { turns: [nativeQuestion], nextCursor: null }
+      : { turns: [nativeReply], nextCursor: 'older' };
+    const second = await f.start();
+    const reloaded = await second.read(session.id);
+    const older = await second.olderTurns(session.id, reloaded.historyNextCursor!);
+    assert.equal(older.turns[0].userInputRequests?.[0].answer, '网络');
+    assert.equal(older.turns[0].userInputRequests?.[0].status, 'answered');
+    await assert.rejects(second.answerUserInput(session.id, turnId, question.id, '容器'), /问题已经回答/);
+    assert.equal(launches, 2);
+  } finally { await f.close(); }
+});
 
 test('Sandbox history failure shows an error without serving the saved transcript', async () => {
   const f = await fixture();
@@ -179,7 +234,8 @@ test('a native history page does not append saved turns outside that page', asyn
     const second = await f.start();
     const page = await second.read(session.id);
     assert.equal(page.turns.length, 1);
-    assert.equal(page.turns[0].id, 'native-turn');
+    assert.equal(page.turns[0].id, stored.turns[0].id);
+    assert.equal(page.turns[0].nativeTurnId, 'native-turn');
     assert.equal((await f.state.listSessions()).find(value => value.id === session.id)!.turns.length, 2);
   } finally { await f.close(); }
 });

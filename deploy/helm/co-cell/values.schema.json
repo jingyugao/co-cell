@@ -244,6 +244,44 @@
     },
     "affinity": {
       "type": "object"
+    },
+    "sharedDirectory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "hostPath",
+        "nodeName"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "hostPath": {
+          "type": "string",
+          "pattern": "^$|^/[^\\s]+$"
+        },
+        "nodeName": {
+          "type": "string"
+        }
+      },
+      "if": {
+        "properties": {
+          "enabled": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "hostPath": {
+            "minLength": 2
+          },
+          "nodeName": {
+            "minLength": 1
+          }
+        }
+      }
     }
   },
   "definitions": {

@@ -60,5 +60,11 @@ resources:
     memory: 2Gi
 
 nodeSelector: {}
+sharedDirectory:
+  enabled: false
+  # Pre-created node directory owned by the web uid (1000), separate from data.
+  hostPath: ""
+  # Must match the Cellbox profile's nodeName.
+  nodeName: ""
 tolerations: []
 affinity: {}

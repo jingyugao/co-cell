@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readlink, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -13,6 +13,51 @@ async function until(check, timeoutMs = 5000) {
   }
   throw new Error('timed out waiting for test condition');
 }
+
+test('shared startup is reusable across restored workspaces and sees atomic document updates', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-mounted-launcher-'));
+  const workspace = join(root, 'workspace'), sharedDirectory = join(root, 'shared');
+  const home = join(workspace, '.cocell', 'codex');
+  const report = join(root, 'report.json'), codex = join(root, 'codex.mjs');
+  let stop, launched;
+  try {
+    await mkdir(join(home, 'docs'), { recursive: true });
+    await writeFile(join(home, 'AGENTS.md'), 'archived instructions');
+    await writeFile(join(home, 'docs', 'old.txt'), 'archived copy');
+    await mkdir(join(sharedDirectory, 'runtime'), { recursive: true });
+    await mkdir(join(sharedDirectory, 'docs'));
+    await writeFile(join(sharedDirectory, 'AGENTS.md'), 'current instructions');
+    await writeFile(join(sharedDirectory, 'docs', 'live.txt'), 'first');
+    await writeFile(codex, `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(report)}, JSON.stringify({key: process.env.CODEX_API_KEY, home: process.env.CODEX_HOME}));
+process.on('SIGTERM', () => process.exit(0));
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+    const configPath = join(sharedDirectory, 'runtime', 'config.json');
+    for (const key of ['first-key', 'second-key']) {
+      await rm(report, { force: true });
+      await writeFile(configPath, JSON.stringify({ version: 1, appServerArgs: [], env: { CODEX_API_KEY: key } }), { mode: 0o644 });
+      stop = new AbortController();
+      launched = startLauncher({ workspace, sharedDirectory, codex, signal: stop.signal, log: () => {} });
+      await until(async () => Boolean(await stat(report).catch(() => null)));
+      assert.equal(JSON.parse(await readFile(report, 'utf8')).key, key);
+      assert.equal(await readlink(join(home, 'docs')), join(sharedDirectory, 'docs'));
+      assert.equal(await readFile(join(home, 'AGENTS.md'), 'utf8'), 'current instructions');
+      assert(await stat(configPath)); // read-only shared config is never consumed.
+      await writeFile(join(sharedDirectory, 'docs', 'new.tmp'), key);
+      await rename(join(sharedDirectory, 'docs', 'new.tmp'), join(sharedDirectory, 'docs', 'live.txt'));
+      assert.equal(await readFile(join(home, 'docs', 'live.txt'), 'utf8'), key);
+      assert.equal(await stat(join(home, 'docs', 'old.txt')).catch(() => null), null);
+      stop.abort();
+      assert.equal(await launched, 0);
+    }
+  } finally {
+    stop?.abort();
+    if (launched) await launched;
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('provisioning waits, starts once on loopback, keeps Codex history, and stops cleanly', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-launcher-'));

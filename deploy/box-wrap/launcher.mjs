@@ -1,7 +1,8 @@
 #!/usr/local/bin/node
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
-import { chmod, lstat, mkdir, open, unlink } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readlink, rename, rm, symlink, unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -55,7 +56,7 @@ async function ensurePrivateDirectory(path) {
   await chmod(path, 0o700);
 }
 
-async function takeConfig(path) {
+async function takeConfig(path, shared = false) {
   let file;
   try {
     file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -65,16 +66,34 @@ async function takeConfig(path) {
   }
   try {
     const info = await file.stat();
-    if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o777) !== 0o600) {
+    if (!info.isFile() || (!shared && (info.uid !== process.getuid() || (info.mode & 0o777) !== 0o600))) {
       throw new Error('provisioning config must be a regular agent-owned file with mode 0600');
     }
     if (info.size > MAX_CONFIG_BYTES) throw new Error('provisioning config is too large');
     const config = parseConfig(await file.readFile({ encoding: 'utf8' }));
     // Startup config lives outside workspace archives and is consumed once.
-    await unlink(path);
+    if (!shared) await unlink(path);
     return config;
   } finally {
     await file.close();
+  }
+}
+
+async function attachSharedFiles(codexHome, sharedDirectory) {
+  for (const name of ['AGENTS.md', 'docs']) {
+    const destination = join(codexHome, name);
+    const source = join(sharedDirectory, name);
+    if (await readlink(destination).catch(error => {
+      if (['ENOENT', 'EINVAL'].includes(error.code)) return null;
+      throw error;
+    }) === source) continue;
+    // Old archives may contain copied snapshots. Replace them once locally.
+    await rm(destination, { recursive: true, force: true });
+    const temp = join(codexHome, `.shared-link-${randomUUID()}`);
+    try {
+      await symlink(source, temp);
+      await rename(temp, destination);
+    } finally { await unlink(temp).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
   }
 }
 
@@ -134,18 +153,20 @@ async function runCodex(config, { workspace, codex, codexHome, signal, log }) {
 }
 
 export async function startLauncher({ workspace = DEFAULT_WORKSPACE, codex = DEFAULT_CODEX,
-  startupDirectory = '/home/agent/.cocell-startup', pollMs = POLL_MS, signal, log = message => console.error(`cocell launcher: ${message}`) } = {}) {
+  startupDirectory = '/home/agent/.cocell-startup', sharedDirectory = process.env.COCELL_LAUNCHER_SHARED_DIRECTORY,
+  pollMs = POLL_MS, signal, log = message => console.error(`cocell launcher: ${message}`) } = {}) {
   if (!signal) throw new Error('an AbortSignal is required');
   const cocellDir = join(workspace, '.cocell');
   const runtimeDir = startupDirectory;
   const codexHome = join(cocellDir, 'codex');
   await ensurePrivateDirectory(cocellDir);
-  await ensurePrivateDirectory(runtimeDir);
+  if (!sharedDirectory) await ensurePrivateDirectory(runtimeDir);
   await ensurePrivateDirectory(codexHome);
-  const configPath = join(runtimeDir, 'config.json');
-  log('waiting for provisioning config');
+  if (sharedDirectory) await attachSharedFiles(codexHome, sharedDirectory);
+  const configPath = sharedDirectory ? join(sharedDirectory, 'runtime', 'config.json') : join(runtimeDir, 'config.json');
+  log(sharedDirectory ? 'reading shared startup config' : 'waiting for provisioning config');
   while (!signal.aborted) {
-    const config = await takeConfig(configPath);
+    const config = await takeConfig(configPath, Boolean(sharedDirectory));
     if (config) return runCodex(config, { workspace, codex, codexHome, signal, log });
     await delay(pollMs, signal);
   }

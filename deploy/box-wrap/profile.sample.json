@@ -10,7 +10,7 @@
   "guest": {
     "workspace": "/home/agent/workspace",
     "agent": { "uid": 11000, "gid": 11000 },
-    "debug": { "uid": 11001, "gid": 11001 },
+    "debug": { "uid": 0, "gid": 0 },
     "command": ["/usr/local/bin/node", "/opt/product/cocell/launcher.mjs"],
     "env": {},
     "tools": [

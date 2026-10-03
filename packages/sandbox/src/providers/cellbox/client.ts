@@ -3,6 +3,10 @@ export interface CellboxCapabilities {
   exec: boolean; files: boolean; http: boolean; websocket: boolean;
   pty: boolean; reconnectExec: boolean; freeze: boolean;
   suspend: 'none' | 'same-node-checkpoint'; archives: string; protectedTools: boolean;
+  sharedDirectory?: boolean;
+  rootDebug?: boolean;
+  credentialBatch?: boolean;
+  internalServices?: boolean;
 }
 /** Conceptual product matrix; Cellbox currently implements only two combinations. */
 export type CellboxRuntimeKind = 'docker-normal' | 'docker-resumable' | 'k8s-normal' | 'k8s-resumable';
@@ -103,6 +107,12 @@ export class CellboxClient {
   get origin() { return new URL(this.baseUrl).origin; }
   /** Server-side access uses the configured API gateway, independent of public route DNS. */
   serviceUrl(routeId: string) { return `${this.baseUrl}/s/${this.id(routeId)}/`; }
+  /** Operator credentials must stay in the backend; never expose this to browsers. */
+  internalService(boxId: string, port: number) {
+    if (!Number.isInteger(port) || port < 1 || port > 65535 || port === 40000)
+      throw new CellboxError('INVALID_REQUEST', 'Invalid internal service port');
+    return { url: `${this.baseUrl}/v1/boxes/${this.id(boxId)}/services/${port}/`, headers: { Authorization: `Bearer ${this.token}` } };
+  }
   private async request<T>(method: string, path: string, options: {
     body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
   } = {}): Promise<T> {
@@ -191,7 +201,7 @@ export class CellboxClient {
   listResourceBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes?observation=resource', { signal }); }
   listCheckpoints(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/checkpoints', { signal }); }
   getBox(id: string, signal?: AbortSignal) { return this.request<CellboxBox>('GET', `/v1/boxes/${this.id(id)}`, { signal }); }
-  createBox(input: { profileId: string; ownerKey: string; importedImageId?: string }, key: string) {
+  createBox(input: { profileId: string; ownerKey: string; importedImageId?: string; staged?: boolean }, key: string) {
     return this.request<CellboxOperation>('POST', '/v1/boxes', { body: input, key });
   }
   restoreBox(input: { profileId: string; ownerKey: string; archiveId: string; importedImageId?: string; acceptImageChange?: boolean }, key: string) {
@@ -243,10 +253,21 @@ export class CellboxClient {
     return this.request<void>('PUT', `/v1/boxes/${this.id(id)}/files?path=${encodeURIComponent(path)}`, { bytes, signal, response: 'empty' });
   }
   writeCredential(boxId: string, slot: string, bytes: Uint8Array, signal?: AbortSignal) {
-    if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(slot) || bytes.byteLength < 1 || bytes.byteLength > 65_536)
-      throw new CellboxError('INVALID_REQUEST', 'Credential slot and 1..65536 bytes are required');
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(slot) || bytes.byteLength < 1 || bytes.byteLength > 1024 * 1024)
+      throw new CellboxError('INVALID_REQUEST', 'Credential slot and 1..1048576 bytes are required');
     return this.request<void>('PUT', `/v1/boxes/${this.id(boxId)}/credentials/${this.id(slot)}`,
       { bytes, signal, response: 'empty' });
+  }
+  writeCredentials(boxId: string, expectedGeneration: number, slots: Record<string, Uint8Array>, signal?: AbortSignal) {
+    const entries = Object.entries(slots);
+    if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1 || entries.length < 1 || entries.length > 32 ||
+      entries.some(([slot, bytes]) => !/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(slot) || bytes.byteLength < 1 || bytes.byteLength > 1024 * 1024) ||
+      entries.reduce((size, [, bytes]) => size + bytes.byteLength, 0) > 2 * 1024 * 1024)
+      throw new CellboxError('INVALID_REQUEST', 'Invalid credential batch');
+    return this.request<void>('PUT', `/v1/boxes/${this.id(boxId)}/credentials`, {
+      body: { expectedGeneration, slots: Object.fromEntries(entries.map(([slot, bytes]) => [slot, Buffer.from(bytes).toString('base64')])) },
+      signal, response: 'empty',
+    });
   }
   runTool(boxId: string, tool: string, args: string[] = [], timeoutMs = 30_000) {
     return this.request<{ stdout: string; stderr: string; exitCode: number; truncated?: boolean }>('POST',

@@ -34,7 +34,7 @@ if [[ -z "$image_tag" ]]; then
   image_tag="k8s-$(date -u +%Y%m%d-%H%M%S)-${git_sha}"
 fi
 
-for command in curl docker helm git kubectl skopeo; do
+for command in curl docker helm git kubectl; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "required command not found: $command" >&2
     exit 1
@@ -62,6 +62,15 @@ else
   exit 1
 fi
 preview_args=()
+mount_args=()
+mount_config="${COCELL_MOUNTS_CONFIG:-$repo_root/deploy/local/mounts.json}"
+if [[ -f "$mount_config" ]]; then
+  uv run --no-project python "$repo_root/deploy/scripts/cellbox/mount_config.py" >/dev/null
+  mount_args=(--values "$mount_config")
+elif [[ -n "${COCELL_MOUNTS_CONFIG:-}" ]]; then
+  echo "Mount configuration file not found: $mount_config" >&2
+  exit 1
+fi
 if [[ -n "${COCELL_PREVIEW_SUBDOMAINS:-}" ]]; then
   case "$COCELL_PREVIEW_SUBDOMAINS" in
     0) preview_args=(--set ingress.previewSubdomains=false) ;;
@@ -80,11 +89,8 @@ fi
 image="${image_repository}:${image_tag}"
 echo "Building ${image} for linux/amd64 with the local Docker cache"
 docker build --platform linux/amd64 --file "$repo_root/deploy/web/Dockerfile" --tag "$image" .
-image_archive="$(mktemp --suffix=.tar)"
-trap 'rm -f "$image_archive"' EXIT
-docker save --output "$image_archive" "$image"
 echo "Publishing ${image} to ${registry_endpoint}"
-skopeo copy --dest-tls-verify=false "docker-archive:${image_archive}" "docker://${image}"
+docker push "$image"
 
 echo "Upgrading Helm release ${release} in ${namespace}"
 helm upgrade "$release" "$chart" \
@@ -92,6 +98,7 @@ helm upgrade "$release" "$chart" \
   --namespace "$namespace" \
   "${values_args[@]}" \
   "${preview_args[@]}" \
+  "${mount_args[@]}" \
   --set-string "image.repository=${image_repository}" \
   --set-string "image.tag=${image_tag}" \
   --set-string image.digest= \

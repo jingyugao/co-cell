@@ -28,7 +28,7 @@ class CellboxRelease:
         self.context = os.environ.get("COCELL_KUBE_CONTEXT", "k3s")
         self.namespace = os.environ.get("COCELL_CELLBOX_NAMESPACE", "cell-box")
         self.release = os.environ.get("COCELL_CELLBOX_RELEASE", "cellbox")
-        for command in ("make", "docker", "skopeo", "kubectl", "helm"):
+        for command in ("make", "docker", "kubectl", "helm"):
             if not shutil.which(command):
                 raise RuntimeError(f"required command not found: {command}")
         self.values = json.loads(run("helm", "get", "values", self.release, "--kube-context", self.context,
@@ -58,11 +58,11 @@ class CellboxRelease:
         tag = os.environ.get(f"{prefix}_TAG", time.strftime(f"{component}-%Y%m%d-%H%M%S", time.gmtime()))
         image = f"{repository}:{tag}"
         run("docker", "build", "--platform", "linux/amd64", "-f", str(dockerfile), "-t", image, str(self.source / "dist/release"))
-        with tempfile.TemporaryDirectory(prefix="cellbox-deploy-") as temporary:
-            archive = str(Path(temporary) / "image.tar")
-            run("docker", "save", "--output", archive, image)
-            run("skopeo", "copy", "--dest-tls-verify=false", f"docker-archive:{archive}", f"docker://{image}")
-        digest = json.loads(run("skopeo", "inspect", "--tls-verify=false", f"docker://{image}", capture=True))["Digest"]
+        run("docker", "push", image)
+        request = urllib.request.Request(f"{endpoint}/v2/{repository[len(host) + 1:]}/manifests/{tag}", method="HEAD",
+                                         headers={"Accept": "application/vnd.docker.distribution.manifest.v2+json"})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=30) as response:
+            digest = response.headers.get("Docker-Content-Digest", "")
         if not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
             raise RuntimeError("Registry did not return a valid image digest")
         immutable_image = f"{repository}@{digest}"

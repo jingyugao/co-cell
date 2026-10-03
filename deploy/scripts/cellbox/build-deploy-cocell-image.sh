@@ -38,8 +38,9 @@ namespace="${COCELL_CELLBOX_NAMESPACE:-cell-box}"
 release="${COCELL_CELLBOX_RELEASE:-cellbox}"
 cellbox_source="${CELLBOX_SOURCE_DIR:?Set CELLBOX_SOURCE_DIR to the Cellbox source directory}"
 profile_id="${COCELL_CELLBOX_PROFILE:-cocell-k8s-resumable}"
+shared_enabled="$(uv run --no-project python "$repo_root/deploy/scripts/cellbox/mount_config.py")"
 
-for command in curl jq kubectl uv skopeo helm; do
+for command in curl jq kubectl uv helm docker; do
   command -v "$command" >/dev/null 2>&1 || { echo "required command not found: $command" >&2; exit 1; }
 done
 if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 3 --max-time 8 "${registry_endpoint}/v2/")" != 200 ]]; then
@@ -57,14 +58,20 @@ manifest_status="$(curl --silent --output /dev/null --write-out '%{http_code}' -
   "${registry_endpoint}/v2/${image_repository#${registry_host}/}/manifests/${image_tag}")"
 case "$manifest_status" in
   200)
-    remote_image="$(skopeo inspect --tls-verify=false "docker://${image}")"
-    remote_key="$(jq -r '.Labels["cellbox.image-key"] // empty' <<< "$remote_image")"
-    remote_version="$(jq -r '.Labels["cellbox.managed-image"] // empty' <<< "$remote_image")"
+    manifest="$(curl --fail --silent --show-error --header 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+      "${registry_endpoint}/v2/${image_repository#${registry_host}/}/manifests/${image_tag}")"
+    config_digest="$(jq -er '.config.digest' <<< "$manifest")"
+    remote_config="$(curl --fail --silent --show-error "${registry_endpoint}/v2/${image_repository#${registry_host}/}/blobs/${config_digest}")"
+    remote_key="$(jq -r '.config.Labels["cellbox.image-key"] // empty' <<< "$remote_config")"
+    remote_version="$(jq -r '.config.Labels["cellbox.managed-image"] // empty' <<< "$remote_config")"
     if [[ "$remote_version" != "2" || ! "$remote_key" =~ ^[a-f0-9]{64}$ ]]; then
       echo "${image} is not a Cellbox prepared image" >&2
       exit 1
     fi
-    digest="$(jq -er '.Digest' <<< "$remote_image")"
+    digest="$(curl --fail --silent --show-error --head \
+      --header 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+      "${registry_endpoint}/v2/${image_repository#${registry_host}/}/manifests/${image_tag}" \
+      | awk -F': ' 'tolower($1) == "docker-content-digest" {print $2}' | tr -d '\r')"
     ;;
   404)
     echo "Prepared Cellbox sandbox image ${image} is missing; publish it before deploying" >&2
@@ -80,6 +87,13 @@ if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
   exit 1
 fi
 immutable_image="${image_repository}@${digest}"
+if [[ "$shared_enabled" == 1 ]]; then
+  kubectl --context "$kube_context" get crd cellboxes.cellbox.local -o json |
+    jq -e '.spec.versions[] | select(.name == "v1alpha1") | .schema.openAPIV3Schema.properties.spec.properties.sharedReadOnlyHostPath' >/dev/null || {
+      echo "Deploy the Cellbox controller/CRD with sharedReadOnlyHostPath support first" >&2
+      exit 1
+    }
+fi
 
 profile_patch="$(helm get values "$release" --kube-context "$kube_context" --namespace "$namespace" --all --output json |
   COCELL_DEBUG_READ_ONLY_HOST_PATH="${COCELL_DEBUG_READ_ONLY_HOST_PATH:-}" \

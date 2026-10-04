@@ -29,7 +29,7 @@ RUN mkdir -p /opt/cellbox/debug-bin \
        else cp -L "$binary" "/opt/cellbox/debug-bin/$tool"; fi; \
      done
 COPY --chmod=0755 launcher.mjs oss-archive-backup.mjs oss-archive-restore.mjs /opt/product/cocell/
-COPY --chmod=0755 tool-client.mjs protected-tool.mjs /opt/product/cocell/
+COPY --chmod=0755 tool-client.mjs protected-tool.mjs credential-files.mjs file-bundle-tool.mjs /opt/product/cocell/
 COPY --chmod=0755 tools/cocell-archive-backup /opt/cellbox/tools/cocell-archive-backup
 COPY --chmod=0755 tools/cocell-archive-restore /opt/cellbox/tools/cocell-archive-restore
 COPY --chmod=0755 tools/cocell-proxy /opt/cellbox/tools/cocell-proxy

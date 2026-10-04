@@ -1,9 +1,76 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { runProtectedTool } from './protected-tool.mjs';
+import { openMeegleBundle, rebindMeegleBundle } from './credential-files.mjs';
+import { meegleFixture } from './meegle-test-fixture.mjs';
+
+test('Meegle native file group rebinds, redacts tokens and retries complete refreshed groups with advancing versions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-meegle-files-'));
+  const binaryRoot = join(root, 'bin'), tempRoot = join(root, 'homes'); await mkdir(binaryRoot);
+  const source = meegleFixture();
+  await writeFile(join(binaryRoot, 'meegle'), `#!${process.execPath}
+const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),crypto=require('node:crypto');
+const home=path.join(process.env.HOME,'.meegle'),filename=path.join(home,'credentials.enc');
+const machineKey=fs.readFileSync(path.join(home,'.machine-key'),'utf8');
+const encrypted=JSON.parse(fs.readFileSync(filename,'utf8'));
+const derive=salt=>crypto.pbkdf2Sync(os.hostname()+':'+process.env.USER+':'+machineKey+':meegle-cli',salt,100000,32,'sha256');
+const decipher=crypto.createDecipheriv('aes-256-gcm',derive(Buffer.from(encrypted.salt,'hex')),Buffer.from(encrypted.iv,'hex'));decipher.setAuthTag(Buffer.from(encrypted.tag,'hex'));
+const data=JSON.parse(Buffer.concat([decipher.update(Buffer.from(encrypted.data,'hex')),decipher.final()]).toString());
+console.log(data.access_token);console.log(data.refresh_token);
+if(process.argv[2]==='refresh'){
+ data.access_token='access-refreshed';data.refresh_token='refresh-refreshed';data.expires_at+=1000;
+ const salt=crypto.randomBytes(16),iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',derive(salt),iv);
+ const bytes=Buffer.concat([cipher.update(JSON.stringify(data)),cipher.final()]);
+ fs.writeFileSync(filename,JSON.stringify({salt:salt.toString('hex'),iv:iv.toString('hex'),tag:cipher.getAuthTag().toString('hex'),data:bytes.toString('hex')}));
+ console.log(data.access_token);console.log(data.refresh_token);
+}
+console.log('native files work');
+process.exit(process.argv[2]==='refresh'?1:0);
+`, { mode: 0o755 });
+  let output = '', requests = 0; const sink = { write(value) { output += value; } }, updates = [];
+  const config = { mode: 'files', generation: 1, url: 'http://unused.invalid', token: 'runtime-secret', files: [{ tool: 'meegle', path: source.files[0].path, secretId: 'group-secret', format: 'files', version: 1, mutable: true, content: Buffer.from(JSON.stringify(source)).toString('base64') }] };
+  const options = { config, binaryRoot, tempRoot, stdout: sink, stderr: sink,
+    fetch: async (_url, init) => {
+      const body = JSON.parse(init.body); requests++; assert.equal(body.updates.length, 1);
+      const update = body.updates[0], bundle = JSON.parse(Buffer.from(update.content, 'base64').toString());
+      assert.equal(bundle.files.length, 3); assert.equal(bundle.identity.username, 'unknown');
+      const data = openMeegleBundle(bundle); updates.push({ update, data });
+      if (requests === 1) throw new Error('offline');
+      return Response.json({ saved: true, versions: [{ secretId: 'group-secret', version: update.baseVersion + 1 }] });
+    },
+  };
+  try {
+    assert.equal(await runProtectedTool('meegle', ['read'], options), 0);
+    assert.equal(requests, 0, 'Re-encryption alone must not commit a central version');
+    assert.equal(await runProtectedTool('meegle', ['refresh'], options), 1);
+    assert.equal(requests, 1); assert.equal(updates[0].data.refresh_token, 'refresh-refreshed');
+    assert.equal(await runProtectedTool('meegle', ['read'], options), 0);
+    assert.equal(updates[1].update.baseVersion, 1);
+    assert.equal(await runProtectedTool('meegle', ['refresh'], options), 1);
+    assert.equal(updates[2].update.baseVersion, 2);
+    assert.equal(await runProtectedTool('meegle', ['read'], options), 0);
+    assert.equal(requests, 3);
+    assert.ok(output.includes('native files work')); assert.ok(output.includes('local files retained'));
+    for (const secret of ['access-original', 'refresh-original', 'access-refreshed', 'refresh-refreshed']) assert.ok(!output.includes(secret));
+    const restored = JSON.parse(updates.at(-1).update.content ? Buffer.from(updates.at(-1).update.content, 'base64').toString() : '{}');
+    const restoredConfig = { ...config, generation: 2, files: [{ ...config.files[0], version: 3, content: Buffer.from(JSON.stringify(restored)).toString('base64') }] };
+    assert.equal(await runProtectedTool('meegle', ['read'], { ...options, config: restoredConfig }), 0);
+    assert.equal(requests, 3);
+    // Simulate an interrupted rebind on another host. Recovery must finish the
+    // journal before interpreting a partially replaced native file group.
+    const migrated = rebindMeegleBundle(restored, { hostname: 'previous-sandbox-host', username: 'unknown' });
+    const snapshot = createHash('sha256').update(JSON.stringify({ generation: config.generation, resource: config.files[0] })).digest('hex');
+    const state = join(tempRoot, 'meegle', snapshot);
+    await writeFile(join(state, 'pending.json'), JSON.stringify(migrated), { mode: 0o600 });
+    await writeFile(join(state, 'home', '.meegle/.machine-key'), migrated.files[1].content, { mode: 0o600 });
+    assert.equal(await runProtectedTool('meegle', ['read'], options), 0);
+    assert.equal(requests, 3);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('provisioned local files survive repeated calls, writeback failure and central deletion without authorization', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-local-files-'));

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, normalize } from 'node:path';
+import { runBundleTool } from './file-bundle-tool.mjs';
 
 const LIMIT = 65536;
 const toolName = /^[A-Za-z][A-Za-z0-9_.\-]{0,63}$/;
@@ -65,6 +66,7 @@ async function runFileTool(tool, args, config, options, request) {
   if (!Array.isArray(config.files)) throw new Error('Invalid local file configuration');
   const files = config.files.filter(file => file.tool === tool);
   if (files.length > 1) throw new Error('Only one credential file per tool is supported');
+  if (files[0]?.format === 'files') return runBundleTool(tool, args, config, { ...options, execute, readCredential, sensitiveValues }, request);
   const snapshot = createHash('sha256').update(JSON.stringify({ generation: config.generation, files })).digest('hex');
   const state = join(options.tempRoot ?? '/var/lib/cellbox/debug/tool-homes', tool, snapshot);
   const root = join(state, 'home');
@@ -131,6 +133,16 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   // Compatibility for Sandboxes provisioned with older executor images.
   const setup = await request('/api/tool-runtime/start', { tool, args: inputArgs });
   if (setup.tool !== tool || !Array.isArray(setup.files) || setup.files.length !== 1) throw new Error('Invalid tool setup');
+  if (setup.files[0].format === 'files') {
+    let completed = false;
+    const result = await runBundleTool(tool, setup.args, { ...config, generation: 0, files: [{ ...setup.files[0], tool }] }, { ...options, execute, readCredential, sensitiveValues }, async (_path, body) => {
+      const response = await request(`/api/tool-runtime/${setup.id}/complete`, { updates: body.updates.map(({ baseVersion: _version, format: _format, ...update }) => update), exitCode: body.exitCode });
+      completed = true;
+      return response;
+    });
+    if (!completed) await request(`/api/tool-runtime/${setup.id}/complete`, { updates: [], exitCode: result });
+    return result;
+  }
   const parent = options.tempRoot ?? '/var/lib/cellbox/debug/tool-runs';
   await mkdir(parent, { recursive: true, mode: 0o700 }); await chmod(parent, 0o700);
   const root = await mkdtemp(join(parent, 'run-'));

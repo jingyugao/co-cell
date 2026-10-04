@@ -92,6 +92,7 @@ export interface Turn {
 }
 export type ProjectStatus = 'active' | 'completed' | 'archived';
 export interface ProjectSandboxOperation {
+  /** Resume completion confirms runtime restoration; health diagnostics do not gate it. */
 	/** Persisted intention ID used for remote operation idempotency. */
 	id?: string;
   kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume';

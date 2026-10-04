@@ -208,9 +208,11 @@ export class ProjectSandboxOperations {
     await this.phase(id, '恢复运行');
     await runtime.resume(target(current), sandbox => this.deps.saveSandbox(id, sandbox, false));
     const resumed = projects.get(id).sandbox;
-    if (!resumed || !runtime.verifySandbox) throw new HttpError(503, 'Sandbox 不支持就绪验证');
-    await this.phase(id, '验证环境');
-    await runtime.verifySandbox(resumed);
+    if (!resumed) throw new HttpError(503, 'Sandbox 恢复后缺少运行实例');
+    // Cellbox completes after restoring the execution and unquiescing Guest;
+    // its health diagnostics run asynchronously. The next real App Server
+    // connection performs initialize/protocol validation without a duplicate
+    // probe or temporary WebSocket stream blocking another lifecycle action.
     await this.deps.saveSandbox(id, { ...resumed, status: 'ready' }, false);
   }
 

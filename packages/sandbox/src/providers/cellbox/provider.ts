@@ -13,7 +13,7 @@ export interface CellboxSandboxProviderOptions extends CellboxClientOptions {
   workspace?: string;
   /** Upper bound for waiting on asynchronous operations. */
   operationTimeoutMs?: number;
-  pollIntervalMs?: number;
+  retryDelayMs?: number;
   /** Durable fallback for SandboxProvider.create when metadata has no caller-persisted key. */
   stateDirectory?: string;
 }
@@ -60,7 +60,7 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   private readonly kind: 'k8s-resumable';
   private readonly workspace?: string;
   private readonly maxWaitMs: number;
-  private readonly pollMs: number;
+  private readonly retryMs: number;
   private readonly stateDirectory?: string;
   private initialized = false;
   private profile?: CellboxProfile;
@@ -70,10 +70,10 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     this.kind = options.kind ?? 'k8s-resumable';
     this.workspace = options.workspace && posix.normalize(options.workspace);
     this.maxWaitMs = options.operationTimeoutMs ?? defaultWaitMs;
-    this.pollMs = options.pollIntervalMs ?? 500;
+    this.retryMs = options.retryDelayMs ?? 100;
     this.stateDirectory = options.stateDirectory;
-    if (!this.profileId || this.maxWaitMs < 1 || this.pollMs < 1)
-      throw new CellboxError('INVALID_REQUEST', 'Valid profileId and operation polling bounds are required');
+    if (!this.profileId || this.maxWaitMs < 1 || this.retryMs < 1)
+      throw new CellboxError('INVALID_REQUEST', 'Valid profileId and operation wait bounds are required');
   }
   async initialize() {
     const profile = (await this.client.listProfiles()).find(value => value.id === this.profileId);
@@ -110,18 +110,20 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
       if (signal?.aborted) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`);
       const remaining = until - Date.now();
       if (remaining <= 0) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} is still pending after the wait limit`);
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, Math.min(this.pollMs, remaining));
-        const abort = () => { clearTimeout(timer); reject(new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`)); };
-        signal?.addEventListener('abort', abort, { once: true });
-      });
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), Math.min(15_000, Math.max(1, until - Date.now())));
-      try { current = await this.client.getOperation(op.id, controller.signal); }
+      try { current = await this.client.getOperation(op.id, signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, Math.min(10_000, remaining)); }
       catch (error) {
         if (signal?.aborted) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`, undefined, undefined, { cause: error });
         if (Date.now() >= until) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} may still be pending`, undefined, undefined, { cause: error });
-        if (error instanceof CellboxError && error.code === 'TRANSPORT') continue;
+        if (error instanceof CellboxError && error.code === 'TRANSPORT') {
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, Math.min(this.retryMs, Math.max(1, until - Date.now())));
+            const abort = () => { clearTimeout(timer); reject(new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`)); };
+            signal?.addEventListener('abort', abort, { once: true });
+          });
+          continue;
+        }
         throw error;
       } finally { clearTimeout(timer); }
     }

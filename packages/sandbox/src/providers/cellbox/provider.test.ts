@@ -8,6 +8,23 @@ import test from 'node:test';
 import { CellboxClient, CellboxError } from './client.js';
 import { CellboxSandboxProvider } from './provider.js';
 
+test('operation completion uses long polling immediately without a polling delay', async () => {
+  let calls = 0;
+  const operation = { id: 'op-resume', kind: 'resume', targetId: 'box-a', status: 'running' as const, version: 1, createdAt: new Date().toISOString() };
+  const provider = new CellboxSandboxProvider({ baseUrl: 'http://cellbox.test', profileId: 'k8s', retryDelayMs: 5000,
+    fetch: async input => {
+      const url = new URL(String(input));
+      assert.equal(url.pathname, '/v1/operations/op-resume');
+      assert.ok(Number(url.searchParams.get('waitMs')) > 0);
+      calls++;
+      return Response.json({ ...operation, status: 'succeeded', version: 2 });
+    },
+  });
+  const result = provider.waitForOperation(operation, 1000);
+  assert.equal(calls, 1);
+  assert.equal((await result).status, 'succeeded');
+});
+
 const capabilities = { exec: true, files: true, http: true, websocket: true, pty: false,
   reconnectExec: false, freeze: false, suspend: 'same-node-checkpoint', archives: 'workspace-best-effort', protectedTools: false };
 
@@ -194,7 +211,7 @@ test('anonymous access, Kubernetes profile validation, and durable create key ad
     const anonymous = new CellboxClient({ baseUrl: http.baseUrl });
     assert.equal((await anonymous.listProfiles()).length, 1);
     const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s',
-      workspace: '/workspace', stateDirectory, pollIntervalMs: 1 });
+      workspace: '/workspace', stateDirectory, retryDelayMs: 1 });
     http.setProfileProvider('docker');
     await assert.rejects(provider.initialize(), (error: unknown) => error instanceof CellboxError && error.code === 'UNSUPPORTED_CAPABILITY');
     http.setProfileProvider('resumable-k8s-pod');
@@ -239,7 +256,7 @@ test('anonymous access, Kubernetes profile validation, and durable create key ad
 test('exec checks generation, shell quotes outside-workspace paths, and does not offer cancellation', async () => {
   const http = await fixture();
   try {
-    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s', pollIntervalMs: 1 });
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s', retryDelayMs: 1 });
     const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
       metadata: { cellboxOwnerKey: 'p', cellboxIdempotencyKey: 'create-p' } });
     await box.commands.run('printf hello', { idempotencyKey: 'exec-one', cwd: '/workspace/source' } as never);
@@ -378,7 +395,7 @@ test('archive downloads enforce the streamed byte cap', async () => {
 test('native file reads preserve binary bytes and reject external paths without exec fallback', async () => {
   const http = await fixture();
   try {
-    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s', pollIntervalMs: 1 });
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s', retryDelayMs: 1 });
     const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
       metadata: { cellboxOwnerKey: 'p', cellboxIdempotencyKey: 'native-file-test' } });
     const contents = Buffer.from([0, 0xff, 0xfe, 0x80]);

@@ -100,13 +100,16 @@ export async function projectLifecycle(env, { userInputOnly = false } = {}) {
     assert(result.commands > 0, 'Agent did not execute any tool commands');
     return { sessionId, threadId, ...result };
   });
-  if (userInputOnly) await step('Ask the agent to use request_user_input_async and answer from the API', async () => {
-    const prompt = `这是平台集成测试。必须调用 Codex 内置 request_user_input_async（禁止使用任何 MCP 工具），发送一个问题“集成测试继续吗？”并提供两个选项“继续”和“停止”。不要把问题当普通文字输出。调用成功后简短汇报。`;
+  const questionIds = new Set();
+  if (userInputOnly) for (const round of [1, 2]) await step(`Native asynchronous question and persisted reply, round ${round}`, async () => {
+    const prompt = `这是平台集成测试的第 ${round} 次提问。必须调用 Codex 内置 request_user_input_async（禁止使用任何 MCP 工具），发送一个问题“集成测试第 ${round} 轮继续吗？”并提供两个选项“继续”和“停止”。不要把问题当普通文字输出。调用成功后简短汇报。`;
     const result = await turn(prompt);
     const session = await json(`/api/sessions/${sessionId}`);
     const source = session.turns.find(t => t.id === result.turnId || t.nativeTurnId === result.nativeTurnId);
     assert(source?.userInputRequests?.length, `request_user_input_async did not create a persisted request; model reply: ${redact(result.text).slice(0, 1000)}`);
     const request = source.userInputRequests.at(-1);
+    assert(!questionIds.has(request.id), 'Continued conversation reused a previous question');
+    questionIds.add(request.id);
     assert.equal(request.status, 'pending');
     const native = source.items.find(item => item.id === request.id);
     assert.equal(native?.type, 'agent_message');

@@ -134,7 +134,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private safeError(error: unknown): Error {
     let message = error instanceof Error ? error.message : String(error);
     if (this.options.apiKey) message = message.replaceAll(this.options.apiKey, '[REDACTED]');
-    return new Error(message);
+    const safe = new Error(message);
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'BUSY') Object.assign(safe, { code: 'BUSY' });
+    return safe;
   }
 
   private async acquire(target: WorkspaceTarget, create: boolean, notify?: SaveSandbox, usageId?: string, signal?: AbortSignal, initialization = false): Promise<Entry> {

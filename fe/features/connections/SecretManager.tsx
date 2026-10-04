@@ -13,6 +13,7 @@ export default function SecretManager() {
   const [tool, setTool] = useState(''), [path, setPath] = useState('');
   const [format, setFormat] = useState<SecretFormat>('text');
   const [files, setFiles] = useState<SecretTextFile[]>([]), [originalFiles, setOriginalFiles] = useState('');
+  const [directoryMode, setDirectoryMode] = useState(false), [directory, setDirectory] = useState('');
   const [meegle, setMeegle] = useState(false);
   const [identity, setIdentity] = useState<SecretFileIdentity>({ hostname: '', username: '' });
   const [history, setHistory] = useState<{ id: string; name: string; rows: SecretVersion[] } | null>(null);
@@ -39,29 +40,47 @@ export default function SecretManager() {
       setName(item?.name ?? ''); setMutable(item?.mutable ?? false);
       setTool(item?.tool ?? ''); setPath(item?.path ?? '');
       setContent(value.content ?? ''); setOriginal(value.content ?? ''); setEditing(item ?? 'new'); setHistory(null);
+      setDirectoryMode(!!value.directory); setDirectory(value.directory ?? '');
       setFormat(value.format ?? 'text'); setFiles(value.files ?? []); setMeegle(value.adapter === 'meegle');
       setIdentity(value.identity ?? { hostname: '', username: '' });
-      setOriginalFiles(JSON.stringify({ files: value.files ?? [], adapter: value.adapter, identity: value.identity }));
+      setOriginalFiles(JSON.stringify({ files: value.files ?? [], ...(value.directory ? { directory: value.directory } : {}), adapter: value.adapter, identity: value.identity }));
     } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
   }
   async function upload(file: File | undefined, index?: number) {
     if (!file) return;
-    if (file.size > 65536 || !file.size) { setError('文件必须为 1..65536 字节'); return; }
+    if (file.size > (index === undefined ? 65536 : 524288)) { setError('文件超过大小限制'); return; }
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
-      const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-      if (index === undefined) setContent(text);
-      else setFiles(previous => previous.map((entry, i) => i === index ? { ...entry, content: text } : entry));
+      const value = uploadedContent(bytes);
+      if (index === undefined) { if (value.encoding) throw new Error('单文件需要 UTF-8 文本'); setContent(value.content); }
+      else setFiles(previous => previous.map((entry, i) => i === index ? { path: entry.path, ...value } : entry));
       setError('');
     } catch { setError('请上传 UTF-8 编码的原始文本文件'); }
   }
+  function uploadedContent(bytes: Uint8Array): Pick<SecretTextFile, 'content' | 'encoding'> {
+    try { return { content: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) }; }
+    catch { return { content: btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join('')), encoding: 'base64' }; }
+  }
+  async function uploadDirectory(selected: FileList | null) {
+    if (!selected?.length) return;
+    const entries = Array.from(selected);
+    if (entries.length > 128 || entries.reduce((sum, file) => sum + file.size, 0) > 524288) { setError('目录最多包含 128 份文件，总大小最多 512 KiB'); return; }
+    try {
+      const sourceRoot = entries[0].webkitRelativePath.split('/')[0], target = directory || sourceRoot;
+      const imported = await Promise.all(entries.map(async file => ({ path: `${target}/${file.webkitRelativePath.split('/').slice(1).join('/')}`, ...uploadedContent(new Uint8Array(await file.arrayBuffer())) })));
+      imported.sort((a, b) => a.path.localeCompare(b.path));
+      const primary = imported.findIndex(file => /(?:^|\/)(?:config(?:\.json)?|auth\.json)$/.test(file.path));
+      if (primary > 0) imported.unshift(...imported.splice(primary, 1));
+      setDirectory(target); setFiles(imported); setError('');
+    } catch { setError('无法读取凭证目录'); }
+  }
   return <>
-    <div className="connections-heading"><div><h1>Secret 管理</h1><p>保存工具的认证文件或文件组，然后在项目中授权。</p></div><button className="primary-button" disabled={busy} onClick={() => void edit()}>新建 Secret</button></div>
+    <div className="connections-heading"><div><h1>Secret 管理</h1><p>保存工具的认证文件、文件组或凭证目录，然后在项目中授权。</p></div><button className="primary-button" disabled={busy} onClick={() => void edit()}>新建 Secret</button></div>
     {error && <p className="connections-error" role="alert">{error}</p>}
     {editing && <form className="secret-form" onSubmit={async event => {
       event.preventDefault(); setBusy(true); setError('');
       try {
-        const bundle = { files, ...(meegle ? { adapter: 'meegle', identity } : {}) };
+        const bundle = { files, ...(directoryMode ? { directory } : {}), ...(meegle ? { adapter: 'meegle', identity } : {}) };
         const config = { tool: tool.trim(), path: format === 'files' ? files[0]?.path : path };
         const changed = editing === 'new' || editing.format !== format || editing.requiresTextImport ||
           (format === 'files' ? JSON.stringify(bundle) !== originalFiles : content !== original);
@@ -86,12 +105,21 @@ export default function SecretManager() {
       <label>上传文件<input type="file" onChange={e => void upload(e.target.files?.[0])} /></label>
       <label>认证内容<textarea required spellCheck={false} autoComplete="off" rows={12} value={content} onChange={e => setContent(e.target.value)} placeholder="粘贴工具原生认证文件的完整文本内容" /></label>
       </> : <>
-        <p>路径相对于工具 HOME。第一份文件作为主配置；整组文件作为一个版本保存，总大小最多 64 KiB。</p>
+        <p>路径相对于工具 HOME。第一份文件作为主配置；整组文件作为一个版本保存，总大小最多 512 KiB。</p>
+        <label className="secret-checkbox"><input type="checkbox" checked={directoryMode} onChange={event => { setDirectoryMode(event.target.checked); if (!directory && files[0]?.path.includes('/')) setDirectory(files[0].path.slice(0, files[0].path.lastIndexOf('/'))); }} />凭证目录</label>
+        {directoryMode && <>
+          <label>凭证目录路径<input required value={directory} maxLength={256} onChange={event => {
+            const next = event.target.value;
+            setFiles(previous => previous.map(file => file.path.startsWith(directory + '/') ? { ...file, path: next + file.path.slice(directory.length) } : file)); setDirectory(next);
+          }} placeholder="相对于工具 HOME，例如 .config/custom" /></label>
+          <label>上传凭证目录<input type="file" multiple {...{ webkitdirectory: '', directory: '' }} onChange={event => void uploadDirectory(event.target.files)} /></label>
+          <label>主配置文件<select value={files[0]?.path ?? ''} onChange={event => setFiles(previous => { const selected = previous.find(file => file.path === event.target.value); return selected ? [selected, ...previous.filter(file => file !== selected)] : previous; })}>{files.map(file => <option key={file.path} value={file.path}>{file.path}</option>)}</select></label>
+          <p>保留子目录、文本和二进制文件。工具在该目录内新增或删除的文件会随整个目录回写。</p>
+        </>}
         <label className="secret-checkbox"><input type="checkbox" checked={meegle} disabled={tool.trim() !== 'meegle'} onChange={event => {
           setMeegle(event.target.checked);
           if (event.target.checked) {
             setMutable(true);
-            setFiles(['.meegle/config.json', '.meegle/.machine-key', '.meegle/credentials.enc'].map(p => ({ path: p, content: files.find(file => file.path === p)?.content ?? '' })));
           }
         }} />Meegle 原生加密凭证</label>
         {meegle && <>
@@ -103,10 +131,10 @@ export default function SecretManager() {
           <legend>文件 {index + 1}{index === 0 ? ' · 主配置' : ''}</legend>
           <label>文件路径<input required maxLength={256} value={file.path} onChange={event => setFiles(previous => previous.map((entry, i) => i === index ? { ...entry, path: event.target.value } : entry))} /></label>
           <label>上传文件<input type="file" onChange={event => void upload(event.target.files?.[0], index)} /></label>
-          <label>文件内容<textarea required rows={5} spellCheck={false} autoComplete="off" value={file.content} onChange={event => setFiles(previous => previous.map((entry, i) => i === index ? { ...entry, content: event.target.value } : entry))} /></label>
+          {file.encoding ? <p>二进制文件 · {atob(file.content).length} 字节，按原内容保存。</p> : <label>文件内容<textarea rows={5} spellCheck={false} autoComplete="off" value={file.content} onChange={event => setFiles(previous => previous.map((entry, i) => i === index ? { ...entry, content: event.target.value } : entry))} /></label>}
           <button type="button" className="secondary-button" disabled={busy || files.length === 1} onClick={() => setFiles(previous => previous.filter((_, i) => i !== index))}>移除文件 {index + 1}</button>
         </fieldset>)}
-        <button type="button" className="secondary-button" disabled={busy || files.length >= 16} onClick={() => setFiles(previous => [...previous, { path: '', content: '' }])}>添加文件</button>
+        <button type="button" className="secondary-button" disabled={busy || files.length >= 128} onClick={() => setFiles(previous => [...previous, { path: '', content: '' }])}>添加文件</button>
       </>}
       <label className="secret-checkbox"><input type="checkbox" checked={mutable} onChange={e => setMutable(e.target.checked)} />允许工具更新{format === 'files' ? '整组文件' : '此文件'}</label>
       <p>{format === 'files' ? '整组回写会检查基础版本，冲突时保留 Sandbox 本地文件并提示。' : '更新后最后保存的内容生效。'}凭证及更新历史加密存储。</p>

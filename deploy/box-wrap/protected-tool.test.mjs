@@ -221,3 +221,46 @@ console.log('refreshed-after-deletion');
     assert.deepEqual(await readdir(tempRoot), []);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('arbitrary credential directories preserve binary files and sync additions and deletions as one version', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-directory-'));
+  const binaryRoot = join(root, 'bin'), tempRoot = join(root, 'homes'); await mkdir(binaryRoot);
+  const directory = '.config/custom', binary = Buffer.from([0, 255, 128, 10]);
+  const source = { directory, files: [{ path: `${directory}/config.json`, content: '\uFEFF{"token":"directory-original"}\r\n' }, { path: `${directory}/keys/old`, content: binary.toString('base64'), encoding: 'base64' }, { path: `${directory}/empty`, content: '' }] };
+  await writeFile(join(binaryRoot, 'custom.cli'), `#!${process.execPath}
+const fs=require('node:fs'),path=require('node:path');
+const dir=path.join(process.env.HOME,'.config/custom');
+if(fs.readFileSync(path.join(dir,'empty')).length)process.exit(2);
+if(process.argv[2]==='refresh'){
+ if(!fs.readFileSync(path.join(dir,'keys/old')).equals(Buffer.from([0,255,128,10])))process.exit(3);
+ fs.unlinkSync(path.join(dir,'keys/old'));
+ fs.writeFileSync(path.join(dir,'keys/new'),Buffer.from([255,0,129,13]));
+ fs.writeFileSync(path.join(dir,'config.json'),' {"token":"directory-refreshed"}\\r\\n');
+ fs.writeFileSync(path.join(process.env.HOME,'outside'),'unrelated');
+}
+if(process.argv[2]==='link')fs.symlinkSync('/etc/passwd',path.join(dir,'link'));
+console.log(JSON.parse(fs.readFileSync(path.join(dir,'config.json'),'utf8').replace(/^\\uFEFF/, '')).token);console.log('directory works');
+`, { mode: 0o755 });
+  const config = { mode: 'files', generation: 1, url: 'http://unused.invalid', token: 'runtime-secret', files: [{ tool: 'custom.cli', path: source.files[0].path, secretId: 'directory-secret', format: 'files', version: 1, mutable: true, content: Buffer.from(JSON.stringify(source)).toString('base64') }] };
+  let output = '', requests = 0, saved;
+  const sink = { write(value) { output += value; } };
+  const options = { config, binaryRoot, tempRoot, stdout: sink, stderr: sink, fetch: async (_url, init) => {
+    requests++; const body = JSON.parse(init.body); assert.equal(body.updates.length, 1);
+    const update = body.updates[0]; assert.equal(update.baseVersion, 1);
+    saved = JSON.parse(Buffer.from(update.content, 'base64').toString());
+    assert.equal(saved.directory, directory); assert.equal(saved.files.length, 3);
+    assert.ok(!saved.files.some(file => file.path.endsWith('/old') || file.path === 'outside'));
+    assert.deepEqual(Buffer.from(saved.files.find(file => file.path.endsWith('/new')).content, 'base64'), Buffer.from([255, 0, 129, 13]));
+    return Response.json({ saved: true, versions: [{ secretId: 'directory-secret', version: 2 }] });
+  } };
+  try {
+    assert.equal(await runProtectedTool('custom.cli', ['read'], options), 0); assert.equal(requests, 0);
+    assert.equal(await runProtectedTool('custom.cli', ['refresh'], options), 0); assert.equal(requests, 1);
+    assert.equal(await runProtectedTool('custom.cli', ['read'], options), 0); assert.equal(requests, 1);
+    const restored = { ...config, generation: 2, files: [{ ...config.files[0], version: 2, content: Buffer.from(JSON.stringify(saved)).toString('base64') }] };
+    assert.equal(await runProtectedTool('custom.cli', ['read'], { ...options, config: restored }), 0); assert.equal(requests, 1);
+    assert.ok(output.includes('directory works')); assert.ok(!output.includes('directory-refreshed'));
+    await assert.rejects(runProtectedTool('custom.cli', ['link'], options), /符号链接/);
+    assert.equal(requests, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

@@ -27,7 +27,7 @@ function sensitiveValues(bytes) {
   }
   return values.filter(Boolean);
 }
-async function readCredential(root, path) {
+async function readCredential(root, path, limit = LIMIT, allowEmpty = false) {
   let current = root;
   for (const part of path.split('/').slice(0, -1)) {
     current = join(current, part); const info = await lstat(current);
@@ -36,9 +36,9 @@ async function readCredential(root, path) {
   const file = await open(join(root, path), constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const stat = await file.stat();
-    if (!stat.isFile() || stat.size < 1 || stat.size > LIMIT) throw new Error('Invalid credential file');
+    if (!stat.isFile() || (!allowEmpty && stat.size < 1) || stat.size > limit) throw new Error('Invalid credential file');
     const bytes = await file.readFile();
-    if (bytes.length > LIMIT) throw new Error('Credential exceeds limit');
+    if (bytes.length > limit) throw new Error('Credential exceeds limit');
     return bytes;
   } finally { await file.close(); }
 }

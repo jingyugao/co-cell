@@ -4,13 +4,13 @@ import { HttpError } from '../../util/errors.js';
 import { SecretCrypto } from './crypto.js';
 import { credentialPath, toolName, validateToolArgs } from './policy.js';
 import type { SecretRepository, StoredSecret, StoredVersion } from './repository.js';
-import { openMeegleBundle, validateFileBundle } from '../../deploy/box-wrap/credential-files.mjs';
+import { FILE_BUNDLE_LIMIT, openMeegleBundle, validateFileBundle } from '../../deploy/box-wrap/credential-files.mjs';
 
 export const MAX_SECRET_BYTES = 64 * 1024;
 export function secretBytes(format: SecretInput['format'], content: string): Buffer {
   const bytes = Buffer.from(content, 'utf8');
-  if (!['text', 'files'].includes(format) || !bytes.length || bytes.length > MAX_SECRET_BYTES || bytes.toString('utf8') !== content)
-    throw new HttpError(400, 'Secret 必须为 1..65536 字节的 UTF-8 文本');
+  if (!['text', 'files'].includes(format) || !bytes.length || bytes.length > (format === 'files' ? FILE_BUNDLE_LIMIT : MAX_SECRET_BYTES) || bytes.toString('utf8') !== content)
+    throw new HttpError(400, '单文件最多 64 KiB，目录或文件组最多 512 KiB');
   return bytes;
 }
 function fileBundle(input: unknown) {
@@ -28,7 +28,7 @@ function inputBytes(input: SecretInput): Buffer {
     }
     return secretBytes('files', JSON.stringify(bundle));
   }
-  if (input.files || input.adapter || input.identity || input.content === undefined) throw new HttpError(400, '单文件请提供 content');
+  if (input.files || input.directory || input.adapter || input.identity || input.content === undefined) throw new HttpError(400, '单文件请提供 content');
   return secretBytes('text', input.content);
 }
 export class SecretService {
@@ -40,7 +40,7 @@ export class SecretService {
     const { ciphertext: _ciphertext, currentVersionId: _versionId, alias: _alias, format, ...metadata } = secret;
     const bundle = format === 'files' ? this.bundle(secret) : null;
     return { ...metadata, format: format === 'files' ? 'files' : 'text', requiresTextImport: !['text', 'files'].includes(format), projectIds,
-      ...(bundle ? { filePaths: bundle.files.map(file => file.path), adapter: bundle.adapter, identity: bundle.identity } : {}) };
+      ...(bundle ? { filePaths: bundle.files.map(file => file.path), directory: bundle.directory, adapter: bundle.adapter, identity: bundle.identity } : {}) };
   }
   private bundle(secret: StoredSecret) { return fileBundle(JSON.parse(this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('utf8'))); }
   async list() {
@@ -83,7 +83,7 @@ export class SecretService {
   async update(id: string, input: SecretUpdate) {
     const secret = await this.requireSecret(id), now = new Date().toISOString();
     const contentChanged = input.content !== undefined || input.files !== undefined;
-    if (!contentChanged && (input.format !== undefined || input.identity !== undefined || input.adapter !== undefined)) throw new HttpError(400, '更改文件格式或加密身份时请提交完整内容');
+    if (!contentChanged && (input.format !== undefined || input.directory !== undefined || input.identity !== undefined || input.adapter !== undefined)) throw new HttpError(400, '更改文件格式或加密身份时请提交完整内容');
     const next: StoredSecret = { ...secret, name: input.name ?? secret.name, mutable: input.mutable ?? secret.mutable,
       enabled: input.enabled ?? secret.enabled, tool: input.tool ?? secret.tool, path: input.path ?? secret.path,
       alias: secret.alias ?? 'default', format: contentChanged ? input.format ?? (input.files ? 'files' : 'text') : secret.format, updatedAt: now };
@@ -210,7 +210,7 @@ export class SecretService {
     let incoming;
     try { incoming = fileBundle(JSON.parse(raw.toString('utf8'))); } catch { throw new HttpError(400, '文件组更新格式无效'); }
     const current = this.bundle(secret);
-    if (incoming.adapter !== current.adapter || JSON.stringify(incoming.files.map(file => file.path)) !== JSON.stringify(current.files.map(file => file.path)))
+    if (incoming.adapter !== current.adapter || incoming.directory !== current.directory || (!current.directory && JSON.stringify(incoming.files.map(file => file.path)) !== JSON.stringify(current.files.map(file => file.path))))
       throw new HttpError(403, '工具不能修改文件组路径或适配方式');
     return inputBytes({ name: secret.name, mutable: secret.mutable, tool: secret.tool!, path: secret.path!, format: 'files', ...incoming });
   }

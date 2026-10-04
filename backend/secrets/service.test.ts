@@ -397,3 +397,22 @@ test('operator deletion removes history and every project binding while discardi
   assert.deepEqual(await repository.versions(racing.id), []);
   assert.equal((await service.grants(projectId))[0].files[0].secretId, preserved.id);
 });
+
+test('directory credentials allow contained file additions and deletions with binary content and version checks', async () => {
+  const { service, projectId } = fixture();
+  const directory = '.config/custom';
+  const files = [{ path: `${directory}/config`, content: 'token=fixture' }, { path: `${directory}/old`, content: '' }];
+  const secret = await service.create({ name: 'Directory', tool: 'custom.cli', path: files[0].path, format: 'files', mutable: true, directory, files });
+  assert.equal(secret.directory, directory);
+  await service.saveSelections(projectId, selections('custom.cli', secret.id));
+  const token = await service.registerRuntime('box-a', projectId, 1);
+  const next = { directory, files: [files[0], { path: `${directory}/nested/new`, content: Buffer.from([255, 0, 128]).toString('base64'), encoding: 'base64' as const }] };
+  const update = (bundle: unknown, baseVersion = 1) => [{ secretId: secret.id, content: Buffer.from(JSON.stringify(bundle)).toString('base64'), baseVersion, format: 'files' as const }];
+  assert.deepEqual(await service.syncFiles(token, 'custom.cli', update(next), 0), { saved: true, versions: [{ secretId: secret.id, version: 2 }] });
+  assert.deepEqual((await service.content(secret.id)).files, next.files);
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update({ ...next, directory: '.config/other' }, 2), 0));
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update({ ...next, files: [...next.files, { path: '.ssh/key', content: 'outside' }] }, 2), 0));
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update({ ...next, files: next.files.slice(1) }, 2), 0));
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update(next), 0));
+  assert.equal((await service.content(secret.id)).version, 2);
+});

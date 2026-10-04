@@ -1,23 +1,23 @@
 export type SecretFormat = 'text' | 'files';
-export interface SecretTextFile { path: string; content: string }
+export interface SecretTextFile { path: string; content: string; encoding?: 'base64' }
 export interface SecretFileIdentity { hostname: string; username: string }
 export interface SecretFileBundle {
-  files: SecretTextFile[]; adapter?: 'meegle'; identity?: SecretFileIdentity;
+  files: SecretTextFile[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity;
 }
 export type ProxyTool = string;
 export interface SecretMetadata {
   id: string; name: string; format: SecretFormat; mutable: boolean; enabled: boolean;
   version: number; createdAt: string; updatedAt: string; projectIds: string[];
   tool: ProxyTool | null; path: string | null; requiresTextImport: boolean;
-  filePaths?: string[]; adapter?: 'meegle'; identity?: SecretFileIdentity;
+  filePaths?: string[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity;
 }
 export interface SecretInput {
   name: string; format: SecretFormat; mutable: boolean; content?: string;
   tool: ProxyTool; path: string;
-  files?: SecretTextFile[]; adapter?: 'meegle'; identity?: SecretFileIdentity;
+  files?: SecretTextFile[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity;
 }
 export interface SecretUpdate { name?: string; mutable?: boolean; enabled?: boolean; content?: string; tool?: ProxyTool; path?: string;
-  format?: SecretFormat; files?: SecretTextFile[]; adapter?: 'meegle'; identity?: SecretFileIdentity }
+  format?: SecretFormat; files?: SecretTextFile[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity }
 export interface SecretContent extends Partial<SecretFileBundle> {
   format: SecretFormat; content: string; requiresTextImport: boolean; version: number;
 }

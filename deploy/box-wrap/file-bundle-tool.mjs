@@ -2,15 +2,17 @@ import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { openMeegleBundle, rebindMeegleBundle, validateFileBundle } from './credential-files.mjs';
+import { collectCredentialDirectory, encodeFile, fileBytes, FILE_BUNDLE_LIMIT, openMeegleBundle, rebindMeegleBundle, validateFileBundle } from './credential-files.mjs';
 
 function fingerprint(bundle) {
   // Re-encryption alone must not consume a central version. Compare the native
   // token data while persisting only a digest, never decrypted credentials.
+  const profile = bundle.adapter === 'meegle' ? JSON.parse(bundle.files.find(file => file.path === '.meegle/config.json').content).current || 'default' : null;
+  const credentialPath = `.meegle/${profile === 'default' ? 'credentials.enc' : `credentials-${profile}.enc`}`;
   const content = bundle.adapter === 'meegle'
-    ? { files: bundle.files.map(file => ({ path: file.path, ...(file.path === '.meegle/config.json' ? { content: file.content } : {}) })),
+    ? { files: bundle.files.map(file => ({ path: file.path, ...(!['.meegle/.machine-key', credentialPath].includes(file.path) ? { content: file.content } : {}) })),
       tokens: Object.fromEntries(Object.entries(openMeegleBundle(bundle)).sort(([a], [b]) => a.localeCompare(b))) }
-    : bundle;
+    : bundle.directory ? { ...bundle, files: [...bundle.files].sort((a, b) => a.path.localeCompare(b.path)) } : bundle;
   return createHash('sha256').update(JSON.stringify(content)).digest('hex');
 }
 
@@ -52,7 +54,7 @@ export async function runBundleTool(tool, args, config, options, request) {
     const syncedPath = join(state, 'synced.json'), materialPath = join(state, 'material.json'), pendingPath = join(state, 'pending.json');
     const masks = [config.token];
     function mask(bundle) {
-      for (const file of bundle.files) masks.push(...options.sensitiveValues(Buffer.from(file.content)));
+      for (const file of bundle.files) masks.push(...options.sensitiveValues(fileBytes(file)));
       if (bundle.adapter === 'meegle') masks.push(...options.sensitiveValues(Buffer.from(JSON.stringify(openMeegleBundle(bundle)))));
     }
     mask(source);
@@ -68,7 +70,7 @@ export async function runBundleTool(tool, args, config, options, request) {
           parent = join(parent, part); await mkdir(parent, { recursive: true, mode: 0o700 });
           const info = await lstat(parent); if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Unsafe credential directory');
         }
-        await atomicFile(join(root, file.path), file.content);
+        await atomicFile(join(root, file.path), fileBytes(file));
       }
       await atomicFile(materialPath, JSON.stringify(bundle));
       await rm(pendingPath, { force: true });
@@ -79,11 +81,10 @@ export async function runBundleTool(tool, args, config, options, request) {
     try { material = validateFileBundle(JSON.parse(await readFile(materialPath, 'utf8'))); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
     async function collect() {
-      return validateFileBundle({ ...material, files: await Promise.all(material.files.map(async file => {
-        const bytes = await options.readCredential(root, file.path), content = bytes.toString('utf8');
-        if (!Buffer.from(content).equals(bytes)) throw new Error('Credential file is not UTF-8');
-        return { path: file.path, content };
-      })) });
+      const files = material.directory
+        ? await collectCredentialDirectory(root, material.directory, resource.path, options.readCredential, material.files)
+        : await Promise.all(material.files.map(async file => encodeFile(file.path, await options.readCredential(root, file.path, FILE_BUNDLE_LIMIT, true), file.encoding)));
+      return validateFileBundle({ ...material, files });
     }
     if (!material || (material.adapter === 'meegle' && (material.identity.hostname !== identity.hostname || material.identity.username !== identity.username))) {
       const current = material ? await collect() : source;

@@ -162,6 +162,8 @@ export interface ArchiveVersionSummary {
   label: string;
 }
 
+/** POST /api/projects/:id/open returns this immediately after joining preparation or accepting
+ * a paused sandbox resume. It does not imply readiness; GET remains read-only. */
 export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null;
   /** Cellbox archive versions, newest first. */
   archiveVersions?: ArchiveVersionSummary[];

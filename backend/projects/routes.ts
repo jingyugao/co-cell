@@ -6,7 +6,7 @@ import type { SessionManager } from '../sessions/manager.js';
 import { workspaceFileResponse } from '../workspaces/http-files.js';
 import { serviceHost } from './service-host.js';
 
-type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
+type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
 
 export async function proxyProjectService(manager: Pick<SessionManager, 'projectService'>, projectId: string, port: number,
   path: string, request: Request, prefix: string, isolatedOrigin = false): Promise<Response> {
@@ -46,6 +46,7 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
     const input = z.object({ imageVersionId: z.string().min(1).max(256).optional() }).strict().parse(parsed);
     return c.json(await manager.rebuildProjectSandbox(c.req.param('id'), input.imageVersionId), 202);
   });
+  app.post('/api/projects/:id/open', async c => c.json(await manager.enterProject(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/resume', async c => c.json(await manager.resumeProjectSandbox(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/checkpoint', async c => c.json(await manager.checkpointProjectSandbox(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/refresh-runtime', async c => c.json(await manager.refreshProjectSandboxRuntime(c.req.param('id')), 202));

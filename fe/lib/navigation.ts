@@ -35,17 +35,11 @@ export function resolveSelection(route: ReturnType<typeof readRoute>, sessions: 
     if (!isActiveProject(project)) {
       return { sessionId: null, projectId: null, error: '项目已归档或未处于使用中状态，请先在项目管理中恢复。' };
     }
-    if (route.page === 'chat' && !canEnterProject(project)) {
-      return { sessionId: null, projectId: null, error: '项目 Sandbox 尚未就绪，请先在项目管理中创建或恢复环境。' };
-    }
     return { sessionId: session.id, projectId: session.projectId! };
   }
   if (route.projectId) {
     const project = projects.find(item => item.id === route.projectId);
     if (!project) return { sessionId: null, projectId: null, error: '链接中的项目不存在或已删除，请从项目列表选择项目。' };
-    if (route.page === 'chat' && isActiveProject(project) && !canEnterProject(project)) {
-      return { sessionId: null, projectId: null, error: '项目 Sandbox 尚未就绪，请先在项目管理中创建或恢复环境。' };
-    }
     return !isActiveProject(project)
       ? { sessionId: null, projectId: null, error: '项目已归档或未处于使用中状态，请先在项目管理中恢复。' }
       : { sessionId: null, projectId: route.projectId };

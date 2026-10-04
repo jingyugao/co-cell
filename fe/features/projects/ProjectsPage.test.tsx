@@ -52,13 +52,13 @@ test('abnormal and missing sandboxes use the recovery-or-first-create paths', ()
   const unknown = page([project({ sandbox: { id: 'query-failed', status: 'unknown', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);
   assert.match(unknown, /状态未知/);
   assert.match(unknown, /状态查询失败/);
-  assert.match(unknown, /<button class="primary-button" disabled="">进入项目/);
+  assert.doesNotMatch(unknown, /<button class="primary-button" disabled="">进入项目/);
   assert.doesNotMatch(unknown, /恢复环境|重建 Sandbox|立即备份|>异常</);
 
   const missing = page([project()]);
   assert.match(missing, /无 Sandbox/);
   assert.match(missing, /进入项目/);
-  assert.match(missing, /<button class="primary-button" disabled="">进入项目/);
+  assert.doesNotMatch(missing, /<button class="primary-button" disabled="">进入项目/);
   assert.match(missing, /重建 Sandbox/);
   assert.doesNotMatch(missing, /恢复环境/);
 });
@@ -67,7 +67,7 @@ test('paused sandbox shows its state and resumes the same environment', () => {
   const html = page([project({ sandbox: { id: 'paused-box', status: 'paused', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);
   assert.match(html, /已暂停/);
   assert.match(html, /恢复运行/);
-  assert.match(html, /<button class="primary-button" disabled="">进入项目/);
+  assert.doesNotMatch(html, /<button class="primary-button" disabled="">进入项目/);
   assert.doesNotMatch(html, /恢复环境|立即备份|>异常</);
 });
 

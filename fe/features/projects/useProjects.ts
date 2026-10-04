@@ -28,6 +28,16 @@ export function useProjects() {
   const createProject = useCallback(async (values: ProjectValues) => storeProject(
     await api<ProjectSummary>('/api/projects', { method: 'POST', body: JSON.stringify(values) }),
   ), [storeProject]);
+  const enterProject = useCallback(async (id: string, signal?: AbortSignal) => {
+    const project = await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/open`, { method: 'POST', signal });
+    signal?.throwIfAborted();
+    return storeProject(project);
+  }, [storeProject]);
+  const refreshProject = useCallback(async (id: string, signal?: AbortSignal) => {
+    const project = await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { signal });
+    signal?.throwIfAborted();
+    return storeProject(project);
+  }, [storeProject]);
   const updateProject = useCallback(async (id: string, values: ProjectUpdate) => storeProject(
     await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(values) }),
   ), [storeProject]);
@@ -56,5 +66,5 @@ export function useProjects() {
   const checkpointSandbox = useCallback((id: string) => runSandboxOperation(id, 'checkpoint', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/checkpoint`, { method: 'POST' }),
   ), [runSandboxOperation]);
-  return { projects, refreshProjects, createProject, updateProject, rebuildSandbox, backupProject, resumeSandbox, checkpointSandbox };
+  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, rebuildSandbox, backupProject, resumeSandbox, checkpointSandbox };
 }

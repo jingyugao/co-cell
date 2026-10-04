@@ -10,18 +10,20 @@ const project = (id: string, archivedAt: string | null): ProjectSummary => ({
   sandbox: { id: `sandbox-${id}`, status: 'ready', template: 'default', workingDirectory: '/home/agent/workspace' },
 });
 
-test('direct and default routes cannot enter pending, missing, or checkpointed sandboxes', () => {
+test('workspace routes open pending and checkpointed projects before their runtime is ready', () => {
   storage.clear();
   const pending = { ...project('pending', null), sandbox: undefined,
     sandboxOperation: { kind: 'create' as const, status: 'running' as const, phase: '创建 Sandbox', updatedAt: '2026-09-30T00:00:00Z' } };
   const paused = project('paused', null); paused.sandbox!.status = 'paused';
   const ready = project('ready', null);
   const route = { page: 'chat' as const, sessionId: null, projectId: null, explicit: false, invalid: false };
-  assert.equal(resolveSelection(route, [], [pending, paused, ready]).projectId, ready.id);
+  assert.equal(resolveSelection(route, [], [pending, paused, ready]).projectId, pending.id);
   for (const value of [pending, paused, { ...pending, sandboxOperation: undefined }]) {
     const result = resolveSelection({ ...route, projectId: value.id, explicit: true }, [], [value]);
-    assert.equal(result.projectId, null);
-    assert.match(result.error ?? '', /尚未就绪/);
+    assert.equal(result.projectId, value.id);
+    assert.equal(result.error, undefined);
+    const session = { id: `session-${value.id}`, projectId: value.id } as SessionSummary;
+    assert.equal(resolveSelection({ ...route, sessionId: session.id, explicit: true }, [session], [value]).sessionId, session.id);
   }
 });
 

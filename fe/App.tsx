@@ -4,6 +4,8 @@ import BillingRail from './features/chat/BillingRail';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { AppConfig, Session, SessionSummary, Settings } from '../protocol/types';
 import { useProjects } from './features/projects/useProjects';
+import { useProjectEntry } from './features/projects/useProjectEntry';
+import './features/projects/ProjectEntry.css';
 import { useSessionStream } from './features/chat/useSessionStream';
 import { usePromptDraft } from './features/chat/usePromptDraft';
 import { requirementPrompt } from './features/projects/requirement-prompt';
@@ -89,7 +91,7 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const refreshConfig = useCallback(() => { void api<AppConfig>('/api/config').then(setConfig).catch(() => {}); }, []);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const { projects, refreshProjects, createProject, updateProject, rebuildSandbox, backupProject, resumeSandbox, checkpointSandbox } = useProjects();
+  const { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, rebuildSandbox, backupProject, resumeSandbox, checkpointSandbox } = useProjects();
   const [selectedProject, setSelectedProject] = useState<string | null>(() => readRoute().explicit ? readRoute().projectId : localStorage.getItem('codex-project'));
   const [selected, setSelected] = useState<string | null>(() => readRoute().explicit ? readRoute().sessionId : localStorage.getItem('codex-session'));
   const archivedProjectAccess = useRef<string | null>(null);
@@ -138,10 +140,10 @@ export default function App() {
   const refreshWorkspace = useCallback(async () => {
     await Promise.all([refreshSessions(), refreshProjects()]);
   }, [refreshSessions, refreshProjects]);
-  const { session, setSession, connected, loadOlder, loadingOlder, loadingHistory } = useSessionStream({
-    selected, enabled: !loading, onState: refreshWorkspace, onError: setError,
-  });
   const project = projects.find(item => item.id === selectedProject) ?? null;
+  const { session, setSession, connected, loadOlder, loadingOlder, loadingHistory } = useSessionStream({
+    selected, enabled: !loading, historyReady: !project || isProjectSandboxReady(project), onState: refreshWorkspace, onError: setError,
+  });
   const { prompt, setPrompt, setSessionDraft, moveToSession } = usePromptDraft(
     selected ? `session:${selected}` : `project:${selectedProject ?? ''}:new`,
   );
@@ -158,7 +160,22 @@ export default function App() {
   };
   const systemManagement = page === 'images' || page === 'sandboxes' || page === 'connections' || page === 'files';
   const needsProject = !session && !project;
+  const projectReadOnly = Boolean(project && !canEnterProject(project));
   const sandboxNotReady = Boolean(project && !isProjectSandboxReady(project));
+  const entryProjectId = !loading && page === 'chat' && project && canEnterProject(project) ? project.id : null;
+  const entry = useProjectEntry(entryProjectId, `${entryProjectId ?? ''}:${selected ?? 'new'}`, enterProject, refreshProject);
+  const [retryingEntry, setRetryingEntry] = useState(false);
+  const environmentPending = sandboxNotReady && (retryingEntry || (!entry.error && (entry.pending || project?.sandboxOperation?.status === 'running')));
+  async function retryProjectEntry() {
+    if (!project || retryingEntry) return;
+    const id = project.id;
+    setRetryingEntry(true);
+    try {
+      if (project.sandboxOperation?.kind === 'create' && project.sandboxOperation.status === 'failed') await rebuildSandbox(id);
+      if (activeProjectId.current === id) entry.retry();
+    } catch (error) { if (activeProjectId.current === id) setError(message(error)); }
+    finally { setRetryingEntry(false); }
+  }
   const running = session?.status === 'running';
   const { agents: subagents, error: subagentsError } = useSubagentConversations(session?.id ?? null, running);
   // Native failed turns are execution history rather than user-visible chat.
@@ -242,15 +259,11 @@ export default function App() {
       if (area) olderScrollPosition.current = { height: area.scrollHeight, top: area.scrollTop };
     })) olderScrollPosition.current = null;
   }
+  useEffect(() => { if (!loading && page === 'chat' && !window.matchMedia('(pointer: coarse)').matches) textarea.current?.focus(); }, [loading, page, selectedProject, selected]);
   useEffect(() => { if (textarea.current) { textarea.current.style.height = 'auto'; textarea.current.style.height = `${Math.min(textarea.current.scrollHeight, 180)}px`; } }, [prompt]);
   function selectSession(id: string | null) {
     const projectId = id ? sessions.find(item => item.id === id)?.projectId ?? selectedProject : selectedProject;
     const target = projects.find(item => item.id === projectId);
-    if (target && !isProjectSandboxReady(target) && archivedProjectAccess.current !== target.id) {
-      navigate('projects', { projectId: null, sessionId: null });
-      setError('项目 Sandbox 尚未就绪，请先创建或恢复环境。');
-      return;
-    }
     if (target && (target.status ?? (target.archivedAt ? 'archived' : 'active')) !== 'active' && archivedProjectAccess.current !== target.id) {
       setError('项目未处于使用中状态，请先在项目管理中恢复。');
       navigate('projects', { projectId: null, sessionId: null });
@@ -260,11 +273,6 @@ export default function App() {
   }
   function openProject(id: string, allowArchived = false) {
     const target = projects.find(item => item.id === id);
-    if (target && !isProjectSandboxReady(target) && !(allowArchived && target.status === 'archived')) {
-      navigate('projects', { projectId: null, sessionId: null });
-      setError('项目 Sandbox 尚未就绪，请先创建或恢复环境。');
-      return;
-    }
     if (target && (target.status ?? (target.archivedAt ? 'archived' : 'active')) !== 'active' && !allowArchived) {
       setError('项目未处于使用中状态，请先在项目管理中恢复。');
       navigate('projects', { projectId: null, sessionId: null });
@@ -275,10 +283,6 @@ export default function App() {
   }
   function returnToChat() {
     const target = projects.find(item => item.id === selectedProject);
-    if (target && !isProjectSandboxReady(target) && archivedProjectAccess.current !== target.id) {
-      navigate('projects', { projectId: null, sessionId: null });
-      return;
-    }
     if (target && (target.status ?? (target.archivedAt ? 'archived' : 'active')) !== 'active' && archivedProjectAccess.current !== target.id) {
       const active = projects.find(canEnterProject);
       navigate('chat', { projectId: active?.id ?? null, sessionId: null });
@@ -297,7 +301,7 @@ export default function App() {
     await refreshWorkspace(); return created;
   }
   async function send() {
-    if (!prompt.trim() || busy || running || archivedSession || localReadOnly || needsProject || sandboxNotReady || !config || (selected && !session)) return;
+    if (!prompt.trim() || busy || running || archivedSession || projectReadOnly || localReadOnly || needsProject || sandboxNotReady || !config || (selected && !session)) return;
     const submittedPrompt = prompt.trim();
     const submittedImages = attachments.map(attachment => attachment.path);
     let target: Session | null = null;
@@ -328,13 +332,13 @@ export default function App() {
   }
   async function stop() { if (!session) return; setBusy(true); try { await api(`/api/sessions/${session.id}/stop`, { method: 'POST' }); } catch (err) { setError(message(err)); } finally { setBusy(false); } }
   async function watchContinue(prompt = '继续') {
-    if (!session || busy || archivedSession || localReadOnly) return;
+    if (!session || busy || archivedSession || projectReadOnly || localReadOnly) return;
     setBusy(true); setError('');
     try { await api(`/api/sessions/${session.id}/turns`, { method: 'POST', body: JSON.stringify({ prompt, images: [] }) }); await refreshWorkspace(); }
     catch (err) { setError(message(err)); } finally { setBusy(false); }
   }
   async function changeModel(model: string) {
-    if (!settings || busy || running || archivedSession || localReadOnly || (selected && !session)) throw new Error('当前无法切换模型，请等待会话就绪。');
+    if (!settings || busy || running || archivedSession || projectReadOnly || localReadOnly || (selected && !session)) throw new Error('当前无法切换模型，请等待会话就绪。');
     setBusy(true);
     try {
       if (session) {
@@ -407,14 +411,16 @@ export default function App() {
       </div>
       {archivedSession && <div className="session-archive-notice" role="status">此会话已归档。如需继续工作，请先取消归档。</div>}
       {localReadOnly && <div className="project-run-note" role="status">本机会话仅供查看历史。请在 Sandbox 项目中创建会话继续工作。<button onClick={() => navigate('projects')}>打开项目管理 ↗</button></div>}
-      {sandboxNotReady && <div className="project-run-note">Sandbox 尚未就绪，请在项目管理中创建或恢复环境。<button onClick={() => navigate('projects')}>打开项目管理 ↗</button></div>}
       {needsProject && <div className="project-run-note">先创建或选择项目，再开始新的会话。<button onClick={() => navigate('projects')}>打开项目管理 ↗</button></div>}
       <div className="content-layout">{session && showBilling && <button className="billing-backdrop mobile-only" aria-label="关闭费用估算" onClick={() => setShowBilling(false)} />}{session && showBilling && <BillingRail sessionId={session.id} turns={conversationTurns} selectedBlockId={billingSelection?.blockId} onSelectBlock={(blockId, turnId, itemIds) => { const targetId = blockId.endsWith(':input') ? itemIds?.at(-1) : itemIds?.[0]; setBillingSelection({ blockId, turnId, itemIds: targetId ? [targetId] : [] }); followOutput.current = false; document.getElementById(`turn-${turnId}-item-${targetId}`)?.scrollIntoView({ block: 'start', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); }} />}<section className="conversation">
         <div className="conversation-scroll" ref={scrollArea} onScroll={() => { const el = scrollArea.current; if (el) followOutput.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100; }}>
           {session?.historyNextCursor && <div className="history-pager"><button disabled={loadingOlder} onClick={() => void loadOlderTurns()}>{loadingOlder ? '加载中…' : '加载更早消息'}</button></div>}
           {loadingHistory && session?.threadId && !conversationTurns.length ? <div className="history-loading" role="status">正在加载历史消息…</div> : !conversationTurns.length ? <div className="welcome"><div className="welcome-eyebrow"><span className="connection-dot" />YOUR WORKSPACE, WITH AN AGENT</div><Mark /><h1>一起，把想法变成代码。</h1><p>{sandbox ? <>CoCell 在独立的 Sandbox 环境中阅读、编写和运行代码。<br />本项目的会话共享文件和已安装工具，可以继续已有工作或克隆仓库。</> : <>让 CoCell 阅读项目、编写代码、执行命令。<br />从一个任务开始，所有进展都在这里。</>}</p><div className="suggestions">{suggestions.map(item => <button key={item.title} onClick={() => { setPrompt(item.text); textarea.current?.focus(); }}><Icon name={item.icon} size={20} /><strong>{item.title}</strong><span>{"description" in item ? item.description : item.text}</span><span className="suggestion-arrow">↗</span></button>)}</div></div> : <div className="turn-list">{session && conversationTurns.map(turn => <article key={turn.id} id={`turn-${turn.id}`} className="turn"><div id={`turn-${turn.id}-item-user-input`} className={`user-message${billingSelection?.turnId === turn.id && billingSelection.itemIds?.includes('user-input') ? ' billing-item-selected' : ''}`}><p>{userInputReplyDisplayText(turn.prompt)}</p><TurnContextStatus turn={turn} /><time className="message-time user-time" dateTime={turn.startedAt}>{dateTime(turn.startedAt)}</time>{turn.images.length > 0 && <div className="sent-images">{turn.images.map((path, i) => <span key={i}><Icon name="attach" size={13} />{basename(path)}</span>)}</div>}</div><div className="assistant-header"><Mark small /><strong>CoCell</strong><span>{turn.clientFailure ? '连接失败（未提交给 CoCell）' : turn.status === 'running' ? '正在处理你的任务' : statusLabels[turn.status]}</span>{turn.completedAt && <time className="message-time" dateTime={turn.completedAt}>{dateTime(turn.completedAt)}</time>}</div><div className="turn-items"><TurnItems sessionId={session.id} onUserInputAnswered={updated => setSession(current => current?.id === updated.id ? updated : current)} highlightedItemIds={billingSelection?.turnId === turn.id ? billingSelection.itemIds : undefined} subagents={subagents.filter(agent => agent.startedAt >= turn.startedAt && agent.startedAt <= (turn.completedAt ?? new Date().toISOString()))} turn={turn} projectId={session.settings.executionMode === 'sandbox' ? session.projectId : undefined} workingDirectory={session.settings.workingDirectory} onOpenFile={file => { if (session.projectId) setOpenFile({ ...file, projectId: session.projectId, workingDirectory: session.settings.workingDirectory }); }} />{turn.error && <div className="inline-error">{turn.error}</div>}<TurnProgress turn={turn} />{turn.status === 'cancelled' && <div className="muted turn-note">任务已停止，可以继续发送消息。</div>}</div>{turn.usage && <div className="usage">输入 {turn.usage.input_tokens.toLocaleString()} · 输出 {turn.usage.output_tokens.toLocaleString()} tokens · 缓存 {turn.usage.cached_input_tokens.toLocaleString()}</div>}</article>)}</div>}
         </div>
-        <div className="composer-area"><div className={`composer ${running ? 'is-running' : ''}`}>{attachments.length > 0 && <div className="attachments">{attachments.map((item, index) => <span key={item.path}><Icon name="attach" size={13} />{item.name}<button aria-label={`移除 ${item.name}`} onClick={() => setAttachments(items => items.filter((_, i) => i !== index))}><Icon name="close" size={12} /></button></span>)}</div>}<textarea ref={textarea} disabled={busy || archivedSession || localReadOnly || sandboxNotReady} aria-label="任务描述" placeholder={archivedSession ? '会话已归档，取消归档后可继续对话…' : running ? 'CoCell 正在工作，完成后可继续对话…' : '描述任务，或提出一个问题…'} value={prompt} rows={1} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && (!window.matchMedia('(pointer: coarse)').matches || event.ctrlKey || event.metaKey)) { event.preventDefault(); void send(); } }} /><div className="composer-toolbar"><div className="composer-options"><input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" multiple hidden onChange={event => void upload(event.target.files)} /><button className="icon-button" aria-label="添加图片" title="添加图片" disabled={busy || running || archivedSession || localReadOnly || needsProject || sandboxNotReady || !config || Boolean(selected && !session)} onClick={() => fileInput.current?.click()}><Icon name="plus" size={20} /></button><span className="toolbar-separator" /><ModelPicker key={selected || selectedProject || "new"} model={settings?.model || DEFAULT_MODEL} effort={settings?.modelReasoningEffort || "medium"} models={config?.models} disabled={!settings || busy || running || archivedSession || localReadOnly || Boolean(selected && !session)} onChange={changeModel} /></div>{running ? <button className="send-button stop-button" aria-label="停止任务" title="停止任务" disabled={busy} onClick={() => void stop()}><Icon name="stop" size={18} /></button> : <button className="send-button" aria-label="发送任务" title="发送任务 (Enter)" disabled={busy || archivedSession || localReadOnly || needsProject || sandboxNotReady || !config || !prompt.trim() || Boolean(selected && !session)} onClick={() => void send()}>{busy ? <span className="spinner" /> : <Icon name="arrow" size={20} />}</button>}</div></div><div className="composer-meta"><button onClick={() => setSettingsOpen(true)} disabled={!settings || busy}><Icon name="folder" size={12} /><span>{settings ? basename(settings.workingDirectory) : '工作目录'}</span><span className="meta-dot">·</span><span>{sandbox ? 'Sandbox · 沙箱内完全访问' : settings?.sandboxMode === 'read-only' ? '只读沙箱' : settings?.sandboxMode === 'workspace-write' ? '工作区可写' : '完全访问'}</span></button><span title="最近一次已完成模型请求的输入 token 数；下一次请求会更新。">{contextUsage ? `上下文 ${contextUsage.inputTokens.toLocaleString()} tokens${contextUsage.cachedInputTokens !== undefined ? ` · 缓存 ${contextUsage.cachedInputTokens.toLocaleString()}` : ''}` : '上下文将在首次模型响应后显示'}</span></div></div>
+        <div className="composer-area">{sandboxNotReady && <div className={`project-entry-status${entry.error ? ' is-error' : ''}`} role="status" aria-live="polite">
+          {environmentPending ? <><span className="spinner" aria-hidden="true" /><span>{project?.sandboxOperation?.kind === 'resume' || project?.sandbox?.status === 'paused' ? '正在恢复环境' : '正在准备环境'}，可以先输入任务…</span></>
+            : <><span>{entry.error || '环境已暂停，可以先输入任务。'}</span><button disabled={retryingEntry} onClick={() => void retryProjectEntry()}>重试准备</button><button onClick={() => navigate('projects')}>项目管理</button></>}
+        </div>}<div className={`composer ${running ? 'is-running' : ''}`}>{attachments.length > 0 && <div className="attachments">{attachments.map((item, index) => <span key={item.path}><Icon name="attach" size={13} />{item.name}<button aria-label={`移除 ${item.name}`} onClick={() => setAttachments(items => items.filter((_, i) => i !== index))}><Icon name="close" size={12} /></button></span>)}</div>}<textarea ref={textarea} disabled={busy || archivedSession || projectReadOnly || localReadOnly} aria-label="任务描述" placeholder={archivedSession ? '会话已归档，取消归档后可继续对话…' : running ? 'CoCell 正在工作，完成后可继续对话…' : '描述任务，或提出一个问题…'} value={prompt} rows={1} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && (!window.matchMedia('(pointer: coarse)').matches || event.ctrlKey || event.metaKey)) { event.preventDefault(); void send(); } }} /><div className="composer-toolbar"><div className="composer-options"><input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" multiple hidden onChange={event => void upload(event.target.files)} /><button className="icon-button" aria-label="添加图片" title="添加图片" disabled={busy || running || archivedSession || projectReadOnly || localReadOnly || needsProject || sandboxNotReady || !config || Boolean(selected && !session)} onClick={() => fileInput.current?.click()}><Icon name="plus" size={20} /></button><span className="toolbar-separator" /><ModelPicker key={selected || selectedProject || "new"} model={settings?.model || DEFAULT_MODEL} effort={settings?.modelReasoningEffort || "medium"} models={config?.models} disabled={!settings || busy || running || archivedSession || projectReadOnly || localReadOnly || Boolean(selected && !session)} onChange={changeModel} /></div>{running ? <button className="send-button stop-button" aria-label="停止任务" title="停止任务" disabled={busy} onClick={() => void stop()}><Icon name="stop" size={18} /></button> : <button className="send-button" aria-label="发送任务" title="发送任务 (Enter)" disabled={busy || archivedSession || projectReadOnly || localReadOnly || needsProject || sandboxNotReady || !config || !prompt.trim() || Boolean(selected && !session)} onClick={() => void send()}>{busy ? <span className="spinner" /> : <Icon name="arrow" size={20} />}</button>}</div></div><div className="composer-meta"><button onClick={() => setSettingsOpen(true)} disabled={!settings || busy}><Icon name="folder" size={12} /><span>{settings ? basename(settings.workingDirectory) : '工作目录'}</span><span className="meta-dot">·</span><span>{sandbox ? 'Sandbox · 沙箱内完全访问' : settings?.sandboxMode === 'read-only' ? '只读沙箱' : settings?.sandboxMode === 'workspace-write' ? '工作区可写' : '完全访问'}</span></button><span title="最近一次已完成模型请求的输入 token 数；下一次请求会更新。">{contextUsage ? `上下文 ${contextUsage.inputTokens.toLocaleString()} tokens${contextUsage.cachedInputTokens !== undefined ? ` · 缓存 ${contextUsage.cachedInputTokens.toLocaleString()}` : ''}` : '上下文将在首次模型响应后显示'}</span></div></div>
       </section></div>
     </main>}
     {archiveDetail && <ArchiveViewer archiveKey={archiveDetail.key} versionId={archiveDetail.versionId} archiveMeta={archiveDetail.meta} onClose={() => setArchiveDetail(null)} />}

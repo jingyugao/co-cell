@@ -93,10 +93,18 @@ export class SessionManager {
         detached: async id => {
           for (const session of this.sessions.values()) {
             if (session.projectId !== id) continue;
+            await Promise.allSettled([...(this.uploads.get(session.id) ?? [])]);
+            await Promise.all([...new Set([join(this.imagesDirectory, session.id), join(this.dataDirectory, 'images', session.id)])]
+              .map(directory => rm(directory, { recursive: true, force: true })));
             delete session.sandbox;
+            session.turns = [];
+            delete session.contextUsage;
+            this.historyErrors.delete(session.id);
+            this.userInputAnswers.delete(session.id);
             await this.save(session);
             this.publish(session.id, { type: 'state', session: this.get(session.id) });
           }
+          this.lastScheduledArchive.delete(id);
         },
       });
       this.lifecycle = new SandboxLifecycleService({
@@ -275,7 +283,7 @@ export class SessionManager {
           : turn.status === 'cancelled' ? 'turn_cancelled' : 'turn_failed';
         const label = type === 'turn_completed' ? '执行完成' : type === 'turn_cancelled' ? '已停止' : '执行失败';
         const projectName = session.projectId ? this.projects.get(session.projectId)?.name : undefined;
-        this.notifications.add({
+        await this.notifications.add({
           type, title: `【${projectName ?? '无项目'}】${label}: ${session.title}`,
           body: turn.prompt.slice(0, 100),
           sessionId: session.id, sessionTitle: session.title, projectName, turnId: turn.id,
@@ -738,6 +746,14 @@ export class SessionManager {
     if (this.closing) return;
     const now = Date.now();
     for (const project of this.projects.list()) {
+      if (project.status === 'archived' && !project.sandboxArtifactsCleanedAt) {
+        await this.archiveProjectNow(project.id).catch(() => {});
+        continue;
+      }
+      if (project.archiveCleanupSourceId) {
+        await this.archiveProjectNow(project.id).catch(() => {});
+        continue;
+      }
       if (project.pendingSandboxCleanup?.length) await this.sandboxOperations?.retryCleanup(project.id).catch(() => {});
       if (!project.sandbox || project.status === 'archived') continue;
       const last = this.lastScheduledArchive.get(project.id) ?? 0;
@@ -983,7 +999,9 @@ export class SessionManager {
   }
 
   async uploadImage(id: string, content: Uint8Array, extension: string): Promise<string> {
-    this.lookup(id);
+    const session = this.lookup(id);
+    if (session.projectId && this.projects.get(session.projectId).status === 'archived') throw new HttpError(409, '项目已归档，请先恢复项目');
+    const release = this.projects.acquire(session.projectId);
     const uploads = this.uploads.get(id) ?? new Set<Promise<string>>();
     this.uploads.set(id, uploads);
     const operation = (async () => {
@@ -995,6 +1013,7 @@ export class SessionManager {
     })();
     uploads.add(operation);
     try { return await operation; } finally {
+      release();
       uploads.delete(operation);
       if (!uploads.size) this.uploads.delete(id);
     }
@@ -1180,6 +1199,7 @@ export class SessionManager {
     try {
       await this.sandbox?.close();
       await Promise.all([this.writer.drain(), this.projects.close()]);
+      await this.notifications?.close();
       await this.state.close();
     } finally { await this.logger?.flush(); }
   }

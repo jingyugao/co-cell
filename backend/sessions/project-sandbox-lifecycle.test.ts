@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -12,6 +12,42 @@ import { installProjectsRoutes } from '../projects/routes.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 import { SessionManager, type CodexClient } from './manager.js';
 import { canEnterProject, isProjectSandboxReady } from '../../util/project-sandbox.js';
+
+test('archiving deletes current and legacy attachment caches and blocks new uploads', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-archive-cache-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const box: SandboxState = { id: 'archive-box', status: 'ready', template: 'default', workingDirectory: defaults.workingDirectory };
+  const reference = { id: 'archive-1', createdAt: new Date().toISOString(), sizeBytes: 10, sha256: 'a'.repeat(64),
+    imageId: 'image', sourceSandboxId: box.id, threadIds: [] };
+  const runtime = {
+    async close() {}, async rebuild(_target, save) { await save(box); },
+    async querySandbox(value) { return { ...value, status: 'ready' as const }; },
+    async verifySandbox() {}, async fenceSandbox() {}, async detachSandbox() {}, async deleteDanglingSandbox() {},
+    remoteArchives: { async capture() { return reference; }, async inspect() { return reference; },
+      async restore() { throw new Error('unused'); }, async activate() {} },
+  } satisfies Partial<SandboxRuntime>;
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime,
+    defaults.workingDirectory, undefined, join(directory, 'custom-images'));
+  try {
+    await manager.init();
+    const session = await manager.create();
+    const image = await manager.uploadImage(session.id, Buffer.from('attachment'), 'png');
+    const legacyDirectory = join(directory, 'images', session.id);
+    await mkdir(legacyDirectory, { recursive: true });
+    await writeFile(join(legacyDirectory, 'legacy.png'), 'legacy attachment');
+    await manager.archiveProjectNow(session.projectId!);
+    assert.equal(manager.getProject(session.projectId!).status, 'archived');
+    await assert.rejects(access(image), { code: 'ENOENT' });
+    await assert.rejects(access(legacyDirectory), { code: 'ENOENT' });
+    assert.equal(manager.get(session.id).sandbox, undefined);
+    assert.deepEqual(manager.get(session.id).turns, []);
+    await assert.rejects(manager.uploadImage(session.id, Buffer.from('late'), 'png'), /已归档/);
+    assert.equal((await state.listSessions())[0].sandbox, undefined);
+    assert.equal(manager.getProject(session.projectId!).remoteArchives?.[0].id, reference.id);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
 
 test('project creation verifies readiness; resume preserves the box without repeating diagnostics', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-provision-'));

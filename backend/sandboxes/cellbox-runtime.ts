@@ -37,7 +37,14 @@ export class CellboxRuntimeIntegration {
     private readonly releases = new Set<() => Promise<void>>();
     constructor(private readonly options: CellboxRuntimeIntegrationOptions) {
         const runtimeConfig = new SandboxRuntimeConfig(options);
-        this.lifecycle = options.lifecycle ?? new SandboxLifecycle([...(options.extensions ?? []), runtimeConfig.extension]);
+        this.lifecycle = options.lifecycle ?? new SandboxLifecycle([...(options.extensions ?? []), runtimeConfig.extension, {
+            name: 'product-resource-cache', post: async context => {
+                if (context.action !== 'destroy' || !context.sandboxId) return;
+                this.prepared.delete(context.sandboxId);
+                this.preparations.delete(context.sandboxId);
+                this.sharedMounts.delete(context.sandboxId);
+            },
+        }]);
         const ossArchiveEndpoint = process.env.OSS_ENDPOINT;
         this.remoteArchives = {
         capture: async (target, key) => {

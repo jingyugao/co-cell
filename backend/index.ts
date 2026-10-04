@@ -103,8 +103,7 @@ const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_M
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
 const sandboxManager = new SandboxManager({ provider, logger: runtimeLog, policy: { autoCheckpointAfterMs }, lifecycle: cellboxRuntime.lifecycle });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
-const notifications = new NotificationStore(process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
-await notifications.init();
+const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
   logger: runtimeLog, baseUrl: process.env.OPENAI_BASE_URL, modelConfig, configOverrides,
   sharedDataDirectory: pathToFileURL(`${sharedDataRoot}/`),
@@ -124,6 +123,7 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
   }, notifications);
 // Project tables must exist before the Secret schema's foreign keys are created.
 await webState.init();
+await notifications.init();
 await secrets.init();
 await manager.init();
 // Paused instances are configured on resume. Running instances survive a web

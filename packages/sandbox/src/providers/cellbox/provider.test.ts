@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
@@ -67,6 +67,7 @@ async function fixture() {
   let execResult = { stdout: '', stderr: '', exitCode: 0, truncated: false };
   let execOperationFails = false;
   let execState: 'exited' | 'unknown' = 'exited';
+  let purgeUnavailable = false;
   const json = (res: ServerResponse, status: number, value: unknown) => {
     res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value));
   };
@@ -99,6 +100,12 @@ async function fixture() {
           createdAt: new Date().toISOString() });
       }
       const value = op('create', id, { boxId: id }); operations.set(value.id, value); json(res, 202, value); return;
+    }
+    const purgeMatch = url.pathname.match(/^\/v1\/boxes\/(box-[^/:]+):purge$/);
+    if (purgeMatch && req.method === 'POST') {
+      if (purgeUnavailable) { json(res, 404, { error: { code: 'NOT_FOUND', message: 'endpoint not found' } }); return; }
+      if (boxes.get(purgeMatch[1])?.phase !== 'deleted' && boxes.has(purgeMatch[1])) { json(res, 409, { error: { code: 'CONFLICT', message: 'not deleted' } }); return; }
+      boxes.delete(purgeMatch[1]); res.writeHead(204); res.end(); return;
     }
     const boxMatch = url.pathname.match(/^\/v1\/boxes\/(box-[^/:]+)(?::(suspend|resume|destroy))?$/);
     if (boxMatch) {
@@ -153,8 +160,37 @@ async function fixture() {
     setExecResult(value: typeof execResult) { execResult = value; },
     setExecOperationFails(value: boolean) { execOperationFails = value; },
     setExecState(value: 'exited' | 'unknown') { execState = value; },
+    setPurgeUnavailable(value: boolean) { purgeUnavailable = value; },
     close: () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) };
 }
+
+test('destruction requires artifact purge and removes only the matching local create journal', async () => {
+  const http = await fixture();
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-purge-'));
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s', stateDirectory: directory });
+    const options = { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause' as const, autoResume: false as const } };
+    const source = await provider.create('k8s', { ...options, metadata: { projectId: 'archived' } });
+    const other = await provider.create('k8s', { ...options, metadata: { projectId: 'active' } });
+    for (const name of await readdir(directory)) {
+      if (JSON.parse(await readFile(join(directory, name), 'utf8')).boxId === source.sandboxId) {
+        await writeFile(join(directory, `${name.slice(0, -5)}.11111111-1111-4111-8111-111111111111.tmp`), '{partial');
+      }
+    }
+    http.setPurgeUnavailable(true);
+    await assert.rejects(provider.kill(source.sandboxId), error => error instanceof CellboxError && error.code === 'CLEANUP_FAILED' && !/not found|404/i.test(error.message));
+    assert.equal(http.boxes.get(source.sandboxId)?.phase, 'deleted');
+    assert.equal((await readdir(directory)).length, 3, 'failure retains the retry journal and its abandoned temporary file');
+    http.setPurgeUnavailable(false);
+    await provider.kill(source.sandboxId);
+    assert.equal(http.boxes.has(source.sandboxId), false);
+    const remaining = await readdir(directory);
+    assert.equal(remaining.length, 1);
+    assert.equal(JSON.parse(await readFile(join(directory, remaining[0]), 'utf8')).boxId, other.sandboxId);
+    await provider.kill(source.sandboxId);
+    assert.equal(http.calls.filter(call => call.path === `/v1/boxes/${source.sandboxId}:purge`).length, 3, 'even an absent box must confirm purge');
+  } finally { await http.close(); await rm(directory, { recursive: true, force: true }); }
+});
 
 test('inventory combines active boxes and paused checkpoints, preferring the active record', async () => {
   const http = await fixture();

@@ -139,6 +139,82 @@ test('Cellbox archive persists its verified reference before fencing the source'
   } finally { await operations.close(); await f.close(); }
 });
 
+test('archive reports deletion failures and resumes its verified cleanup journal without recapturing', async () => {
+  const id = 'archive-cleanup';
+  const f = await fixture(project(id, { status: 'completed', completedAt: new Date(0).toISOString(), pendingSandboxCleanup: [sandbox('retired')] }));
+  const control: { status?: SandboxState['status'] } = {};
+  let failDelete = true, failLocalCleanup = false, captures = 0, detached = 0;
+  const remoteRuntime: SandboxRuntime = { ...runtime(control, []),
+    async fenceSandbox() { control.status = 'paused'; },
+    async deleteDanglingSandbox(boxId) {
+      if (failDelete && boxId === 'sandbox-old') throw new Error('provider deletion failed');
+    },
+    remoteArchives: {
+      async capture() { captures++; return remoteReference; },
+      async inspect() { return remoteReference; },
+      async restore() { throw new Error('unused'); }, async activate() {},
+    },
+  };
+  const createOperations = () => new ProjectSandboxOperations({ projects: f.projects, runtime: remoteRuntime, threadIds: () => ['thread-1'],
+    saveSandbox: async () => {}, detached: async () => { detached++; if (failLocalCleanup) throw new Error('cache deletion failed'); } });
+  let operations = createOperations();
+  try {
+    await assert.rejects(operations.run(id, 'archive'), /尚未清理完成/);
+    let value = f.projects.get(id);
+    assert.equal(value.status, 'completed');
+    assert.equal(value.sandboxOperation?.status, 'failed');
+    assert.equal(value.archiveCleanupSourceId, 'sandbox-old');
+    assert.deepEqual(value.pendingSandboxCleanup?.map(box => box.id), ['sandbox-old']);
+    assert.equal(detached, 0);
+    await assert.rejects(operations.run(id, 'restore'), /归档清理尚未完成/);
+    // Reload persisted project state to exercise recovery after a service restart.
+    await operations.close(); await f.projects.init(); operations = createOperations();
+    failDelete = false; failLocalCleanup = true;
+    await assert.rejects(operations.run(id, 'archive'), /cache deletion failed/);
+    assert.equal(f.projects.get(id).status, 'completed');
+    assert.equal(f.projects.get(id).archiveCleanupSourceId, 'sandbox-old');
+    failLocalCleanup = false;
+    await operations.run(id, 'archive');
+    value = f.projects.get(id);
+    assert.equal(captures, 1, 'retries use the verified archive even after the source is stopped/deleted');
+    assert.equal(value.status, 'archived');
+    assert.equal(value.sandbox, undefined);
+    assert.equal(value.pendingSandboxCleanup, undefined);
+    assert.equal(value.archiveCleanupSourceId, undefined);
+    assert.equal(value.sandboxOperation?.status, 'succeeded');
+    assert.equal(value.remoteArchives?.[0].id, remoteReference.id);
+  } finally { await operations.close(); await f.close(); }
+});
+
+test('legacy archives reconcile all known retired boxes and preserve their archive history', async () => {
+  const id = 'legacy-artifacts';
+  const archivedAt = '2026-09-20T00:00:00.000Z';
+  const history = [{ id: 'record', action: 'archived' as const, at: archivedAt, sandboxId: 'older-source' }];
+  const f = await fixture(project(id, { status: 'archived', archivedAt, sandbox: undefined, remoteArchives: [remoteReference], lifecycleHistory: history }));
+  let failure = true;
+  const deleted: string[] = [];
+  const operations = new ProjectSandboxOperations({ projects: f.projects,
+    runtime: { ...runtime({}, []), async listProjectSandboxes() { return [sandbox('lost-response-candidate')]; },
+      async deleteDanglingSandbox(boxId) { deleted.push(boxId); if (failure && boxId === 'older-source') throw new Error('purge unavailable'); } },
+    threadIds: () => [], saveSandbox: async () => { throw new Error('must not restore'); }, detached: async () => {} });
+  try {
+    await assert.rejects(operations.run(id, 'archive'), /尚未清理完成/);
+    assert.equal(f.projects.get(id).sandboxArtifactsCleanedAt, undefined);
+    assert.equal(f.projects.get(id).sandboxOperation?.status, 'failed');
+    failure = false;
+    await operations.run(id, 'archive');
+    const value = f.projects.get(id);
+    assert.ok(value.sandboxArtifactsCleanedAt);
+    assert.equal(value.pendingSandboxCleanup, undefined);
+    assert.equal(value.archivedAt, archivedAt);
+    assert.deepEqual(value.lifecycleHistory, history);
+    assert.deepEqual(value.remoteArchives, [remoteReference]);
+    assert.ok(deleted.includes(remoteReference.sourceSandboxId));
+    assert.ok(deleted.includes('older-source'));
+    assert.ok(deleted.includes('lost-response-candidate'));
+  } finally { await operations.close(); await f.close(); }
+});
+
 test('Cellbox backup keeps the configured number of owned references', async () => {
   const id = 'd4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4';
   const f = await fixture(project(id, { backupRetentionCount: 2 }));

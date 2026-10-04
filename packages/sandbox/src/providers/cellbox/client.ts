@@ -214,6 +214,10 @@ export class CellboxClient {
   actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile', key: string) {
     return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { key });
   }
+  /** Purge owned artifacts after destruction; old APIs must fail rather than silently skip cleanup. */
+  purgeBoxArtifacts(id: string) {
+    return this.request<void>('POST', `/v1/boxes/${this.id(id)}:purge`, { response: 'empty' });
+  }
   exec(id: string, input: { argv: string[]; expectedGeneration: number; cwd?: string; env?: Record<string, string>; timeoutMs?: number }, key: string, signal?: AbortSignal) {
     return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}/execs`, { body: input, key, signal });
   }

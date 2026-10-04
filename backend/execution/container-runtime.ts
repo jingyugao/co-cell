@@ -46,6 +46,8 @@ export interface SandboxRuntime {
   detachSandbox?(target: WorkspaceTarget): Promise<void>;
   pauseDanglingSandbox?(sandboxId: string): Promise<void>;
   deleteDanglingSandbox?(sandboxId: string): Promise<void>;
+  /** Discover project-owned resources, including candidates whose response was lost. */
+  listProjectSandboxes?(projectId: string): Promise<SandboxState[]>;
   close(): Promise<void>;
 }
 export type { AppServerEndpoint } from './app-server-reader.js';
@@ -710,6 +712,15 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         if (!/not found|no such container/i.test(String(error))) throw this.safeError(error);
       });
     });
+  }
+
+  async listProjectSandboxes(projectId: string): Promise<SandboxState[]> {
+    const provider = this.options.provider as SandboxProvider & {
+      listBoxes?: () => Promise<Array<{ id: string; ownerKey: string; profileId: string; workspace: string }>>;
+    };
+    if (!provider.listBoxes) throw new HttpError(503, 'Sandbox 不支持项目资源检查');
+    return (await provider.listBoxes()).filter(box => box.ownerKey === `project:${projectId}`)
+      .map(box => ({ id: box.id, template: box.profileId, workingDirectory: box.workspace, status: 'unknown' }));
   }
 
   async close() {

@@ -3,6 +3,22 @@ import test from 'node:test';
 import type { SandboxHandle, SandboxProvider } from '@co-cell/sandbox';
 import { ContainerCodexRuntime } from './container-runtime.js';
 import type { ProjectSandboxes } from '../sandboxes/project-sandboxes.js';
+import type { Session } from '../../protocol/types.js';
+import { AppServerReader } from './app-server-reader.js';
+
+test('history maintenance keeps BUSY classification through runtime error sanitization', async () => {
+  const reader = new AppServerReader(async () => { throw new Error('must not connect during maintenance'); }, () => {});
+  const runtime = new ContainerCodexRuntime({ provider: {} as SandboxProvider,
+    sandboxes: { close: async () => {} } as unknown as ProjectSandboxes, apiKey: 'test-secret', appServerReader: reader,
+    paths: { root: '/workspace', runtime: '/runtime', codexHome: '/codex', node: '/node' }, prepareRemote: async () => false });
+  const release = await reader.extension.pre!({ action: 'checkpoint', resourceKey: 'p', sandboxId: 'box-one' });
+  const session = { threadId: 'thread-one', sandbox: { id: 'box-one' } } as Session;
+  try {
+    for (const request of [() => runtime.history(session), () => runtime.subagents(session)]) {
+      await assert.rejects(request(), error => error instanceof Error && 'code' in error && error.code === 'BUSY');
+    }
+  } finally { release?.(); await runtime.close(); }
+});
 
 test('health verification uses a non-resuming connection and never prepares the environment', async () => {
   let probes = 0;

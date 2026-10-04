@@ -64,6 +64,7 @@ export interface ContainerRuntimeOptions {
   sharedFilesMounted?: (sandboxId: string) => boolean;
   logger?: RuntimeLog;
   appServer?: (sandboxId: string) => Promise<AppServerEndpoint>;
+  appServerReader?: AppServerReader;
   serviceAccess?: (sandboxId: string, port: number) => Promise<CellboxServiceAccess>;
 }
 type Preparation = {
@@ -105,7 +106,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   constructor(private options: ContainerRuntimeOptions) {
     this.sandboxes = options.sandboxes;
-    this.reader = new AppServerReader(async id => {
+    this.reader = options.appServerReader ?? new AppServerReader(async id => {
       if (!options.appServer) throw new Error('Sandbox App Server endpoint is not configured');
       return options.appServer(id);
     }, error => { void options.logger?.write({ event: 'sandbox.access_release_failed', error: this.safeError(error).message }); });
@@ -133,7 +134,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private safeError(error: unknown): Error {
     let message = error instanceof Error ? error.message : String(error);
     if (this.options.apiKey) message = message.replaceAll(this.options.apiKey, '[REDACTED]');
-    return new Error(message);
+    const safe = new Error(message);
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'BUSY') Object.assign(safe, { code: 'BUSY' });
+    return safe;
   }
 
   private async acquire(target: WorkspaceTarget, create: boolean, notify?: SaveSandbox, usageId?: string, signal?: AbortSignal, initialization = false): Promise<Entry> {

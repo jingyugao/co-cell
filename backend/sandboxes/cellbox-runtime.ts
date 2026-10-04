@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { posix } from 'node:path';
-import { SandboxLifecycle, type SandboxHandle, type SandboxLifecycleContext } from '@co-cell/sandbox';
+import { SandboxLifecycle, type SandboxExtension, type SandboxHandle, type SandboxLifecycleContext } from '@co-cell/sandbox';
 import { CellboxError, CellboxSandboxProvider, type CellboxArchive } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import type { AppServerEndpoint } from '../execution/container-runtime.js';
@@ -22,6 +22,7 @@ export interface CellboxRuntimeIntegrationOptions extends SandboxRuntimeConfigOp
     appServerArgs: string[];
     env: Record<string, string>;
     lifecycle?: SandboxLifecycle;
+    extensions?: readonly SandboxExtension[];
     onRenewalFailure?: (error: unknown) => void;
     logger?: RuntimeLog;
     sharedDirectory?: boolean;
@@ -36,7 +37,7 @@ export class CellboxRuntimeIntegration {
     private readonly releases = new Set<() => Promise<void>>();
     constructor(private readonly options: CellboxRuntimeIntegrationOptions) {
         const runtimeConfig = new SandboxRuntimeConfig(options);
-        this.lifecycle = options.lifecycle ?? new SandboxLifecycle([runtimeConfig.extension]);
+        this.lifecycle = options.lifecycle ?? new SandboxLifecycle([...(options.extensions ?? []), runtimeConfig.extension]);
         const ossArchiveEndpoint = process.env.OSS_ENDPOINT;
         this.remoteArchives = {
         capture: async (target, key) => {

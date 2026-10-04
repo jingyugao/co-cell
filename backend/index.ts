@@ -15,6 +15,7 @@ import { NotificationStore } from './notifications/store.js';
 import { createApp } from './app.js';
 import { SessionManager } from './sessions/manager.js';
 import { ContainerCodexRuntime } from './execution/container-runtime.js';
+import { AppServerReader } from './execution/app-server-reader.js';
 import { ProjectSandboxes } from './sandboxes/project-sandboxes.js';
 import { RuntimeLog } from './infra/diagnostics/runtime-log.js';
 import { installProductionStatic } from './infra/http/static-files.js';
@@ -71,7 +72,10 @@ const secrets = new SecretService(webState.secretRepository, secretCrypto, id =>
   const project = manager?.listProjects().find(project => project.id === projectId);
   return Boolean(project && project.status !== 'archived' && project.sandbox?.id === boxId);
 });
+const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
+  error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); });
 const cellboxRuntime=new CellboxRuntimeIntegration({provider:cellboxProvider,profileId:process.env.CELLBOX_PROFILE!,appServerArgs:appServerArguments,
+  extensions: [appServerReader.extension],
   env:appServerEnv, sharedDirectory,
   secrets, toolBrokerUrl, logger: runtimeLog,
   onRenewalFailure:error=>{void runtimeLog.write({event:'sandbox.cellbox_renewal_failed',error});}});
@@ -105,7 +109,7 @@ const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provide
   logger: runtimeLog, baseUrl: process.env.OPENAI_BASE_URL, modelConfig, configOverrides,
   sharedDataDirectory: pathToFileURL(`${sharedDataRoot}/`),
   ...(sharedDirectory ? { sharedFilesMounted: (id: string) => cellboxRuntime.usesSharedDirectory(id) } : {}),
-  appServer, paths:CELLBOX_PRODUCT_PATHS, prepareRemote:(handle,target,signal)=>cellboxRuntime.prepare(handle,target,signal),
+  appServer, appServerReader, paths:CELLBOX_PRODUCT_PATHS, prepareRemote:(handle,target,signal)=>cellboxRuntime.prepare(handle,target,signal),
   acquireRemoteUsage:(id, initializationDirectory)=>cellboxRuntime.acquireUsage(id, initializationDirectory), remoteArchives:cellboxRuntime.remoteArchives,
   serviceAccess:(id:string,port:number)=>cellboxProvider.getServiceAccess(id,port) });
 const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || 'data/web-state');

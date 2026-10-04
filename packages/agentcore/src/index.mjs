@@ -119,12 +119,30 @@ export class CodexAppServerClient extends EventEmitter {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(error); }
     this.pending.clear(); this.emit('closed', error);
   }
-  async close() {
-    if (this.closed) return;
+  close() {
+    if (this.closing) return this.closing;
     this.closed = true;
+    this.closing = this.closeTransport();
+    return this.closing;
+  }
+  async closeTransport() {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('Client closed')); }
     this.pending.clear(); this.emit('closed'); this.lines?.close();
-    if (this.socket) { this.socket.close(); return; }
+    if (this.socket) {
+      const socket = this.socket;
+      if (socket.readyState === WebSocket.CLOSED) return;
+      await new Promise((resolve, reject) => {
+        const done = () => { clearTimeout(timer); socket.removeEventListener('close', done); resolve(); };
+        const timer = setTimeout(() => {
+          socket.removeEventListener('close', done);
+          reject(new Error('App Server WebSocket did not close within 5 seconds'));
+        }, 5000);
+        socket.addEventListener('close', done, { once: true });
+        try { socket.close(); }
+        catch (error) { clearTimeout(timer); socket.removeEventListener('close', done); reject(error); }
+      });
+      return;
+    }
     const child = this.child;
     if (!child || child.exitCode !== null || child.signalCode !== null) return;
     await new Promise(resolve => {

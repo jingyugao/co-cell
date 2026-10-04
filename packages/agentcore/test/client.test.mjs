@@ -2,9 +2,35 @@ import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { AppServerEventAdapter, CodexAppServerClient } from '../src/index.mjs';
 const fake = fileURLToPath(new URL('./fake-server.mjs', import.meta.url));
 const open = () => CodexAppServerClient.spawn({ command: process.execPath, args: [fake], requestTimeoutMs: 2000 });
+test('WebSocket close waits for peer acknowledgement and concurrent callers share completion', async () => {
+ const gate = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+ const received = gate(), acknowledge = gate();
+ const server = createServer();
+ let peer;
+ server.on('upgrade', (request, socket) => {
+  peer = socket;
+  const accept = createHash('sha1').update(request.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+  socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+  socket.once('data', () => { received.resolve(); void acknowledge.promise.then(() => socket.end(Buffer.from([0x88, 2, 3, 232]))); });
+ });
+ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+ const client = new CodexAppServerClient();
+ client.socket = new WebSocket(`ws://127.0.0.1:${server.address().port}`);
+ try {
+  await new Promise((resolve, reject) => { client.socket.addEventListener('open', resolve, { once: true }); client.socket.addEventListener('error', reject, { once: true }); });
+  let finished = false;
+  const first = client.close(); first.then(() => { finished = true; });
+  assert.equal(client.close(), first);
+  await received.promise; assert.equal(finished, false);
+  acknowledge.resolve(); await first;
+  assert.equal(client.socket.readyState, WebSocket.CLOSED);
+ } finally { acknowledge.resolve(); peer?.destroy(); await client.close(); await new Promise(resolve => server.close(resolve)); }
+});
 test('concurrent request correlation, early notifications, server request replies', async () => {
  const client = await open();
  try {

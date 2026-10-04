@@ -137,7 +137,8 @@ export interface SandboxLifecycleContext {
 /** Hooks are awaited in registration order. A failed pre hook prevents the operation. */
 export interface SandboxExtension {
   name: string;
-  pre?(context: Readonly<SandboxLifecycleContext>): Promise<void>;
+  /** A returned release callback runs after success or failure, in reverse order. */
+  pre?(context: Readonly<SandboxLifecycleContext>): Promise<void | (() => void)>;
   /** Runs only after a successful operation, before the manager reports readiness. */
   post?(context: Readonly<SandboxLifecycleContext>): Promise<void>;
   /** Best-effort notification; it never replaces the original failure. */

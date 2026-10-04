@@ -379,6 +379,7 @@ test('CodexAppServerClient sends Authorization on the WebSocket upgrade', async 
     const consume = (chunk: Buffer) => {
       pending = Buffer.concat([pending, chunk]);
       while (pending.length >= 2) {
+        const opcode = pending[0] & 0x0f;
         const wide = pending[1] & 0x7f;
         const header = wide === 126 ? 4 : wide === 127 ? 10 : 2;
         if (pending.length < header + 4) return;
@@ -388,7 +389,7 @@ test('CodexAppServerClient sends Authorization on the WebSocket upgrade', async 
         const payload = Buffer.from(pending.subarray(header + 4, header + 4 + length));
         pending = pending.subarray(header + 4 + length);
         for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
-        if ((chunk[0] & 0x0f) === 0x8) return;
+        if (opcode === 0x8) { socket.end(Buffer.concat([Buffer.from([0x88, payload.length]), payload])); return; }
         const message = JSON.parse(payload.toString()) as { id?: number; method?: string };
         if (message.id) respond({ id: message.id, result: message.method === 'thread/list' ? { data: [] } : {} });
       }
@@ -411,9 +412,11 @@ test('CodexAppServerClient sends Authorization on the WebSocket upgrade', async 
     assert.equal(authorization, 'Bearer wire-secret');
   } finally {
     clearTimeout(startupTimer);
-    await client?.close();
-    for (const socket of sockets) socket.destroy();
-    await new Promise<void>(resolve => server.close(() => resolve()));
+    try { await client?.close(); }
+    finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   }
 });
 

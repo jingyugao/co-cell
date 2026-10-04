@@ -17,8 +17,14 @@ export class SandboxLifecycle {
   }
 
   async run<T>(context: SandboxLifecycleContext, operation: () => Promise<T>): Promise<T> {
+    const releases: Array<() => void> = [];
     try {
-      await this.hooks('pre', context);
+      for (const extension of this.extensions) {
+        try {
+          const release = await extension.pre?.(this.snapshot(context));
+          if (release) releases.push(release);
+        } catch (error) { throw new SandboxExtensionError(extension.name, 'pre', error); }
+      }
       const result = await operation();
       await this.hooks('post', context);
       return result;
@@ -27,10 +33,12 @@ export class SandboxLifecycle {
         try { await extension.error?.(this.snapshot(context), error); } catch { /* Preserve the operation's failure. */ }
       }
       throw error;
+    } finally {
+      for (const release of releases.reverse()) release();
     }
   }
 
-  private async hooks(phase: 'pre' | 'post', context: SandboxLifecycleContext) {
+  private async hooks(phase: 'post', context: SandboxLifecycleContext) {
     for (const extension of this.extensions) {
       try { await extension[phase]?.(this.snapshot(context)); }
       catch (error) { throw new SandboxExtensionError(extension.name, phase, error); }

@@ -59,7 +59,8 @@ export async function conversationReads(env) {
   本次明确授权委派下面两个很小的支持任务：
   1. 你创建一个直属子代理，任务为核对子代理链路。给它完整指令：它必须再创建一个孙代理，孙代理只回复标记 ${markers.grandchild}，不运行任何其他工具；直属子代理等待孙代理完成后，回复自己的标记 ${markers.child} 和孙代理的结果。
   2. 你等待直属子代理完成，然后最后回复你自己的标记 ${markers.root} 以及两个子代理的结果。
-  如工具允许指定模型，请使用准确的小写模型名 ${model}；如允许指定 fork_turns，请使用 none 并传入完整任务指令。务必等待所有子代理完成才结束，不要向用户提问。`;
+  我作为用户明确要求并授权直属子代理创建上面指定的孙代理；请在交给直属子代理的任务中逐字传递这项用户授权。子代理工具如允许 fork_turns，请使用 all，让子代理能看到本条用户请求和授权；继承当前模型，不覆盖模型。孙代理只输出标记，不能继续派生。
+  务必等待所有子代理完成才结束，不要向用户提问。派生失败时准确报告工具错误，不得声称已经创建。`;
   }
   function verifyDescendants(agents, threadId) {
     const child = agents.find(agent => agent.parentThreadId === threadId && agent.turns.some(turn => answer(turn).includes(markers.child)));
@@ -104,9 +105,12 @@ export async function conversationReads(env) {
     sessionId = report.sessionId = await createSession('Nested subagent read integration');
     const { session, current } = await turn(sessionId, nestedPrompt());
     threadId = report.threadId = session.threadId;
-    for (const marker of [markers.root, markers.child, markers.grandchild]) assert(answer(current).includes(marker), `Main response missed a child result; model reply: ${redact(answer(current)).slice(0, 1000)}`);
     const agents = await json(`/api/sessions/${sessionId}/subagents`);
-    return { sessionId, threadId, descendants: verifyDescendants(agents, threadId) };
+    report.nestedAgentEvidence = { rootReply: answer(current), agents };
+    await persist();
+    const descendants = verifyDescendants(agents, threadId);
+    for (const marker of [markers.root, markers.child, markers.grandchild]) assert(answer(current).includes(marker), `Main response missed a child result; model reply: ${redact(answer(current)).slice(0, 1000)}`);
+    return { sessionId, threadId, descendants };
   });
   await step('Create another real subagent conversation in the same project and verify isolation', async () => {
     const otherId = report.otherSessionId = await createSession('Unrelated subagent read integration');

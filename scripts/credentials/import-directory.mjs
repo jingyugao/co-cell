@@ -5,7 +5,7 @@ import { basename, dirname, resolve } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { parseArgs } from 'node:util';
-import { collectCredentialDirectory, FILE_BUNDLE_LIMIT, openMeegleBundle, validateFileBundle } from '../../deploy/box-wrap/credential-files.mjs';
+import { collectCredentialDirectory, FILE_BUNDLE_LIMIT, openMeegleBundle, validateFileBundle } from '../../util/credential-files.mjs';
 import { loadDeployEnv } from '../config/deploy-env.mjs';
 import { liveTransport } from '../integration/support/kubernetes.mjs';
 

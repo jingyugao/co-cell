@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { meegleFixture } from './meegle-test-fixture.mjs';
+import { meegleFixture } from './fixtures/meegle-credentials.mjs';
 import test from 'node:test';
-import { openMeegleBundle, rebindMeegleBundle, validateFileBundle } from './credential-files.mjs';
+import { openMeegleBundle, rebindMeegleBundle, validateFileBundle } from '../../util/credential-files.mjs';
 
 test('native Meegle encrypted files rebind across identities without dropping refresh data', () => {
   const source = meegleFixture(), targetIdentity = { hostname: 'sandbox-host', username: 'unknown' };

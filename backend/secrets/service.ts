@@ -4,7 +4,7 @@ import { HttpError } from '../../util/errors.js';
 import { SecretCrypto } from './crypto.js';
 import { credentialPath, toolName, validateToolArgs } from './policy.js';
 import type { SecretRepository, StoredSecret, StoredVersion } from './repository.js';
-import { FILE_BUNDLE_LIMIT, openMeegleBundle, validateFileBundle } from '../../deploy/box-wrap/credential-files.mjs';
+import { FILE_BUNDLE_LIMIT, openMeegleBundle, validateFileBundle } from '../../util/credential-files.mjs';
 
 export const MAX_SECRET_BYTES = 64 * 1024;
 export function secretBytes(format: SecretInput['format'], content: string): Buffer {

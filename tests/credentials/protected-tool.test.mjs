@@ -4,9 +4,9 @@ import { mkdtemp, mkdir, writeFile, readdir, readFile, rm } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { runProtectedTool } from './protected-tool.mjs';
-import { openMeegleBundle, rebindMeegleBundle } from './credential-files.mjs';
-import { meegleFixture } from './meegle-test-fixture.mjs';
+import { runProtectedTool } from '../../deploy/box-wrap/protected-tool.mjs';
+import { openMeegleBundle, rebindMeegleBundle } from '../../util/credential-files.mjs';
+import { meegleFixture } from './fixtures/meegle-credentials.mjs';
 
 test('Meegle native file group rebinds, redacts tokens and retries complete refreshed groups with advancing versions', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-meegle-files-'));

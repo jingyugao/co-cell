@@ -1,3 +1,4 @@
+# Build from the repository root: docker build -f deploy/box-wrap/Dockerfile .
 ARG COCELL_USER_BASE_IMAGE=node:22.18.0-bookworm-slim
 FROM ${COCELL_USER_BASE_IMAGE}
 USER root
@@ -28,11 +29,15 @@ RUN mkdir -p /opt/cellbox/debug-bin \
        if test -L "$binary"; then ln -s "$(readlink -f "$binary")" "/opt/cellbox/debug-bin/$tool"; \
        else cp -L "$binary" "/opt/cellbox/debug-bin/$tool"; fi; \
      done
-COPY --chmod=0755 launcher.mjs oss-archive-backup.mjs oss-archive-restore.mjs /opt/product/cocell/
-COPY --chmod=0755 tool-client.mjs protected-tool.mjs /opt/product/cocell/
-COPY --chmod=0755 tools/cocell-archive-backup /opt/cellbox/tools/cocell-archive-backup
-COPY --chmod=0755 tools/cocell-archive-restore /opt/cellbox/tools/cocell-archive-restore
-COPY --chmod=0755 tools/cocell-proxy /opt/cellbox/tools/cocell-proxy
+COPY --chmod=0755 deploy/box-wrap/launcher.mjs deploy/box-wrap/oss-archive-backup.mjs deploy/box-wrap/oss-archive-restore.mjs /opt/product/cocell/
+COPY --chmod=0755 deploy/box-wrap/tool-client.mjs /opt/product/cocell/
+COPY --chmod=0755 deploy/box-wrap/protected-tool.mjs /opt/product/cocell/deploy/box-wrap/
+COPY util/credential-files.mjs /opt/product/cocell/util/
+# Preserve the public tool entry while resolving imports against the source layout.
+RUN ln -s deploy/box-wrap/protected-tool.mjs /opt/product/cocell/protected-tool.mjs
+COPY --chmod=0755 deploy/box-wrap/tools/cocell-archive-backup /opt/cellbox/tools/cocell-archive-backup
+COPY --chmod=0755 deploy/box-wrap/tools/cocell-archive-restore /opt/cellbox/tools/cocell-archive-restore
+COPY --chmod=0755 deploy/box-wrap/tools/cocell-proxy /opt/cellbox/tools/cocell-proxy
 
 ENV PATH=/usr/local/bin:/usr/bin:/bin
 WORKDIR /home/agent/workspace

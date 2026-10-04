@@ -62,12 +62,51 @@ export class MemorySecrets implements SecretRepository {
   async completeInvocation(value: StoredInvocation, changes: Array<{ secret: StoredSecret; version: StoredVersion }>, _exitCode: number) {
     if (this.runs.get(value.id)?.completedAt) return false;
     for (const { secret, version } of changes) {
+      if (secret.format === 'files' && this.records.get(secret.id)?.version !== version.baseVersion) throw new HttpError(409, '文件组已更新');
+    }
+    for (const { secret, version } of changes) {
       const current = this.records.get(secret.id)!;
       this.records.set(secret.id, { ...current, version: current.version + 1, currentVersionId: version.id, ciphertext: version.ciphertext, updatedAt: version.createdAt }); this.history.push(version);
     }
     this.runs.set(value.id, value); return true;
   }
 }
+test('file groups provision and save atomically, reject stale versions and unsafe path changes', async () => {
+  const { service, projectId, repository } = fixture();
+  const files = [{ path: '.config/tool/config.json', content: '{"host":"fixture"}\r\n' }, { path: '.config/tool/token', content: 'secret-original' }];
+  const secret = await service.create({ name: 'Native files', tool: 'custom.cli', path: files[0].path, format: 'files', mutable: true, files });
+  assert.deepEqual(secret.filePaths, files.map(file => file.path));
+  assert.equal(secret.requiresTextImport, false);
+  assert.ok(!JSON.stringify(await service.list()).includes('secret-original'));
+  assert.ok(!repository.records.get(secret.id)!.ciphertext.includes('secret-original'));
+  await service.saveSelections(projectId, selections('custom.cli', secret.id));
+  const [provisioned] = await service.provision(projectId);
+  assert.equal(provisioned.format, 'files');
+  assert.deepEqual(JSON.parse(Buffer.from(provisioned.content, 'base64').toString()), { files });
+  const token = await service.registerRuntime('box-a', projectId, 1);
+  const next = { files: files.map(file => ({ ...file, content: file.content.replace('original', 'refreshed') })) };
+  const update = (bundle: unknown, baseVersion: number) => [{ secretId: secret.id, content: Buffer.from(JSON.stringify(bundle)).toString('base64'), baseVersion }];
+  assert.deepEqual(await service.syncFiles(token, 'custom.cli', update(next, 1), 1), { saved: true, versions: [{ secretId: secret.id, version: 2 }] });
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update({ files }, 1), 0), /文件组已更新/);
+  await assert.rejects(service.syncFiles(token, 'other.cli', update(next, 2), 0), /其他工具/);
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update({ files: [{ path: '../escape', content: 'secret' }] }, 2), 0), /格式无效/);
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update({ files: [{ path: '.other', content: 'secret' }] }, 2), 0), /路径/);
+  assert.deepEqual((await service.content(secret.id)).files, next.files);
+  assert.equal((await service.content(secret.id)).version, 2);
+  await service.update(secret.id, { name: 'Renamed group' });
+  assert.equal((await service.content(secret.id)).version, 2);
+  await assert.rejects(service.create({ name: 'Duplicate', tool: 'custom.cli', path: 'a', format: 'files', mutable: false, files: [{ path: 'a', content: 'x' }, { path: 'a/b', content: 'y' }] }), /目录冲突/);
+  const app = new Hono();
+  app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'invalid' }, error instanceof HttpError ? error.status as 400 : 400));
+  installSecretRoutes(app, service, value => value === projectId);
+  const created = await app.request('/api/secrets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'API files', tool: 'custom.cli', path: files[0].path, format: 'files', mutable: true, files }) });
+  assert.equal(created.status, 201);
+  const apiSecret = await created.json();
+  assert.equal(apiSecret.format, 'files');
+  const apiContent = await (await app.request(`/api/secrets/${apiSecret.id}/content`)).json();
+  assert.deepEqual(apiContent.files, files);
+  assert.equal(apiContent.requiresTextImport, false);
+});
 export function fixture() {
   const repository = new MemorySecrets(), crypto = new SecretCrypto(Buffer.alloc(32, 7).toString('base64'));
   const projectId = randomUUID();
@@ -357,4 +396,23 @@ test('operator deletion removes history and every project binding while discardi
   assert.equal(await repository.get(racing.id), null);
   assert.deepEqual(await repository.versions(racing.id), []);
   assert.equal((await service.grants(projectId))[0].files[0].secretId, preserved.id);
+});
+
+test('directory credentials allow contained file additions and deletions with binary content and version checks', async () => {
+  const { service, projectId } = fixture();
+  const directory = '.config/custom';
+  const files = [{ path: `${directory}/config`, content: 'token=fixture' }, { path: `${directory}/old`, content: '' }];
+  const secret = await service.create({ name: 'Directory', tool: 'custom.cli', path: files[0].path, format: 'files', mutable: true, directory, files });
+  assert.equal(secret.directory, directory);
+  await service.saveSelections(projectId, selections('custom.cli', secret.id));
+  const token = await service.registerRuntime('box-a', projectId, 1);
+  const next = { directory, files: [files[0], { path: `${directory}/nested/new`, content: Buffer.from([255, 0, 128]).toString('base64'), encoding: 'base64' as const }] };
+  const update = (bundle: unknown, baseVersion = 1) => [{ secretId: secret.id, content: Buffer.from(JSON.stringify(bundle)).toString('base64'), baseVersion, format: 'files' as const }];
+  assert.deepEqual(await service.syncFiles(token, 'custom.cli', update(next), 0), { saved: true, versions: [{ secretId: secret.id, version: 2 }] });
+  assert.deepEqual((await service.content(secret.id)).files, next.files);
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update({ ...next, directory: '.config/other' }, 2), 0));
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update({ ...next, files: [...next.files, { path: '.ssh/key', content: 'outside' }] }, 2), 0));
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update({ ...next, files: next.files.slice(1) }, 2), 0));
+  await assert.rejects(service.syncFiles(token, 'custom.cli', update(next), 0));
+  assert.equal((await service.content(secret.id)).version, 2);
 });

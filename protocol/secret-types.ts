@@ -1,24 +1,36 @@
-export type SecretFormat = 'text';
+export type SecretFormat = 'text' | 'files';
+export interface SecretTextFile { path: string; content: string; encoding?: 'base64' }
+export interface SecretFileIdentity { hostname: string; username: string }
+export interface SecretFileBundle {
+  files: SecretTextFile[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity;
+}
 export type ProxyTool = string;
 export interface SecretMetadata {
   id: string; name: string; format: SecretFormat; mutable: boolean; enabled: boolean;
   version: number; createdAt: string; updatedAt: string; projectIds: string[];
   tool: ProxyTool | null; path: string | null; requiresTextImport: boolean;
+  filePaths?: string[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity;
 }
 export interface SecretInput {
-  name: string; format: SecretFormat; mutable: boolean; content: string;
+  name: string; format: SecretFormat; mutable: boolean; content?: string;
   tool: ProxyTool; path: string;
+  files?: SecretTextFile[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity;
 }
-export interface SecretUpdate { name?: string; mutable?: boolean; enabled?: boolean; content?: string; tool?: ProxyTool; path?: string }
+export interface SecretUpdate { name?: string; mutable?: boolean; enabled?: boolean; content?: string; tool?: ProxyTool; path?: string;
+  format?: SecretFormat; files?: SecretTextFile[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity }
+export interface SecretContent extends Partial<SecretFileBundle> {
+  format: SecretFormat; content: string; requiresTextImport: boolean; version: number;
+}
 export interface SecretDeleteResult { ok: true }
-export interface ToolCompletionResult { saved: boolean; discarded?: boolean }
+export interface ToolCompletionResult { saved: boolean; discarded?: boolean; versions?: Array<{ secretId: string; version: number }> }
 export interface ProvisionedToolFile {
   tool: ProxyTool; secretId: string; path: string; content: string; mutable: boolean; version: number;
+  format?: SecretFormat;
 }
 export interface ToolRuntimeConfig {
   mode: 'files'; generation: number; token: string; url: string; files: ProvisionedToolFile[];
 }
-export interface ToolFileUpdate { secretId: string; content: string; baseVersion: number }
+export interface ToolFileUpdate { secretId: string; content: string; baseVersion: number; format?: SecretFormat }
 export interface SecretVersion {
   id: string; source: 'operator' | 'tool'; baseVersion: number | null;
   createdAt: string; projectId: string | null; invocationId: string | null;
@@ -39,5 +51,5 @@ export interface ProjectToolSelection { tool: ProxyTool; secretId: string | null
 /** Only the protected tool runner receives this response, never the agent. */
 export interface ToolInvocationSetup {
   id: string; tool: ProxyTool; args: string[];
-  files: Array<{ path: string; content: string; secretId: string; version: number; mutable: boolean }>;
+  files: Array<{ path: string; content: string; secretId: string; version: number; mutable: boolean; format?: SecretFormat }>;
 }

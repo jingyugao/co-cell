@@ -11,7 +11,7 @@ export interface StoredSecret {
 export interface StoredVersion extends SecretVersion { secretId: string; ciphertext: string }
 export interface StoredInvocation {
   id: string; projectId: string; boxId: string; generation: number; grant: ProjectToolGrant;
-  files: Array<{ path: string; secretId: string; version: number; versionId: string }>;
+  files: Array<{ path: string; secretId: string; version: number; versionId: string; format?: SecretFormat }>;
   createdAt: string; completedAt: string | null;
 }
 export interface SecretRepository {
@@ -149,7 +149,9 @@ export class MySqlSecretRepository implements SecretRepository {
       // Stable ordering avoids deadlocks for invocations that update several files.
       // These short database transaction locks are not execution/refresh leases.
       for (const { secret, version } of changes.sort((a, b) => a.secret.id.localeCompare(b.secret.id))) {
-        const [result] = await connection.query<ResultSetHeader>('UPDATE secrets SET version=version+1,current_version_id=?,ciphertext=?,updated_at=? WHERE id=? AND enabled=1 AND mutable=1 AND format=?', [version.id, version.ciphertext, version.createdAt, secret.id, secret.format]);
+        const grouped = secret.format === 'files';
+        const [result] = await connection.query<ResultSetHeader>(`UPDATE secrets SET version=version+1,current_version_id=?,ciphertext=?,updated_at=? WHERE id=? AND enabled=1 AND mutable=1 AND format=?${grouped ? ' AND version=?' : ''}`, [version.id, version.ciphertext, version.createdAt, secret.id, secret.format, ...(grouped ? [version.baseVersion] : [])]);
+        if (!result.affectedRows && grouped) throw new HttpError(409, '文件组已更新或不可写，请刷新运行环境后重试');
         if (!result.affectedRows) throw new Error('Secret is no longer writable');
         await this.insertVersion(connection, version);
       }

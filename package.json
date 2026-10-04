@@ -15,6 +15,7 @@
     "capture:http": "tsx backend/infra/diagnostics/capture-demo.ts",
     "sandbox:timing": "node scripts/diagnostics/sandbox-timing.mjs",
     "credentials:import": "tsx backend/connections/import-local.ts",
+    "credentials:import-directory": "node scripts/credentials/import-directory.mjs",
     "credentials:migrate": "tsx backend/connections/migrate-credentials.ts",
     "cliproxyapi": "node scripts/cliproxyapi/manage.mjs",
     "env:audit": "node scripts/config/audit-env.mjs",

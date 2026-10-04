@@ -45,9 +45,10 @@ export function mergeSession(current: Session | null, incoming: Session): Sessio
   return preserveClientFailures(merged, current);
 }
 
-export function useSessionStream({ selected, enabled, onState, onError }: {
+export function useSessionStream({ selected, enabled, historyReady = true, onState, onError }: {
   selected: string | null;
   enabled: boolean;
+  historyReady?: boolean;
   onState: () => Promise<void>;
   onError: (error: string) => void;
 }) {
@@ -114,13 +115,21 @@ export function useSessionStream({ selected, enabled, onState, onError }: {
         }
       } catch { onErrorRef.current('会话事件解析失败，请刷新页面重试。'); }
     };
-    // The SSE snapshot is authoritative; this request also exposes missing sessions.
+    return () => { alive = false; source.close(); };
+  }, [selected, enabled]);
+
+  // Open the conversation immediately through SSE, but defer native history
+  // reads while the project's runtime is still being created or resumed.
+  useEffect(() => {
+    if (!enabled || !selected || !historyReady) return;
+    let alive = true;
+    setLoadingHistory(true);
     api<Session>(`/api/sessions/${selected}`)
       .then(value => { if (alive) setSession(current => mergeSession(current, value)); })
       .catch(error => { if (alive) onErrorRef.current(errorMessage(error)); })
       .finally(() => { if (alive) setLoadingHistory(false); });
-    return () => { alive = false; source.close(); };
-  }, [selected, enabled]);
+    return () => { alive = false; };
+  }, [selected, enabled, historyReady]);
 
   const loadOlder = async (beforeMerge?: () => void) => {
     const cursor = session?.historyNextCursor;

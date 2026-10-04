@@ -217,7 +217,10 @@ export class CellboxClient {
   exec(id: string, input: { argv: string[]; expectedGeneration: number; cwd?: string; env?: Record<string, string>; timeoutMs?: number }, key: string, signal?: AbortSignal) {
     return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}/execs`, { body: input, key, signal });
   }
-  getOperation(id: string, signal?: AbortSignal) { return this.request<CellboxOperation>('GET', `/v1/operations/${this.id(id)}`, { signal }); }
+  getOperation(id: string, signal?: AbortSignal, waitMs = 0) {
+    if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 10_000) throw new CellboxError('INVALID_REQUEST', 'waitMs must be 0..10000');
+    return this.request<CellboxOperation>('GET', `/v1/operations/${this.id(id)}${waitMs ? `?waitMs=${waitMs}` : ''}`, { signal });
+  }
   getExec(id: string, signal?: AbortSignal) { return this.request<CellboxExecution>('GET', `/v1/execs/${this.id(id)}`, { signal }); }
   async fileResponse(id: string, path: string, options: { method?: 'GET' | 'HEAD'; headers?: Headers; signal?: AbortSignal } = {}): Promise<Response> {
     const headers = new Headers({ ...this.clientHeaders(), 'Accept-Encoding': 'identity' });

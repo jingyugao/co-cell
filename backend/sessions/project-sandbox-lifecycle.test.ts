@@ -11,9 +11,9 @@ import type { ProjectService } from '../projects/service.js';
 import { installProjectsRoutes } from '../projects/routes.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 import { SessionManager, type CodexClient } from './manager.js';
-import { canEnterProject } from '../../util/project-sandbox.js';
+import { canEnterProject, isProjectSandboxReady } from '../../util/project-sandbox.js';
 
-test('project creation returns a durable pending operation; checkpoint/resume require readiness and preserve the box', async () => {
+test('project creation verifies readiness; resume preserves the box without repeating diagnostics', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-provision-'));
   const state = new MemoryWebStateStore();
   const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
@@ -25,6 +25,8 @@ test('project creation returns a durable pending operation; checkpoint/resume re
   let saveBinding!: (value: SandboxState) => Promise<void>;
   let verifications = 0, inspections = 0, createCalls = 0, resumeCalls = 0, queryCalls = 0;
   let failVerification = false;
+  let failResume = false;
+  let resumeBarrier = Promise.resolve();
   const runtime = {
     async close() {},
     async rebuild(_target, save) {
@@ -37,7 +39,9 @@ test('project creation returns a durable pending operation; checkpoint/resume re
     async verifySandbox() { verifications++; if (failVerification) throw new Error('App Server unavailable'); },
     async inspect() { inspections++; },
     async checkpoint(target) { assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'paused' }; return { ...providerBox }; },
-    async resume(target, save) { resumeCalls++; assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'ready' }; await save({ ...providerBox }); },
+    async resume(target, save) { resumeCalls++; assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'ready' }; await save({ ...providerBox });
+      await resumeBarrier;
+      if (failResume) throw new Error('Runtime restore outcome unavailable'); },
     async delete(target) { assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'unavailable' }; await saveBinding({ ...providerBox }); },
   } satisfies Partial<SandboxRuntime>;
   const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
@@ -52,13 +56,18 @@ test('project creation returns a durable pending operation; checkpoint/resume re
     assert.equal(created.sandboxOperation?.kind, 'create');
     assert.equal(created.sandboxOperation?.status, 'running');
     assert.equal((await state.listProjects())[0].sandboxOperation?.id, created.sandboxOperation?.id);
-    assert.equal(canEnterProject(created), false);
+    assert.equal(canEnterProject(created), true);
+    assert.equal(isProjectSandboxReady(created), false);
+    const duringEntry = await (await app.request(`/api/projects/${created.id}/open`, { method: 'POST' })).json() as ProjectSummary;
+    assert.equal(duringEntry.sandboxOperation?.id, created.sandboxOperation?.id);
+    await assert.rejects(manager.create({ projectId: created.id }), /维护/);
     const duringCreate = await (await app.request('/api/projects?refreshSandboxes=1')).json() as ProjectSummary[];
     assert.equal(duringCreate[0].sandbox?.status, 'ready', 'live provider status is returned during creation maintenance');
     assert.equal(inspections, 0, 'polling must not inspect, prepare, resume, or verify the Sandbox');
     assert.equal(resumeCalls, 0);
     assert.equal(verifications, 0);
-    assert.equal(canEnterProject(duringCreate[0]), false);
+    assert.equal(canEnterProject(duringCreate[0]), true);
+    assert.equal(isProjectSandboxReady(duringCreate[0]), false);
     await assert.rejects(manager.checkpointProjectSandbox(created.id), /维护/);
     finishPreparation(); await operations().close();
     assert.equal(createCalls, 1);
@@ -89,11 +98,23 @@ test('project creation returns a durable pending operation; checkpoint/resume re
     await operations().close();
     const pausedAfterCheckpoint = await manager.readProject(created.id);
     assert.equal(pausedAfterCheckpoint.sandbox?.status, 'paused');
-    assert.equal(canEnterProject(pausedAfterCheckpoint), false);
-    const resumed = await app.request(`/api/projects/${created.id}/sandbox/resume`, { method: 'POST' });
-    assert.equal(resumed.status, 202);
-    await operations().close();
-    assert.equal(verifications, 3, 'checkpoint inspects health and resume verifies the restored application');
+    assert.equal(canEnterProject(pausedAfterCheckpoint), true);
+    assert.equal(isProjectSandboxReady(pausedAfterCheckpoint), false);
+    let finishResume!: () => void;
+    resumeBarrier = new Promise<void>(resolve => { finishResume = resolve; });
+    const opened = await Promise.all([1, 2].map(() => app.request(`/api/projects/${created.id}/open`, { method: 'POST' })));
+    assert.ok(opened.every(response => response.status === 202));
+    const entries = await Promise.all(opened.map(response => response.json() as Promise<ProjectSummary>));
+    assert.equal(entries[0].sandboxOperation?.id, entries[1].sandboxOperation?.id);
+    assert.equal(entries[0].sandboxOperation?.kind, 'resume');
+    assert.equal(isProjectSandboxReady(entries[0]), false);
+    await manager.enterProject(created.id);
+    await assert.rejects(manager.create({ projectId: created.id }), /维护/);
+    finishResume(); await operations().close();
+    assert.equal(resumeCalls, 1, 'concurrent entries and repeated entry during preparation share one resume');
+    await manager.enterProject(created.id);
+    assert.equal(resumeCalls, 1, 'entering a ready project does not start another operation');
+    assert.equal(verifications, 2, 'creation and checkpoint inspect health; resume relies on runtime completion');
     assert.equal((await manager.readProject(created.id)).sandbox?.id, box.id);
     assert.equal(createCalls, 1, 'resume must not provision a second sandbox');
     assert.equal(canEnterProject(await manager.readProject(created.id)), true);
@@ -101,18 +122,27 @@ test('project creation returns a durable pending operation; checkpoint/resume re
     await saveBinding({ ...providerBox });
     failVerification = true;
     await manager.resumeProjectSandbox(created.id); await operations().close();
+    assert.equal((await manager.readProject(created.id)).sandboxOperation?.status, 'succeeded');
+    assert.equal(canEnterProject(await manager.readProject(created.id)), true);
+    assert.equal(verifications, 2, 'a diagnostic failure cannot delay or fail a restored execution');
+    providerBox = { ...box, status: 'paused' };
+    await saveBinding({ ...providerBox });
+    failResume = true;
+    await manager.resumeProjectSandbox(created.id); await operations().close();
     const failed = await manager.readProject(created.id);
     assert.equal(failed.sandboxOperation?.status, 'failed');
-    assert.equal(canEnterProject(failed), false);
+    assert.equal(canEnterProject(failed), true);
+    assert.equal(isProjectSandboxReady(failed), false);
     const beforeFailedPoll = { queries: queryCalls, inspections, resumes: resumeCalls, verifications };
     const failedPoll = await manager.listProjectsWithArchives();
-    assert.equal(failedPoll[0].sandbox?.status, 'ready', 'provider state is refreshed even after a failed readiness operation');
+    assert.equal(failedPoll[0].sandbox?.status, 'ready', 'provider state is refreshed even after a failed restore operation');
     assert.equal(failedPoll[0].sandboxOperation?.status, 'failed');
-    assert.equal(canEnterProject(failedPoll[0]), false, 'a successful provider query does not erase the failed-operation gate');
+    assert.equal(canEnterProject(failedPoll[0]), true);
+    assert.equal(isProjectSandboxReady(failedPoll[0]), false, 'a successful provider query does not erase the failed-operation gate');
     assert.equal(queryCalls, beforeFailedPoll.queries + 1);
     assert.deepEqual({ inspections, resumes: resumeCalls, verifications }, {
       inspections: beforeFailedPoll.inspections, resumes: beforeFailedPoll.resumes, verifications: beforeFailedPoll.verifications,
-    }, 'polling after failed readiness only queries provider status');
+    }, 'polling after failed restore only queries provider status');
     failVerification = false;
     await manager.rebuildProjectSandbox(created.id); await operations().close();
     const rebuilt = await manager.readProject(created.id);

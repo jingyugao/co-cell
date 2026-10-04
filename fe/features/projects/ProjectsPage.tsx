@@ -79,7 +79,7 @@ function ProjectForm({ busy, onSubmit, onCancel }: {
     <label>项目名称<input ref={input} required={!automaticName} maxLength={100} value={automaticName ? '' : name} disabled={busy || automaticName} placeholder={automaticName ? '自动使用飞书需求名称' : type === 3 ? '例如：本周重点事项' : '例如：订单系统改造'} onChange={event => setName(event.target.value)} /></label>
     {feishu && <label>飞书需求链接<input type="url" required maxLength={4096} value={url} disabled={busy} placeholder="https://…" onChange={event => setUrl(event.target.value)} /></label>}
     <ImagePicker disabled={busy} onChange={setImage} />
-    <p className="project-form-hint">飞书项目自动读取需求名称；本周项目每周只能创建一个。创建项目后立即准备 Sandbox，就绪后可进入项目，项目内会话共享该环境。</p>
+    <p className="project-form-hint">飞书项目自动读取需求名称；本周项目每周只能创建一个。创建后立即进入项目，可以先输入任务，环境会在后台准备。</p>
     {error && <p className="project-error" role="alert">{error}</p>}
     <div className="project-form-actions"><button type="button" className="secondary-button" onClick={onCancel} disabled={busy}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? automaticName ? '正在读取飞书需求并创建…' : '创建中…' : '创建项目'}</button></div>
   </form>;
@@ -156,7 +156,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
           <button className="secondary-button" onClick={() => setShowToolGrants(true)}>工具权限</button>
           {archived && backup ? <button className="primary-button" disabled={busy || operating || hasTask} onClick={restore}>恢复项目</button>
             : archived ? <span className="project-action-note">暂无可恢复备份</span>
-            : <button className="primary-button" disabled={openDisabled || busy || operating} onClick={() => onOpenProject(project.id)}>进入项目 <span aria-hidden="true">→</span></button>}
+            : <button className="primary-button" disabled={openDisabled} onClick={() => onOpenProject(project.id)}>进入项目 <span aria-hidden="true">→</span></button>}
           {!archived && <button className="project-archive-button" disabled={busy || operating} title={completed ? '恢复为使用中，才能继续对话' : '完成满 1 天后自动归档'} onClick={() => void changeStatus()}>{busy ? '处理中…' : completed ? '恢复使用中' : '标记已完成'}</button>}
         </div>
       </section>
@@ -172,7 +172,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
       </section>}
     </div>
     {operation && !(operation.kind === 'backup' && operation.status === 'succeeded') && <p className={`project-operation ${operation.status === 'failed' ? 'failed' : ''}`} role={operation.status === 'failed' ? 'alert' : 'status'}><strong>{operationLabels[operation.kind]}：{operation.status === 'running' ? operation.phase : operation.status === 'succeeded' ? '已完成' : '失败'}</strong>{operation.error && <span>{operation.error}</span>}</p>}
-    {sandboxPaused && !operating && <p className="project-rebuild-hint">Checkpoint 已保存，恢复运行并验证就绪后可进入项目。</p>}
+    {sandboxPaused && !operating && <p className="project-rebuild-hint">Checkpoint 已保存，进入项目会自动恢复，等待时可以先输入任务。</p>}
     {archived && project.executionMode === 'sandbox' && <div className="project-rebuild-hint">
       <p>恢复时优先使用{project.imageSelection ? '原仓库默认版本' : '当前系统默认镜像'}；文件和对话历史从备份恢复，服务需要重新启动。</p>
       {project.imageSelection && <><button className="secondary-button" disabled={busy || operating} onClick={() => setChooseRestoreVersion(value => !value)}>选择恢复版本</button>
@@ -225,7 +225,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
       {message && <p className="project-message" role="status">{message}</p>}
       {creating && canCreate && <section className="project-create-panel"><h2>创建项目</h2><ProjectForm busy={busy} onCancel={stopCreating} onSubmit={async values => {
         setBusy(true);
-        try { const project = await onCreate(values); stopCreating(); setView('active'); setMessage(`「${project.name}」已创建，Sandbox 就绪后可进入项目。`); }
+        try { const project = await onCreate(values); setCreating(false); onOpenProject(project.id); }
         finally { setBusy(false); }
       }} /></section>}
       <div className="projects-toolbar"><div className="project-tabs" role="group" aria-label="项目状态"><button ref={activeTab} className={view === 'active' ? 'selected' : ''} aria-pressed={view === 'active'} onClick={() => setView('active')}>使用中 <span>{activeCount}</span></button><button className={view === 'completed' ? 'selected' : ''} aria-pressed={view === 'completed'} onClick={() => setView('completed')}>已完成 <span>{completedCount}</span></button><button ref={archivedTab} className={view === 'archived' ? 'selected' : ''} aria-pressed={view === 'archived'} onClick={() => setView('archived')}>归档 <span>{archivedCount}</span></button></div><div><input aria-label="搜索项目" placeholder="搜索项目、需求链接或 Sandbox" value={query} onChange={event => setQuery(event.target.value)} /><button className="secondary-button" disabled={loading} onClick={async () => { setError(''); try { await onRefresh(); } catch (err) { setError(err instanceof Error ? err.message : '刷新失败，请重试。'); } }}>{loading ? '刷新中…' : '刷新'}</button></div></div>

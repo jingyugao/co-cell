@@ -8,5 +8,7 @@ export function isProjectSandboxReady(project: ProjectSummary): boolean {
 }
 
 export function canEnterProject(project: ProjectSummary): boolean {
-  return (project.status ?? (project.archivedAt ? 'archived' : 'active')) === 'active' && isProjectSandboxReady(project);
+  // Opening a workspace and drafting do not require a running sandbox.
+  // Execution continues to use isProjectSandboxReady and the server gate.
+  return (project.status ?? (project.archivedAt ? 'archived' : 'active')) === 'active';
 }

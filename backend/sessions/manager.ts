@@ -52,6 +52,7 @@ export class SessionManager {
   private notifications?: NotificationStore;
   private projects: ProjectService;
   private sandboxOperations?: ProjectSandboxOperations;
+  private projectEntries = new Map<string, Promise<ProjectSummary>>();
   private imageCatalog?: ImageCatalog;
   private danglingDeletions = new Map<string, Promise<void>>();
   private sessions = new Map<string, Session>();
@@ -667,6 +668,32 @@ export class SessionManager {
   async resumeProjectSandbox(id: string): Promise<ProjectSummary> {
     await this.submitProjectSandboxOperation(id, 'resume');
     return this.readProject(id);
+  }
+
+  /** Opening is idempotent: join preparation, or start one resume of the existing box. */
+  async enterProject(id: string): Promise<ProjectSummary> {
+    const pending = this.projectEntries.get(id);
+    if (pending) return pending;
+    const request = Promise.resolve().then(async () => {
+      if (this.closing) throw new HttpError(503, '服务正在关闭');
+      let project = this.projects.get(id);
+      if (project.status !== 'active') throw new HttpError(409, '项目未处于使用中状态，请先恢复项目');
+      if (project.executionMode !== 'sandbox' || this.projects.isMaintaining(id)) return this.readProject(id);
+      const revision = project.updatedAt;
+      const operationId = project.sandboxOperation?.id;
+      const observed = await this.liveProject(project);
+      // Another lifecycle action may have started while the provider was read.
+      project = this.projects.get(id);
+      if (this.closing) throw new HttpError(503, '服务正在关闭');
+      if (project.status !== 'active') throw new HttpError(409, '项目未处于使用中状态，请先恢复项目');
+      if (this.projects.isMaintaining(id) || project.updatedAt !== revision || project.sandboxOperation?.id !== operationId
+        || project.sandbox?.id !== observed.sandbox?.id) return this.readProject(id);
+      if (observed.sandbox?.status === 'paused') await this.submitProjectSandboxOperation(id, 'resume');
+      return this.readProject(id);
+    });
+    this.projectEntries.set(id, request);
+    try { return await request; }
+    finally { if (this.projectEntries.get(id) === request) this.projectEntries.delete(id); }
   }
 
   async checkpointProjectSandbox(id: string): Promise<ProjectSummary> {

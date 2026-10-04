@@ -1,0 +1,4 @@
+.project-entry-status { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 2px 9px; color: #7a866b; font-size: 11px; line-height: 1.6; }
+.project-entry-status .spinner { flex: 0 0 12px; width: 12px; height: 12px; }
+.project-entry-status button { color: #4c6539; text-decoration: underline; text-underline-offset: 3px; }
+.project-entry-status.is-error { color: #a3694f; }

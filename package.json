@@ -12,14 +12,19 @@
     "build": "pnpm typecheck && vite build",
     "start": "NODE_ENV=production tsx backend/index.ts",
     "typecheck": "tsc --noEmit",
-    "test:integration": "node scripts/integration/conversation-reads.mjs && node scripts/integration/project-lifecycle.mjs",
-    "test:integration:reads": "node scripts/integration/conversation-reads.mjs",
     "capture:http": "tsx backend/infra/diagnostics/capture-demo.ts",
     "sandbox:timing": "node scripts/diagnostics/sandbox-timing.mjs",
     "credentials:import": "tsx backend/connections/import-local.ts",
     "credentials:migrate": "tsx backend/connections/migrate-credentials.ts",
     "cliproxyapi": "node scripts/cliproxyapi/manage.mjs",
-    "env:audit": "node scripts/config/audit-env.mjs"
+    "env:audit": "node scripts/config/audit-env.mjs",
+    "test:integration": "node scripts/integration/run.mjs ui",
+    "test:integration:reads": "node scripts/integration/run.mjs reads",
+    "test:integration:live": "node scripts/integration/run.mjs live",
+    "test:integration:full": "node scripts/integration/run.mjs full",
+    "test:integration:lifecycle": "node scripts/integration/run.mjs lifecycle",
+    "test:integration:user-input": "node scripts/integration/run.mjs user-input",
+    "test:integration:cleanup": "node scripts/integration/cleanup.mjs"
   },
   "dependencies": {
     "@co-cell/agentcore": "file:packages/agentcore",
@@ -36,6 +41,7 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "@types/node": "24.13.3",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.4",

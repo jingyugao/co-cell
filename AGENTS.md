@@ -10,6 +10,16 @@ Use Node.js 22.18 or later and pnpm. Install dependencies with
 `pnpm install --frozen-lockfile`; validate changes with `pnpm typecheck` and
 `pnpm build`. Start development with `PORT=3001 pnpm dev`.
 
+The maintained integration module is `scripts/integration/`. Keep core project,
+Sandbox, conversation, and user-input behavior covered in the same change that
+modifies it. Run `pnpm test:integration` for local desktop/mobile regressions.
+Use `pnpm test:integration:live` against the configured test installation for
+runtime changes, and `pnpm test:integration:full` for real model, files, process
+continuity, backup/restore, and conversation-history verification. Model suites
+consume real model tokens. Do not replace live assertions with mocks or add
+unconditional retries to hide failures. Run instructions and the coverage map
+are in [the integration guide](tmp/docs/integration-tests.md).
+
 Do not commit `.env`, `data/`, credentials, kubeconfigs, runtime logs, or
 temporary investigation output. Use `.env.example` for documented, sanitized
 configuration values. Kubernetes access is opt-in through
@@ -40,6 +50,13 @@ that require explicit operator authorization.
 Run deployments from this repository's root. The Cellbox source is in the
 sibling `cell-box` repository. Set `COCELL_REGISTRY_ENDPOINT` to the HTTP
 registry origin used by the installation.
+
+Keep local installation settings in root `deploy.env`, using
+`deploy.env.example` as the template. All `make deploy-*` targets and integration
+commands load it; explicit environment variables take precedence. `deploy.env`
+is excluded from Git and Docker build contexts. Integration tests can read the
+existing Kubernetes Secret in memory using `COCELL_E2E_KUBE_CONTEXT`, so operator
+tokens need not be copied into the file.
 
 ```sh
 make deploy-cellbox-api CELLBOX_SOURCE_DIR=../cell-box COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT

@@ -25,6 +25,10 @@ logs:
 ps:
 	$(COMPOSE) ps
 
+ifneq ($(COCELL_DEPLOY_ENV_LOADED),1)
+deploy-co-cell deploy-cellbox-api deploy-cellbox-controller deploy-cocell-sandbox deploy-debug-mount deploy-all:
+	node deploy/scripts/with-env.mjs $(MAKE) COCELL_DEPLOY_ENV_LOADED=1 $@
+else
 deploy-co-cell:
 	deploy/scripts/k8s/deploy-co-cell.sh
 
@@ -63,3 +67,4 @@ deploy-all:
 	CELLBOX_SKIP_BUILD=1 $(MAKE) deploy-cellbox-api
 	$(MAKE) deploy-cocell-sandbox
 	$(MAKE) deploy-co-cell
+endif

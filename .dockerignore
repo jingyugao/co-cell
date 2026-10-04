@@ -10,6 +10,8 @@ deploy/mybox
 .env
 .env.*
 !.env.example
+deploy.env
+deploy.env.*
 /auth.json
 /.git-credentials
 /.mylogin.cnf

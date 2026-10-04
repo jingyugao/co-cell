@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises';
 import { posix } from 'node:path';
 import type { CheckpointableSandboxProvider, SandboxCheckpoint, SandboxCommandHandle, SandboxCommandResult, SandboxHandle, SandboxInfo, SandboxProvider } from '../../types.js';
 import { CellboxClient, CellboxError, type CellboxBox, type CellboxClientOptions, type CellboxOperation, type CellboxProfile } from './client.js';
@@ -248,10 +248,45 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   }
   async kill(id: string) {
     await this.ready();
-    const box = await this.box(id);
-    if (box.phase === 'deleted') return true;
-    await this.act(id, 'destroy', `cocell-destroy-${id}`);
+    let box: CellboxBox | undefined;
+    try { box = await this.box(id); }
+    catch (error) { if (!(error instanceof CellboxError) || error.code !== 'NOT_FOUND') throw error; }
+    if (box && box.phase !== 'deleted') await this.act(id, 'destroy', `cocell-destroy-${id}`);
+    try {
+      await this.client.purgeBoxArtifacts(id);
+      await this.removeCreateJournal(id, box?.ownerKey);
+    }
+    catch (error) {
+      // Generic provider consumers ignore missing-box errors. A missing purge
+      // endpoint is instead an incomplete cleanup and must retain its retry journal.
+      throw new CellboxError('CLEANUP_FAILED', 'Cellbox artifact cleanup has not completed', undefined, undefined, { cause: error });
+    }
     return true;
+  }
+  private async removeCreateJournal(boxId: string, ownerKey?: string) {
+    if (!this.stateDirectory) return;
+    let names: string[];
+    try { names = await readdir(this.stateDirectory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
+    let removed = false;
+    const ownerHash = ownerKey && createHash('sha256').update(`${this.profileId}\0${ownerKey}`).digest('hex');
+    for (const name of names) {
+      if (!/^[a-f0-9]{64}\.(?:json|[a-f0-9-]{36}\.tmp)$/.test(name)) continue;
+      const path = posix.join(this.stateDirectory, name);
+      let raw: string;
+      try { raw = await readFile(path, 'utf8'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+      let record: { boxId?: string };
+      try { record = JSON.parse(raw); } catch { record = {}; }
+      if (record?.boxId === boxId || (ownerHash && name.startsWith(`${ownerHash}.`) && name.endsWith('.tmp'))) {
+        await unlink(path).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; });
+        removed = true;
+      }
+    }
+    if (removed) {
+      const directory = await open(this.stateDirectory, 'r');
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
   }
   async resumeBox(id: string, key: string) { await this.ready(); return this.act(id, 'resume', key); }
   async suspendBox(id: string, key: string) { await this.ready(); return this.act(id, 'suspend', key); }

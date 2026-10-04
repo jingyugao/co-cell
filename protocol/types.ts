@@ -129,6 +129,8 @@ export interface Project {
   sandbox?: SandboxState;
   /** Timestamp at which project archiving removed the previous sandbox. */
   sandboxReclaimedAt?: string;
+  /** Confirmed runtime and Cellbox artifact cleanup; absent on legacy archives awaiting reconciliation. */
+  sandboxArtifactsCleanedAt?: string;
 	/** Product references only; archive bytes and integrity belong to the box service. */
 	remoteArchives?: import('./remote-archive-types.js').RemoteArchiveRef[];
   backupRetentionCount?: number;
@@ -136,6 +138,8 @@ export interface Project {
   sandboxOperation?: ProjectSandboxOperation;
   /** Uncommitted replacement containers and retired containers awaiting cleanup. */
   pendingSandboxCleanup?: SandboxState[];
+  /** Verified archive source awaiting deletion and archive finalization; survives retries/restarts. */
+  archiveCleanupSourceId?: string;
   archivedAt?: string | null;
   lifecycleHistory?: ProjectLifecycleRecord[];
   createdAt: string;

@@ -39,6 +39,7 @@ export class ProjectSandboxes {
     if (!target.sandbox) return;
     this.track(target);
     await this.manager.untrack(resourceKey(target), target.sandbox.id);
+    this.bindings.delete(resourceKey(target));
   }
 
   private project(record: SandboxRecord, workingDirectory: string): SandboxState {

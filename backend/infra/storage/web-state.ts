@@ -3,6 +3,7 @@ import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import type { Project, Session, Turn } from '../../../protocol/types.js';
 import type { SandboxState } from '../../../protocol/sandbox-types.js';
 import { MySqlSecretRepository } from '../../secrets/repository.js';
+import { MySqlNotificationRepository } from '../../notifications/repository.js';
 
 export interface WebStateStore {
   init(): Promise<void>; listProjects(): Promise<Project[]>; listSessions(): Promise<Session[]>;
@@ -66,7 +67,12 @@ function requireMySqlUrl(value: string | undefined): string {
 export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   private pool: Pool;
   readonly secretRepository: MySqlSecretRepository;
-  constructor(url: string) { this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' }); this.secretRepository = new MySqlSecretRepository(this.pool); }
+  readonly notificationRepository: MySqlNotificationRepository;
+  constructor(url: string) {
+    this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' });
+    this.secretRepository = new MySqlSecretRepository(this.pool);
+    this.notificationRepository = new MySqlNotificationRepository(this.pool);
+  }
   async listImages(): Promise<ImageRecord[]> {
     const [rows] = await this.pool.query<Array<RowDataPacket & { document: ImageRecord | string }>>('SELECT document FROM managed_images');
     return rows.map(row => this.document<ImageRecord>(row.document));
@@ -78,6 +84,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS managed_images (id CHAR(36) PRIMARY KEY, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS projects (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL, requirement_url TEXT NULL, execution_mode ENUM('sandbox','local') NOT NULL, working_directory TEXT NOT NULL, archived_at DATETIME(3) NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sessions (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NULL, thread_id VARCHAR(191) NULL, title VARCHAR(255) NOT NULL, status ENUM('idle','running','completed','failed','cancelled') NOT NULL, archived_at DATETIME(3) NULL, started_at DATETIME(3) NOT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL, INDEX sessions_project_updated (project_id, updated_at), CONSTRAINT sessions_project_fk FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
+    await this.notificationRepository.init();
   }
   async listProjects(): Promise<Project[]> { const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects'); return rows.map(row => hydrateProject(this.document<Project>(row.document))); }
   async listSessions(): Promise<Session[]> {

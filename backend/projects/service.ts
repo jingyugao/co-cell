@@ -104,7 +104,10 @@ export class ProjectService {
       if (sourceId && project.sandbox?.id !== sourceId) throw new HttpError(409, '项目 Sandbox 已变化');
       const at = new Date().toISOString();
       delete project.sandbox;
+      delete project.archiveCleanupSourceId;
+      delete project.pendingSandboxCleanup;
       project.sandboxReclaimedAt = at;
+      project.sandboxArtifactsCleanedAt = at;
       project.status = 'archived'; project.completedAt = null; project.archivedAt = at;
       project.lifecycleHistory = [...(project.lifecycleHistory ?? []), { id: randomUUID(), action: 'archived', at, ...(sourceId ? { sandboxId: sourceId } : {}) }];
     }, true);
@@ -131,6 +134,22 @@ export class ProjectService {
     await this.mutateSandboxMetadata(id, project => { project.pendingSandboxCleanup = structuredClone(sandboxes); });
   }
 
+  async prepareArchiveCleanup(id: string, sandbox: NonNullable<Project['sandbox']>) {
+    await this.mutateSandboxMetadata(id, project => {
+      project.archiveCleanupSourceId = sandbox.id;
+      project.pendingSandboxCleanup = [...(project.pendingSandboxCleanup ?? []).filter(item => item.id !== sandbox.id), structuredClone(sandbox)];
+    });
+  }
+
+  async markArchivedArtifactsCleaned(id: string) {
+    await this.mutateSandboxMetadata(id, project => {
+      if (project.status !== 'archived') throw new HttpError(409, '项目未归档');
+      delete project.pendingSandboxCleanup;
+      delete project.archiveCleanupSourceId;
+      project.sandboxArtifactsCleanedAt = new Date().toISOString();
+    });
+  }
+
   private async mutateSandboxMetadata(id: string, mutate: (project: Project) => void, commitLifecycle = false) {
     await this.writer.run(id, async () => {
       const current = this.records.get(id);
@@ -151,8 +170,10 @@ export class ProjectService {
       current.latestBackup = next.latestBackup;
 	  current.remoteArchives = next.remoteArchives;
       current.sandboxReclaimedAt = next.sandboxReclaimedAt;
+      current.sandboxArtifactsCleanedAt = next.sandboxArtifactsCleanedAt;
       current.sandboxOperation = next.sandboxOperation;
       current.pendingSandboxCleanup = next.pendingSandboxCleanup;
+      current.archiveCleanupSourceId = next.archiveCleanupSourceId;
       if (commitLifecycle) {
         current.status = next.status;
         current.completedAt = next.completedAt;
@@ -270,6 +291,7 @@ export class ProjectService {
     if (!project || this.deleting.has(id)) return false;
     await this.mutateSandboxMetadata(id, next => {
       delete next.sandboxReclaimedAt;
+      delete next.sandboxArtifactsCleanedAt;
       next.sandbox = structuredClone(sandbox);
       next.workingDirectory = sandbox.workingDirectory;
       if (restoreProject) next.imageSelection = restoreImage ? structuredClone(restoreImage) : undefined;

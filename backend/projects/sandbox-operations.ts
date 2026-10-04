@@ -78,6 +78,7 @@ export class ProjectSandboxOperations {
   async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
     const project = this.deps.projects.get(id);
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
+    if (project.archiveCleanupSourceId && kind !== 'archive') throw new HttpError(409, '项目归档清理尚未完成，请先重试归档');
     const release = this.deps.projects.beginMaintenance(id);
     let reservation: { selection?: ProjectImageSelection; release(): void } | undefined;
     try {
@@ -221,17 +222,27 @@ export class ProjectSandboxOperations {
     await this.deps.projects.setPendingSandboxCleanup(id, [...pending.filter(item => item.id !== sandbox.id), sandbox]);
   }
 
-  private async cleanup(id: string) {
+  private async cleanup(id: string, archive = false) {
     const project = this.deps.projects.get(id);
     const remaining: SandboxState[] = [];
+    let failed = false;
     for (const sandbox of project.pendingSandboxCleanup ?? []) {
-      if (sandbox.id === project.sandbox?.id) continue;
+      if (sandbox.id === project.sandbox?.id && !archive) { remaining.push(sandbox); continue; }
       try {
         if (!this.deps.runtime.deleteDanglingSandbox) throw new Error('cleanup not supported');
         await this.deps.runtime.deleteDanglingSandbox(sandbox.id);
-      } catch { remaining.push(sandbox); }
+        // Keep the source journal until the archive state is committed, so a
+        // restart after deletion can finish without selecting an older backup.
+        if (archive && sandbox.id === project.archiveCleanupSourceId) remaining.push(sandbox);
+      } catch (error) {
+        failed = true; remaining.push(sandbox);
+        void this.deps.logger?.write({ event: 'sandbox.cleanup_failed', projectId: id, sandboxId: sandbox.id, error });
+      }
     }
     await this.deps.projects.setPendingSandboxCleanup(id, remaining);
+    if (archive && failed) {
+      throw new HttpError(503, '归档环境尚未清理完成，请重试');
+    }
   }
 
   private async restore(id: string, allowHealthy = false, reservation?: { selection?: ProjectImageSelection }) {
@@ -293,22 +304,54 @@ export class ProjectSandboxOperations {
   private async archive(id: string, useExistingBackup: boolean) {
     const { projects, runtime } = this.deps;
     const project = await this.inspect(id);
-    if (project.sandbox?.status === 'ready') {
+    if (project.status === 'archived') {
+      if (project.sandbox) {
+        // Legacy status flags could leave a live binding. Preserve its data
+        // before reclaiming it rather than interpreting the flag as a backup.
+        if (project.sandbox.status === 'ready') await this.backup(id);
+        else await this.latestRemote(id);
+      }
+      const pending = new Map((project.pendingSandboxCleanup ?? []).map(sandbox => [sandbox.id, sandbox]));
+      for (const sandbox of await runtime.listProjectSandboxes?.(id) ?? []) pending.set(sandbox.id, sandbox);
+      const sourceIds = [...(project.remoteArchives ?? []).map(ref => ref.sourceSandboxId),
+        ...(project.lifecycleHistory ?? []).filter(record => record.action === 'archived').flatMap(record => record.sandboxId ? [record.sandboxId] : [])];
+      for (const sourceId of sourceIds) {
+        if (!pending.has(sourceId)) pending.set(sourceId, { id: sourceId, status: 'unknown', template: 'legacy', workingDirectory: project.workingDirectory });
+      }
+      if (project.sandbox) pending.set(project.sandbox.id, project.sandbox);
+      await projects.setPendingSandboxCleanup(id, [...pending.values()]);
+      await this.phase(id, '清理归档遗留资源');
+      await this.cleanup(id, true);
+      await this.deps.detached(id);
+      // Legacy archives may still carry their obsolete binding.
+      if (project.sandbox) {
+        await runtime.detachSandbox?.(target(project));
+        await projects.archiveAndDetachSandbox(id, project.sandbox.id);
+      } else await projects.markArchivedArtifactsCleaned(id);
+      return;
+    }
+    if (project.archiveCleanupSourceId) {
+      await this.latestRemote(id);
+    } else if (project.sandbox?.status === 'ready') {
       await this.backup(id);
     } else {
       await this.latestRemote(id);
       if (!useExistingBackup) throw new HttpError(409, '当前环境无法生成新备份，请确认使用已有备份归档；未备份数据不会保存');
     }
+    for (const sandbox of await runtime.listProjectSandboxes?.(id) ?? []) {
+      if (sandbox.id !== project.sandbox?.id) await this.rememberCleanup(id, sandbox);
+    }
     if (project.sandbox) {
       if (!runtime.fenceSandbox || !runtime.detachSandbox) throw new HttpError(503, 'Sandbox 不支持安全释放');
       await this.phase(id, '释放环境');
+      await projects.prepareArchiveCleanup(id, project.sandbox);
       await runtime.fenceSandbox(project.sandbox);
-      await this.rememberCleanup(id, project.sandbox);
       await runtime.detachSandbox(target(project));
     }
-    await projects.archiveAndDetachSandbox(id, project.sandbox?.id);
+    await this.phase(id, '清理环境和缓存');
+    await this.cleanup(id, true);
     await this.deps.detached(id);
-    await this.cleanup(id);
+    await projects.archiveAndDetachSandbox(id, project.sandbox?.id);
   }
 
   private async refreshRuntime(id: string) {

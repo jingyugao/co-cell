@@ -1,69 +1,67 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { readFile, rm } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import type { AppNotification, NotificationType } from '../../protocol/notification-types.js';
+import type { NotificationRepository } from './repository.js';
 
 export class NotificationStore {
-  private items = new Map<string, AppNotification>();
-  private dirty = false;
-  private saving?: Promise<void>;
   private readonly path: string;
+  private readonly pending = new Set<Promise<unknown>>();
+  private closed = false;
 
-  constructor(basePath?: string) {
-    this.path = resolve(basePath ?? 'data/notifications.json');
+  constructor(private readonly repository: NotificationRepository, legacyPath?: string) {
+    this.path = resolve(legacyPath ?? 'data/notifications.json');
   }
 
+  /** Import both legacy snapshots before removing them; never write local files. */
   async init() {
-    try {
-      const raw = await readFile(this.path, 'utf8');
-      const list = JSON.parse(raw) as AppNotification[];
-      for (const item of list) this.items.set(item.id, item);
-    } catch { /* file doesn't exist yet */ }
+    const notifications = new Map<string, AppNotification>();
+    const paths: string[] = [];
+    for (const path of [this.path, `${this.path}.tmp`]) {
+      let raw: string;
+      try { raw = await readFile(path, 'utf8'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+      const list: unknown = JSON.parse(raw);
+      if (!Array.isArray(list) || !list.every(isNotification)) throw new Error(`Invalid legacy notification file: ${path}`);
+      paths.push(path);
+      for (const item of list) {
+        const existing = notifications.get(item.id);
+        notifications.set(item.id, existing ? { ...existing, ...(existing.readAt || item.readAt ? { readAt: existing.readAt ?? item.readAt } : {}) } : item);
+      }
+    }
+    if (!paths.length) return;
+    await this.repository.importLegacy([...notifications.values()]);
+    for (const path of paths) await rm(path, { force: true });
   }
 
-  add(opts: { type: NotificationType; title: string; body: string; sessionId: string; sessionTitle: string; projectName?: string; turnId?: string }) {
-    const now = new Date().toISOString();
-    const id = randomUUID();
-    const notification: AppNotification = { id, ...opts, createdAt: now };
-    this.items.set(id, notification);
-    // prune to 500
-    if (this.items.size > 500) {
-      const sorted = [...this.items.values()].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
-      this.items = new Map(sorted.slice(0, 500).map(n => [n.id, n]));
-    }
-    this.flush();
+  async add(opts: { type: NotificationType; title: string; body: string; sessionId: string; sessionTitle: string; projectName?: string; turnId?: string }) {
+    const notification: AppNotification = { id: randomUUID(), ...opts, createdAt: new Date().toISOString() };
+    await this.track(() => this.repository.save(notification));
     return notification;
   }
 
-  markRead(id: string) {
-    const notification = this.items.get(id);
-    if (notification && !notification.readAt) {
-      notification.readAt = new Date().toISOString();
-      this.flush();
-    }
+  async markRead(id: string) { await this.track(() => this.repository.markRead(id, new Date().toISOString())); }
+
+  list(limit = 100) { return this.repository.list(limit); }
+
+  private track<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.closed) return Promise.reject(new Error('Notification store is closed'));
+    const pending = Promise.resolve().then(operation);
+    this.pending.add(pending);
+    void pending.finally(() => this.pending.delete(pending)).catch(() => {});
+    return pending;
   }
 
-  list(limit = 100): AppNotification[] {
-    return [...this.items.values()]
-      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
-      .slice(0, limit);
-  }
+  async close() { this.closed = true; await Promise.allSettled([...this.pending]); }
+}
 
-  private flush() {
-    this.dirty = true;
-    if (this.saving) return;
-    this.saving = (async () => {
-      await new Promise(resolve => setTimeout(resolve, 500)); // debounce
-      while (this.dirty) {
-        this.dirty = false;
-        const list = this.list(500);
-        await mkdir(dirname(this.path), { recursive: true });
-        await writeFile(this.path + '.tmp', JSON.stringify(list, null, 2), 'utf8');
-        await writeFile(this.path, JSON.stringify(list, null, 2), 'utf8');
-      }
-      this.saving = undefined;
-    })().catch(() => { this.saving = undefined; });
-  }
-
-  close() { /* noop — flush is fire-and-forget */ }
+function isNotification(value: unknown): value is AppNotification {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.id === 'string' && item.id.length > 0 && item.id.length <= 36
+    && typeof item.type === 'string' && ['turn_completed', 'turn_failed', 'turn_cancelled'].includes(item.type)
+    && ['title', 'body', 'sessionId', 'sessionTitle'].every(key => typeof item[key] === 'string')
+    && typeof item.createdAt === 'string' && Number.isFinite(Date.parse(item.createdAt))
+    && (item.readAt === undefined || (typeof item.readAt === 'string' && Number.isFinite(Date.parse(item.readAt))))
+    && ['projectName', 'turnId'].every(key => item[key] === undefined || typeof item[key] === 'string');
 }

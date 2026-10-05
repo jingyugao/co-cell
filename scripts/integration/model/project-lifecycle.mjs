@@ -175,11 +175,21 @@ export async function projectLifecycle(env, { userInputOnly = false } = {}) {
       assert.equal(backup.sourceSandboxId, originalSandboxId); assert(backup.threadIds.includes(threadId));
       return { archiveId: backup.id, sizeBytes: backup.sizeBytes, sha256: backup.sha256, threadIds: backup.threadIds };
     });
-    await step('Archive the project and confirm the original sandbox was deleted', async () => {
+    await step('Complete a checkpointed project without resuming it', async () => {
+      await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 202 });
+      await waitProject('checkpoint', 'paused');
+      const completed = await json(`/api/projects/${projectId}`, { method: 'PATCH', body: { status: 'completed' } });
+      assert.equal(completed.status, 'completed'); assert.equal(completed.sandbox.status, 'paused');
+      assert.equal(completed.sandbox.id, originalSandboxId);
+      return { sandboxId: originalSandboxId, completedAt: completed.completedAt };
+    });
+    await step('Clean up the checkpointed project using its existing archive', async () => {
+      const previousArchiveId = backup.id;
       const archived = await json(`/api/projects/${projectId}/archive`, { method: 'POST', body: { useExistingBackup: true }, expectedStatus: 202, timeoutMs: operationTimeout });
       assert.equal(archived.status, 'archived'); assert.equal(archived.sandbox, undefined);
       assert.equal(archived.sandboxOperation.status, 'succeeded'); assert(!archived.pendingSandboxCleanup?.length, 'Sandbox deletion is still pending');
       backup = archived.remoteArchives[0]; assert(backup.threadIds.includes(threadId));
+      assert.equal(backup.id, previousArchiveId, 'Paused cleanup created a new archive');
       const inventory = await json('/api/sandboxes'); assert(!inventory.sandboxes.some(s => s.id === originalSandboxId), 'Original sandbox still exists');
       return { deletedSandboxId: originalSandboxId, archiveId: backup.id };
     });

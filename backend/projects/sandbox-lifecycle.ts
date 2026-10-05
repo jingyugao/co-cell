@@ -6,13 +6,13 @@ const MINUTE = 60 * 1000;
 export interface SandboxLifecycleOptions {
   listProjects: () => Project[] | Promise<Project[]>;
   /** Resolves only after the reclaim operation has reached a terminal state. */
-  reclaim: (projectId: string) => Promise<void>;
+  reclaim: (projectId: string, options?: { useExistingBackup: boolean }) => Promise<void>;
   archivedReclaimAfterMs?: number;
   scanIntervalMs?: number;
   now?: () => number;
 }
 
-/** Archives completed projects after the grace period and deletes their environments. */
+/** Reclaims completed projects using their existing archives after the grace period. */
 export class SandboxLifecycleService {
   private readonly archivedReclaimAfterMs: number;
   private readonly scanIntervalMs: number;
@@ -51,15 +51,15 @@ export class SandboxLifecycleService {
     const eligible = (await this.options.listProjects()).filter(project => {
       if (project.executionMode !== 'sandbox') return false;
       if (project.status !== 'completed') return false;
-      // An unhealthy/missing environment needs explicit confirmation to archive
-      // using an older backup; automatic reclamation must never make that choice.
-      if (project.sandbox?.status !== 'ready' && !project.archiveCleanupSourceId) return false;
+      // Paused projects retain their existing archive without waking execution.
+      // Unhealthy/missing environments still require explicit confirmation.
+      if (project.sandbox?.status !== 'ready' && project.sandbox?.status !== 'paused' && !project.archiveCleanupSourceId) return false;
       const timestamp = Date.parse(project.completedAt ?? '');
       return Number.isFinite(timestamp) && timestamp <= cutoff;
     });
     for (const project of eligible) {
       if (this.closed) break;
-      try { await this.options.reclaim(project.id); }
+      try { await this.options.reclaim(project.id, { useExistingBackup: true }); }
       catch { /* A busy project or transient failure is retried by a later sweep. */ }
     }
   }

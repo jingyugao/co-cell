@@ -330,7 +330,7 @@ export class ProjectSandboxOperations {
       } else await projects.markArchivedArtifactsCleaned(id);
       return;
     }
-    if (project.archiveCleanupSourceId) {
+    if (project.archiveCleanupSourceId || useExistingBackup) {
       await this.latestRemote(id);
     } else if (project.sandbox?.status === 'ready') {
       await this.backup(id);

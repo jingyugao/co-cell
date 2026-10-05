@@ -30,6 +30,10 @@ export const test = base.extend({
       } else if (path.startsWith('/api/projects/')) {
         const id = path.split('/')[3]; data = projects.get(id);
         if (!data) { data = { error: '不存在' }; status = 404; }
+        else if (method === 'PATCH' && path === `/api/projects/${id}`) {
+          const next = request.postDataJSON();
+          if (next.status !== undefined) { data.status = next.status; data.completedAt = next.status === 'completed' ? now : null; }
+        }
         else if (method === 'POST' && path.endsWith('/open')) {
           status = 202;
           if (data.sandbox?.status === 'paused' && data.sandboxOperation?.status !== 'running') data.sandboxOperation = operation('resume');

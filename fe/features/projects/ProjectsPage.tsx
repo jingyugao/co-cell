@@ -172,7 +172,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onBackup, on
       </section>}
     </div>
     {operation && !(operation.kind === 'backup' && operation.status === 'succeeded') && <p className={`project-operation ${operation.status === 'failed' ? 'failed' : ''}`} role={operation.status === 'failed' ? 'alert' : 'status'}><strong>{operationLabels[operation.kind]}：{operation.status === 'running' ? operation.phase : operation.status === 'succeeded' ? '已完成' : '失败'}</strong>{operation.error && <span>{operation.error}</span>}</p>}
-    {sandboxPaused && !operating && <p className="project-rebuild-hint">Checkpoint 已保存，进入项目会自动恢复，等待时可以先输入任务。</p>}
+    {sandboxPaused && !operating && <p className="project-rebuild-hint">{completed ? `有可用归档备份时，完成满 ${duration(config?.sandbox?.archivedReclaimAfterMs, '1 天')}后会保留已有备份并清理暂停环境，不恢复运行。` : 'Checkpoint 已保存，进入项目会自动恢复，等待时可以先输入任务。'}</p>}
     {archived && project.executionMode === 'sandbox' && <div className="project-rebuild-hint">
       <p>恢复时优先使用{project.imageSelection ? '原仓库默认版本' : '当前系统默认镜像'}；文件和对话历史从备份恢复，服务需要重新启动。</p>
       {project.imageSelection && <><button className="secondary-button" disabled={busy || operating} onClick={() => setChooseRestoreVersion(value => !value)}>选择恢复版本</button>

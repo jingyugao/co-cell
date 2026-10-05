@@ -15,15 +15,25 @@ test('sweep archives only completed Sandbox projects after the grace period', as
   const threshold = 24 * 60 * 60 * 1000;
   const projects = [
     project('eligible', { status: 'completed', completedAt: new Date(now - threshold).toISOString() }),
+    project('paused', { status: 'completed', completedAt: new Date(now - threshold).toISOString(), sandbox: { ...sandbox, status: 'paused' } }),
+    project('paused-recent', { status: 'completed', completedAt: new Date(now - threshold + 1).toISOString(), sandbox: { ...sandbox, status: 'paused' } }),
+    project('unavailable', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'unavailable' } }),
+    project('unknown', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'unknown' } }),
+    project('starting', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'starting' } }),
     project('too-recent', { status: 'completed', completedAt: new Date(now - threshold + 1).toISOString() }),
     project('active', { status: 'active', sandbox: { ...sandbox, lastActiveAt: new Date(0).toISOString() } }),
     project('local', { status: 'completed', completedAt: new Date(0).toISOString(), executionMode: 'local' }),
     project('missing', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: undefined }),
   ];
   const reclaimed: string[] = [];
-  const service = new SandboxLifecycleService({ listProjects: () => projects, reclaim: async id => { reclaimed.push(id); }, now: () => now });
+  const existingBackups: string[] = [];
+  const service = new SandboxLifecycleService({ listProjects: () => projects, reclaim: async (id, options) => {
+    reclaimed.push(id);
+    if (options?.useExistingBackup) existingBackups.push(id);
+  }, now: () => now });
   await service.sweep();
-  assert.deepEqual(reclaimed, ['eligible']);
+  assert.deepEqual(reclaimed, ['eligible', 'paused']);
+  assert.deepEqual(existingBackups, ['eligible', 'paused']);
   await service.close();
 });
 

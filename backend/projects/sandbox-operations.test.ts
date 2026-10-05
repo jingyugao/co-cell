@@ -68,6 +68,41 @@ const remoteReference: RemoteArchiveRef = {
   sourceSandboxId: 'sandbox-old', threadIds: ['thread-1'],
 };
 
+for (const status of ['ready', 'paused'] as const) test(`cleanup uses an existing backup without capturing or resuming a ${status} box`, async () => {
+  const id = 'checkpoint-existing-backup';
+  const f = await fixture(project(id, { sandbox: sandbox('sandbox-old', status), remoteArchives: [remoteReference] }));
+  const operations = new ProjectSandboxOperations({ projects: f.projects,
+    runtime: { ...runtime({ status }, []), async resume() { assert.fail('must not resume'); },
+      remoteArchives: { async capture() { assert.fail('must not capture'); }, async inspect() { return remoteReference; },
+        async restore() { throw new Error('unused'); }, async activate() {} } },
+    threadIds: () => [], saveSandbox: async () => {}, detached: async () => {} });
+  try {
+    await operations.run(id, 'archive', { useExistingBackup: true });
+    assert.equal(f.projects.get(id).status, 'archived');
+    assert.equal(f.projects.get(id).remoteArchives?.[0].id, remoteReference.id);
+  } finally { await operations.close(); await f.close(); }
+});
+
+test('cleanup without a usable existing archive preserves the completed project and checkpoint', async () => {
+  const id = 'checkpoint-no-backup';
+  const f = await fixture(project(id, { status: 'completed', sandbox: sandbox('sandbox-old', 'paused') }));
+  const operations = new ProjectSandboxOperations({ projects: f.projects,
+    runtime: { ...runtime({ status: 'paused' }, []), async resume() { assert.fail('must not resume'); },
+      async fenceSandbox() { assert.fail('must not fence'); }, async deleteDanglingSandbox() { assert.fail('must not delete'); },
+      remoteArchives: { async capture() { assert.fail('must not capture'); }, async inspect() { throw new Error('archive missing'); },
+        async restore() { throw new Error('unused'); }, async activate() {} } },
+    threadIds: () => [], saveSandbox: async () => {}, detached: async () => { assert.fail('must not detach'); } });
+  try {
+    await assert.rejects(operations.run(id, 'archive', { useExistingBackup: true }), /未找到可恢复/);
+    await f.projects.saveRemoteArchive(id, remoteReference);
+    await assert.rejects(operations.run(id, 'archive', { useExistingBackup: true }), /最新 Cellbox 归档不可用/);
+    assert.equal(f.projects.get(id).status, 'completed');
+    assert.equal(f.projects.get(id).sandbox?.id, 'sandbox-old');
+    assert.equal(f.projects.get(id).archiveCleanupSourceId, undefined);
+    assert.equal(f.projects.get(id).sandboxOperation?.status, 'failed');
+  } finally { await operations.close(); await f.close(); }
+});
+
 test('a failed backup health check preserves the reference and a later retry uses live Cellbox state', async () => {
   const id = 'backup-health';
   const f = await fixture(project(id));

@@ -110,7 +110,7 @@ export class SessionManager {
       this.lifecycle = new SandboxLifecycleService({
         ...lifecycleOptions,
         listProjects: () => this.listProjectsWithArchives(),
-        reclaim: id => this.archiveProjectNow(id).then(() => {}),
+        reclaim: (id, options) => this.archiveProjectNow(id, options).then(() => {}),
       });
     }
   }

@@ -1,5 +1,17 @@
 import { test, expect, createThroughUI, projectList } from './fixture.mjs';
 
+test('marking a checkpointed project completed keeps it paused and explains automatic archiving', async ({ page, ui }) => {
+  await page.goto('/#projects');
+  await page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('button', { name: '标记已完成', exact: true }).click();
+  await page.getByRole('button', { name: /^已完成 \d+$/ }).click();
+  const card = page.getByRole('article', { name: '暂停项目', exact: true });
+  await expect(card.getByRole('button', { name: '恢复使用中', exact: true })).toBeVisible();
+  await expect(card.getByText('有可用归档备份时，完成满 1 天后会保留已有备份并清理暂停环境，不恢复运行。', { exact: true })).toBeVisible();
+  expect(ui.projects.get('paused').status).toBe('completed');
+  expect(ui.projects.get('paused').sandbox.status).toBe('paused');
+  expect(ui.calls.filter(call => call.method === 'POST')).toEqual([]);
+});
+
 test('paused entry permits drafting while one resume is pending', async ({ page, ui }) => {
   await page.goto('/#projects');
   const enter = page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('button', { name: '进入项目' });

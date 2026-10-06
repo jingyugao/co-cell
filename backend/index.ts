@@ -68,15 +68,12 @@ if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOK
 const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,clientId:process.env.CELLBOX_CLIENT_ID,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',stateDirectory:resolve('data/cellbox-operations')});
 await cellboxProvider.initialize();
 let manager: SessionManager;
-const secrets = new SecretService(webState.secretRepository, secretCrypto, id => cellboxProvider.client.getBox(id), (projectId, boxId) => {
-  const project = manager?.listProjects().find(project => project.id === projectId);
-  return Boolean(project && project.status !== 'archived' && project.sandbox?.id === boxId);
-});
+const secrets = new SecretService(webState.secretRepository, secretCrypto);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
   error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); });
 const cellboxRuntime=new CellboxRuntimeIntegration({provider:cellboxProvider,profileId:process.env.CELLBOX_PROFILE!,appServerArgs:appServerArguments,
   extensions: [appServerReader.extension],
-  env:appServerEnv, sharedDirectory,
+  env:appServerEnv, sharedDirectory, ...(sharedDirectory ? { sharedDataRoot } : {}),
   secrets, toolBrokerUrl, logger: runtimeLog,
   onRenewalFailure:error=>{void runtimeLog.write({event:'sandbox.cellbox_renewal_failed',error});}});
 const provider = cellboxProvider;

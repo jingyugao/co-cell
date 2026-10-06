@@ -8,8 +8,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'k8s'))
 from cellbox_deploy import CellboxRelease
 
-if len(sys.argv) != 4 or not re.fullmatch(r'[^\s@]+@sha256:[a-f0-9]{64}', sys.argv[3]):
-    raise SystemExit('usage: admit-tool-image.py CELLBOX_SOURCE_DIR PROFILE_ID REPOSITORY@sha256:DIGEST')
+if len(sys.argv) not in (4, 5) or not re.fullmatch(r'[^\s@]+@sha256:[a-f0-9]{64}', sys.argv[3]) or (len(sys.argv) == 5 and sys.argv[4] != '--mounted-tool-runtime'):
+    raise SystemExit('usage: admit-tool-image.py CELLBOX_SOURCE_DIR PROFILE_ID REPOSITORY@sha256:DIGEST [--mounted-tool-runtime]')
 release = CellboxRelease(sys.argv[1])
 config = release.values['api']['config']
 if not release.values['api'].get('manageSecrets', True):
@@ -21,6 +21,12 @@ profile = profiles[0]
 trusted = profile.setdefault('trustedToolImages', [])
 if sys.argv[3] not in trusted:
     trusted.append(sys.argv[3])
+# Opt in only after inspecting an image built with the mounted-runtime runner.
+# Existing immutable images keep the batch-delivery fallback during rollout.
+if len(sys.argv) == 5:
+    mounted = profile.setdefault('mountedToolRuntimeImages', [])
+    if sys.argv[3] not in mounted:
+        mounted.append(sys.argv[3])
 tools = profile['guest'].setdefault('tools', [])
 names = json.loads((Path(__file__).resolve().parents[2] / 'box-wrap/proxy-tools.json').read_text())
 for name in names:

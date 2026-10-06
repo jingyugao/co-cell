@@ -4,6 +4,7 @@ export interface CellboxCapabilities {
   pty: boolean; reconnectExec: boolean; freeze: boolean;
   suspend: 'none' | 'same-node-checkpoint'; archives: string; protectedTools: boolean;
   sharedDirectory?: boolean;
+  mountedToolRuntime?: boolean;
   rootDebug?: boolean;
   credentialBatch?: boolean;
   internalServices?: boolean;

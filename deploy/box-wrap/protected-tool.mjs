@@ -5,6 +5,7 @@ import { chmod, lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } f
 import { dirname, join, normalize } from 'node:path';
 import { hostname } from 'node:os';
 import { decodeGitlabHost } from '../../util/gitlab-tool-host.mjs';
+import { toolRuntimeBoxId } from '../../util/tool-runtime-identity.mjs';
 import { collectCredentialDirectory, encodeFile, fileBytes, FILE_BUNDLE_LIMIT, openMeegleBundle, rebindMeegleBundle, validateFileBundle } from '../../util/credential-files.mjs';
 
 const LIMIT = 65536;
@@ -111,13 +112,13 @@ async function runBundleTool(tool, args, config, options, request) {
   if (!resource || config.files.filter(file => file.tool === tool).length !== 1) throw new Error('Select one file group per tool');
   const source = validateFileBundle(JSON.parse(Buffer.from(resource.content, 'base64').toString('utf8')));
   if (source.files[0].path !== resource.path || (source.adapter === 'meegle' && tool !== 'meegle')) throw new Error('Invalid file group binding');
-  const snapshot = createHash('sha256').update(JSON.stringify({ generation: config.generation, resource })).digest('hex');
+  const snapshot = createHash('sha256').update(JSON.stringify({ generation: config.revision ?? config.generation, resource })).digest('hex');
   const state = join(options.tempRoot ?? '/var/lib/cellbox/debug/tool-homes', tool, snapshot), root = join(state, 'home');
   await mkdir(state, { recursive: true, mode: 0o700 }); await chmod(state, 0o700);
   const unlock = await lockState(state);
   try {
     const syncedPath = join(state, 'synced.json'), materialPath = join(state, 'material.json'), pendingPath = join(state, 'pending.json');
-    const masks = [config.token];
+    const masks = config.token ? [config.token] : [];
     function mask(bundle) {
       for (const file of bundle.files) masks.push(...options.sensitiveValues(fileBytes(file)));
       if (bundle.adapter === 'meegle') masks.push(...options.sensitiveValues(Buffer.from(JSON.stringify(openMeegleBundle(bundle)))));
@@ -195,11 +196,11 @@ async function runFileTool(tool, args, config, options, request) {
   const files = config.files.filter(file => file.tool === tool);
   if (files.length > 1) throw new Error('Only one credential file per tool is supported');
   if (files[0]?.format === 'files') return runBundleTool(tool, args, config, { ...options, execute, readCredential, sensitiveValues }, request);
-  const snapshot = createHash('sha256').update(JSON.stringify({ generation: config.generation, files })).digest('hex');
+  const snapshot = createHash('sha256').update(JSON.stringify({ generation: config.revision ?? config.generation, files })).digest('hex');
   const state = join(options.tempRoot ?? '/var/lib/cellbox/debug/tool-homes', tool, snapshot);
   const root = join(state, 'home');
   await mkdir(root, { recursive: true, mode: 0o700 });
-  const masks = [config.token];
+  const masks = config.token ? [config.token] : [];
   const persisted = new Map();
   for (const file of files) {
     if (!safePath(file.path)) throw new Error('Invalid tool file');
@@ -251,12 +252,24 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   const decoded = decodeGitlabHost(tool, inputArgs);
   inputArgs = decoded.args;
   options = { ...options, gitlabEnv: decoded.env };
-  const config = options.config ?? JSON.parse(await readFile(process.env.COCELL_TOOL_RUNTIME, 'utf8'));
+  let config = options.config ?? JSON.parse(await readFile(process.env.COCELL_TOOL_RUNTIME, 'utf8'));
+  if (config.mode === 'mount') {
+    const prefix = '/var/lib/cellbox/shared/';
+    if (typeof config.path !== 'string' || !config.path.startsWith(prefix) ||
+      !/^runtime\/boxes\/[a-z0-9][a-z0-9-]{0,54}\/tool-runtime\.json$/.test(config.path.slice(prefix.length)))
+      throw new Error('Invalid mounted runtime path');
+    config = JSON.parse((await readCredential(options.mountRoot ?? '/var/lib/cellbox/shared', config.path.slice(prefix.length), 1024 * 1024)).toString('utf8'));
+    const revision = config.revision ?? config.generation;
+    if (config.mode !== 'files' || !Number.isSafeInteger(revision) || revision < 0)
+      throw new Error('Invalid mounted runtime configuration');
+  }
   const base = new URL(config.url);
   if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash || base.pathname !== '/') throw new Error('Invalid broker origin');
   const transport = options.fetch ?? fetch;
+  const boxId = toolRuntimeBoxId(config.boxId ?? config.token);
   const request = async (path, body) => {
-    const response = await transport(new URL(path, base), { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(4000), headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.token}` }, body: JSON.stringify(body) });
+    if (!boxId) throw new Error('Box identity is required for credential synchronization');
+    const response = await transport(new URL(path, base), { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(4000), headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...body, boxId }) });
     if (!response.ok) throw new Error('Secret request failed');
     return response.json();
   };
@@ -277,7 +290,7 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   const parent = options.tempRoot ?? '/var/lib/cellbox/debug/tool-runs';
   await mkdir(parent, { recursive: true, mode: 0o700 }); await chmod(parent, 0o700);
   const root = await mkdtemp(join(parent, 'run-'));
-  const originals = new Map(), masks = [config.token]; let retain = false;
+  const originals = new Map(), masks = config.token ? [config.token] : []; let retain = false;
   try {
     for (const file of setup.files) {
       if (!safePath(file.path) || originals.has(file.path)) throw new Error('Invalid tool file');

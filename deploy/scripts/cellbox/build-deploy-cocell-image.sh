@@ -99,6 +99,7 @@ profile_patch="$(helm get values "$release" --kube-context "$kube_context" --nam
   COCELL_DEBUG_READ_ONLY_HOST_PATH="${COCELL_DEBUG_READ_ONLY_HOST_PATH:-}" \
   COCELL_DEBUG_READ_WRITE_HOST_PATH="${COCELL_DEBUG_READ_WRITE_HOST_PATH:-}" \
   COCELL_DEBUG_HOST_UID="${COCELL_DEBUG_HOST_UID:-}" COCELL_DEBUG_HOST_GID="${COCELL_DEBUG_HOST_GID:-}" \
+  COCELL_TOOL_RUNTIME_MOUNT_VERSION="$(jq -r '.config.Labels["cocell.tool-runtime-mount"] // empty' <<< "$remote_config")" \
   uv run --no-project python "$repo_root/deploy/scripts/cellbox/patch-cocell-profile.py" "$profile_id" "$immutable_image" "$repo_root/deploy/box-wrap/profile.sample.json")"
 if [[ "$profile_patch" == "{}" ]]; then
   echo "Cellbox profile ${profile_id} already uses ${immutable_image} and the admitted tools"

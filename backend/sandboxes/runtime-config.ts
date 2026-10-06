@@ -6,6 +6,7 @@ import type { ConnectionStore } from '../connections/store.js';
 import type { SecretService } from '../secrets/service.js';
 import type { ToolRuntimeConfig } from '../../protocol/secret-types.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
+import { mountedRuntime } from './mounted-runtime.js';
 
 export interface SandboxRuntimeConfigOptions {
   provider: CellboxSandboxProvider;
@@ -14,6 +15,8 @@ export interface SandboxRuntimeConfigOptions {
   secrets?: SecretService;
   toolBrokerUrl?: string;
   logger?: RuntimeLog;
+  /** CoCell's writable view of the same directory mounted read-only by the Box. */
+  sharedDataRoot?: string;
 }
 
 /** Distributes protected configuration only at lifecycle boundaries. */
@@ -25,9 +28,10 @@ export class SandboxRuntimeConfig {
     name: 'runtime-config',
     pre: async context => { if (context.action === 'activate') await this.sync(context); },
     post: async context => {
-      if (['create', 'connect', 'resume', 'restore', 'reconcile'].includes(context.action)) await this.sync(context);
+      if (['create', 'connect', 'restore', 'reconcile'].includes(context.action)) await this.sync(context);
       if (context.action === 'destroy' && context.sandboxId) {
         await this.options.secrets?.repository.forgetRuntime(context.sandboxId);
+        if (this.options.sharedDataRoot) await mountedRuntime(this.options.sharedDataRoot, context.sandboxId).remove();
         this.legacyGuests.delete(context.sandboxId);
         for (const key of this.legacyDigests.keys()) if (key.startsWith(`${context.sandboxId}:`)) this.legacyDigests.delete(key);
       }
@@ -62,10 +66,17 @@ export class SandboxRuntimeConfig {
     if (box.phase !== 'running' && box.phase !== 'staged') throw new Error(`Cannot configure Cellbox in phase ${box.phase}`);
     const generation = box.generation;
     const repository = this.options.secrets?.repository;
+    const previous = await repository?.runtime(boxId);
+    // The provisioning revision survives execution changes. The legacy SQL
+    // generation column stores it; Cellbox's live generation still fences writes.
+    const revision = previous?.generation ?? generation;
+    const mount = !archive && this.options.secrets && this.options.sharedDataRoot && box.capabilities.mountedToolRuntime
+      ? mountedRuntime(this.options.sharedDataRoot, boxId) : undefined;
+    let previousPointer: string | undefined;
     let slots: Record<string, Uint8Array>;
     let applied: Record<string, string>;
     if (this.options.secrets) {
-      applied = await repository!.runtimeConfig(boxId, generation);
+      applied = await repository!.runtimeConfig(boxId, revision);
       slots = {};
       if (archive) {
         slots = {
@@ -73,19 +84,27 @@ export class SandboxRuntimeConfig {
           cocell_oss_secret_key: Buffer.from(process.env.OSS_SECRET_KEY || '\n'),
         };
       } else {
-        const previous = await repository!.runtime(boxId);
+        if (mount) previousPointer = applied.cocell_tool_runtime_mount;
         const projectId = context.metadata?.projectId
           ?? (context.resourceKey.startsWith('project:') ? context.resourceKey.slice('project:'.length) : previous?.projectId);
         if (!projectId) throw new Error('Project identity is required for tool credentials');
         if (!this.options.toolBrokerUrl) throw new Error('COCELL_TOOL_BROKER_URL is required');
-        const token = await this.options.secrets.registerRuntime(boxId, projectId, generation);
+        if (!previous || previous.projectId !== projectId) await this.options.secrets.registerRuntime(boxId, projectId, revision);
         // Connecting or restarting the service must not replace an existing
-        // generation's file snapshot after a resource was removed centrally.
+        // file snapshot after a resource was removed centrally.
         if (!['connect', 'reconcile'].includes(context.action) || !applied.cocell_tool_runtime) {
-          const config: ToolRuntimeConfig = { mode: 'files', generation, token, url: this.options.toolBrokerUrl, files: await this.options.secrets.provision(projectId) };
+          const config: ToolRuntimeConfig = { mode: 'files', boxId, revision, url: this.options.toolBrokerUrl, files: await this.options.secrets.provision(projectId),
+            // Compatibility with checkpointed older runners; no authentication.
+            generation: revision, token: boxId };
           const bytes = Buffer.from(JSON.stringify(config));
           if (bytes.length > 1024 * 1024) throw new Error('Selected credential files exceed the 1 MiB Sandbox configuration limit');
           slots = { cocell_tool_runtime: bytes };
+        } else if (mount) {
+          // A service restart must retain the mounted snapshot even after a
+          // centrally selected resource was deleted.
+          const bytes = await mount.read();
+          if (createHash('sha256').update(bytes).digest('hex') !== applied.cocell_tool_runtime)
+            throw new Error('Mounted runtime configuration differs from its acknowledged snapshot');
         }
       }
     } else {
@@ -96,7 +115,25 @@ export class SandboxRuntimeConfig {
     }
     const digests = Object.fromEntries(Object.entries(slots).map(([slot, bytes]) => [slot, createHash('sha256').update(bytes).digest('hex')]));
     const changed = Object.fromEntries(Object.entries(slots).filter(([slot]) => applied[slot] !== digests[slot]));
-    if (!Object.keys(changed).length) return;
+    let pointerDigest: string | undefined;
+    if (mount && slots.cocell_tool_runtime) {
+      await mount.publish(slots.cocell_tool_runtime);
+      const pointer = Buffer.from(JSON.stringify(mount.descriptor));
+      pointerDigest = createHash('sha256').update(pointer).digest('hex');
+      // The descriptor is unchanged by checkpoint/resume and survives in the
+      // restored filesystem. Ordinary resume does not touch either file.
+      if (previousPointer === pointerDigest) delete changed.cocell_tool_runtime;
+      else changed.cocell_tool_runtime = pointer;
+      if ((await this.options.provider.client.getBox(boxId)).generation !== generation)
+        throw new Error('Cellbox generation changed during runtime configuration');
+    }
+    if (!Object.keys(changed).length && !pointerDigest) return;
+    const acknowledge = async () => {
+      const acknowledged = { ...digests, ...(pointerDigest ? { cocell_tool_runtime_mount: pointerDigest } : {}) };
+      if (repository) await repository.markRuntimeConfigs(boxId, revision, acknowledged);
+      Object.assign(applied, acknowledged);
+    };
+    if (!Object.keys(changed).length) { await acknowledge(); return; }
     if (box.capabilities.credentialBatch && !this.legacyGuests.has(boxId)) {
       try {
         await this.options.provider.client.writeCredentials(boxId, generation, changed);
@@ -106,9 +143,7 @@ export class SandboxRuntimeConfig {
         this.legacyGuests.add(boxId);
       }
       if (!this.legacyGuests.has(boxId)) {
-        const acknowledged = Object.fromEntries(Object.keys(changed).map(slot => [slot, digests[slot]]));
-        if (repository) await repository.markRuntimeConfigs(boxId, generation, acknowledged);
-        Object.assign(applied, acknowledged);
+        await acknowledge();
         return;
       }
     }
@@ -118,9 +153,12 @@ export class SandboxRuntimeConfig {
       // Do not acknowledge a write against a generation that changed mid-sync.
       if ((await this.options.provider.client.getBox(boxId)).generation !== generation)
         throw new Error('Cellbox generation changed during runtime configuration');
-      if (repository) await repository.markRuntimeConfig(boxId, generation, slot, digest);
-      applied[slot] = digest;
+      if (!mount) {
+        if (repository) await repository.markRuntimeConfig(boxId, revision, slot, digest);
+        applied[slot] = digest;
+      }
     }
+    if (mount) await acknowledge();
   }
 
   private async legacySlots(archive: boolean): Promise<Record<string, Uint8Array>> {

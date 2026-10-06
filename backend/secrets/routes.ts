@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { SecretService } from './service.js';
 import { TOOL_NAME_PATTERN } from '../../util/tool-secrets.js';
 import { HttpError } from '../../util/errors.js';
+import { toolRuntimeBoxId } from '../../util/tool-runtime-identity.mjs';
 const id = z.string().uuid();
 const alias = z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/);
 const tool = z.string().trim().regex(TOOL_NAME_PATTERN);
@@ -32,17 +33,22 @@ export function installSecretRoutes(app: Hono, secrets: SecretService, projectEx
     return c.json(await secrets.saveSelections(project(c.req.param('id')), input.selections));
   });
   app.delete('/api/projects/:id/tool-grants/:grantId', async c => { await secrets.deleteGrant(project(c.req.param('id')), id.parse(c.req.param('grantId'))); return c.json({ ok: true }); });
-  const token = (header: string | undefined) => { if (!header?.startsWith('Bearer ')) throw new HttpError(401, '工具认证无效'); return header.slice(7); };
+  const runtimeBox = (boxId: string | undefined, header: string | undefined) => {
+    const value = toolRuntimeBoxId(boxId ?? (header?.startsWith('Bearer ') ? header.slice(7) : undefined));
+    if (!value) throw new HttpError(400, '请提供 Box ID');
+    return value;
+  };
+  const boxId = z.string().regex(/^[a-z0-9][a-z0-9-]{0,54}$/).optional();
   app.post('/api/tool-runtime/files', async c => {
-    const input = z.object({ tool, updates: z.array(z.object({ secretId: id, content: z.string().max(1500000), baseVersion: z.number().int().min(1), format: fileFields.format.optional() }).strict()).max(10), exitCode: z.number().int().min(-1).max(255) }).strict().parse(await c.req.json());
-    return c.json(await secrets.syncFiles(token(c.req.header('authorization')), input.tool, input.updates, input.exitCode));
+    const input = z.object({ boxId, tool, updates: z.array(z.object({ secretId: id, content: z.string().max(1500000), baseVersion: z.number().int().min(1), format: fileFields.format.optional() }).strict()).max(10), exitCode: z.number().int().min(-1).max(255) }).strict().parse(await c.req.json());
+    return c.json(await secrets.syncFiles(runtimeBox(input.boxId, c.req.header('authorization')), input.tool, input.updates, input.exitCode));
   });
   app.post('/api/tool-runtime/start', async c => {
-    const input = z.object({ tool, alias: alias.optional(), args: z.array(z.string().max(8192)).max(32) }).strict().parse(await c.req.json());
-    return c.json(await secrets.start(token(c.req.header('authorization')), input.tool, input.alias, input.args));
+    const input = z.object({ boxId, tool, alias: alias.optional(), args: z.array(z.string().max(8192)).max(32) }).strict().parse(await c.req.json());
+    return c.json(await secrets.start(runtimeBox(input.boxId, c.req.header('authorization')), input.tool, input.alias, input.args));
   });
   app.post('/api/tool-runtime/:id/complete', async c => {
-    const input = z.object({ updates: z.array(z.object({ secretId: id, content: z.string().max(1500000) }).strict()).max(10), exitCode: z.number().int().min(-1).max(255) }).strict().parse(await c.req.json());
-    return c.json(await secrets.complete(token(c.req.header('authorization')), id.parse(c.req.param('id')), input.updates, input.exitCode));
+    const input = z.object({ boxId, updates: z.array(z.object({ secretId: id, content: z.string().max(1500000) }).strict()).max(10), exitCode: z.number().int().min(-1).max(255) }).strict().parse(await c.req.json());
+    return c.json(await secrets.complete(runtimeBox(input.boxId, c.req.header('authorization')), id.parse(c.req.param('id')), input.updates, input.exitCode));
   });
 }

@@ -10,6 +10,7 @@ export interface StoredSecret {
 }
 export interface StoredVersion extends SecretVersion { secretId: string; ciphertext: string }
 export interface StoredInvocation {
+  /** generation is the legacy name of the stable provisioning revision. */
   id: string; projectId: string; boxId: string; generation: number; grant: ProjectToolGrant;
   files: Array<{ path: string; secretId: string; version: number; versionId: string; format?: SecretFormat }>;
   createdAt: string; completedAt: string | null;

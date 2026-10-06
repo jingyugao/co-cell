@@ -55,6 +55,10 @@ profile["image"] = image
 trusted = profile.setdefault("trustedToolImages", [])
 if image not in trusted:
     trusted.append(image)
+if os.environ.get("COCELL_TOOL_RUNTIME_MOUNT_VERSION") == "1":
+    mounted = profile.setdefault("mountedToolRuntimeImages", [])
+    if image not in mounted:
+        mounted.append(image)
 for tool in guest["tools"]:
     if tool["id"] in ("cocell_git", "cocell_glab"):
         tool["workspaceRead"] = True

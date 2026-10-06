@@ -97,6 +97,26 @@ async function attachSharedFiles(codexHome, sharedDirectory) {
   }
 }
 
+async function attachCodexHome(agentHome, codexHome) {
+  await mkdir(agentHome, { recursive: true });
+  const destination = join(agentHome, '.codex');
+  const info = await lstat(destination).catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  // Keep history in the workspace archive; expose the standard ~/.codex path.
+  // Never overwrite an image's real configuration directory or another user's link.
+  if (info && (!info.isSymbolicLink() || info.uid !== process.getuid())) {
+    throw new Error(`cannot link Codex home over existing configuration: ${destination}`);
+  }
+  if (info && await readlink(destination) === codexHome) return;
+  const temporary = join(agentHome, `.codex-link-${randomUUID()}`);
+  try {
+    await symlink(codexHome, temporary);
+    await rename(temporary, destination);
+  } finally { await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+}
+
 function delay(ms, signal) {
   return new Promise(resolve => {
     if (signal.aborted) return resolve();
@@ -106,7 +126,7 @@ function delay(ms, signal) {
   });
 }
 
-async function runCodex(config, { workspace, codex, codexHome, signal, log }) {
+async function runCodex(config, { workspace, agentHome, codex, codexHome, signal, log }) {
   // Keep image-provided language environments (PATH, VIRTUAL_ENV, etc.) while
   // withholding Cellbox control variables and Node process injection options.
   const imageEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
@@ -118,7 +138,7 @@ async function runCodex(config, { workspace, codex, codexHome, signal, log }) {
   if (!paths.includes(nodeDirectory)) paths.unshift(nodeDirectory);
   const env = {
     ...imageEnv,
-    PATH: paths.join(':'), HOME: '/home/agent', LANG: imageEnv.LANG || 'C.UTF-8',
+    PATH: paths.join(':'), HOME: agentHome, LANG: imageEnv.LANG || 'C.UTF-8',
     CODEX_HOME: codexHome, ...config.env,
   };
   // Cellbox is the Sandbox boundary; Codex must not start its nested Linux sandbox.
@@ -153,6 +173,7 @@ async function runCodex(config, { workspace, codex, codexHome, signal, log }) {
 }
 
 export async function startLauncher({ workspace = DEFAULT_WORKSPACE, codex = DEFAULT_CODEX,
+  agentHome = '/home/agent',
   startupDirectory = '/home/agent/.cocell-startup', sharedDirectory = process.env.COCELL_LAUNCHER_SHARED_DIRECTORY,
   pollMs = POLL_MS, signal, log = message => console.error(`cocell launcher: ${message}`) } = {}) {
   if (!signal) throw new Error('an AbortSignal is required');
@@ -163,11 +184,12 @@ export async function startLauncher({ workspace = DEFAULT_WORKSPACE, codex = DEF
   if (!sharedDirectory) await ensurePrivateDirectory(runtimeDir);
   await ensurePrivateDirectory(codexHome);
   if (sharedDirectory) await attachSharedFiles(codexHome, sharedDirectory);
+  await attachCodexHome(agentHome, codexHome);
   const configPath = sharedDirectory ? join(sharedDirectory, 'runtime', 'config.json') : join(runtimeDir, 'config.json');
   log(sharedDirectory ? 'reading shared startup config' : 'waiting for provisioning config');
   while (!signal.aborted) {
     const config = await takeConfig(configPath, Boolean(sharedDirectory));
-    if (config) return runCodex(config, { workspace, codex, codexHome, signal, log });
+    if (config) return runCodex(config, { workspace, agentHome, codex, codexHome, signal, log });
     await delay(pollMs, signal);
   }
   return 0;

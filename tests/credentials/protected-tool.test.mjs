@@ -7,6 +7,53 @@ import test from 'node:test';
 import { runProtectedTool } from '../../deploy/box-wrap/protected-tool.mjs';
 import { openMeegleBundle, rebindMeegleBundle } from '../../util/credential-files.mjs';
 import { meegleFixture } from './fixtures/meegle-credentials.mjs';
+import { encodeGitlabHost } from '../../util/gitlab-tool-host.mjs';
+
+test('GitLab host survives the tool boundary without forwarding caller credentials', { timeout: 15000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-glab-host-'));
+  const binaryRoot = join(root, 'bin'); await mkdir(binaryRoot);
+  await writeFile(join(binaryRoot, 'glab'), `#!${process.execPath}
+console.log(JSON.stringify({host:process.env.GITLAB_HOST,args:process.argv.slice(2),token:process.env.GITLAB_TOKEN}));
+`, { mode: 0o755 });
+  const path = '.config/glab-cli/config.yml', content = 'host: gitlab.com\n';
+  const file = { tool: 'glab', path, secretId: 'glab', version: 1, mutable: false, content: Buffer.from(content).toString('base64') };
+  const previous = process.env.GITLAB_TOKEN;
+  process.env.GITLAB_TOKEN = 'must-not-cross-boundary';
+  try {
+    for (const mode of ['files', 'bundle', 'legacy']) {
+      const config = { url: 'http://unused.invalid', token: 'runtime-secret', ...(mode === 'legacy' ? {} : {
+        mode: 'files', generation: 1, files: [mode === 'bundle' ? { ...file, format: 'files', content: Buffer.from(JSON.stringify({ files: [{ path, content }] })).toString('base64') } : file],
+      }) };
+      let output = '';
+      const options = { config, binaryRoot, tempRoot: join(root, mode), stdout: { write(value) { output += value; } },
+        fetch: async (url, init) => {
+          const body = JSON.parse(init.body);
+          if (String(url).endsWith('/start')) {
+            assert.ok(body.args.every(arg => !arg.startsWith('--cocell-')));
+            return Response.json({ id: 'run', tool: 'glab', args: body.args, files: [file] });
+          }
+          return Response.json({});
+        },
+      };
+      for (const [args, expectedHost] of [
+        [encodeGitlabHost('glab', ['repo', 'clone', 'group/repo'], 'git.example.test:8443'), 'git.example.test:8443'],
+        [['repo', 'clone', 'https://other.example.test/group/repo.git'], 'other.example.test'],
+        [['api', '--hostname', 'git.example.test', 'user'], undefined],
+      ]) {
+        output = '';
+        assert.equal(await runProtectedTool('glab', args, options), 0);
+        const result = JSON.parse(output);
+        assert.equal(result.host, expectedHost);
+        assert.equal(result.token, undefined);
+        assert.deepEqual(result.args, args.filter(arg => !arg.startsWith('--cocell-')));
+      }
+      await assert.rejects(runProtectedTool('glab', ['--cocell-gitlab-host=https://bad/'], options), /Invalid GitLab host/);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.GITLAB_TOKEN; else process.env.GITLAB_TOKEN = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('Meegle native file group rebinds, redacts tokens and retries complete refreshed groups with advancing versions', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-meegle-files-'));

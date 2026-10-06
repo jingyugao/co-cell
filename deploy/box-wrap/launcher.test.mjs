@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, readlink, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -22,6 +22,8 @@ test('shared startup is reusable across restored workspaces and sees atomic docu
   let stop, launched;
   try {
     await mkdir(join(home, 'docs'), { recursive: true });
+    await mkdir(join(root, 'agent'));
+    await symlink(join(root, 'old-workspace', '.cocell', 'codex'), join(root, 'agent', '.codex'));
     await writeFile(join(home, 'AGENTS.md'), 'archived instructions');
     await writeFile(join(home, 'docs', 'old.txt'), 'archived copy');
     await mkdir(join(sharedDirectory, 'runtime'), { recursive: true });
@@ -39,15 +41,17 @@ setInterval(() => {}, 1000);
       await rm(report, { force: true });
       await writeFile(configPath, JSON.stringify({ version: 1, appServerArgs: [], env: { CODEX_API_KEY: key } }), { mode: 0o644 });
       stop = new AbortController();
-      launched = startLauncher({ workspace, sharedDirectory, codex, signal: stop.signal, log: () => {} });
+      launched = startLauncher({ agentHome: join(root, 'agent'), workspace, sharedDirectory, codex, signal: stop.signal, log: () => {} });
       await until(async () => Boolean(await stat(report).catch(() => null)));
       assert.equal(JSON.parse(await readFile(report, 'utf8')).key, key);
       assert.equal(await readlink(join(home, 'docs')), join(sharedDirectory, 'docs'));
       assert.equal(await readFile(join(home, 'AGENTS.md'), 'utf8'), 'current instructions');
+      assert.equal(await readFile(join(root, 'agent', '.codex', 'AGENTS.md'), 'utf8'), 'current instructions');
       assert(await stat(configPath)); // read-only shared config is never consumed.
       await writeFile(join(sharedDirectory, 'docs', 'new.tmp'), key);
       await rename(join(sharedDirectory, 'docs', 'new.tmp'), join(sharedDirectory, 'docs', 'live.txt'));
       assert.equal(await readFile(join(home, 'docs', 'live.txt'), 'utf8'), key);
+      assert.equal(await readFile(join(root, 'agent', '.codex', 'docs', 'live.txt'), 'utf8'), key);
       assert.equal(await stat(join(home, 'docs', 'old.txt')).catch(() => null), null);
       stop.abort();
       assert.equal(await launched, 0);
@@ -78,7 +82,7 @@ setInterval(() => {}, 1000);
   process.env.CELLBOX_TOKEN = 'internal-token';
   process.env.VIRTUAL_ENV = '/opt/project-venv';
   try {
-    const launched = startLauncher({ workspace, startupDirectory, codex: fakeCodex, pollMs: 20,
+    const launched = startLauncher({ agentHome: join(root, 'agent'), workspace, startupDirectory, codex: fakeCodex, pollMs: 20,
       signal: stop.signal, log: () => {} });
     const configPath = join(startupDirectory, 'config.json');
     await until(async () => (await stat(startupDirectory).catch(() => null)) !== null);
@@ -91,7 +95,8 @@ setInterval(() => {}, 1000);
       '-c', 'sandbox_mode="danger-full-access"', '--listen', 'ws://127.0.0.1:4500']);
     assert.equal(first.cwd, workspace);
     assert.equal(first.env.CODEX_HOME, join(workspace, '.cocell', 'codex'));
-    assert.equal(first.env.HOME, '/home/agent');
+    assert.equal(first.env.HOME, join(root, 'agent'));
+    assert.equal(await readlink(join(root, 'agent', '.codex')), first.env.CODEX_HOME);
     assert.equal(first.env.OPENAI_API_KEY, 'test-secret');
     assert.equal(first.env.CELLBOX_TOKEN, undefined);
     assert.equal(first.env.PATH, process.env.PATH);
@@ -124,8 +129,15 @@ test('rejects an insecure config file and remote listener overrides', async () =
     const configPath = join(configDir, 'config.json');
     await writeFile(configPath, JSON.stringify({ version: 1, appServerArgs: [], env: {} }));
     await chmod(configPath, 0o640);
-    await assert.rejects(startLauncher({ workspace, startupDirectory, codex: '/does/not/matter', pollMs: 10,
+    await assert.rejects(startLauncher({ agentHome: join(root, 'agent'), workspace, startupDirectory, codex: '/does/not/matter', pollMs: 10,
       signal: stop.signal, log: () => {} }), /mode 0600/);
+    const existingHome = join(root, 'agent', '.codex');
+    await rm(existingHome);
+    await mkdir(existingHome);
+    await writeFile(join(existingHome, 'config.toml'), 'existing configuration');
+    await assert.rejects(startLauncher({ agentHome: join(root, 'agent'), workspace, startupDirectory,
+      signal: stop.signal, log: () => {} }), /existing configuration/);
+    assert.equal(await readFile(join(existingHome, 'config.toml'), 'utf8'), 'existing configuration');
     assert.throws(() => parseConfig(JSON.stringify({ version: 1,
       appServerArgs: ['--listen', 'ws://0.0.0.0:4500'], env: {} })), /config or feature/);
     assert.throws(() => parseConfig(JSON.stringify({ version: 1,
@@ -156,7 +168,7 @@ setInterval(() => {}, 1000);
 `, { mode: 0o755 });
     await writeFile(join(startupDirectory, 'config.json'), JSON.stringify({ version: 1, appServerArgs: [], env: {} }), { mode: 0o600 });
     process.env.PATH = '/opt/project-tools/without-node';
-    launched = startLauncher({ workspace, startupDirectory, codex: fakeCodex, signal: stop.signal, log: () => {} });
+    launched = startLauncher({ agentHome: join(root, 'agent'), workspace, startupDirectory, codex: fakeCodex, signal: stop.signal, log: () => {} });
     await until(async () => (await stat(report).catch(() => null)) !== null);
     assert.equal(JSON.parse(await readFile(report, 'utf8')).path, `${dirname(process.execPath)}:/opt/project-tools/without-node`);
     stop.abort();
@@ -182,7 +194,7 @@ test('unexpected Codex exit is reported as launcher failure', async () => {
     await writeFile(join(configDir, 'config.json'), JSON.stringify({ version: 1,
       appServerArgs: [], env: {} }), { mode: 0o600 });
     const logs = [];
-    assert.equal(await startLauncher({ workspace, startupDirectory, codex: fakeCodex, pollMs: 10,
+    assert.equal(await startLauncher({ agentHome: join(root, 'agent'), workspace, startupDirectory, codex: fakeCodex, pollMs: 10,
       signal: new AbortController().signal, log: message => logs.push(message) }), 1);
     assert.ok(logs.some(message => message.includes('exited (code 0')));
   } finally {

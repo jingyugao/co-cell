@@ -12,8 +12,10 @@ import { encodeGitlabHost } from '../../util/gitlab-tool-host.mjs';
 test('GitLab host survives the tool boundary without forwarding caller credentials', { timeout: 15000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-glab-host-'));
   const binaryRoot = join(root, 'bin'); await mkdir(binaryRoot);
+  await writeFile(join(binaryRoot, 'git'), `#!${process.execPath}\nconsole.log('native-git');\n`, { mode: 0o755 });
   await writeFile(join(binaryRoot, 'glab'), `#!${process.execPath}
-console.log(JSON.stringify({host:process.env.GITLAB_HOST,args:process.argv.slice(2),token:process.env.GITLAB_TOKEN}));
+const git=require('node:child_process').spawnSync('git',['--version'],{encoding:'utf8'});
+console.log(JSON.stringify({host:process.env.GITLAB_HOST,args:process.argv.slice(2),token:process.env.GITLAB_TOKEN,nestedGit:git.stdout.trim()}));
 `, { mode: 0o755 });
   const path = '.config/glab-cli/config.yml', content = 'host: gitlab.com\n';
   const file = { tool: 'glab', path, secretId: 'glab', version: 1, mutable: false, content: Buffer.from(content).toString('base64') };
@@ -36,7 +38,7 @@ console.log(JSON.stringify({host:process.env.GITLAB_HOST,args:process.argv.slice
         },
       };
       for (const [args, expectedHost] of [
-        [encodeGitlabHost('glab', ['repo', 'clone', 'group/repo'], 'git.example.test:8443'), 'git.example.test:8443'],
+        [encodeGitlabHost('cocell_glab', ['repo', 'clone', 'group/repo'], 'git.example.test:8443'), 'git.example.test:8443'],
         [['repo', 'clone', 'https://other.example.test/group/repo.git'], 'other.example.test'],
         [['api', '--hostname', 'git.example.test', 'user'], undefined],
       ]) {
@@ -45,6 +47,7 @@ console.log(JSON.stringify({host:process.env.GITLAB_HOST,args:process.argv.slice
         const result = JSON.parse(output);
         assert.equal(result.host, expectedHost);
         assert.equal(result.token, undefined);
+        assert.equal(result.nestedGit, 'native-git');
         assert.deepEqual(result.args, args.filter(arg => !arg.startsWith('--cocell-')));
       }
       await assert.rejects(runProtectedTool('glab', ['--cocell-gitlab-host=https://bad/'], options), /Invalid GitLab host/);

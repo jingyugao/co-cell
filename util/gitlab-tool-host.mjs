@@ -9,7 +9,7 @@ function validateHost(host) {
 
 // The Cellbox tool transport carries argv, not the caller's environment.
 export function encodeGitlabHost(tool, args, host) {
-  return tool === 'glab' && host ? [PREFIX + validateHost(host), ...args] : args;
+  return ['glab', 'cocell_glab'].includes(tool) && host ? [PREFIX + validateHost(host), ...args] : args;
 }
 
 export function decodeGitlabHost(tool, inputArgs) {

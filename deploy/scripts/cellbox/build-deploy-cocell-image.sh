@@ -54,11 +54,11 @@ if ! kubectl --context "$kube_context" get crd cellboxes.cellbox.local -o json |
 fi
 
 manifest_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --head \
-  -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+  -H 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
   "${registry_endpoint}/v2/${image_repository#${registry_host}/}/manifests/${image_tag}")"
 case "$manifest_status" in
   200)
-    manifest="$(curl --fail --silent --show-error --header 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+    manifest="$(curl --fail --silent --show-error --header 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
       "${registry_endpoint}/v2/${image_repository#${registry_host}/}/manifests/${image_tag}")"
     config_digest="$(jq -er '.config.digest' <<< "$manifest")"
     remote_config="$(curl --fail --silent --show-error "${registry_endpoint}/v2/${image_repository#${registry_host}/}/blobs/${config_digest}")"
@@ -69,7 +69,7 @@ case "$manifest_status" in
       exit 1
     fi
     digest="$(curl --fail --silent --show-error --head \
-      --header 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+      --header 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
       "${registry_endpoint}/v2/${image_repository#${registry_host}/}/manifests/${image_tag}" \
       | awk -F': ' 'tolower($1) == "docker-content-digest" {print $2}' | tr -d '\r')"
     ;;

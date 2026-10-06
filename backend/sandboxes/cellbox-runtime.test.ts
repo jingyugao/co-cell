@@ -179,6 +179,10 @@ test('imported images skip credentials, use native archives and restore with the
   try {
     await runtime.prepare(handle, { ...target, imageSelection }, AbortSignal.timeout(5000));
     assert.equal(fake.credentialWrites.length, 0);
+    // Operator-approved imported images can have tools, but still need native
+    // portable archives: the protected OSS restore path only supports profiles.
+    fake.provider.client.getBox = async () => ({ phase: 'staged', generation: 1, image: 'image@sha256:abc',
+      capabilities: { protectedTools: true } }) as never;
     const archive = await runtime.remoteArchives.capture({ ...target, imageSelection }, 'capture-imported');
     assert.equal(archive.id, fake.archive.id);
     assert.equal(archive.portable, true);

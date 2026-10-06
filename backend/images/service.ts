@@ -102,13 +102,16 @@ export class ImageCatalog {
     }
     return [...groups.values()];
   }
-  private async readImages(): Promise<ManagedImage[]> {
+  private async readImages(includeExternalDuplicates = false): Promise<ManagedImage[]> {
     await this.refresh();
     const [images, profiles] = await Promise.all([this.client.listImages(), this.client.listProfiles()]);
     const profile = profiles.find(profile => profile.id === this.profileId);
     const builtin: ManagedImage[] = profile ? [{ id: 'default', name: '系统默认镜像', category: '系统', origin: 'profile',
       versions: [{ id: 'default', version: '当前配置', source: profile.image, image: profile.image, status: 'succeeded', createdAt: '' }] }] : [];
-    return [...builtin, ...[...this.records.values()].filter(image => image.origin === 'managed' && !image.deletedAt).map(publicImage), ...this.external(images)];
+    const managed = [...this.records.values()].filter(image => image.origin === 'managed' && !image.deletedAt).map(publicImage);
+    const repositories = new Set(managed.map(image => normalizeRepository(image.repository!).replace(/^https?:\/\//, '')));
+    const external = this.external(images).filter(image => includeExternalDuplicates || !repositories.has(normalizeRepository(image.repository!).replace(/^https?:\/\//, '')));
+    return [...builtin, ...managed, ...external];
   }
   list(): Promise<ManagedImage[]> {
     return this.exclusive(() => this.readImages());
@@ -151,10 +154,10 @@ export class ImageCatalog {
         throw new HttpError(409, '已有版本正在同步或结果待确认，请等待完成或确认结果');
       }
       const digest = await this.registry.resolveTag(stored.repository!, input.tag, input.registryAuth);
-      const existing = stored.versions.find(version => !version.deletedAt && !version.cleanup && version.version === input.tag);
-      if (existing?.upstreamDigest === digest && existing.status === 'succeeded') return publicImage(stored);
-      const source = registryImageReference(stored.repository!, input.tag);
       const request = await prepareImageRequest(registryImageReference(stored.repository!, digest), stored.buildCommand);
+      const existing = stored.versions.find(version => !version.deletedAt && !version.cleanup && version.version === input.tag);
+      if (existing?.upstreamDigest === digest && existing.status === 'succeeded' && existing.request.buildCommand === request.buildCommand) return publicImage(stored);
+      const source = registryImageReference(stored.repository!, input.tag);
       const record = structuredClone(stored);
       const version: ImageVersionRecord = { id: randomUUID(), version: input.tag, source, upstreamDigest: digest,
         status: 'submitting', createdAt: new Date().toISOString(), request, projectReady: true, requiresRegistryAuth: Boolean(input.registryAuth),
@@ -200,7 +203,7 @@ export class ImageCatalog {
     return this.exclusive(() => this.resolveAvailable(imageId, versionId));
   }
   private async resolveAvailable(imageId: string, versionId: string): Promise<ProjectImageSelection | undefined> {
-    const image = (await this.readImages()).find(image => image.id === imageId);
+    const image = (await this.readImages(true)).find(image => image.id === imageId);
     const version = image?.versions.find(version => version.id === versionId);
     if (!image || !version) throw new HttpError(404, '镜像或版本不存在');
     if (version.deprecatedAt) throw new HttpError(409, '镜像版本已弃用，请选择生效中的版本');
@@ -237,7 +240,7 @@ export class ImageCatalog {
         if (versionId) throw new HttpError(400, '系统镜像项目不能选择其他仓库版本');
         return this.reserve();
       }
-      const image = (await this.readImages()).find(image => image.id === project.imageSelection!.imageId);
+      const image = (await this.readImages(true)).find(image => image.id === project.imageSelection!.imageId);
       if (!image) throw new HttpError(409, '项目镜像仓库已不可用，请先同步可用版本');
       const selected = versionId ?? image.defaultVersionId ?? image.versions
         .filter(value => value.status === 'succeeded' && !value.deprecatedAt && !value.cleanup && value.projectReady !== false)

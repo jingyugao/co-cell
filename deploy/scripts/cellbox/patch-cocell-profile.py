@@ -7,10 +7,9 @@ import os
 import re
 import sys
 
-from proxy_tools import load_proxy_tools
 from mount_config import load_mount_config
 
-profile_id, image, sample_path, proxy_config, base_image = sys.argv[1:]
+profile_id, image, sample_path = sys.argv[1:]
 if not re.fullmatch(r"[^\s@]+@sha256:[a-f0-9]{64}", image):
     raise SystemExit("CoCell requires an immutable repository@sha256:digest image")
 values = json.load(sys.stdin)
@@ -26,7 +25,6 @@ if profile["provider"] != "resumable-k8s-pod":
 before = deepcopy(profile)
 with open(sample_path, encoding="utf-8") as stream:
     sample = json.load(stream)
-proxy_tools, owned_ids = load_proxy_tools(proxy_config, base_image, required=bool(os.environ.get("COCELL_PROXY_TOOLS_CONFIG")))
 read_only_path = os.environ.get("COCELL_DEBUG_READ_ONLY_HOST_PATH", "")
 read_write_path = os.environ.get("COCELL_DEBUG_READ_WRITE_HOST_PATH", "")
 if read_only_path or read_write_path:
@@ -51,7 +49,8 @@ if profile.get("sharedReadOnlyHostPath"):
     guest.setdefault("env", {})["COCELL_LAUNCHER_SHARED_DIRECTORY"] = "/var/lib/cellbox/shared"
 else:
     guest.setdefault("env", {}).pop("COCELL_LAUNCHER_SHARED_DIRECTORY", None)
-guest["tools"] = [tool for tool in guest.get("tools", []) if tool["id"] not in owned_ids] + [tool["profile"] for tool in proxy_tools]
+# Tool registration belongs to admit-tool-image.py; profile updates preserve it.
+guest.setdefault("tools", [])
 profile["image"] = image
 trusted = profile.setdefault("trustedToolImages", [])
 if image not in trusted:

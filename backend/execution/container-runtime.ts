@@ -1,3 +1,4 @@
+import { traced } from '@co-cell/sandbox';
 import { withNativeUserInput } from '../../util/user-input.js';
 import type { SandboxImageIdentity, SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
@@ -622,8 +623,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
   async resume(target: WorkspaceTarget, onSandbox: SaveSandbox) {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
-    const entry = await this.acquire(target, false, onSandbox, undefined, undefined, true);
-    try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
+    const entry = await traced('sandbox.acquire', { 'sandbox.id': target.sandbox.id },
+      () => this.acquire(target, false, onSandbox, undefined, undefined, true));
+    try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await traced('sandbox.release', { 'sandbox.id': target.sandbox.id }, () => this.release(entry)); }
   }
 
   async checkpoint(target: WorkspaceTarget) {

@@ -59,6 +59,14 @@ spec:
               containerPort: 3001
               protocol: TCP
           env:
+            {{- if .Values.tracing.endpoint }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.tracing.endpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            - name: OTEL_SERVICE_NAME
+              value: {{ .Values.tracing.serviceName | quote }}
+            {{- end }}
             - name: HOST
               value: "0.0.0.0"
             - name: PORT

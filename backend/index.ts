@@ -1,3 +1,4 @@
+import { initializeTracing } from './infra/diagnostics/tracing.js';
 import { ImageCatalog } from './images/service.js';
 import { createServer } from 'node:http';
 import { loadEnvFile } from 'node:process';
@@ -28,6 +29,7 @@ import { publishSharedDirectory } from './shared-files/mount.js';
 import { loadSharedMountConfig } from './shared-files/config.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+const shutdownTracing = initializeTracing();
 const mysqlUrl = process.env.MYSQL_URL?.trim() ?? '';
 const webState = createWebStateStore(mysqlUrl);
 const port = Number(process.env.PORT || 3000);
@@ -165,5 +167,5 @@ const archiveInterval = setInterval(() => { void manager.scheduledArchive().catc
 archiveInterval.unref();
 async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await manager.close(); await cellboxRuntime.close(); await sandboxManager.close();
   clearInterval(archiveInterval);
-  await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); }
+  await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); await shutdownTracing?.(); }
 process.on('SIGINT', () => void shutdown()); process.on('SIGTERM', () => void shutdown());

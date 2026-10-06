@@ -5,6 +5,7 @@ import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { workspaceFileResponse } from '../workspaces/http-files.js';
 import { serviceHost } from './service-host.js';
+import { PROJECT_OPERATION_WAIT_MS } from '../../protocol/types.js';
 
 type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
 
@@ -102,7 +103,12 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
   });
   app.get('/api/projects/:id', async c => {
     c.header('Cache-Control', 'no-store');
-    return c.json(await manager.readProject(c.req.param('id')));
+    const options = z.object({
+      waitForOperation: z.string().min(1).max(200).optional(),
+      waitMs: z.coerce.number().int().min(0).max(PROJECT_OPERATION_WAIT_MS).optional(),
+    }).refine(input => input.waitForOperation !== undefined || input.waitMs === undefined, '等待操作时须提供 operation ID')
+      .parse({ waitForOperation: c.req.query('waitForOperation'), waitMs: c.req.query('waitMs') });
+    return c.json(await manager.readProject(c.req.param('id'), options, c.req.raw.signal));
   });
   app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional(), backupRetentionCount: z.number().int().min(2).max(100).optional() }).parse(await c.req.json()))));
   app.delete('/api/projects/:id', async c => { await manager.deleteProject(c.req.param('id')); return c.json({ ok: true }); });

@@ -23,8 +23,16 @@ test('paused entry permits drafting while one resume is pending', async ({ page,
   expect(ui.count('POST', '/api/projects/paused/open')).toBe(1);
   expect(ui.count('POST', '/api/sessions')).toBe(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await expect.poll(() => ui.calls.filter(call => call.path === '/api/projects/paused'
+    && call.waitForOperation === ui.projects.get('paused').sandboxOperation.id).length).toBe(1);
+  // Runtime ready can precede unquiesce and the durable operation result.
+  ui.projects.get('paused').sandbox.status = 'ready';
+  await page.waitForTimeout(350);
+  await expect(ui.send).toBeDisabled();
+  expect(ui.count('GET', '/api/projects/paused')).toBe(1);
   ui.complete('paused');
   await expect(ui.send).toBeEnabled(); await expect(ui.editor).toHaveValue('恢复时先输入的提示词');
+  expect(ui.count('GET', '/api/projects/paused')).toBe(1);
 });
 
 test('create opens before binding; failure and explicit retry preserve draft', async ({ page, ui }) => {
@@ -43,7 +51,7 @@ test('restore failure stops retries; explicit retry and reload retain draft', as
   await page.goto('/projects/paused'); await ui.editor.fill('恢复失败也保留');
   await expect.poll(() => ui.count('POST', '/api/projects/paused/open')).toBe(1);
   ui.fail('paused', '恢复环境失败'); await expect(page.getByText('恢复环境失败', { exact: true })).toBeVisible();
-  // Negative assertion spans several 250 ms polling intervals.
+  // A failed completion must not issue another resume or wait request.
   await page.waitForTimeout(800); expect(ui.count('POST', '/api/projects/paused/open')).toBe(1);
   await expect(ui.send).toBeDisabled(); await expect(ui.editor).toBeEditable();
   await page.getByRole('button', { name: '重试准备', exact: true }).click();

@@ -336,3 +336,34 @@ test('repository cleanup requires all versions removed and remains hidden across
   await assert.rejects(restarted.sync(repo.id, { tag: 'v2' }), /镜像仓库不存在/);
   await restarted.addRepository({ name: 'Demo', category: '开发', repository: 'team/demo' });
 });
+
+test('managed repositories hide duplicate imports while pinned imports still resolve and restore', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const source = 'registry.example/team/mybox@sha256:' + 'a'.repeat(64);
+  f.images.set('external', { id: 'external', source, resolvedSource: source, image: 'registry/prepared@sha256:' + 'b'.repeat(64),
+    platform: 'linux/amd64', command: ['/usr/local/bin/node', '/opt/product/cocell/launcher.mjs'], env: {}, workingDir: '/home/agent/workspace',
+    ports: [], warnings: [], key: 'external', createdAt: new Date().toISOString() });
+  const pinned = (await catalog.resolve('cellbox:registry.example/team/mybox', 'external'))!;
+  await catalog.addRepository({ name: 'mybox', category: '自定义', repository: 'http://registry.example/team/mybox' });
+  assert.equal((await catalog.list()).filter(image => image.repository?.endsWith('/team/mybox')).length, 1);
+  assert.deepEqual(await catalog.resolve(pinned.imageId, pinned.versionId), pinned);
+  const project: Project = { id: 'p', name: 'existing', status: 'active', executionMode: 'sandbox', workingDirectory: '/home/agent/workspace',
+    requirementUrl: null, createdAt: '', updatedAt: '', imageSelection: pinned };
+  const reservation = await catalog.acquireRestoreSelection(project);
+  assert.deepEqual(reservation.selection, pinned); reservation.release();
+});
+
+test('sync rebuilds unchanged upstream content when the platform tool installation changes', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'mybox', category: '自定义', repository: 'team/mybox' });
+  const first = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(first.operationId!, first.source);
+  await catalog.list();
+  const saved = f.documents.get(repo.id)!;
+  saved.versions[0].request.buildCommand = 'old launcher without proxies';
+  const restarted = f.catalog(); await restarted.init();
+  const rebuilt = await restarted.sync(repo.id, { tag: 'v1' });
+  assert.equal(rebuilt.versions.length, 2);
+  assert.notEqual(rebuilt.versions[0].id, first.id);
+  assert.match(String(f.submissions.at(-1)!.body.buildCommand), /proxy-tool-ids\.json/);
+  assert.match(String(f.submissions.at(-1)!.body.buildCommand), /\/usr\/local\/bin\/\$tool/);
+});

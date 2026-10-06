@@ -50,7 +50,7 @@ export class CellboxRuntimeIntegration {
         capture: async (target, key) => {
                 if (!target.sandbox)
                     throw new Error('Project has no Cellbox');
-                const capabilities = ossArchiveEndpoint ? (await options.provider.client.getBox(target.sandbox.id)).capabilities : undefined;
+                const capabilities = ossArchiveEndpoint && !target.imageSelection ? (await options.provider.client.getBox(target.sandbox.id)).capabilities : undefined;
                 if (capabilities?.protectedTools) {
                     await runtimeConfig.ensureArchiveCredentials(target.sandbox.id);
                     const suffix = `${target.projectId ?? target.id}/${key.replace(/[^A-Za-z0-9._/-]/g, '_')}.tar.gz`;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, writeFile, readdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readdir, readFile, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -8,6 +8,55 @@ import { runProtectedTool } from '../../deploy/box-wrap/protected-tool.mjs';
 import { openMeegleBundle, rebindMeegleBundle } from '../../util/credential-files.mjs';
 import { meegleFixture } from './fixtures/meegle-credentials.mjs';
 import { encodeGitlabHost } from '../../util/gitlab-tool-host.mjs';
+
+test('mounted runner reads the current atomic snapshot without changing the shared credential file', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-mounted-tool-'));
+  const binaryRoot = join(root, 'bin'), directory = join(root, 'runtime', 'boxes', 'box-one');
+  await mkdir(binaryRoot); await mkdir(directory, { recursive: true });
+  await writeFile(join(binaryRoot, 'custom'), `#!${process.execPath}\nconsole.log(require('node:fs').readFileSync(process.env.HOME+'/auth.txt','utf8').length);\n`, { mode: 0o755 });
+  const config = { mode: 'mount', path: '/var/lib/cellbox/shared/runtime/boxes/box-one/tool-runtime.json' };
+  const destination = join(directory, 'tool-runtime.json');
+  try {
+    for (const generation of [1, 2]) {
+      const bytes = JSON.stringify({ mode: 'files', generation, token: `runtime-${generation}`, url: 'http://unused.invalid',
+        files: [{ tool: 'custom', path: 'auth.txt', secretId: 'secret', mutable: false, version: generation, content: Buffer.from('x'.repeat(generation)).toString('base64') }] });
+      const temp = join(directory, 'new'); await writeFile(temp, bytes, { mode: 0o600 }); await rename(temp, destination);
+      let output = '';
+      assert.equal(await runProtectedTool('custom', [], { config, mountRoot: root, binaryRoot, tempRoot: join(root, 'homes'),
+        stdout: { write(value) { output += value; } }, fetch: () => { assert.fail('Immutable local credentials need no broker round trip'); } }), 0);
+      assert.equal(output.trim(), String(generation)); assert.equal(await readFile(destination, 'utf8'), bytes);
+    }
+    await assert.rejects(runProtectedTool('custom', [], { config: { mode: 'mount', path: '/etc/passwd' }, mountRoot: root }), /Invalid mounted runtime path/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('credential refresh sends Box identity without authentication and execution changes retain the writable HOME', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-noauth-tool-'));
+  const binaryRoot = join(root, 'bin'), tempRoot = join(root, 'homes'); await mkdir(binaryRoot);
+  await writeFile(join(binaryRoot, 'custom'), `#!${process.execPath}
+const fs=require('node:fs'),path=require('node:path');
+const file=path.join(process.env.HOME,'auth.txt');
+if(process.argv[2]==='refresh')fs.writeFileSync(file,'credential-refreshed');
+console.log(fs.readFileSync(file,'utf8')==='credential-refreshed'?'refreshed':'original');
+`, { mode: 0o755 });
+  const config = { mode: 'files', boxId: 'box-one', revision: 1, generation: 1, url: 'http://unused.invalid',
+    files: [{ tool: 'custom', path: 'auth.txt', secretId: 'secret', mutable: true, version: 1, content: Buffer.from('credential-original').toString('base64') }] };
+  const requests = []; let output = '';
+  const options = { config, binaryRoot, tempRoot, stdout: { write(value) { output += value; } }, fetch: async (url, init) => {
+    assert.equal(new Headers(init.headers).has('authorization'), false);
+    const body = JSON.parse(init.body); assert.equal(body.boxId, 'box-one');
+    assert.equal(new URL(url).pathname, '/api/tool-runtime/files'); requests.push(body);
+    return Response.json({ saved: true });
+  } };
+  try {
+    assert.equal(await runProtectedTool('custom', ['refresh'], options), 0);
+    assert.equal(requests.length, 1);
+    assert.equal(Buffer.from(requests[0].updates[0].content, 'base64').toString(), 'credential-refreshed');
+    assert.equal(await runProtectedTool('custom', ['read'], { ...options, config: { ...config, generation: 2 } }), 0);
+    assert.deepEqual(output.trim().split('\n'), ['refreshed', 'refreshed']);
+    assert.equal(requests.length, 1, 'An unchanged provisioned revision retains local refreshed files after resume');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('GitLab host survives the tool boundary without forwarding caller credentials', { timeout: 15000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-glab-host-'));

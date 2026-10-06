@@ -28,9 +28,17 @@ export interface ProvisionedToolFile {
   format?: SecretFormat;
 }
 export interface ToolRuntimeConfig {
-  mode: 'files'; generation: number; token: string; url: string; files: ProvisionedToolFile[];
+  mode: 'files'; boxId: string; revision: number; url: string; files: ProvisionedToolFile[];
+  /** Older runners read these aliases. token contains the plain Box ID. */
+  generation?: number; token?: string;
 }
+export interface ToolRuntimeIdentity { boxId: string }
+/** Stable descriptor retained in the checkpoint; ordinary resume leaves it unchanged. */
+export interface ToolRuntimeMount { mode: 'mount'; path: string }
 export interface ToolFileUpdate { secretId: string; content: string; baseVersion: number; format?: SecretFormat }
+export interface ToolFileSyncRequest extends ToolRuntimeIdentity { tool: ProxyTool; updates: ToolFileUpdate[]; exitCode: number }
+export interface ToolInvocationStartRequest extends ToolRuntimeIdentity { tool: ProxyTool; alias?: string; args: string[] }
+export interface ToolInvocationCompleteRequest extends ToolRuntimeIdentity { updates: Array<{ secretId: string; content: string }>; exitCode: number }
 export interface SecretVersion {
   id: string; source: 'operator' | 'tool'; baseVersion: number | null;
   createdAt: string; projectId: string | null; invocationId: string | null;

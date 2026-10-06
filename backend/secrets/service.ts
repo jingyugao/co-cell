@@ -32,9 +32,7 @@ function inputBytes(input: SecretInput): Buffer {
   return secretBytes('text', input.content);
 }
 export class SecretService {
-  constructor(readonly repository: SecretRepository, private crypto: SecretCrypto,
-    private liveRuntime: (boxId: string) => Promise<{ generation: number; phase: string }>,
-    private ownsRuntime: (projectId: string, boxId: string) => boolean) {}
+  constructor(readonly repository: SecretRepository, private crypto: SecretCrypto) {}
   async init() { await this.repository.init(); }
   private metadata(secret: StoredSecret, projectIds: string[] = []): SecretMetadata {
     const { ciphertext: _ciphertext, currentVersionId: _versionId, alias: _alias, format, ...metadata } = secret;
@@ -155,30 +153,22 @@ export class SecretService {
   }
   async registerRuntime(boxId: string, projectId: string, generation: number) {
     await this.repository.registerRuntime(boxId, projectId, generation);
-    return this.crypto.runtimeToken(boxId, generation);
+    return boxId;
   }
-  private async runtimeIdentity(token: string) {
-    const identity = this.crypto.verifyRuntimeToken(token);
-    if (!identity) throw new HttpError(401, '工具认证无效');
-    const runtime = await this.repository.runtime(identity.boxId);
-    if (!runtime || runtime.generation !== identity.generation || !this.ownsRuntime(runtime.projectId, identity.boxId)) throw new HttpError(403, 'Sandbox 未绑定当前项目');
-    return { ...identity, projectId: runtime.projectId };
-  }
-  private async authorize(token: string) {
-    const identity = await this.runtimeIdentity(token);
-    const live = await this.liveRuntime(identity.boxId);
-    if (live.generation !== identity.generation || live.phase !== 'running') throw new HttpError(403, 'Sandbox 运行身份已失效');
-    return identity;
+  private async runtimeIdentity(boxId: string) {
+    const runtime = await this.repository.runtime(boxId);
+    if (!runtime) throw new HttpError(404, 'Box 未绑定项目');
+    return { boxId, ...runtime };
   }
   /** Persist modified local files without checking the project's current selection. */
-  async syncFiles(token: string, tool: ProxyTool, updates: ToolFileUpdate[], exitCode: number): Promise<ToolCompletionResult> {
-    const identity = await this.runtimeIdentity(token), now = new Date().toISOString(), id = randomUUID();
+  async syncFiles(boxId: string, tool: ProxyTool, updates: ToolFileUpdate[], exitCode: number): Promise<ToolCompletionResult> {
+    const identity = await this.runtimeIdentity(boxId), now = new Date().toISOString(), id = randomUUID();
     if (new Set(updates.map(update => update.secretId)).size !== updates.length) throw new HttpError(400, 'Secret 更新不可重复');
     const changes: Array<{ secret: StoredSecret; version: StoredVersion }> = [];
     for (const update of updates) {
       const secret = await this.repository.get(update.secretId);
       if (!secret?.enabled || !secret.mutable || !['text', 'files'].includes(secret.format)) continue;
-      if (secret.tool !== tool) throw new HttpError(403, '不能更新其他工具的凭证');
+      if (secret.tool !== tool) throw new HttpError(400, '不能更新其他工具的凭证');
       if (update.format !== undefined && secret.format !== update.format) throw new HttpError(409, '凭证格式已变更，请刷新运行环境后重试');
       if (secret.format === 'files' && secret.version !== update.baseVersion) throw new HttpError(409, '文件组已更新，请刷新运行环境后重试');
       const raw = Buffer.from(update.content, 'base64');
@@ -211,21 +201,21 @@ export class SecretService {
     try { incoming = fileBundle(JSON.parse(raw.toString('utf8'))); } catch { throw new HttpError(400, '文件组更新格式无效'); }
     const current = this.bundle(secret);
     if (incoming.adapter !== current.adapter || incoming.directory !== current.directory || (!current.directory && JSON.stringify(incoming.files.map(file => file.path)) !== JSON.stringify(current.files.map(file => file.path))))
-      throw new HttpError(403, '工具不能修改文件组路径或适配方式');
+      throw new HttpError(400, '工具不能修改文件组路径或适配方式');
     return inputBytes({ name: secret.name, mutable: secret.mutable, tool: secret.tool!, path: secret.path!, format: 'files', ...incoming });
   }
-  async start(token: string, tool: ProxyTool, _alias: string | undefined, args: string[]): Promise<ToolInvocationSetup> {
-    const identity = await this.authorize(token);
+  async start(boxId: string, tool: ProxyTool, _alias: string | undefined, args: string[]): Promise<ToolInvocationSetup> {
+    const identity = await this.runtimeIdentity(boxId);
     const grants = (await this.repository.grants(identity.projectId)).filter(g => g.enabled && g.tool === tool);
-    if (grants.length !== 1) throw new HttpError(403, grants.length ? '工具存在旧的多密钥配置，请重新选择一个密钥' : '项目未授权此工具连接');
+    if (grants.length !== 1) throw new HttpError(400, grants.length ? '工具存在旧的多密钥配置，请重新选择一个密钥' : '项目未选择此工具的凭证');
     const grant = grants[0], checked = validateToolArgs(tool, args, grant);
-    if (grant.files.length !== 1) throw new HttpError(403, '每种工具只能使用一个密钥，请重新配置');
+    if (grant.files.length !== 1) throw new HttpError(400, '每种工具只能使用一个密钥，请重新配置');
     const setup: ToolInvocationSetup = { id: randomUUID(), tool, args: checked, files: [] };
     const snapshots = [];
     for (const binding of grant.files) {
       const secret = await this.requireSecret(binding.secretId);
-      if (!secret.enabled) throw new HttpError(403, 'Secret 已停用');
-      if (secret.tool && (secret.tool !== tool || secret.path !== binding.path)) throw new HttpError(403, '密钥所属工具或文件路径已变更');
+      if (!secret.enabled) throw new HttpError(409, 'Secret 已停用');
+      if (secret.tool && (secret.tool !== tool || secret.path !== binding.path)) throw new HttpError(409, '密钥所属工具或文件路径已变更');
       this.validateConfig({ ...secret, tool, path: binding.path });
       const bytes = this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext);
       setup.files.push({ path: binding.path, content: bytes.toString('base64'), secretId: secret.id, version: secret.version, mutable: secret.mutable,
@@ -236,23 +226,23 @@ export class SecretService {
     await this.repository.startInvocation({ id: setup.id, ...identity, grant, files: snapshots, createdAt: new Date().toISOString(), completedAt: null });
     return setup;
   }
-  async complete(token: string, id: string, updates: Array<{ secretId: string; content: string }>, exitCode: number): Promise<ToolCompletionResult> {
-    const identity = await this.authorize(token), invocation = await this.repository.invocation(id);
-    if (!invocation || invocation.boxId !== identity.boxId || invocation.generation !== identity.generation || invocation.projectId !== identity.projectId) throw new HttpError(403, '工具调用不属于该 Sandbox');
+  async complete(boxId: string, id: string, updates: Array<{ secretId: string; content: string }>, exitCode: number): Promise<ToolCompletionResult> {
+    const invocation = await this.repository.invocation(id);
+    if (!invocation) throw new HttpError(404, '工具调用不存在');
+    if (invocation.boxId !== boxId) throw new HttpError(400, '工具调用与 Box 不匹配');
+    const identity = invocation;
     if (invocation.completedAt) return { saved: false };
     try {
-      const grant = (await this.repository.grants(identity.projectId)).find(g => g.id === invocation.grant.id);
-      if (!grant?.enabled || JSON.stringify(grant.files) !== JSON.stringify(invocation.grant.files)) throw new HttpError(403, '工具授权已撤销或变更');
       if (new Set(updates.map(update => update.secretId)).size !== updates.length) throw new HttpError(400, 'Secret 更新不可重复');
       const now = new Date().toISOString(), changes = [];
       for (const update of updates) {
         const snapshot = invocation.files.find(file => file.secretId === update.secretId);
-        if (!snapshot) throw new HttpError(403, '不能更新未绑定的 Secret');
+        if (!snapshot) throw new HttpError(400, '不能更新未绑定的 Secret');
         const secret = await this.requireSecret(update.secretId);
         if (snapshot.format !== undefined && secret.format !== snapshot.format) throw new HttpError(409, '凭证格式已变更，请刷新运行环境后重试');
-        if (!secret.enabled || !secret.mutable) throw new HttpError(403, 'Secret 不允许工具更新');
+        if (!secret.enabled || !secret.mutable) throw new HttpError(409, 'Secret 已停用或设为只读');
         this.validateConfig({ ...secret, tool: invocation.grant.tool, path: snapshot.path });
-        if (secret.tool && (secret.tool !== invocation.grant.tool || secret.path !== snapshot.path)) throw new HttpError(403, '密钥所属工具或文件路径已变更');
+        if (secret.tool && (secret.tool !== invocation.grant.tool || secret.path !== snapshot.path)) throw new HttpError(409, '密钥所属工具或文件路径已变更');
         const raw = Buffer.from(update.content, 'base64');
         if (raw.toString('base64') !== update.content) throw new HttpError(400, 'Secret 更新编码无效');
         if (!Buffer.from(raw.toString('utf8')).equals(raw)) throw new HttpError(400, '认证文件必须使用 UTF-8 编码');
@@ -269,7 +259,7 @@ export class SecretService {
       if (resources.every(Boolean)) throw error;
       // Acknowledge a deleted resource without accepting its refresh. Existing
       // runners then remove their private files instead of retaining tokens for
-      // retry. Invocation identity was verified before entering this block.
+      // retry. The invocation already identifies its project and resource snapshot.
       await this.repository.completeInvocation({ ...invocation, completedAt: new Date().toISOString() }, [], exitCode);
       return { saved: false, discarded: true };
     }

@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 export class SecretCrypto {
   private key: Buffer;
@@ -20,19 +20,4 @@ export class SecretCrypto {
       return Buffer.concat([cipher.update(bytes.subarray(28)), cipher.final()]);
     } catch { throw new Error('Secret decryption failed'); }
   }
-  runtimeToken(boxId: string, generation: number): string {
-    const payload = Buffer.from(JSON.stringify({ boxId, generation })).toString('base64url');
-    return `${payload}.${this.sign(payload)}`;
-  }
-  verifyRuntimeToken(token: string): { boxId: string; generation: number } | null {
-    const parts = token.split('.');
-    if (parts.length !== 2 || token.length > 1024) return null;
-    const signature = Buffer.from(parts[1]); const expected = Buffer.from(this.sign(parts[0]));
-    if (signature.length !== expected.length || !timingSafeEqual(signature, expected)) return null;
-    try {
-      const data = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
-      return typeof data.boxId === 'string' && Number.isSafeInteger(data.generation) && data.generation >= 0 ? data : null;
-    } catch { return null; }
-  }
-  private sign(payload: string) { return createHmac('sha256', this.key).update(`cocell-tool-runtime-v1\0${payload}`).digest('base64url'); }
 }

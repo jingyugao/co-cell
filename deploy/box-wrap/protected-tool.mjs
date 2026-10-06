@@ -9,6 +9,11 @@ import { collectCredentialDirectory, encodeFile, fileBytes, FILE_BUNDLE_LIMIT, o
 
 const LIMIT = 65536;
 const toolName = /^[A-Za-z][A-Za-z0-9_.\-]{0,63}$/;
+function toolEnvironment(root, options) {
+  // Native CLIs such as glab spawn git. Do not recurse into agent-side proxies.
+  return { PATH: `${options.binaryRoot ?? '/opt/cellbox/debug-bin'}:/usr/local/bin:/usr/bin:/bin`,
+    HOME: root, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(root, '.config'), XDG_DATA_HOME: join(root, '.local/share'), ...options.gitlabEnv };
+}
 function safePath(path) {
   return typeof path === 'string' && path.length > 0 && path.length <= 256 && !path.startsWith('/') && normalize(path) === path &&
     !/[\\\u0000-\u001f\u007f]/.test(path) && path.split('/').every(part => part && part !== '.' && part !== '..');
@@ -118,7 +123,7 @@ async function runBundleTool(tool, args, config, options, request) {
       if (bundle.adapter === 'meegle') masks.push(...options.sensitiveValues(Buffer.from(JSON.stringify(openMeegleBundle(bundle)))));
     }
     mask(source);
-    const env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: root, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(root, '.config'), XDG_DATA_HOME: join(root, '.local/share'), ...options.gitlabEnv };
+    const env = toolEnvironment(root, options);
     const identity = { hostname: hostname(), username: 'unknown' };
     // USER is explicit so the native CLI uses the same identity as the adapter.
     if (source.adapter === 'meegle') env.USER = identity.username;
@@ -208,7 +213,7 @@ async function runFileTool(tool, args, config, options, request) {
     persisted.set(file.path, { marker, bytes: await readFile(marker) });
     masks.push(...sensitiveValues(bytes), ...sensitiveValues(await readCredential(root, file.path)));
   }
-  const env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: root, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(root, '.config'), XDG_DATA_HOME: join(root, '.local/share'), ...options.gitlabEnv };
+  const env = toolEnvironment(root, options);
   if (files[0]) {
     const credential = join(root, files[0].path);
     if (tool === 'kubectl') env.KUBECONFIG = credential;
@@ -283,7 +288,7 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
       await writeFile(destination, bytes, { mode: 0o600, flag: 'wx' });
       originals.set(file.path, bytes); masks.push(...sensitiveValues(bytes));
     }
-    const env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: root, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(root, '.config'), XDG_DATA_HOME: join(root, '.local/share'), ...options.gitlabEnv };
+    const env = toolEnvironment(root, options);
     let argv = setup.args;
     const credential = join(root, setup.files[0].path);
     if (tool === 'kubectl') env.KUBECONFIG = credential;

@@ -53,4 +53,11 @@ else:
     guest.setdefault("env", {}).pop("COCELL_LAUNCHER_SHARED_DIRECTORY", None)
 guest["tools"] = [tool for tool in guest.get("tools", []) if tool["id"] not in owned_ids] + [tool["profile"] for tool in proxy_tools]
 profile["image"] = image
+trusted = profile.setdefault("trustedToolImages", [])
+if image not in trusted:
+    trusted.append(image)
+for tool in guest["tools"]:
+    if tool["id"] in ("cocell_git", "cocell_glab"):
+        tool["workspaceRead"] = True
+        tool["workspaceWrite"] = True
 json.dump({} if profile == before else {"api": {"config": config}}, sys.stdout)

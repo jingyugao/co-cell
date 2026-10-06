@@ -28,6 +28,10 @@ for name in names:
     if not any(tool['id'] == tool_id for tool in tools):
         tools.append({'id': tool_id, 'executable': '/opt/cellbox/tools/cocell-proxy', 'args': [name, '-'],
                       'passThroughArgs': True, 'credentialEnv': {'COCELL_TOOL_RUNTIME': 'cocell_tool_runtime'}})
+for tool in tools:
+    if tool['id'] in ('cocell_git', 'cocell_glab'):
+        tool['workspaceRead'] = True
+        tool['workspaceWrite'] = True
 release.check_lifecycle_operations()
 release.upgrade({'api': {'config': config}})
 print('Admitted inspected image:', sys.argv[3])

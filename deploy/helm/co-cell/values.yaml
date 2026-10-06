@@ -6,6 +6,10 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
+tracing:
+  endpoint: ""
+  serviceName: co-cell
+
 # Existing Secret in the release namespace. Required keys: COCELL_ACCESS_TOKEN, MYSQL_URL, COCELL_SECRET_MASTER_KEY.
 # Optional keys: CODEX_API_KEY, OPENAI_API_KEY.
 existingSecret: ""

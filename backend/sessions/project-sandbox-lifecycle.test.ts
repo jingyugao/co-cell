@@ -146,7 +146,39 @@ test('project creation verifies readiness; resume preserves the box without repe
     assert.equal(isProjectSandboxReady(entries[0]), false);
     await manager.enterProject(created.id);
     await assert.rejects(manager.create({ projectId: created.id }), /维护/);
-    finishResume(); await operations().close();
+    const operationId = entries[0].sandboxOperation!.id!;
+    let notified = false;
+    const beforeWaitQueries = queryCalls;
+    const waitingResponse = Promise.resolve(app.request(`/api/projects/${created.id}?waitForOperation=${operationId}&waitMs=10000`))
+      .then(response => { notified = true; return response; });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(notified, false, 'runtime ready alone cannot finish the wait');
+    assert.equal(queryCalls, beforeWaitQueries, 'waiting for completion does not poll the provider');
+    const saveProject = state.saveProject.bind(state);
+    let persistReached!: () => void, commitResult!: () => void;
+    const persistenceStarted = new Promise<void>(resolve => { persistReached = resolve; });
+    const persistenceBarrier = new Promise<void>(resolve => { commitResult = resolve; });
+    state.saveProject = async project => {
+      if (project.sandboxOperation?.id === operationId && project.sandboxOperation.status === 'succeeded') {
+        persistReached(); await persistenceBarrier;
+      }
+      await saveProject(project);
+    };
+    const projectService = (manager as unknown as { projects: ProjectService }).projects;
+    finishResume(); await persistenceStarted;
+    try {
+      assert.equal(notified, false, 'completion must be durable before notifying readers');
+      assert.equal(projectService.isMaintaining(created.id), true);
+    } finally { commitResult(); }
+    const completionResponse = await waitingResponse;
+    assert.equal(completionResponse.status, 200);
+    const completion = await completionResponse.json() as ProjectSummary;
+    assert.equal(completion.sandboxOperation?.id, operationId);
+    assert.equal(completion.sandboxOperation?.status, 'succeeded');
+    assert.equal(isProjectSandboxReady(completion), true);
+    assert.equal(projectService.isMaintaining(created.id), false, 'notified clients can begin execution');
+    state.saveProject = saveProject;
+    await operations().close();
     assert.equal(resumeCalls, 1, 'concurrent entries and repeated entry during preparation share one resume');
     await manager.enterProject(created.id);
     assert.equal(resumeCalls, 1, 'entering a ready project does not start another operation');

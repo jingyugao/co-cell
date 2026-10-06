@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
-import type { ProjectSummary } from '../../../protocol/types';
+import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type ProjectSummary } from '../../../protocol/types';
 import { isProjectSandboxReady } from '../../../util/project-sandbox';
 import { errorMessage } from '../../lib/api';
 
-type ReadProject = (id: string, signal?: AbortSignal) => Promise<ProjectSummary>;
+type ReadProject = (id: string, signal?: AbortSignal, options?: ProjectReadOptions) => Promise<ProjectSummary>;
 
 /** Prepare once per workspace entry, independently of the editable prompt draft. */
 export function useProjectEntry(projectId: string | null, entryKey: string, enter: ReadProject, read: ReadProject) {
@@ -43,9 +43,15 @@ export function useProjectEntry(projectId: string | null, entryKey: string, ente
         if (operation?.status !== 'running' && project.sandbox?.status !== 'starting') {
           throw new Error(project.sandbox ? '环境暂不可用，请重试或在项目管理中恢复。' : '环境尚未创建，请在项目管理中重试准备。');
         }
-        await wait();
-        signal.throwIfAborted();
-        project = await read(projectId, signal);
+        if (operation?.status === 'running' && operation.id) {
+          project = await read(projectId, signal, { waitForOperation: operation.id,
+            waitMs: Math.min(PROJECT_OPERATION_WAIT_MS, Math.max(0, deadline - Date.now())) });
+        } else {
+          // A transition without an operation ID cannot subscribe to completion.
+          await wait();
+          signal.throwIfAborted();
+          project = await read(projectId, signal);
+        }
       }
     })().catch(error => {
       if (!signal.aborted) setState({ key: entryKey, pending: false, error: errorMessage(error) });

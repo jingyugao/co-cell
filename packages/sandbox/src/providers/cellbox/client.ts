@@ -1,3 +1,4 @@
+import { injectTraceHeaders, traced } from '../../tracing.js';
 /** The internal Cellbox REST contract. Calls require no Cellbox credential. */
 export interface CellboxCapabilities {
   exec: boolean; files: boolean; http: boolean; websocket: boolean;
@@ -118,11 +119,19 @@ export class CellboxClient {
       throw new CellboxError('INVALID_REQUEST', 'Invalid internal service port');
     return { url: `${this.baseUrl}/v1/boxes/${this.id(boxId)}/services/${port}/`, headers: this.clientHeaders() };
   }
-  private async request<T>(method: string, path: string, options: {
+  private request<T>(method: string, path: string, options: {
     body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
   } = {}): Promise<T> {
+    return traced('cellbox.http', { 'http.request.method': method, 'url.path': path.split('?')[0] },
+      () => this.requestImpl<T>(method, path, options));
+  }
+  private async requestImpl<T>(method: string, path: string, options: {
+    body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
+  }): Promise<T> {
     if (options.signal?.aborted) throw new CellboxError('TRANSPORT', 'Cellbox request was cancelled before submission');
-    const headers = new Headers(this.clientHeaders());
+    const outgoing = this.clientHeaders();
+    injectTraceHeaders(outgoing);
+    const headers = new Headers(outgoing);
     if (options.key !== undefined) {
       if (!options.key || options.key.length > 200) throw new CellboxError('INVALID_REQUEST', 'Idempotency key must contain 1..200 characters');
       headers.set('Idempotency-Key', options.key);

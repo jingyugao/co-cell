@@ -1,3 +1,4 @@
+import { traced, traceEvent } from '@co-cell/sandbox';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { randomUUID } from 'node:crypto';
 import type { Project, ProjectStatus, ProjectType, Settings } from '../../protocol/types.js';
@@ -151,7 +152,8 @@ export class ProjectService {
   }
 
   private async mutateSandboxMetadata(id: string, mutate: (project: Project) => void, commitLifecycle = false) {
-    await this.writer.run(id, async () => {
+    await traced('project.metadata.update', { 'project.id': id }, () => this.writer.run(id, async () => {
+      traceEvent('project.writer.acquired');
       const current = this.records.get(id);
       if (!current || this.deleting.has(id)) throw new HttpError(409, '项目已删除或正在删除');
       const next = structuredClone(current);
@@ -181,7 +183,7 @@ export class ProjectService {
         current.lifecycleHistory = next.lifecycleHistory;
       }
       current.updatedAt = next.updatedAt;
-    });
+    }));
   }
 
   /** Project records hold references. Only request-local Cellbox observations have a status. */

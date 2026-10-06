@@ -172,6 +172,18 @@ export interface ProjectSummary extends Project { sessionCount: number; activeSe
   /** Cellbox archive versions, newest first. */
   archiveVersions?: ArchiveVersionSummary[];
 }
+
+export const PROJECT_OPERATION_WAIT_MS = 10_000;
+
+/** GET /api/projects/:id remains read-only. Optional query parameters wait for
+ * this exact operation to finish (success or failure), then return a live view.
+ * Already finished/replaced operations return immediately; a timeout returns
+ * the current view. Disconnecting only cancels the wait, never the operation. */
+export interface ProjectReadOptions {
+  waitForOperation?: string;
+  /** Integer milliseconds, 0 through PROJECT_OPERATION_WAIT_MS; default 10s. */
+  waitMs?: number;
+}
 export interface Session {
   projectId?: string;
   id: string;

@@ -1,8 +1,9 @@
+import { traced, traceEvent } from '@co-cell/sandbox';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
-import type { Project, ProjectSummary, Session, SessionSummary, SessionTurnPage, Settings, StreamMessage, SubagentConversation, Turn } from '../../protocol/types.js';
+import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type Project, type ProjectSummary, type Session, type SessionSummary, type SessionTurnPage, type Settings, type StreamMessage, type SubagentConversation, type Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
@@ -361,8 +362,19 @@ export class SessionManager {
     return project;
   }
 
-  async readProject(id: string): Promise<ProjectSummary> {
-    return this.projectSummary(await this.liveProject(this.projects.get(id), true));
+  async readProject(id: string, options: ProjectReadOptions = {}, signal?: AbortSignal): Promise<ProjectSummary> {
+    return traced('project.read', { 'project.id': id, 'operation.id': options.waitForOperation }, async () => {
+      this.projects.get(id);
+      if (options.waitForOperation) {
+        await traced('project.wait', { 'operation.id': options.waitForOperation }, async () => {
+          await this.sandboxOperations?.wait(id, options.waitForOperation!, options.waitMs ?? PROJECT_OPERATION_WAIT_MS, signal);
+        });
+        traceEvent('project.wait.finished');
+      }
+      signal?.throwIfAborted();
+      return traced('project.live_view', { 'project.id': id }, async () =>
+        this.projectSummary(await this.liveProject(this.projects.get(id), true)));
+    });
   }
 
   async snapshot(id: string): Promise<Session> {

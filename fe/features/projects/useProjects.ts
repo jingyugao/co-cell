@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react';
-import type { ProjectSandboxOperation, ProjectStatus, ProjectSummary, ProjectType } from '../../../protocol/types';
+import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type ProjectSandboxOperation, type ProjectStatus, type ProjectSummary, type ProjectType } from '../../../protocol/types';
 import { api } from '../../lib/api';
 
 export type ProjectValues = { name: string; requirementUrl: string | null; type: ProjectType; imageId?: string; imageVersionId?: string };
@@ -33,8 +33,11 @@ export function useProjects() {
     signal?.throwIfAborted();
     return storeProject(project);
   }, [storeProject]);
-  const refreshProject = useCallback(async (id: string, signal?: AbortSignal) => {
-    const project = await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { signal });
+  const refreshProject = useCallback(async (id: string, signal?: AbortSignal, options?: ProjectReadOptions) => {
+    const query = options?.waitForOperation ? `?${new URLSearchParams({
+      waitForOperation: options.waitForOperation, waitMs: String(options.waitMs ?? PROJECT_OPERATION_WAIT_MS),
+    })}` : '';
+    const project = await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}${query}`, { signal });
     signal?.throwIfAborted();
     return storeProject(project);
   }, [storeProject]);

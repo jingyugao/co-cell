@@ -1,3 +1,4 @@
+import { traced, traceEvent } from '@co-cell/sandbox';
 import { randomUUID } from 'node:crypto';
 import type { Project, ProjectSandboxOperation } from '../../protocol/types.js';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
@@ -19,6 +20,7 @@ const target = (project: Project): WorkspaceTarget => ({ id: project.id, project
 
 export class ProjectSandboxOperations {
   private tasks = new Set<Promise<void>>();
+  private pending = new Map<string, { operationId: string; waiters: Set<() => void> }>();
   private timings = new Map<string, { operationId: string; kind: string; started: number; phaseStarted: number; phase: string }>();
   constructor(private deps: {
     projects: ProjectService;
@@ -74,6 +76,25 @@ export class ProjectSandboxOperations {
     await done;
   }
 
+  async wait(id: string, operationId: string, waitMs: number, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const pending = this.pending.get(id);
+    if (!pending || pending.operationId !== operationId || waitMs <= 0) return;
+    await new Promise<void>((resolve, reject) => {
+      const finish = () => { cleanup(); resolve(); };
+      const abort = () => { cleanup(); reject(signal!.reason); };
+      const timer = setTimeout(finish, waitMs);
+      const cleanup = () => {
+        clearTimeout(timer);
+        pending.waiters.delete(finish);
+        signal?.removeEventListener('abort', abort);
+      };
+      pending.waiters.add(finish);
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+    });
+  }
+
   /** Persist acceptance before returning; the caller can poll while the task runs. */
   async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
     const project = this.deps.projects.get(id);
@@ -81,18 +102,24 @@ export class ProjectSandboxOperations {
     if (project.archiveCleanupSourceId && kind !== 'archive') throw new HttpError(409, '项目归档清理尚未完成，请先重试归档');
     const release = this.deps.projects.beginMaintenance(id);
     let reservation: { selection?: ProjectImageSelection; release(): void } | undefined;
+    let operationId: string;
     try {
       if (options.imageVersionId && (kind !== 'restore' || project.status !== 'archived')) throw new HttpError(409, '仅归档项目恢复时可以选择镜像版本');
       if (kind === 'restore' && project.status === 'archived' && this.deps.selectRestoreImage) reservation = await this.deps.selectRestoreImage(project, options.imageVersionId);
       await this.deps.projects.updateSandboxOperation(id, { id: randomUUID(), kind,
         phase: kind === 'create' ? '创建 Sandbox' : '检查环境', status: 'running', updatedAt: new Date().toISOString() });
       const accepted = this.deps.projects.get(id).sandboxOperation!;
+      operationId = accepted.id!;
       const now = Date.now();
       this.timings.set(id, { operationId: accepted.id!, kind, started: now, phaseStarted: now, phase: accepted.phase });
       void this.deps.logger?.write({ event: 'sandbox.operation_started', projectId: id,
         operationId: accepted.id, operation: kind, startedAt: new Date(now).toISOString(), sandboxId: project.sandbox?.id });
     } catch (error) { reservation?.release(); release(); throw error; }
-    const task = Promise.resolve().then(async () => {
+    const pending = { operationId, waiters: new Set<() => void>() };
+    this.pending.set(id, pending);
+    const task = Promise.resolve().then(() => traced(`project.sandbox.${kind}`, {
+      'project.id': id, 'operation.id': operationId, 'sandbox.id': project.sandbox?.id,
+    }, async () => {
       try {
         if (kind === 'create') await this.create(id);
         else if (kind === 'checkpoint') await this.checkpoint(id);
@@ -123,8 +150,15 @@ export class ProjectSandboxOperations {
       } finally {
         this.recordTiming(id, this.deps.projects.get(id).sandboxOperation?.status ?? 'failed');
         reservation?.release(); release();
+        // Wake readers only after the terminal state is durable and execution
+        // is admitted again. A Box being Running alone is not resume success.
+        this.pending.delete(id);
+        const status = this.deps.projects.get(id).sandboxOperation?.status;
+        traceEvent(status === 'succeeded' ? 'project.success.published' : 'project.failure.published', { 'operation.status': status });
+        for (const finish of pending.waiters) finish();
+        traceEvent('project.waiters.notified');
       }
-    });
+    }));
     this.tasks.add(task);
     void task.finally(() => this.tasks.delete(task)).catch(() => {});
     return { done: task };

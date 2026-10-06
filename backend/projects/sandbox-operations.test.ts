@@ -62,6 +62,46 @@ test('resume reconnects a paused Sandbox without replacing its binding', async (
   } finally { await operations.close(); await f.close(); }
 });
 
+for (const outcome of ['succeeded', 'failed'] as const) test(`operation waits observe ${outcome} after timeout/disconnect without cancelling resume or following another operation`, async () => {
+  const id = 'wait-resume';
+  const f = await fixture(project(id, { sandbox: sandbox('same-sandbox', 'paused') }));
+  let finishResume!: () => void;
+  const barrier = new Promise<void>(resolve => { finishResume = resolve; });
+  const operations = new ProjectSandboxOperations({ projects: f.projects,
+    runtime: { ...runtime({ status: 'paused' }, []), async resume() {
+      await barrier;
+      if (outcome === 'failed') throw new Error('restore failed');
+    } },
+    threadIds: () => [], saveSandbox: async (projectId, value) => { await f.projects.updateSandbox(projectId, value, false); },
+    detached: async () => {} });
+  try {
+    const { done } = await operations.start(id, 'resume');
+    const operationId = f.projects.get(id).sandboxOperation!.id!;
+    const controller = new AbortController();
+    const disconnected = operations.wait(id, operationId, 10_000, controller.signal);
+    controller.abort();
+    await assert.rejects(disconnected, { name: 'AbortError' });
+    await operations.wait(id, operationId, 1);
+    assert.equal(f.projects.get(id).sandboxOperation?.status, 'running');
+    assert.equal(f.projects.isMaintaining(id), true);
+    for (const [projectId, token] of [[id, 'stale-operation'], ['another-project', operationId]]) {
+      const immediate = await Promise.race([
+        operations.wait(projectId, token, 10_000).then(() => true),
+        new Promise<boolean>(resolve => setImmediate(() => resolve(false))),
+      ]);
+      assert.equal(immediate, true, 'a different operation/project must not inherit this wait');
+    }
+    const completion = operations.wait(id, operationId, 10_000);
+    finishResume();
+    if (outcome === 'failed') await assert.rejects(done, /restore failed/);
+    else await done;
+    await completion;
+    await operations.wait(id, operationId, 10_000);
+    assert.equal(f.projects.get(id).sandboxOperation?.status, outcome);
+    assert.equal(f.projects.isMaintaining(id), false);
+  } finally { finishResume(); await operations.close(); await f.close(); }
+});
+
 const remoteReference: RemoteArchiveRef = {
   id: 'arc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', createdAt: '2026-09-20T01:00:00.000Z',
   sizeBytes: 128, sha256: 'b'.repeat(64), imageId: `registry.example/cellbox@sha256:${'a'.repeat(64)}`,

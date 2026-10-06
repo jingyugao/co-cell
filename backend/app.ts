@@ -1,5 +1,6 @@
 import { installImageRoutes } from './images/routes.js';
 import type { ImageCatalog } from './images/service.js';
+import { traceHttpRequest } from './infra/diagnostics/tracing.js';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
@@ -26,6 +27,7 @@ import { installPwaAssets } from './infra/http/pwa.js';
 
 export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService) {
   const app = new Hono();
+  app.use('/api/*', traceHttpRequest);
   if (operatorAccess) installOperatorAccess(app, {
     ...operatorAccess,
     serviceProxy: (projectId, port, path, request) =>

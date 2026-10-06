@@ -287,6 +287,20 @@
           }
         }
       }
+    },
+    "tracing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "pattern": "^$|^https?://[^/@\\s?#]+/?$"
+        },
+        "serviceName": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
     }
   },
   "definitions": {

@@ -1,3 +1,4 @@
+import { traced } from '@co-cell/sandbox';
 import { createHash, randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { posix } from 'node:path';
@@ -253,7 +254,7 @@ export class CellboxRuntimeIntegration {
         const startedAt = new Date().toISOString();
         const started = performance.now();
         let status = 'succeeded';
-        try { return await action(); }
+        try { return await traced(phase, { 'sandbox.id': sandboxId }, action); }
         catch (error) { status = 'failed'; throw error; }
         finally {
             void this.options.logger?.write({ event: 'sandbox.runtime_stage', phase, sandboxId, status,

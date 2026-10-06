@@ -115,3 +115,22 @@ test('resume endpoint returns the resumed project', async () => {
   assert.equal(response.status, 202);
   assert.deepEqual(await response.json(), { id: 'project-to-resume', sandbox: { id: 'same-sandbox', status: 'ready' } });
 });
+
+test('project reads forward an exact bounded operation wait and reject unbounded waits', async () => {
+  const app = new Hono();
+  const calls: unknown[] = [];
+  app.onError((_error, c) => c.json({ error: 'invalid request' }, 400));
+  const manager: Pick<Parameters<typeof installProjectsRoutes>[1], 'readProject'> = { async readProject(id, options, signal) {
+    calls.push({ id, options }); assert(signal instanceof AbortSignal); return { id } as never;
+  } };
+  installProjectsRoutes(app, manager as unknown as Parameters<typeof installProjectsRoutes>[1]);
+  const response = await app.request('/api/projects/project-1?waitForOperation=operation-1&waitMs=10000');
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(calls, [{ id: 'project-1', options: { waitForOperation: 'operation-1', waitMs: 10_000 } }]);
+  for (const query of ['waitMs=10', 'waitForOperation=', 'waitForOperation=operation-1&waitMs=10001',
+    'waitForOperation=operation-1&waitMs=-1', 'waitForOperation=operation-1&waitMs=1.5']) {
+    assert.equal((await app.request(`/api/projects/project-1?${query}`)).status, 400);
+  }
+  assert.equal(calls.length, 1);
+});

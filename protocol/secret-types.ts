@@ -35,6 +35,9 @@ export interface ToolRuntimeConfig {
 export interface ToolRuntimeIdentity { boxId: string }
 /** Stable descriptor retained in the checkpoint; ordinary resume leaves it unchanged. */
 export interface ToolRuntimeMount { mode: 'mount'; path: string }
+/** Stable across resume; carries no credential content or authentication token. */
+export interface ToolHomeRuntimeConfig { mode: 'home'; boxId: string; url: string }
+export interface ToolAuthorization { tool: ProxyTool; args: string[]; home: string; path: string }
 export interface ToolFileUpdate { secretId: string; content: string; baseVersion: number; format?: SecretFormat }
 export interface ToolFileSyncRequest extends ToolRuntimeIdentity { tool: ProxyTool; updates: ToolFileUpdate[]; exitCode: number }
 export interface ToolInvocationStartRequest extends ToolRuntimeIdentity { tool: ProxyTool; alias?: string; args: string[] }
@@ -56,6 +59,9 @@ export interface ProjectToolGrant {
 }
 export type ProjectToolGrantInput = Omit<ProjectToolGrant, 'id' | 'projectId' | 'updatedAt'>;
 export interface ProjectToolSelection { tool: ProxyTool; secretId: string | null }
+export interface ProjectToolPermissionInput { tool: ProxyTool; enabled: boolean }
+/** Project controls only whether it can use a tool's configured credential. */
+export interface ProjectToolPermission extends ProjectToolPermissionInput { available: boolean; reason?: string }
 /** Only the protected tool runner receives this response, never the agent. */
 export interface ToolInvocationSetup {
   id: string; tool: ProxyTool; args: string[];

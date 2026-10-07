@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readdir, readFile, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,37 @@ import { runProtectedTool } from '../../deploy/box-wrap/protected-tool.mjs';
 import { openMeegleBundle, rebindMeegleBundle } from '../../util/credential-files.mjs';
 import { meegleFixture } from './fixtures/meegle-credentials.mjs';
 import { encodeGitlabHost } from '../../util/gitlab-tool-host.mjs';
+
+test('native HOME authorizes each call, persists CLI changes and never transports credential bytes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-direct-home-'));
+  const projectId = randomUUID(), homeRoot = join(root, 'homes'), home = join(homeRoot, projectId), binaryRoot = join(root, 'bin');
+  await mkdir(join(home, '.kube'), { recursive: true }); await mkdir(binaryRoot);
+  const file = join(home, '.kube/config'); await writeFile(file, 'credential-original');
+  await writeFile(join(binaryRoot, 'kubectl'), `#!${process.execPath}
+const fs=require('node:fs');
+if(process.argv[2]==='refresh')fs.writeFileSync(process.env.KUBECONFIG,'credential-refreshed');
+console.log(fs.readFileSync(process.env.KUBECONFIG,'utf8')==='credential-refreshed'?'refreshed':'original');
+`, { mode: 0o755 });
+  const config = { mode: 'home', boxId: 'box-one', url: 'http://broker.example.test' };
+  const requests = []; let output = '';
+  const options = { config, homeRoot, binaryRoot, stdout: { write(value) { output += value; } }, fetch: async (url, init) => {
+    assert.equal(new URL(url).pathname, '/api/tool-runtime/authorize');
+    assert.equal(new Headers(init.headers).has('authorization'), false);
+    const body = JSON.parse(init.body); requests.push(body);
+    assert.deepEqual(Object.keys(body).sort(), ['args', 'boxId', 'tool']);
+    return Response.json({ tool: body.tool, args: body.args, home: `/home/debug/${projectId}`, path: '.kube/config' });
+  } };
+  try {
+    assert.equal(await runProtectedTool('kubectl', ['refresh'], options), 0);
+    assert.equal(await runProtectedTool('kubectl', ['read'], options), 0);
+    assert.deepEqual(output.trim().split('\n'), ['refreshed', 'refreshed']); assert.equal(requests.length, 2);
+    assert.equal(await readFile(file, 'utf8'), 'credential-refreshed');
+    output = '';
+    await assert.rejects(runProtectedTool('kubectl', ['read'], { ...options, fetch: async () => new Response('', { status: 403 }) }), /authorization failed/);
+    assert.equal(output, '');
+    await assert.rejects(runProtectedTool('kubectl', ['read'], { ...options, fetch: async () => Response.json({ tool: 'kubectl', args: [], home: `/home/debug/${projectId}`, path: '../escape' }) }), /Invalid tool authorization/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('mounted runner reads the current atomic snapshot without changing the shared credential file', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-mounted-tool-'));

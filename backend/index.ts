@@ -71,6 +71,7 @@ const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_AP
 await cellboxProvider.initialize();
 let manager: SessionManager;
 const secrets = new SecretService(webState.secretRepository, secretCrypto);
+if (sharedDirectory) await secrets.mountHomes(sharedDataRoot);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
   error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); });
 const cellboxRuntime=new CellboxRuntimeIntegration({provider:cellboxProvider,profileId:process.env.CELLBOX_PROFILE!,appServerArgs:appServerArguments,

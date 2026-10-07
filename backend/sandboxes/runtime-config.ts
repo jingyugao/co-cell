@@ -4,7 +4,7 @@ import type { CellboxSandboxProvider } from '../../packages/sandbox/src/provider
 import { CellboxError } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import type { ConnectionStore } from '../connections/store.js';
 import type { SecretService } from '../secrets/service.js';
-import type { ToolRuntimeConfig } from '../../protocol/secret-types.js';
+import type { ToolHomeRuntimeConfig, ToolRuntimeConfig } from '../../protocol/secret-types.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 import { mountedRuntime } from './mounted-runtime.js';
 
@@ -70,7 +70,8 @@ export class SandboxRuntimeConfig {
     // The provisioning revision survives execution changes. The legacy SQL
     // generation column stores it; Cellbox's live generation still fences writes.
     const revision = previous?.generation ?? generation;
-    const mount = !archive && this.options.secrets && this.options.sharedDataRoot && box.capabilities.mountedToolRuntime
+    const home = !archive && this.options.secrets?.homes && box.capabilities.mountedDebugHome;
+    const mount = !archive && !home && this.options.secrets && this.options.sharedDataRoot && box.capabilities.mountedToolRuntime
       ? mountedRuntime(this.options.sharedDataRoot, boxId) : undefined;
     let previousPointer: string | undefined;
     let slots: Record<string, Uint8Array>;
@@ -90,21 +91,24 @@ export class SandboxRuntimeConfig {
         if (!projectId) throw new Error('Project identity is required for tool credentials');
         if (!this.options.toolBrokerUrl) throw new Error('COCELL_TOOL_BROKER_URL is required');
         if (!previous || previous.projectId !== projectId) await this.options.secrets.registerRuntime(boxId, projectId, revision);
-        // Connecting or restarting the service must not replace an existing
-        // file snapshot after a resource was removed centrally.
-        if (!['connect', 'reconcile'].includes(context.action) || !applied.cocell_tool_runtime) {
-          const config: ToolRuntimeConfig = { mode: 'files', boxId, revision, url: this.options.toolBrokerUrl, files: await this.options.secrets.provision(projectId),
-            // Compatibility with checkpointed older runners; no authentication.
-            generation: revision, token: boxId };
-          const bytes = Buffer.from(JSON.stringify(config));
-          if (bytes.length > 1024 * 1024) throw new Error('Selected credential files exceed the 1 MiB Sandbox configuration limit');
-          slots = { cocell_tool_runtime: bytes };
-        } else if (mount) {
-          // A service restart must retain the mounted snapshot even after a
-          // centrally selected resource was deleted.
-          const bytes = await mount.read();
-          if (createHash('sha256').update(bytes).digest('hex') !== applied.cocell_tool_runtime)
-            throw new Error('Mounted runtime configuration differs from its acknowledged snapshot');
+        if (home) {
+          await this.options.secrets.publishHome(projectId);
+          const config: ToolHomeRuntimeConfig = { mode: 'home', boxId, url: this.options.toolBrokerUrl };
+          slots = { cocell_tool_runtime: Buffer.from(JSON.stringify(config)) };
+        } else {
+          // Existing images retain the delivery contract saved in their checkpoint.
+          if (!['connect', 'reconcile'].includes(context.action) || !applied.cocell_tool_runtime) {
+            const config: ToolRuntimeConfig = { mode: 'files', boxId, revision, url: this.options.toolBrokerUrl, files: await this.options.secrets.provision(projectId),
+              // Compatibility with checkpointed older runners; no authentication.
+              generation: revision, token: boxId };
+            const bytes = Buffer.from(JSON.stringify(config));
+            if (bytes.length > 1024 * 1024) throw new Error('Selected credential files exceed the 1 MiB Sandbox configuration limit');
+            slots = { cocell_tool_runtime: bytes };
+          } else if (mount) {
+            const bytes = await mount.read();
+            if (createHash('sha256').update(bytes).digest('hex') !== applied.cocell_tool_runtime)
+              throw new Error('Mounted runtime configuration differs from its acknowledged snapshot');
+          }
         }
       }
     } else {

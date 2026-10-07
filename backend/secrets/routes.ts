@@ -27,6 +27,11 @@ export function installSecretRoutes(app: Hono, secrets: SecretService, projectEx
   app.delete('/api/secrets/:id', async c => c.json(await secrets.delete(id.parse(c.req.param('id')))));
   app.get('/api/secrets/:id/versions', async c => c.json(await secrets.versions(id.parse(c.req.param('id')))));
   app.get('/api/projects/:id/tool-grants', async c => c.json(await secrets.grants(project(c.req.param('id')))));
+  app.get('/api/projects/:id/tool-permissions', async c => c.json(await secrets.permissions(project(c.req.param('id')))));
+  app.put('/api/projects/:id/tool-permissions', async c => {
+    const input = z.object({ permissions: z.array(z.object({ tool, enabled: z.boolean() }).strict()).max(256) }).strict().parse(await c.req.json());
+    return c.json(await secrets.savePermissions(project(c.req.param('id')), input.permissions));
+  });
   app.post('/api/projects/:id/tool-grants', async c => c.json(await secrets.saveGrant(project(c.req.param('id')), grant.parse(await c.req.json()))));
   app.put('/api/projects/:id/tool-grants', async c => {
     const input = z.object({ selections: z.array(z.object({ tool, secretId: id.nullable() }).strict()).max(256) }).strict().parse(await c.req.json());
@@ -39,6 +44,10 @@ export function installSecretRoutes(app: Hono, secrets: SecretService, projectEx
     return value;
   };
   const boxId = z.string().regex(/^[a-z0-9][a-z0-9-]{0,54}$/).optional();
+  app.post('/api/tool-runtime/authorize', async c => {
+    const input = z.object({ boxId, tool, args: z.array(z.string().max(8192)).max(32) }).strict().parse(await c.req.json());
+    return c.json(await secrets.authorize(runtimeBox(input.boxId, c.req.header('authorization')), input.tool, input.args));
+  });
   app.post('/api/tool-runtime/files', async c => {
     const input = z.object({ boxId, tool, updates: z.array(z.object({ secretId: id, content: z.string().max(1500000), baseVersion: z.number().int().min(1), format: fileFields.format.optional() }).strict()).max(10), exitCode: z.number().int().min(-1).max(255) }).strict().parse(await c.req.json());
     return c.json(await secrets.syncFiles(runtimeBox(input.boxId, c.req.header('authorization')), input.tool, input.updates, input.exitCode));

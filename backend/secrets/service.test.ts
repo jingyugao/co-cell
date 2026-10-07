@@ -10,6 +10,12 @@ import { SecretCrypto } from './crypto.js';
 import { credentialPath, toolName, validateToolArgs } from './policy.js';
 import { SecretService } from './service.js';
 import type { SecretRepository, StoredInvocation, StoredSecret, StoredVersion } from './repository.js';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { SandboxLifecycle } from '@co-cell/sandbox';
+import { SandboxRuntimeConfig } from '../sandboxes/runtime-config.js';
+import type { CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
 
 export class MemorySecrets implements SecretRepository {
   records = new Map<string, StoredSecret>(); history: StoredVersion[] = [];
@@ -113,6 +119,75 @@ export function fixture() {
   const service = new SecretService(repository, crypto);
   return { repository, service, projectId, crypto };
 }
+test('native HOME publishes selections after creation, retains CLI refreshes on resume and revokes without credential transport', async () => {
+  const { service, projectId, repository, crypto } = fixture();
+  const root = await mkdtemp(join(tmpdir(), 'cocell-native-home-'));
+  await service.mountHomes(root);
+  let generation = 1, queries = 0;
+  const writes: string[] = [];
+  const provider = { client: {
+    getBox: async () => { queries++; return { phase: 'running', generation, capabilities: { protectedTools: true, credentialBatch: true, mountedDebugHome: true } }; },
+    writeCredentials: async (_id: string, _generation: number, files: Record<string, Uint8Array>) => { writes.push(Buffer.from(files.cocell_tool_runtime).toString()); },
+  } } as unknown as CellboxSandboxProvider;
+  const host = new SandboxLifecycle([new SandboxRuntimeConfig({ provider, secrets: service, sharedDataRoot: root, toolBrokerUrl: 'http://broker.example.test' }).extension]);
+  const run = (action: 'create' | 'connect' | 'resume' | 'destroy') => host.run({ action, resourceKey: `project:${projectId}`, sandboxId: 'box-one' }, async () => {});
+  const file = join(root, 'runtime/debug-homes', projectId, '.kube/config');
+  try {
+    await run('create');
+    assert.deepEqual(JSON.parse(writes[0]), { mode: 'home', boxId: 'box-one', url: 'http://broker.example.test' });
+    await assert.rejects(service.authorize('box-one', 'kubectl', ['config', 'get-contexts']), /未授权/);
+    const raw = '\uFEFFapiVersion: v1\r\ncurrent-context: fixture\r\n';
+    const secret = await service.create({ name: 'fixture', tool: 'kubectl', path: '.kube/config', format: 'text', content: raw, mutable: true });
+    await service.savePermissions(projectId, [{ tool: 'kubectl', enabled: true }]);
+    assert.equal(await readFile(file, 'utf8'), raw, 'Selection saved after creation must be delivered immediately');
+    const authorization = await service.authorize('box-one', 'kubectl', ['config', 'get-contexts']);
+    assert.deepEqual(authorization, { tool: 'kubectl', args: ['config', 'get-contexts'], home: `/home/debug/${projectId}`, path: '.kube/config' });
+    assert.equal(repository.runs.size, 0, 'Authorization must not create invocation persistence work');
+    const app = new Hono();
+    installOperatorAccess(app, { token: 'operator-' + 'x'.repeat(32), publicUrl: 'https://cocell.example.test', projects: () => [] });
+    installSecretRoutes(app, service, id => id === projectId);
+    const response = await app.request('http://broker.example.test/api/tool-runtime/authorize', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ boxId: 'box-one', tool: 'kubectl', args: ['config', 'get-contexts'] }) });
+    assert.equal(response.status, 200); assert.deepEqual(await response.json(), authorization);
+    await writeFile(file, 'native-refreshed-file');
+    const before = await stat(file), queryCount = queries;
+    generation++;
+    await run('resume');
+    assert.equal(queries, queryCount, 'Resume must not query or deliver credentials');
+    assert.equal((await stat(file)).mtimeMs, before.mtimeMs);
+    await run('connect');
+    await service.saveSelections(projectId, [{ tool: 'kubectl', secretId: secret.id }]);
+    assert.equal(await readFile(file, 'utf8'), 'native-refreshed-file'); assert.equal(writes.length, 1);
+    const restarted = new SecretService(repository, crypto); await restarted.mountHomes(root);
+    assert.deepEqual(await restarted.authorize('box-one', 'kubectl', ['config', 'get-contexts']), authorization);
+    await run('destroy');
+    assert.equal(await readFile(file, 'utf8'), 'native-refreshed-file', 'Project HOME must outlive a destroyed Box');
+    await service.registerRuntime('box-restored', projectId, 1);
+    await service.publishHome(projectId);
+    assert.deepEqual(await service.authorize('box-restored', 'kubectl', ['config', 'get-contexts']), authorization);
+    assert.equal(await readFile(file, 'utf8'), 'native-refreshed-file', 'A new Box must reuse native refreshed credentials');
+    await service.update(secret.id, { content: 'operator-updated-file' });
+    assert.equal(await readFile(file, 'utf8'), 'operator-updated-file');
+    await service.update(secret.id, { enabled: false });
+    await assert.rejects(service.authorize('box-restored', 'kubectl', ['get', 'pods']), /停用/);
+    await assert.rejects(readFile(file), { code: 'ENOENT' });
+    assert.equal((await stat(join(root, 'runtime/debug-homes', projectId))).isDirectory(), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('native HOME rejects multi-file credentials and path collisions before changing project selection', async () => {
+  const { service, projectId } = fixture();
+  const group = await service.create({ name: 'Legacy group', tool: 'custom', path: 'auth', format: 'files', mutable: true, files: [{ path: 'auth', content: 'fixture' }, { path: 'key', content: 'fixture' }] });
+  const root = await mkdtemp(join(tmpdir(), 'cocell-home-selection-'));
+  await service.mountHomes(root);
+  try {
+    await assert.rejects(service.saveSelections(projectId, [{ tool: 'custom', secretId: group.id }]), /一个原生文本/);
+    const a = await service.create({ name: 'A', tool: 'first', path: 'auth', format: 'text', content: 'fixture', mutable: false });
+    const b = await service.create({ name: 'B', tool: 'second', path: 'auth/key', format: 'text', content: 'fixture', mutable: false });
+    await service.saveSelections(projectId, [{ tool: 'first', secretId: a.id }]);
+    await assert.rejects(service.saveSelections(projectId, [{ tool: 'first', secretId: a.id }, { tool: 'second', secretId: b.id }]), /路径不能重复/);
+    assert.deepEqual((await service.grants(projectId)).map(grant => grant.tool), ['first']);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 test('local file provisioning and last commit wins sync do not check current selections or live Sandbox status', async () => {
   const { repository, projectId, crypto } = fixture();
   const service = new SecretService(repository, crypto);
@@ -303,6 +378,50 @@ test('selection API accepts only operator access and persists or clears one key 
   assert.equal((await response.json())[0].files[0].secretId, secret.id);
   assert.equal((await put(operatorToken, [])).status, 200);
   assert.equal((await service.grants(projectId)).length, 0);
+});
+
+test('binary permission API returns no credential identifiers, preserves explicit bindings and rejects ambiguous new grants atomically', async () => {
+  const { service, projectId } = fixture();
+  const operatorToken = 'operator-' + 'x'.repeat(32), origin = 'https://cocell.example.test';
+  const app = new Hono();
+  installOperatorAccess(app, { token: operatorToken, publicUrl: origin, projects: () => [] });
+  app.onError((error, c) => c.json({ error: error instanceof HttpError ? error.message : 'invalid' }, error instanceof HttpError ? error.status as 400 : 400));
+  installSecretRoutes(app, service, id => id === projectId);
+  const path = `${origin}/api/projects/${projectId}/tool-permissions`;
+  const put = (permissions: unknown, token = operatorToken) => app.request(path, { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ permissions }) });
+  const first = await service.create({ name: 'Private credential name', tool: 'kubectl', path: '.kube/config', format: 'text', mutable: true, content: 'private-credential-content' });
+  assert.deepEqual(await service.permissions(projectId), [{ tool: 'kubectl', enabled: false, available: true }]);
+  assert.equal((await put([{ tool: 'kubectl', enabled: true }], 'not-operator')).status, 401);
+  assert.equal((await put([{ tool: 'kubectl', enabled: true }])).status, 200);
+  const initial = await service.grants(projectId);
+  assert.equal(initial[0].files[0].secretId, first.id);
+  const second = await service.create({ name: 'Other legacy choice', tool: 'kubectl', path: '.kube/other', format: 'text', mutable: false, content: 'other-fixture' });
+  const existing = await put([{ tool: 'kubectl', enabled: true }]);
+  assert.equal(existing.status, 200);
+  assert.deepEqual(await existing.json(), [{ tool: 'kubectl', enabled: true, available: true }]);
+  assert.equal((await service.grants(projectId))[0].id, initial[0].id);
+  assert.equal((await put([{ tool: 'kubectl', enabled: false }, { tool: 'mysql', enabled: true }])).status, 400);
+  assert.equal((await service.grants(projectId))[0].files[0].secretId, first.id);
+  assert.equal((await put([{ tool: 'kubectl', enabled: true, secretId: second.id }])).status, 400);
+  assert.equal((await put([{ tool: 'kubectl', enabled: false }])).status, 200);
+  assert.deepEqual(await service.permissions(projectId), [{ tool: 'kubectl', enabled: false, available: true }]);
+  const revoked = (await service.grants(projectId))[0];
+  assert.equal(revoked.enabled, false); assert.equal(revoked.id, initial[0].id);
+  assert.equal(revoked.files[0].secretId, first.id);
+  assert.equal((await put([{ tool: 'kubectl', enabled: true }])).status, 200);
+  assert.equal((await service.grants(projectId))[0].files[0].secretId, first.id);
+  await service.saveSelections(projectId, []);
+  assert.equal((await service.permissions(projectId))[0].available, false);
+  const ambiguous = await put([{ tool: 'kubectl', enabled: true }]);
+  assert.equal(ambiguous.status, 400); assert.match((await ambiguous.json()).error, /只保留一份/);
+  assert.deepEqual(await service.grants(projectId), []);
+  await service.update(second.id, { enabled: false });
+  assert.equal((await put([{ tool: 'kubectl', enabled: true }])).status, 200);
+  const duplicate = await put([{ tool: 'kubectl', enabled: true }, { tool: 'kubectl', enabled: false }]);
+  assert.equal(duplicate.status, 400);
+  assert.equal((await service.grants(projectId))[0].files[0].secretId, first.id);
+  const read = await app.request(path, { headers: { Authorization: `Bearer ${operatorToken}` } });
+  assert.equal(read.status, 200); assert.deepEqual(await read.json(), [{ tool: 'kubectl', enabled: true, available: true }]);
 });
 
 test('arbitrary tools and paths use unchanged text, including YAML, and refresh through the same boundary', async () => {

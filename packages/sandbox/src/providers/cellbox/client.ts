@@ -6,6 +6,7 @@ export interface CellboxCapabilities {
   suspend: 'none' | 'same-node-checkpoint'; archives: string; protectedTools: boolean;
   sharedDirectory?: boolean;
   mountedToolRuntime?: boolean;
+  mountedDebugHome?: boolean;
   rootDebug?: boolean;
   credentialBatch?: boolean;
   internalServices?: boolean;

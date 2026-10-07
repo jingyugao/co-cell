@@ -59,6 +59,13 @@ if os.environ.get("COCELL_TOOL_RUNTIME_MOUNT_VERSION") == "1":
     mounted = profile.setdefault("mountedToolRuntimeImages", [])
     if image not in mounted:
         mounted.append(image)
+if os.environ.get("COCELL_DEBUG_HOME_VERSION") == "1":
+    if not profile.get("sharedReadOnlyHostPath"):
+        raise SystemExit("Mounted debug HOME requires the shared directory")
+    profile["debugReadWriteHostPath"] = profile["sharedReadOnlyHostPath"] + "/runtime/debug-homes"
+    homes = profile.setdefault("debugHomeImages", [])
+    if image not in homes:
+        homes.append(image)
 for tool in guest["tools"]:
     if tool["id"] in ("cocell_git", "cocell_glab"):
         tool["workspaceRead"] = True

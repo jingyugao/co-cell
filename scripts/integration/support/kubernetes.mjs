@@ -66,13 +66,12 @@ export async function testWorkspaceWriter(env, projectId) {
     const project = await env.json(`/api/projects/${projectId}`);
     assert(project.name.startsWith(`${env.prefix} `));
     assert.equal(project.sandbox.status, 'ready');
-    const path = `${project.workingDirectory}/${filename}`;
-    const response = await fetch(`${transport.base}/v1/boxes/${encodeURIComponent(project.sandbox.id)}/files?path=${encodeURIComponent(path)}`, {
+    const response = await fetch(`${transport.base}/v1/boxes/${encodeURIComponent(project.sandbox.id)}/files?path=${encodeURIComponent(filename)}`, {
       method: 'PUT', headers: { 'X-Cellbox-Client-ID': values.cellbox.clientId, 'Content-Type': 'application/octet-stream' },
       body: content, signal: AbortSignal.any([env.controller.signal, AbortSignal.timeout(30_000)]), redirect: 'error',
     });
-    assert(response.ok, `Workspace fixture write failed: HTTP ${response.status}`);
-    await response.arrayBuffer();
+    const detail = await response.text();
+    assert(response.ok, `Workspace fixture write failed: HTTP ${response.status}; ${env.redact(detail).slice(0, 500)}`);
   };
 }
 

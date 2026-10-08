@@ -192,15 +192,10 @@ export class ProjectSandboxOperations {
       if (sandbox.id !== project.sandbox!.id) throw new Error('重建不能替换持久化目录的所属 Sandbox');
       await this.deps.saveSandbox(id, sandbox, false);
     };
-    if (project.sandbox.status !== 'ready') {
-      if (project.sandbox.status !== 'unavailable') throw new HttpError(409, '仅故障 Sandbox 可以从挂载目录重建');
-      if (!runtime.rebuildPersistent) throw new HttpError(503, 'Sandbox 不支持保留挂载目录重建');
-      await this.phase(id, '保留挂载目录并重建进程');
-      await runtime.rebuildPersistent(target(project), `${projects.get(id).sandboxOperation!.id}:rebuild`, save);
-    } else {
-      if (!runtime.resume) throw new HttpError(503, 'Sandbox 不支持重建后的环境准备');
-      await runtime.resume(target(project), save);
-    }
+    if (!['ready', 'unavailable'].includes(project.sandbox.status)) throw new HttpError(409, '仅故障 Sandbox 可以从挂载目录重建');
+    if (!runtime.rebuildPersistent) throw new HttpError(503, 'Sandbox 不支持保留挂载目录重建');
+    await this.phase(id, project.sandbox.status === 'ready' ? '检查并启动环境进程' : '保留挂载目录并重建进程');
+    await runtime.rebuildPersistent(target(project), `${projects.get(id).sandboxOperation!.id}:rebuild`, save);
     await this.phase(id, '验证环境和历史');
     const candidate = projects.get(id).sandbox!;
     if (candidate.id !== project.sandbox.id) throw new Error('重建改变了 Sandbox 归属');

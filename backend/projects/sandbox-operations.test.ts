@@ -455,6 +455,7 @@ test('retry after a cold rebuild prepares the ready execution without rebuilding
   const operations = new ProjectSandboxOperations({ projects: f.projects,
     runtime: { ...runtime(control, []),
       async rebuildPersistent(value, _key, save) {
+        if (control.status === 'ready') { preparations++; await save({ ...value.sandbox!, status: 'ready' }); return; }
         rebuilds++; control.status = 'ready'; await save({ ...value.sandbox!, status: 'ready' });
         throw new Error('configuration temporarily failed');
       },

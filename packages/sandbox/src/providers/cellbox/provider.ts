@@ -250,8 +250,8 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   async rebuildPersistent(id: string, key: string) {
     await this.ready();
     const box = await this.box(id);
-    if (box.phase !== 'failed') throw new CellboxError('CONFLICT', `Box ${id} is ${box.phase}`);
-    await this.act(id, 'rebuild', key);
+    if (box.phase !== 'failed' && box.phase !== 'running') throw new CellboxError('CONFLICT', `Box ${id} is ${box.phase}`);
+    await this.act(id, box.phase === 'failed' ? 'rebuild' : 'reconcile', key);
   }
   async kill(id: string) {
     await this.ready();

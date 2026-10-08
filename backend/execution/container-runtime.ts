@@ -656,10 +656,12 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
     const endpoint = await this.options.appServer(sandbox.id);
     const client = new CodexAppServerClient({ url: endpoint.url, headers: endpoint.headers, requestTimeoutMs: 10_000 });
+    let verified = false;
     try {
       await client.connect();
       for (const threadId of [...new Set(threadIds)].slice(0, 3)) await client.request('thread/read', { threadId, includeTurns: true });
-    } finally { await client.close(); }
+      verified = true;
+    } finally { await this.closeVerificationClient(client, sandbox.id, verified); }
   }
 
   private async verifySandboxOnce(sandbox: SandboxState, timeoutMs: number) {
@@ -675,14 +677,24 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const endpoint = await this.options.appServer(sandbox.id);
     const client = new CodexAppServerClient({ url: endpoint.url, headers: endpoint.headers, requestTimeoutMs: timeoutMs });
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let verified = false;
     try {
       await Promise.race([
         client.connect(), // connect includes a real initialize RPC and protocol validation.
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new HttpError(502, 'Sandbox 服务验证超时')), timeoutMs); }),
       ]);
-    } finally { if (timer) clearTimeout(timer); await client.close(); }
+      verified = true;
+    } finally { if (timer) clearTimeout(timer); await this.closeVerificationClient(client, sandbox.id, verified); }
     sandbox.status = 'ready';
     sandbox.image = info.templateIdentity;
+  }
+
+  private async closeVerificationClient(client: CodexAppServerClient, sandboxId: string, verified: boolean) {
+    try { await client.close(); }
+    catch (error) {
+      if (verified) throw error;
+      void this.options.logger?.write({ event: 'sandbox.verification_cleanup_failed', sandboxId, error });
+    }
   }
 
   async fenceSandbox(sandbox: SandboxState) {

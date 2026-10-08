@@ -178,6 +178,17 @@ export async function projectLifecycle(env, { userInputOnly = false, homeRebuild
       return { archiveId: backup.id, sizeBytes: backup.sizeBytes, sha256: backup.sha256, threadIds: backup.threadIds };
     });
     if (homeRebuild) {
+      await step('Restore an activated archive candidate before testing its cold rebuild', async () => {
+        await json(`/api/projects/${projectId}/archive`, { method: 'POST', body: { useExistingBackup: true }, expectedStatus: 202, timeoutMs: operationTimeout });
+        await json(`/api/projects/${projectId}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 202 });
+        const ready = await waitProject('restore', 'ready');
+        assert.notEqual(ready.sandbox.id, originalSandboxId);
+        originalSandboxId = ready.sandbox.id;
+        const result = await turn(`请继续原会话，回复首次验证码。用已有 ${folder}/start.mjs 重新启动 HTTP 服务，不修改服务代码或文件内容，不下载软件。`);
+        assert(result.text.includes(memory));
+        firstHealth = await health(resumedContent);
+        return { ...result, restoredSandboxId: originalSandboxId };
+      });
       const latestContent = `after-backup-${randomUUID()}`;
       const latestMemory = `latest-conversation-${randomUUID()}`;
       await step('Write files and conversation after the archive was captured', async () => {

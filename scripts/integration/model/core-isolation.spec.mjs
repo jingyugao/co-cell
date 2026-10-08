@@ -24,8 +24,22 @@ test('core: sessions share workspace only within their project and deletion pres
     return { threadId: result.session.threadId };
   });
   await env.step('A sibling session reads the shared file but has a separate transcript', async () => {
-    const result = await runAgent(env, peer, `Read ${filename} using Node and reply with its exact content. Do not use subagents or external systems.`);
-    assert(result.text.includes(markerA));
+    const path = `${a.workingDirectory}/${filename}`;
+    const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
+    const command = `node -e 'process.stdout.write(require("node:fs").readFileSync(process.argv[1], "utf8"))' ${quote(path)}`;
+    const prompt = `请核对这个项目中已有文件的实际内容。必须使用 exec_command 执行以下只读命令：
+${command}
+必须等命令完成，根据工具输出，在最终回复中返回文件完整原文。不要猜测内容，不要只确认收到任务。读取失败则报告真实错误。不要修改文件，不要使用子代理或外部服务。`;
+    const result = await runAgent(env, peer, prompt);
+    env.report.sharedReadEvidence = { prompt, threadId: result.session.threadId, turn: result.turn };
+    await env.persist();
+    const reads = result.turn.items.filter(item => item.type === 'command_execution');
+    assert(reads.length > 0, `Sibling agent did not execute a file read; reply: ${env.redact(result.text).slice(0, 1000)}`);
+    assert(reads.some(item => item.status === 'completed' && item.exit_code === 0
+      && item.command.includes(filename) && item.aggregated_output.includes(markerA)), 'Sibling file-read command did not return the stored content');
+    assert(result.text.includes(markerA), `Sibling final reply missed the stored content; reply: ${env.redact(result.text).slice(0, 1000)}`);
+    assert(!result.turn.items.some(item => item.type === 'file_change'), 'Sibling read modified the workspace');
+    assert.equal((await env.json(fileURL(a, filename))).trim(), markerA, 'Sibling read changed the shared file');
     assert(!JSON.stringify(result.session.turns).includes(privateMarker), 'Sibling transcript contains private conversation');
     const original = await env.json(`/api/sessions/${owner.id}`);
     assert.notEqual(original.threadId, result.session.threadId);

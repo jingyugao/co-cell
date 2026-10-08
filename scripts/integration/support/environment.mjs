@@ -57,8 +57,10 @@ export class LiveEnvironment {
       try {
         const session = await this.json(`/api/sessions/${id}`, { signal: AbortSignal.timeout(10_000) });
         this.report.failedSessions.push({ id, status: session.status, threadId: session.threadId, historyError: session.historyError,
-          turns: session.turns.map(turn => ({ id: turn.id, status: turn.status, error: turn.error,
-            items: turn.items.map(item => ({ type: item.type, status: item.status, message: item.message, error: item.error })) })) });
+          turns: session.turns.map(turn => ({ id: turn.id, prompt: turn.prompt, status: turn.status, error: turn.error,
+            items: turn.items.map(item => ({ type: item.type, status: item.status, text: item.text,
+              command: item.command, exit_code: item.exit_code, aggregated_output: item.aggregated_output,
+              message: item.message, error: item.error })) })) });
       } catch (error) { this.report.failedSessions.push({ id, error: this.redact(error.message) }); }
     }
     await this.persist();
@@ -81,7 +83,13 @@ export class LiveEnvironment {
       await this.persist();
       const start = performance.now();
       try { entry.evidence = await run(); entry.status = 'passed'; return entry.evidence; }
-      catch (error) { entry.status = 'failed'; entry.error = this.redact(error.message); throw new Error(entry.error); }
+      catch (error) {
+        entry.status = 'failed'; entry.error = this.redact(error.message ?? String(error));
+        const failure = new Error(entry.error);
+        // Retain the original assertion location without leaking its raw properties.
+        if (error.stack) failure.stack = this.redact(error.stack);
+        throw failure;
+      }
       finally { entry.durationMs = performance.now() - start; await this.persist(); }
     });
   }

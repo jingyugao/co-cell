@@ -1,6 +1,8 @@
 import { test } from '../support/fixtures.mjs';
 import { projectLifecycle } from './project-lifecycle.mjs';
 import { conversationReads } from './conversation-reads.mjs';
+import { asynchronousUserInput } from './user-input.mjs';
+import { homeRebuild } from './home-rebuild.mjs';
 
 test('project lifecycle with real model, files, process memory, backup and restore', async ({ environment }) => {
   await projectLifecycle(environment);
@@ -11,9 +13,9 @@ test('conversation reads with a real direct subagent, isolation and latency guar
 });
 
 test('asynchronous user input with real native tool and persisted reply', async ({ environment }) => {
-  await projectLifecycle(environment, { userInputOnly: true });
+  await asynchronousUserInput(environment);
 });
 
 test('project lifecycle: failed Sandbox rebuild retains mounted files and conversation newer than the archive', async ({ environment }) => {
-  await projectLifecycle(environment, { homeRebuild: true });
+  await homeRebuild(environment);
 });

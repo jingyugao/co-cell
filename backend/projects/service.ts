@@ -334,7 +334,7 @@ export class ProjectService {
       delete next.sandboxArtifactsCleanedAt;
       next.sandbox = structuredClone(sandbox);
       next.workingDirectory = sandbox.workingDirectory;
-      if (restoreProject) next.imageSelection = restoreImage ? structuredClone(restoreImage) : undefined;
+      if (restoreProject || restoreImage) next.imageSelection = restoreImage ? structuredClone(restoreImage) : undefined;
       if (restoreProject && next.status === 'archived') {
         const at = new Date().toISOString();
         next.status = 'active';

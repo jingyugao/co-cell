@@ -19,7 +19,7 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
   return renderToStaticMarkup(<ProjectsPage
     projects={projects} config={config} loading={false} initialView={initialView}
     onRefresh={async () => projects} onCreate={async () => project()} onUpdate={async () => project()}
-    onRebuildSandbox={async () => project()} onBackup={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()}
+    onRebuildSandbox={async () => project()} onUpgradeSandbox={async () => project()} onArchive={async () => project()} onBackup={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()}
     onOpenProject={() => {}} onMenu={() => {}} onBack={() => {}}
   />);
 }

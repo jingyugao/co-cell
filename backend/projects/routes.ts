@@ -7,7 +7,7 @@ import { workspaceFileResponse } from '../workspaces/http-files.js';
 import { serviceHost } from './service-host.js';
 import { PROJECT_OPERATION_WAIT_MS } from '../../protocol/types.js';
 
-type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
+type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'upgradeProjectSandbox' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
 
 export async function proxyProjectService(manager: Pick<SessionManager, 'projectService'>, projectId: string, port: number,
   path: string, request: Request, prefix: string, isolatedOrigin = false): Promise<Response> {
@@ -46,6 +46,10 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
     try { parsed = body ? JSON.parse(body) : {}; } catch { throw new HttpError(400, '请求 JSON 无效'); }
     const input = z.object({ imageVersionId: z.string().min(1).max(256).optional() }).strict().parse(parsed);
     return c.json(await manager.rebuildProjectSandbox(c.req.param('id'), input.imageVersionId), 202);
+  });
+  app.post('/api/projects/:id/sandbox/upgrade', async c => {
+    const input = z.object({ imageVersionId: z.string().min(1).max(256) }).strict().parse(await c.req.json());
+    return c.json(await manager.upgradeProjectSandbox(c.req.param('id'), input.imageVersionId), 202);
   });
   app.post('/api/projects/:id/open', async c => c.json(await manager.enterProject(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/resume', async c => c.json(await manager.resumeProjectSandbox(c.req.param('id')), 202));

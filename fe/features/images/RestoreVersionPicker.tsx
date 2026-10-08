@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import type { ManagedImage } from '../../../protocol/image-types';
 import { api } from '../../lib/api';
 
-export default function RestoreVersionPicker({ imageId, disabled, value, onChange }: {
+export default function RestoreVersionPicker({ imageId, disabled, value, onChange, label = "恢复镜像版本" }: {
+  label?: string;
   imageId: string; disabled: boolean; value: string; onChange: (value: string) => void;
 }) {
   const [image, setImage] = useState<ManagedImage>();
@@ -14,8 +15,8 @@ export default function RestoreVersionPicker({ imageId, disabled, value, onChang
     }).catch(error => { if (alive) setError(error instanceof Error ? error.message : '版本读取失败'); });
     return () => { alive = false; };
   }, [imageId]);
-  return <label className="project-rebuild-hint">恢复镜像版本
-    <select aria-label="恢复镜像版本" disabled={disabled} value={value} onChange={event => onChange(event.target.value)}>
+  return <label className="project-rebuild-hint">{label}
+    <select aria-label={label} disabled={disabled} value={value} onChange={event => onChange(event.target.value)}>
       <option value="">保留项目原版本</option>
       {image?.versions.filter(version => version.status === 'succeeded' && !version.deprecatedAt && !version.cleanup && version.projectReady !== false).map(version =>
         <option value={version.id} key={version.id}>{version.version}{version.id === image.defaultVersionId ? '（默认）' : ''} · {new Date(version.createdAt).toLocaleString('zh-CN', { hour12: false })}</option>)}

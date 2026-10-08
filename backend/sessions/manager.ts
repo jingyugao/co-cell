@@ -45,6 +45,7 @@ function normalizeExecutionSettings(settings: Settings): Settings {
 
 export interface SandboxLifecycleOptions {
   archivedReclaimAfterMs?: number;
+  completedPauseAfterMs?: number;
   scanIntervalMs?: number;
   now?: () => number;
 }
@@ -111,7 +112,12 @@ export class SessionManager {
       this.lifecycle = new SandboxLifecycleService({
         ...lifecycleOptions,
         listProjects: () => this.listProjectsWithArchives(),
-        reclaim: (id, options) => this.archiveProjectNow(id, options).then(() => {}),
+        reclaim: async id => {
+          // Recheck after the scan, then acquire the normal project operation
+          // lock. Completion never authorizes deleting the persistent disk.
+          if (this.projects.get(id).status !== 'completed') return;
+          await this.runProjectSandboxOperation(id, 'checkpoint');
+        },
       });
     }
   }
@@ -216,7 +222,7 @@ export class SessionManager {
     // records retain references only; API responses always query Cellbox.
     for (const project of this.projects.list()) {
       if (project.executionMode !== 'sandbox' || !project.sandbox || !this.sandbox?.inspect) continue;
-      if (project.sandboxOperation?.status === 'failed' && ['create', 'resume', 'rebuild'].includes(project.sandboxOperation.kind)) continue;
+      if (project.sandboxOperation?.status === 'failed' && ['create', 'resume', 'rebuild', 'upgrade'].includes(project.sandboxOperation.kind)) continue;
       try { await this.sandbox.inspect(this.projectWorkspace(project)); }
       catch { /* A later query or lifecycle pass can retry provider inspection. */ }
     }
@@ -686,9 +692,10 @@ export class SessionManager {
 
   async rebuildProjectSandbox(id: string, imageVersionId?: string): Promise<ProjectSummary> {
     const project = await this.liveProject(this.projects.get(id));
+    if (project.sandboxOperation?.kind === 'upgrade' && project.sandboxOperation.status === 'failed') throw new HttpError(409, '镜像升级未完成，请重新选择镜像并重试升级');
     if (project.sandbox?.status === 'paused') throw new HttpError(409, 'Sandbox 已暂停，请恢复运行');
     if (project.sandbox?.status === 'starting') throw new HttpError(409, 'Sandbox 正在切换状态，请稍后重试');
-    if (project.sandbox?.status === 'ready' && !(project.sandboxOperation?.status === 'failed' && ['create', 'resume', 'rebuild'].includes(project.sandboxOperation.kind))) {
+    if (project.sandbox?.status === 'ready' && !(project.sandboxOperation?.status === 'failed' && ['create', 'resume', 'rebuild', 'upgrade'].includes(project.sandboxOperation.kind))) {
       throw new HttpError(409, 'Sandbox 已就绪，无需重建');
     }
     if (project.status !== 'archived' && !project.sandbox && project.remoteArchives?.length) throw new HttpError(409, '没有可沿用的 Sandbox 挂载目录，重建已停止');
@@ -697,6 +704,11 @@ export class SessionManager {
       : project.sandbox.status === 'ready' && project.sandboxOperation?.kind === 'create' ? 'create'
       : project.sandbox.status === 'ready' && project.sandboxOperation?.kind === 'resume' ? 'resume' : 'rebuild';
     await this.submitProjectSandboxOperation(id, kind, { imageVersionId });
+    return this.readProject(id);
+  }
+
+  async upgradeProjectSandbox(id: string, imageVersionId: string): Promise<ProjectSummary> {
+    await this.submitProjectSandboxOperation(id, 'upgrade', { imageVersionId });
     return this.readProject(id);
   }
 
@@ -824,7 +836,7 @@ export class SessionManager {
       throw new HttpError(409, '项目已归档，请先点击“恢复项目”');
     }
     if (project.sandbox?.status !== 'ready' || (project.sandboxOperation?.status === 'failed'
-      && ['create', 'resume', 'rebuild'].includes(project.sandboxOperation.kind))) {
+      && ['create', 'resume', 'rebuild', 'upgrade'].includes(project.sandboxOperation.kind))) {
       throw new HttpError(409, project.sandbox?.status === 'paused' ? 'Sandbox 已暂停，请先恢复运行' : 'Sandbox 尚未就绪，请先在项目管理中创建或恢复环境');
     }
     if (!project.sandbox && (project.remoteArchives?.length)) {

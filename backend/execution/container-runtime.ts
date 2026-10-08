@@ -10,6 +10,7 @@ import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxLease, Sandbox
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import { readCellboxWorkspaceFile, cellboxWorkspaceFileResponse } from '../sandboxes/cellbox-files.js';
 import { holdResponse } from '../../util/http-stream.js';
+import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import type { AgentEvent } from '../../protocol/types.js';
 import type { Session, SubagentConversation, Turn } from '../../protocol/types.js';
 import type { NativeHistory } from './native-history.mjs';
@@ -39,6 +40,7 @@ export interface SandboxRuntime {
   subagents?(session: Session, signal?: AbortSignal): Promise<SubagentConversation[]>;
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
+  upgradePersistent?(target: WorkspaceTarget, selection: ProjectImageSelection, key: string): Promise<SandboxState>;
   rebuildPersistent?(target: WorkspaceTarget, key: string, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   resume?(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   checkpoint?(target: WorkspaceTarget): Promise<SandboxState>;
@@ -58,6 +60,7 @@ export interface ContainerRuntimeOptions {
   prepareRemote: (sandbox: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal) => Promise<boolean>;
   acquireRemoteUsage?: (sandboxId: string, initializationDirectory?: string) => Promise<() => Promise<void>>;
   remoteArchives?: import('../archives/remote.js').RemoteArchives;
+  activateSandbox?: (candidate: SandboxState) => Promise<void>;
   sandboxes: ProjectSandboxes;
   provider: SandboxProvider;
   apiKey: string;
@@ -596,7 +599,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (!info) return { ...sandbox, status: 'unavailable' };
     const phase = info.metadata?.phase;
     const status = info.state === 'running' ? 'ready' : info.state === 'paused' ? 'paused'
-      : ['creating', 'resuming', 'restoring', 'checkpointing', 'suspending', 'staged'].includes(phase ?? '') ? 'starting' : 'unavailable';
+      : ['upgrading', 'rebuilding', 'creating', 'resuming', 'restoring', 'checkpointing', 'suspending', 'staged'].includes(phase ?? '') ? 'starting' : 'unavailable';
     return { ...sandbox, status, ...(info.templateIdentity ? { image: info.templateIdentity } : {}) };
   }
 
@@ -616,6 +619,19 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const entry = await this.acquire(target, true, onSandbox, undefined, undefined, true);
     try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
   }
+  async upgradePersistent(target: WorkspaceTarget, selection: ProjectImageSelection, key: string): Promise<SandboxState> {
+    if (!target.sandbox) throw new HttpError(409, '项目没有持久化 Sandbox');
+    const provider = this.options.provider as SandboxProvider & { upgradePersistent?: (id: string, image: string, key: string) => Promise<void> };
+    if (!provider.upgradePersistent || !this.options.activateSandbox) throw new HttpError(503, 'Sandbox 不支持磁盘保留升级');
+    await this.detachSandbox(target);
+    this.runtimePreparations.delete(target.sandbox.id);
+    await provider.upgradePersistent(target.sandbox.id, selection.importedImageId, key);
+    const candidate = await this.querySandbox(target.sandbox);
+    if (candidate.image?.id !== selection.image) throw new HttpError(409, '升级后的镜像身份与所选版本不一致');
+    await this.options.activateSandbox(candidate);
+    return { ...candidate, status: 'ready' };
+  }
+
   async rebuildPersistent(target: WorkspaceTarget, key: string, onSandbox: SaveSandbox) {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在，无法沿用挂载目录');
     const provider = this.options.provider as SandboxProvider & { rebuildPersistent?: (id: string, key: string) => Promise<void> };

@@ -12,6 +12,7 @@ export const test = base.extend({
     // Deterministic API boundaries make pending/error transitions reproducible.
     // These cases test the real React application, separately from the live suites.
     const projects = new Map([['paused', project('paused', '暂停项目')], ['other', project('other', '另一个项目', 'ready')]]);
+    const images = [{ id: 'default', name: '系统默认镜像', category: '系统', origin: 'profile', versions: [{ id: 'default', version: '当前配置', status: 'succeeded', source: 'default', projectReady: true }] }];
     const calls = [], historyReads = [], errors = [];
     const waiters = new Map(), cancelled = new Map();
     const notify = id => { for (const finish of waiters.get(id) ?? []) finish(); };
@@ -26,7 +27,7 @@ export const test = base.extend({
       let data, status = 200;
       if (path === '/api/config') data = config;
       else if (path === '/api/notifications') data = [];
-      else if (path === '/api/images') data = [{ id: 'default', name: '系统默认镜像', category: '系统', origin: 'profile', versions: [{ id: 'default', version: '当前配置', status: 'succeeded', source: 'default', projectReady: true }] }];
+      else if (path === '/api/images') data = images;
       else if (path === '/api/projects' && method === 'GET') data = [...projects.values()];
       else if (path === '/api/projects' && method === 'POST') {
         data = project('new', request.postDataJSON().name); delete data.sandbox;
@@ -55,7 +56,8 @@ export const test = base.extend({
         else if (method === 'POST' && path.endsWith('/open')) {
           status = 202;
           if (data.sandbox?.status === 'paused' && data.sandboxOperation?.status !== 'running') data.sandboxOperation = operation('resume');
-        } else if (method === 'POST' && path.endsWith('/rebuild')) { data.sandboxOperation = operation(data.sandbox ? 'rebuild' : 'create'); status = 202; }
+        } else if (method === 'POST' && path.endsWith('/upgrade')) { data.sandboxOperation = operation('upgrade'); data.selectedUpgrade = request.postDataJSON().imageVersionId; status = 202; }
+        else if (method === 'POST' && path.endsWith('/rebuild')) { data.sandboxOperation = operation(data.sandbox ? 'rebuild' : 'create'); status = 202; }
       } else if (path === '/api/sessions' && method === 'GET') data = [session];
       else if (path === '/api/sessions/old-session/events') {
         await route.fulfill({ contentType: 'text/event-stream', body: `data: ${JSON.stringify({ type: 'snapshot', session })}\n\n` }); return;
@@ -66,7 +68,7 @@ export const test = base.extend({
       if (!request.failure()) await route.fulfill({ status, json: data });
     });
     const ui = {
-      projects, calls, historyReads,
+      projects, images, calls, historyReads,
       editor: page.getByRole('textbox', { name: '任务描述', exact: true }),
       send: page.getByRole('button', { name: '发送任务', exact: true }),
       count: (method, path) => calls.filter(call => call.path === path && call.method === method).length,

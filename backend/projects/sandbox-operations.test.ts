@@ -470,3 +470,36 @@ test('retry after a cold rebuild prepares the ready execution without rebuilding
     assert.equal(f.projects.get(id).sandboxOperation?.status, 'succeeded');
   } finally { await operations.close(); await f.close(); }
 });
+
+for (const verificationFails of [false, true]) test(`disk image upgrade preserves binding and commits selection only after validation (${verificationFails})`, async () => {
+  const old: ProjectImageSelection = { imageId: 'image', imageName: 'base', category: 'test', versionId: 'old', version: '1', importedImageId: 'import-old', image: 'digest-old' };
+  const next: ProjectImageSelection = { ...old, versionId: 'new', version: '2', importedImageId: 'import-new', image: 'digest-new' };
+  const f = await fixture(project('upgrade', { imageSelection: old, remoteArchives: [remoteReference] }));
+  const calls: string[] = [];
+  let released = false;
+  const operations = new ProjectSandboxOperations({ projects: f.projects,
+    runtime: { ...runtime({}, calls),
+      async upgradePersistent(value, selection) {
+        assert.equal(value.sandbox?.id, 'sandbox-old'); assert.deepEqual(selection, next);
+        calls.push('upgrade-disk');
+        return { ...value.sandbox!, image: { id: next.image, reference: next.image, repoDigests: [] } };
+      },
+      async verifyHistory(_sandbox, threads) {
+        assert.deepEqual(threads, ['thread-1']); calls.push('history');
+        if (verificationFails) throw new Error('history unavailable');
+      },
+    }, threadIds: () => ['thread-1'],
+    selectRestoreImage: async (_project, version) => { assert.equal(version, 'new'); return { selection: next, release() { released = true; } }; },
+    saveSandbox: async (id, value, restore, image) => { await f.projects.updateSandbox(id, value, restore, image); },
+    detached: async () => { throw new Error('must not discard session history'); },
+  });
+  try {
+    const run = operations.run('upgrade', 'upgrade', { imageVersionId: 'new' });
+    if (verificationFails) await assert.rejects(run, /history unavailable/); else await run;
+    assert.equal(f.projects.get('upgrade').sandbox?.id, 'sandbox-old');
+    assert.equal(f.projects.get('upgrade').imageSelection?.versionId, verificationFails ? 'old' : 'new');
+    assert.equal(released, true);
+    assert.deepEqual(calls, ['inspect', 'upgrade-disk', 'verify', 'history']);
+    assert.equal(f.projects.get('upgrade').remoteArchives?.[0].id, remoteReference.id);
+  } finally { await operations.close(); await f.close(); }
+});

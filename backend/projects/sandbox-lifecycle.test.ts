@@ -10,7 +10,7 @@ const project = (id: string, overrides: Partial<Project> = {}): Project => ({
   ...overrides,
 });
 
-test('sweep archives only completed Sandbox projects after the grace period', async () => {
+test('sweep pauses only completed Sandbox projects after the grace period', async () => {
   const now = Date.parse('2026-04-01T00:00:00.000Z');
   const threshold = 24 * 60 * 60 * 1000;
   const projects = [
@@ -26,14 +26,11 @@ test('sweep archives only completed Sandbox projects after the grace period', as
     project('missing', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: undefined }),
   ];
   const reclaimed: string[] = [];
-  const existingBackups: string[] = [];
-  const service = new SandboxLifecycleService({ listProjects: () => projects, reclaim: async (id, options) => {
+  const service = new SandboxLifecycleService({ listProjects: () => projects, reclaim: async id => {
     reclaimed.push(id);
-    if (options?.useExistingBackup) existingBackups.push(id);
   }, now: () => now });
   await service.sweep();
-  assert.deepEqual(reclaimed, ['eligible', 'paused']);
-  assert.deepEqual(existingBackups, ['eligible', 'paused']);
+  assert.deepEqual(reclaimed, ['eligible']);
   await service.close();
 });
 

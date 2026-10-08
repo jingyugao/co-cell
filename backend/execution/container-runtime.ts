@@ -621,7 +621,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const provider = this.options.provider as SandboxProvider & { rebuildPersistent?: (id: string, key: string) => Promise<void> };
     if (!provider.rebuildPersistent) throw new HttpError(503, 'Sandbox 不支持保留挂载目录重建');
     this.runtimePreparations.delete(target.sandbox.id);
-    await this.sandboxes.manager.lifecycle.run({ action: 'reconcile', resourceKey: `project:${target.projectId ?? target.id}`, sandboxId: target.sandbox.id },
+    await this.sandboxes.manager.lifecycle.run({ action: 'reconcile', resourceKey: `project:${target.projectId ?? target.id}`, sandboxId: target.sandbox.id, metadata: { restoreRuntimeConfig: 'true' } },
       () => provider.rebuildPersistent!(target.sandbox!.id, key));
     await this.sandboxes.inspect(target);
     await this.resume(target, onSandbox);

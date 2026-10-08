@@ -65,6 +65,9 @@ export class SandboxRuntimeConfig {
     if (!box.capabilities.protectedTools) return;
     if (box.phase !== 'running' && box.phase !== 'staged') throw new Error(`Cannot configure Cellbox in phase ${box.phase}`);
     const generation = box.generation;
+    // Cold rebuild loses guest credential slots even though HOME and the stable
+    // provisioning revision survive. A digest is not proof the slot still exists.
+    const restoreRuntimeConfig = context.metadata?.restoreRuntimeConfig === 'true';
     const repository = this.options.secrets?.repository;
     const previous = await repository?.runtime(boxId);
     // The provisioning revision survives execution changes. The legacy SQL
@@ -97,7 +100,7 @@ export class SandboxRuntimeConfig {
           slots = { cocell_tool_runtime: Buffer.from(JSON.stringify(config)) };
         } else {
           // Existing images retain the delivery contract saved in their checkpoint.
-          if (!['connect', 'reconcile'].includes(context.action) || !applied.cocell_tool_runtime) {
+          if (!['connect', 'reconcile'].includes(context.action) || !applied.cocell_tool_runtime || (restoreRuntimeConfig && !mount)) {
             const config: ToolRuntimeConfig = { mode: 'files', boxId, revision, url: this.options.toolBrokerUrl, files: await this.options.secrets.provision(projectId),
               // Compatibility with checkpointed older runners; no authentication.
               generation: revision, token: boxId };
@@ -108,6 +111,7 @@ export class SandboxRuntimeConfig {
             const bytes = await mount.read();
             if (createHash('sha256').update(bytes).digest('hex') !== applied.cocell_tool_runtime)
               throw new Error('Mounted runtime configuration differs from its acknowledged snapshot');
+            if (restoreRuntimeConfig) slots = { cocell_tool_runtime: bytes };
           }
         }
       }
@@ -118,7 +122,7 @@ export class SandboxRuntimeConfig {
       this.legacyDigests.set(key, applied);
     }
     const digests = Object.fromEntries(Object.entries(slots).map(([slot, bytes]) => [slot, createHash('sha256').update(bytes).digest('hex')]));
-    const changed = Object.fromEntries(Object.entries(slots).filter(([slot]) => applied[slot] !== digests[slot]));
+    const changed = Object.fromEntries(Object.entries(slots).filter(([slot]) => restoreRuntimeConfig || applied[slot] !== digests[slot]));
     let pointerDigest: string | undefined;
     if (mount && slots.cocell_tool_runtime) {
       await mount.publish(slots.cocell_tool_runtime);
@@ -126,7 +130,7 @@ export class SandboxRuntimeConfig {
       pointerDigest = createHash('sha256').update(pointer).digest('hex');
       // The descriptor is unchanged by checkpoint/resume and survives in the
       // restored filesystem. Ordinary resume does not touch either file.
-      if (previousPointer === pointerDigest) delete changed.cocell_tool_runtime;
+      if (previousPointer === pointerDigest && !restoreRuntimeConfig) delete changed.cocell_tool_runtime;
       else changed.cocell_tool_runtime = pointer;
       if ((await this.options.provider.client.getBox(boxId)).generation !== generation)
         throw new Error('Cellbox generation changed during runtime configuration');

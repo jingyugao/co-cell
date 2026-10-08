@@ -106,6 +106,16 @@ test('mounted credentials survive restart and resume without runtime queries or 
     assert.equal(fake.writes.length, 1, 'Checkpoint retains its descriptor and mounted snapshot');
     assert.equal(fake.batches.length, 1);
     assert.equal(fake.acknowledgements.has('box-one:2'), false);
+    fake.provider.client.getBox = async id => {
+      const box = await getBox(id);
+      return { ...box, capabilities: { ...box.capabilities, mountedToolRuntime: true } };
+    };
+    await new SandboxLifecycle([new SandboxRuntimeConfig(options).extension]).run({ action: 'reconcile',
+      resourceKey: 'project:project-one', sandboxId: 'box-one', metadata: { restoreRuntimeConfig: 'true' } }, async () => {});
+    assert.equal(fake.writes.length, 2, 'Cold rebuild restores its lost mounted descriptor');
+    assert.equal(fake.writes[1].bytes, fake.writes[0].bytes);
+    assert.equal(await readFile(path, 'utf8'), initialBytes, 'Retain the original credential snapshot');
+    assert.equal(fake.provisions(), 1);
     await run('destroy');
     assert.equal(await stat(path).catch(() => null), null);
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -147,6 +157,33 @@ test('durable acknowledgements survive execution changes and explicit provisioni
   assert.equal(Object.keys(fake.acknowledgements.get('box-one:1')!).length, 1);
   await fake.lifecycle().run({ action: 'destroy', resourceKey: 'project:project-one', sandboxId: 'box-one' }, async () => {});
   assert.equal(fake.acknowledgements.size, 0);
+});
+
+test('cold rebuild restores a lost native HOME descriptor despite its durable acknowledgement', async () => {
+  const fake = fixture(true), getBox = fake.provider.client.getBox;
+  fake.provider.client.getBox = async id => {
+    const box = await getBox(id);
+    return { ...box, capabilities: { ...box.capabilities, mountedDebugHome: true } };
+  };
+  let publications = 0;
+  fake.options.secrets.homes = {} as NonNullable<SecretService['homes']>;
+  fake.options.secrets.publishHome = async () => { publications++; };
+  await fake.reconcile();
+  const descriptor = fake.writes[0].bytes;
+  assert.deepEqual(JSON.parse(descriptor), { mode: 'home', boxId: 'box-one', url: fake.options.toolBrokerUrl });
+  fake.setGeneration(2);
+  await fake.reconcile();
+  assert.equal(fake.writes.length, 1, 'Ordinary reconnect keeps deduplication');
+  await fake.lifecycle().run({ action: 'reconcile', resourceKey: 'project:project-one', sandboxId: 'box-one',
+    metadata: { restoreRuntimeConfig: 'true' } }, async () => {});
+  assert.equal(fake.writes.length, 2);
+  assert.equal(fake.writes[1].bytes, descriptor);
+  assert.deepEqual(fake.batches, [['cocell_tool_runtime'], ['cocell_tool_runtime']]);
+  assert.equal(fake.acknowledgements.has('box-one:2'), false, 'Keep the stable provisioning revision');
+  assert.equal(fake.provisions(), 0, 'Native credentials stay in their mounted HOME');
+  assert.equal(publications, 3);
+  await fake.reconcile();
+  assert.equal(fake.writes.length, 2);
 });
 
 test('legacy archive delivery persists successful slots and a restart retries only the remainder', async () => {

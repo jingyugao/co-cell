@@ -40,6 +40,7 @@ export class LiveEnvironment {
     this.projects = new Map();
     this.sessions = new Set();
     this.boxes = new Set();
+    this.transports = [];
     this.controller = new AbortController();
     this.journal = journal;
     this.pendingWrite = Promise.resolve();
@@ -199,6 +200,12 @@ export class LiveEnvironment {
       try {
         const inventory = await this.json('/api/sandboxes', { signal });
         assert(!inventory.sandboxes.some(box => this.boxes.has(box.id)), 'A test sandbox remains after project deletion');
+      } catch (error) { errors.push(this.redact(error.message)); }
+    }
+    if (!this.config.keepProjects && this.sessions.size) {
+      try {
+        const sessions = await this.json('/api/sessions', { signal });
+        assert(!sessions.some(session => this.sessions.has(session.id)), 'A test session remains after project deletion');
       } catch (error) { errors.push(this.redact(error.message)); }
     }
     this.report.finishedAt = new Date().toISOString();

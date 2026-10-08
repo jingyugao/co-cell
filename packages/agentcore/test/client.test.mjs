@@ -104,3 +104,23 @@ test('native async questions survive live events and history conversion', () => 
  assert.deepEqual(event.item.questions, native.questions);
  assert.deepEqual(new AppServerEventAdapter().convert(native), event.item);
 });
+test('resuming an existing thread applies the current model to the next turn', async () => {
+ const { Codex } = await import('../src/index.mjs');
+ const { mkdtemp, writeFile, readFile, chmod, rm } = await import('node:fs/promises');
+ const { tmpdir } = await import('node:os');
+ const { join } = await import('node:path');
+ const directory = await mkdtemp(join(tmpdir(), 'agentcore-model-'));
+ const command = join(directory, 'codex'), log = join(directory, 'requests.jsonl');
+ await writeFile(command, `#!${process.execPath}\nimport(${JSON.stringify(new URL('./fake-server.mjs', import.meta.url).href)});\n`);
+ await chmod(command, 0o700);
+ const codex = new Codex({ codexPathOverride: command, env: { ...process.env, AGENTCORE_TEST_REQUEST_LOG: log } });
+ try {
+  const first = codex.startThread({ model: 'first-model' });
+  for await (const event of (await first.runStreamed('first')).events) {}
+  const resumed = codex.resumeThread(first.id, { model: 'corrected-model' });
+  for await (const event of (await resumed.runStreamed('next')).events) {}
+  const calls = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(calls.filter(call => call.method === 'turn/start').map(call => call.params.model), ['first-model', 'corrected-model']);
+  assert.equal(calls.find(call => call.method === 'thread/resume').params.threadId, first.id);
+ } finally { await codex.close(); await rm(directory, { recursive: true, force: true }); }
+});

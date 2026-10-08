@@ -13,7 +13,10 @@ export const test = base.extend({
       await use(environment);
     } finally {
       try { await environment.cleanup(); }
-      finally { await testInfo.attach('lifecycle-evidence', { path: environment.journal, contentType: 'application/json' }); }
+      finally {
+        try { await Promise.all(environment.transports.map(transport => transport.close())); }
+        finally { await testInfo.attach('lifecycle-evidence', { path: environment.journal, contentType: 'application/json' }); }
+      }
     }
   }, { timeout: Number(process.env.COCELL_E2E_OPERATION_TIMEOUT_MS ?? 300_000) + 60_000 }],
   livePage: async ({ browser, environment }, use) => {

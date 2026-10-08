@@ -175,6 +175,14 @@ export async function projectLifecycle(env, { userInputOnly = false } = {}) {
       assert.equal(backup.sourceSandboxId, originalSandboxId); assert(backup.threadIds.includes(threadId));
       return { archiveId: backup.id, sizeBytes: backup.sizeBytes, sha256: backup.sha256, threadIds: backup.threadIds };
     });
+    await step('Change the live workspace after backup so restore must roll it back', async () => {
+      const unbackedContent = `not-in-backup-${randomUUID()}`;
+      const result = await turn(`Do not restart the service. Change only ${folder}/continuity.txt to ${unbackedContent} plus newline. Do not create another backup. Verify the running HTTP service reads this new value.`);
+      assert(result.commands > 0);
+      await textFile('continuity.txt', unbackedContent);
+      const current = await health(unbackedContent); checkSameProcess(firstHealth, current);
+      return { archiveId: backup.id, unbackedContent, http: current };
+    });
     await step('Complete a checkpointed project without resuming it', async () => {
       await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 202 });
       await waitProject('checkpoint', 'paused');

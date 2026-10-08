@@ -23,7 +23,7 @@ await writeFile(join(work, 'credentials.json'), JSON.stringify(credentials), { m
 
 // Import images directly into this node; no registry credentials or image pushes.
 const suffix = exec('git', ['rev-parse', '--short=12', 'HEAD']).trim();
-const images = Object.fromEntries(['web', 'api', 'controller', 'sandbox'].map(name => [name, `docker.io/cocell-ci/${name}:${suffix}`]));
+const images = Object.fromEntries(['web', 'api', 'controller', 'sandbox', 'minio'].map(name => [name, `docker.io/cocell-ci/${name}:${suffix}`]));
 const build = args => exec('docker', ['build', ...args], { stdio: 'inherit' });
 build(['-f', 'deploy/web/Dockerfile', '-t', images.web, '.']);
 build(['-f', join(cellbox, 'images/cellbox-api.Dockerfile'), '-t', images.api, join(cellbox, 'dist/release')]);
@@ -33,6 +33,14 @@ await copyFile(join(cellbox, 'dist/release/cellbox-container-agent'), join(sandb
 await copyFile('deploy/box-wrap/launcher.mjs', join(sandboxContext, 'launcher.mjs'));
 const codexVersion = JSON.parse(await readFile('package.json', 'utf8')).dependencies['@openai/codex'];
 build(['-f', join(process.cwd(), 'deploy/ci/Sandbox.Dockerfile'), '--build-arg', `CODEX_VERSION=${codexVersion}`, '-t', images.sandbox, sandboxContext]);
+// The old public MinIO image is no longer pullable. Build its pinned official
+// source instead of depending on an unverified image mirror.
+const minioCommit = '0d7408fc9969caf07de6a8c3a84f9fbb10a6739e';
+const minioContext = join(work, 'minio'); await mkdir(minioContext);
+exec('go', ['install', `github.com/minio/minio@${minioCommit}`], {
+  env: { ...process.env, GOBIN: minioContext, CGO_ENABLED: '0' }, stdio: 'inherit',
+});
+build(['-f', join(process.cwd(), 'deploy/ci/Minio.Dockerfile'), '-t', images.minio, minioContext]);
 for (const image of Object.values(images)) {
   exec('bash', ['-o', 'pipefail', '-c', 'docker save "$1" | sudo k3s ctr images import -', 'image-import', image], { stdio: 'inherit' });
 }
@@ -67,7 +75,7 @@ function deployment(name, image, port, extra) {
     } } } };
 }
 apply([service('mysql', 3306), deployment('mysql', 'mysql:8.4', 3306, {}),
-  service('minio', 9000), deployment('minio', 'minio/minio:RELEASE.2025-04-22T22-12-26Z', 9000, { args: ['server', '/data'] })]);
+  service('minio', 9000), deployment('minio', images.minio, 9000, { imagePullPolicy: 'Never', args: ['server', '/data'] })]);
 for (const name of ['mysql', 'minio']) exec('kubectl', kube(['rollout', 'status', `deployment/${name}`, '--timeout=5m']), { stdio: 'inherit' });
 const forward = spawn('kubectl', kube(['port-forward', 'service/minio', ':9000', '--address=127.0.0.1']), { stdio: ['ignore', 'pipe', 'pipe'] });
 forward.stderr.resume();
@@ -101,4 +109,4 @@ for (const [name, chart, values] of [['cellbox', join(cellbox, 'charts/cellbox')
 // Keep the provenance, not configuration or credentials, in the uploaded report.
 await mkdir('tmp/integration/ci', { recursive: true });
 await writeFile('tmp/integration/ci/deployment.json', JSON.stringify({ commit: exec('git', ['rev-parse', 'HEAD']).trim(),
-  cellboxCommit: exec('git', ['-C', cellbox, 'rev-parse', 'HEAD']).trim(), nodeName, images, sandboxImage }, null, 2));
+  cellboxCommit: exec('git', ['-C', cellbox, 'rev-parse', 'HEAD']).trim(), minioCommit, nodeName, images, sandboxImage }, null, 2));

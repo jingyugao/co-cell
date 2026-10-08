@@ -26,6 +26,8 @@
     "test:integration:lifecycle": "node scripts/integration/run.mjs lifecycle",
     "test:integration:user-input": "node scripts/integration/run.mjs user-input",
     "test:integration:agent": "node scripts/integration/run.mjs agent",
+    "test:integration:core": "node scripts/integration/run.mjs core",
+    "test:integration:extended": "node scripts/integration/run.mjs extended",
     "test:integration:cleanup": "node scripts/integration/cleanup.mjs"
   },
   "dependencies": {

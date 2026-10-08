@@ -1,6 +1,14 @@
 name: Real agent on disposable K3s
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        description: Integration suite
+        type: choice
+        options: [core, extended]
+        default: core
+  schedule:
+    - cron: '30 18 * * *'
   push:
     branches: [master]
 permissions:
@@ -10,10 +18,10 @@ concurrency:
   cancel-in-progress: false
 jobs:
   agent:
-    if: github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     environment: integration
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CELLBOX_SOURCE_DIR: ${{ github.workspace }}/cellbox-source
       COCELL_E2E_MODEL: ${{ vars.COCELL_E2E_MODEL || secrets.COCELL_E2E_MODEL }}
@@ -23,6 +31,7 @@ jobs:
       COCELL_E2E_NAMESPACE: co-cell-ci
       COCELL_E2E_HELM_RELEASE: co-cell
       COCELL_E2E_OUTPUT_DIR: tmp/integration/ci
+      COCELL_E2E_DISPOSABLE_CI: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -45,12 +54,13 @@ jobs:
         run: |
           corepack enable
           pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
       - name: Install disposable K3s and gVisor
         run: bash scripts/integration/ci/setup-k3s.sh
       - name: Build and deploy the real stack
         run: node scripts/integration/ci/deploy.mjs
-      - name: Run a real agent and verify its service
-        run: pnpm test:integration:agent
+      - name: Run real core journeys (extended nightly)
+        run: pnpm test:integration:${{ github.event_name == 'schedule' && 'extended' || inputs.suite || 'core' }}
       - name: Collect diagnostics
         if: always()
         run: node scripts/integration/ci/collect.mjs

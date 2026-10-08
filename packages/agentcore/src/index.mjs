@@ -260,6 +260,7 @@ export class Thread {
       signal?.throwIfAborted();
       const userInput = typeof input === 'string' ? [{ type: 'text', text: input }] : input;
       const result = await client.turnStart({ threadId: this.id, input: userInput.map(part => part.type === 'local_image' ? { type: 'localImage', path: part.path } : { type: 'text', text: part.text, text_elements: [] }),
+        ...(opts.model ? { model: opts.model } : {}),
         ...(opts.modelReasoningEffort ? { effort: opts.modelReasoningEffort } : {}), ...(outputSchema ? { outputSchema } : {}) });
       turnId = result.turn.id;
       signal?.addEventListener('abort', abort, { once: true });

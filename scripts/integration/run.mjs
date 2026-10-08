@@ -16,6 +16,8 @@ const profiles = {
   lifecycle: ['model'],
   'user-input': ['model'],
   agent: ['model'],
+  core: ['live', 'model'],
+  extended: ['live', 'model'],
 };
 const [profile = 'ui', ...args] = process.argv.slice(2);
 if (profile === '--help' || profile === 'help') {
@@ -28,6 +30,8 @@ pnpm test:integration:reads             Real conversation history and nested sub
 pnpm test:integration:lifecycle         Real files, process continuity, backup/restore
 pnpm test:integration:user-input        Real asynchronous user question and answer
 pnpm test:integration:agent             Real agent writes files and starts HTTP; no tool credentials
+pnpm test:integration:core              Real core API/browser/model journeys; no business tool cases
+pnpm test:integration:extended          Core plus subagents, Git/Go and disposable-CI Web restart
 pnpm test:integration:full --list        List coverage without connecting to services
 
 Live suites require COCELL_E2E_BASE_URL and COCELL_E2E_ACCESS_TOKEN.
@@ -57,6 +61,7 @@ All other runs clean up their own projects, including on failure. Model suites u
     ...(profile === 'lifecycle' ? ['--grep=project lifecycle'] : []),
     ...(profile === 'user-input' ? ['--grep=asynchronous user input'] : []),
     ...(profile === 'agent' ? ['--grep=real agent creates files'] : []),
+    ...(['core', 'extended'].includes(profile) ? [`--grep-invert=prepared image tools|native .* HOME|deployed Git proxy${profile === 'core' ? '|conversation reads|nightly:' : ''}`] : []),
     ...args], { stdio: 'inherit', env: { ...process.env, ...transport.env, COCELL_E2E_PROFILE: profile, COCELL_E2E_OUTPUT_DIR: output } });
   // Let Playwright tear down fixtures on the first interrupt.
   process.on('SIGINT', () => child.kill('SIGINT'));

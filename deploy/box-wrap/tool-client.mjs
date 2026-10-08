@@ -1,6 +1,7 @@
 #!/usr/local/bin/node
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { encodeWorkingDirectory } from '../../util/tool-working-directory.mjs';
 import { encodeGitlabHost } from '../../util/gitlab-tool-host.mjs';
 
 const tool = process.argv[2];
@@ -12,7 +13,7 @@ if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(tool ?? '') || !Array.isArray(allowed) 
   process.exit(2);
 }
 let args;
-try { args = encodeGitlabHost(tool, process.argv.slice(3), process.env.GITLAB_HOST); }
+try { args = encodeWorkingDirectory(tool, encodeGitlabHost(tool, process.argv.slice(3), process.env.GITLAB_HOST), process.cwd()); }
 catch (error) { console.error(error.message); process.exit(2); }
 if (args.length > 32 || args.some(arg => Buffer.byteLength(arg) > 8192) ||
     args.reduce((bytes, arg) => bytes + Buffer.byteLength(arg), 0) > 8192) {

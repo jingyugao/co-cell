@@ -11,6 +11,7 @@ export async function prepareImageRequest(url: string, userCommand?: string) {
     ['deploy/box-wrap/protected-tool.mjs', '/opt/product/cocell/deploy/box-wrap/protected-tool.mjs'],
     ['deploy/box-wrap/legacy-protected-tool.mjs', '/opt/product/cocell/deploy/box-wrap/legacy-protected-tool.mjs'],
     ['util/credential-files.mjs', '/opt/product/cocell/util/credential-files.mjs'],
+    ['util/tool-working-directory.mjs', '/opt/product/cocell/util/tool-working-directory.mjs'],
     ['util/gitlab-tool-host.mjs', '/opt/product/cocell/util/gitlab-tool-host.mjs'],
     ['util/tool-runtime-identity.mjs', '/opt/product/cocell/util/tool-runtime-identity.mjs'],
     ['deploy/box-wrap/tools/cocell-proxy', '/opt/cellbox/tools/cocell-proxy'],

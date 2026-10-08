@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, normalize } from 'node:path';
+import { decodeWorkingDirectory } from '../../util/tool-working-directory.mjs';
 import { decodeGitlabHost } from '../../util/gitlab-tool-host.mjs';
 import { toolRuntimeBoxId } from '../../util/tool-runtime-identity.mjs';
 
@@ -24,6 +25,9 @@ async function execute(executable, args, env, cwd) {
 /** Authorize access, then execute against native files in the mounted HOME. */
 export async function runProtectedTool(tool, inputArgs, options = {}) {
   if (!/^[A-Za-z][A-Za-z0-9_.\-]{0,63}$/.test(tool)) throw new Error('Invalid protected tool name');
+  const invocation = await decodeWorkingDirectory(tool, inputArgs, options.agentHome);
+  inputArgs = invocation.args;
+  options = { ...options, ...(invocation.cwd ? { cwd: invocation.cwd, gitEnv: invocation.gitEnv } : {}) };
   const config = options.config ?? JSON.parse(await readFile(process.env.COCELL_TOOL_RUNTIME, 'utf8'));
   if (config.mode !== 'home') {
     // Checkpointed images/configurations keep their original delivery contract.
@@ -49,7 +53,7 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   const home = options.homeRoot ? join(options.homeRoot, setup.home.slice('/home/debug/'.length)) : setup.home;
   // Native tools may spawn each other. This PATH bypasses agent-side wrappers.
   const env = { PATH: `${options.binaryRoot ?? '/opt/cellbox/debug-bin'}:/usr/local/bin:/usr/bin:/bin`,
-    HOME: home, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(home, '.config'), XDG_DATA_HOME: join(home, '.local/share'), ...decoded.env };
+    HOME: home, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(home, '.config'), XDG_DATA_HOME: join(home, '.local/share'), ...decoded.env, ...options.gitEnv };
   const credential = join(home, setup.path);
   if (tool === 'kubectl') env.KUBECONFIG = credential;
   if (tool === 'glab') env.GLAB_CONFIG_DIR = dirname(credential);

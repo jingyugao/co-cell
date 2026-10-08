@@ -34,6 +34,7 @@ COPY --chmod=0755 deploy/box-wrap/tool-client.mjs /opt/product/cocell/deploy/box
 COPY --chmod=0755 deploy/box-wrap/protected-tool.mjs /opt/product/cocell/deploy/box-wrap/
 COPY --chmod=0755 deploy/box-wrap/legacy-protected-tool.mjs /opt/product/cocell/deploy/box-wrap/
 COPY util/credential-files.mjs /opt/product/cocell/util/
+COPY util/tool-working-directory.mjs /opt/product/cocell/util/
 COPY util/gitlab-tool-host.mjs /opt/product/cocell/util/
 COPY util/tool-runtime-identity.mjs /opt/product/cocell/util/
 # Preserve the public tool entry while resolving imports against the source layout.

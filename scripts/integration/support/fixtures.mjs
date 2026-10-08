@@ -12,6 +12,7 @@ export const test = base.extend({
       expect((await environment.json('/api/config')).sandbox?.enabled).toBe(true);
       await use(environment);
     } finally {
+      if (testInfo.status !== testInfo.expectedStatus) await environment.captureFailure();
       try { await environment.cleanup(); }
       finally {
         try { await Promise.all(environment.transports.map(transport => transport.close())); }

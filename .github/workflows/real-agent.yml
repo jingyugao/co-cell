@@ -54,9 +54,7 @@ jobs:
             ~/.cache/go-build
           key: ${{ runner.os }}-cocell-native-go-minio-0d7408fc-${{ hashFiles('cellbox-source/go.mod', 'cellbox-source/go.sum') }}
       - name: Check model configuration
-        run: |
-          test -n "$CODEX_API_KEY" || { echo 'Set integration secret CODEX_API_KEY'; exit 1; }
-          test -n "$COCELL_E2E_MODEL" || { echo 'Set integration variable or secret COCELL_E2E_MODEL'; exit 1; }
+        run: node scripts/integration/ci/check-model.mjs
       - name: Install test dependencies
         run: |
           corepack enable

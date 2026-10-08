@@ -47,7 +47,22 @@ export class LiveEnvironment {
     this.testStep = step;
     this.report = { runId: this.runId, prefix: this.prefix, target: config.publicURL.origin, startedAt: new Date().toISOString(), steps: [], requests: [], cleanup: [] };
   }
-  redact(value) { return String(value).replaceAll(this.config.token, '[redacted]'); }
+  redact(value) {
+    return [this.config.token, process.env.CODEX_API_KEY, process.env.OPENAI_API_KEY].filter(Boolean)
+      .reduce((text, secret) => text.replaceAll(secret, '[redacted]'), String(value));
+  }
+  async captureFailure() {
+    this.report.failedSessions = [];
+    for (const id of this.sessions) {
+      try {
+        const session = await this.json(`/api/sessions/${id}`, { signal: AbortSignal.timeout(10_000) });
+        this.report.failedSessions.push({ id, status: session.status, threadId: session.threadId, historyError: session.historyError,
+          turns: session.turns.map(turn => ({ id: turn.id, status: turn.status, error: turn.error,
+            items: turn.items.map(item => ({ type: item.type, status: item.status, message: item.message, error: item.error })) })) });
+      } catch (error) { this.report.failedSessions.push({ id, error: this.redact(error.message) }); }
+    }
+    await this.persist();
+  }
   name(label) { return `${this.prefix} ${label}`; }
   async persist() {
     if (!this.journal) return;

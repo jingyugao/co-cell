@@ -7,6 +7,10 @@ on:
         type: choice
         options: [core, extended]
         default: core
+      grep:
+        description: Optional test-title regex for focused diagnosis (empty runs the whole suite)
+        type: string
+        default: ''
   schedule:
     - cron: '30 18 * * *'
   push:
@@ -32,6 +36,7 @@ jobs:
       COCELL_E2E_HELM_RELEASE: co-cell
       COCELL_E2E_OUTPUT_DIR: tmp/integration/ci
       COCELL_E2E_DISPOSABLE_CI: '1'
+      COCELL_E2E_GREP: ${{ inputs.grep }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -65,7 +70,10 @@ jobs:
       - name: Build and deploy the real stack
         run: node scripts/integration/ci/deploy.mjs
       - name: Run real core journeys (extended nightly)
-        run: pnpm test:integration:${{ github.event_name == 'schedule' && 'extended' || inputs.suite || 'core' }} --max-failures=1
+        run: |
+          test_args=(--max-failures=1)
+          if [[ -n "$COCELL_E2E_GREP" ]]; then test_args+=(--grep="$COCELL_E2E_GREP"); fi
+          pnpm test:integration:${{ github.event_name == 'schedule' && 'extended' || inputs.suite || 'core' }} "${test_args[@]}"
       - name: Collect diagnostics
         if: always()
         run: node scripts/integration/ci/collect.mjs

@@ -108,6 +108,14 @@
             "new-api"
           ]
         },
+        "codexModelMetadata": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["template"],
+            "properties": { "template": { "type": "string", "minLength": 1 } }
+          }
+        },
         "credentialSlots": {
           "type": "object",
           "additionalProperties": {

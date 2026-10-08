@@ -123,6 +123,7 @@ export class ProjectSandboxOperations {
     }, async () => {
       try {
         if (kind === 'create') await this.create(id);
+        else if (kind === 'rebuild') await this.rebuild(id);
         else if (kind === 'checkpoint') await this.checkpoint(id);
         else if (kind === 'restore') await this.restore(id,
           project.sandboxOperation?.status === 'failed' && ['create', 'resume'].includes(project.sandboxOperation.kind), reservation);
@@ -179,6 +180,27 @@ export class ProjectSandboxOperations {
     await this.phase(id, '验证环境');
     if (!runtime.verifySandbox) throw new HttpError(503, 'Sandbox 不支持就绪验证');
     await runtime.verifySandbox(candidate);
+    await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, false);
+  }
+
+  private async rebuild(id: string) {
+    const { projects, runtime } = this.deps;
+    const project = await this.inspect(id);
+    if (project.status === 'archived' || !project.sandbox) throw new HttpError(409, '没有可沿用的项目挂载目录');
+    if (!runtime.verifySandbox) throw new HttpError(503, 'Sandbox 不支持就绪验证');
+    const save = async (sandbox: SandboxState) => {
+      if (sandbox.id !== project.sandbox!.id) throw new Error('重建不能替换持久化目录的所属 Sandbox');
+      await this.deps.saveSandbox(id, sandbox, false);
+    };
+    if (!['ready', 'unavailable'].includes(project.sandbox.status)) throw new HttpError(409, '仅故障 Sandbox 可以从挂载目录重建');
+    if (!runtime.rebuildPersistent) throw new HttpError(503, 'Sandbox 不支持保留挂载目录重建');
+    await this.phase(id, project.sandbox.status === 'ready' ? '检查并启动环境进程' : '保留挂载目录并重建进程');
+    await runtime.rebuildPersistent(target(project), `${projects.get(id).sandboxOperation!.id}:rebuild`, save);
+    await this.phase(id, '验证环境和历史');
+    const candidate = projects.get(id).sandbox!;
+    if (candidate.id !== project.sandbox.id) throw new Error('重建改变了 Sandbox 归属');
+    await runtime.verifySandbox(candidate);
+    await runtime.verifyHistory?.(candidate, this.deps.threadIds(id));
     await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, false);
   }
 

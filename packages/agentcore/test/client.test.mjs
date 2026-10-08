@@ -104,3 +104,13 @@ test('native async questions survive live events and history conversion', () => 
  assert.deepEqual(event.item.questions, native.questions);
  assert.deepEqual(new AppServerEventAdapter().convert(native), event.item);
 });
+
+test('a rejected WebSocket upgrade preserves its connection error and closes without waiting for peer acknowledgement', async () => {
+ const server = createServer((_request, response) => { response.writeHead(502); response.end('upstream unavailable'); });
+ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+ const start = Date.now();
+ try {
+  await assert.rejects(CodexAppServerClient.spawn({ url: `ws://127.0.0.1:${server.address().port}`, requestTimeoutMs: 2000 }), /WebSocket connection failed/);
+  assert(Date.now() - start < 2000, 'Failed upgrade waited for a nonexistent WebSocket close acknowledgement');
+ } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});

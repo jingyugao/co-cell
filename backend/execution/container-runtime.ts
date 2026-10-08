@@ -39,6 +39,7 @@ export interface SandboxRuntime {
   subagents?(session: Session, signal?: AbortSignal): Promise<SubagentConversation[]>;
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
+  rebuildPersistent?(target: WorkspaceTarget, key: string, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   resume?(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   checkpoint?(target: WorkspaceTarget): Promise<SandboxState>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
@@ -615,6 +616,17 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const entry = await this.acquire(target, true, onSandbox, undefined, undefined, true);
     try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
   }
+  async rebuildPersistent(target: WorkspaceTarget, key: string, onSandbox: SaveSandbox) {
+    if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在，无法沿用挂载目录');
+    const provider = this.options.provider as SandboxProvider & { rebuildPersistent?: (id: string, key: string) => Promise<void> };
+    if (!provider.rebuildPersistent) throw new HttpError(503, 'Sandbox 不支持保留挂载目录重建');
+    this.runtimePreparations.delete(target.sandbox.id);
+    await this.sandboxes.manager.lifecycle.run({ action: 'reconcile', resourceKey: `project:${target.projectId ?? target.id}`, sandboxId: target.sandbox.id, metadata: { restoreRuntimeConfig: 'true' } },
+      () => provider.rebuildPersistent!(target.sandbox!.id, key));
+    await this.sandboxes.inspect(target);
+    await this.resume(target, onSandbox);
+  }
+
   async resume(target: WorkspaceTarget, onSandbox: SaveSandbox) {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
     const entry = await traced('sandbox.acquire', { 'sandbox.id': target.sandbox.id },
@@ -644,10 +656,12 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
     const endpoint = await this.options.appServer(sandbox.id);
     const client = new CodexAppServerClient({ url: endpoint.url, headers: endpoint.headers, requestTimeoutMs: 10_000 });
+    let verified = false;
     try {
       await client.connect();
       for (const threadId of [...new Set(threadIds)].slice(0, 3)) await client.request('thread/read', { threadId, includeTurns: true });
-    } finally { await client.close(); }
+      verified = true;
+    } finally { await this.closeVerificationClient(client, sandbox.id, verified); }
   }
 
   private async verifySandboxOnce(sandbox: SandboxState, timeoutMs: number) {
@@ -663,14 +677,24 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const endpoint = await this.options.appServer(sandbox.id);
     const client = new CodexAppServerClient({ url: endpoint.url, headers: endpoint.headers, requestTimeoutMs: timeoutMs });
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let verified = false;
     try {
       await Promise.race([
         client.connect(), // connect includes a real initialize RPC and protocol validation.
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new HttpError(502, 'Sandbox 服务验证超时')), timeoutMs); }),
       ]);
-    } finally { if (timer) clearTimeout(timer); await client.close(); }
+      verified = true;
+    } finally { if (timer) clearTimeout(timer); await this.closeVerificationClient(client, sandbox.id, verified); }
     sandbox.status = 'ready';
     sandbox.image = info.templateIdentity;
+  }
+
+  private async closeVerificationClient(client: CodexAppServerClient, sandboxId: string, verified: boolean) {
+    try { await client.close(); }
+    catch (error) {
+      if (verified) throw error;
+      void this.options.logger?.write({ event: 'sandbox.verification_cleanup_failed', sandboxId, error });
+    }
   }
 
   async fenceSandbox(sandbox: SandboxState) {

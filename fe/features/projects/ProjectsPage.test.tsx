@@ -46,7 +46,7 @@ test('a backup from within the past hour is shown in minutes', () => {
 test('abnormal and missing sandboxes use the recovery-or-first-create paths', () => {
   const broken = page([project({ sandbox: { id: 'broken', status: 'unavailable', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);
   assert.match(broken, /异常/);
-  assert.match(broken, /恢复环境/);
+  assert.match(broken, /重建环境/);
   assert.doesNotMatch(broken, /立即备份/);
 
   const unknown = page([project({ sandbox: { id: 'query-failed', status: 'unknown', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);

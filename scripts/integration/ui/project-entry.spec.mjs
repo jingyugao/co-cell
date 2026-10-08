@@ -91,3 +91,21 @@ test('leaving preparation cancels polling and keeps separate project drafts', as
   await page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('button', { name: '进入项目' }).click();
   await expect(ui.editor).toHaveValue('第一个项目的草稿'); ui.complete('paused'); await expect(ui.send).toBeEnabled();
 });
+
+for (const withArchive of [false, true]) test(`failed mounted Sandbox rebuild explains preservation (${withArchive ? 'old archive' : 'no archive'})`, async ({ page, ui }) => {
+  const project = ui.projects.get('other');
+  project.sandbox.status = 'unavailable';
+  if (withArchive) project.remoteArchives = [{ id: 'old-archive', createdAt: '2025-01-01T00:00:00Z', sizeBytes: 128, sha256: 'a'.repeat(64), threadIds: [] }];
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '另一个项目', exact: true });
+  let confirmation;
+  page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept(); });
+  await card.getByRole('button', { name: '重建环境', exact: true }).click();
+  await expect.poll(() => ui.count('POST', '/api/projects/other/sandbox/rebuild')).toBe(1);
+  expect(confirmation).toContain('保留当前挂载目录中的文件和会话历史');
+  expect(confirmation).not.toContain('备份');
+  expect(ui.projects.get('other').sandbox.id).toBe('other-box');
+  expect(ui.projects.get('other').sandboxOperation.kind).toBe('rebuild');
+  ui.complete('other');
+  await expect(card.locator('.project-status').getByText('就绪', { exact: true })).toBeVisible();
+});

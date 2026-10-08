@@ -95,7 +95,7 @@ export interface ProjectSandboxOperation {
   /** Resume completion confirms runtime restoration; health diagnostics do not gate it. */
 	/** Persisted intention ID used for remote operation idempotency. */
 	id?: string;
-  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume';
+  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild';
   phase: string;
   status: 'running' | 'failed' | 'succeeded';
   error?: string;

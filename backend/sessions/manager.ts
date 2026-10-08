@@ -116,7 +116,7 @@ export class SessionManager {
           // Recheck after the scan, then acquire the normal project operation
           // lock. Completion never authorizes deleting the persistent disk.
           if (this.projects.get(id).status !== 'completed') return;
-          await this.runProjectSandboxOperation(id, 'checkpoint');
+          await this.runProjectSandboxOperation(id, 'checkpoint', { background: true });
         },
       });
     }
@@ -770,7 +770,7 @@ export class SessionManager {
   }
 
   private async runProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'],
-    options: { useExistingBackup?: boolean } = {}) {
+    options: { useExistingBackup?: boolean; background?: boolean } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
     await this.sandboxOperations.run(id, kind, options);

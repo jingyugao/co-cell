@@ -258,3 +258,38 @@ test('rebuild endpoint chooses mounted HOME despite an existing older archive', 
     assert.equal(rebuilt, true);
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
+
+test('automatic completion reclaim pauses the same disk without requiring a backup', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-completed-disk-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  let box: SandboxState = { id: 'retained-disk', status: 'ready', template: 'default', workingDirectory: defaults.workingDirectory };
+  let checkpoints = 0;
+  const runtime = {
+    async close() {}, async rebuild(_target, save) { await save(box); }, async verifySandbox() {},
+    async querySandbox(value) { return { ...value, status: box.status }; },
+    async querySandboxes(values) { return values.map(value => ({ ...value, status: box.status })); },
+    async checkpoint(target) { assert.equal(target.sandbox?.id, box.id); checkpoints++; box = { ...box, status: 'paused' }; return box; },
+    async deleteDanglingSandbox() { throw new Error('automatic completion must retain disk'); },
+  } satisfies Partial<SandboxRuntime>;
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime,
+    undefined, undefined, undefined, { completedPauseAfterMs: 0 });
+  try {
+    await manager.init();
+    const session = await manager.create();
+    const internals = manager as unknown as { sandboxOperations: { close(): Promise<void> } };
+    await internals.sandboxOperations.close();
+    await manager.updateProject(session.projectId!, { status: 'completed' });
+    await manager.sweepSandboxLifecycle();
+    const project = await manager.readProject(session.projectId!);
+    assert.equal(project.status, 'completed');
+    assert.equal(project.sandbox?.id, 'retained-disk');
+    assert.equal(project.sandbox?.status, 'paused');
+    assert.equal(project.remoteArchives?.length ?? 0, 0);
+    assert.equal(project.sandboxOperation?.kind, 'checkpoint');
+    await manager.sweepSandboxLifecycle();
+    assert.equal(checkpoints, 1, 'already paused disk must not be reclaimed again');
+    assert.equal(manager.get(session.id).sandbox?.id, 'retained-disk');
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});

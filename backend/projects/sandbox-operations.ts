@@ -13,7 +13,7 @@ import { pruneRemoteArchives } from '../archives/retention.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
 
-type OperationOptions = { useExistingBackup?: boolean; imageVersionId?: string };
+type OperationOptions = { background?: boolean; useExistingBackup?: boolean; imageVersionId?: string };
 
 const target = (project: Project): WorkspaceTarget => ({ id: project.id, projectId: project.id,
   settings: { workingDirectory: project.workingDirectory }, imageSelection: project.imageSelection, sandbox: project.sandbox, updatedAt: project.updatedAt });
@@ -101,7 +101,7 @@ export class ProjectSandboxOperations {
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
     if (project.archiveCleanupSourceId && kind !== 'archive') throw new HttpError(409, '项目归档清理尚未完成，请先重试归档');
     if (kind !== 'upgrade' && project.sandboxOperation?.kind === 'upgrade' && project.sandboxOperation.status === 'failed') throw new HttpError(409, '镜像升级未完成，请重新选择镜像并重试升级');
-    const release = this.deps.projects.beginMaintenance(id);
+    const release = this.deps.projects.beginMaintenance(id, options.background !== true);
     let reservation: { selection?: ProjectImageSelection; release(): void } | undefined;
     let operationId: string;
     try {

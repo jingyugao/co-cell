@@ -503,3 +503,23 @@ for (const verificationFails of [false, true]) test(`disk image upgrade preserve
     assert.equal(f.projects.get('upgrade').remoteArchives?.[0].id, remoteReference.id);
   } finally { await operations.close(); await f.close(); }
 });
+
+test('background maintenance yields to current and recent reads without cancelling them', async t => {
+  const f = await fixture(project('background-read'));
+  const read = f.projects.beginRead('background-read');
+  try {
+    assert.throws(() => f.projects.beginMaintenance('background-read', false), /后台维护稍后重试/);
+    assert.equal(read.signal.aborted, false);
+    assert.equal(f.projects.isMaintaining('background-read'), false);
+    read.release();
+    assert.throws(() => f.projects.beginMaintenance('background-read', false), /后台维护稍后重试/);
+    const later = Date.now() + 5_001;
+    t.mock.method(Date, 'now', () => later);
+    const release = f.projects.beginMaintenance('background-read', false);
+    release();
+    const explicitRead = f.projects.beginRead('background-read');
+    const explicit = f.projects.beginMaintenance('background-read');
+    assert.equal(explicitRead.signal.aborted, true, 'explicit lifecycle actions still fence reads');
+    explicitRead.release(); explicit();
+  } finally { read.release(); await f.close(); }
+});

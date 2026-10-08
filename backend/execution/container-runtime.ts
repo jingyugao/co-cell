@@ -621,15 +621,18 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
   async upgradePersistent(target: WorkspaceTarget, selection: ProjectImageSelection, key: string): Promise<SandboxState> {
     if (!target.sandbox) throw new HttpError(409, '项目没有持久化 Sandbox');
+    const sandbox = target.sandbox;
     const provider = this.options.provider as SandboxProvider & { upgradePersistent?: (id: string, image: string, key: string) => Promise<void> };
     if (!provider.upgradePersistent || !this.options.activateSandbox) throw new HttpError(503, 'Sandbox 不支持磁盘保留升级');
-    await this.detachSandbox(target);
-    this.runtimePreparations.delete(target.sandbox.id);
-    await provider.upgradePersistent(target.sandbox.id, selection.importedImageId, key);
-    const candidate = await this.querySandbox(target.sandbox);
-    if (candidate.image?.id !== selection.image) throw new HttpError(409, '升级后的镜像身份与所选版本不一致');
-    await this.options.activateSandbox(candidate);
-    return { ...candidate, status: 'ready' };
+    return this.sandboxes.manager.lifecycle.run({ action: 'upgrade', resourceKey: `project:${target.projectId ?? target.id}`, sandboxId: sandbox.id }, async () => {
+      await this.detachSandbox(target);
+      this.runtimePreparations.delete(sandbox.id);
+      await provider.upgradePersistent!(sandbox.id, selection.importedImageId, key);
+      const candidate = await this.querySandbox(sandbox);
+      if (candidate.image?.id !== selection.image) throw new HttpError(409, '升级后的镜像身份与所选版本不一致');
+      await this.options.activateSandbox!(candidate);
+      return { ...candidate, status: 'ready' };
+    });
   }
 
   async rebuildPersistent(target: WorkspaceTarget, key: string, onSandbox: SaveSandbox) {

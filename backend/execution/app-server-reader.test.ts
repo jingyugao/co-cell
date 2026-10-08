@@ -55,7 +55,7 @@ test('lifecycle fences reads, drains RPCs and sockets, and releases its fence af
     finishClose.resolve(); await failed;
     await reader.read('box-1', async () => 'new connection after failure');
     assert.equal(connects, 2);
-    for (const action of ['pause', 'destroy'] as const) {
+    for (const action of ['pause', 'destroy', 'upgrade'] as const) {
       await lifecycle.run({ action, resourceKey: 'p', sandboxId: 'box-1' }, async () => {
         await assert.rejects(reader.read('box-1', async () => {}), /maintenance/);
       });

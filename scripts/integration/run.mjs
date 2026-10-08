@@ -26,7 +26,7 @@ if (profile === '--help' || profile === 'help') {
 pnpm test:integration                   Local browser regression; no cluster or model
 pnpm test:integration:live              Deployed API + browser; creates isolated projects
 pnpm test:integration:full              All suites, including real model turns
-pnpm test:integration:reads             Real conversation history and nested subagents
+pnpm test:integration:reads             Real conversation history and direct subagents
 pnpm test:integration:lifecycle         Real files, process continuity, backup/restore
 pnpm test:integration:user-input        Real asynchronous user question and answer
 pnpm test:integration:agent             Real agent writes files and starts HTTP; no tool credentials

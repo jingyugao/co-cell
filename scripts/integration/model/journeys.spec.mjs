@@ -6,7 +6,7 @@ test('project lifecycle with real model, files, process memory, backup and resto
   await projectLifecycle(environment);
 });
 
-test('conversation reads with real nested subagents, isolation and latency guard', async ({ environment }) => {
+test('conversation reads with a real direct subagent, isolation and latency guard', async ({ environment }) => {
   await conversationReads(environment);
 });
 

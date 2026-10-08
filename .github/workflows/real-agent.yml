@@ -67,7 +67,7 @@ jobs:
       - name: Build and deploy the real stack
         run: node scripts/integration/ci/deploy.mjs
       - name: Run real core journeys (extended nightly)
-        run: pnpm test:integration:${{ github.event_name == 'schedule' && 'extended' || inputs.suite || 'core' }}
+        run: pnpm test:integration:${{ github.event_name == 'schedule' && 'extended' || inputs.suite || 'core' }} --max-failures=1
       - name: Collect diagnostics
         if: always()
         run: node scripts/integration/ci/collect.mjs

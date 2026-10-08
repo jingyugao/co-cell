@@ -110,25 +110,53 @@ for (const withArchive of [false, true]) test(`failed mounted Sandbox rebuild ex
   await expect(card.locator('.project-status').getByText('就绪', { exact: true })).toBeVisible();
 });
 
-test('image upgrade explicitly selects a version and keeps backup actions secondary', async ({ page, ui }) => {
+test('image version popover confirms upgrades and keeps backup actions secondary', async ({ page, ui, isMobile }) => {
   const project = ui.projects.get('other');
-  project.imageSelection = { imageId: 'managed', imageName: 'mybox', versionId: 'v1', version: '1', image: 'old', importedImageId: 'old' };
-  ui.images.push({ id: 'managed', name: 'mybox', category: 'test', origin: 'managed', versions: [
-    { id: 'v2', version: '2', status: 'succeeded', projectReady: true, createdAt: '2026-01-01T00:00:00Z' },
+  project.imageSelection = { imageId: 'managed', imageName: 'mybox', versionId: 'v1', version: '1.0.2', image: 'old', importedImageId: 'old' };
+  ui.images.push({ id: 'managed', name: 'mybox', category: 'test', origin: 'managed', defaultVersionId: 'v1', versions: [
+    { id: 'v1', version: '1.0.2', status: 'succeeded', projectReady: true, createdAt: '2026-02-01T00:00:00Z' },
+    { id: 'v2', version: '1.0.3', status: 'succeeded', projectReady: true, createdAt: '2026-01-01T00:00:00Z' },
+    { id: 'bad', version: '1.0.4', status: 'failed', createdAt: '2026-03-01T00:00:00Z' },
   ] });
   await page.goto('/#projects');
   const card = page.getByRole('article', { name: '另一个项目', exact: true });
   await expect(card.getByRole('button', { name: '立即备份', exact: true })).toBeHidden();
-  await card.getByRole('button', { name: '升级镜像', exact: true }).click();
-  await expect(card.getByRole('button', { name: '确认升级', exact: true })).toBeDisabled();
-  await card.getByLabel('升级镜像版本', { exact: true }).selectOption('v2');
-  let confirmation;
-  page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept(); });
-  await card.getByRole('button', { name: '确认升级', exact: true }).click();
+  const trigger = card.getByRole('button', { name: 'mybox · 1.0.2，查看版本', exact: true });
+  if (isMobile) await trigger.click(); else await trigger.hover();
+  const versions = page.getByRole('region', { name: '镜像版本列表' });
+  await expect(versions.getByRole('button').first()).toHaveText('1.0.3最新');
+  await expect(versions.getByRole('button', { name: /1.0.2/ })).toBeDisabled();
+  await expect(versions.getByText('1.0.4')).toHaveCount(0);
+  await versions.getByRole('button', { name: /1.0.3/ }).click();
+  const dialog = page.getByRole('dialog', { name: '升级项目镜像' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText('保留挂载磁盘中的最新文件和会话历史');
+  await dialog.getByRole('button', { name: '取消', exact: true }).click();
+  expect(ui.count('POST', '/api/projects/other/sandbox/upgrade')).toBe(0);
+  await trigger.click();
+  await versions.getByRole('button', { name: /1.0.3/ }).click();
+  await dialog.getByRole('button', { name: '确认升级', exact: true }).click();
   await expect.poll(() => ui.count('POST', '/api/projects/other/sandbox/upgrade')).toBe(1);
   expect(project.selectedUpgrade).toBe('v2');
-  expect(confirmation).toContain('保留挂载磁盘中的最新文件和会话历史');
   expect(ui.count('POST', '/api/projects/other/archive')).toBe(0);
   expect(ui.count('POST', '/api/projects/other/backup')).toBe(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test('latest image version is identified independently from repository default', async ({ page, ui }) => {
+  const project = ui.projects.get('other');
+  project.imageSelection = { imageId: 'managed', imageName: 'mybox', versionId: 'v3', version: '1.0.10', image: 'new', importedImageId: 'new' };
+  ui.images.push({ id: 'managed', name: 'mybox', category: 'test', origin: 'managed', defaultVersionId: 'v2', versions: [
+    { id: 'v2', version: '1.0.9', status: 'succeeded', createdAt: '2026-02-01T00:00:00Z' },
+    { id: 'v3', version: '1.0.10', status: 'succeeded', createdAt: '2026-01-01T00:00:00Z' },
+  ] });
+  await page.goto('/#projects');
+  await page.getByRole('button', { name: 'mybox · 1.0.10，查看版本', exact: true }).click();
+  const versions = page.getByRole('region', { name: '镜像版本列表' });
+  await expect(versions.getByText('当前已是最新可用版本')).toBeVisible();
+  await expect(versions.getByRole('button').first()).toHaveText('1.0.10当前最新');
+  await expect(versions.getByRole('button').first()).toBeDisabled();
+  await page.keyboard.press('Escape');
+  await expect(versions).toBeHidden();
+  expect(ui.count('POST', '/api/projects/other/sandbox/upgrade')).toBe(0);
 });

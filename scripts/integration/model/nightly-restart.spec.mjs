@@ -16,7 +16,7 @@ test('nightly: Web restart recovers an active native turn without executing its 
   const ready = await env.waitProject(project.id, { kind: 'create', status: 'ready' });
   const session = await createConversation(env, project, 'Web restart recovery');
   const marker = randomUUID(), folder = `restart-${marker}`;
-  const source = `const fs=require("node:fs"),path=require("node:path");const folder=process.argv[1],marker=process.argv[2];fs.mkdirSync(folder,{recursive:true});const count=path.join(folder,"count.txt");const previous=fs.existsSync(count)?Number(fs.readFileSync(count,"utf8")):0;fs.writeFileSync(count,String(previous+1));console.log("started-"+marker);setTimeout(()=>{fs.writeFileSync(path.join(folder,"done.txt"),marker);console.log(marker)},60000);`;
+  const source = `const fs=require("node:fs"),path=require("node:path");const folder=process.argv[1],marker=process.argv[2];fs.mkdirSync(folder,{recursive:true});const count=path.join(folder,"count.txt");const previous=fs.existsSync(count)?Number(fs.readFileSync(count,"utf8")):0;fs.writeFileSync(count,String(previous+1));console.log(${JSON.stringify(`started-${marker}`)});setTimeout(()=>{fs.writeFileSync(path.join(folder,"done.txt"),marker);console.log(marker)},60000);`;
   const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
   const command = `node -e ${quote(source)} ${quote(`${ready.workingDirectory}/${folder}`)} ${quote(marker)}`;
   const prompt = `请使用 exec_command 原样执行下面这条前台 Node 命令一次，yield_time_ms=1000。命令会增加计数、打印启动标记，等待 60 秒后写入完整随机标记。不要改写代码，不要后台运行，不要重新执行。如果返回 session_id，只用 write_stdin 轮询同一个进程直到退出。完成后回复 ${marker}。不要使用子代理、凭据或外部系统。\n${command}`;

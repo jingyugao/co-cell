@@ -148,4 +148,22 @@ export async function conversationReads(env) {
     assert(subagentsP95Ms <= readBudgetMs, `Subagents p95 ${Math.round(subagentsP95Ms)} ms exceeds ${readBudgetMs} ms`);
     return report.readMeasurements;
   });
+  await step('Checkpoint during concurrent native reads, then resume the same conversations', async () => {
+    const reads = Array.from({ length: 4 }, (_, index) => request(index % 2
+      ? `/api/sessions/${sessionId}/subagents` : `/api/sessions/${sessionId}`, { expectedStatus: [200, 409] }));
+    const results = await Promise.allSettled([...reads,
+      json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 })]);
+    for (const result of results) if (result.status === 'rejected') throw result.reason;
+    const accepted = results.at(-1).value;
+    const paused = await env.waitProject(projectId, { kind: 'checkpoint', status: 'paused', operationId: accepted.sandboxOperation.id });
+    const opened = await json(`/api/projects/${projectId}/open`, { method: 'POST', expectedStatus: 202 });
+    const ready = await env.waitProject(projectId, { kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id });
+    assert.equal(ready.sandbox.id, paused.sandbox.id);
+    const fresh = await json(`/api/sessions/${sessionId}`);
+    checkHistory(fresh, threadId);
+    assert(fresh.turns.some(turn => answer(turn).includes(markers.followup)));
+    verifyDescendants(await json(`/api/sessions/${sessionId}/subagents`), threadId);
+    return { sandboxId: ready.sandbox.id, checkpointId: accepted.sandboxOperation.id };
+  });
+
 }

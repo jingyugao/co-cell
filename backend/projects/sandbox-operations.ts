@@ -104,6 +104,7 @@ export class ProjectSandboxOperations {
     let reservation: { selection?: ProjectImageSelection; release(): void } | undefined;
     let operationId: string;
     try {
+      await this.deps.projects.drainReads(id);
       if (options.imageVersionId && (kind !== 'restore' || project.status !== 'archived')) throw new HttpError(409, '仅归档项目恢复时可以选择镜像版本');
       if (kind === 'restore' && project.status === 'archived' && this.deps.selectRestoreImage) reservation = await this.deps.selectRestoreImage(project, options.imageVersionId);
       await this.deps.projects.updateSandboxOperation(id, { id: randomUUID(), kind,
@@ -405,7 +406,7 @@ export class ProjectSandboxOperations {
 
   async retryCleanup(id: string) {
     const release = this.deps.projects.beginMaintenance(id);
-    const task = this.cleanup(id).finally(release);
+    const task = this.deps.projects.drainReads(id).then(() => this.cleanup(id)).finally(release);
     this.tasks.add(task);
     void task.finally(() => this.tasks.delete(task)).catch(() => {});
     return task;

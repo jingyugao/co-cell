@@ -16,9 +16,13 @@ test('core: sessions share workspace only within their project and deletion pres
   await events.wait(message => message.type === 'snapshot' && message.session.id === other.id);
   const servicePrompt = marker => `Also create a Node HTTP service using only standard libraries. Bind 127.0.0.1:18081. GET /healthz must return JSON with marker=${marker}, pid=process.pid and instance=crypto.randomUUID() generated once at startup. Start with a detached child, stdin ignored, stdout/stderr in a project-local log and child.unref(). Make an actual HTTP request, then leave the service running.`;
   const health = project => env.json(`/api/projects/${project.id}/service/18081/healthz`);
-  await env.step('First session writes a file and remembers a conversation-only marker', async () => {
-    const result = await runAgent(env, owner, `Use Node standard libraries to write ${filename} containing exactly ${markerA}. Remember ${privateMarker} in this conversation only; do not write it in any file. ${servicePrompt(markerA)} Reply ${privateMarker}. Do not use subagents or external systems.`);
-    assert(result.text.includes(privateMarker));
+  await env.step('First session writes a file and persists its private user message', async () => {
+    const prompt = `Use Node standard libraries to write ${filename} containing exactly ${markerA}. This conversation's private reference is ${privateMarker}; keep it in the conversation only and do not write it in any file. ${servicePrompt(markerA)} Do not use subagents or external systems.`;
+    const result = await runAgent(env, owner, prompt);
+    const persisted = await env.json(`/api/sessions/${owner.id}`);
+    assert.equal(persisted.threadId, result.session.threadId);
+    assert.equal(persisted.turns.find(turn => turn.id === result.turn.id)?.prompt, prompt,
+      'Original session did not persist its private user message');
     assert.equal((await env.json(fileURL(a, filename))).trim(), markerA);
     assert.equal((await health(first)).marker, markerA);
     return { threadId: result.session.threadId };
@@ -29,7 +33,7 @@ test('core: sessions share workspace only within their project and deletion pres
     const command = `node -e 'process.stdout.write(require("node:fs").readFileSync(process.argv[1], "utf8"))' ${quote(path)}`;
     const prompt = `请核对这个项目中已有文件的实际内容。必须使用 exec_command 执行以下只读命令：
 ${command}
-必须等命令完成，根据工具输出，在最终回复中返回文件完整原文。不要猜测内容，不要只确认收到任务。读取失败则报告真实错误。不要修改文件，不要使用子代理或外部服务。`;
+必须等命令完成，读取失败则报告真实错误。不要猜测内容，不要只确认收到任务。不要修改文件，不要使用子代理或外部服务。`;
     const result = await runAgent(env, peer, prompt);
     env.report.sharedReadEvidence = { prompt, threadId: result.session.threadId, turn: result.turn };
     await env.persist();
@@ -37,18 +41,22 @@ ${command}
     assert(reads.length > 0, `Sibling agent did not execute a file read; reply: ${env.redact(result.text).slice(0, 1000)}`);
     assert(reads.some(item => item.status === 'completed' && item.exit_code === 0
       && item.command.includes(filename) && item.aggregated_output.includes(markerA)), 'Sibling file-read command did not return the stored content');
-    assert(result.text.includes(markerA), `Sibling final reply missed the stored content; reply: ${env.redact(result.text).slice(0, 1000)}`);
     assert(!result.turn.items.some(item => item.type === 'file_change'), 'Sibling read modified the workspace');
     assert.equal((await env.json(fileURL(a, filename))).trim(), markerA, 'Sibling read changed the shared file');
     assert(!JSON.stringify(result.session.turns).includes(privateMarker), 'Sibling transcript contains private conversation');
     const original = await env.json(`/api/sessions/${owner.id}`);
+    assert(original.turns.some(turn => turn.prompt.includes(privateMarker)), 'Original private message disappeared');
     assert.notEqual(original.threadId, result.session.threadId);
     assert(events.messages.every(message => message.type !== 'sdk'), 'Another project received first-project execution events');
     assert(events.messages.every(message => !message.session || message.session.id === other.id), 'SSE snapshot contains another session');
     return { ownerThread: original.threadId, peerThread: result.session.threadId };
   });
   await env.step('Another project has no first-project file or history and owns its own content', async () => {
-    const result = await runAgent(env, other, `Use Node to assert ${filename} does not exist, then write it containing exactly ${markerB}. ${servicePrompt(markerB)} Do not use subagents or external systems. Reply ${markerB}.`);
+    const result = await runAgent(env, other, `Use Node to assert ${filename} does not exist, then write it containing exactly ${markerB}. ${servicePrompt(markerB)} Do not use subagents or external systems.`);
+    for (const session of [owner, peer]) {
+      assert.notEqual((await env.json(`/api/sessions/${session.id}`)).threadId, result.session.threadId,
+        'Projects share a conversation thread');
+    }
     assert(!JSON.stringify(result.session.turns).includes(privateMarker));
     assert.equal((await env.json(fileURL(b, filename))).trim(), markerB);
     assert.equal((await env.json(fileURL(a, filename))).trim(), markerA);

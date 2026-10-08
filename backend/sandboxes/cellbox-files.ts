@@ -8,10 +8,11 @@ export async function readCellboxWorkspaceFile(
   sandbox: SandboxHandle,
   workingDirectory: string,
   absolutePath: string,
+  signal?: AbortSignal,
 ): Promise<WorkspaceFileResult> {
   const path = workspaceFilePath(workingDirectory, absolutePath);
   try {
-    return workspaceFileResult(path, await sandbox.files.readBytes(path, { user: 'agent' }));
+    return workspaceFileResult(path, await sandbox.files.readBytes(path, { user: 'agent', signal }));
   } catch (error) { throw fileError(error); }
 }
 

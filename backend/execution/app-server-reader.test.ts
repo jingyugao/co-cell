@@ -102,3 +102,43 @@ test('RPC errors retain a connection; transport failure retires it without repla
   assert.equal(closes, 3);
   await assert.rejects(reader.read('box-1', async () => undefined), /closed/);
 });
+
+test('cancelled read closes its socket and observes late RPC rejection without replay', async t => {
+  let closes = 0;
+  t.mock.method(CodexAppServerClient.prototype, 'connect', async () => {});
+  t.mock.method(CodexAppServerClient.prototype, 'close', async () => { closes++; });
+  const reader = new AppServerReader(async () => ({ url: 'ws://app-server.test' }), error => assert.fail(String(error)));
+  const controller = new AbortController();
+  let entered!: () => void;
+  let failLate!: (error: Error) => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const rpc = new Promise<string>((_, reject) => { failLate = reject; });
+  try {
+    const read = reader.read('box', async () => { entered(); return rpc; }, controller.signal);
+    const rejected = assert.rejects(read, /maintenance/);
+    await started;
+    controller.abort(new Error('maintenance'));
+    await rejected;
+    assert.equal(closes, 1);
+    failLate(new Error('old connection closed'));
+    assert.equal(await reader.read('box', async () => 'new history'), 'new history');
+  } finally { await reader.close(); }
+});
+
+test('cancelling an opening connection does not wait for the connect timeout', async t => {
+  let connecting!: () => void;
+  const entered = new Promise<void>(resolve => { connecting = resolve; });
+  let closes = 0;
+  t.mock.method(CodexAppServerClient.prototype, 'connect', () => { connecting(); return new Promise<void>(() => {}); });
+  t.mock.method(CodexAppServerClient.prototype, 'close', async () => { closes++; });
+  const reader = new AppServerReader(async () => ({ url: 'ws://app-server.test' }), error => assert.fail(String(error)));
+  const controller = new AbortController();
+  try {
+    const read = reader.read('box', async () => assert.fail('cancelled connection must not run RPCs'), controller.signal);
+    const rejected = assert.rejects(read, /maintenance/);
+    await entered;
+    controller.abort(new Error('maintenance'));
+    await rejected;
+    assert.equal(closes, 1);
+  } finally { await reader.close(); }
+});

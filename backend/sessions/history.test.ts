@@ -155,7 +155,7 @@ test('Sandbox detail and older turns use App Server cursors', async () => {
     const original = manager.get(created.id).turns[0];
     const seen: Array<{ cursor?: string; limit?: number } | undefined> = [];
     f.runtime.history = async (_session, options) => {
-      seen.push(options);
+      seen.push(options ? { ...(options.cursor ? { cursor: options.cursor } : {}), limit: options.limit } : undefined);
       return options?.cursor === 'older'
         ? { turns: [{ ...original, id: 'old-turn', prompt: 'older' }], nextCursor: null }
         : { turns: [{ ...original, id: 'new-turn', prompt: 'newer' }], nextCursor: 'older' };
@@ -259,5 +259,78 @@ test('an archived Sandbox reports that history cannot be loaded until restoratio
     const snapshot = await second.read(session.id);
     assert.match(snapshot.historyError!, /Sandbox 尚未恢复/);
     assert.deepEqual(snapshot.turns, []);
+  } finally { await f.close(); }
+});
+
+test('maintenance invalidates an in-flight history result without rejecting the lifecycle operation', async () => {
+  const f = await fixture();
+  let finishRead!: () => void;
+  let entered!: () => void;
+  const reading = new Promise<void>(resolve => { entered = resolve; });
+  const pending = new Promise<void>(resolve => { finishRead = resolve; });
+  try {
+    const manager = await f.start();
+    const session = await manager.create();
+    await manager.startTurn(session.id, 'first');
+    await manager.waitForIdle(session.id);
+    const old = manager.get(session.id).turns[0];
+    let signal!: AbortSignal;
+    f.runtime.history = async (_session, options) => {
+      signal = options!.signal!;
+      entered();
+      await pending;
+      return { turns: [{ ...old, prompt: 'stale history' }] };
+    };
+    const read = manager.read(session.id);
+    const rejected = assert.rejects(read, /环境正在切换/);
+    await reading;
+    const projects = (manager as unknown as { projects: import('../projects/service.js').ProjectService }).projects;
+    const release = projects.beginMaintenance(session.projectId!);
+    try {
+      assert.equal(signal.aborted, true);
+      assert.throws(() => projects.beginRead(session.projectId), /维护/);
+      let drained = false;
+      const draining = projects.drainReads(session.projectId!).then(() => { drained = true; });
+      await Promise.resolve();
+      assert.equal(drained, false, 'maintenance waits for underlying read cleanup');
+      finishRead();
+      await rejected;
+      await draining;
+      assert.equal(manager.get(session.id).historyError, undefined, 'cancelled old reads must not change current history errors');
+      assert.notEqual(manager.get(session.id).turns[0].prompt, 'stale history');
+    } finally { release(); }
+    f.runtime.history = async () => ({ turns: [old] });
+    assert.equal((await manager.read(session.id)).historyError, undefined);
+  } finally { finishRead?.(); await f.close(); }
+});
+
+test('preview and file streams are cancelled by maintenance; writes and running tasks still block it', async () => {
+  const f = await fixture();
+  try {
+    const manager = await f.start();
+    const session = await manager.create();
+    const projectId = session.projectId!;
+    const projects = (manager as unknown as { projects: import('../projects/service.js').ProjectService }).projects;
+    let cancelled = 0;
+    const stream = () => new Response(new ReadableStream({ cancel() { cancelled++; } }));
+    f.runtime.service = async () => stream();
+    f.runtime.fileResponse = async () => stream();
+    for (const response of [
+      await manager.projectService(projectId, 8000, '/', new Request('http://localhost/')),
+      await manager.projectFileResponse(projectId, '/home/agent/workspace/file.txt', new Request('http://localhost/file')),
+    ]) {
+      assert.ok(response.body);
+    }
+    const release = projects.beginMaintenance(projectId);
+    await projects.drainReads(projectId);
+    assert.equal(cancelled, 2);
+    release();
+    const response = await manager.projectService(projectId, 8000, '/', new Request('http://localhost/', { method: 'POST' }));
+    assert.throws(() => projects.beginMaintenance(projectId), /正在使用/);
+    await response.body!.cancel();
+    const finishTask = projects.startSession(projectId, session.id);
+    assert.throws(() => projects.beginMaintenance(projectId), /正在使用/);
+    finishTask();
+    projects.beginMaintenance(projectId)();
   } finally { await f.close(); }
 });

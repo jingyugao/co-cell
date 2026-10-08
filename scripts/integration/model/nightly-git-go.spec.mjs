@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from '../support/fixtures.mjs';
 import { createConversation, fileURL, runAgent } from '../support/agent.mjs';
 
@@ -21,6 +25,20 @@ Run the built server and save its exact JSON stdout to git-go-fixture/result.jso
     assert.equal(output.vcs['vcs'], 'git');
     assert.equal(output.vcs['vcs.revision'], revision);
     assert.equal(output.vcs['vcs.modified'], 'false');
-    return { revision, vcs: output.vcs };
+    // Parse the actual executable independently; never execute agent-generated
+    // binaries on the runner or trust only the JSON written by the agent.
+    const downloaded = await env.request(fileURL(ready, 'git-go-fixture/clone/server'));
+    const directory = await mkdtemp(join(tmpdir(), 'cocell-go-binary-'));
+    let buildInfo;
+    try {
+      const binary = join(directory, 'server'); await writeFile(binary, downloaded.buffer);
+      const { GOROOT: _goroot, ...goEnv } = process.env;
+      buildInfo = execFileSync('go', ['version', '-m', binary], { encoding: 'utf8', env: goEnv, timeout: 30_000 });
+      assert(buildInfo.includes('vcs=git'));
+      assert(buildInfo.includes(`vcs.revision=${revision}`));
+      assert(buildInfo.includes('vcs.modified=false'));
+      assert(buildInfo.includes('example.com/ci-fixture/cmd/server'));
+    } finally { await rm(directory, { recursive: true, force: true }); }
+    return { revision, vcs: output.vcs, buildInfo };
   });
 });

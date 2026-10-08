@@ -45,7 +45,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: cellbox-source/go.mod
-          cache-dependency-path: cellbox-source/go.sum
+          cache: false
+      - uses: actions/cache/restore@v4
+        id: native-go-cache
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-cocell-native-go-minio-0d7408fc-${{ hashFiles('cellbox-source/go.mod', 'cellbox-source/go.sum') }}
       - name: Check model configuration
         run: |
           test -n "$CODEX_API_KEY" || { echo 'Set integration secret CODEX_API_KEY'; exit 1; }
@@ -64,6 +71,14 @@ jobs:
       - name: Collect diagnostics
         if: always()
         run: node scripts/integration/ci/collect.mjs
+      - uses: actions/cache/save@v4
+        if: always() && steps.native-go-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ steps.native-go-cache.outputs.cache-primary-key }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:

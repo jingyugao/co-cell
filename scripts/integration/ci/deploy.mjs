@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdir, copyFile, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, copyFile, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 assert(process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_OS === 'Linux', 'Only deploy on a disposable GitHub Linux runner');
@@ -92,7 +92,7 @@ try {
 
 const cellboxValues = { api: { image: images.api, imagePullPolicy: 'Never', config: { clientId: 'cocell-ci', startupTimeoutSeconds: 180,
   profiles: [{ id: 'cocell-ci', provider: 'resumable-k8s-pod', image: sandboxImage, namespace, nodeName, cpu: 1, memoryMiB: 1024,
-    clients: ['cocell-ci'], guest: { workspace: '/home/agent/workspace', agent: { uid: 11000, gid: 11000 }, debug: { uid: 11001, gid: 11001 },
+    guest: { workspace: '/home/agent/workspace', agent: { uid: 11000, gid: 11000 }, debug: { uid: 11001, gid: 11001 },
       command: ['/usr/local/bin/node', '/opt/product/cocell/launcher.mjs'], env: {}, tools: [] } }] } },
   controller: { image: images.controller, imagePullPolicy: 'Never', warmPoolSize: 0, criDirectory: '/run/k3s/containerd', criSocket: '/run/k3s/containerd/containerd.sock' },
   objectStorage: { endpoint: `http://minio.${namespace}.svc.cluster.local:9000`, bucket: 'cocell-ci', credentialsSecret: 'ci-storage' },
@@ -102,6 +102,12 @@ const webValues = { image: { repository: 'docker.io/cocell-ci/web', tag: suffix,
   publicUrl: 'http://127.0.0.1:3001', config: { codexModel: process.env.COCELL_E2E_MODEL, openaiBaseUrl: process.env.OPENAI_BASE_URL ?? '' },
   persistence: { size: '1Gi' },
 };
+const checkDirectory = await mkdtemp(join(cellbox, '.cocell-config-check-'));
+try {
+  const check = join(checkDirectory, 'main.go');
+  await copyFile('scripts/integration/ci/check-cellbox-config.go', check);
+  exec('go', ['run', '-buildvcs=false', check], { cwd: cellbox, input: JSON.stringify(cellboxValues.api.config), stdio: ['pipe', 'inherit', 'inherit'] });
+} finally { await rm(checkDirectory, { recursive: true, force: true }); }
 for (const [name, chart, values] of [['cellbox', join(cellbox, 'charts/cellbox'), cellboxValues], ['co-cell', 'deploy/helm/co-cell', webValues]]) {
   const file = join(work, `${name}-values.json`); await writeFile(file, JSON.stringify(values), { mode: 0o600 });
   exec('helm', ['upgrade', '--install', name, chart, '--kube-context', context, '-n', namespace, '-f', file, '--wait', '--timeout', '5m'], { stdio: 'inherit' });

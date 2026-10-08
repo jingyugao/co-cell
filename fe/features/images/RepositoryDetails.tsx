@@ -64,7 +64,7 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry
       if (!version.cleanup) {
         const usage = await api<ImageVersionUsage>(`/api/images/${encodeURIComponent(image.id)}/versions/${encodeURIComponent(version.id)}/usage`);
         if (!usage.deletable) throw new Error(usage.blockers.join('；') || 'Cellbox 暂不允许清理此镜像');
-        if (!window.confirm(`清理 ${version.version}？运行中和 Checkpoint 项目的版本受保护；归档恢复将使用仓库默认版本。${usage.manifestShared ? '其他版本共享此镜像，只移除此版本记录。' : '将删除成品镜像，磁盘空间由 Registry GC 和节点缓存回收释放。'}`)) return;
+        if (!window.confirm(`清理 ${version.version}？运行中和 Checkpoint 项目的版本受保护；使用此版本的归档项目恢复时需要另选可用版本。${usage.manifestShared ? '其他版本共享此镜像，只移除此版本记录。' : '将删除成品镜像，磁盘空间由 Registry GC 和节点缓存回收释放。'}`)) return;
       }
       await onDelete(version.id);
     }, '清理请求已处理，请查看版本状态。');
@@ -75,7 +75,7 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry
     <div className="projects-heading"><div><span className="projects-eyebrow">REPOSITORY VERSIONS</span><h1>{image.name}</h1><p>{image.repository ?? '系统默认开发环境'}</p></div><button className="secondary-button" disabled={busy} onClick={onBack}>返回仓库列表</button></div>
     {managed && <>
       <section className="image-card image-import-form">
-        <h2>仓库配置</h2><p className="project-form-hint">版本名与上游 Tag 一致。运行中和 Checkpoint 项目固定原版本；归档项目恢复时优先使用本仓库默认版本。首个同步成功的版本自动设为默认，后续可手动切换。</p>
+        <h2>仓库配置</h2><p className="project-form-hint">版本名与上游 Tag 一致。项目固定原版本，归档恢复时可手动选择其他版本。首个同步成功的版本自动设为默认，后续可手动切换。</p>
         {image.buildCommand && <details><summary>构建命令</summary><pre>{image.buildCommand}</pre></details>}
         <p className="project-form-hint">支持 linux/amd64。源镜像或构建命令须提供 /usr/local/bin/node 和 /usr/local/bin/codex，平台自动写入 CoCell 启动器。</p>
         <label className="image-checkbox"><input type="checkbox" checked={privateRegistry} disabled={blocked || image.registryAuthRequired} onChange={event => setPrivateRegistry(event.target.checked)} />私有仓库认证</label>

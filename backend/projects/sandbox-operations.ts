@@ -313,6 +313,9 @@ export class ProjectSandboxOperations {
     }
     const restoredProject = projects.get(id);
     if (reservation) restoredProject.imageSelection = reservation.selection;
+    void this.deps.logger?.write({ event: 'sandbox.restore_image_selected', projectId: id,
+      operationId: restoredProject.sandboxOperation?.id, archiveId: reference.id, archiveImageId: reference.imageId,
+      imageVersionId: restoredProject.imageSelection?.versionId, imageId: restoredProject.imageSelection?.image });
     const currentImage = await runtime.currentImageIdentity?.(target(restoredProject));
     if (reference.storageType !== 'oss' && !reference.portable && currentImage && currentImage.id !== reference.imageId) {
       throw new HttpError(409, 'Cellbox 归档只能恢复到相同镜像，当前镜像已变化');

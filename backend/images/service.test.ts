@@ -71,6 +71,23 @@ function fixture() {
     rejectDeletion: (reject: boolean) => { rejectDeletion = reject; }, loseResponse: () => { loseResponse = true; } };
 }
 
+test('restore keeps a newer project image when the repository default is older', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
+  const first = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(first.operationId!, first.source);
+  const older = (await catalog.resolve(repo.id, first.id))!;
+  const second = (await catalog.sync(repo.id, { tag: 'v2' })).versions[0]; f.finish(second.operationId!, second.source);
+  const pinned = (await catalog.resolve(repo.id, second.id))!;
+  const project: Project = { id: 'p', name: 'Newer runtime', requirementUrl: null, executionMode: 'sandbox',
+    workingDirectory: '/home/agent/workspace', status: 'archived', imageSelection: pinned, createdAt: '', updatedAt: '' };
+  assert.equal((await catalog.list()).find(image => image.id === repo.id)?.defaultVersionId, first.id);
+  const restore = await catalog.acquireRestoreSelection(project);
+  assert.deepEqual(restore.selection, pinned); restore.release();
+  const explicit = await catalog.acquireRestoreSelection(project, first.id);
+  assert.deepEqual(explicit.selection, older); explicit.release();
+  assert.deepEqual(project.imageSelection, pinned, 'selection must not alter the binding before restore succeeds');
+});
+
 test('version cleanup protects pinned projects, backups, defaults and in-flight restore reservations', async () => {
   const f = fixture(); const catalog = f.catalog(); await catalog.init();
   const repo = await catalog.addRepository({ name: 'Go', category: '开发', repository: 'team/go' });
@@ -89,7 +106,7 @@ test('version cleanup protects pinned projects, backups, defaults and in-flight 
   await assert.rejects(catalog.removeVersion(repo.id, first.id), /依赖原镜像的备份/);
   project.remoteArchives[0].portable = true;
   const restore = await catalog.acquireRestoreSelection(project);
-  assert.equal(restore.selection?.versionId, second.id); restore.release();
+  assert.equal(restore.selection?.versionId, first.id); restore.release();
   const oldRestore = await catalog.acquireRestoreSelection(project, first.id);
   await assert.rejects(catalog.removeVersion(repo.id, first.id), /创建或恢复操作/); oldRestore.release();
   project.pendingSandboxCleanup = [{ id: 'stale', template: 'cocell', status: 'unavailable', workingDirectory: project.workingDirectory, image: { id: original.image, reference: original.image, repoDigests: [] } }];
@@ -105,7 +122,9 @@ test('version cleanup protects pinned projects, backups, defaults and in-flight 
   await assert.rejects(catalog.resolve(repo.id, first.id), /正在清理/);
   const cleanup = f.operations.get(f.deletions[0])!; cleanup.status = 'succeeded'; f.images.delete(cleanup.targetId);
   assert.equal((await catalog.list()).find(image => image.id === repo.id)?.versions.some(version => version.id === first.id), false);
-  assert.equal((await catalog.acquireRestoreSelection(project)).selection?.versionId, second.id);
+  await assert.rejects(catalog.acquireRestoreSelection(project), /镜像或版本不存在/);
+  const replacement = await catalog.acquireRestoreSelection(project, second.id);
+  assert.equal(replacement.selection?.versionId, second.id); replacement.release();
 });
 
 test('lost cleanup acceptance remains unavailable across restart and retries the durable key', async () => {
@@ -291,11 +310,12 @@ test('deprecation persists, blocks new selections and moves restore default with
   await assert.rejects(restarted.acquireSelection(repo.id, first.id), /已弃用/);
   await assert.rejects(restarted.setDefault(repo.id, first.id), /已弃用/);
   await assert.rejects(restarted.acquireRestoreSelection(project, first.id), /已弃用/);
-  const restore = await restarted.acquireRestoreSelection(project);
+  await assert.rejects(restarted.acquireRestoreSelection(project), /已弃用/);
+  const restore = await restarted.acquireRestoreSelection(project, second.id);
   assert.equal(restore.selection?.versionId, second.id); restore.release();
   await restarted.setDeprecated(repo.id, second.id, true);
   assert.equal((await restarted.list()).find(value => value.id === repo.id)?.defaultVersionId, undefined);
-  await assert.rejects(restarted.acquireRestoreSelection(project), /没有可恢复/);
+  await assert.rejects(restarted.acquireRestoreSelection(project), /已弃用/);
   await restarted.setDeprecated(repo.id, first.id, false);
   assert.deepEqual(await restarted.resolve(repo.id, first.id), pinned);
   assert.equal((await restarted.list()).find(value => value.id === repo.id)?.defaultVersionId, first.id);

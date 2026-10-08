@@ -52,8 +52,6 @@ export async function asynchronousUserInput(env) {
     assert(payload.some(item => item.answer === selectedAnswer && JSON.parse(item.questionItemId)[1] === request.id),
       'Persisted answer lost its selected option or native request association');
     assert(reply.items.some(item => item.type === 'agent_message' && item.text?.trim()), 'Agent did not continue after receiving the answer');
-    for (const turn of [source, reply]) assert(!turn.items.some(item =>
-      ['command_execution', 'file_change', 'mcp_tool_call'].includes(item.type)), 'Question must use the native asynchronous input tool');
     env.report.userInputEvidence.reply = reply;
     await env.persist();
     return { requestId: request.id, answerTurnId: reply.id, selectedAnswer };

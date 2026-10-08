@@ -109,16 +109,16 @@ const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provide
   sharedDataDirectory: pathToFileURL(`${sharedDataRoot}/`),
   ...(sharedDirectory ? { sharedFilesMounted: (id: string) => cellboxRuntime.usesSharedDirectory(id) } : {}),
   appServer, appServerReader, paths:CELLBOX_PRODUCT_PATHS, prepareRemote:(handle,target,signal)=>cellboxRuntime.prepare(handle,target,signal),
-  acquireRemoteUsage:(id, initializationDirectory)=>cellboxRuntime.acquireUsage(id, initializationDirectory), remoteArchives:cellboxRuntime.remoteArchives,
+  acquireRemoteUsage:(id, initializationDirectory)=>cellboxRuntime.acquireUsage(id, initializationDirectory), remoteArchives:cellboxRuntime.remoteArchives, activateSandbox: cellboxRuntime.activateSandbox,
   serviceAccess:(id:string,port:number)=>cellboxProvider.getServiceAccess(id,port) });
 const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || 'data/web-state');
 const webImagesDirectory = resolve(process.env.CODEX_WEB_IMAGES_DIR || 'data/images');
-const archivedReclaimAfterMs = Number(process.env.SANDBOX_ARCHIVED_RECLAIM_AFTER_MS ?? 24 * 60 * 60 * 1000);
+const completedPauseAfterMs = Number(process.env.SANDBOX_COMPLETED_PAUSE_AFTER_MS ?? process.env.SANDBOX_ARCHIVED_RECLAIM_AFTER_MS ?? 24 * 60 * 60 * 1000);
 const lifecycleScanIntervalMs = process.env.SANDBOX_LIFECYCLE_SCAN_INTERVAL_MS === undefined ? undefined : Number(process.env.SANDBOX_LIFECYCLE_SCAN_INTERVAL_MS);
-if (!Number.isFinite(archivedReclaimAfterMs) || archivedReclaimAfterMs < 0) throw new Error('SANDBOX_ARCHIVED_RECLAIM_AFTER_MS must be non-negative');
+if (!Number.isFinite(completedPauseAfterMs) || completedPauseAfterMs < 0) throw new Error('SANDBOX_COMPLETED_PAUSE_AFTER_MS must be non-negative');
 manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtime, sandboxWorkingDirectory, runtimeLog,
   webImagesDirectory, {
-    archivedReclaimAfterMs,
+    completedPauseAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   }, notifications);
 // Project tables must exist before the Secret schema's foreign keys are created.
@@ -139,7 +139,7 @@ await imageCatalog.init();
 manager.setImageCatalog(imageCatalog);
 const config: AppConfig = { models: availableModels, sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
   ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}),
-  archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
+  completedPauseAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
   localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };
 const publicUrl=cocellPublicUrl;
 const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';

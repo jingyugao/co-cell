@@ -29,7 +29,7 @@ export class AppServerReader {
   readonly extension: SandboxExtension = {
     name: 'app-server-read-connections',
     pre: async context => {
-      if (!context.sandboxId || !['pause', 'checkpoint', 'destroy'].includes(context.action)) return;
+      if (!context.sandboxId || !['pause', 'checkpoint', 'destroy', 'upgrade'].includes(context.action)) return;
       return this.suspend(context.sandboxId);
     },
   };

@@ -247,6 +247,10 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     await this.act(id, 'resume', `cocell-resume-${id}-${box.generation}`);
   }
   /** Explicit cold restart preserves the Box-owned HOME; never creates or restores a Box. */
+  async upgradePersistent(id: string, importedImageId: string, key: string) {
+    await this.ready();
+    await this.wait(await this.client.upgradeBox(id, importedImageId, key));
+  }
   async rebuildPersistent(id: string, key: string) {
     await this.ready();
     const box = await this.box(id);

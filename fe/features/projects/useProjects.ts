@@ -57,9 +57,15 @@ export function useProjects() {
     }
     finally { await refreshProjects().catch(() => undefined); }
   }, [refreshProjects, storeProject]);
-  const rebuildSandbox = useCallback((id: string, imageVersionId?: string) => runSandboxOperation(id, projects.find(project => project.id === id)?.remoteArchives?.length ? 'restore' : 'create', () =>
+  const rebuildSandbox = useCallback((id: string, imageVersionId?: string) => runSandboxOperation(id, projects.find(project => project.id === id)?.status === 'archived' ? 'restore' : projects.find(project => project.id === id)?.sandbox ? 'rebuild' : 'create', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST', body: JSON.stringify(imageVersionId ? { imageVersionId } : {}) }),
   ), [projects, runSandboxOperation]);
+  const upgradeSandbox = useCallback((id: string, imageVersionId: string) => runSandboxOperation(id, 'upgrade', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/upgrade`, { method: 'POST', body: JSON.stringify({ imageVersionId }) }),
+  ), [runSandboxOperation]);
+  const archiveProject = useCallback((id: string) => runSandboxOperation(id, 'archive', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, { method: 'POST' }),
+  ), [runSandboxOperation]);
   const backupProject = useCallback((id: string) => runSandboxOperation(id, 'backup', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/backup`, { method: 'POST' }),
   ), [runSandboxOperation]);
@@ -69,5 +75,5 @@ export function useProjects() {
   const checkpointSandbox = useCallback((id: string) => runSandboxOperation(id, 'checkpoint', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/checkpoint`, { method: 'POST' }),
   ), [runSandboxOperation]);
-  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, rebuildSandbox, backupProject, resumeSandbox, checkpointSandbox };
+  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, rebuildSandbox, upgradeSandbox, archiveProject, backupProject, resumeSandbox, checkpointSandbox };
 }

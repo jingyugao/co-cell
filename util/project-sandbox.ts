@@ -4,7 +4,7 @@ export function isProjectSandboxReady(project: ProjectSummary): boolean {
   if (project.executionMode !== 'sandbox') return true;
   const operation = project.sandboxOperation;
   return project.sandbox?.status === 'ready' && operation?.status !== 'running'
-    && !(operation?.status === 'failed' && ['create', 'resume', 'rebuild'].includes(operation.kind));
+    && !(operation?.status === 'failed' && ['create', 'resume', 'rebuild', 'upgrade'].includes(operation.kind));
 }
 
 export function canEnterProject(project: ProjectSummary): boolean {

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // Real model journey: all guest files and processes must be created through CoCell turns.
-export async function projectLifecycle(env, { userInputOnly = false, homeRebuild = false } = {}) {
+export async function projectLifecycle(env, { userInputOnly = false, homeRebuild = false, diskUpgrade = false } = {}) {
   if (homeRebuild) assert(process.env.COCELL_E2E_KUBE_CONTEXT, 'Mounted HOME rebuild test requires COCELL_E2E_KUBE_CONTEXT');
   const { model, operationTimeout, turnTimeout } = env.config;
   const report = env.report;
@@ -80,7 +80,15 @@ export async function projectLifecycle(env, { userInputOnly = false, homeRebuild
 
   await step('Create project and wait for its sandbox to become ready', async () => {
     const config = await json('/api/config'); assert.equal(config.sandbox?.enabled, true);
-    const project = await env.createProject('lifecycle');
+    let project;
+    if (diskUpgrade) {
+      const fromId = process.env.COCELL_E2E_UPGRADE_FROM_VERSION_ID;
+      const images = await json('/api/images');
+      const image = images.find(image => image.versions.some(version => version.id === fromId));
+      assert(image, 'Source image version is unavailable');
+      project = await json('/api/projects', { method: 'POST', expectedStatus: 201,
+        body: { name: env.name('upgrade-history'), type: 1, imageId: image.id, imageVersionId: fromId } });
+    } else project = await env.createProject('lifecycle');
     projectId = report.projectId = project.id;
     assert.equal(project.sandboxOperation?.kind, 'create');
     const ready = await waitProject('create', 'ready'); originalSandboxId = report.originalSandboxId = ready.sandbox.id;
@@ -148,6 +156,27 @@ export async function projectLifecycle(env, { userInputOnly = false, homeRebuild
       firstHealth = await health(initialContent); const next = await health(initialContent); checkSameProcess(firstHealth, next); firstHealth = next;
       return { sourceSha256: source.sha256, fileSha256: file.sha256, http: firstHealth };
     });
+    if (diskUpgrade) {
+      await step('Upgrade image using the existing disk and retain the real native conversation', async () => {
+        const versionId = process.env.COCELL_E2E_UPGRADE_TO_VERSION_ID;
+        assert(versionId, 'Target image version is required');
+        await json(`/api/projects/${projectId}/sandbox/upgrade`, { method: 'POST', expectedStatus: 202, body: { imageVersionId: versionId } });
+        const upgraded = await waitProject('upgrade', 'ready');
+        assert.equal(upgraded.sandbox.id, originalSandboxId);
+        assert.equal(upgraded.imageSelection.versionId, versionId);
+        assert.equal((await textFile('main.mjs')).sha256, source.sha256);
+        await textFile('continuity.txt', initialContent);
+        const history = await json(`/api/sessions/${sessionId}`);
+        assert.equal(history.threadId, threadId);
+        assert(history.turns.some(turn => turn.prompt.includes(memory)), 'Original native turn was lost');
+        const result = await turn(`请继续原会话，回复首次告诉你的、只在对话中记住的验证码。用已有 ${folder}/start.mjs 重新启动 HTTP 服务，不修改服务代码，不下载软件。只把 continuity.txt 改为 ${resumedContent} 加换行，然后实际访问 /healthz 验证。`);
+        assert(result.text.includes(memory), 'Conversation context did not survive image upgrade');
+        const restarted = await health(resumedContent);
+        assert.notEqual(restarted.instance, firstHealth.instance, 'Image upgrade reused the old process');
+        return { sandboxId: originalSandboxId, threadId, versionId, ...result };
+      });
+      return;
+    }
     await step('Checkpoint the sandbox and verify access cannot silently resume it', async () => {
       await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 202 });
       const paused = await waitProject('checkpoint', 'paused'); assert.equal(paused.sandbox.id, originalSandboxId);

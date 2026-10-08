@@ -125,7 +125,7 @@ export interface SandboxManagerOptions {
   extensions?: readonly SandboxExtension[];
 }
 
-export type SandboxLifecycleAction = 'create' | 'connect' | 'resume' | 'pause' | 'checkpoint' | 'destroy' | 'restore' | 'activate' | 'reconcile';
+export type SandboxLifecycleAction = 'create' | 'connect' | 'resume' | 'pause' | 'checkpoint' | 'destroy' | 'restore' | 'activate' | 'reconcile' | 'upgrade';
 export interface SandboxLifecycleContext {
   action: SandboxLifecycleAction;
   resourceKey: string;

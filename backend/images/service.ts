@@ -242,10 +242,9 @@ export class ImageCatalog {
       }
       const image = (await this.readImages(true)).find(image => image.id === project.imageSelection!.imageId);
       if (!image) throw new HttpError(409, '项目镜像仓库已不可用，请先同步可用版本');
-      const selected = versionId ?? image.defaultVersionId ?? image.versions
-        .filter(value => value.status === 'succeeded' && !value.deprecatedAt && !value.cleanup && value.projectReady !== false)
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]?.id;
-      if (!selected) throw new HttpError(409, '仓库没有可恢复的镜像版本，请先同步版本');
+      // A repository default can be older or incompatible with this project's
+      // archive. Changing restore images requires an explicit version choice.
+      const selected = versionId ?? project.imageSelection.versionId;
       return this.reserve(await this.resolveAvailable(image.id, selected));
     });
   }

@@ -1,0 +1,63 @@
+name: Real agent on disposable K3s
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+permissions:
+  contents: read
+concurrency:
+  group: disposable-k3s-agent
+  cancel-in-progress: false
+jobs:
+  agent:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    environment: integration
+    timeout-minutes: 60
+    env:
+      CELLBOX_SOURCE_DIR: ${{ github.workspace }}/cellbox-source
+      COCELL_E2E_MODEL: ${{ vars.COCELL_E2E_MODEL || secrets.COCELL_E2E_MODEL }}
+      OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+      CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+      COCELL_E2E_KUBE_CONTEXT: cocell-ci
+      COCELL_E2E_NAMESPACE: co-cell-ci
+      COCELL_E2E_HELM_RELEASE: co-cell
+      COCELL_E2E_OUTPUT_DIR: tmp/integration/ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: jingyugao/cell-box
+          ref: a7bd6b822e0f131c46b9f95cc5dcd0514e36b878
+          path: cellbox-source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.18.0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cellbox-source/go.mod
+          cache-dependency-path: cellbox-source/go.sum
+      - name: Check model configuration
+        run: |
+          test -n "$CODEX_API_KEY" || { echo 'Set integration secret CODEX_API_KEY'; exit 1; }
+          test -n "$COCELL_E2E_MODEL" || { echo 'Set integration variable or secret COCELL_E2E_MODEL'; exit 1; }
+      - name: Install test dependencies
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+      - name: Install disposable K3s and gVisor
+        run: bash scripts/integration/ci/setup-k3s.sh
+      - name: Build and deploy the real stack
+        run: node scripts/integration/ci/deploy.mjs
+      - name: Run a real agent and verify its service
+        run: pnpm test:integration:agent
+      - name: Collect diagnostics
+        if: always()
+        run: node scripts/integration/ci/collect.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-agent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tmp/integration/ci/
+          retention-days: 7
+      # No production kubeconfig is used. The entire VM/cluster is discarded.

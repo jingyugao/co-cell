@@ -21,7 +21,7 @@ export interface CellboxProfile {
   cpu: number; memoryMiB: number;
 }
 export type CellboxPhase = 'creating' | 'running' | 'freezing' | 'frozen' | 'unfreezing'
-  | 'checkpointing' | 'suspending' | 'suspended' | 'resuming' | 'restoring' | 'staged' | 'deleting' | 'deleted' | 'failed';
+  | 'rebuilding' | 'checkpointing' | 'suspending' | 'suspended' | 'resuming' | 'restoring' | 'staged' | 'deleting' | 'deleted' | 'failed';
 export interface CellboxBox {
   id: string; ownerKey: string; profileId: string; phase: CellboxPhase; generation: number;
   resourceVersion: number; importedImageId?: string; image: string; imageId?: string; workspace: string;
@@ -222,7 +222,7 @@ export class CellboxClient {
   restoreBox(input: { profileId: string; ownerKey: string; archiveId: string; importedImageId?: string; acceptImageChange?: boolean }, key: string) {
     return this.request<CellboxOperation>('POST', '/v1/boxes:restore', { body: input, key });
   }
-  actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile', key: string) {
+  actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string) {
     return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { key });
   }
   /** Purge owned artifacts after destruction; old APIs must fail rather than silently skip cleanup. */

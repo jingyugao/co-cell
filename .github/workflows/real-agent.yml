@@ -34,6 +34,7 @@ jobs:
       CODEX_MODEL_METADATA_JSON: ${{ vars.CODEX_MODEL_METADATA_JSON }}
       COCELL_E2E_KUBE_CONTEXT: cocell-ci
       COCELL_E2E_NAMESPACE: co-cell-ci
+      COCELL_E2E_CELLBOX_NAMESPACE: co-cell-ci
       COCELL_E2E_HELM_RELEASE: co-cell
       COCELL_E2E_OUTPUT_DIR: tmp/integration/ci
       COCELL_E2E_DISPOSABLE_CI: '1'

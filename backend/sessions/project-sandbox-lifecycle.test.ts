@@ -223,3 +223,38 @@ test('project creation verifies readiness; resume preserves the box without repe
     assert.throws(() => manager.getProject(created.id), /不存在/);
   } finally { finishPreparation(); await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
+
+test('rebuild endpoint chooses mounted HOME despite an existing older archive', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-home-rebuild-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const box: SandboxState = { id: 'same-box', status: 'unavailable', template: 'default', workingDirectory: defaults.workingDirectory };
+  await state.init();
+  await state.saveProject({ id: 'mounted-project', name: 'mounted project', type: 1, requirementUrl: null,
+    status: 'active', completedAt: null, archivedAt: null, executionMode: 'sandbox', workingDirectory: defaults.workingDirectory,
+    sandbox: box, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    remoteArchives: [{ id: 'old-archive', createdAt: '2025-01-01T00:00:00Z', sizeBytes: 128, sha256: 'a'.repeat(64), imageId: 'image', sourceSandboxId: 'old-box', threadIds: [] }] });
+  let rebuilt = false;
+  const runtime = {
+    async close() {},
+    async querySandbox(value) { return { ...value, status: rebuilt ? 'ready' as const : 'unavailable' as const }; },
+    async rebuildPersistent(target, _key, save) { assert.equal(target.sandbox?.id, box.id); rebuilt = true; await save({ ...box, status: 'ready' }); },
+    async verifySandbox() {}, async verifyHistory() {},
+    async rebuild() { assert.fail('must not create an empty sandbox'); },
+    async deleteDanglingSandbox() { assert.fail('must retain HOME'); },
+    remoteArchives: { async capture() { assert.fail('must not archive'); }, async inspect() { assert.fail('must not inspect archive'); },
+      async restore() { assert.fail('must not roll back archive'); }, async activate() {} },
+  } satisfies Partial<SandboxRuntime>;
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
+  try {
+    await manager.init();
+    const accepted = await manager.rebuildProjectSandbox('mounted-project');
+    assert.equal(accepted.sandboxOperation?.kind, 'rebuild');
+    const operations = (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations;
+    await operations.close();
+    assert.equal(manager.getProject('mounted-project').sandbox?.id, box.id);
+    assert.equal(manager.getProject('mounted-project').sandboxOperation?.status, 'succeeded');
+    assert.equal(rebuilt, true);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});

@@ -11,7 +11,7 @@ export class CodexAppServerClient extends EventEmitter {
   constructor(options = {}) { super(); this.options = options; this.pending = new Map(); this.nextId = 1; this.closed = false; }
   static async spawn(options = {}) {
     const client = new CodexAppServerClient(options);
-    try { await client.connect(); return client; } catch (error) { await client.close(); throw error; }
+    try { await client.connect(); return client; } catch (error) { try { await client.close(); } catch (cleanupError) { client.emit("cleanupError", cleanupError); } throw error; }
   }
   async connect() {
     if (this.child || this.socket) throw new Error('Client already started');
@@ -41,7 +41,7 @@ export class CodexAppServerClient extends EventEmitter {
     const socket = this.socket = new WebSocket(this.options.url, { headers: this.options.headers ?? {} });
     await new Promise((resolve, reject) => {
       const opened = () => { cleanup(); resolve(); };
-      const failed = () => { cleanup(); reject(new Error('App Server WebSocket connection failed')); };
+      const failed = () => { cleanup(); const error = new Error('App Server WebSocket connection failed'); this.fail(error); reject(error); };
       const cleanup = () => { socket.removeEventListener('open', opened); socket.removeEventListener('error', failed); };
       socket.addEventListener('open', opened, { once: true }); socket.addEventListener('error', failed, { once: true });
     });
@@ -131,6 +131,9 @@ export class CodexAppServerClient extends EventEmitter {
     if (this.socket) {
       const socket = this.socket;
       if (socket.readyState === WebSocket.CLOSED) return;
+      // A failed upgrade has no WebSocket peer to acknowledge a close frame.
+      // Node's native client can remain CONNECTING after its error event.
+      if (socket.readyState === WebSocket.CONNECTING) { socket.close(); return; }
       await new Promise((resolve, reject) => {
         const done = () => { clearTimeout(timer); socket.removeEventListener('close', done); resolve(); };
         const timer = setTimeout(() => {

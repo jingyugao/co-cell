@@ -1,4 +1,6 @@
-import { execFile, spawn } from 'node:child_process';
+import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
+import { execFileSync, execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
@@ -40,4 +42,37 @@ export async function liveTransport(env) {
     });
     return { env: { COCELL_E2E_BASE_URL: `http://127.0.0.1:${port}`, COCELL_E2E_PUBLIC_URL: values.publicUrl, COCELL_E2E_ACCESS_TOKEN: token }, close };
   } catch (error) { await close(); throw error; }
+}
+
+/** Fault injection is limited to the existing execution Pod of this test's project. */
+export async function failTestSandbox(env, projectId) {
+  assert(env.projects.has(projectId), 'Fault injection requires a project owned by this test');
+  const context = process.env.COCELL_E2E_KUBE_CONTEXT;
+  assert(context, 'Mounted HOME rebuild test requires COCELL_E2E_KUBE_CONTEXT');
+  const namespace = process.env.COCELL_E2E_CELLBOX_NAMESPACE ?? 'cell-box';
+  const project = await env.json(`/api/projects/${projectId}`);
+  assert(project.name.startsWith(`${env.prefix} `));
+  assert.equal(project.sandbox.status, 'ready');
+  const cli = ['--context', context, '-n', namespace];
+  const read = async args => JSON.parse((await exec('kubectl', [...cli, ...args, '-o', 'json'], { timeout: 30_000 })).stdout);
+  const box = await read(['get', 'cellboxes.cellbox.local', `cellbox-${project.sandbox.id}`]);
+  assert(box.spec.persistentHome, 'Fault injection requires persistent HOME');
+  assert.equal(box.status.phase, 'Running');
+  const pod = await read(['get', 'pod', box.status.podName]);
+  assert.equal(pod.metadata.uid, box.status.podUID);
+  assert(pod.metadata.ownerReferences.some(ref => ref.controller && ref.uid === box.metadata.uid));
+  const path = `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods/${encodeURIComponent(pod.metadata.name)}`;
+  execFileSync('kubectl', ['--context', context, 'delete', '--raw', path, '-f', '-'], {
+    input: JSON.stringify({ apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: pod.metadata.uid } }),
+    timeout: 30_000, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const deadline = Date.now() + env.config.operationTimeout;
+  for (;;) {
+    const current = await read(['get', 'cellboxes.cellbox.local', box.metadata.name]);
+    assert.equal(current.metadata.uid, box.metadata.uid, 'Fault injection changed HOME ownership');
+    if (current.status.phase === 'Failed') break;
+    assert(Date.now() < deadline, 'Lost test execution did not reach the failed state');
+    await delay(250, undefined, { signal: env.controller.signal });
+  }
+  return { sandboxId: project.sandbox.id, ownerUID: box.metadata.uid, podUID: pod.metadata.uid };
 }

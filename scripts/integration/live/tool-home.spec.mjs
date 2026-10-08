@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { test, expect } from '../support/fixtures.mjs';
+import { failTestSandbox } from '../support/kubernetes.mjs';
 
 const exec = promisify(execFile);
 
@@ -11,7 +12,7 @@ test.afterEach(async ({ environment: env }) => {
   }
 });
 
-test('native tool HOME: deployed permission UI, immediate revocation and checkpoint continuity', async ({ livePage: page, environment: env }) => {
+test('native tool HOME: deployed permission UI, revocation, checkpoint continuity and cold rebuild', async ({ livePage: page, environment: env }) => {
   test.skip(process.env.COCELL_E2E_TOOL_HOME_TEST !== '1', 'Requires an installation with a mounted HOME image and a configured kubectl credential');
   const context = process.env.COCELL_E2E_KUBE_CONTEXT;
   assert(context, 'This installation test requires its explicit Kubernetes context');
@@ -109,5 +110,29 @@ test('native tool HOME: deployed permission UI, immediate revocation and checkpo
     assert.equal((await fileState()).sha256, refreshed.sha256);
     assert.equal((await cli(['config', 'current-context'])).status, 0);
     return { observedReadyMs, pod, nativeCredentialPreserved: true };
+  });
+  await env.step('Cold rebuild restores protected kubectl and MySQL while retaining native credential updates', async () => {
+    assert(secrets.some(secret => secret.tool === 'mysql' && secret.enabled && secret.format === 'text'),
+      'Cold rebuild verification requires an enabled MySQL credential');
+    await env.json(`/api/projects/${project.id}/tool-permissions`, { method: 'PUT',
+      body: { permissions: [{ tool: 'kubectl', enabled: true }, { tool: 'mysql', enabled: true }] } });
+    const before = await fileState();
+    const previousPod = pod;
+    const lost = await failTestSandbox(env, project.id);
+    await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', expectedStatus: 202 });
+    const rebuilt = await env.waitProject(project.id, { kind: 'rebuild', status: 'ready' });
+    assert.equal(rebuilt.sandbox.id, lost.sandboxId);
+    pod = await findPod();
+    assert.notEqual(pod, previousPod);
+    assert.equal((await fileState()).sha256, before.sha256);
+    const resources = await cli(['--context', process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? context,
+      '-n', 'co-cell', 'get', 'pods', '-o', 'name']);
+    assert.equal(resources.status, 0, resources.stderr);
+    assert.match(resources.stdout, /^pod\//m);
+    const args = ['--login-path=' + (process.env.COCELL_E2E_TOOL_MYSQL_PROFILE ?? 'doris'), '-e', 'SELECT 1'];
+    const mysql = await guest(`const {spawnSync}=require('node:child_process');const r=spawnSync('/usr/local/bin/mysql',${JSON.stringify(args)},{uid:11000,gid:11000,cwd:'/home/agent/workspace',env:{HOME:'/home/agent',PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:20000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.code}));`);
+    assert.equal(mysql.status, 0, mysql.stderr || mysql.error);
+    assert.equal(mysql.stdout.trim().split('\n').at(-1), '1');
+    return { sandboxId: rebuilt.sandbox.id, pod, credentialPreserved: true, kubectl: 'passed', mysql: 'passed' };
   });
 });

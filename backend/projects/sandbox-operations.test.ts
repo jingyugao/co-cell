@@ -407,3 +407,66 @@ test('archived portable restore switches image only after history verification a
     await assert.rejects(operations.run('archived', 'restore', { imageVersionId: 'v1' }), /仅归档项目/);
   } finally { await operations.close(); await f.close(); }
 });
+
+for (const fails of [false, true]) test(`mounted HOME rebuild ${fails ? 'failure retains the binding' : 'ignores an older archive'}`, async () => {
+  const id = `mounted-rebuild-${fails}`;
+  const f = await fixture(project(id, { sandbox: sandbox('same-box', 'unavailable'), remoteArchives: [remoteReference] }));
+  const calls: string[] = [];
+  const control: { status: SandboxState['status'] } = { status: 'unavailable' };
+  const operations = new ProjectSandboxOperations({ projects: f.projects,
+    runtime: { ...runtime(control, calls),
+      async rebuildPersistent(value, key, save) {
+        assert.equal(value.sandbox?.id, 'same-box');
+        assert.match(key, /:rebuild$/);
+        calls.push('rebuild');
+        if (fails) throw new Error('persistent HOME missing');
+        control.status = 'ready';
+        await save(sandbox('same-box', 'ready'));
+      },
+      async verifyHistory(value, threads) {
+        assert.equal(value.id, 'same-box');
+        assert.deepEqual(threads, ['latest-thread']);
+        calls.push('history');
+      },
+      async deleteDanglingSandbox() { assert.fail('must retain HOME owner'); },
+      remoteArchives: {
+        async capture() { assert.fail('must not archive'); },
+        async inspect() { assert.fail('must not inspect archive'); },
+        async restore() { assert.fail('must not restore archive'); }, async activate() { assert.fail('must not activate archive'); },
+      },
+    }, threadIds: () => ['latest-thread'],
+    saveSandbox: async (projectId, value) => { await f.projects.updateSandbox(projectId, value, false); },
+    detached: async () => { assert.fail('must retain binding'); } });
+  try {
+    if (fails) await assert.rejects(operations.run(id, 'rebuild'), /persistent HOME missing/);
+    else await operations.run(id, 'rebuild');
+    assert.equal(f.projects.get(id).sandbox?.id, 'same-box');
+    assert.equal(f.projects.get(id).remoteArchives?.[0].id, remoteReference.id);
+    assert.deepEqual(calls, fails ? ['inspect', 'rebuild'] : ['inspect', 'rebuild', 'verify', 'history']);
+    assert.equal(f.projects.get(id).sandboxOperation?.status, fails ? 'failed' : 'succeeded');
+  } finally { await operations.close(); await f.close(); }
+});
+
+test('retry after a cold rebuild prepares the ready execution without rebuilding it again', async () => {
+  const id = 'rebuild-prepare-retry';
+  const f = await fixture(project(id, { sandbox: sandbox('same-box', 'unavailable') }));
+  const control: { status: SandboxState['status'] } = { status: 'unavailable' };
+  let rebuilds = 0, preparations = 0;
+  const operations = new ProjectSandboxOperations({ projects: f.projects,
+    runtime: { ...runtime(control, []),
+      async rebuildPersistent(value, _key, save) {
+        if (control.status === 'ready') { preparations++; await save({ ...value.sandbox!, status: 'ready' }); return; }
+        rebuilds++; control.status = 'ready'; await save({ ...value.sandbox!, status: 'ready' });
+        throw new Error('configuration temporarily failed');
+      },
+      async resume(value, save) { preparations++; await save({ ...value.sandbox!, status: 'ready' }); },
+    }, threadIds: () => [], saveSandbox: async (projectId, value) => { await f.projects.updateSandbox(projectId, value, false); },
+    detached: async () => { assert.fail('must retain binding'); } });
+  try {
+    await assert.rejects(operations.run(id, 'rebuild'), /configuration temporarily failed/);
+    await operations.run(id, 'rebuild');
+    assert.equal(rebuilds, 1); assert.equal(preparations, 1);
+    assert.equal(f.projects.get(id).sandbox?.id, 'same-box');
+    assert.equal(f.projects.get(id).sandboxOperation?.status, 'succeeded');
+  } finally { await operations.close(); await f.close(); }
+});

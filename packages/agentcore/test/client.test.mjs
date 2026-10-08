@@ -124,3 +124,13 @@ test('resuming an existing thread applies the current model to the next turn', a
   assert.equal(calls.find(call => call.method === 'thread/resume').params.threadId, first.id);
  } finally { await codex.close(); await rm(directory, { recursive: true, force: true }); }
 });
+
+test('a rejected WebSocket upgrade preserves its connection error and closes without waiting for peer acknowledgement', async () => {
+ const server = createServer((_request, response) => { response.writeHead(502); response.end('upstream unavailable'); });
+ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+ const start = Date.now();
+ try {
+  await assert.rejects(CodexAppServerClient.spawn({ url: `ws://127.0.0.1:${server.address().port}`, requestTimeoutMs: 2000 }), /WebSocket connection failed/);
+  assert(Date.now() - start < 2000, 'Failed upgrade waited for a nonexistent WebSocket close acknowledgement');
+ } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});

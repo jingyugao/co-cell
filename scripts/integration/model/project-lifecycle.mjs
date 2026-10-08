@@ -102,14 +102,28 @@ export async function projectLifecycle(env, { userInputOnly = false } = {}) {
   });
   const questionIds = new Set();
   if (userInputOnly) for (const round of [1, 2]) await step(`Native asynchronous question and persisted reply, round ${round}`, async () => {
-    const prompt = `这是平台集成测试的第 ${round} 次提问。必须调用 Codex 内置 request_user_input_async（禁止使用任何 MCP 工具），发送一个问题“集成测试第 ${round} 轮继续吗？”并提供两个选项“继续”和“停止”。不要把问题当普通文字输出。调用成功后简短汇报。`;
+    const question = round === 1
+      ? { title: '健康检查服务使用哪种启动方式？', options: ['后台运行', '前台运行'] }
+      : { title: '健康检查服务使用哪个监听端口？', options: ['18080', '18081'] };
+    const selectedAnswer = question.options[round - 1];
+    const replyMarker = `async-result-${randomUUID()}`;
+    const missingPreference = round === 1 ? '启动方式' : '监听端口';
+    const prompt = `请帮我确定这个项目的 Node.js 健康检查服务${missingPreference}。现在缺少我的${missingPreference}偏好，在确认前不得写文件或执行命令。
+请立即调用原生 request_user_input_async，参数为 ${JSON.stringify({ questions: [question] })}。不要使用同步 request_user_input 或 MCP，也不要用普通文本代替工具提问。
+调用后结束本轮并等待异步回答。收到回答后只回复我选择的${missingPreference}和标记 ${replyMarker}，不要使用任何其他工具。`;
     const result = await turn(prompt);
     const session = await json(`/api/sessions/${sessionId}`);
     const source = session.turns.find(t => t.id === result.turnId || t.nativeTurnId === result.nativeTurnId);
+    assert.equal(source?.prompt, prompt, 'Native history lost the submitted user task');
+    report.userInputEvidence ??= [];
+    report.userInputEvidence.push({ round, prompt, threadId: session.threadId, source });
+    await persist();
     assert(source?.userInputRequests?.length, `request_user_input_async did not create a persisted request; model reply: ${redact(result.text).slice(0, 1000)}`);
     const request = source.userInputRequests.at(-1);
     assert(!questionIds.has(request.id), 'Continued conversation reused a previous question');
     questionIds.add(request.id);
+    assert.equal(source.userInputRequests.length, 1, 'Expected exactly one question request');
+    assert.deepEqual(request.questions, [question], 'Native question does not match the missing preference');
     assert.equal(request.status, 'pending');
     const native = source.items.find(item => item.id === request.id);
     assert.equal(native?.type, 'agent_message');
@@ -117,7 +131,7 @@ export async function projectLifecycle(env, { userInputOnly = false } = {}) {
     assert.deepEqual(native.questions, request.questions);
     assert(!source.items.some(item => item.type === 'mcp_tool_call'), 'Must use the native tool, not MCP');
     const answered = await json(`/api/sessions/${sessionId}/turns/${source.id}/user-input/${request.id}`, {
-      method: 'POST', body: { answer: '继续' }, expectedStatus: 200,
+      method: 'POST', body: { answer: selectedAnswer }, expectedStatus: 200,
     });
     let updated = answered.turns.find(t => t.id === source.id);
     const deadline = Date.now() + 120_000;
@@ -136,6 +150,14 @@ export async function projectLifecycle(env, { userInputOnly = false } = {}) {
     assert(reply?.prompt.includes('send_user_message_question_reply'));
     assert(reply.prompt.includes(request.id), 'Reply lost native call ID');
     assert.equal(reply.status, 'completed');
+    assert(reply.prompt.includes(selectedAnswer), 'Reply lost the selected answer');
+    const replyText = reply.items.filter(item => item.type === 'agent_message').map(item => item.text).join('\n');
+    assert(replyText.includes(selectedAnswer), 'Agent did not consume the actual user answer');
+    assert(replyText.includes(replyMarker), 'Answer turn lost the original task context');
+    for (const candidate of [source, reply]) assert(!candidate.items.some(item =>
+      ['command_execution', 'file_change', 'mcp_tool_call'].includes(item.type)), 'This preference question must use only the native asynchronous input tool');
+    report.userInputEvidence.at(-1).reply = reply;
+    await persist();
     return { requestId: request.id, answerTurnId: updated.userInputRequests.at(-1).answerTurnId };
   });
   if (!userInputOnly) {

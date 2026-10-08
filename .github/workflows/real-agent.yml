@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 60
     env:
       CELLBOX_SOURCE_DIR: ${{ github.workspace }}/cellbox-source
-      COCELL_E2E_MODEL: ${{ vars.COCELL_E2E_MODEL }}
+      COCELL_E2E_MODEL: ${{ vars.COCELL_E2E_MODEL || secrets.COCELL_E2E_MODEL }}
       OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
       CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
       COCELL_E2E_KUBE_CONTEXT: cocell-ci
@@ -40,7 +40,7 @@ jobs:
       - name: Check model configuration
         run: |
           test -n "$CODEX_API_KEY" || { echo 'Set integration secret CODEX_API_KEY'; exit 1; }
-          test -n "$COCELL_E2E_MODEL" || { echo 'Set integration variable COCELL_E2E_MODEL'; exit 1; }
+          test -n "$COCELL_E2E_MODEL" || { echo 'Set integration variable or secret COCELL_E2E_MODEL'; exit 1; }
       - name: Install test dependencies
         run: |
           corepack enable

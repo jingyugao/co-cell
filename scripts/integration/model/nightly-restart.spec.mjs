@@ -1,0 +1,50 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { test } from '../support/fixtures.mjs';
+import { createConversation, fileURL, finish, runAgent, submit, waitCommandStart } from '../support/agent.mjs';
+import { liveTransport } from '../support/kubernetes.mjs';
+
+test('nightly: Web restart recovers an active native turn without executing its command twice', async ({ environment: env }) => {
+  test.skip(process.env.GITHUB_ACTIONS !== 'true' || process.env.COCELL_E2E_DISPOSABLE_CI !== '1', 'Only restart the dedicated disposable GitHub installation');
+  const context = process.env.COCELL_E2E_KUBE_CONTEXT, namespace = process.env.COCELL_E2E_NAMESPACE;
+  assert.equal(context, 'cocell-ci'); assert.equal(namespace, 'co-cell-ci');
+  const kube = args => execFileSync('kubectl', ['--context', context, '-n', namespace, ...args], { encoding: 'utf8', timeout: 180_000 });
+  const nodes = JSON.parse(kube(['get', 'nodes', '-o', 'json'])).items;
+  assert(nodes.length === 1 && nodes[0].metadata.labels['cocell-ci-run'] === process.env.GITHUB_RUN_ID, 'Refusing to restart an unrelated installation');
+  const project = await env.createProject('web-restart');
+  const ready = await env.waitProject(project.id, { kind: 'create', status: 'ready' });
+  const session = await createConversation(env, project, 'Web restart recovery');
+  const marker = randomUUID(), folder = `restart-${marker}`;
+  const source = `const fs=require("node:fs"),path=require("node:path");const folder=process.argv[1],marker=process.argv[2];fs.mkdirSync(folder,{recursive:true});const count=path.join(folder,"count.txt");const previous=fs.existsSync(count)?Number(fs.readFileSync(count,"utf8")):0;fs.writeFileSync(count,String(previous+1));console.log(${JSON.stringify(`started-${marker}`)});setTimeout(()=>{fs.writeFileSync(path.join(folder,"done.txt"),marker);console.log(marker)},60000);`;
+  const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
+  const command = `node -e ${quote(source)} ${quote(`${ready.workingDirectory}/${folder}`)} ${quote(marker)}`;
+  const prompt = `请使用 exec_command 原样执行下面这条前台 Node 命令一次，yield_time_ms=1000。命令会增加计数、打印启动标记，等待 60 秒后写入完整随机标记。不要改写代码，不要后台运行，不要重新执行。如果返回 session_id，只用 write_stdin 轮询同一个进程直到退出。完成后回复 ${marker}。不要使用子代理、凭据或外部系统。\n${command}`;
+  env.report.restartCommand = { command, prompt, marker, folder };
+  await env.persist();
+  const { turnId } = await submit(env, session, prompt);
+  await waitCommandStart(env, session, `started-${marker}`);
+  const before = await env.json(`/api/sessions/${session.id}`);
+  assert.equal(before.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId)?.status, 'running');
+  assert(before.threadId);
+  await env.step('Restart only the disposable CoCell deployment and reconnect its API transport', async () => {
+    kube(['rollout', 'restart', 'deployment/co-cell']);
+    kube(['rollout', 'status', 'deployment/co-cell', '--timeout=150s']);
+    const transport = await liveTransport({ ...process.env, COCELL_E2E_BASE_URL: undefined, COCELL_E2E_SERVICE: 'co-cell' });
+    env.transports.push(transport);
+    env.config.base = new URL(transport.env.COCELL_E2E_BASE_URL);
+    return { deployment: 'co-cell', namespace };
+  });
+  await env.step('Recovered native turn finishes once and keeps files and history', async () => {
+    const recovered = await finish(env, session, turnId);
+    assert.equal(recovered.session.threadId, before.threadId);
+    assert.equal(recovered.session.turns.filter(turn => turn.prompt.includes(folder)).length, 1);
+    assert.equal((await env.json(fileURL(ready, `${folder}/count.txt`))).trim(), '1');
+    assert.equal((await env.json(fileURL(ready, `${folder}/done.txt`))).trim(), marker);
+    assert(recovered.text.includes(marker));
+    const next = await runAgent(env, session, `Read ${folder}/done.txt using Node and reply its exact content. Do not run the previous command again.`);
+    assert.equal(next.session.threadId, before.threadId);
+    assert(next.text.includes(marker));
+    return { threadId: before.threadId, count: 1 };
+  });
+});

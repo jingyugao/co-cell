@@ -20,7 +20,12 @@ export async function liveTransport(env) {
   const secret = await read('kubectl', ['--context', context, '-n', namespace, 'get', 'secret', values.existingSecret, '-o', 'json']);
   const token = env.COCELL_E2E_ACCESS_TOKEN ?? Buffer.from(secret.data?.COCELL_ACCESS_TOKEN ?? '', 'base64').toString();
   if (!token) throw new Error('The existing CoCell Secret has no operator access token');
-  const forward = spawn('kubectl', ['--context', context, '-n', namespace, 'port-forward', `service/${service}`, ':3001', '--address=127.0.0.1'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const transport = await forwardService(context, namespace, service, 3001);
+  return { env: { COCELL_E2E_BASE_URL: transport.base, COCELL_E2E_PUBLIC_URL: values.publicUrl, COCELL_E2E_ACCESS_TOKEN: token }, close: transport.close };
+}
+
+async function forwardService(context, namespace, service, servicePort) {
+  const forward = spawn('kubectl', ['--context', context, '-n', namespace, 'port-forward', `service/${service}`, `:${servicePort}`, '--address=127.0.0.1'], { stdio: ['ignore', 'pipe', 'pipe'] });
   forward.stderr.resume();
   const close = async () => {
     if (forward.exitCode !== null) return;
@@ -40,8 +45,34 @@ export async function liveTransport(env) {
         if (match) { clearTimeout(timer); resolve(match[1]); }
       });
     });
-    return { env: { COCELL_E2E_BASE_URL: `http://127.0.0.1:${port}`, COCELL_E2E_PUBLIC_URL: values.publicUrl, COCELL_E2E_ACCESS_TOKEN: token }, close };
+    return { base: `http://127.0.0.1:${port}`, close };
   } catch (error) { await close(); throw error; }
+}
+
+/** Prepare deterministic workspace fixtures through the real Cellbox file API. */
+export async function testWorkspaceWriter(env, projectId) {
+  assert(env.projects.has(projectId), 'Fixture writes require a project owned by this test');
+  const context = process.env.COCELL_E2E_KUBE_CONTEXT;
+  assert(context, 'Workspace fixture requires COCELL_E2E_KUBE_CONTEXT');
+  const namespace = process.env.COCELL_E2E_NAMESPACE ?? process.env.COCELL_NAMESPACE ?? 'co-cell';
+  const release = process.env.COCELL_E2E_HELM_RELEASE ?? process.env.COCELL_HELM_RELEASE ?? 'co-cell';
+  const values = JSON.parse((await exec('helm', ['--kube-context', context, '-n', namespace, 'get', 'values', release, '-o', 'json'], { timeout: 30_000 })).stdout);
+  assert(values.cellbox?.clientId, 'Missing Cellbox client namespace');
+  const transport = await forwardService(context, process.env.COCELL_E2E_CELLBOX_NAMESPACE ?? 'cell-box', 'cellbox-api', 8090);
+  env.transports.push(transport);
+  return async (filename, content) => {
+    assert(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(filename), 'Fixture must be a plain workspace filename');
+    assert(env.projects.has(projectId));
+    const project = await env.json(`/api/projects/${projectId}`);
+    assert(project.name.startsWith(`${env.prefix} `));
+    assert.equal(project.sandbox.status, 'ready');
+    const response = await fetch(`${transport.base}/v1/boxes/${encodeURIComponent(project.sandbox.id)}/files?path=${encodeURIComponent(filename)}`, {
+      method: 'PUT', headers: { 'X-Cellbox-Client-ID': values.cellbox.clientId, 'Content-Type': 'application/octet-stream' },
+      body: content, signal: AbortSignal.any([env.controller.signal, AbortSignal.timeout(30_000)]), redirect: 'error',
+    });
+    const detail = await response.text();
+    assert(response.ok, `Workspace fixture write failed: HTTP ${response.status}; ${env.redact(detail).slice(0, 500)}`);
+  };
 }
 
 /** Fault injection is limited to the existing execution Pod of this test's project. */

@@ -40,13 +40,31 @@ export class LiveEnvironment {
     this.projects = new Map();
     this.sessions = new Set();
     this.boxes = new Set();
+    this.transports = [];
     this.controller = new AbortController();
     this.journal = journal;
     this.pendingWrite = Promise.resolve();
     this.testStep = step;
     this.report = { runId: this.runId, prefix: this.prefix, target: config.publicURL.origin, startedAt: new Date().toISOString(), steps: [], requests: [], cleanup: [] };
   }
-  redact(value) { return String(value).replaceAll(this.config.token, '[redacted]'); }
+  redact(value) {
+    return [this.config.token, process.env.CODEX_API_KEY, process.env.OPENAI_API_KEY].filter(Boolean)
+      .reduce((text, secret) => text.replaceAll(secret, '[redacted]'), String(value));
+  }
+  async captureFailure() {
+    this.report.failedSessions = [];
+    for (const id of this.sessions) {
+      try {
+        const session = await this.json(`/api/sessions/${id}`, { signal: AbortSignal.timeout(10_000) });
+        this.report.failedSessions.push({ id, status: session.status, threadId: session.threadId, historyError: session.historyError,
+          turns: session.turns.map(turn => ({ id: turn.id, prompt: turn.prompt, status: turn.status, error: turn.error,
+            items: turn.items.map(item => ({ type: item.type, status: item.status, text: item.text,
+              command: item.command, exit_code: item.exit_code, aggregated_output: item.aggregated_output,
+              message: item.message, error: item.error })) })) });
+      } catch (error) { this.report.failedSessions.push({ id, error: this.redact(error.message) }); }
+    }
+    await this.persist();
+  }
   name(label) { return `${this.prefix} ${label}`; }
   async persist() {
     if (!this.journal) return;
@@ -65,7 +83,13 @@ export class LiveEnvironment {
       await this.persist();
       const start = performance.now();
       try { entry.evidence = await run(); entry.status = 'passed'; return entry.evidence; }
-      catch (error) { entry.status = 'failed'; entry.error = this.redact(error.message); throw new Error(entry.error); }
+      catch (error) {
+        entry.status = 'failed'; entry.error = this.redact(error.message ?? String(error));
+        const failure = new Error(entry.error);
+        // Retain the original assertion location without leaking its raw properties.
+        if (error.stack) failure.stack = this.redact(error.stack);
+        throw failure;
+      }
       finally { entry.durationMs = performance.now() - start; await this.persist(); }
     });
   }
@@ -199,6 +223,12 @@ export class LiveEnvironment {
       try {
         const inventory = await this.json('/api/sandboxes', { signal });
         assert(!inventory.sandboxes.some(box => this.boxes.has(box.id)), 'A test sandbox remains after project deletion');
+      } catch (error) { errors.push(this.redact(error.message)); }
+    }
+    if (!this.config.keepProjects && this.sessions.size) {
+      try {
+        const sessions = await this.json('/api/sessions', { signal });
+        assert(!sessions.some(session => this.sessions.has(session.id)), 'A test session remains after project deletion');
       } catch (error) { errors.push(this.redact(error.message)); }
     }
     this.report.finishedAt = new Date().toISOString();

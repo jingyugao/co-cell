@@ -1,7 +1,9 @@
 import { createInterface } from 'node:readline';
+import { appendFileSync } from 'node:fs';
 const send = message => process.stdout.write(`${JSON.stringify(message)}\n`);
 for await (const line of createInterface({ input: process.stdin })) {
  const message = JSON.parse(line);
+ if (process.env.AGENTCORE_TEST_REQUEST_LOG) appendFileSync(process.env.AGENTCORE_TEST_REQUEST_LOG, `${line}\n`);
  if (message.method === 'initialize') send({ id: message.id, result: {} });
  else if (message.method === 'echo') send({ id: message.id, result: message.params });
  else if (message.method === 'burst') {

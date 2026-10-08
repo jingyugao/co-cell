@@ -61,7 +61,8 @@ const cellboxKind=process.env.CELLBOX_KIND??'k8s-resumable';
 if(cellboxKind!=='k8s-resumable')throw new Error('This CoCell Cellbox adapter requires CELLBOX_KIND=k8s-resumable');
 const cocellPublicUrl = process.env.COCELL_PUBLIC_URL || `http://127.0.0.1:${port}`;
 const appServerArguments=appServerArgs(modelConfig, configOverrides).slice(1);
-const appServerEnv = {...(apiKey?{CODEX_API_KEY:apiKey}:{}),...(process.env.OPENAI_BASE_URL?{OPENAI_BASE_URL:process.env.OPENAI_BASE_URL}:{})};
+const appServerEnv = {...(apiKey?{CODEX_API_KEY:apiKey}:{}),...(process.env.OPENAI_BASE_URL?{OPENAI_BASE_URL:process.env.OPENAI_BASE_URL}:{}),
+  ...(process.env.CODEX_MODEL_METADATA_JSON ? { CODEX_MODEL_METADATA_JSON: process.env.CODEX_MODEL_METADATA_JSON } : {})};
 const sharedDirectory = await loadSharedMountConfig();
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
 if (sharedDirectory) await publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });

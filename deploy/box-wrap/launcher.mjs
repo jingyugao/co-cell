@@ -1,10 +1,31 @@
 #!/usr/local/bin/node
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { constants } from 'node:fs';
-import { chmod, lstat, mkdir, open, readlink, rename, rm, symlink, unlink } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readlink, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
+
+const exec = promisify(execFile);
+
+export function extendModelCatalog(catalog, metadata) {
+  assertPrivateObject(metadata, 'model metadata');
+  const models = [...catalog.models];
+  for (const [slug, settings] of Object.entries(metadata)) {
+    assertPrivateObject(settings, 'model metadata entry');
+    if (!slug.trim() || models.some(model => model.slug === slug)) throw new Error('model metadata must register a new model name');
+    const { template, ...overrides } = settings;
+    const source = catalog.models.find(model => model.slug === template);
+    if (!source) throw new Error('model metadata template is not in the installed Codex catalog');
+    const model = { ...structuredClone(source), ...overrides, slug, display_name: slug, description: 'Configured external coding model' };
+    // Template capabilities do not imply that the external model is a GPT model.
+    if (model.base_instructions) model.base_instructions = model.base_instructions.replace(/based on GPT-[\w.-]+/g, `using ${slug}`);
+    if (model.model_messages?.instructions_template) model.model_messages.instructions_template = model.model_messages.instructions_template.replace(/based on GPT-[\w.-]+/g, `using ${slug}`);
+    models.push(model);
+  }
+  return { ...catalog, models };
+}
 
 const DEFAULT_WORKSPACE = '/home/agent/workspace';
 const DEFAULT_CODEX = '/usr/local/bin/codex';
@@ -144,6 +165,21 @@ async function runCodex(config, { workspace, agentHome, codex, codexHome, signal
   // Cellbox is the Sandbox boundary; Codex must not start its nested Linux sandbox.
   const args = ['app-server', ...config.appServerArgs, '-c', 'sandbox_mode="danger-full-access"',
     '--listen', 'ws://127.0.0.1:4500'];
+  if (env.CODEX_MODEL_METADATA_JSON) {
+    if (config.appServerArgs.some(value => /^\s*model_catalog_json\s*=/.test(value))) throw new Error('Use model metadata or an explicit model catalog, not both');
+    let metadata;
+    try { metadata = JSON.parse(env.CODEX_MODEL_METADATA_JSON); } catch { throw new Error('model metadata is not valid JSON'); }
+    const { stdout } = await exec(codex, ['debug', 'models'], { env, cwd: workspace, timeout: 30000, maxBuffer: 8 * 1024 * 1024 });
+    const catalog = extendModelCatalog(JSON.parse(stdout), metadata);
+    const destination = join(codexHome, '.cocell-models.json');
+    const temporary = join(codexHome, `.models-${randomUUID()}.tmp`);
+    try {
+      await writeFile(temporary, JSON.stringify(catalog), { flag: 'wx', mode: 0o600 });
+      await rename(temporary, destination);
+    } finally { await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+    args.push('-c', `model_catalog_json=${JSON.stringify(destination)}`);
+    delete env.CODEX_MODEL_METADATA_JSON;
+  }
   log('provisioning accepted; starting Codex App Server on 127.0.0.1:4500');
   return new Promise((resolve, reject) => {
     const child = spawn(codex, args, { cwd: workspace, env, stdio: 'inherit' });

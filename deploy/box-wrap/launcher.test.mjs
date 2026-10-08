@@ -5,6 +5,37 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { parseConfig, startLauncher } from './launcher.mjs';
 
+test('external model metadata reaches App Server without replacing built-in models', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-model-catalog-'));
+  const workspace = join(root, 'workspace'), startupDirectory = join(root, 'startup');
+  const report = join(root, 'report.json'), codex = join(root, 'codex.mjs');
+  const original = { slug: 'template', base_instructions: 'You are an agent based on GPT-5.', experimental_supported_tools: [] };
+  const stop = new AbortController(); let launched;
+  try {
+    await mkdir(workspace); await mkdir(startupDirectory);
+    await writeFile(codex, `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from 'node:fs';
+if (process.argv[2] === 'debug') { console.log(JSON.stringify({ models: [${JSON.stringify(original)}] })); process.exit(0); }
+const argument = process.argv.find(arg => arg.startsWith('model_catalog_json='));
+const path = JSON.parse(argument.slice(argument.indexOf('=') + 1));
+writeFileSync(${JSON.stringify(report)}, JSON.stringify({path, catalog:JSON.parse(readFileSync(path)), metadata:process.env.CODEX_MODEL_METADATA_JSON}));
+process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+    await writeFile(join(startupDirectory, 'config.json'), JSON.stringify({ version: 1, appServerArgs: [], env: {
+      CODEX_MODEL_METADATA_JSON: JSON.stringify({ 'external-model': { template: 'template', experimental_supported_tools: ['send_user_message_async'] } }),
+    } }), { mode: 0o600 });
+    launched = startLauncher({ workspace, agentHome: join(root, 'agent'), startupDirectory, codex, signal: stop.signal, log: () => {} });
+    await until(async () => Boolean(await stat(report).catch(() => null)));
+    const result = JSON.parse(await readFile(report, 'utf8'));
+    assert.deepEqual(result.catalog.models[0], original);
+    assert.equal(result.catalog.models[1].slug, 'external-model');
+    assert.deepEqual(result.catalog.models[1].experimental_supported_tools, ['send_user_message_async']);
+    assert(result.catalog.models[1].base_instructions.includes('using external-model'));
+    assert.equal(result.metadata, undefined);
+    assert.equal((await stat(result.path)).mode & 0o777, 0o600);
+  } finally { stop.abort(); if (launched) await launched; await rm(root, { recursive: true, force: true }); }
+});
+
 async function until(check, timeoutMs = 5000) {
   const end = Date.now() + timeoutMs;
   while (Date.now() < end) {

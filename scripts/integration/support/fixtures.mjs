@@ -12,8 +12,12 @@ export const test = base.extend({
       expect((await environment.json('/api/config')).sandbox?.enabled).toBe(true);
       await use(environment);
     } finally {
+      if (testInfo.status !== testInfo.expectedStatus) await environment.captureFailure();
       try { await environment.cleanup(); }
-      finally { await testInfo.attach('lifecycle-evidence', { path: environment.journal, contentType: 'application/json' }); }
+      finally {
+        try { await Promise.all(environment.transports.map(transport => transport.close())); }
+        finally { await testInfo.attach('lifecycle-evidence', { path: environment.journal, contentType: 'application/json' }); }
+      }
     }
   }, { timeout: Number(process.env.COCELL_E2E_OPERATION_TIMEOUT_MS ?? 300_000) + 60_000 }],
   livePage: async ({ browser, environment }, use) => {

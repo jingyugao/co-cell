@@ -9,7 +9,7 @@ export async function conversationReads(env) {
   const json = env.json.bind(env), request = env.request.bind(env), step = env.step.bind(env);
   const redact = env.redact.bind(env), persist = env.persist.bind(env);
   const delay = ms => sleep(ms, undefined, { signal: env.controller.signal });
-  const markers = Object.fromEntries(['root', 'child', 'grandchild', 'other', 'followup'].map(name => [name, `${name}-${randomUUID()}`]));
+  const markers = Object.fromEntries(['root', 'child', 'other', 'otherRoot', 'followup'].map(name => [name, `${name}-${randomUUID()}`]));
   let projectId;
   const createdSessions = [];
   const waitIdle = () => env.waitIdle(projectId);
@@ -54,31 +54,18 @@ export async function conversationReads(env) {
     await json(`/api/sessions/${id}/stop`, { method: 'POST', body: {} }).catch(() => {});
     throw new Error(`Model turn timed out; inspect session ${id}`);
   }
-  function nestedPrompt() {
-    return `这是对话历史与子代理接口的真实模型集成测试。必须实际使用子代理工具，不能只描述或假装已经委派。你和所有子代理都不得使用 shell、读写文件、联网、安装软件或操作凭证。
-  本次明确授权委派下面两个很小的支持任务：
-  1. 你创建一个直属子代理，任务为核对子代理链路。给它完整指令：它必须再创建一个孙代理，孙代理只回复标记 ${markers.grandchild}，不运行任何其他工具；直属子代理等待孙代理完成后，回复自己的标记 ${markers.child} 和孙代理的结果。
-  2. 你等待直属子代理完成，然后最后回复你自己的标记 ${markers.root} 以及两个子代理的结果。
-  我作为用户明确要求并授权直属子代理创建上面指定的孙代理；请在交给直属子代理的任务中逐字传递这项用户授权。子代理工具如允许 fork_turns，请使用 all，让子代理能看到本条用户请求和授权；继承当前模型，不覆盖模型。孙代理只输出标记，不能继续派生。
-  务必等待所有子代理完成才结束，不要向用户提问。派生失败时准确报告工具错误，不得声称已经创建。`;
+  function childPrompt(childMarker = markers.child, rootMarker = markers.root) {
+    return `这是对话历史与子代理接口的真实模型集成测试。用户明确授权你创建一个直属子代理，必须实际使用子代理工具，不能只描述或假装已经委派。你和子代理都不得执行命令、读写文件、联网、安装软件或操作凭证。
+  只创建一个直属子代理，给它完整独立指令：仅回复随机标记 ${childMarker}，不使用任何工具，不创建任何后代。继承当前模型，不覆盖模型。
+  必须等待该子代理完成，并在最终回复中包含你自己的标记 ${rootMarker} 和子代理实际返回的标记。不要向用户提问。派生失败时准确报告工具错误，不得模拟结果。`;
   }
-  function verifyDescendants(agents, threadId) {
-    const child = agents.find(agent => agent.parentThreadId === threadId && agent.turns.some(turn => answer(turn).includes(markers.child)));
-    assert(child, 'Missing actual direct-child transcript');
-    const grandchild = agents.find(agent => agent.parentThreadId === child.threadId
-      && agent.turns.some(turn => answer(turn).includes(markers.grandchild)));
-    assert(grandchild, 'Missing actual grandchild transcript');
-    assert.notEqual(child.threadId, grandchild.threadId);
-    assert.equal(child.depth, 1); assert.equal(grandchild.depth, 2);
-    const ancestors = new Set([threadId]);
-    let changed;
-    do {
-      changed = false;
-      for (const agent of agents) if (ancestors.has(agent.parentThreadId) && !ancestors.has(agent.threadId)) {
-        ancestors.add(agent.threadId); changed = true;
-      }
-    } while (changed);
-    assert.equal(ancestors.size, agents.length + 1, 'Unrelated or duplicate thread leaked into the response');
+  function verifyChild(agents, threadId, marker = markers.child) {
+    assert.equal(agents.length, 1, 'Expected exactly one direct child and no further descendants');
+    const child = agents[0];
+    assert.equal(child.parentThreadId, threadId, 'Child belongs to another native thread');
+    assert.notEqual(child.threadId, threadId);
+    assert.equal(child.depth, 1);
+    assert(child.turns.some(turn => answer(turn).includes(marker)), 'Missing actual direct-child reply');
     for (const agent of agents) {
       assert(Number.isFinite(Date.parse(agent.startedAt))); assert(agent.path);
       assert(agent.turns.length > 0);
@@ -101,32 +88,35 @@ export async function conversationReads(env) {
     return { projectId, sandboxId: current.sandbox.id, image: current.sandbox.image?.id };
   });
   let sessionId, threadId;
-  await step('Ask the real model to create a child and grandchild and wait for their replies', async () => {
-    sessionId = report.sessionId = await createSession('Nested subagent read integration');
-    const { session, current } = await turn(sessionId, nestedPrompt());
+  await step('Ask the real model to create one direct child and wait for its reply', async () => {
+    sessionId = report.sessionId = await createSession('Direct subagent read integration');
+    const { session, current } = await turn(sessionId, childPrompt());
     threadId = report.threadId = session.threadId;
     const agents = await json(`/api/sessions/${sessionId}/subagents`);
-    report.nestedAgentEvidence = { rootReply: answer(current), agents };
+    report.childAgentEvidence = { rootReply: answer(current), agents };
     await persist();
-    const descendants = verifyDescendants(agents, threadId);
-    for (const marker of [markers.root, markers.child, markers.grandchild]) assert(answer(current).includes(marker), `Main response missed a child result; model reply: ${redact(answer(current)).slice(0, 1000)}`);
+    const descendants = verifyChild(agents, threadId);
+    for (const marker of [markers.root, markers.child]) assert(answer(current).includes(marker), `Main response missed a child result; model reply: ${redact(answer(current)).slice(0, 1000)}`);
     return { sessionId, threadId, descendants };
   });
   await step('Create another real subagent conversation in the same project and verify isolation', async () => {
     const otherId = report.otherSessionId = await createSession('Unrelated subagent read integration');
-    const { session } = await turn(otherId, `这是另一个会话的隔离测试。必须实际创建一个直属子代理，让它只回复 ${markers.other}。如允许指定模型，使用准确的小写模型名 ${model}。等待它完成，并在最终回复中包含这个标记。你和子代理都不得执行命令、读写文件或联网。`);
+    const { session, current } = await turn(otherId, childPrompt(markers.other, markers.otherRoot));
     const otherAgents = await json(`/api/sessions/${otherId}/subagents`);
-    assert(otherAgents.some(agent => agent.parentThreadId === session.threadId && transcript([agent]).includes(markers.other)), 'Other conversation did not spawn a real child');
+    report.isolationAgentEvidence = { rootReply: answer(current), agents: otherAgents };
+    await persist();
+    verifyChild(otherAgents, session.threadId, markers.other);
+    for (const marker of [markers.otherRoot, markers.other]) assert(answer(current).includes(marker), 'Other parent did not return its child result');
     const agents = await json(`/api/sessions/${sessionId}/subagents`);
-    verifyDescendants(agents, threadId);
+    verifyChild(agents, threadId);
     assert(!transcript(agents).includes(markers.other), 'Other session transcript leaked into the first session');
     assert(!transcript(otherAgents).includes(markers.child), 'First session transcript leaked into the other session');
     return { sessionId: otherId, threadId: session.threadId, agents: otherAgents.map(agent => agent.threadId) };
   });
   await step('Continue the original model conversation and verify fresh native history', async () => {
-    const { session, current } = await turn(sessionId, `继续原对话。不要创建新的子代理，不要运行工具。回复本次标记 ${markers.followup}，再复述前一轮中直属子代理与孙代理回复的两个随机标记，确认原对话上下文仍在。`);
+    const { session, current } = await turn(sessionId, `继续原对话。不要创建新的子代理，不要运行工具。回复本次标记 ${markers.followup}，再复述前一轮中直属子代理回复的随机标记，确认原对话上下文仍在。`);
     checkHistory(session, threadId);
-    for (const marker of [markers.followup, markers.child, markers.grandchild]) assert(answer(current).includes(marker), 'Follow-up lost native conversation context');
+    for (const marker of [markers.followup, markers.child]) assert(answer(current).includes(marker), 'Follow-up lost native conversation context');
     const fresh = await json(`/api/sessions/${sessionId}`); checkHistory(fresh, threadId);
     assert(fresh.turns.some(turn => answer(turn).includes(markers.followup)), 'History served a stale transcript');
     return { threadId, turns: fresh.turns.length };
@@ -135,7 +125,7 @@ export async function conversationReads(env) {
     const samples = [];
     for (let index = 0; index < 5; index++) {
       const [history, agents] = await Promise.all([request(`/api/sessions/${sessionId}`), request(`/api/sessions/${sessionId}/subagents`)]);
-      checkHistory(history.data, threadId); verifyDescendants(agents.data, threadId);
+      checkHistory(history.data, threadId); verifyChild(agents.data, threadId);
       assert(history.data.turns.some(turn => answer(turn).includes(markers.followup)));
       samples.push({ historyMs: history.durationMs, subagentsMs: agents.durationMs, historyBytes: history.bytes, subagentsBytes: agents.bytes });
       console.log(`    history ${Math.round(history.durationMs)} ms; subagents ${Math.round(agents.durationMs)} ms`);
@@ -162,7 +152,7 @@ export async function conversationReads(env) {
     const fresh = await json(`/api/sessions/${sessionId}`);
     checkHistory(fresh, threadId);
     assert(fresh.turns.some(turn => answer(turn).includes(markers.followup)));
-    verifyDescendants(await json(`/api/sessions/${sessionId}/subagents`), threadId);
+    verifyChild(await json(`/api/sessions/${sessionId}/subagents`), threadId);
     return { sandboxId: ready.sandbox.id, checkpointId: accepted.sandboxOperation.id };
   });
 

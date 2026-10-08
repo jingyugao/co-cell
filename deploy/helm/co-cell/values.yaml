@@ -30,6 +30,8 @@ config:
   codexModel: ""
   openaiBaseUrl: ""
   codexProxyKind: ""
+  # External model name -> installed catalog template plus capability overrides.
+  codexModelMetadata: {}
   # Relative credential source path -> Cellbox admitted debug credential slot.
   credentialSlots: {}
 

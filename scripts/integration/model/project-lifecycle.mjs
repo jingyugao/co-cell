@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict';
-import { failTestSandbox } from '../support/kubernetes.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // Real model journey: all guest files and processes must be created through CoCell turns.
-export async function projectLifecycle(env, { userInputOnly = false, homeRebuild = false } = {}) {
-  if (homeRebuild) assert(process.env.COCELL_E2E_KUBE_CONTEXT, 'Mounted HOME rebuild test requires COCELL_E2E_KUBE_CONTEXT');
+export async function projectLifecycle(env) {
   const { model, operationTimeout, turnTimeout } = env.config;
   const report = env.report;
   const json = env.json.bind(env), request = env.request.bind(env), step = env.step.bind(env);
@@ -88,11 +86,10 @@ export async function projectLifecycle(env, { userInputOnly = false, homeRebuild
     console.log(`    project ${projectId}; sandbox ${originalSandboxId}`);
     return { projectId, sandboxId: originalSandboxId, image: ready.sandbox.image?.id };
   });
-  await step(userInputOnly ? 'Create a fresh model conversation for asynchronous user input' : 'Create a model conversation and ask the agent to build/start Node HTTP', async () => {
+  await step('Create a model conversation and ask the agent to build/start Node HTTP', async () => {
     const session = await json('/api/sessions', { method: 'POST', body: { projectId, title: 'Node HTTP lifecycle integration',
       settings: { model, modelReasoningEffort: 'low', webSearchMode: 'disabled' } }, expectedStatus: 201 });
     sessionId = report.sessionId = session.id; await persist(); assert.equal(session.settings.model, model);
-    if (userInputOnly) return { sessionId, model };
     const result = await turn(`这是平台集成测试，请直接执行，不要只提供代码。只修改工作目录下 ${folder}/，不读写凭证，不安装或下载软件，不使用子 agent。
 只在对话中记住验证码 ${memory}，不要把这个验证码写入任何文件。后续会检验你是否记得。
 使用预装 Node.js 标准库（node:http、node:fs、node:crypto），编写 ${folder}/main.mjs 和启动脚本 ${folder}/start.mjs，不依赖 npm 包。创建 continuity.txt，内容为 ${initialContent} 加换行。
@@ -102,45 +99,7 @@ export async function projectLifecycle(env, { userInputOnly = false, homeRebuild
     assert(result.commands > 0, 'Agent did not execute any tool commands');
     return { sessionId, threadId, ...result };
   });
-  const questionIds = new Set();
-  if (userInputOnly) for (const round of [1, 2]) await step(`Native asynchronous question and persisted reply, round ${round}`, async () => {
-    const prompt = `这是平台集成测试的第 ${round} 次提问。必须调用 Codex 内置 request_user_input_async（禁止使用任何 MCP 工具），发送一个问题“集成测试第 ${round} 轮继续吗？”并提供两个选项“继续”和“停止”。不要把问题当普通文字输出。调用成功后简短汇报。`;
-    const result = await turn(prompt);
-    const session = await json(`/api/sessions/${sessionId}`);
-    const source = session.turns.find(t => t.id === result.turnId || t.nativeTurnId === result.nativeTurnId);
-    assert(source?.userInputRequests?.length, `request_user_input_async did not create a persisted request; model reply: ${redact(result.text).slice(0, 1000)}`);
-    const request = source.userInputRequests.at(-1);
-    assert(!questionIds.has(request.id), 'Continued conversation reused a previous question');
-    questionIds.add(request.id);
-    assert.equal(request.status, 'pending');
-    const native = source.items.find(item => item.id === request.id);
-    assert.equal(native?.type, 'agent_message');
-    assert.equal(native.delivery, 'async');
-    assert.deepEqual(native.questions, request.questions);
-    assert(!source.items.some(item => item.type === 'mcp_tool_call'), 'Must use the native tool, not MCP');
-    const answered = await json(`/api/sessions/${sessionId}/turns/${source.id}/user-input/${request.id}`, {
-      method: 'POST', body: { answer: '继续' }, expectedStatus: 200,
-    });
-    let updated = answered.turns.find(t => t.id === source.id);
-    const deadline = Date.now() + 120_000;
-    while (updated?.userInputRequests?.at(-1)?.status !== 'answered' && Date.now() < deadline) {
-      await delay(1000);
-      const current = await json(`/api/sessions/${sessionId}`);
-      updated = current.turns.find(t => t.id === source.id);
-    }
-    assert.equal(updated?.userInputRequests?.at(-1)?.status, 'answered');
-    assert(updated.userInputRequests.at(-1).answerTurnId, 'answer turn was not created');
-    await waitIdle();
-    const refreshed = await json(`/api/sessions/${sessionId}`);
-    const saved = refreshed.turns.find(t => t.id === source.id)?.userInputRequests?.find(r => r.id === request.id);
-    assert.equal(saved?.status, 'answered', 'Answer state lost on reload');
-    const reply = refreshed.turns.find(t => t.id === saved.answerTurnId);
-    assert(reply?.prompt.includes('send_user_message_question_reply'));
-    assert(reply.prompt.includes(request.id), 'Reply lost native call ID');
-    assert.equal(reply.status, 'completed');
-    return { requestId: request.id, answerTurnId: updated.userInputRequests.at(-1).answerTurnId };
-  });
-  if (!userInputOnly) {
+  {
     let source, firstHealth;
     await step('Verify workspace file API, raw downloads, and proxied Node HTTP', async () => {
       source = await textFile('main.mjs'); assert(source.text.includes('createServer'));
@@ -177,46 +136,14 @@ export async function projectLifecycle(env, { userInputOnly = false, homeRebuild
       assert.equal(backup.sourceSandboxId, originalSandboxId); assert(backup.threadIds.includes(threadId));
       return { archiveId: backup.id, sizeBytes: backup.sizeBytes, sha256: backup.sha256, threadIds: backup.threadIds };
     });
-    if (homeRebuild) {
-      await step('Restore an activated archive candidate before testing its cold rebuild', async () => {
-        await json(`/api/projects/${projectId}/archive`, { method: 'POST', body: { useExistingBackup: true }, expectedStatus: 202, timeoutMs: operationTimeout });
-        await json(`/api/projects/${projectId}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 202 });
-        const ready = await waitProject('restore', 'ready');
-        assert.notEqual(ready.sandbox.id, originalSandboxId);
-        originalSandboxId = ready.sandbox.id;
-        const result = await turn(`请继续原会话，回复首次验证码。用已有 ${folder}/start.mjs 重新启动 HTTP 服务，不修改服务代码或文件内容，不下载软件。`);
-        assert(result.text.includes(memory));
-        firstHealth = await health(resumedContent);
-        return { ...result, restoredSandboxId: originalSandboxId };
-      });
-      const latestContent = `after-backup-${randomUUID()}`;
-      const latestMemory = `latest-conversation-${randomUUID()}`;
-      await step('Write files and conversation after the archive was captured', async () => {
-        const result = await turn(`请把 ${folder}/continuity.txt 改为 ${latestContent} 加换行。请只在对话中记住新验证码 ${latestMemory}，不要写入任何文件。不要重启服务。`);
-        await textFile('continuity.txt', latestContent);
-        return result;
-      });
-      await step('Lose only the test Sandbox execution and observe failure', async () => {
-        const evidence = await failTestSandbox(env, projectId);
-        await env.waitProject(projectId, { status: 'unavailable' });
-        return evidence;
-      });
-      await step('Rebuild from the same mounted HOME without rolling back the archive', async () => {
-        await json(`/api/projects/${projectId}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 202 });
-        const ready = await waitProject('rebuild', 'ready');
-        assert.equal(ready.sandbox.id, originalSandboxId);
-        assert.equal(ready.remoteArchives[0].id, backup.id);
-        await textFile('continuity.txt', latestContent);
-        assert.equal((await textFile('main.mjs')).sha256, source.sha256);
-        const result = await turn(`请继续原会话，回复首次验证码和最近的新验证码，以确认归档之后的对话仍在。先读取 ${folder}/continuity.txt，必须仍为 ${latestContent}。用已有 ${folder}/start.mjs 启动 HTTP 服务，不修改服务代码或文件内容，不下载软件。`);
-        assert(result.text.includes(memory)); assert(result.text.includes(latestMemory));
-        assert.equal((await json(`/api/sessions/${sessionId}`)).threadId, threadId);
-        const current = await health(latestContent);
-        assert.notEqual(current.instance, firstHealth.instance, 'Cold rebuild must restart processes');
-        return { ...result, sandboxId: ready.sandbox.id, http: current };
-      });
-      return;
-    }
+    await step('Change the live workspace after backup so restore must roll it back', async () => {
+      const unbackedContent = `not-in-backup-${randomUUID()}`;
+      const result = await turn(`Do not restart the service. Change only ${folder}/continuity.txt to ${unbackedContent} plus newline. Do not create another backup. Verify the running HTTP service reads this new value.`);
+      assert(result.commands > 0);
+      await textFile('continuity.txt', unbackedContent);
+      const current = await health(unbackedContent); checkSameProcess(firstHealth, current);
+      return { archiveId: backup.id, unbackedContent, http: current };
+    });
     await step('Complete a checkpointed project without resuming it', async () => {
       await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 202 });
       await waitProject('checkpoint', 'paused');

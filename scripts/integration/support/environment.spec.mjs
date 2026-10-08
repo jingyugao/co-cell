@@ -43,3 +43,28 @@ test('cleanup failures fail the suite and redact the operator token in evidence'
     expect(JSON.parse(evidence).cleanup[0].status).toBe('failed');
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
+
+test('failure evidence keeps task and command details with a redacted original stack', async ({}, testInfo) => {
+  const token = 'private-diagnostic-token';
+  const env = new LiveEnvironment(liveConfig({ COCELL_E2E_BASE_URL: 'http://127.0.0.1:3001', COCELL_E2E_ACCESS_TOKEN: token }),
+    { journal: testInfo.outputPath('resources.json') });
+  env.sessions.add('owned');
+  env.json = async () => ({ id: 'owned', status: 'completed', threadId: 'native', turns: [{ id: 'turn',
+    prompt: `Read the file ${token}`, status: 'completed', items: [
+      { type: 'command_execution', command: `node read.js ${token}`, aggregated_output: `content ${token}`, exit_code: 0, status: 'completed' },
+      { type: 'agent_message', text: `reply ${token}` },
+    ] }] });
+  await env.captureFailure();
+  const original = new Error(`failed ${token}`);
+  original.stack = `Error: failed ${token}\n    at originalAssertion (/fixture/check.mjs:28:5)`;
+  let caught;
+  try { await env.step('read shared file', async () => { throw original; }); } catch (error) { caught = error; }
+  expect(caught.stack).toContain('/fixture/check.mjs:28:5');
+  expect(caught.stack).not.toContain(token);
+  const raw = await readFile(env.journal, 'utf8');
+  expect(raw).not.toContain(token);
+  const turn = JSON.parse(raw).failedSessions[0].turns[0];
+  expect(turn.prompt).toBe('Read the file [redacted]');
+  expect(turn.items[0]).toMatchObject({ command: 'node read.js [redacted]', aggregated_output: 'content [redacted]', exit_code: 0 });
+  expect(turn.items[1].text).toBe('reply [redacted]');
+});

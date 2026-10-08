@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 import { execFileSync, execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -65,5 +66,13 @@ export async function failTestSandbox(env, projectId) {
     input: JSON.stringify({ apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: pod.metadata.uid } }),
     timeout: 30_000, stdio: ['pipe', 'pipe', 'pipe'],
   });
+  const deadline = Date.now() + env.config.operationTimeout;
+  for (;;) {
+    const current = await read(['get', 'cellboxes.cellbox.local', box.metadata.name]);
+    assert.equal(current.metadata.uid, box.metadata.uid, 'Fault injection changed HOME ownership');
+    if (current.status.phase === 'Failed') break;
+    assert(Date.now() < deadline, 'Lost test execution did not reach the failed state');
+    await delay(250, undefined, { signal: env.controller.signal });
+  }
   return { sandboxId: project.sandbox.id, ownerUID: box.metadata.uid, podUID: pod.metadata.uid };
 }

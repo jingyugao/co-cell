@@ -13,7 +13,7 @@ const toolName = /^[A-Za-z][A-Za-z0-9_.\-]{0,63}$/;
 function toolEnvironment(root, options) {
   // Native CLIs such as glab spawn git. Do not recurse into agent-side proxies.
   return { PATH: `${options.binaryRoot ?? '/opt/cellbox/debug-bin'}:/usr/local/bin:/usr/bin:/bin`,
-    HOME: root, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(root, '.config'), XDG_DATA_HOME: join(root, '.local/share'), ...options.gitlabEnv };
+    HOME: root, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(root, '.config'), XDG_DATA_HOME: join(root, '.local/share'), ...options.gitlabEnv, ...options.gitEnv };
 }
 function safePath(path) {
   return typeof path === 'string' && path.length > 0 && path.length <= 256 && !path.startsWith('/') && normalize(path) === path &&
@@ -171,7 +171,7 @@ async function runBundleTool(tool, args, config, options, request) {
     if (tool === 'kubectl') env.KUBECONFIG = credential;
     if (tool === 'glab') env.GLAB_CONFIG_DIR = dirname(credential);
     if (tool === 'mysql') args = [`--defaults-file=${credential}`, ...args];
-    const result = await options.execute(join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool), args, env, root);
+    const result = await options.execute(join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool), args, env, options.cwd ?? root);
     const current = await collect(); mask(current);
     const content = JSON.stringify(current), digest = fingerprint(current);
     if (resource.mutable && digest !== synced.digest) {
@@ -221,7 +221,7 @@ async function runFileTool(tool, args, config, options, request) {
     if (tool === 'glab') env.GLAB_CONFIG_DIR = dirname(credential);
     if (tool === 'mysql') args = [`--defaults-file=${credential}`, ...args];
   }
-  const result = await execute(join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool), args, env, root);
+  const result = await execute(join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool), args, env, options.cwd ?? root);
   const updates = [];
   for (const file of files) {
     const bytes = await readCredential(root, file.path);
@@ -308,7 +308,7 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
     if (tool === 'glab') env.GLAB_CONFIG_DIR = dirname(credential);
     if (tool === 'mysql') argv = [`--defaults-file=${credential}`, ...argv];
     retain = setup.files.some(file => file.mutable);
-    const result = await execute(join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool), argv, env, root);
+    const result = await execute(join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool), argv, env, options.cwd ?? root);
     const updates = [];
     for (const file of setup.files) {
       const bytes = await readCredential(root, file.path); masks.push(...sensitiveValues(bytes));

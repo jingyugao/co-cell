@@ -72,7 +72,7 @@ jobs:
       - name: Run real core journeys (extended nightly)
         run: |
           test_args=(--max-failures=1)
-          if [[ -n "$COCELL_E2E_GREP" ]]; then test_args+=(--grep="$COCELL_E2E_GREP"); fi
+          if [[ -n "$COCELL_E2E_GREP" ]]; then test_args=(--grep="$COCELL_E2E_GREP"); fi
           pnpm test:integration:${{ github.event_name == 'schedule' && 'extended' || inputs.suite || 'core' }} "${test_args[@]}"
       - name: Collect diagnostics
         if: always()

@@ -31,6 +31,7 @@ jobs:
       COCELL_E2E_MODEL: ${{ vars.COCELL_E2E_MODEL || secrets.COCELL_E2E_MODEL }}
       OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
       CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+      CODEX_MODEL_METADATA_JSON: ${{ vars.CODEX_MODEL_METADATA_JSON }}
       COCELL_E2E_KUBE_CONTEXT: cocell-ci
       COCELL_E2E_NAMESPACE: co-cell-ci
       COCELL_E2E_HELM_RELEASE: co-cell

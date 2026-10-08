@@ -99,7 +99,8 @@ const cellboxValues = { api: { image: images.api, imagePullPolicy: 'Never', conf
 };
 const webValues = { image: { repository: 'docker.io/cocell-ci/web', tag: suffix, pullPolicy: 'Never' }, existingSecret: 'co-cell-runtime',
   cellbox: { apiUrl: `http://cellbox-api.${namespace}.svc.cluster.local:8090`, clientId: 'cocell-ci', profile: 'cocell-ci' },
-  publicUrl: 'http://127.0.0.1:3001', config: { codexModel: process.env.COCELL_E2E_MODEL, openaiBaseUrl: process.env.OPENAI_BASE_URL ?? '' },
+  publicUrl: 'http://127.0.0.1:3001', config: { codexModel: process.env.COCELL_E2E_MODEL, openaiBaseUrl: process.env.OPENAI_BASE_URL ?? '',
+    codexModelMetadata: JSON.parse(process.env.CODEX_MODEL_METADATA_JSON || '{}') },
   persistence: { size: '1Gi' },
 };
 const checkDirectory = await mkdtemp(join(cellbox, '.cocell-config-check-'));

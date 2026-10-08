@@ -59,6 +59,10 @@ spec:
               containerPort: 3001
               protocol: TCP
           env:
+            {{- with .Values.config.codexModelMetadata }}
+            - name: CODEX_MODEL_METADATA_JSON
+              value: {{ . | toJson | quote }}
+            {{- end }}
             {{- if .Values.tracing.endpoint }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.tracing.endpoint | quote }}

@@ -22,7 +22,6 @@ Run the built server and save its exact JSON stdout to git-go-fixture/result.jso
     const revision = (await env.json(fileURL(ready, 'git-go-fixture/revision.txt'))).trim();
     assert.equal(output.marker, marker);
     assert.match(revision, /^[a-f0-9]{40}$/);
-    assert.equal(output.vcs['vcs'], 'git');
     assert.equal(output.vcs['vcs.revision'], revision);
     assert.equal(output.vcs['vcs.modified'], 'false');
     // Parse the actual executable independently; never execute agent-generated

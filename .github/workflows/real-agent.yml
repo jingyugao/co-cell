@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: Integration suite
+        description: Integration suite (core = 9 P0 cases; extended = all 13 cases)
         type: choice
         options: [core, extended]
         default: core

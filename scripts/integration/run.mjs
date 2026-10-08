@@ -61,7 +61,7 @@ All other runs clean up their own projects, including on failure. Model suites u
     ...(profile === 'lifecycle' ? ['--grep=project lifecycle'] : []),
     ...(profile === 'user-input' ? ['--grep=asynchronous user input'] : []),
     ...(profile === 'agent' ? ['--grep=real agent creates files'] : []),
-    ...(['core', 'extended'].includes(profile) ? [`--grep-invert=prepared image tools|native .* HOME|deployed Git proxy${profile === 'core' ? '|conversation reads|nightly:' : ''}`] : []),
+    ...(['core', 'extended'].includes(profile) ? [`--grep-invert=prepared image tools|native .* HOME|deployed Git proxy${profile === 'core' ? '|conversation reads|nightly:|project lifecycle with real model' : ''}`] : []),
     ...args], { stdio: 'inherit', env: { ...process.env, ...transport.env, COCELL_E2E_PROFILE: profile, COCELL_E2E_OUTPUT_DIR: output } });
   // Let Playwright tear down fixtures on the first interrupt.
   process.on('SIGINT', () => child.kill('SIGINT'));

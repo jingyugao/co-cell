@@ -17,6 +17,7 @@ export class ProjectService {
   private revisions = new Map<string, number>();
   private deleting = new Set<string>();
   private operations = new Map<string, number>();
+  private reads = new Map<string, Set<{ controller: AbortController; done: Promise<void> }>>();
   private activeSessions = new Map<string, Set<string>>();
   private maintenance = new Set<string>();
   private creatingWeeklyProjects = new Set<string>();
@@ -75,6 +76,42 @@ export class ProjectService {
     };
   }
 
+  /** Reads may run concurrently, but maintenance invalidates them instead of rejecting it. */
+  beginRead(id?: string) {
+    if (id) { this.get(id); this.assertAvailable(id); }
+    const controller = new AbortController();
+    let finish!: () => void;
+    const done = new Promise<void>(resolve => { finish = resolve; });
+    const entry = { controller, done };
+    if (id) {
+      const reads = this.reads.get(id) ?? new Set();
+      reads.add(entry);
+      this.reads.set(id, reads);
+    }
+    return {
+      signal: controller.signal,
+      release: () => {
+        if (id) {
+          const reads = this.reads.get(id);
+          reads?.delete(entry);
+          if (!reads?.size) this.reads.delete(id);
+        }
+        finish();
+      },
+    };
+  }
+
+  private cancelReads(id: string) {
+    for (const read of this.reads.get(id) ?? []) {
+      read.controller.abort(new HttpError(409, '项目环境正在切换，请刷新重试'));
+    }
+  }
+
+  /** Wait for cancelled readers to release their underlying Sandbox leases. */
+  async drainReads(id: string) {
+    await Promise.all([...(this.reads.get(id) ?? [])].map(read => read.done));
+  }
+
   startSession(projectId: string | undefined, sessionId: string): () => void {
     if (!projectId) return () => {};
     this.get(projectId);
@@ -97,6 +134,7 @@ export class ProjectService {
     this.assertAvailable(id);
     if (this.activeSessions.has(id) || this.operations.has(id)) throw new HttpError(409, '项目正在使用，请等待任务和文件操作结束后重试');
     this.maintenance.add(id);
+    this.cancelReads(id);
     return () => { this.maintenance.delete(id); };
   }
 
@@ -315,7 +353,9 @@ export class ProjectService {
     const project = this.get(id);
     if (this.activeSessions.has(id) || this.operations.has(id) || this.maintenance.has(id)) throw new HttpError(409, '项目正在使用，请先停止任务或稍后重试');
     this.deleting.add(id);
+    this.cancelReads(id);
     try {
+      await this.drainReads(id);
       await this.writer.wait(id);
       await removeDependents(project);
       await this.state.deleteProject(id);

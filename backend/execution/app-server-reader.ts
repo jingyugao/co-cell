@@ -1,3 +1,4 @@
+import { abortable } from '../../util/abortable.js';
 import { AppServerRpcError, CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import type { SandboxExtension } from '@co-cell/sandbox';
 
@@ -8,6 +9,7 @@ export interface AppServerEndpoint {
 
 type Connection = {
   id: string;
+  opening: AbortController;
   ready: Promise<CodexAppServerClient>;
   users: number;
   retired: boolean;
@@ -35,14 +37,15 @@ export class AppServerReader {
   constructor(private endpoint: (id: string) => Promise<AppServerEndpoint>,
     private onCleanupError: (error: unknown) => void, private idleMs = 60_000) {}
 
-  async read<T>(id: string, action: (client: CodexAppServerClient) => Promise<T>): Promise<T> {
+  async read<T>(id: string, action: (client: CodexAppServerClient) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    signal?.throwIfAborted();
     if (this.closed) throw new Error('App Server reader is closed');
     if (this.blocked.has(id)) throw Object.assign(new Error('Sandbox is entering maintenance'), { code: 'BUSY' });
     let connection = this.connections.get(id);
     if (!connection) {
       let finish!: Connection['finish'];
       const drained = new Promise(resolve => { finish = resolve; });
-      connection = { id, ready: undefined!, users: 0, retired: false, drained, finish };
+      connection = { id, opening: new AbortController(), ready: undefined!, users: 0, retired: false, drained, finish };
       this.live.add(connection);
       const current = connection;
       this.connections.set(id, current);
@@ -51,8 +54,8 @@ export class AppServerReader {
     clearTimeout(connection.timer);
     connection.users++;
     try {
-      const client = await connection.ready;
-      return await action(client);
+      const client = await abortable(connection.ready, signal);
+      return await abortable(action(client), signal);
     } catch (error) {
       // An RPC rejection does not break the transport; other failures need a
       // fresh connection on the next read. Do not automatically replay requests.
@@ -61,7 +64,7 @@ export class AppServerReader {
     } finally {
       connection.users--;
       if (!connection.users) {
-        if (connection.retired) this.dispose(connection);
+        if (connection.retired) { this.dispose(connection); if (signal?.aborted) await connection.drained; }
         else {
           connection.timer = setTimeout(() => this.retire(id, connection!), this.idleMs);
           connection.timer.unref();
@@ -86,15 +89,15 @@ export class AppServerReader {
   }
 
   private async open(id: string, connection: Connection) {
-    const endpoint = await this.endpoint(id);
+    const endpoint = await abortable(this.endpoint(id), connection.opening.signal);
     const client = new CodexAppServerClient({ url: endpoint.url,
       headers: endpoint.headers,
       requestTimeoutMs: 30_000 });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([client.connect(), new Promise<never>((_, reject) => {
+      await abortable(Promise.race([client.connect(), new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error('App Server connection timed out')), 30_000);
-      })]);
+      })]), connection.opening.signal);
       client.once('closed', () => this.retire(id, connection));
       return client;
     } catch (error) {
@@ -112,6 +115,7 @@ export class AppServerReader {
 
   private dispose(connection: Connection) {
     if (connection.disposal) return;
+    connection.opening.abort(new Error('App Server read connection retired'));
     connection.disposal = (async () => {
       let failure;
       let client;

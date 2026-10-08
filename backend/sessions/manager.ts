@@ -417,6 +417,7 @@ export class SessionManager {
         turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
         return { ...snapshot, turns: this.withUserInputHistory(session, turns), historyNextCursor: page.nextCursor ?? null, historyError: undefined };
       } catch (error) {
+        if (error instanceof HttpError && error.status === 409) throw error;
         console.error('Native history read failed:', error instanceof Error ? error.message : 'unknown error');
         const historyError = '历史消息暂时无法从 Sandbox 加载，请确认项目 Sandbox 可用后刷新重试。';
         this.historyErrors.set(id, historyError);
@@ -455,15 +456,20 @@ export class SessionManager {
     if (session.settings.executionMode === 'sandbox') {
       if (!session.sandbox || (session.projectId && this.projects.isMaintaining(session.projectId))) return [];
       if (!this.sandbox?.subagents) return [];
-      const release = this.projects.acquire(session.projectId);
-      try { return await this.sandbox.subagents(session); }
+      const read = this.projects.beginRead(session.projectId);
+      try {
+        const result = await this.sandbox.subagents(structuredClone(session), read.signal);
+        read.signal.throwIfAborted();
+        return result;
+      }
       catch (error) {
+        read.signal.throwIfAborted();
         if (error && typeof error === 'object' && 'code' in error && error.code === 'BUSY') {
           throw new HttpError(503, 'Sandbox 正忙，请稍后重试');
         }
         throw error;
       }
-      finally { release(); }
+      finally { read.release(); }
     }
     return readSubagentConversations(session.threadId, process.env.CODEX_HOME || join(homedir(), '.codex'));
   }
@@ -535,9 +541,18 @@ export class SessionManager {
   }
 
   private async readSandboxHistory(session: Session, options: { cursor?: string; limit?: number } = {}) {
-    const release = this.projects.acquire(session.projectId);
-    try { return await this.sandbox!.history(session, options); }
-    finally { release(); }
+    const read = this.projects.beginRead(session.projectId);
+    try {
+      if (session.projectId && this.projects.get(session.projectId).sandbox?.id !== session.sandbox?.id) {
+        throw new HttpError(409, '项目环境已切换，请刷新重试');
+      }
+      const result = await this.sandbox!.history(structuredClone(session), { ...options, signal: read.signal });
+      read.signal.throwIfAborted();
+      return result;
+    } catch (error) {
+      read.signal.throwIfAborted();
+      throw error;
+    } finally { read.release(); }
   }
 
   private async loadNativeHistory(id: string) {
@@ -1150,25 +1165,14 @@ export class SessionManager {
     await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
     if (!project.sandbox || !this.sandbox?.service) throw new HttpError(503, 'Sandbox 服务代理未配置');
-    const release = this.projects.acquire(project.id);
-    let released = false;
-    const done = () => { if (!released) { released = true; release(); } };
+    const read = ['GET', 'HEAD'].includes(request.method) ? this.projects.beginRead(project.id) : undefined;
+    const release = read?.release ?? this.projects.acquire(project.id);
+    const signal = read ? AbortSignal.any([request.signal, read.signal]) : request.signal;
     try {
-      const response = await this.sandbox.service(this.projectWorkspace(project), port, path, request);
-      if (!response.body) { done(); return response; }
-      const reader = response.body.getReader();
-      const body = new ReadableStream<Uint8Array>({
-        async pull(controller) {
-          try {
-            const next = await reader.read();
-            if (next.done) { controller.close(); done(); }
-            else controller.enqueue(next.value);
-          } catch (error) { controller.error(error); done(); }
-        },
-        async cancel(reason) { try { await reader.cancel(reason); } finally { done(); } },
-      });
-      return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
-    } catch (error) { done(); throw error; }
+      const response = await this.sandbox.service(this.projectWorkspace(project), port, path, new Request(request, { signal }));
+      signal.throwIfAborted();
+      return holdResponse(response, release, signal);
+    } catch (error) { release(); read?.signal.throwIfAborted(); throw error; }
   }
 
   async projectFileResponse(projectId: string, path: string, request: Request): Promise<Response> {
@@ -1176,10 +1180,13 @@ export class SessionManager {
     await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
     if (!project.sandbox || !this.sandbox?.fileResponse) throw new HttpError(503, 'Sandbox 文件流接口未配置');
-    const release = this.projects.acquire(project.id);
+    const read = this.projects.beginRead(project.id);
+    const signal = AbortSignal.any([request.signal, read.signal]);
     try {
-      return holdResponse(await this.sandbox.fileResponse(this.projectWorkspace(project), path, request), release, request.signal);
-    } catch (error) { release(); throw error; }
+      const response = await this.sandbox.fileResponse(this.projectWorkspace(project), path, new Request(request, { signal }));
+      signal.throwIfAborted();
+      return holdResponse(response, read.release, signal);
+    } catch (error) { read.release(); read.signal.throwIfAborted(); throw error; }
   }
 
   async projectFile(projectId: string, path: string) {
@@ -1188,9 +1195,15 @@ export class SessionManager {
     const project = this.projects.get(projectId);
     if (project.executionMode !== 'sandbox' || !this.sandbox) throw new HttpError(400, '此项目不使用 Sandbox 沙箱');
     if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先发送一条消息');
-    const release = this.projects.acquire(project.id);
-    try { return await this.sandbox.file(this.projectWorkspace(project), path); }
-    finally { release(); }
+    const read = this.projects.beginRead(project.id);
+    try {
+      const result = await this.sandbox.file(this.projectWorkspace(project), path, read.signal);
+      read.signal.throwIfAborted();
+      return result;
+    } catch (error) {
+      read.signal.throwIfAborted();
+      throw error;
+    } finally { read.release(); }
   }
 
   async close() {

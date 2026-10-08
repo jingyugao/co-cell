@@ -1,3 +1,4 @@
+import ProjectImageVersion from './ProjectImageVersion';
 import ImagePicker from '../images/ImagePicker';
 import RestoreVersionPicker from '../images/RestoreVersionPicker';
 import { useEffect, useRef, useState } from 'react';
@@ -95,8 +96,6 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onUpgradeSan
   const [showToolGrants, setShowToolGrants] = useState(false);
   const [error, setError] = useState('');
   const pending = useRef(false);
-  const [chooseUpgradeVersion, setChooseUpgradeVersion] = useState(false);
-  const [upgradeVersionId, setUpgradeVersionId] = useState('');
   const [chooseRestoreVersion, setChooseRestoreVersion] = useState(false);
   const [restoreVersionId, setRestoreVersionId] = useState('');
   const status = project.status ?? (project.archivedAt ? 'archived' : 'active');
@@ -155,7 +154,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onUpgradeSan
     <div className="project-card-heading"><span className="project-folder" aria-hidden="true">▱</span><div className="project-card-statuses"><span className="project-type-badge">{typeLabel}</span>{archived && <span className="project-archived-badge">已归档</span>}<span className={`project-status ${project.activeSessionId ? 'active' : ''}`}>{project.activeSessionId ? '任务执行中' : project.executionMode === 'local' ? '本地项目' : operating ? operation.phase : project.sandbox ? states[project.sandbox.status] : '无 Sandbox'}</span></div></div>
     <h2>{openDisabled ? <span className="project-title-disabled">{displayName}</span> : <button className="project-title-button" onClick={() => onOpenProject(project.id)}>{displayName}</button>}</h2>
     {project.requirementUrl && /^https?:\/\//i.test(project.requirementUrl) ? <div className="project-requirement-wrap"><a className="project-requirement" href={project.requirementUrl} target="_blank" rel="noopener noreferrer" title={project.requirementUrl}>飞书需求 ↗<span>{project.requirementUrl}</span></a>{project.requirementStatus && <p className="project-requirement-status"><span>飞书项目状态</span><strong>{project.requirementStatus}</strong></p>}</div> : project.type === 2 ? <p className="project-unlinked">飞书需求待绑定</p> : <p className="project-unlinked">{typeLabel}</p>}
-      <dl className="project-details"><div><dt>项目镜像</dt><dd>{project.imageSelection ? `${project.imageSelection.imageName} · ${project.imageSelection.version}` : '系统默认镜像'}</dd></div><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div></dl>
+      <dl className="project-details"><div><dt>项目镜像</dt><dd>{project.imageSelection ? <ProjectImageVersion selection={project.imageSelection} disabled={busy || operating || hasTask || archived || !project.sandbox || project.sandbox.status === 'starting' || project.sandbox.status === 'unknown'} onUpgrade={versionId => onUpgradeSandbox(project.id, versionId)} /> : '系统默认镜像'}</dd></div><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div></dl>
     <div className="project-action-groups">
       <section className="project-action-group" aria-label="项目操作">
         <h3>项目操作</h3>
@@ -175,15 +174,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onUpgradeSan
             : !sandboxBroken && !sandboxMissing ? <span className="project-action-note">等待状态就绪后操作</span>
             : project.sandbox ? <button className="secondary-button" disabled={busy || operating || hasTask} onClick={restore}>重建环境</button>
             : <button className="secondary-button" disabled={busy || operating || hasTask} onClick={() => void run('重建 Sandbox', () => onRebuildSandbox(project.id))}>重建 Sandbox</button>}
-          {project.imageSelection && project.sandbox && <button className="secondary-button" disabled={busy || operating || hasTask} onClick={() => setChooseUpgradeVersion(value => !value)}>升级镜像</button>}
         </div>
-        {chooseUpgradeVersion && project.imageSelection && <div>
-          <RestoreVersionPicker label="升级镜像版本" imageId={project.imageSelection.imageId} disabled={busy || operating || hasTask} value={upgradeVersionId} onChange={setUpgradeVersionId} />
-          <p className="project-rebuild-hint">沿用当前磁盘，不读取备份。运行进程和旧 Checkpoint 会清除，服务需要重新启动。</p>
-          <button className="secondary-button" disabled={!upgradeVersionId || busy || operating || hasTask} onClick={() => {
-            if (window.confirm('升级将停止当前运行进程，保留挂载磁盘中的最新文件和会话历史。旧 Checkpoint 将失效，是否继续？')) void run('升级镜像', () => onUpgradeSandbox(project.id, upgradeVersionId));
-          }}>确认升级</button>
-        </div>}
       </section>}
     </div>
     <details className="project-backup-details"><summary>备份与冷存储</summary>

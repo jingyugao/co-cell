@@ -1,4 +1,5 @@
 node_modules
+cellbox-source
 dist
 .git
 .codex-web

@@ -17,3 +17,9 @@ test('asynchronous user input with real native tool and persisted reply', async 
 test('project lifecycle: failed Sandbox rebuild retains mounted files and conversation newer than the archive', async ({ environment }) => {
   await projectLifecycle(environment, { homeRebuild: true });
 });
+
+
+test('disk image upgrade retains real conversation history and latest workspace files', async ({ environment }) => {
+  test.skip(!process.env.COCELL_E2E_UPGRADE_FROM_VERSION_ID || !process.env.COCELL_E2E_UPGRADE_TO_VERSION_ID, 'Requires two admitted managed image versions');
+  await projectLifecycle(environment, { diskUpgrade: true });
+});

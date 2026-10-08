@@ -85,6 +85,7 @@ export class ProjectService {
     const entry = { controller, done };
     if (id) {
       const reads = this.reads.get(id) ?? new Set();
+      this.recentReads.set(id, Date.now());
       reads.add(entry);
       this.reads.set(id, reads);
     }
@@ -93,6 +94,7 @@ export class ProjectService {
       release: () => {
         if (id) {
           const reads = this.reads.get(id);
+          this.recentReads.set(id, Date.now());
           reads?.delete(entry);
           if (!reads?.size) this.reads.delete(id);
         }
@@ -100,6 +102,8 @@ export class ProjectService {
       },
     };
   }
+
+  private readonly recentReads = new Map<string, number>();
 
   private cancelReads(id: string) {
     for (const read of this.reads.get(id) ?? []) {
@@ -129,10 +133,13 @@ export class ProjectService {
     if (this.maintenance.has(id)) throw new HttpError(409, '项目沙箱正在维护，请稍后重试');
   }
 
-  beginMaintenance(id: string): () => void {
+  beginMaintenance(id: string, interruptReads = true): () => void {
     this.get(id);
     this.assertAvailable(id);
     if (this.activeSessions.has(id) || this.operations.has(id)) throw new HttpError(409, '项目正在使用，请等待任务和文件操作结束后重试');
+    if (!interruptReads && (this.reads.has(id) || Date.now() - (this.recentReads.get(id) ?? -Infinity) < 5_000)) {
+      throw new HttpError(409, '项目正在读取，后台维护稍后重试');
+    }
     this.maintenance.add(id);
     this.cancelReads(id);
     return () => { this.maintenance.delete(id); };
@@ -334,7 +341,7 @@ export class ProjectService {
       delete next.sandboxArtifactsCleanedAt;
       next.sandbox = structuredClone(sandbox);
       next.workingDirectory = sandbox.workingDirectory;
-      if (restoreProject) next.imageSelection = restoreImage ? structuredClone(restoreImage) : undefined;
+      if (restoreProject || restoreImage) next.imageSelection = restoreImage ? structuredClone(restoreImage) : undefined;
       if (restoreProject && next.status === 'archived') {
         const at = new Date().toISOString();
         next.status = 'active';
@@ -361,6 +368,7 @@ export class ProjectService {
       await this.state.deleteProject(id);
       this.records.delete(id);
       this.revisions.delete(id);
+      this.recentReads.delete(id);
       this.writer.forget(id);
     } finally { this.deleting.delete(id); }
   }

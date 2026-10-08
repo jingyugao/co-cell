@@ -6,15 +6,17 @@ const MINUTE = 60 * 1000;
 export interface SandboxLifecycleOptions {
   listProjects: () => Project[] | Promise<Project[]>;
   /** Resolves only after the reclaim operation has reached a terminal state. */
-  reclaim: (projectId: string, options?: { useExistingBackup: boolean }) => Promise<void>;
+  reclaim: (projectId: string) => Promise<void>;
+  completedPauseAfterMs?: number;
+  /** Legacy configuration alias; completed projects now retain their disks. */
   archivedReclaimAfterMs?: number;
   scanIntervalMs?: number;
   now?: () => number;
 }
 
-/** Reclaims completed projects using their existing archives after the grace period. */
+/** Releases compute for completed projects while retaining their existing disks. */
 export class SandboxLifecycleService {
-  private readonly archivedReclaimAfterMs: number;
+  private readonly completedPauseAfterMs: number;
   private readonly scanIntervalMs: number;
   private readonly now: () => number;
   private timer?: ReturnType<typeof setInterval>;
@@ -22,10 +24,10 @@ export class SandboxLifecycleService {
   private closed = false;
 
   constructor(private readonly options: SandboxLifecycleOptions) {
-    this.archivedReclaimAfterMs = options.archivedReclaimAfterMs ?? DAY;
+    this.completedPauseAfterMs = options.completedPauseAfterMs ?? options.archivedReclaimAfterMs ?? DAY;
     this.scanIntervalMs = options.scanIntervalMs ?? MINUTE;
     this.now = options.now ?? Date.now;
-    if (!Number.isFinite(this.archivedReclaimAfterMs) || this.archivedReclaimAfterMs < 0) throw new Error('archivedReclaimAfterMs must be a non-negative finite number');
+    if (!Number.isFinite(this.completedPauseAfterMs) || this.completedPauseAfterMs < 0) throw new Error('completedPauseAfterMs must be a non-negative finite number');
     if (!Number.isFinite(this.scanIntervalMs) || this.scanIntervalMs <= 0) throw new Error('scanIntervalMs must be a positive finite number');
   }
 
@@ -47,19 +49,20 @@ export class SandboxLifecycleService {
   }
 
   private async runSweep(): Promise<void> {
-    const cutoff = this.now() - this.archivedReclaimAfterMs;
+    const cutoff = this.now() - this.completedPauseAfterMs;
     const eligible = (await this.options.listProjects()).filter(project => {
       if (project.executionMode !== 'sandbox') return false;
       if (project.status !== 'completed') return false;
-      // Paused projects retain their existing archive without waking execution.
-      // Unhealthy/missing environments still require explicit confirmation.
-      if (project.sandbox?.status !== 'ready' && project.sandbox?.status !== 'paused' && !project.archiveCleanupSourceId) return false;
+      // Already paused projects retain both their disk and checkpoint. Never
+      // retire a disk automatically, including when an older backup exists.
+      if (project.sandbox?.status !== 'ready' || project.archiveCleanupSourceId) return false;
+      if (project.sandboxOperation?.status === 'running') return false;
       const timestamp = Date.parse(project.completedAt ?? '');
       return Number.isFinite(timestamp) && timestamp <= cutoff;
     });
     for (const project of eligible) {
       if (this.closed) break;
-      try { await this.options.reclaim(project.id, { useExistingBackup: true }); }
+      try { await this.options.reclaim(project.id); }
       catch { /* A busy project or transient failure is retried by a later sweep. */ }
     }
   }

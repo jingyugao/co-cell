@@ -1,12 +1,12 @@
 import { test, expect, createThroughUI, projectList } from './fixture.mjs';
 
-test('marking a checkpointed project completed keeps it paused and explains automatic archiving', async ({ page, ui }) => {
+test('marking a checkpointed project completed keeps it paused and retains disk and checkpoint', async ({ page, ui }) => {
   await page.goto('/#projects');
   await page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('button', { name: '标记已完成', exact: true }).click();
   await page.getByRole('button', { name: /^已完成 \d+$/ }).click();
   const card = page.getByRole('article', { name: '暂停项目', exact: true });
   await expect(card.getByRole('button', { name: '恢复使用中', exact: true })).toBeVisible();
-  await expect(card.getByText('有可用归档备份时，完成满 1 天后会保留已有备份并清理暂停环境，不恢复运行。', { exact: true })).toBeVisible();
+  await expect(card.getByText('磁盘和 Checkpoint 已保留。恢复为使用中后，进入项目即可继续。', { exact: true })).toBeVisible();
   expect(ui.projects.get('paused').status).toBe('completed');
   expect(ui.projects.get('paused').sandbox.status).toBe('paused');
   expect(ui.calls.filter(call => call.method === 'POST')).toEqual([]);
@@ -108,4 +108,27 @@ for (const withArchive of [false, true]) test(`failed mounted Sandbox rebuild ex
   expect(ui.projects.get('other').sandboxOperation.kind).toBe('rebuild');
   ui.complete('other');
   await expect(card.locator('.project-status').getByText('就绪', { exact: true })).toBeVisible();
+});
+
+test('image upgrade explicitly selects a version and keeps backup actions secondary', async ({ page, ui }) => {
+  const project = ui.projects.get('other');
+  project.imageSelection = { imageId: 'managed', imageName: 'mybox', versionId: 'v1', version: '1', image: 'old', importedImageId: 'old' };
+  ui.images.push({ id: 'managed', name: 'mybox', category: 'test', origin: 'managed', versions: [
+    { id: 'v2', version: '2', status: 'succeeded', projectReady: true, createdAt: '2026-01-01T00:00:00Z' },
+  ] });
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '另一个项目', exact: true });
+  await expect(card.getByRole('button', { name: '立即备份', exact: true })).toBeHidden();
+  await card.getByRole('button', { name: '升级镜像', exact: true }).click();
+  await expect(card.getByRole('button', { name: '确认升级', exact: true })).toBeDisabled();
+  await card.getByLabel('升级镜像版本', { exact: true }).selectOption('v2');
+  let confirmation;
+  page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept(); });
+  await card.getByRole('button', { name: '确认升级', exact: true }).click();
+  await expect.poll(() => ui.count('POST', '/api/projects/other/sandbox/upgrade')).toBe(1);
+  expect(project.selectedUpgrade).toBe('v2');
+  expect(confirmation).toContain('保留挂载磁盘中的最新文件和会话历史');
+  expect(ui.count('POST', '/api/projects/other/archive')).toBe(0);
+  expect(ui.count('POST', '/api/projects/other/backup')).toBe(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });

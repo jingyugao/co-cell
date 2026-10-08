@@ -95,7 +95,7 @@ export interface ProjectSandboxOperation {
   /** Resume completion confirms runtime restoration; health diagnostics do not gate it. */
 	/** Persisted intention ID used for remote operation idempotency. */
 	id?: string;
-  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild';
+  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild' | 'upgrade';
   phase: string;
   status: 'running' | 'failed' | 'succeeded';
   error?: string;
@@ -269,6 +269,8 @@ export interface AppConfig {
     imageIdentity?: SandboxImageIdentity;
     workingDirectory: string;
     archivedReclaimAfterMs?: number;
+    /** Completed projects pause after this delay, retaining their disks. */
+    completedPauseAfterMs?: number;
   };
   defaults: Settings;
   codexVersion: string;

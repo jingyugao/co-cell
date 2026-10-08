@@ -32,6 +32,7 @@ export interface CellboxRuntimeIntegrationOptions extends SandboxRuntimeConfigOp
 export class CellboxRuntimeIntegration {
     readonly lifecycle: SandboxLifecycle;
     readonly remoteArchives: RemoteArchives;
+    readonly activateSandbox: (candidate: SandboxState) => Promise<void>;
     private readonly preparations = new Map<string, Promise<void>>();
     private readonly prepared = new Map<string, { generation: number; workspace: string }>();
     private readonly sharedMounts = new Set<string>();
@@ -47,6 +48,17 @@ export class CellboxRuntimeIntegration {
             },
         }]);
         const ossArchiveEndpoint = process.env.OSS_ENDPOINT;
+        this.activateSandbox = async (candidate) => {
+            await this.lifecycle.run({ action: 'activate', resourceKey: `sandbox:${candidate.id}`, sandboxId: candidate.id, metadata: { restoreRuntimeConfig: 'true' } }, async () => {
+                const handle = await options.provider.connectForSetup(candidate.id);
+                await this.prepare(handle, { id: candidate.id, settings: { workingDirectory: candidate.workingDirectory }, sandbox: candidate, updatedAt: new Date().toISOString() }, AbortSignal.timeout(120000), false);
+                const box = await options.provider.client.getBox(candidate.id);
+                if (box.phase === 'staged') await this.timed('cellbox.activate', candidate.id,
+                    () => options.provider.activateBox(candidate.id, `cocell-activate-${candidate.id}-${box.generation}`));
+                else if (box.phase !== 'running') throw new Error(`Cellbox restore candidate is ${box.phase}`);
+                if (!this.usesSharedDirectory(candidate.id)) await this.waitForAppServer(handle, AbortSignal.timeout(30000));
+            });
+        };
         this.remoteArchives = {
         capture: async (target, key) => {
                 if (!target.sandbox)
@@ -114,17 +126,7 @@ export class CellboxRuntimeIntegration {
                     return candidate;
                 });
             },
-            activate: async (candidate) => {
-                await this.lifecycle.run({ action: 'activate', resourceKey: `sandbox:${candidate.id}`, sandboxId: candidate.id }, async () => {
-                    const handle = await options.provider.connectForSetup(candidate.id);
-                    await this.prepare(handle, { id: candidate.id, settings: { workingDirectory: candidate.workingDirectory }, sandbox: candidate, updatedAt: new Date().toISOString() }, AbortSignal.timeout(120000), false);
-                    const box = await options.provider.client.getBox(candidate.id);
-                    if (box.phase === 'staged') await this.timed('cellbox.activate', candidate.id,
-                        () => options.provider.activateBox(candidate.id, `cocell-activate-${candidate.id}`));
-                    else if (box.phase !== 'running') throw new Error(`Cellbox restore candidate is ${box.phase}`);
-                    if (!this.usesSharedDirectory(candidate.id)) await this.waitForAppServer(handle, AbortSignal.timeout(30000));
-                });
-            },
+            activate: candidate => this.activateSandbox(candidate),
             download: async (ref, destination) => {
                 if (ref.sizeBytes > 256 * 1024 * 1024)
                     throw new Error('Archive exceeds the 256 MiB interactive browsing limit');

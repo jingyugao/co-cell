@@ -13,7 +13,7 @@ import { pruneRemoteArchives } from '../archives/retention.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
 
-type OperationOptions = { useExistingBackup?: boolean; imageVersionId?: string };
+type OperationOptions = { background?: boolean; useExistingBackup?: boolean; imageVersionId?: string };
 
 const target = (project: Project): WorkspaceTarget => ({ id: project.id, projectId: project.id,
   settings: { workingDirectory: project.workingDirectory }, imageSelection: project.imageSelection, sandbox: project.sandbox, updatedAt: project.updatedAt });
@@ -100,13 +100,15 @@ export class ProjectSandboxOperations {
     const project = this.deps.projects.get(id);
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
     if (project.archiveCleanupSourceId && kind !== 'archive') throw new HttpError(409, '项目归档清理尚未完成，请先重试归档');
-    const release = this.deps.projects.beginMaintenance(id);
+    if (kind !== 'upgrade' && project.sandboxOperation?.kind === 'upgrade' && project.sandboxOperation.status === 'failed') throw new HttpError(409, '镜像升级未完成，请重新选择镜像并重试升级');
+    const release = this.deps.projects.beginMaintenance(id, options.background !== true);
     let reservation: { selection?: ProjectImageSelection; release(): void } | undefined;
     let operationId: string;
     try {
       await this.deps.projects.drainReads(id);
-      if (options.imageVersionId && (kind !== 'restore' || project.status !== 'archived')) throw new HttpError(409, '仅归档项目恢复时可以选择镜像版本');
-      if (kind === 'restore' && project.status === 'archived' && this.deps.selectRestoreImage) reservation = await this.deps.selectRestoreImage(project, options.imageVersionId);
+      if (options.imageVersionId && kind !== 'upgrade' && (kind !== 'restore' || project.status !== 'archived')) throw new HttpError(409, '仅归档项目恢复时可以选择镜像版本');
+      if (kind === 'upgrade' && (!options.imageVersionId || !project.imageSelection || !this.deps.selectRestoreImage)) throw new HttpError(400, '请选择已同步的目标镜像版本');
+      if ((kind === 'upgrade' || (kind === 'restore' && project.status === 'archived')) && this.deps.selectRestoreImage) reservation = await this.deps.selectRestoreImage(project, options.imageVersionId);
       await this.deps.projects.updateSandboxOperation(id, { id: randomUUID(), kind,
         phase: kind === 'create' ? '创建 Sandbox' : '检查环境', status: 'running', updatedAt: new Date().toISOString() });
       const accepted = this.deps.projects.get(id).sandboxOperation!;
@@ -124,6 +126,7 @@ export class ProjectSandboxOperations {
       try {
         if (kind === 'create') await this.create(id);
         else if (kind === 'rebuild') await this.rebuild(id);
+        else if (kind === 'upgrade') await this.upgrade(id, reservation?.selection);
         else if (kind === 'checkpoint') await this.checkpoint(id);
         else if (kind === 'restore') await this.restore(id,
           project.sandboxOperation?.status === 'failed' && ['create', 'resume'].includes(project.sandboxOperation.kind), reservation);
@@ -202,6 +205,25 @@ export class ProjectSandboxOperations {
     await runtime.verifySandbox(candidate);
     await runtime.verifyHistory?.(candidate, this.deps.threadIds(id));
     await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, false);
+  }
+
+  private async upgrade(id: string, selection?: ProjectImageSelection) {
+    const { projects, runtime } = this.deps;
+    const project = await this.inspect(id);
+    if (project.status === 'archived' || !project.sandbox || !selection) throw new HttpError(409, '升级需要现有 Sandbox 和目标镜像');
+    if (!['ready', 'paused', 'unavailable', 'starting'].includes(project.sandbox.status)) throw new HttpError(409, 'Sandbox 状态未知，请刷新后重试');
+    if (!runtime.upgradePersistent || !runtime.verifySandbox) throw new HttpError(503, 'Sandbox 不支持保留磁盘升级');
+    await this.phase(id, '保留磁盘并切换镜像');
+    void this.deps.logger?.write({ event: 'sandbox.upgrade_image_selected', projectId: id,
+      operationId: projects.get(id).sandboxOperation?.id, sandboxId: project.sandbox.id,
+      previousImage: project.sandbox.image?.id, imageVersionId: selection.versionId, image: selection.image });
+    const candidate = await runtime.upgradePersistent(target(project), selection, `${projects.get(id).sandboxOperation!.id}:upgrade`);
+    if (candidate.id !== project.sandbox.id || candidate.image?.id !== selection.image) throw new HttpError(409, '升级改变了磁盘归属或镜像身份');
+    await this.phase(id, '验证环境和历史');
+    await runtime.verifySandbox(candidate);
+    await runtime.verifyHistory?.(candidate, this.deps.threadIds(id));
+    await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, false, selection);
+    runtime.track?.(target(projects.get(id)), sandbox => this.deps.saveSandbox(id, sandbox, false));
   }
 
   private async checkpoint(id: string) {
@@ -418,13 +440,7 @@ export class ProjectSandboxOperations {
     const { projects, runtime } = this.deps;
     const project = await this.inspect(id);
     if (project.status === 'archived' || project.sandbox?.status !== 'ready') throw new HttpError(409, '仅可刷新正常运行的项目 Sandbox');
-    const currentImage = await runtime.currentImageIdentity?.(target(project));
-    if (!currentImage || project.sandbox.image?.id !== currentImage.id) {
-      throw new HttpError(409, 'Cellbox 归档只能恢复到相同镜像，无法切换镜像版本');
-    }
-    await this.phase(id, '备份当前环境');
-    await this.backup(id);
-    await this.restore(id, true);
+    await this.rebuild(id);
   }
 
   async close() { await Promise.allSettled(this.tasks); }

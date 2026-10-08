@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: jingyugao/cell-box
-          ref: a7bd6b822e0f131c46b9f95cc5dcd0514e36b878
+          ref: 419a2492f7398c37f61c361c6539e2a6d1e07d0b
           path: cellbox-source
       - uses: actions/setup-node@v4
         with:

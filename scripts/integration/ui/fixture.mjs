@@ -55,7 +55,7 @@ export const test = base.extend({
         else if (method === 'POST' && path.endsWith('/open')) {
           status = 202;
           if (data.sandbox?.status === 'paused' && data.sandboxOperation?.status !== 'running') data.sandboxOperation = operation('resume');
-        } else if (method === 'POST' && path.endsWith('/rebuild')) { data.sandboxOperation = operation('create'); status = 202; }
+        } else if (method === 'POST' && path.endsWith('/rebuild')) { data.sandboxOperation = operation(data.sandbox ? 'rebuild' : 'create'); status = 202; }
       } else if (path === '/api/sessions' && method === 'GET') data = [session];
       else if (path === '/api/sessions/old-session/events') {
         await route.fulfill({ contentType: 'text/event-stream', body: `data: ${JSON.stringify({ type: 'snapshot', session })}\n\n` }); return;

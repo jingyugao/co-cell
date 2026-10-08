@@ -13,3 +13,7 @@ test('conversation reads with real nested subagents, isolation and latency guard
 test('asynchronous user input with real native tool and persisted reply', async ({ environment }) => {
   await projectLifecycle(environment, { userInputOnly: true });
 });
+
+test('project lifecycle: failed Sandbox rebuild retains mounted files and conversation newer than the archive', async ({ environment }) => {
+  await projectLifecycle(environment, { homeRebuild: true });
+});

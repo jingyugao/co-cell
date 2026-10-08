@@ -39,6 +39,7 @@ export interface SandboxRuntime {
   subagents?(session: Session, signal?: AbortSignal): Promise<SubagentConversation[]>;
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
+  rebuildPersistent?(target: WorkspaceTarget, key: string, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   resume?(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   checkpoint?(target: WorkspaceTarget): Promise<SandboxState>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
@@ -615,6 +616,17 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const entry = await this.acquire(target, true, onSandbox, undefined, undefined, true);
     try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
   }
+  async rebuildPersistent(target: WorkspaceTarget, key: string, onSandbox: SaveSandbox) {
+    if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在，无法沿用挂载目录');
+    const provider = this.options.provider as SandboxProvider & { rebuildPersistent?: (id: string, key: string) => Promise<void> };
+    if (!provider.rebuildPersistent) throw new HttpError(503, 'Sandbox 不支持保留挂载目录重建');
+    this.runtimePreparations.delete(target.sandbox.id);
+    await this.sandboxes.manager.lifecycle.run({ action: 'reconcile', resourceKey: `project:${target.projectId ?? target.id}`, sandboxId: target.sandbox.id },
+      () => provider.rebuildPersistent!(target.sandbox!.id, key));
+    await this.sandboxes.inspect(target);
+    await this.resume(target, onSandbox);
+  }
+
   async resume(target: WorkspaceTarget, onSandbox: SaveSandbox) {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
     const entry = await traced('sandbox.acquire', { 'sandbox.id': target.sandbox.id },

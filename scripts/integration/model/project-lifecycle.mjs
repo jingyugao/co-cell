@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
+import { failTestSandbox } from '../support/kubernetes.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // Real model journey: all guest files and processes must be created through CoCell turns.
-export async function projectLifecycle(env, { userInputOnly = false } = {}) {
+export async function projectLifecycle(env, { userInputOnly = false, homeRebuild = false } = {}) {
+  if (homeRebuild) assert(process.env.COCELL_E2E_KUBE_CONTEXT, 'Mounted HOME rebuild test requires COCELL_E2E_KUBE_CONTEXT');
   const { model, operationTimeout, turnTimeout } = env.config;
   const report = env.report;
   const json = env.json.bind(env), request = env.request.bind(env), step = env.step.bind(env);
@@ -175,6 +177,35 @@ export async function projectLifecycle(env, { userInputOnly = false } = {}) {
       assert.equal(backup.sourceSandboxId, originalSandboxId); assert(backup.threadIds.includes(threadId));
       return { archiveId: backup.id, sizeBytes: backup.sizeBytes, sha256: backup.sha256, threadIds: backup.threadIds };
     });
+    if (homeRebuild) {
+      const latestContent = `after-backup-${randomUUID()}`;
+      const latestMemory = `latest-conversation-${randomUUID()}`;
+      await step('Write files and conversation after the archive was captured', async () => {
+        const result = await turn(`请把 ${folder}/continuity.txt 改为 ${latestContent} 加换行。请只在对话中记住新验证码 ${latestMemory}，不要写入任何文件。不要重启服务。`);
+        await textFile('continuity.txt', latestContent);
+        return result;
+      });
+      await step('Lose only the test Sandbox execution and observe failure', async () => {
+        const evidence = await failTestSandbox(env, projectId);
+        await env.waitProject(projectId, { status: 'unavailable' });
+        return evidence;
+      });
+      await step('Rebuild from the same mounted HOME without rolling back the archive', async () => {
+        await json(`/api/projects/${projectId}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 202 });
+        const ready = await waitProject('rebuild', 'ready');
+        assert.equal(ready.sandbox.id, originalSandboxId);
+        assert.equal(ready.remoteArchives[0].id, backup.id);
+        await textFile('continuity.txt', latestContent);
+        assert.equal((await textFile('main.mjs')).sha256, source.sha256);
+        const result = await turn(`请继续原会话，回复首次验证码和最近的新验证码，以确认归档之后的对话仍在。先读取 ${folder}/continuity.txt，必须仍为 ${latestContent}。用已有 ${folder}/start.mjs 启动 HTTP 服务，不修改服务代码或文件内容，不下载软件。`);
+        assert(result.text.includes(memory)); assert(result.text.includes(latestMemory));
+        assert.equal((await json(`/api/sessions/${sessionId}`)).threadId, threadId);
+        const current = await health(latestContent);
+        assert.notEqual(current.instance, firstHealth.instance, 'Cold rebuild must restart processes');
+        return { ...result, sandboxId: ready.sandbox.id, http: current };
+      });
+      return;
+    }
     await step('Complete a checkpointed project without resuming it', async () => {
       await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 202 });
       await waitProject('checkpoint', 'paused');

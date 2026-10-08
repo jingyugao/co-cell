@@ -130,7 +130,7 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   }
   waitForOperation(op: CellboxOperation, timeoutMs?: number, signal?: AbortSignal) { return this.wait(op, timeoutMs, signal); }
   inspectOperation(id: string) { return this.client.getOperation(id); }
-  private async act(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile', key: string) {
+  private async act(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string) {
     return this.wait(await this.client.actBox(id, action, key));
   }
   private async createJournal(ownerKey: string) {
@@ -245,6 +245,13 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     if (checkpointId !== `cellbox-suspended:${id}:${box.generation}` || box.phase !== 'suspended')
       throw new CellboxError('CONFLICT', 'The same-node Cellbox suspension is no longer available');
     await this.act(id, 'resume', `cocell-resume-${id}-${box.generation}`);
+  }
+  /** Explicit cold restart preserves the Box-owned HOME; never creates or restores a Box. */
+  async rebuildPersistent(id: string, key: string) {
+    await this.ready();
+    const box = await this.box(id);
+    if (box.phase !== 'failed') throw new CellboxError('CONFLICT', `Box ${id} is ${box.phase}`);
+    await this.act(id, 'rebuild', key);
   }
   async kill(id: string) {
     await this.ready();

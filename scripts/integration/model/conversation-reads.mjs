@@ -9,7 +9,7 @@ export async function conversationReads(env) {
   const json = env.json.bind(env), request = env.request.bind(env), step = env.step.bind(env);
   const redact = env.redact.bind(env), persist = env.persist.bind(env);
   const delay = ms => sleep(ms, undefined, { signal: env.controller.signal });
-  const markers = Object.fromEntries(['root', 'child', 'other', 'followup'].map(name => [name, `${name}-${randomUUID()}`]));
+  const markers = Object.fromEntries(['root', 'child', 'other', 'otherRoot', 'followup'].map(name => [name, `${name}-${randomUUID()}`]));
   let projectId;
   const createdSessions = [];
   const waitIdle = () => env.waitIdle(projectId);
@@ -54,10 +54,10 @@ export async function conversationReads(env) {
     await json(`/api/sessions/${id}/stop`, { method: 'POST', body: {} }).catch(() => {});
     throw new Error(`Model turn timed out; inspect session ${id}`);
   }
-  function childPrompt() {
+  function childPrompt(childMarker = markers.child, rootMarker = markers.root) {
     return `这是对话历史与子代理接口的真实模型集成测试。用户明确授权你创建一个直属子代理，必须实际使用子代理工具，不能只描述或假装已经委派。你和子代理都不得执行命令、读写文件、联网、安装软件或操作凭证。
-  只创建一个直属子代理，给它完整独立指令：仅回复随机标记 ${markers.child}，不使用任何工具，不创建任何后代。继承当前模型，不覆盖模型。
-  必须等待该子代理完成，并在最终回复中包含你自己的标记 ${markers.root} 和子代理实际返回的标记。不要向用户提问。派生失败时准确报告工具错误，不得模拟结果。`;
+  只创建一个直属子代理，给它完整独立指令：仅回复随机标记 ${childMarker}，不使用任何工具，不创建任何后代。继承当前模型，不覆盖模型。
+  必须等待该子代理完成，并在最终回复中包含你自己的标记 ${rootMarker} 和子代理实际返回的标记。不要向用户提问。派生失败时准确报告工具错误，不得模拟结果。`;
   }
   function verifyChild(agents, threadId, marker = markers.child) {
     assert.equal(agents.length, 1, 'Expected exactly one direct child and no further descendants');
@@ -101,9 +101,12 @@ export async function conversationReads(env) {
   });
   await step('Create another real subagent conversation in the same project and verify isolation', async () => {
     const otherId = report.otherSessionId = await createSession('Unrelated subagent read integration');
-    const { session } = await turn(otherId, `这是另一个会话的隔离测试。必须实际创建一个直属子代理，让它只回复 ${markers.other}，不使用任何工具，不创建任何后代。继承当前模型，不覆盖模型。等待它完成，并在最终回复中包含这个标记。你和子代理都不得执行命令、读写文件或联网。`);
+    const { session, current } = await turn(otherId, childPrompt(markers.other, markers.otherRoot));
     const otherAgents = await json(`/api/sessions/${otherId}/subagents`);
+    report.isolationAgentEvidence = { rootReply: answer(current), agents: otherAgents };
+    await persist();
     verifyChild(otherAgents, session.threadId, markers.other);
+    for (const marker of [markers.otherRoot, markers.other]) assert(answer(current).includes(marker), 'Other parent did not return its child result');
     const agents = await json(`/api/sessions/${sessionId}/subagents`);
     verifyChild(agents, threadId);
     assert(!transcript(agents).includes(markers.other), 'Other session transcript leaked into the first session');

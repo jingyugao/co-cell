@@ -5,6 +5,38 @@ import { ContainerCodexRuntime } from './container-runtime.js';
 import type { ProjectSandboxes } from '../sandboxes/project-sandboxes.js';
 import type { Session } from '../../protocol/types.js';
 import { AppServerReader } from './app-server-reader.js';
+import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
+
+test('turns reuse the read transport and keep native success when activity persistence fails', async t => {
+  let connects = 0, releases = 0;
+  t.mock.method(CodexAppServerClient.prototype, 'connect', async () => { connects++; });
+  t.mock.method(CodexAppServerClient.prototype, 'request', async () => ({ thread: { id: 'thread-one' } }));
+  t.mock.method(CodexAppServerClient.prototype, 'turnStart', async function (this: CodexAppServerClient) {
+    this.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-one', turn: { id: 'native-one', status: 'completed' } } });
+    return { turn: { id: 'native-one' } };
+  });
+  const reader = new AppServerReader(async () => ({ url: 'ws://test' }), error => assert.fail(String(error)));
+  const runtime = new ContainerCodexRuntime({ provider: {} as SandboxProvider,
+    sandboxes: { close: async () => {} } as unknown as ProjectSandboxes, apiKey: '', appServerReader: reader,
+    appServer: async () => ({ url: 'ws://test' }),
+    paths: { root: '/workspace', runtime: '/runtime', codexHome: '/codex', node: '/node' }, prepareRemote: async () => false });
+  // Keep real execution/stream/cleanup behavior; isolate provider setup.
+  t.mock.method(runtime as any, 'acquire', async () => ({ metadata: { id: 'box-one' },
+    lease: { release: async () => { releases++; throw new Error('activity write failed'); } } }));
+  t.mock.method(runtime as any, 'prepareEnvironment', async () => {});
+  const session = { threadId: 'thread-one', settings: { workingDirectory: '/workspace' } } as Session;
+  try {
+    await reader.read('box-one', async () => {});
+    for (let index = 0; index < 2; index++) {
+      const events = [];
+      for await (const event of runtime.run(session, { id: `turn-${index}`, prompt: 'hello', images: [], status: 'running', items: [], startedAt: new Date().toISOString() },
+        new AbortController().signal, async () => {})) events.push(event);
+      assert.equal(events.at(-1)?.type, 'turn.completed');
+    }
+    assert.equal(connects, 1);
+    assert.equal(releases, 2);
+  } finally { await runtime.close(); }
+});
 
 test('history maintenance keeps BUSY classification through runtime error sanitization', async () => {
   const reader = new AppServerReader(async () => { throw new Error('must not connect during maintenance'); }, () => {});

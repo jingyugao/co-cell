@@ -93,13 +93,14 @@ export class CodexAppServerClient extends EventEmitter {
   }
   /** Subscribe immediately, before issuing the request that produces notifications. No history is implied. */
   events() {
-    const queue = []; let wake; let ended = this.closed; let failure = this.failure;
+    const queue = []; let wake; let ended = this.closed || Boolean(this.failure); let failure = this.failure;
     const notify = value => { queue.push(value); wake?.(); };
     const stop = error => { ended = true; failure = error; wake?.(); };
     this.on('notification', notify); this.on('closed', stop);
     const cleanup = () => { this.off('notification', notify); this.off('closed', stop); };
     return {
       [Symbol.asyncIterator]() { return this; },
+      drain() { return queue.splice(0); },
       next: async () => {
         while (!queue.length && !ended) await new Promise(resolve => { wake = resolve; });
         if (queue.length) return { done: false, value: queue.shift() };
@@ -171,6 +172,7 @@ const status = value => value === 'inProgress' ? 'in_progress' : value === 'comp
 /** Normalizes presentation events; native context remains owned by Codex. */
 export class AppServerEventAdapter {
   constructor() { this.items = new Map(); this.usage = emptyUsage(); }
+  seed(items) { this.items = new Map(items.map(item => [item.id, structuredClone(item)])); }
   convert(item) {
     const previous = this.items.get(item.id);
     switch (item.type) {
@@ -237,10 +239,14 @@ export function appServerArgs(config, configOverrides = []) {
 
 /** Small execution facade over App Server, independent of @openai/codex-sdk. */
 export class Codex {
-  constructor(options = {}) { this.options = options; this.clients = new Set(); }
+  constructor(options = {}) { this.options = options; this.clients = new Set(); this.streams = new Set(); this.closed = false; }
   startThread(options = {}) { return new Thread(this, options); }
   resumeThread(id, options = {}) { return new Thread(this, options, id); }
-  async close() { await Promise.all([...this.clients].map(client => client.close())); }
+  async close() {
+    this.closed = true;
+    await Promise.all([...this.streams].map(stream => stream.return()));
+    await Promise.all([...this.clients].map(client => client.close()));
+  }
 }
 export class Thread {
   constructor(codex, options, id = null) { this.codex = codex; this.options = options; this.id = id; this.running = false; }
@@ -256,14 +262,15 @@ export class Thread {
     const abort = () => { if (turnId) void client.turnInterrupt({ threadId: this.id, turnId }).catch(() => {}); };
     try {
       signal?.throwIfAborted();
+      if (this.codex.closed) throw new Error('Codex observer is closed');
       const config = this.codex.options;
       const args = appServerArgs(config.config, config.configOverrides);
-      client = await CodexAppServerClient.spawn(config.appServerUrl ? { url: config.appServerUrl, headers: config.appServerHeaders } : { command: config.codexPathOverride, args, cwd: this.options.workingDirectory,
+      client = config.appServerClient ?? await CodexAppServerClient.spawn(config.appServerUrl ? { url: config.appServerUrl, headers: config.appServerHeaders } : { command: config.codexPathOverride, args, cwd: this.options.workingDirectory,
         env: { ...(config.env ?? process.env), ...(config.apiKey ? { CODEX_API_KEY: config.apiKey } : {}), ...(config.baseUrl ? { OPENAI_BASE_URL: config.baseUrl } : {}) } });
-      this.codex.clients.add(client);
-      client.on('stderr', message => { /* callers may observe diagnostics */ this.codex.emit?.('stderr', message); });
+      if (!config.appServerClient) this.codex.clients.add(client);
       signal?.throwIfAborted();
       stream = client.events();
+      this.codex.streams.add(stream);
       const opts = this.options;
       const threadConfig = {
         ...(opts.webSearchMode ? { web_search: opts.webSearchMode } : {}),
@@ -276,6 +283,7 @@ export class Thread {
       this.id = response.thread.id;
       yield { type: 'thread.started', thread_id: this.id };
       signal?.throwIfAborted();
+      if (this.codex.closed) throw new Error('Codex observer is closed');
       const userInput = typeof input === 'string' ? [{ type: 'text', text: input }] : input;
       const result = await client.turnStart({ threadId: this.id, input: userInput.map(part => part.type === 'local_image' ? { type: 'localImage', path: part.path } : { type: 'text', text: part.text, text_elements: [] }),
         ...(opts.model ? { model: opts.model } : {}),
@@ -300,7 +308,8 @@ export class Thread {
       this.activeClient = undefined; this.activeTurnId = undefined;
       signal?.removeEventListener('abort', abort);
       await stream?.return();
-      await client?.close();
+      if (stream) this.codex.streams.delete(stream);
+      if (!this.codex.options.appServerClient) await client?.close();
       if (client) this.codex.clients.delete(client);
       this.running = false;
     }

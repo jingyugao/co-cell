@@ -21,7 +21,7 @@ type TurnExecutionDependencies = {
   onSteer?(steer: (text: string) => Promise<boolean>): void;
 };
 
-/** Runs one turn and persists each event before publishing it to subscribers. */
+/** Persist turn boundaries; native Sandbox history can reconstruct coalesced deltas. */
 export async function runTurn(session: Session, turn: Turn, controller: AbortController, dependencies: TurnExecutionDependencies) {
   const { client, sandbox, logger, save, publish, snapshot, updateSandbox } = dependencies;
   let terminalFailure: string | undefined;
@@ -86,7 +86,17 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
       }
       if (event.type === 'turn.completed' || event.type === 'turn.failed') terminal = true;
       assertCanPersist();
-      await save();
+      // Native App Server history owns conversation bodies and stream deltas.
+      // MySQL only needs thread/turn acceptance and actionable control state.
+      // In particular, persist async questions before publishing them so an
+      // answer from another API instance can resolve the request immediately.
+      const asyncQuestion = (event.type === 'item.started' || event.type === 'item.updated' || event.type === 'item.completed')
+        && event.item.type === 'agent_message' && event.item.delivery === 'async' && !!event.item.questions?.length;
+      const durableControl = event.type === 'thread.started' || event.type === 'turn.started'
+        || event.type === 'runtime.retry' || asyncQuestion;
+      if (durableControl) {
+        await save();
+      }
       assertCanPersist();
       publish({ type: 'sdk', turnId: turn.id, event });
     }

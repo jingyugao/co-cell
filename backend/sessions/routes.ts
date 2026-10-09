@@ -2,7 +2,7 @@ import type { Hono } from 'hono';
 import { z } from 'zod';
 import { HttpError } from '../../util/errors.js';
 import { streamSSE } from 'hono/streaming';
-import type { AppConfig, StreamMessage } from '../../protocol/types.js';
+import type { AppConfig, StreamMessage, SubmitTurnResponse } from '../../protocol/types.js';
 import type { SessionManager } from './manager.js';
 
 const settingsSchema = z.object({
@@ -58,7 +58,7 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
     const input = z.object({ prompt: z.string().trim().min(1).max(200_000), images: z.array(z.string().max(4096)).max(5).default([]) }).strict().parse(await c.req.json());
     requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);
     const turnId = await manager.startTurn(c.req.param('id'), input.prompt, input.images);
-    return c.json({ turnId }, 202);
+    return c.json({ turnId } satisfies SubmitTurnResponse, 202);
   });
   app.post('/api/sessions/:id/stop', async c => {
     await manager.stop(c.req.param('id'));
@@ -80,10 +80,6 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
       const send = (message: StreamMessage) => {
         queue = queue.then(async () => {
           if (closed) return;
-          if (message.type === 'snapshot' || message.type === 'state') {
-            const live = await manager.snapshot(id);
-            message = { ...message, session: { ...message.session, sandbox: live.sandbox } };
-          }
           if (!closed) await stream.writeSSE({ data: JSON.stringify(message) });
         }).catch(() => { closed = true; finish(); });
       };

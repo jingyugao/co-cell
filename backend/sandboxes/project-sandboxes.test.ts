@@ -4,7 +4,7 @@ import test from 'node:test';
 import type { SandboxHandle, SandboxInfo } from '@co-cell/sandbox';
 import { SandboxManager, type SandboxProvider } from '@co-cell/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
-import type { Session, Turn } from '../../protocol/types.js';
+import type { Session, StreamMessage, Turn } from '../../protocol/types.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import { ContainerCodexRuntime } from '../execution/container-runtime.js';
 import { runTurn } from '../execution/runner.js';
@@ -14,6 +14,74 @@ import { CellboxError } from '../../packages/sandbox/src/providers/cellbox/clien
 type TurnExecutionDependencies = Parameters<typeof runTurn>[3];
 const runtimePaths = { root: '/home/agent/workspace/.cocell', runtime: '/home/agent/workspace/.cocell/runtime',
   codexHome: '/home/agent/workspace/.cocell/codex', node: '/usr/local/bin/node' };
+
+test('Sandbox stream publishes every delta but persists only thread, turn, and terminal boundaries', async () => {
+  const now = new Date().toISOString();
+  const turn: Turn = { id: 'turn', prompt: 'stream', images: [], items: [], status: 'running', startedAt: now };
+  const session: Session = { id: 'session', projectId: 'project', title: 'test', threadId: null, status: 'running',
+    startedAt: now, createdAt: now, updatedAt: now, archivedAt: null, turns: [turn],
+    settings: { executionMode: 'sandbox', workingDirectory: '/workspace', model: 'test', modelReasoningEffort: 'low',
+      sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true } };
+  const events = [
+    { type: 'thread.started' as const, thread_id: 'thread' },
+    { type: 'turn.started' as const, turn_id: 'native-turn' },
+    ...['a', 'ab', 'abc'].map(text => ({ type: 'item.updated' as const,
+      item: { id: 'answer', type: 'agent_message' as const, text } })),
+    { type: 'runtime.context_usage' as const, contextUsage: { inputTokens: 10, observedAt: now } },
+    { type: 'item.completed' as const, item: { id: 'answer', type: 'agent_message' as const, text: 'final answer' } },
+    { type: 'turn.completed' as const, usage: { input_tokens: 10, cached_input_tokens: 0, cache_write_input_tokens: 0,
+      output_tokens: 3, reasoning_output_tokens: 0 } },
+  ];
+  const sandbox = { async *run() { yield* events; } } as unknown as ContainerCodexRuntime;
+  const saved: Session[] = [];
+  const published: StreamMessage[] = [];
+  await runTurn(session, turn, new AbortController(), {
+    client: {} as TurnExecutionDependencies['client'], sandbox,
+    save: async () => { saved.push(structuredClone(session)); },
+    publish: message => published.push(message), snapshot: () => structuredClone(session), updateSandbox: async () => {},
+  });
+  assert.equal(published.filter(message => message.type === 'sdk').length, events.length);
+  assert.equal(saved.length, 3, 'only thread.started, turn.started, and final status should be persisted');
+  const finalTurn = saved.at(-1)?.turns[0];
+  const finalItem = finalTurn?.items[0];
+  assert.equal(finalItem?.type === 'agent_message' ? finalItem.text : undefined, 'final answer');
+  assert.equal(finalTurn?.status, 'completed');
+});
+
+test('async user-input requests are persisted before they are published while ordinary items stay in native history', async () => {
+  const now = new Date().toISOString();
+  const turn: Turn = { id: 'turn', prompt: 'ask me', images: [], items: [], status: 'running', startedAt: now };
+  const session: Session = { id: 'session', projectId: 'project', title: 'test', threadId: null, status: 'running',
+    startedAt: now, createdAt: now, updatedAt: now, archivedAt: null, turns: [turn],
+    settings: { executionMode: 'sandbox', workingDirectory: '/workspace', model: 'test', modelReasoningEffort: 'low',
+      sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true } };
+  const question = { id: 'question', type: 'agent_message' as const, delivery: 'async' as const, text: '',
+    questions: [{ title: 'Continue?', options: ['yes', 'no'] }] };
+  const events = [
+    { type: 'thread.started' as const, thread_id: 'thread' },
+    { type: 'turn.started' as const, turn_id: 'native-turn' },
+    ...['one', 'two', 'three'].map(text => ({ type: 'item.updated' as const,
+      item: { id: 'tool', type: 'command_execution' as const, command: 'run', aggregated_output: text, status: 'in_progress' as const } })),
+    { type: 'item.completed' as const, item: question },
+    { type: 'turn.completed' as const },
+  ];
+  const sandbox = { async *run() { yield* events; } } as unknown as ContainerCodexRuntime;
+  const saved: Session[] = [];
+  let publishedQuestionSawSave = false;
+  await runTurn(session, turn, new AbortController(), {
+    client: {} as TurnExecutionDependencies['client'], sandbox,
+    save: async () => { saved.push(structuredClone(session)); },
+    publish: message => {
+      if (message.type === 'sdk' && message.event.type === 'item.completed' && message.event.item.id === question.id) {
+        publishedQuestionSawSave = saved.at(-1)?.turns[0].userInputRequests?.[0].id === question.id;
+      }
+    }, snapshot: () => structuredClone(session), updateSandbox: async () => {},
+  });
+  assert.equal(saved.length, 4, 'thread, accepted turn, async question, and final status should be persisted');
+  assert.equal(publishedQuestionSawSave, true, 'question must be durable before another API instance can answer it');
+  assert.equal(saved[2].turns[0].userInputRequests?.[0].id, question.id);
+  assert.equal(saved[2].turns[0].items.some(item => item.id === question.id), true);
+});
 
 test('history and descendant transcripts use only a shared App Server connection, including archived and paginated children', async t => {
   const { provider, projects, counts, target, record, manager } = fixture();
@@ -367,7 +435,7 @@ test('App Server recovery snapshots preserve native status, prompt, and full ite
   } finally { await runtime.close(); await manager.close(); }
 });
 
-test('App Server recovery polls the accepted native turn and never starts another turn', async () => {
+test('App Server recovery polls the accepted native turn and never starts another turn', async t => {
   const { provider, projects, manager, target, record } = fixture();
   const turn: Turn = { id: randomUUID(), nativeTurnId: 'native-turn', codexAccepted: true, prompt: '', images: [], items: [],
     status: 'running', startedAt: target.updatedAt };
@@ -376,18 +444,14 @@ test('App Server recovery polls the accepted native turn and never starts anothe
     settings: { ...target.settings, executionMode: 'sandbox', model: 'test', modelReasoningEffort: 'low',
       sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: false } };
   let listCalls = 0, startCalls = 0, nativeStatus = 'completed';
-  const originalSpawn = CodexAppServerClient.spawn;
-  CodexAppServerClient.spawn = (async () => ({
-    request: async (method: string) => {
+  t.mock.method(CodexAppServerClient.prototype, 'connect', async () => {});
+  t.mock.method(CodexAppServerClient.prototype, 'request', async (method: string) => {
       if (method === 'turn/start') { startCalls++; assert.fail('recovery must not start a turn'); }
       assert.equal(method, 'thread/turns/list');
       listCalls++;
       return { data: [{ id: 'native-turn', status: nativeStatus, startedAt: 1, completedAt: 2,
         items: [{ type: 'agentMessage', id: 'answer', text: 'done after restart' }] }] };
-    },
-    turnInterrupt: async () => ({}),
-    close: async () => {},
-  })) as unknown as typeof CodexAppServerClient.spawn;
+  });
   const runtime = new ContainerCodexRuntime({ paths: runtimePaths, prepareRemote: async () => false, provider, apiKey: '', sandboxes: projects,
     appServer: async () => ({ url: 'ws://app-server.test', token: 'x'.repeat(24) }) });
   runtime.track(session, async () => {});
@@ -404,7 +468,6 @@ test('App Server recovery polls the accepted native turn and never starts anothe
     assert.deepEqual(interruptedEvents.map(event => event.type), ['turn.started', 'item.completed', 'turn.failed']);
     assert.equal(interruptedEvents[2].type === 'turn.failed' && interruptedEvents[2].cancelled, true);
   } finally {
-    CodexAppServerClient.spawn = originalSpawn;
     await runtime.close(); await manager.close();
   }
 });

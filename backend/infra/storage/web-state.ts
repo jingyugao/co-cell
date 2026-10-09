@@ -70,11 +70,9 @@ function requireMySqlUrl(value: string | undefined): string {
 /** Web metadata and sandbox-local ~/.codex are intentionally separate. */
 export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   private pool: Pool;
-  private preserveLiveItems: boolean;
   readonly secretRepository: MySqlSecretRepository;
   readonly notificationRepository: MySqlNotificationRepository;
-  constructor(url: string, options: { preserveLiveItems?: boolean } = {}) {
-    this.preserveLiveItems = options.preserveLiveItems ?? false;
+  constructor(url: string) {
     this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' });
     this.secretRepository = new MySqlSecretRepository(this.pool);
     this.notificationRepository = new MySqlNotificationRepository(this.pool);
@@ -213,8 +211,8 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     // to the native turn ID and observe completion without retaining its body.
     const pendingTurns = turns.filter(turn => turn.status === 'running' || !!turn.userInputRequests?.length || turn === latestAcceptedTerminal)
       .map(turn => ({ ...turn, prompt: turn.status === 'running' ? turn.prompt : '', images: [],
-        items: this.preserveLiveItems && turn.status === 'running' ? turn.items : [],
-        itemTimestamps: this.preserveLiveItems && turn.status === 'running' ? turn.itemTimestamps : {},
+        items: [],
+        itemTimestamps: {},
         contextUsage: undefined, sdkUsage: undefined, usage: undefined }));
     return persistedSession({ ...metadata, turnCount: Math.max(session.turnCount ?? 0,
       turns.filter(turn => turn.codexAccepted || turn.nativeTurnId).length),
@@ -228,6 +226,6 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   }
 }
 
-export function createWebStateStore(mysqlUrl?: string, options: { preserveLiveItems?: boolean } = {}) {
-  return new MySqlWebStateStore(requireMySqlUrl(mysqlUrl), options);
+export function createWebStateStore(mysqlUrl?: string) {
+  return new MySqlWebStateStore(requireMySqlUrl(mysqlUrl));
 }

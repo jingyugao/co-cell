@@ -98,10 +98,9 @@ test('running Sandbox submission metadata is persisted before Codex accepts the 
   assert.equal(restored.turns[0].status, 'running');
 });
 
-test('shared storage round-trips live running items and clears them at terminal compaction', async () => {
+test('Sandbox storage strips running item bodies as well as terminal items', async () => {
   let document: Record<string, any> | undefined;
   const store = Object.create(MySqlWebStateStore.prototype) as MySqlWebStateStore;
-  (store as unknown as { preserveLiveItems: boolean }).preserveLiveItems = true;
   (store as unknown as { pool: { query: (sql: string, values?: unknown[]) => Promise<unknown> } }).pool = {
     async query(sql, values) {
       if (sql.startsWith('SELECT document FROM sessions')) return [[{ document }], []];
@@ -113,9 +112,9 @@ test('shared storage round-trips live running items and clears them at terminal 
   const running: Session = { ...session, turns: [{ ...session.turns[0], status: 'running', codexAccepted: true,
     items: [liveItem], itemTimestamps: { 'live-item': now } }] };
   await store.saveSession(running);
-  assert.deepEqual(document?.pendingTurns[0].items, [liveItem]);
-  assert.equal(document?.pendingTurns[0].itemTimestamps['live-item'], now);
-  assert.deepEqual((await store.getSession(session.id))?.turns[0].items, [liveItem]);
+  assert.deepEqual(document?.pendingTurns[0].items, []);
+  assert.deepEqual(document?.pendingTurns[0].itemTimestamps, {});
+  assert.deepEqual((await store.getSession(session.id))?.turns[0].items, []);
 
   const terminal: Session = { ...running, status: 'completed', turns: [{ ...running.turns[0], status: 'completed',
     completedAt: '2026-09-24T00:01:00.000Z' }] };

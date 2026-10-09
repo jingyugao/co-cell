@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import type { Project, Session, Settings, Turn } from '../../protocol/types.js';
-import { TurnObserverDetached, type SandboxRuntime } from '../execution/container-runtime.js';
+import { TurnObserverDetached, type NativeTurnObservation, type SandboxRuntime } from '../execution/container-runtime.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import type { CodexClient } from './manager.js';
 import { SessionManager } from './manager.js';
@@ -45,8 +45,14 @@ type Control = {
   maintenanceCalls: number;
   archiveCaptures: number;
   questionReady: ReturnType<typeof deferred<void>>;
+  acceptanceReady: ReturnType<typeof deferred<void>>;
+  delayAcceptance: boolean;
   recoveryReady: ReturnType<typeof deferred<void>>;
   terminal: ReturnType<typeof deferred<'completed' | 'cancelled'>>;
+  enableNativeObservation: boolean;
+  observeCalls: number;
+  observeReady: ReturnType<typeof deferred<void>>;
+  observedSandboxStatus?: string;
   nativeTurn?: Turn;
 };
 
@@ -65,6 +71,7 @@ function runtimeFor(control: Control): SandboxRuntime {
       await onSandbox(session.sandbox!);
       yield { type: 'thread.started' as const, thread_id: 'shared-thread' };
     }
+    if (control.delayAcceptance) await control.acceptanceReady.promise;
     yield { type: 'turn.started' as const, turn_id: 'native-turn' };
     yield { type: 'item.completed' as const, item: questionItem };
     if (kind === 'run') control.questionReady.resolve();
@@ -80,7 +87,7 @@ function runtimeFor(control: Control): SandboxRuntime {
     else yield { type: 'turn.completed' as const, usage };
     observers.delete(turn.id);
   }
-  return {
+  const runtime: any = {
     async close() {},
     track() {},
     async querySandbox(sandbox: NonNullable<Session['sandbox']>) { return { ...sandbox, status: 'ready' as const }; },
@@ -96,7 +103,19 @@ function runtimeFor(control: Control): SandboxRuntime {
     async steer(_session: Session, _turn: Turn, text: string) { control.steers.push(text); return true; },
     async interrupt() { control.interrupts++; control.terminal.resolve('cancelled'); },
     async history() { return { turns: control.nativeTurn ? [structuredClone(control.nativeTurn)] : [] }; },
-  } as unknown as SandboxRuntime;
+  };
+  if (control.enableNativeObservation) {
+    runtime.observe = async function* (session: Session, turn: Turn, signal: AbortSignal): AsyncGenerator<NativeTurnObservation> {
+      control.observeCalls++;
+      control.observedSandboxStatus = session.sandbox?.status;
+      control.observeReady.resolve();
+      yield { type: 'snapshot', turn: { ...turn, id: 'native-turn', nativeTurnId: 'native-turn', codexAccepted: true,
+        status: 'running', items: [{ id: 'answer', type: 'agent_message', text: 'seeded native answer' }] } };
+      yield { type: 'event', event: { type: 'item.updated', item: { id: 'answer', type: 'agent_message', text: 'seeded native answer plus live delta' } } };
+      if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+    };
+  }
+  return runtime as SandboxRuntime;
 }
 
 async function fixture() {
@@ -115,7 +134,9 @@ async function fixture() {
   await state.saveProject(project);
   await state.saveSession(session);
   const control: Control = { runCalls: 0, recoverCalls: 0, steers: [], interrupts: 0, maintenanceCalls: 0,
-    archiveCaptures: 0, questionReady: deferred<void>(), recoveryReady: deferred<void>(), terminal: deferred<'completed' | 'cancelled'>() };
+    archiveCaptures: 0, questionReady: deferred<void>(), acceptanceReady: deferred<void>(), delayAcceptance: false,
+    recoveryReady: deferred<void>(), terminal: deferred<'completed' | 'cancelled'>(), enableNativeObservation: false,
+    observeCalls: 0, observeReady: deferred<void>() };
   const managers: SessionManager[] = [];
   const start = async () => {
     const manager = new SessionManager({} as CodexClient, directory, settings, state, runtimeFor(control), undefined, undefined,
@@ -135,7 +156,7 @@ async function fixture() {
   } };
 }
 
-test('a second API sees the running turn, steers its async answer, and rejects a duplicate start', async () => {
+test('a second API appends messages to the accepted native turn and steers its async answer', async () => {
   const f = await fixture();
   try {
     const apiA = await f.start();
@@ -154,16 +175,69 @@ test('a second API sees the running turn, steers its async answer, and rejects a
       await waitUntil(() => events.some(event => event.session?.turns.some(turn => turn.id === turnId
         && turn.userInputRequests?.some(request => request.status === 'pending'))));
       const state = apiB.get(f.sessionId);
-      await assert.rejects(apiB.startTurn(f.sessionId, 'duplicate task'), /执行|任务|running|running/i);
+      assert.equal(await apiB.startTurn(f.sessionId, 'additional instruction'), turnId);
+      assert.equal(f.control.steers[0], 'additional instruction');
       await apiB.answerUserInput(f.sessionId, turnId, 'request-1', 'Yes', ['Yes']);
       assert.equal(f.control.runCalls, 1);
-      assert.equal(f.control.steers.length, 1);
-      assert.match(f.control.steers[0], /Yes/);
+      assert.equal(f.control.steers.length, 2);
+      assert.match(f.control.steers[1], /Yes/);
       assert.equal(state.turns[0].status, 'running');
+      assert.equal(apiB.get(f.sessionId).turns[0].prompt, 'Run the shared task');
+      assert.deepEqual(apiB.get(f.sessionId).turns[0].additionalUserInputs, ['additional instruction']);
       await waitUntil(() => ownerEvents.some(event => event.session?.turns.some(turn => turn.id === turnId
         && turn.userInputRequests?.some(request => request.status === 'answered'))));
     } finally { unsubscribe(); unsubscribeOwner(); }
   } finally { f.control.terminal.resolve('completed'); await f.close(); }
+});
+
+test('a second API waits for native turn acceptance before steering without holding the project lock', async () => {
+  const f = await fixture();
+  try {
+    const apiA = await f.start();
+    const apiB = await f.start();
+    f.control.delayAcceptance = true;
+    await apiA.startTurn(f.sessionId, 'Original prompt');
+    await waitUntil(() => f.control.runCalls === 1);
+    const appended = apiB.startTurn(f.sessionId, 'Waited addition');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    f.control.acceptanceReady.resolve();
+    const turnId = await appended;
+    await f.control.questionReady.promise;
+    assert.equal(f.control.steers.length, 1);
+    assert.equal(f.control.steers[0], 'Waited addition');
+    assert.equal(apiB.get(f.sessionId).turns[0].prompt, 'Original prompt');
+    assert.deepEqual(apiB.get(f.sessionId).turns[0].additionalUserInputs, ['Waited addition']);
+    assert.ok(turnId);
+  } finally { f.control.acceptanceReady.resolve(); f.control.terminal.resolve('completed'); await f.close(); }
+});
+
+test('simultaneous submissions converge on one accepted turn and steer the second prompt', async () => {
+  const f = await fixture();
+  try {
+    const apiA = await f.start();
+    const apiB = await f.start();
+    f.control.delayAcceptance = true;
+    const starting = Promise.all([
+      apiA.startTurn(f.sessionId, 'Window A prompt'),
+      apiB.startTurn(f.sessionId, 'Window B prompt'),
+    ]);
+    await waitUntil(() => f.control.runCalls === 1);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    f.control.acceptanceReady.resolve();
+    const [turnA, turnB] = await starting;
+    await f.control.questionReady.promise;
+    assert.equal(turnA, turnB);
+    assert.equal(f.control.runCalls, 1);
+    assert.equal(f.control.steers.length, 1);
+    const saved = await f.state.getSession(f.sessionId);
+    assert.equal(saved?.turns.length, 1);
+    const source = saved!.turns[0];
+    const original = ['Window A prompt', 'Window B prompt'].find(prompt => prompt === source.prompt);
+    const added = ['Window A prompt', 'Window B prompt'].find(prompt => prompt !== source.prompt);
+    assert.ok(original);
+    assert.deepEqual(source.additionalUserInputs, [added]);
+    assert.equal(f.control.steers[0], added);
+  } finally { f.control.acceptanceReady.resolve(); f.control.terminal.resolve('completed'); await f.close(); }
 });
 
 test('a second API blocks maintenance and remotely stops the native turn as cancelled', async () => {
@@ -199,6 +273,36 @@ test('a new API does not fail another API turn and takes over observation after 
     assert.equal(f.control.runCalls, 1);
     assert.equal(f.control.recoverCalls, 1);
     assert.equal((await f.state.getSession(f.sessionId))?.turns.find(turn => turn.id === turnId)?.status, 'completed');
+  } finally { f.control.terminal.resolve('completed'); await f.close(); }
+});
+
+test('a remote viewer observes an accepted turn when reloaded sandbox metadata has unknown status', async () => {
+  const f = await fixture();
+  try {
+    const apiA = await f.start();
+    const turnId = await apiA.startTurn(f.sessionId, 'Keep observing the accepted turn');
+    await f.control.questionReady.promise;
+
+    const project = await f.state.getProject(f.projectId);
+    assert.ok(project?.sandbox);
+    project.sandbox.status = 'unknown';
+    await f.state.saveProject(project);
+
+    f.control.enableNativeObservation = true;
+    const apiB = await f.start();
+    assert.equal(apiB.get(f.sessionId).sandbox?.status, 'unknown');
+    const messages: Array<{ type: string; turnId?: string; event?: { type: string } }> = [];
+    const unsubscribe = apiB.subscribe(f.sessionId, message => {
+      if (message.type === 'sdk') messages.push(message);
+    });
+    try {
+      await f.control.observeReady.promise;
+      await waitUntil(() => messages.some(message => message.type === 'sdk' && message.turnId === turnId
+        && message.event?.type === 'item.updated'));
+      assert.equal(f.control.observedSandboxStatus, 'unknown');
+      assert.equal(f.control.observeCalls, 1);
+      assert.equal(f.control.runCalls, 1, 'viewing native events must not start another execution');
+    } finally { unsubscribe(); }
   } finally { f.control.terminal.resolve('completed'); await f.close(); }
 });
 

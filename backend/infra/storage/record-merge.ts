@@ -31,8 +31,14 @@ function conflict(path: string): never {
 
 function mergeValue(previous: unknown, incoming: unknown, latest: unknown, path: string): unknown {
   const field = path.slice(path.lastIndexOf('.') + 1);
-  if (field === 'updatedAt' && [previous, incoming, latest].every(value => typeof value === 'string' && value.includes('T') && Number.isFinite(Date.parse(value)))) {
+  if (field === 'updatedAt'
+    && [previous, incoming, latest].every(value => typeof value === 'string' && value.includes('T') && Number.isFinite(Date.parse(value)))) {
     return [previous, incoming, latest].reduce((max, value) => Date.parse(value as string) > Date.parse(max as string) ? value : max);
+  }
+  if (field === 'lastActiveAt' && [previous, incoming, latest].every(value => value === undefined
+    || (typeof value === 'string' && value.includes('T') && Number.isFinite(Date.parse(value))))) {
+    const timestamps = [previous, incoming, latest].filter((value): value is string => typeof value === 'string');
+    if (timestamps.length) return timestamps.reduce((max, value) => Date.parse(value) > Date.parse(max) ? value : max);
   }
   if (equal(previous, incoming)) return latest;
   if (equal(previous, latest) || equal(incoming, latest)) return incoming;
@@ -46,7 +52,11 @@ function mergeValue(previous: unknown, incoming: unknown, latest: unknown, path:
       if (hadPrevious === hasIncoming && (!hadPrevious || equal(previous[key], incoming[key]))) continue;
       const hasLatest = hasOwn(latest, key);
       const childPath = path ? `${path}.${key}` : key;
-      if (!hasIncoming) {
+      if (key === 'lastActiveAt') {
+        const merged = mergeValue(hadPrevious ? previous[key] : undefined, hasIncoming ? incoming[key] : undefined,
+          hasLatest ? latest[key] : undefined, childPath);
+        if (merged === undefined) delete result[key]; else result[key] = merged;
+      } else if (!hasIncoming) {
         if (!hasLatest || equal(previous[key], latest[key])) delete result[key];
         else conflict(childPath);
       } else if (!hadPrevious) {

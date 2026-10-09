@@ -27,6 +27,7 @@ export interface SandboxRuntime {
   run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
   recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
   detach(turn: Turn): void;
+  interrupt?(session: Session, turn: Turn): Promise<void>;
   steer?(session: Session, turn: Turn, text: string): Promise<boolean>;
   service?(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response>;
   file(session: WorkspaceTarget, path: string, signal?: AbortSignal): Promise<WorkspaceFileResult>;
@@ -406,7 +407,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
           return;
         }
         if (native.status === 'failed' || native.status === 'cancelled') {
-          yield { type: 'turn.failed', error: { message: native.error ?? (native.status === 'cancelled' ? 'Turn cancelled' : 'Turn failed') } };
+          yield { type: 'turn.failed', ...(native.status === 'cancelled' ? { cancelled: true } : {}),
+            error: { message: native.error ?? (native.status === 'cancelled' ? 'Turn cancelled' : 'Turn failed') } };
           return;
         }
         await waitFor(1000, observerSignal);
@@ -519,6 +521,13 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async steer(session: Session, turn: Turn, text: string): Promise<boolean> {
     if (!session.sandbox || !session.threadId || !turn.nativeTurnId) return false;
     return this.reader.read(session.sandbox.id, client => client.steerTurn(session.threadId!, turn.nativeTurnId!, text));
+  }
+  async interrupt(session: Session, turn: Turn): Promise<void> {
+    if (!session.sandbox || !session.threadId || !turn.nativeTurnId) {
+      throw new Error('App Server turn interruption information is incomplete');
+    }
+    await this.reader.read(session.sandbox.id, client =>
+      client.turnInterrupt({ threadId: session.threadId!, turnId: turn.nativeTurnId! }));
   }
   async subagents(session: Session, signal?: AbortSignal): Promise<SubagentConversation[]> {
     if (!session.threadId) return [];

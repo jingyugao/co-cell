@@ -7,6 +7,7 @@ import type { SecretRepository, StoredSecret, StoredVersion } from './repository
 import { FILE_BUNDLE_LIMIT, openMeegleBundle, validateFileBundle } from '../../util/credential-files.mjs';
 import { MountedToolHomes } from './mounted-home.js';
 import type { ProjectToolPermission, ProjectToolPermissionInput, ToolAuthorization } from '../../protocol/secret-types.js';
+import type { SharedCoordinator } from '../infra/storage/coordination.js';
 
 export const MAX_SECRET_BYTES = 64 * 1024;
 export function secretBytes(format: SecretInput['format'], content: string): Buffer {
@@ -37,7 +38,7 @@ export class SecretService {
   homes?: MountedToolHomes;
   constructor(readonly repository: SecretRepository, private crypto: SecretCrypto) {}
   async init() { await this.repository.init(); }
-  async mountHomes(root: string) { this.homes = new MountedToolHomes(root); await this.homes.init(); }
+  async mountHomes(root: string, coordinator?: SharedCoordinator) { this.homes = new MountedToolHomes(root, coordinator); await this.homes.init(); }
   publishHome(projectId: string) {
     if (!this.homes) throw new Error('Mounted debug HOME is not configured');
     return this.homes.publish(projectId, () => this.provision(projectId));

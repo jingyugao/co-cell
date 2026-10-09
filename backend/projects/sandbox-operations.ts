@@ -27,12 +27,14 @@ export class ProjectSandboxOperations {
     runtime: SandboxRuntime;
     threadIds: (id: string) => string[];
     saveSandbox: (id: string, sandbox: SandboxState, restore: boolean, image?: ProjectImageSelection) => Promise<void>;
-    selectRestoreImage?: (project: Project, versionId?: string) => Promise<{ selection?: ProjectImageSelection; release(): void }>;
+    selectRestoreImage?: (project: Project, versionId?: string) => Promise<{ selection?: ProjectImageSelection; release(): void | Promise<void> }>;
     detached: (id: string) => Promise<void>;
     logger?: RuntimeLog;
+    assertHeld?: (id: string) => void;
   }) {}
 
   private async phase(id: string, phase: string) {
+    this.deps.assertHeld?.(id);
     const operation = this.deps.projects.get(id).sandboxOperation!;
     await this.deps.projects.updateSandboxOperation(id, { ...operation, phase, updatedAt: new Date().toISOString() });
     this.recordTiming(id, 'running', phase);
@@ -101,21 +103,35 @@ export class ProjectSandboxOperations {
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
     if (project.archiveCleanupSourceId && kind !== 'archive') throw new HttpError(409, '项目归档清理尚未完成，请先重试归档');
     const release = this.deps.projects.beginMaintenance(id);
-    let reservation: { selection?: ProjectImageSelection; release(): void } | undefined;
+    let reservation: { selection?: ProjectImageSelection; release(): void | Promise<void> } | undefined;
     let operationId: string;
     try {
       await this.deps.projects.drainReads(id);
       if (options.imageVersionId && (kind !== 'restore' || project.status !== 'archived')) throw new HttpError(409, '仅归档项目恢复时可以选择镜像版本');
-      if (kind === 'restore' && project.status === 'archived' && this.deps.selectRestoreImage) reservation = await this.deps.selectRestoreImage(project, options.imageVersionId);
+      if (kind === 'restore' && project.status === 'archived' && this.deps.selectRestoreImage) {
+        const priorOperationSelection = project.sandboxOperation?.imageSelection;
+        const priorSelection = priorOperationSelection ?? project.imageSelection;
+        const versionId = options.imageVersionId ?? priorOperationSelection?.versionId;
+        reservation = await this.deps.selectRestoreImage({ ...project, imageSelection: priorSelection }, versionId);
+      }
+      const stagedSelection = reservation ? reservation.selection : kind === 'restore'
+        ? project.sandboxOperation?.imageSelection ?? project.imageSelection : undefined;
       await this.deps.projects.updateSandboxOperation(id, { id: randomUUID(), kind,
-        phase: kind === 'create' ? '创建 Sandbox' : '检查环境', status: 'running', updatedAt: new Date().toISOString() });
+        phase: kind === 'create' ? '创建 Sandbox' : '检查环境', status: 'running',
+        ...(stagedSelection ? { imageSelection: structuredClone(stagedSelection) } : {}), updatedAt: new Date().toISOString() });
+      if (reservation) {
+        // The durable staged reference now protects the image from deletion;
+        // other projects can reserve the same image while this restore runs.
+        await reservation.release();
+        reservation = { selection: reservation.selection, release() {} };
+      }
       const accepted = this.deps.projects.get(id).sandboxOperation!;
       operationId = accepted.id!;
       const now = Date.now();
       this.timings.set(id, { operationId: accepted.id!, kind, started: now, phaseStarted: now, phase: accepted.phase });
       void this.deps.logger?.write({ event: 'sandbox.operation_started', projectId: id,
         operationId: accepted.id, operation: kind, startedAt: new Date(now).toISOString(), sandboxId: project.sandbox?.id });
-    } catch (error) { reservation?.release(); release(); throw error; }
+    } catch (error) { try { await reservation?.release(); } catch {} finally { release(); } throw error; }
     const pending = { operationId, waiters: new Set<() => void>() };
     this.pending.set(id, pending);
     const task = Promise.resolve().then(() => traced(`project.sandbox.${kind}`, {
@@ -133,9 +149,11 @@ export class ProjectSandboxOperations {
           await this.backup(id);
         } else if (kind === 'refresh') await this.refreshRuntime(id);
         else await this.archive(id, options.useExistingBackup === true);
+        this.deps.assertHeld?.(id);
         await this.deps.projects.updateSandboxOperation(id, { ...this.deps.projects.get(id).sandboxOperation!, kind,
-          phase: '完成', status: 'succeeded', updatedAt: new Date().toISOString() });
+          phase: '完成', status: 'succeeded', imageSelection: undefined, updatedAt: new Date().toISOString() });
       } catch (error) {
+        this.deps.assertHeld?.(id);
         // Keep the user-facing state deliberately concise, but always retain the
         // provider error and operation context in the bounded server log. Without
         // this, restore failures are indistinguishable from one another in the UI.
@@ -151,7 +169,9 @@ export class ProjectSandboxOperations {
         throw error;
       } finally {
         this.recordTiming(id, this.deps.projects.get(id).sandboxOperation?.status ?? 'failed');
-        reservation?.release(); release();
+        try { await reservation?.release(); }
+        catch (error) { void this.deps.logger?.write({ event: 'sandbox.image_reservation_release_failed', projectId: id, error }); }
+        finally { release(); }
         // Wake readers only after the terminal state is durable and execution
         // is admitted again. A Box being Running alone is not resume success.
         this.pending.delete(id);

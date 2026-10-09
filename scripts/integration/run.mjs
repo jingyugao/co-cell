@@ -15,11 +15,13 @@ const profiles = {
   reads: ['model'],
   lifecycle: ['model'],
   'user-input': ['model'],
+  'multi-api': ['model'],
   agent: ['model'],
   core: ['live', 'model'],
   extended: ['live', 'model'],
 };
 const [profile = 'ui', ...args] = process.argv.slice(2);
+const forwardedArgs = args[0] === '--' ? args.slice(1) : args;
 if (profile === '--help' || profile === 'help') {
   console.log(`CoCell integration tests
 
@@ -29,12 +31,14 @@ pnpm test:integration:full              All suites, including real model turns
 pnpm test:integration:reads             Real conversation history and direct subagents
 pnpm test:integration:lifecycle         Real files, process continuity, backup/restore
 pnpm test:integration:user-input        Real asynchronous user question and answer
+pnpm exec node scripts/integration/run.mjs multi-api  Real two-instance coordination with a live model turn
 pnpm test:integration:agent             Real agent writes files and starts HTTP; no tool credentials
 pnpm test:integration:core              Real core API/browser/model journeys; no business tool cases
 pnpm test:integration:extended          Core plus subagents, Git/Go and disposable-CI Web restart
 pnpm test:integration:full --list        List coverage without connecting to services
 
 Live suites require COCELL_E2E_BASE_URL and COCELL_E2E_ACCESS_TOKEN.
+The multi-api profile requires COCELL_E2E_API_A_URL and COCELL_E2E_API_B_URL pointing directly to distinct API instances (for example, separate pod port-forwards).
 Alternatively, set COCELL_E2E_KUBE_CONTEXT in ignored deploy.env to use the existing Helm release.
 COCELL_E2E_PUBLIC_URL optionally supplies the public Host/Origin when using a port-forward.
 Install Chromium once: pnpm exec playwright install chromium
@@ -53,16 +57,17 @@ All other runs clean up their own projects, including on failure. Model suites u
     process.env.COCELL_E2E_UI_PORT = String(probe.address().port);
     await new Promise(resolve => probe.close(resolve));
   }
-  const transport = profile !== 'ui' && !args.includes('--list') ? await liveTransport(process.env) : { env: {}, close() {} };
+  const transport = profile !== 'ui' && profile !== 'multi-api' && !forwardedArgs.includes('--list') ? await liveTransport(process.env) : { env: {}, close() {} };
   const child = spawn(process.execPath, [require.resolve('@playwright/test/cli'), 'test',
     '--config=scripts/integration/playwright.config.mjs',
-    ...(args.some(arg => arg === '--project' || arg.startsWith('--project=')) ? [] : profiles[profile].map(name => `--project=${name}`)),
+    ...(forwardedArgs.some(arg => arg === '--project' || arg.startsWith('--project=')) ? [] : profiles[profile].map(name => `--project=${name}`)),
     ...(profile === 'reads' ? ['--grep=conversation reads'] : []),
     ...(profile === 'lifecycle' ? ['--grep=project lifecycle'] : []),
     ...(profile === 'user-input' ? ['--grep=asynchronous user input'] : []),
+    ...(profile === 'multi-api' ? ['--grep=multi-api coordination'] : []),
     ...(profile === 'agent' ? ['--grep=real agent creates files'] : []),
     ...(['core', 'extended'].includes(profile) ? [`--grep-invert=prepared image tools|native .* HOME|deployed Git proxy${profile === 'core' ? '|conversation reads|nightly:|project lifecycle with real model' : ''}`] : []),
-    ...args], { stdio: 'inherit', env: { ...process.env, ...transport.env, COCELL_E2E_PROFILE: profile, COCELL_E2E_OUTPUT_DIR: output } });
+    ...forwardedArgs], { stdio: 'inherit', env: { ...process.env, ...transport.env, COCELL_E2E_PROFILE: profile, COCELL_E2E_OUTPUT_DIR: output } });
   // Let Playwright tear down fixtures on the first interrupt.
   process.on('SIGINT', () => child.kill('SIGINT'));
   process.on('SIGTERM', () => child.kill('SIGTERM'));

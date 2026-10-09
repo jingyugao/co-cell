@@ -27,11 +27,17 @@ import { installPwaAssets } from './infra/http/pwa.js';
 
 export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService) {
   const app = new Hono();
+  app.get('/healthz', c => c.text('ok'));
   app.use('/api/*', traceHttpRequest);
   if (operatorAccess) installOperatorAccess(app, {
     ...operatorAccess,
     serviceProxy: (projectId, port, path, request) =>
       proxyProjectService(manager, projectId, port, path, request, '', true),
+  });
+  if (manager.sharedStateEnabled) app.use('/api/*', async (c, next) => {
+    if (new URL(c.req.url).pathname.startsWith('/api/tool-runtime/')) return next();
+    await manager.refreshSharedState();
+    await next();
   });
   installPwaAssets(app);
 

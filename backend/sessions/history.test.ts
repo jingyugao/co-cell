@@ -54,7 +54,7 @@ async function fixture(state = new MemoryWebStateStore()) {
   } };
 }
 
-test('async answers recover from native history across reload and pagination without new MySQL state', async () => {
+test('async answers recover from native history across reload and pagination without a stored transcript', async () => {
   let document: unknown;
   const sql = Object.create(MySqlWebStateStore.prototype) as MySqlWebStateStore;
   (sql as unknown as { pool: { query: (query: string, values?: unknown[]) => Promise<unknown> } }).pool = {
@@ -94,7 +94,9 @@ test('async answers recover from native history across reload and pagination wit
     assert.equal((await first.read(session.id)).turns.find(turn => turn.items.some(item => item.id === question.id))?.userInputRequests?.[0].status, 'answered');
     await first.close();
     assert.equal('userInputTurns' in (document as object), false);
-    assert.deepEqual((await state.listSessions())[0].turns, []);
+    const controls = (await state.listSessions())[0].turns;
+    assert(controls.length > 0);
+    assert(controls.every(turn => turn.items.length === 0 && turn.prompt === ''));
 
     f.runtime.history = async (_session, options) => options?.cursor
       ? { turns: [nativeQuestion], nextCursor: null }

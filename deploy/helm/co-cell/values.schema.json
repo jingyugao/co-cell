@@ -140,6 +140,15 @@
         }
       }
     },
+    "multiApi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "replicas"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicas": { "type": "integer", "minimum": 1 }
+      }
+    },
     "ingress": {
       "type": "object",
       "additionalProperties": false,

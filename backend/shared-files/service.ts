@@ -4,6 +4,7 @@ import { link, lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promi
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HttpError } from '../../util/errors.js';
+import type { SharedCoordinator } from '../infra/storage/coordination.js';
 
 const LIMIT = 1024 * 1024;
 const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT';
@@ -15,7 +16,7 @@ function decode(bytes: Uint8Array): string | undefined {
 export class SharedFiles {
   private tail: Promise<unknown> = Promise.resolve();
   constructor(private root = process.env.SHARED_DATA_DIRECTORY || fileURLToPath(new URL('../../data/', import.meta.url)),
-    private mounted = false) {}
+    private mounted = false, private coordinator?: SharedCoordinator) {}
   private serial<T>(action: () => Promise<T>): Promise<T> {
     const next = this.tail.then(action);
     this.tail = next.catch(() => {});
@@ -27,6 +28,9 @@ export class SharedFiles {
       path.split('/').some(part => !part || part === '.' || part === '..' || part.startsWith('.shared-write-'))) {
       throw new HttpError(400, '路径须为 AGENTS.md 或 docs/ 下的文件，不能包含路径跳转');
     }
+  }
+  private withPathLock<T>(path: string, action: () => Promise<T>) {
+    return this.coordinator ? this.coordinator.run(`shared-file:${this.root}:${path}`, action) : action();
   }
   private async resolve(path: string, createParents = false) {
     this.validate(path);
@@ -101,36 +105,41 @@ export class SharedFiles {
   write(path: string, content: string, expectedVersion?: string) {
     return this.serial(async () => {
       this.validate(path);
-      const bytes = Buffer.from(content);
-      if (decode(bytes) === undefined) throw new HttpError(400, '文件须为 1 MB 以内、不含空字符的 UTF-8 文本');
-      if (expectedVersion !== undefined) {
-        const previous = await this.snapshot(path);
-        if (previous.version !== expectedVersion) throw new HttpError(409, '文件已被修改，请重新加载后再保存');
-      }
-      const location = await this.resolve(path, true);
-      const temp = join(dirname(location), `.shared-write-${randomUUID()}`);
-      try {
-        const handle = await open(temp, 'wx', 0o600);
+      return this.withPathLock(path, async () => {
+        const bytes = Buffer.from(content);
+        if (decode(bytes) === undefined) throw new HttpError(400, '文件须为 1 MB 以内、不含空字符的 UTF-8 文本');
+        if (expectedVersion !== undefined) {
+          const previous = await this.snapshot(path);
+          if (previous.version !== expectedVersion) throw new HttpError(409, '文件已被修改，请重新加载后再保存');
+        }
+        const location = await this.resolve(path, true);
+        const temp = join(dirname(location), `.shared-write-${randomUUID()}`);
         try {
-          await handle.writeFile(bytes);
-          if (this.mounted || path === 'AGENTS.md') await handle.chmod(0o644);
-        } finally { await handle.close(); }
-        if (expectedVersion === undefined) {
-          await link(temp, location).catch(error => {
-            if (error.code === 'EEXIST') throw new HttpError(409, '同名文件已存在，请选择其他路径或打开该文件');
-            throw error;
-          });
-        } else await rename(temp, location);
-      } finally { await unlink(temp).catch(error => { if (!missing(error)) throw error; }); }
-      return { path, content, version: version(bytes) };
+          const handle = await open(temp, 'wx', 0o600);
+          try {
+            await handle.writeFile(bytes);
+            if (this.mounted || path === 'AGENTS.md') await handle.chmod(0o644);
+          } finally { await handle.close(); }
+          if (expectedVersion === undefined) {
+            await link(temp, location).catch(error => {
+              if (error.code === 'EEXIST') throw new HttpError(409, '同名文件已存在，请选择其他路径或打开该文件');
+              throw error;
+            });
+          } else await rename(temp, location);
+        } finally { await unlink(temp).catch(error => { if (!missing(error)) throw error; }); }
+        return { path, content, version: version(bytes) };
+      });
     });
   }
   delete(path: string, expectedVersion: string) {
     return this.serial(async () => {
-      const previous = await this.snapshot(path);
-      if (previous.version !== expectedVersion) throw new HttpError(409, '文件已被修改，请重新加载后再删除');
-      await unlink(await this.resolve(path));
-      return { ok: true };
+      this.validate(path);
+      return this.withPathLock(path, async () => {
+        const previous = await this.snapshot(path);
+        if (previous.version !== expectedVersion) throw new HttpError(409, '文件已被修改，请重新加载后再删除');
+        await unlink(await this.resolve(path));
+        return { ok: true };
+      });
     });
   }
 }

@@ -191,7 +191,9 @@ export class AppServerEventAdapter {
       return [];
     }
     if (method === 'turn/completed') {
-      if (p.turn.status !== 'completed') return [{ type: 'turn.failed', error: { message: p.turn.error?.message ?? `Turn ${p.turn.status}` } }];
+      if (p.turn.status !== 'completed') return [{ type: 'turn.failed',
+        ...( ['interrupted', 'cancelled', 'canceled', 'aborted'].includes(p.turn.status) ? { cancelled: true } : {}),
+        error: { message: p.turn.error?.message ?? `Turn ${p.turn.status}` } }];
       return [{ type: 'turn.completed', usage: this.usage }];
     }
     if (method === 'error') return [{ type: 'error', message: p.error?.message ?? 'App Server error' }];

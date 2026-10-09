@@ -13,10 +13,13 @@ const project = (): Project => ({
 });
 
 class MemoryState implements WebStateStore {
+  projectReads = 0;
   constructor(public projects: Project[]) {}
   async init() {}
   async listProjects() { return structuredClone(this.projects); }
   async listSessions(): Promise<Session[]> { return []; }
+  async getProject(id: string) { this.projectReads++; const value = this.projects.find(item => item.id === id); return value ? structuredClone(value) : undefined; }
+  async getSession(_id: string) { return undefined; }
   async saveProject(value: Project) {
     const index = this.projects.findIndex(item => item.id === value.id);
     if (index < 0) this.projects.push(structuredClone(value)); else this.projects[index] = structuredClone(value);
@@ -26,6 +29,55 @@ class MemoryState implements WebStateStore {
   async deleteSession() {}
   async close() {}
 }
+
+test('shared refresh waits for in-flight writes, honors skipped scopes, and refreshes baselines safely', async () => {
+  class DelayedState extends MemoryState {
+    holdNext = false;
+    lastPrevious?: Project;
+    entered!: () => void;
+    releaseSave!: () => void;
+    async saveProject(value: Project, previous?: Project) {
+      this.lastPrevious = previous;
+      if (this.holdNext) {
+        this.holdNext = false;
+        const gate = new Promise<void>(resolve => { this.releaseSave = resolve; });
+        this.entered();
+        await gate;
+      }
+      await super.saveProject(value);
+    }
+  }
+  const state = new DelayedState([project()]);
+  const service = new ProjectService(state, undefined, undefined, true);
+  await service.init();
+
+  state.projects[0].name = 'remote skipped update';
+  await service.refresh(new Set(['project-1']));
+  assert.equal(service.get('project-1').name, 'Archive history');
+  assert.equal(state.projectReads, 0);
+
+  let signalEntered!: () => void;
+  const entered = new Promise<void>(resolve => { signalEntered = resolve; });
+  state.entered = signalEntered;
+  state.holdNext = true;
+  const update = service.update('project-1', { name: 'local write' });
+  await entered;
+  let refreshed = false;
+  const refresh = service.refresh().then(() => { refreshed = true; });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(refreshed, false);
+  state.releaseSave();
+  await Promise.all([update, refresh]);
+  assert.equal(service.get('project-1').name, 'local write');
+  assert.equal(state.projectReads, 1, 'only the stale list entry is reread after the save advances its baseline');
+
+  state.projects[0].name = 'new remote baseline';
+  await service.refresh();
+  assert.equal(service.get('project-1').name, 'new remote baseline');
+  assert.equal(state.projectReads, 1, 'ordinary bulk refreshes do not issue per-project point reads');
+  await service.update('project-1', { name: 'final local write' });
+  assert.equal(state.lastPrevious?.name, 'new remote baseline');
+});
 
 test('archive detaches the Sandbox and rebuilding restores the project with a new binding', async () => {
   const state = new MemoryState([project()]);

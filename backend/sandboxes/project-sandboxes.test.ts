@@ -307,6 +307,44 @@ test('a user stop remains cancelled when App Server reports its interrupted turn
   assert.equal(turn.error, undefined);
 });
 
+test('a remote native interruption is persisted as cancellation without a local abort', async () => {
+  const now = new Date().toISOString();
+  const turn: Turn = { id: 'turn', prompt: 'stop me remotely', images: [], items: [], status: 'running', startedAt: now };
+  const session: Session = { id: 'session', projectId: 'project', title: 'test', threadId: 'thread', status: 'running',
+    startedAt: now, createdAt: now, updatedAt: now, archivedAt: null, turns: [turn],
+    settings: { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test', modelReasoningEffort: 'low',
+      sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true } };
+  const sandbox = { async *run() {
+    yield { type: 'turn.started' as const, turn_id: 'native-turn' };
+    yield { type: 'turn.failed' as const, cancelled: true, error: { message: 'Turn interrupted' } };
+  } } as unknown as ContainerCodexRuntime;
+  await runTurn(session, turn, new AbortController(), {
+    client: {} as TurnExecutionDependencies['client'], sandbox,
+    save: async () => {}, publish: () => {}, snapshot: () => structuredClone(session), updateSandbox: async () => {},
+  });
+  assert.equal(turn.status, 'cancelled');
+  assert.equal(turn.error, undefined);
+});
+
+test('lost execution ownership detaches before applying or persisting another event', async () => {
+  const now = new Date().toISOString();
+  const turn: Turn = { id: 'turn', prompt: 'continue elsewhere', images: [], items: [], status: 'running', startedAt: now };
+  const session: Session = { id: 'session', projectId: 'project', title: 'test', threadId: 'thread', status: 'running',
+    startedAt: now, createdAt: now, updatedAt: now, archivedAt: null, turns: [turn],
+    settings: { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test', modelReasoningEffort: 'low',
+      sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true } };
+  let checks = 0, saves = 0, publishes = 0;
+  const sandbox = ({ async *run() { yield { type: 'turn.failed' as const, error: { message: 'stale observer' } }; } }) as unknown as ContainerCodexRuntime;
+  await runTurn(session, turn, new AbortController(), {
+    client: {} as TurnExecutionDependencies['client'], sandbox,
+    save: async () => { saves++; }, publish: () => { publishes++; }, snapshot: () => structuredClone(session), updateSandbox: async () => {},
+    canPersist: () => ++checks < 2,
+  });
+  assert.equal(turn.status, 'running');
+  assert.equal(saves, 0);
+  assert.equal(publishes, 0);
+});
+
 test('App Server recovery snapshots preserve native status, prompt, and full items', async () => {
   const { provider, projects, manager } = fixture();
   const runtime = new ContainerCodexRuntime({ paths: runtimePaths, prepareRemote: async () => false, provider, apiKey: '', sandboxes: projects });
@@ -337,14 +375,14 @@ test('App Server recovery polls the accepted native turn and never starts anothe
     startedAt: target.updatedAt, createdAt: target.updatedAt, archivedAt: null, turns: [turn],
     settings: { ...target.settings, executionMode: 'sandbox', model: 'test', modelReasoningEffort: 'low',
       sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: false } };
-  let listCalls = 0, startCalls = 0;
+  let listCalls = 0, startCalls = 0, nativeStatus = 'completed';
   const originalSpawn = CodexAppServerClient.spawn;
   CodexAppServerClient.spawn = (async () => ({
     request: async (method: string) => {
       if (method === 'turn/start') { startCalls++; assert.fail('recovery must not start a turn'); }
       assert.equal(method, 'thread/turns/list');
       listCalls++;
-      return { data: [{ id: 'native-turn', status: 'completed', startedAt: 1, completedAt: 2,
+      return { data: [{ id: 'native-turn', status: nativeStatus, startedAt: 1, completedAt: 2,
         items: [{ type: 'agentMessage', id: 'answer', text: 'done after restart' }] }] };
     },
     turnInterrupt: async () => ({}),
@@ -359,6 +397,12 @@ test('App Server recovery polls the accepted native turn and never starts anothe
     assert.equal(listCalls, 1);
     assert.equal(startCalls, 0);
     assert.deepEqual(events.map(event => event.type), ['turn.started', 'item.completed', 'turn.completed']);
+    nativeStatus = 'interrupted';
+    const interrupted: Turn = { ...turn, id: randomUUID(), status: 'running', items: [] };
+    const interruptedEvents = [];
+    for await (const event of runtime.recover(session, interrupted, new AbortController().signal, async () => {})) interruptedEvents.push(event);
+    assert.deepEqual(interruptedEvents.map(event => event.type), ['turn.started', 'item.completed', 'turn.failed']);
+    assert.equal(interruptedEvents[2].type === 'turn.failed' && interruptedEvents[2].cancelled, true);
   } finally {
     CodexAppServerClient.spawn = originalSpawn;
     await runtime.close(); await manager.close();

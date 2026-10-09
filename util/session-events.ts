@@ -33,7 +33,8 @@ export function applyTurnEvent(turn: Turn, event: AgentEvent): Turn {
     case 'turn.completed':
       return { ...turn, status: 'completed', phase: 'finalizing', sdkUsage: event.usage, usage: sumRequestUsage(turn.contextUsage), error: undefined, retry: undefined };
     case 'turn.failed':
-      return { ...turn, status: 'failed', phase: 'finalizing', error: event.error.message, retry: undefined };
+      return { ...turn, status: event.cancelled ? 'cancelled' : 'failed', phase: 'finalizing',
+        error: event.cancelled ? undefined : event.error.message, retry: undefined };
     case 'error':
       // Codex can recover from transport errors and still emit turn.completed.
       return { ...turn, error: event.message };

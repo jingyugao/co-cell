@@ -109,6 +109,71 @@ test('async answers recover from native history across reload and pagination wit
   } finally { await f.close(); }
 });
 
+for (const outcome of ['accepted', 'accepted-before-finish', 'finished', 'error'] as const) test(`async input delivery during a turn: ${outcome}`, async () => {
+  const f = await fixture();
+  let finish!: () => void;
+  const running = new Promise<void>(resolve => { finish = resolve; });
+  let questionReady!: () => void;
+  const ready = new Promise<void>(resolve => { questionReady = resolve; });
+  let releaseSteer!: () => void;
+  const steering = new Promise<void>(resolve => { releaseSteer = resolve; });
+  let steerStarted!: () => void;
+  const started = new Promise<void>(resolve => { steerStarted = resolve; });
+  let launches = 0;
+  const question = { id: 'live-question', type: 'agent_message' as const, delivery: 'async', text: '',
+    questions: [{ title: '检查哪项？', options: ['网络', '容器'] }] };
+  f.runtime.run = async function* () {
+    const count = ++launches;
+    yield { type: 'thread.started', thread_id: 'original-thread' };
+    yield { type: 'turn.started', turn_id: `native-${count}` };
+    if (count === 1) {
+      yield { type: 'item.completed', item: question };
+      questionReady();
+      await running;
+    }
+    yield { type: 'turn.completed', usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0,
+      output_tokens: 0, reasoning_output_tokens: 0 } };
+  };
+  f.runtime.history = async session => ({ turns: structuredClone(session.turns) });
+  f.runtime.steer = async (_session, turn, text) => {
+    assert.equal(turn.nativeTurnId, 'native-1');
+    assert(text.includes('live-question') && text.includes('网络'));
+    steerStarted();
+    await steering;
+    if (outcome === 'error') throw new Error('transport failed');
+    return outcome === 'accepted' || outcome === 'accepted-before-finish';
+  };
+  try {
+    const manager = await f.start();
+    const session = await manager.create();
+    const turnId = await manager.startTurn(session.id, '检查环境');
+    await ready;
+    const response = manager.answerUserInput(session.id, turnId, question.id, '网络');
+    const rejected = outcome === 'error' ? assert.rejects(response, /transport failed/) : undefined;
+    await started;
+    if (outcome === 'finished' || outcome === 'accepted-before-finish') {
+      finish();
+      await manager.waitForIdle(session.id);
+    }
+    releaseSteer();
+    if (rejected) await rejected;
+    else {
+      const result = await response;
+      const saved = result.turns.find(turn => turn.id === turnId)?.userInputRequests?.[0];
+      assert.equal(saved?.status, 'answered');
+      if (outcome === 'accepted') {
+        assert.equal(saved?.answerTurnId, turnId);
+        assert.equal(result.status, 'running');
+        assert.equal(launches, 1);
+      }
+    }
+    finish();
+    await manager.waitForIdle(session.id);
+    assert.equal(launches, outcome === 'finished' ? 2 : 1);
+    if (outcome === 'error') assert.equal(manager.get(session.id).turns[0].userInputRequests?.[0].status, 'pending');
+  } finally { finish(); releaseSteer(); await f.close(); }
+});
+
 test('Sandbox history failure shows an error without serving the saved transcript', async () => {
   const f = await fixture();
   try {

@@ -18,6 +18,7 @@ export class CodexAppServerClient extends EventEmitter {
   threadStart(params: unknown): Promise<any>;
   threadResume(params: unknown): Promise<any>;
   turnStart(params: unknown): Promise<any>;
+  steerTurn(threadId: string, expectedTurnId: string, text: string): Promise<boolean>;
   turnInterrupt(params: unknown): Promise<any>;
   close(): Promise<void>;
 }
@@ -32,5 +33,5 @@ export interface ThreadOptions {
  approvalPolicy?: 'never' | 'on-request' | 'on-failure' | 'untrusted'; additionalDirectories?: string[]; skipGitRepoCheck?: boolean;
 }
 export class Codex { constructor(options?: CodexOptions); startThread(options?: ThreadOptions): Thread; resumeThread(id: string, options?: ThreadOptions): Thread; close(): Promise<void>; }
-export class Thread { readonly id: string | null; runStreamed(input: Input, options?: { signal?: AbortSignal; outputSchema?: unknown }): Promise<{ events: AsyncGenerator<AgentEvent> }>; }
+export class Thread { readonly id: string | null; steer(text: string): Promise<boolean>; runStreamed(input: Input, options?: { signal?: AbortSignal; outputSchema?: unknown }): Promise<{ events: AsyncGenerator<AgentEvent> }>; }
 export function appServerArgs(config?: Record<string, unknown>, configOverrides?: string[]): string[];

@@ -19,7 +19,7 @@ type Connection = {
   finish(error?: unknown): void;
 };
 
-/** Read RPCs share a connection, without acquiring or waking a Sandbox. */
+/** History reads and active-turn control share a connection, without acquiring or waking a Sandbox. */
 export class AppServerReader {
   private connections = new Map<string, Connection>();
   private live = new Set<Connection>();

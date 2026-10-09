@@ -16,6 +16,7 @@ type TurnExecutionDependencies = {
   snapshot(): Session;
   updateSandbox(sandbox: NonNullable<Session['sandbox']>): Promise<void>;
   recovering?: boolean;
+  onSteer?(steer: (text: string) => Promise<boolean>): void;
 };
 
 /** Runs one turn and persists each event before publishing it to subscribers. */
@@ -37,9 +38,11 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
     if (executionMode === 'sandbox') {
       if (!sandbox) throw new HttpError(503, 'Sandbox 未配置，无法运行此沙箱会话');
       const observe = dependencies.recovering ? sandbox.recover.bind(sandbox) : sandbox.run.bind(sandbox);
+      if (sandbox.steer) dependencies.onSteer?.(text => sandbox.steer!(session, turn, text));
       events = observe(session, turn, controller.signal, sandbox => updateSandbox(sandbox));
     } else {
       const thread: Thread = session.threadId ? client.resumeThread(session.threadId, options) : client.startThread(options);
+      dependencies.onSteer?.(text => thread.steer(text));
       const input: Input = turn.images.length ? [{ type: 'text', text: turn.prompt }, ...turn.images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
       ({ events } = await thread.runStreamed(input, { signal: controller.signal }));
     }

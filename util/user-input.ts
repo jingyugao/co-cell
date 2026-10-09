@@ -42,16 +42,18 @@ export function userInputReplyDisplayText(prompt: string): string {
 export function collectNativeUserInputAnswers(turns: Turn[], answers: NativeUserInputAnswers): void {
   for (const turn of turns) {
     if (!turn.codexAccepted) continue;
-    for (const reply of parseQuestionReplies(turn.prompt) ?? []) {
-      try {
-        const key: unknown = JSON.parse(reply.questionItemId);
-        if (!Array.isArray(key) || key.length !== 3 || key[0] !== 'request_user_input_async'
-          || typeof key[1] !== 'string' || !Number.isInteger(key[2]) || key[2] < 0) continue;
-        const id = JSON.stringify(key);
-        if (!answers.has(id) || answers.get(id)!.answeredAt < turn.startedAt) {
-          answers.set(id, { ...reply, answeredAt: turn.startedAt, answerTurnId: turn.id });
-        }
-      } catch { /* Ordinary user text cannot resolve an async question. */ }
+    for (const input of [turn.prompt, ...(turn.additionalUserInputs ?? [])]) {
+      for (const reply of parseQuestionReplies(input) ?? []) {
+        try {
+          const key: unknown = JSON.parse(reply.questionItemId);
+          if (!Array.isArray(key) || key.length !== 3 || key[0] !== 'request_user_input_async'
+            || typeof key[1] !== 'string' || !Number.isInteger(key[2]) || key[2] < 0) continue;
+          const id = JSON.stringify(key);
+          if (!answers.has(id) || answers.get(id)!.answeredAt < turn.startedAt) {
+            answers.set(id, { ...reply, answeredAt: turn.startedAt, answerTurnId: turn.id });
+          }
+        } catch { /* Ordinary user text cannot resolve an async question. */ }
+      }
     }
   }
 }
@@ -69,7 +71,8 @@ export function withNativeUserInput(turn: Turn, answers?: NativeUserInputAnswers
   return requests.length ? { ...turn, userInputRequests: requests.map(request => {
     const replies = request.questions.map((question, index) => {
       const reply = answers?.get(JSON.stringify(['request_user_input_async', request.id, index]));
-      return reply?.question === question.title && reply.answeredAt >= request.createdAt ? reply : undefined;
+      return reply?.question === question.title
+        && (reply.answeredAt >= request.createdAt || reply.answerTurnId === turn.id || reply.answerTurnId === turn.nativeTurnId) ? reply : undefined;
     });
     if (!replies.length || replies.some(reply => !reply)) return request;
     const values = replies.map(reply => reply!.answer);

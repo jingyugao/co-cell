@@ -32,6 +32,7 @@ type ActiveExecution = {
   controller: AbortController;
   done: Promise<void>;
   turnId?: string;
+  steer?(text: string): Promise<boolean>;
   finish(): void;
 };
 
@@ -65,6 +66,7 @@ export class SessionManager {
   private closing = false;
   private historyReads = new Map<string, Promise<void>>();
   private userInputAnswers = new Map<string, { threadId: Session['threadId']; answers: NativeUserInputAnswers }>();
+  private userInputDeliveries = new Map<string, Promise<void>>();
   private historyErrors = new Map<string, string>();
   private billingReads = new Map<string, Promise<SessionCostBreakdown>>();
 
@@ -267,6 +269,7 @@ export class SessionManager {
       client: this.client, sandbox: this.sandbox, logger: this.logger, recovering,
       save: () => this.save(session), publish: message => this.publish(id, message), snapshot: () => this.get(id),
       updateSandbox: sandbox => this.updateSandbox(session.projectId, id, sandbox),
+      onSteer: steer => { execution.steer = steer; },
     }).finally(async () => {
       if (session.settings.executionMode === 'sandbox' && session.status !== 'running'
         && !(session.turnCount ?? 0) && !session.turns.some(candidate => candidate.codexAccepted)) {
@@ -325,7 +328,7 @@ export class SessionManager {
     request.answers = answers ?? [answer];
     request.status = 'queued'; request.answer = answer; request.answeredAt = new Date().toISOString(); session.updatedAt = request.answeredAt;
     await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
-    if (!this.active.has(id)) await this.startQueuedUserInput(id);
+    await this.startQueuedUserInput(id);
     const snapshot = this.get(id);
     // Starting the reply makes it the latest turn. Return the updated question
     // too, so clients can replace the form they just submitted.
@@ -333,8 +336,19 @@ export class SessionManager {
     return snapshot;
   }
 
-  private async startQueuedUserInput(id: string) {
-    if (this.active.has(id)) return;
+  private async startQueuedUserInput(id: string): Promise<void> {
+    const pending = this.userInputDeliveries.get(id);
+    if (pending) {
+      await pending;
+      return this.startQueuedUserInput(id);
+    }
+    const delivery = this.deliverQueuedUserInput(id);
+    this.userInputDeliveries.set(id, delivery);
+    try { await delivery; }
+    finally { if (this.userInputDeliveries.get(id) === delivery) this.userInputDeliveries.delete(id); }
+  }
+
+  private async deliverQueuedUserInput(id: string) {
     const session = this.lookup(id);
     for (const [index, source] of session.turns.entries()) for (const request of source.userInputRequests ?? []) {
       if (request.status !== 'queued' || !request.answer) continue;
@@ -343,6 +357,29 @@ export class SessionManager {
         question: question.title,
         questionItemId: JSON.stringify(['request_user_input_async', request.id, index]),
       })))}\n</send_user_message_question_reply>`;
+      const execution = this.active.get(id);
+      if (execution) {
+        const target = session.turns.find(turn => turn.id === execution.turnId);
+        if (!target?.nativeTurnId || !execution.steer) return;
+        let accepted: boolean;
+        try { accepted = await execution.steer(prompt); }
+        catch (error) {
+          // Do not replay an RPC with an unknown delivery outcome at turn end.
+          request.status = 'pending';
+          delete request.answer; delete request.answers; delete request.answeredAt;
+          await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
+          throw error;
+        }
+        if (accepted) {
+          request.status = 'answered'; request.answerTurnId = target.id;
+          session.updatedAt = new Date().toISOString();
+          await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
+          continue;
+        }
+        // The native turn can finish before our observer sees completion.
+        // Its finalizer drains this queue after releasing the active execution.
+        if (this.active.has(id)) return;
+      }
       const existing = session.turns.slice(index + 1).find(turn => turn.prompt === prompt && Date.parse(turn.startedAt) >= Date.parse(request.answeredAt ?? request.createdAt));
       const answerTurnId = existing?.id ?? await this.startTurn(id, prompt);
       request.status = 'answered'; request.answerTurnId = answerTurnId; session.updatedAt = new Date().toISOString();
@@ -409,6 +446,7 @@ export class SessionManager {
         const turns = page.turns.map(native => {
           const current = session.turns.find(turn => turn.nativeTurnId === native.id || turn.id === native.id);
           return withNativeUserInput(current ? { ...native, ...current, nativeTurnId: native.id,
+            additionalUserInputs: native.additionalUserInputs ?? current.additionalUserInputs,
             prompt: current.prompt || native.prompt, items: native.items.map(item => ({ ...current.items.find(old => old.id === item.id), ...item })).concat(current.items.filter(item => !native.items.some(other => other.id === item.id))),
             ...(current.userInputRequests ? { userInputRequests: current.userInputRequests } : {}) } : native);
         });
@@ -1016,6 +1054,7 @@ export class SessionManager {
       id: turn.id, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
       codexAccepted: turn.codexAccepted, error: turn.error,
       prompt: turn.prompt,
+      additionalUserInputs: turn.additionalUserInputs,
       images: turn.images,
       items: turn.items,
       userInputRequests: turn.userInputRequests,

@@ -67,6 +67,8 @@ export interface Turn {
   segment?: number;
   compactions?: Array<{ segment: number; timestamp: string; beforeItemIndex: number }>;
   nativeTurnId?: string;
+  /** User messages injected into an accepted native turn after its original prompt. */
+  additionalUserInputs?: string[];
   /** Confirmed by the App Server turn.started event, not by saving a web submission. */
   codexAccepted?: boolean;
   /** Browser-only failure observed by the currently open page. Never persisted. */

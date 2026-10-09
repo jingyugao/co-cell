@@ -16,6 +16,7 @@ const usage = value => Object.fromEntries(['input_tokens', 'cached_input_tokens'
 /** Project only Codex's persisted events; platform submissions are never inputs. */
 export function parseNativeHistory(source, includeBlocks = false) {
   const turns = [], byId = new Map(), confirmed = new Set(), responses = new Set();
+  const lastUserMessages = new Map();
   let current, model;
   let segment = 0;
   const blocks = [], pendingOutputs = new Set();
@@ -27,6 +28,17 @@ export function parseNativeHistory(source, includeBlocks = false) {
     const index = turn.items.findIndex(existing => existing.id === item.id);
     if (index < 0) turn.items.push(item); else turn.items[index] = item;
     turn.itemTimestamps[item.id] = timestamp;
+  };
+  const recordUserMessage = (turn, value) => {
+    const message = text(value);
+    const signature = message.trimEnd();
+    if (lastUserMessages.get(turn.id) === signature) return false;
+    const original = !confirmed.has(turn.id);
+    if (original) turn.prompt = message;
+    else (turn.additionalUserInputs ??= []).push(message);
+    confirmed.add(turn.id);
+    lastUserMessages.set(turn.id, signature);
+    return original;
   };
   for (const [index, line] of source.split('\n').entries()) {
     if (!line.trim()) continue;
@@ -81,7 +93,10 @@ export function parseNativeHistory(source, includeBlocks = false) {
         // generation is the submission; preceding user items contain injected rules.
         turn.prompt = text(p.content);
       }
-      if (p.type === 'message' && p.role === 'assistant') upsert(turn, { id: p.id ?? `native-item-${index}`, type: 'agent_message', text: text(p.content) }, timestamp);
+      if (p.type === 'message' && p.role === 'assistant') {
+        lastUserMessages.delete(turn.id);
+        upsert(turn, { id: p.id ?? `native-item-${index}`, type: 'agent_message', text: text(p.content) }, timestamp);
+      }
       if (['function_call', 'custom_tool_call'].includes(p.type)) {
         let args = p.arguments ?? p.input;
         try { args = JSON.parse(args); } catch { /* Preserve exact non-JSON tool arguments. */ }
@@ -95,10 +110,14 @@ export function parseNativeHistory(source, includeBlocks = false) {
     if (record.type === 'event_msg' && p.type === 'item_completed') {
       const item = p.item ?? {}, id = item.id ?? `native-item-${index}`;
       if (item.type === 'UserMessage') {
-        turn.prompt = text(item.content);
-        turn.images = (item.content ?? []).filter(part => part.type === 'local_image').map(part => part.path);
-        confirmed.add(turn.id);
-      } else if (item.type === 'AgentMessage') upsert(turn, { id, type: 'agent_message', text: text(item.content), ...(item.delivery ? { delivery: item.delivery } : {}), ...(item.questions ? { questions: item.questions } : {}) }, timestamp);
+        recordUserMessage(turn, item.content);
+        if (!turn.additionalUserInputs?.length) {
+          turn.images = (item.content ?? []).filter(part => part.type === 'local_image').map(part => part.path);
+        }
+      } else if (item.type === 'AgentMessage') {
+        lastUserMessages.delete(turn.id);
+        upsert(turn, { id, type: 'agent_message', text: text(item.content), ...(item.delivery ? { delivery: item.delivery } : {}), ...(item.questions ? { questions: item.questions } : {}) }, timestamp);
+      }
       else if (item.type === 'Reasoning') {
         const summary = item.summary_text ?? item.summary ?? item.content;
         const summaryText = Array.isArray(summary) && summary.every(part => typeof part === 'string') ? summary.join('\n') : text(summary);
@@ -122,7 +141,7 @@ export function parseNativeHistory(source, includeBlocks = false) {
       else if (item.type === 'McpToolCall') upsert(turn, { ...item, type: 'mcp_tool_call' }, timestamp);
       else if (['agent_message', 'reasoning', 'command_execution', 'mcp_tool_call', 'file_change', 'web_search', 'todo_list', 'error'].includes(item.type)) upsert(turn, item, timestamp);
     }
-    if (record.type === 'event_msg' && p.type === 'user_message') { turn.prompt = p.message ?? ''; confirmed.add(turn.id); }
+    if (record.type === 'event_msg' && p.type === 'user_message') recordUserMessage(turn, p.message ?? '');
     if (record.type === 'token_usage_record' && p.usage && !responses.has(p.response_id ?? `usage-${index}`)) {
       responses.add(p.response_id ?? `usage-${index}`);
       const u = usage(p.usage);

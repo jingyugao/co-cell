@@ -44,6 +44,22 @@ test('updatedAt values merge monotonically at every object depth', () => {
   assert.equal(result.operation.updatedAt, '2026-01-04T00:00:00.000Z');
 });
 
+test('concurrent Sandbox activity timestamps merge monotonically, including legacy missing values', () => {
+  const result = mergeRecord(
+    { sandbox: { id: 'box', lastActiveAt: '2026-01-01T00:00:00.000Z' } },
+    { sandbox: { id: 'box', lastActiveAt: '2026-01-03T00:00:00.000Z' } },
+    { sandbox: { id: 'box', lastActiveAt: '2026-01-02T00:00:00.000Z' } },
+  );
+  assert.equal(result.sandbox.lastActiveAt, '2026-01-03T00:00:00.000Z');
+
+  const migrated = mergeRecord(
+    { sandbox: { id: 'legacy-box' } },
+    { sandbox: { id: 'legacy-box', lastActiveAt: '2026-01-03T00:00:00.000Z' } },
+    { sandbox: { id: 'legacy-box', lastActiveAt: '2026-01-02T00:00:00.000Z' } },
+  );
+  assert.equal(migrated.sandbox.lastActiveAt, '2026-01-03T00:00:00.000Z');
+});
+
 test('JSON persistence omits undefined baseline fields without turning their updates into conflicts', () => {
   const previous = { pendingTurns: [{ id: 'turn', codexAccepted: false, nativeTurnId: undefined }],
     sandboxOperation: { id: 'op', status: 'running', error: undefined } };

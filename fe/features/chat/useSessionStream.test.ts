@@ -28,3 +28,13 @@ test('an accepted failed turn is not labelled as a failed browser submission', (
   const merged = mergeSession({ ...base, turns: [running] }, { ...base, turns: [failed] });
   assert.equal(merged.turns[0].clientFailure, undefined);
 });
+
+test('repeated additional user inputs stay ordered when histories and live state merge', () => {
+  const running = { ...turn('native', now), status: 'running' as const, additionalUserInputs: ['补充', '补充'] };
+  const stale = { ...running, additionalUserInputs: ['补充'] };
+  const kept = mergeSession({ ...base, turns: [running] }, { ...base, turns: [stale] });
+  assert.deepEqual(kept.turns[0].additionalUserInputs, ['补充', '补充']);
+  const newer = { ...running, additionalUserInputs: ['补充', '补充', '再次补充'] };
+  const advanced = mergeSession({ ...base, turns: [running] }, { ...base, turns: [newer] });
+  assert.deepEqual(advanced.turns[0].additionalUserInputs, ['补充', '补充', '再次补充']);
+});

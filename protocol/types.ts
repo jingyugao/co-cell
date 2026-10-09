@@ -63,6 +63,10 @@ export interface Settings {
   webSearchMode: 'disabled' | 'cached' | 'live';
   networkAccessEnabled: boolean;
 }
+/** POST /api/sessions/:id/turns: starts a turn, or steers the running turn
+ * with text-only input. An accepted steer returns that existing turn's ID.
+ * An uncertain RPC outcome must not be automatically resubmitted. */
+export interface SubmitTurnResponse { turnId: string }
 export interface Turn {
   segment?: number;
   compactions?: Array<{ segment: number; timestamp: string; beforeItemIndex: number }>;

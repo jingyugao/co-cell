@@ -7,6 +7,32 @@ import { createHash } from 'node:crypto';
 import { AppServerEventAdapter, CodexAppServerClient } from '../src/index.mjs';
 const fake = fileURLToPath(new URL('./fake-server.mjs', import.meta.url));
 const open = () => CodexAppServerClient.spawn({ command: process.execPath, args: [fake], requestTimeoutMs: 2000 });
+test('borrowed transport isolates concurrent threads and survives observer close and reuse', async () => {
+ const { Codex } = await import('../src/index.mjs');
+ const client = await open();
+ const first = new Codex({ appServerClient: client });
+ const second = new Codex({ appServerClient: client });
+ const collect = async (codex, id) => {
+  const events = [];
+  for await (const event of (await codex.resumeThread(id).runStreamed('hello')).events) events.push(event);
+  assert.equal(events[0].thread_id, id);
+  assert.equal(events.filter(event => event.type === 'turn.completed').length, 1);
+  assert.equal(events.filter(event => event.type === 'item.updated').length, 1);
+ };
+ try {
+  // Suspend one observer after subscription; closing it must not close the
+  // shared socket or submit its prompt when iteration resumes.
+  const abandoned = (await first.resumeThread('abandoned').runStreamed('hello')).events;
+  assert.equal((await abandoned.next()).value.type, 'thread.started');
+  await first.close();
+  await assert.rejects(abandoned.next(), /observer is closed/);
+  await Promise.all([collect(second, 'thread-a'), collect(second, 'thread-b')]);
+  await collect(second, 'thread-a');
+  await second.close();
+  assert.deepEqual(await client.request('echo', { alive: true }), { alive: true });
+  assert.equal(client.listenerCount('notification'), 0);
+ } finally { await first.close(); await second.close(); await client.close(); }
+});
 test('WebSocket close waits for peer acknowledgement and concurrent callers share completion', async () => {
  const gate = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
  const received = gate(), acknowledge = gate();

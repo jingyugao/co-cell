@@ -12,7 +12,7 @@ export const test = base.extend({
     // Deterministic API boundaries make pending/error transitions reproducible.
     // These cases test the real React application, separately from the live suites.
     const projects = new Map([['paused', project('paused', '暂停项目')], ['other', project('other', '另一个项目', 'ready')]]);
-    const calls = [], historyReads = [], errors = [];
+    const calls = [], historyReads = [], submissions = [], errors = [];
     const waiters = new Map(), cancelled = new Map();
     const notify = id => { for (const finish of waiters.get(id) ?? []) finish(); };
     page.on('requestfailed', request => cancelled.get(request)?.());
@@ -60,15 +60,19 @@ export const test = base.extend({
       else if (path === '/api/sessions/old-session/events') {
         await route.fulfill({ contentType: 'text/event-stream', body: `data: ${JSON.stringify({ type: 'snapshot', session })}\n\n` }); return;
       } else if (path === '/api/sessions/old-session' && method === 'GET') {
-        historyReads.push(path); data = { ...session, turns: [{ id: 'old-turn', prompt: '历史任务内容', images: [], items: [], status: 'completed', startedAt: now, completedAt: now }] };
+        historyReads.push(path); data = { ...session, turns: session.turns.length ? session.turns : [{ id: 'old-turn', prompt: '历史任务内容', images: [], items: [], status: 'completed', startedAt: now, completedAt: now }] };
+      } else if (path === '/api/sessions/old-session/turns' && method === 'POST') {
+        const input = request.postDataJSON(); submissions.push(input);
+        data = { turnId: session.turns.at(-1)?.id ?? 'old-turn' }; status = 202;
       } else if (path.endsWith('/subagents')) data = [];
       else { errors.push(`Unexpected API call: ${method} ${path}`); data = { error: 'Unexpected test API call' }; status = 500; }
       if (!request.failure()) await route.fulfill({ status, json: data });
     });
     const ui = {
-      projects, calls, historyReads,
+      projects, calls, historyReads, submissions,
       editor: page.getByRole('textbox', { name: '任务描述', exact: true }),
       send: page.getByRole('button', { name: '发送任务', exact: true }),
+      setRunning() { session.status = 'running'; session.turns = [{ id: 'native-turn', nativeTurnId: 'native-turn', prompt: '原始任务', additionalUserInputs: ['相同补充', '相同补充'], images: [], items: [], status: 'running', codexAccepted: true, startedAt: now }]; },
       count: (method, path) => calls.filter(call => call.path === path && call.method === method).length,
       complete(id) { const value = projects.get(id); value.sandbox = sandbox(id); value.sandboxOperation = operation(value.sandboxOperation?.kind ?? 'create', 'succeeded'); notify(id); },
       fail(id, message) { const value = projects.get(id); value.sandboxOperation = operation(value.sandboxOperation?.kind ?? 'resume', 'failed', message); notify(id); },

@@ -19,7 +19,7 @@ type Connection = {
   finish(error?: unknown): void;
 };
 
-/** History reads and active-turn control share a connection, without acquiring or waking a Sandbox. */
+/** Execution, history and turn control share a transport without waking a Sandbox. */
 export class AppServerReader {
   private connections = new Map<string, Connection>();
   private live = new Set<Connection>();
@@ -38,6 +38,15 @@ export class AppServerReader {
     private onCleanupError: (error: unknown) => void, private idleMs = 60_000) {}
 
   async read<T>(id: string, action: (client: CodexAppServerClient) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const lease = await this.acquire(id, signal);
+    try { return await abortable(action(lease.client), signal); }
+    catch (error) {
+      if (!(error instanceof AppServerRpcError)) lease.retire();
+      throw error;
+    } finally { await lease.release(); }
+  }
+
+  async acquire(id: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
     if (this.closed) throw new Error('App Server reader is closed');
     if (this.blocked.has(id)) throw Object.assign(new Error('Sandbox is entering maintenance'), { code: 'BUSY' });
@@ -53,15 +62,10 @@ export class AppServerReader {
     }
     clearTimeout(connection.timer);
     connection.users++;
-    try {
-      const client = await abortable(connection.ready, signal);
-      return await abortable(action(client), signal);
-    } catch (error) {
-      // An RPC rejection does not break the transport; other failures need a
-      // fresh connection on the next read. Do not automatically replay requests.
-      if (!(error instanceof AppServerRpcError)) this.retire(id, connection);
-      throw error;
-    } finally {
+    let released = false;
+    const release = async () => {
+      if (released) return;
+      released = true;
       connection.users--;
       if (!connection.users) {
         if (connection.retired) { this.dispose(connection); if (signal?.aborted) await connection.drained; }
@@ -70,6 +74,14 @@ export class AppServerReader {
           connection.timer.unref();
         }
       }
+    };
+    try {
+      const client = await abortable(connection.ready, signal);
+      return { client, release, retire: () => this.retire(id, connection) };
+    } catch (error) {
+      this.retire(id, connection);
+      await release();
+      throw error;
     }
   }
 

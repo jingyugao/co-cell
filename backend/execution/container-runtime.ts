@@ -17,9 +17,11 @@ import { AppServerReader, type AppServerEndpoint } from './app-server-reader.js'
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 import { HttpError } from '../../util/errors.js';
+import { abortable } from '../../util/abortable.js';
 import type { WorkspaceFileResult } from '../workspaces/files.js';
 
 export interface SandboxRuntime {
+  observe?(session: Session, turn: Turn, signal: AbortSignal): AsyncGenerator<NativeTurnObservation>;
 	remoteArchives?: import('../archives/remote.js').RemoteArchives;
   currentImageIdentity?(target?: WorkspaceTarget): Promise<SandboxImageIdentity>;
   track?(session: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): void;
@@ -54,6 +56,8 @@ export interface SandboxRuntime {
   listProjectSandboxes?(projectId: string): Promise<SandboxState[]>;
   close(): Promise<void>;
 }
+
+export type NativeTurnObservation = { type: 'snapshot'; turn: Turn } | { type: 'event'; event: AgentEvent };
 export type { AppServerEndpoint } from './app-server-reader.js';
 export interface ContainerRuntimeOptions {
   paths: { root: string; runtime: string; codexHome: string; node: string };
@@ -270,14 +274,13 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const startupSignal = AbortSignal.any([signal, observer.signal]);
     let entry: Entry | undefined;
     let codex: Codex | undefined;
-    let failed = false;
+    let connection: Awaited<ReturnType<AppServerReader['acquire']>> | undefined;
     let detached = false;
     try {
       entry = await this.acquire(session, true, onSandbox, turn.id, startupSignal);
       // Publish the global AGENTS.md and shared docs before every turn.
       await this.prepareEnvironment(session, entry, startupSignal);
       observer.signal.throwIfAborted();
-      const endpoint = await this.options.appServer(entry.metadata.id);
       const images: string[] = [];
       if (turn.images.length) {
         await entry.sandbox.commands.run(`mkdir -p ${quote(`${this.root}/images`)}`, { user: 'user', timeoutMs: 30_000 });
@@ -287,9 +290,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
           images.push(destination);
         }
       }
+      connection = await this.reader.acquire(entry.metadata.id, startupSignal);
       codex = new Codex({ apiKey: this.options.apiKey, baseUrl: this.options.baseUrl, config: this.options.modelConfig,
-        configOverrides: this.options.configOverrides, appServerUrl: endpoint.url,
-        appServerHeaders: endpoint.headers });
+        configOverrides: this.options.configOverrides, appServerClient: connection.client });
       this.appServerObservers.set(turn.id, codex);
       observer.signal.throwIfAborted();
       const options = { workingDirectory: session.settings.workingDirectory, ...(session.settings.model ? { model: session.settings.model } : {}),
@@ -301,7 +304,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       for await (const event of streamed.events) yield event;
     } catch (error) {
       detached = observer.signal.aborted || this.detachRequests.has(turn.id);
-      failed = !detached;
       if (detached) throw new TurnObserverDetached();
       throw error;
     }
@@ -310,12 +312,80 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       if (this.appServerObservers.get(turn.id) === codex) this.appServerObservers.delete(turn.id);
       this.detachRequests.delete(turn.id);
       await codex?.close();
-      if (entry) await this.release(entry, failed, detached);
+      await connection?.release();
+      // Native completion is authoritative; activity persistence is maintenance.
+      if (entry) await this.release(entry, true, detached);
     }
   }
 
   async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox): AsyncGenerator<AgentEvent> {
     yield* this.runAppServer(session, turn, signal, onSandbox);
+  }
+
+  /** Observe an accepted turn without acquiring usage, sending input, or interrupting it. */
+  async *observe(session: Session, turn: Turn, signal: AbortSignal): AsyncGenerator<NativeTurnObservation> {
+    if (!session.sandbox || !session.threadId || !turn.nativeTurnId) return;
+    const lease = await this.reader.acquire(session.sandbox.id, signal);
+    const stream = lease.client.events();
+    const adapter = new AppServerEventAdapter();
+    const knownItems = new Set<string>();
+    const belongs = (event: { params?: any }) => event.params?.threadId === session.threadId
+      && (!event.params.turnId || event.params.turnId === turn.nativeTurnId)
+      && (!event.params.turn?.id || event.params.turn.id === turn.nativeTurnId);
+    const stop = () => { void stream.return(); };
+    signal.addEventListener('abort', stop, { once: true });
+    const snapshot = async () => {
+      const boundarySignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+      let current: Turn | undefined;
+      for (;;) {
+        current = (await abortable(this.readAppServerTurns(lease.client, session.threadId!, true), boundarySignal))
+          .find(candidate => candidate.id === turn.nativeTurnId);
+        // Native deltas have no sequence/offset. If any crossed this read,
+        // read again AFTER them instead of guessing whether to replay them.
+        // A quiet read boundary avoids both missing and duplicated text.
+        const crossed = stream.drain().some(event => belongs(event)
+          && (event.method.startsWith('item/') || event.method.startsWith('turn/')));
+        if (!crossed) break;
+        boundarySignal.throwIfAborted();
+      }
+      if (!current) throw new Error('Native turn is unavailable for observation');
+      adapter.seed(current.items);
+      knownItems.clear();
+      for (const item of current.items) knownItems.add(item.id);
+      return current;
+    };
+    try {
+      signal.throwIfAborted();
+      // Rejoin only this existing thread, preserving its execution settings.
+      await abortable(lease.client.threadResume({ threadId: session.threadId, excludeTurns: true }), signal);
+      const initial = await snapshot();
+      yield { type: 'snapshot', turn: initial };
+      if (initial.status !== 'running') return;
+      for await (const notification of stream) {
+        signal.throwIfAborted();
+        if (!belongs(notification)) continue;
+        const itemId = notification.params?.itemId;
+        if (itemId && !knownItems.has(itemId)) {
+          // An item can start while the initial snapshot is being read.
+          const current = await snapshot();
+          yield { type: 'snapshot', turn: current };
+          if (current.status !== 'running') return;
+          continue;
+        }
+        if (notification.method === 'turn/completed') yield { type: 'snapshot', turn: await snapshot() };
+        for (const event of adapter.accept(notification)) {
+          if ('item' in event) knownItems.add(event.item.id);
+          yield { type: 'event', event };
+        }
+        if (notification.method === 'turn/completed') return;
+      }
+      signal.throwIfAborted();
+      throw new Error('App Server observation disconnected');
+    } finally {
+      signal.removeEventListener('abort', stop);
+      await stream.return();
+      await lease.release();
+    }
   }
 
   private mapAppServerTurn(rawTurn: any): Turn {
@@ -364,8 +434,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const observerSignal = AbortSignal.any([signal, detached.signal]);
     let entry: Entry | undefined;
     let client: CodexAppServerClient | undefined;
+    let connection: Awaited<ReturnType<AppServerReader['acquire']>> | undefined;
     let observerDetached = false;
-    let failed = false;
     let interruptSent = false;
     let interruptRequest: Promise<unknown> | undefined;
     const emittedItems = new Map<string, string>();
@@ -377,9 +447,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     };
     try {
       entry = await this.acquire(session, false, onSandbox, turn.id, observerSignal);
-      const endpoint = await this.options.appServer(entry.metadata.id);
-      client = await CodexAppServerClient.spawn({ url: endpoint.url, headers: endpoint.headers, requestTimeoutMs: 120_000 });
-      this.appServerObservers.set(turn.id, client);
+      connection = await this.reader.acquire(entry.metadata.id, observerSignal);
+      client = connection.client;
       signal.addEventListener('abort', interrupt, { once: true });
       if (signal.aborted) interrupt();
       yield { type: 'turn.started', turn_id: turn.nativeTurnId };
@@ -415,7 +484,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       }
     } catch (error) {
       observerDetached = detached.signal.aborted || this.detachRequests.has(turn.id) || error instanceof TurnObserverDetached;
-      failed = !observerDetached;
       if (observerDetached) throw new TurnObserverDetached();
       if (signal.aborted) {
         interrupt();
@@ -425,11 +493,10 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       throw this.safeError(error);
     } finally {
       if (this.observers.get(turn.id) === detached) this.observers.delete(turn.id);
-      if (this.appServerObservers.get(turn.id) === client) this.appServerObservers.delete(turn.id);
       signal.removeEventListener('abort', interrupt);
       this.detachRequests.delete(turn.id);
-      await client?.close();
-      if (entry) await this.release(entry, failed, observerDetached);
+      await connection?.release();
+      if (entry) await this.release(entry, true, observerDetached);
     }
   }
 

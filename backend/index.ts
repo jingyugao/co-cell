@@ -36,7 +36,7 @@ const multiApiFlag = process.env.COCELL_MULTI_API ?? '0';
 if (multiApiFlag !== '0' && multiApiFlag !== '1') throw new Error('COCELL_MULTI_API must be 0 or 1');
 const multiApi = multiApiFlag === '1';
 const coordinator = multiApi ? new MySqlCoordinator(mysqlUrl) : undefined;
-const webState = createWebStateStore(mysqlUrl, { preserveLiveItems: multiApi });
+const webState = createWebStateStore(mysqlUrl);
 const port = Number(process.env.PORT || 3000);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be between 1 and 65535');
 const apiKey = process.env.CODEX_API_KEY || process.env.OPENAI_API_KEY;

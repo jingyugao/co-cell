@@ -36,8 +36,14 @@ export function mergeSession(current: Session | null, incoming: Session): Sessio
   const turns = new Map(current.turns.map(turn => [key(turn), turn]));
   for (const turn of incoming.turns) {
     const previous = turns.get(key(turn));
+    const previousInputs = previous?.additionalUserInputs;
+    const incomingInputs = turn.additionalUserInputs;
+    const additionalUserInputs = !previousInputs ? incomingInputs : !incomingInputs ? previousInputs
+      : previousInputs.every((value, index) => incomingInputs[index] === value) ? incomingInputs
+        : incomingInputs.every((value, index) => previousInputs[index] === value) ? previousInputs : incomingInputs;
     turns.set(key(turn), previous ? { ...previous, ...turn,
       prompt: turn.prompt || previous.prompt,
+      additionalUserInputs,
       items: turn.items.length ? turn.items : previous.items } : turn);
   }
   const merged: Session = { ...incoming, turns: [...turns.values()].sort((left, right) => left.startedAt.localeCompare(right.startedAt)),

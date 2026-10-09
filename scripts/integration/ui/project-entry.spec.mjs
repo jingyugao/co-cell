@@ -68,6 +68,25 @@ test('paused session opens SSE immediately and defers native history until ready
   await expect(ui.send).toBeEnabled(); await expect(ui.editor).toHaveValue('旧会话恢复时输入');
 });
 
+test('running conversation accepts an added message and preserves repeated input order', async ({ page, ui }) => {
+  ui.setRunning();
+  ui.complete('paused');
+  await page.goto('/sessions/old-session');
+  await expect(page.getByText('原始任务', { exact: true })).toBeVisible();
+  await expect(page.locator('.additional-user-message')).toHaveCount(2);
+  await expect(page.locator('.additional-user-message').nth(0)).toContainText('相同补充');
+  await expect(page.locator('.additional-user-message').nth(1)).toContainText('相同补充');
+  await expect(ui.editor).toBeEditable();
+  const send = page.getByRole('button', { name: '追加消息', exact: true });
+  await expect(send).toBeDisabled();
+  await ui.editor.fill('请同时检查这个边界情况');
+  await expect(send).toBeEnabled();
+  await send.click();
+  await expect.poll(() => ui.submissions.length).toBe(1);
+  expect(ui.submissions[0]).toEqual({ prompt: '请同时检查这个边界情况', images: [] });
+  await expect(page.getByRole('button', { name: '停止任务', exact: true })).toBeVisible();
+});
+
 test('entry joins checkpoint then resumes once after checkpoint completes', async ({ page, ui }) => {
   ui.checkpoint('paused', true); await page.goto('/projects/paused');
   await expect(ui.editor).toBeEditable(); await ui.editor.fill('Checkpoint 期间输入');

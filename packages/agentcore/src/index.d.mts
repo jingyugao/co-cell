@@ -14,7 +14,7 @@ export class CodexAppServerClient extends EventEmitter {
   notify(method: string, params?: unknown): void;
   respond(id: string | number, result: unknown): void;
   respondError(id: string | number, error: RpcError): void;
-  events(): AsyncIterableIterator<AppServerEvent>;
+  events(): AsyncIterableIterator<AppServerEvent> & { drain(): AppServerEvent[]; return(): Promise<IteratorResult<AppServerEvent>> };
   threadStart(params: unknown): Promise<any>;
   threadResume(params: unknown): Promise<any>;
   turnStart(params: unknown): Promise<any>;
@@ -23,10 +23,10 @@ export class CodexAppServerClient extends EventEmitter {
   close(): Promise<void>;
 }
 export type AgentEvent = ThreadEvent;
-export class AppServerEventAdapter { convert(item: any): any; accept(event: AppServerEvent): AgentEvent[]; }
+export class AppServerEventAdapter { seed(items: Array<{ id: string }>): void; convert(item: any): any; accept(event: AppServerEvent): AgentEvent[]; }
 export type UserInput = { type: 'text'; text: string } | { type: 'local_image'; path: string };
 export type Input = string | UserInput[];
-export interface CodexOptions { codexPathOverride?: string; config?: Record<string, unknown>; configOverrides?: string[]; apiKey?: string; baseUrl?: string; env?: Record<string, string>; appServerUrl?: string; appServerHeaders?: Record<string, string> }
+export interface CodexOptions { appServerClient?: CodexAppServerClient; codexPathOverride?: string; config?: Record<string, unknown>; configOverrides?: string[]; apiKey?: string; baseUrl?: string; env?: Record<string, string>; appServerUrl?: string; appServerHeaders?: Record<string, string> }
 export interface ThreadOptions {
  model?: string; workingDirectory?: string; sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
  modelReasoningEffort?: string; webSearchMode?: 'disabled' | 'cached' | 'live'; networkAccessEnabled?: boolean;

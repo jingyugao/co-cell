@@ -26,6 +26,7 @@ import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
 import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../util/user-input.js';
 import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
+import { applyTurnEvent } from '../../util/session-events.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -36,6 +37,14 @@ type ActiveExecution = {
   steer?(text: string): Promise<boolean>;
   lease?: SharedLease;
   finish(): Promise<void>;
+};
+class NativeTurnAcceptancePending extends Error {}
+type SubscriptionWatch = {
+  timer: ReturnType<typeof setInterval>;
+  pending?: Promise<void>;
+  last?: string;
+  completedKey?: string;
+  observation?: { key: string; controller: AbortController; done: Promise<void> };
 };
 
 function normalizeExecutionSettings(settings: Settings): Settings {
@@ -79,7 +88,7 @@ export class SessionManager {
   private projectLeases = new Map<string, SharedLease>();
   private autoCheckpointAfterMs: number;
   private mutations = new Map<string, number>();
-  private subscriptionPolls = new Map<string, { timer: ReturnType<typeof setInterval>; pending?: Promise<void>; last?: string }>();
+  private subscriptionPolls = new Map<string, SubscriptionWatch>();
 
   constructor(
     private client: CodexClient,
@@ -154,6 +163,9 @@ export class SessionManager {
           let changed = false;
           for (const remoteTurn of stored.get(id)?.turns ?? []) {
             const localTurn = local?.turns.find(turn => turn.id === remoteTurn.id);
+            if (localTurn && (remoteTurn.additionalUserInputs?.length ?? 0) > (localTurn.additionalUserInputs?.length ?? 0)) {
+              localTurn.additionalUserInputs = [...remoteTurn.additionalUserInputs!]; changed = true;
+            }
             for (const reply of remoteTurn.userInputRequests ?? []) {
               if (reply.status !== 'answered') continue;
               const request = localTurn?.userInputRequests?.find(request => request.id === reply.id);
@@ -1227,12 +1239,14 @@ export class SessionManager {
         sibling.sandbox = structuredClone(sandbox);
         if (freshEnvironment) { sibling.threadId = null; delete sibling.contextUsage; }
         sibling.settings.workingDirectory = sandbox.workingDirectory;
-        try { await this.save(sibling); }
-        catch (error) {
-          if (!replacing) throw error;
-          // The authoritative project cutover is already durable. Hydration and
-          // startup repair session snapshots; don't roll the runtime binding back.
-          console.error('Session sandbox snapshot save failed after upgrade:', sibling.id);
+        if (replacing || freshEnvironment) {
+          try { await this.save(sibling); }
+          catch (error) {
+            if (!replacing) throw error;
+            // The authoritative project cutover is already durable. Hydration and
+            // startup repair session snapshots; don't roll the runtime binding back.
+            console.error('Session sandbox snapshot save failed after upgrade:', sibling.id);
+          }
         }
         if (!this.projects.isDeleting(projectId) && !this.deleting.has(sibling.id)) this.publish(sibling.id, { type: 'state', session: this.get(sibling.id) });
       }
@@ -1348,30 +1362,96 @@ export class SessionManager {
     subscribers.add(callback);
     callback({ type: 'snapshot', session: this.get(id) });
     if (this.coordinator && !this.subscriptionPolls.has(id)) {
-      const poll: { timer: ReturnType<typeof setInterval>; pending?: Promise<void>; last?: string } = {
+      const poll: SubscriptionWatch = {
         timer: setInterval(() => {
-          if (this.closing || poll.pending || this.active.has(id)) return;
-          poll.pending = (async () => {
-            const session = await this.read(id);
-            const serialized = JSON.stringify(session);
-            if (serialized !== poll.last) {
-              poll.last = serialized;
-              this.publish(id, { type: 'state', session });
-            }
-          })().catch(() => {}).finally(() => { poll.pending = undefined; });
-        }, 500),
+          if (this.closing || poll.pending) return;
+          poll.pending = this.syncSubscriber(id, poll).catch(error => {
+            void this.logger?.write({ event: 'session.observation_failed', sessionId: id,
+              message: error instanceof Error ? error.message : String(error) });
+          }).finally(() => { poll.pending = undefined; });
+        }, 1000),
       };
       poll.timer.unref();
       this.subscriptionPolls.set(id, poll);
+      poll.pending = this.syncSubscriber(id, poll).catch(() => {}).finally(() => { poll.pending = undefined; });
     }
     return () => {
       subscribers.delete(callback);
       if (!subscribers.size) {
         this.subscribers.delete(id);
         clearInterval(this.subscriptionPolls.get(id)?.timer);
+        this.subscriptionPolls.get(id)?.observation?.controller.abort();
         this.subscriptionPolls.delete(id);
       }
     };
+  }
+
+  /** Poll only control metadata. Conversation bodies arrive over the native connection. */
+  private async syncSubscriber(id: string, watch: SubscriptionWatch) {
+    if (this.active.has(id)) { watch.observation?.controller.abort(); return; }
+    const stored = await this.state.getSession(id);
+    if (!stored || this.closing || !this.subscribers.has(id) || this.active.has(id)) return;
+    const previous = this.sessions.get(id);
+    const session = { ...stored, turns: stored.turns.map(turn => {
+      const old = previous?.threadId === stored.threadId && previous?.sandbox?.id === stored.sandbox?.id
+        ? previous.turns.find(value => value.id === turn.id) : undefined;
+      return old ? { ...old, ...turn, items: old.items, itemTimestamps: old.itemTimestamps,
+        // A native terminal event may beat the owner's control-state commit.
+        ...(old.status !== 'running' && turn.status === 'running' && old.codexAccepted
+          ? { status: old.status, completedAt: old.completedAt } : {}) } : turn;
+    }) };
+    this.sessions.set(id, session);
+    const serialized = JSON.stringify(stored);
+    if (serialized !== watch.last) {
+      watch.last = serialized;
+      this.publish(id, { type: 'state', session: this.get(id) });
+    }
+    const current = this.lookup(id);
+    const turn = stored.turns.find(value => value.status === 'running' && value.codexAccepted && value.nativeTurnId);
+    // Runtime status is intentionally absent from durable project metadata.
+    // A confirmed running turn is enough to attempt a non-waking connection.
+    const available = !!current.sandbox
+      && (!current.projectId || !this.projects.isMaintaining(current.projectId));
+    const key = turn && current.threadId && available
+      ? `${current.sandbox!.id}:${current.threadId}:${turn.nativeTurnId}` : undefined;
+    if (watch.observation?.key !== key || watch.observation?.controller.signal.aborted) {
+      watch.observation?.controller.abort();
+      await watch.observation?.done;
+      watch.observation = undefined;
+    }
+    if (!key || !turn || !this.sandbox?.observe || watch.observation || watch.completedKey === key
+      || this.closing || !this.subscribers.has(id)) return;
+    const controller = new AbortController();
+    const observation = { key, controller, done: Promise.resolve() };
+    watch.observation = observation;
+    observation.done = (async () => {
+      const read = this.projects.beginRead(current.projectId);
+      const signal = AbortSignal.any([controller.signal, read.signal]);
+      try {
+        for await (const value of this.sandbox!.observe!(structuredClone(current), structuredClone(turn), signal)) {
+          if (signal.aborted || this.active.has(id) || !this.subscribers.has(id)) { controller.abort(); break; }
+          const live = this.lookup(id);
+          if (live.threadId !== current.threadId || live.sandbox?.id !== current.sandbox?.id) { controller.abort(); break; }
+          const target = live.turns.find(candidate => candidate.id === turn.id);
+          if (!target) break;
+          if (value.type === 'snapshot') {
+            Object.assign(target, withNativeUserInput({ ...target, ...value.turn, id: target.id,
+              nativeTurnId: value.turn.id, prompt: target.prompt || value.turn.prompt,
+              userInputRequests: target.userInputRequests }));
+            live.status = target.status;
+            this.publish(id, { type: 'state', session: this.get(id) });
+          } else {
+            Object.assign(target, applyTurnEvent(target, value.event));
+            live.status = target.status;
+            this.publish(id, { type: 'sdk', turnId: target.id, event: value.event });
+          }
+          if (target.status !== 'running') watch.completedKey = key;
+        }
+      } finally { read.release(); }
+    })().catch(error => {
+      if (!controller.signal.aborted) void this.logger?.write({ event: 'session.native_observation_failed', sessionId: id,
+        message: error instanceof Error ? error.message : String(error) });
+    }).finally(() => { if (watch.observation === observation) watch.observation = undefined; });
   }
 
   private publish(id: string, message: StreamMessage) {
@@ -1433,7 +1513,33 @@ export class SessionManager {
   }
 
   async startTurn(id: string, prompt: string, images: string[] = []): Promise<string> {
-    return this.sessionMutation(id, () => this.startTurnLocal(id, prompt, images));
+    const deadline = Date.now() + 10_000;
+    while (true) {
+      if (!images.length) await this.waitForNativeTurnAcceptance(id, deadline);
+      try {
+        return await this.sessionMutation(id, () => this.startTurnLocal(id, prompt, images));
+      } catch (error) {
+        if (!(error instanceof NativeTurnAcceptancePending)) throw error;
+        if (Date.now() >= deadline) throw new HttpError(409, '当前任务尚未连接到 Codex，请稍后再发送');
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    }
+  }
+
+  private async waitForNativeTurnAcceptance(id: string, deadline: number) {
+    let observed = this.coordinator ? await this.state.getSession(id) : this.lookup(id);
+    let turn = observed?.turns.find(candidate => candidate.status === 'running');
+    while (turn && !turn.nativeTurnId && Date.now() < deadline) {
+      const execution = this.active.get(id);
+      if (execution) {
+        await Promise.race([execution.done, new Promise(resolve => setTimeout(resolve, 50))]);
+        observed = this.lookup(id);
+      } else {
+        observed = this.coordinator ? await this.state.getSession(id) : this.lookup(id);
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      turn = observed?.turns.find(candidate => candidate.status === 'running');
+    }
   }
 
   private async startTurnLocal(id: string, prompt: string, images: string[] = []): Promise<string> {
@@ -1443,13 +1549,44 @@ export class SessionManager {
       throw new HttpError(409, this.projects.get(session.projectId).status === 'completed'
         ? '项目已完成，请先恢复为使用中再继续对话' : '项目已归档，请先恢复项目后再继续对话');
     }
+    if (session.archivedAt) throw new HttpError(409, '会话已归档，请先恢复后再发送消息');
+    const running = () => session.turns.find(turn => turn.status === 'running');
+    let current = running();
+    if (current || this.active.has(id)) {
+      if (images.length) throw new HttpError(409, '任务执行中只能追加文字消息');
+      const execution = this.active.get(id);
+      current = running();
+      if (!current && !this.active.has(id)) {
+        // The previous turn completed while this submission waited for
+        // acceptance. Continue below and start it as a regular next turn.
+      } else {
+        if (!current?.nativeTurnId) throw new NativeTurnAcceptancePending();
+        let accepted = false;
+        try {
+          if (execution && this.active.get(id) === execution && execution.steer) {
+            accepted = await execution.steer(prompt);
+          } else if (this.coordinator && session.settings.executionMode === 'sandbox' && this.sandbox?.steer) {
+            accepted = await this.sandbox.steer(session, current, prompt);
+          }
+        } catch {
+          // A failed steer RPC can have an unknown delivery outcome. Never
+          // retry it automatically or start a separate turn on this request.
+          throw new HttpError(502, '追加消息的接收状态不确定，请检查会话后再继续');
+        }
+        if (!accepted) throw new HttpError(409, 'Codex 已不再接收当前任务的追加消息，请刷新会话后重试');
+        current.additionalUserInputs = [...(current.additionalUserInputs ?? []), prompt];
+        session.updatedAt = new Date().toISOString();
+        await this.save(session);
+        this.publish(id, { type: 'state', session: this.get(id) });
+        return current.id;
+      }
+    }
+    if (this.active.has(id) || running()) throw new HttpError(409, '当前会话已有任务正在执行');
     if (session.projectId && session.settings.executionMode === 'sandbox') {
       await this.ensureProjectSandbox(session.projectId);
       if (this.closing) throw new HttpError(503, '服务正在关闭');
       session = this.lookup(id);
     }
-    if (session.archivedAt) throw new HttpError(409, '会话已归档，请先恢复后再发送消息');
-    if (this.active.has(id) || session.turns.some(turn => turn.status === 'running')) throw new HttpError(409, '当前会话已有任务正在执行');
     const previous = structuredClone(session);
     // Reserve the session synchronously, before validating attachments or saving state.
     const lease = await this.coordinator?.tryAcquire(`session-execution:${id}`);
@@ -1615,8 +1752,9 @@ export class SessionManager {
   async close() {
     this.closing = true;
     clearInterval(this.recoveryTimer);
-    for (const poll of this.subscriptionPolls.values()) clearInterval(poll.timer);
+    for (const poll of this.subscriptionPolls.values()) { clearInterval(poll.timer); poll.observation?.controller.abort(); }
     await Promise.allSettled([...this.subscriptionPolls.values()].map(poll => poll.pending));
+    await Promise.allSettled([...this.subscriptionPolls.values()].map(poll => poll.observation?.done));
     this.subscriptionPolls.clear();
     await this.reconciling;
     await this.lifecycle?.close();

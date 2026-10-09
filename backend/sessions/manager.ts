@@ -25,6 +25,7 @@ import type { ImageCatalog } from '../images/service.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
 import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../util/user-input.js';
+import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -32,7 +33,9 @@ type ActiveExecution = {
   controller: AbortController;
   done: Promise<void>;
   turnId?: string;
-  finish(): void;
+  steer?(text: string): Promise<boolean>;
+  lease?: SharedLease;
+  finish(): Promise<void>;
 };
 
 function normalizeExecutionSettings(settings: Settings): Settings {
@@ -45,6 +48,7 @@ function normalizeExecutionSettings(settings: Settings): Settings {
 
 export interface SandboxLifecycleOptions {
   archivedReclaimAfterMs?: number;
+  autoCheckpointAfterMs?: number;
   scanIntervalMs?: number;
   now?: () => number;
 }
@@ -65,8 +69,17 @@ export class SessionManager {
   private closing = false;
   private historyReads = new Map<string, Promise<void>>();
   private userInputAnswers = new Map<string, { threadId: Session['threadId']; answers: NativeUserInputAnswers }>();
+  private userInputDeliveries = new Map<string, Promise<void>>();
   private historyErrors = new Map<string, string>();
   private billingReads = new Map<string, Promise<SessionCostBreakdown>>();
+  private savedSessions = new Map<string, Session>();
+  private refreshing?: Promise<void>;
+  private recoveryTimer?: ReturnType<typeof setInterval>;
+  private reconciling?: Promise<void>;
+  private projectLeases = new Map<string, SharedLease>();
+  private autoCheckpointAfterMs: number;
+  private mutations = new Map<string, number>();
+  private subscriptionPolls = new Map<string, { timer: ReturnType<typeof setInterval>; pending?: Promise<void>; last?: string }>();
 
   constructor(
     private client: CodexClient,
@@ -79,12 +92,15 @@ export class SessionManager {
     private readonly imagesDirectory = join(dataDirectory, 'images'),
     lifecycleOptions: SandboxLifecycleOptions = {},
     notifications?: NotificationStore,
+    private coordinator?: SharedCoordinator,
   ) {
+    this.autoCheckpointAfterMs = lifecycleOptions.autoCheckpointAfterMs ?? 60 * 60 * 1000;
     this.notifications = notifications;
-    this.projects = new ProjectService(state);
+    this.projects = new ProjectService(state, undefined, undefined, Boolean(coordinator));
     if (sandbox) {
       this.sandboxOperations = new ProjectSandboxOperations({
         projects: this.projects, runtime: sandbox,
+        assertHeld: id => this.projectLeases.get(id)?.assertHeld(),
         threadIds: id => [...this.sessions.values()].filter(session => session.projectId === id).flatMap(session => session.threadId ? [session.threadId] : []),
         saveSandbox: (id, value, restore, image) => this.updateSandbox(id, id, value, restore, image),
         selectRestoreImage: async (project, versionId) => this.imageCatalog
@@ -119,10 +135,150 @@ export class SessionManager {
 	get remoteArchives() { return this.sandbox?.remoteArchives; }
   setImageCatalog(catalog: ImageCatalog) { this.imageCatalog = catalog; }
 
+  get sharedStateEnabled() { return Boolean(this.coordinator); }
+
+  async refreshSharedState(): Promise<void> {
+    if (!this.coordinator || this.closing) return;
+    if (this.refreshing) return this.refreshing;
+    this.refreshing = (async () => {
+      await this.projects.refresh(new Set(this.mutations.keys()));
+      const baselines = new Map(this.savedSessions);
+      const sessions = await this.state.listSessions();
+      const stored = new Map(sessions.map(session => [session.id, session]));
+      const ids = new Set([...sessions.map(session => session.id), ...this.sessions.keys()]);
+      await Promise.all([...ids].map(id => this.writer.run(id, async () => {
+        if (this.active.has(id)) {
+          // Keep the live observer's turn objects, but fan out answers accepted
+          // by another API to viewers connected to this executing instance too.
+          const local = this.sessions.get(id);
+          let changed = false;
+          for (const remoteTurn of stored.get(id)?.turns ?? []) {
+            const localTurn = local?.turns.find(turn => turn.id === remoteTurn.id);
+            for (const reply of remoteTurn.userInputRequests ?? []) {
+              if (reply.status !== 'answered') continue;
+              const request = localTurn?.userInputRequests?.find(request => request.id === reply.id);
+              if (request && request.status !== 'answered') { Object.assign(request, reply); changed = true; }
+            }
+          }
+          if (changed) this.publish(id, { type: 'state', session: this.get(id) });
+          return;
+        }
+        const protectedScope = () => this.active.has(id) || this.deleting.has(id)
+          || this.mutations.has(this.sessions.get(id)?.projectId ?? `session:${id}`);
+        if (protectedScope()) return;
+        const session = baselines.get(id) === this.savedSessions.get(id)
+          ? stored.get(id) : await this.state.getSession(id);
+        if (protectedScope()) return;
+        if (!session) { this.sessions.delete(id); this.savedSessions.delete(id); return; }
+        const local = this.sessions.get(id);
+        this.savedSessions.set(id, structuredClone(session));
+        session.turns = session.turns.map(turn => {
+          const old = local?.turns.find(value => value.id === turn.id);
+          return old ? { ...old, ...turn, items: turn.items.length ? turn.items : old.items } : turn;
+        });
+        this.sessions.set(id, session);
+      })));
+    })();
+    try { await this.refreshing; } finally { this.refreshing = undefined; }
+  }
+
+  private async projectMutation<T>(id: string, action: () => Promise<T>): Promise<T> {
+    if (!this.coordinator) return action();
+    return this.coordinator.run(`project-control:${id}`, async () => {
+      await this.refreshSharedState();
+      this.mutations.set(id, (this.mutations.get(id) ?? 0) + 1);
+      try { return await action(); }
+      finally {
+        const count = this.mutations.get(id)! - 1;
+        if (count) this.mutations.set(id, count); else this.mutations.delete(id);
+      }
+    });
+  }
+
+  private async sessionMutation<T>(id: string, action: () => Promise<T>): Promise<T> {
+    if (!this.coordinator) return action();
+    const session = await this.state.getSession(id);
+    if (!session) throw new HttpError(404, '会话不存在');
+    return this.projectMutation(session.projectId ?? `session:${id}`, action);
+  }
+
+  private async recoverSharedExecutions() {
+    if (!this.coordinator || this.closing || this.reconciling) return;
+    this.reconciling = (async () => {
+      await this.refreshSharedState();
+      for (const candidate of [...this.sessions.values()]) {
+        if (this.closing || this.active.has(candidate.id)) continue;
+        if (!candidate.turns.some(turn => turn.status === 'running' || turn.userInputRequests?.some(request => request.status === 'queued'))) continue;
+        await this.sessionMutation(candidate.id, async () => {
+          if (this.closing || this.active.has(candidate.id)) return;
+          let session = this.lookup(candidate.id);
+          let turn = session.turns.find(turn => turn.status === 'running');
+          if (!turn) { await this.startQueuedUserInput(session.id); return; }
+          const lease = await this.coordinator!.tryAcquire(`session-execution:${session.id}`);
+          if (!lease) return;
+          try {
+            lease.assertHeld();
+            const fresh = await this.state.getSession(session.id);
+            const freshTurn = fresh?.turns.find(value => value.id === turn!.id && value.status === 'running');
+            if (!fresh || !freshTurn) { await lease.release(); return; }
+            session = fresh; turn = freshTurn;
+            this.savedSessions.set(session.id, structuredClone(session));
+            this.sessions.set(session.id, session);
+            if (!this.canRecover(session, turn)) {
+              if (session.threadId && session.settings.executionMode === 'sandbox' && this.sandbox) {
+                const history = await this.sandbox.history(session, { limit: 5 });
+                const knownNativeTurnIds = new Set(session.turns.filter(candidate => candidate.id !== turn!.id && candidate.nativeTurnId)
+                  .map(candidate => candidate.nativeTurnId!));
+                const native = history.turns.find(candidate => candidate.status === 'running'
+                  && !knownNativeTurnIds.has(candidate.id) && candidate.prompt === turn!.prompt
+                  && Date.parse(candidate.startedAt) >= Date.parse(turn!.startedAt) - 1000);
+                if (native) Object.assign(turn, native, { id: turn.id, nativeTurnId: native.id });
+              }
+              if (!this.canRecover(session, turn)) {
+                if (turn.status === 'running') {
+                  turn.status = 'cancelled'; turn.completedAt = new Date().toISOString();
+                  turn.error = '执行实例已离线，未确认的请求不会自动重发。';
+                }
+                session.status = turn.status;
+                lease.assertHeld();
+                await this.save(session); await lease.release(); return;
+              }
+            }
+            this.sandbox?.trackExecution?.(session, turn);
+            this.executeTurn(session, turn, this.reserveTurn(session, lease), true);
+          } catch (error) { await lease.release(); throw error; }
+        });
+      }
+      for (const project of this.projects.list()) {
+        if (this.closing || project.sandboxOperation?.status !== 'running' || this.projectLeases.has(project.id)) continue;
+        await this.projectMutation(project.id, async () => {
+          const lease = await this.coordinator!.tryAcquire(`project-maintenance:${project.id}`);
+          if (!lease) return;
+          try {
+            // The cached ProjectService record can still say "running" if the
+            // previous owner completed after this reconciler refreshed state
+            // but before its maintenance lease became available. Re-read under
+            // the lease and only fail the exact operation we originally saw.
+            const latest = await this.state.getProject(project.id);
+            const observed = project.sandboxOperation;
+            if (latest?.sandboxOperation?.status === 'running'
+              && latest.sandboxOperation.id === observed?.id) {
+              lease.assertHeld();
+              await this.projects.updateSandboxOperation(project.id, { ...latest.sandboxOperation,
+                status: 'failed', error: '原执行实例已离线，请重试操作。', updatedAt: new Date().toISOString() });
+            }
+          } finally { await lease.release(); }
+        });
+      }
+    })();
+    try { await this.reconciling; } finally { this.reconciling = undefined; }
+  }
+
   async init() {
     await this.state.init();
     await this.projects.init();
     for (const session of await this.state.listSessions()) {
+      this.savedSessions.set(session.id, structuredClone(session));
       // Invalid state is reported rather than silently overwriting someone's history.
       if (!session.id || !Array.isArray(session.turns) || !session.settings) {
         throw new Error(`Invalid session state: ${session.id}`);
@@ -163,7 +319,7 @@ export class SessionManager {
         changed = true;
       }
       for (const turn of session.turns) {
-        if (turn.status === 'running' && !this.canRecover(session, turn)) {
+        if (!this.coordinator && turn.status === 'running' && !this.canRecover(session, turn)) {
           turn.status = 'cancelled';
           turn.error = '服务重启时发现本轮没有可恢复的执行任务，已标记为已停止。';
           turn.completedAt = new Date().toISOString();
@@ -183,7 +339,7 @@ export class SessionManager {
           changed = true;
         }
       }
-      if (session.status === 'running' || session.turns.some(turn => turn.status === 'running' || this.canRecover(session, turn))) {
+      if (!this.coordinator && (session.status === 'running' || session.turns.some(turn => turn.status === 'running' || this.canRecover(session, turn)))) {
         changed = true;
         for (const turn of session.turns.filter(t => t.status === 'running' || this.canRecover(session, t))) {
           if (this.canRecover(session, turn)) {
@@ -229,14 +385,19 @@ export class SessionManager {
       return turn ? [{ session, turn }] : [];
     });
     // Register remote use before connection/recovery yields to lifecycle scans.
-    for (const { session, turn } of recoverable) this.sandbox?.trackExecution?.(session, turn);
-    for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
+    if (!this.coordinator) for (const { session, turn } of recoverable) this.sandbox?.trackExecution?.(session, turn);
+    if (!this.coordinator) for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
     for (const session of this.sessions.values()) {
-      if (session.turns.some(turn => turn.userInputRequests?.some(request => request.status === 'queued')) && !this.active.has(session.id)) void this.startQueuedUserInput(session.id);
-    }
-    for (const session of this.sessions.values()) {
+      if (!this.coordinator && session.turns.some(turn => turn.userInputRequests?.some(request => request.status === 'queued')) && !this.active.has(session.id)) void this.startQueuedUserInput(session.id);
     }
     this.lifecycle?.start();
+    if (this.coordinator) {
+      await this.recoverSharedExecutions();
+      this.recoveryTimer = setInterval(() => {
+        void this.recoverSharedExecutions().catch(error => console.error('Shared execution recovery failed:', error.message));
+      }, 1000);
+      this.recoveryTimer.unref();
+    }
   }
 
   private canRecover(session: Session, turn: Turn): boolean {
@@ -245,18 +406,24 @@ export class SessionManager {
       && Boolean(session.threadId && turn.nativeTurnId);
   }
 
-  private reserveTurn(session: Session): ActiveExecution {
+  private reserveTurn(session: Session, lease?: SharedLease): ActiveExecution {
     const releaseProject = this.projects.startSession(session.projectId, session.id);
     let resolveDone!: () => void;
     const execution: ActiveExecution = {
-      controller: new AbortController(), done: new Promise<void>(resolve => { resolveDone = resolve; }),
-      finish: () => {
+      controller: new AbortController(), lease, done: new Promise<void>(resolve => { resolveDone = resolve; }),
+      finish: async () => {
         if (this.active.get(session.id) === execution) this.active.delete(session.id);
         releaseProject();
+        await lease?.release();
         resolveDone();
       },
     };
     this.active.set(session.id, execution);
+    lease?.signal.addEventListener('abort', () => {
+      const turn = session.turns.find(turn => turn.id === execution.turnId);
+      if (turn && session.settings.executionMode === 'sandbox') this.sandbox?.detach(turn);
+      else execution.controller.abort();
+    }, { once: true });
     return execution;
   }
 
@@ -267,7 +434,10 @@ export class SessionManager {
       client: this.client, sandbox: this.sandbox, logger: this.logger, recovering,
       save: () => this.save(session), publish: message => this.publish(id, message), snapshot: () => this.get(id),
       updateSandbox: sandbox => this.updateSandbox(session.projectId, id, sandbox),
+      onSteer: steer => { execution.steer = steer; },
+      canPersist: () => !execution.lease?.signal.aborted,
     }).finally(async () => {
+      if (execution.lease?.signal.aborted) { await execution.finish(); return; }
       if (session.settings.executionMode === 'sandbox' && session.status !== 'running'
         && !(session.turnCount ?? 0) && !session.turns.some(candidate => candidate.codexAccepted)) {
         try {
@@ -277,8 +447,8 @@ export class SessionManager {
           console.error('Unaccepted session cleanup failed:', error instanceof Error ? error.message : 'unknown error');
         }
       }
-      execution.finish();
-      void this.startQueuedUserInput(id).catch(error => console.error('Queued user input failed:', error));
+      await execution.finish();
+      if (!this.closing) void this.startQueuedUserInput(id).catch(error => console.error('Queued user input failed:', error));
       if (this.notifications && turn.status !== 'running') {
         const type = turn.status === 'completed' ? 'turn_completed'
           : turn.status === 'cancelled' ? 'turn_cancelled' : 'turn_failed';
@@ -295,8 +465,12 @@ export class SessionManager {
   }
 
   async answerUserInput(id: string, turnId: string, requestId: string, answer: string, answers?: string[]): Promise<Session> {
-    const session = this.lookup(id);
+    return this.sessionMutation(id, () => this.answerUserInputLocal(id, turnId, requestId, answer, answers));
+  }
+
+  private async answerUserInputLocal(id: string, turnId: string, requestId: string, answer: string, answers?: string[]): Promise<Session> {
     const history = await this.read(id);
+    const session = this.lookup(id);
     const matches = (turn: Turn) => turn.id === turnId || turn.nativeTurnId === turnId || turn.userInputRequests?.some(request => request.id === requestId);
     let source = history.turns.find(matches);
     let cursor = history.historyNextCursor;
@@ -319,13 +493,18 @@ export class SessionManager {
     const questionTurn = session.turns.find(matches);
     const request = questionTurn?.userInputRequests?.find(item => item.id === requestId);
     if (!questionTurn || !request) throw new HttpError(404, '问题不存在');
+    if (this.coordinator) {
+      const persisted = await this.state.getSession(id);
+      const savedRequest = persisted?.turns.flatMap(turn => turn.userInputRequests ?? []).find(item => item.id === requestId);
+      if (savedRequest && savedRequest.status !== 'pending') throw new HttpError(409, '问题已经回答');
+    }
     if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
     if (answers && answers.length !== request.questions.length) throw new HttpError(400, '请回答所有问题');
     if (!answers && request.questions.length > 1) throw new HttpError(400, '请分别回答所有问题');
     request.answers = answers ?? [answer];
     request.status = 'queued'; request.answer = answer; request.answeredAt = new Date().toISOString(); session.updatedAt = request.answeredAt;
     await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
-    if (!this.active.has(id)) await this.startQueuedUserInput(id);
+    await this.startQueuedUserInput(id);
     const snapshot = this.get(id);
     // Starting the reply makes it the latest turn. Return the updated question
     // too, so clients can replace the form they just submitted.
@@ -333,8 +512,24 @@ export class SessionManager {
     return snapshot;
   }
 
-  private async startQueuedUserInput(id: string) {
-    if (this.active.has(id)) return;
+  private async startQueuedUserInput(id: string): Promise<void> {
+    if (this.closing) return;
+    return this.sessionMutation(id, () => this.startQueuedUserInputLocal(id));
+  }
+
+  private async startQueuedUserInputLocal(id: string): Promise<void> {
+    const pending = this.userInputDeliveries.get(id);
+    if (pending) {
+      await pending;
+      return this.startQueuedUserInputLocal(id);
+    }
+    const delivery = this.deliverQueuedUserInput(id);
+    this.userInputDeliveries.set(id, delivery);
+    try { await delivery; }
+    finally { if (this.userInputDeliveries.get(id) === delivery) this.userInputDeliveries.delete(id); }
+  }
+
+  private async deliverQueuedUserInput(id: string) {
     const session = this.lookup(id);
     for (const [index, source] of session.turns.entries()) for (const request of source.userInputRequests ?? []) {
       if (request.status !== 'queued' || !request.answer) continue;
@@ -343,6 +538,57 @@ export class SessionManager {
         question: question.title,
         questionItemId: JSON.stringify(['request_user_input_async', request.id, index]),
       })))}\n</send_user_message_question_reply>`;
+      if (this.coordinator && session.threadId && session.settings.executionMode === 'sandbox' && this.sandbox) {
+        // A successful native send may precede a failed metadata save. Confirm
+        // native receipt before replaying a durable queue entry after takeover.
+        const history = await this.sandbox.history(session, { limit: 20 });
+        const received = history.turns.find(turn => turn.prompt === prompt || turn.additionalUserInputs?.includes(prompt));
+        if (received) {
+          request.status = 'answered'; request.answerTurnId = received.id;
+          await this.save(session); continue;
+        }
+      }
+      const execution = this.active.get(id);
+      const remote = !execution && this.coordinator && session.settings.executionMode === 'sandbox'
+        ? session.turns.find(turn => turn.status === 'running' && turn.nativeTurnId) : undefined;
+      if (remote && this.sandbox?.steer) {
+        let accepted: boolean;
+        try { accepted = await this.sandbox.steer(session, remote, prompt); }
+        catch (error) {
+          request.status = 'pending'; delete request.answer; delete request.answers; delete request.answeredAt;
+          await this.save(session); throw error;
+        }
+        if (accepted) {
+          request.status = 'answered'; request.answerTurnId = remote.id;
+          await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
+          continue;
+        }
+        // Another observer owns finalization. Leave the durable reply queued;
+        // shared recovery drains it once the native terminal state is saved.
+        return;
+      }
+      if (execution) {
+        const target = session.turns.find(turn => turn.id === execution.turnId);
+        if (!target?.nativeTurnId || !execution.steer) return;
+        let accepted: boolean;
+        try { accepted = await execution.steer(prompt); }
+        catch (error) {
+          // Do not replay an RPC with an unknown delivery outcome at turn end.
+          request.status = 'pending';
+          delete request.answer; delete request.answers; delete request.answeredAt;
+          await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
+          throw error;
+        }
+        if (accepted) {
+          request.status = 'answered'; request.answerTurnId = target.id;
+          session.updatedAt = new Date().toISOString();
+          await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
+          continue;
+        }
+        // The native turn can finish before our observer sees completion.
+        // Its finalizer drains this queue after releasing the active execution.
+        if (this.active.has(id)) return;
+      }
       const existing = session.turns.slice(index + 1).find(turn => turn.prompt === prompt && Date.parse(turn.startedAt) >= Date.parse(request.answeredAt ?? request.createdAt));
       const answerTurnId = existing?.id ?? await this.startTurn(id, prompt);
       request.status = 'answered'; request.answerTurnId = answerTurnId; session.updatedAt = new Date().toISOString();
@@ -363,6 +609,7 @@ export class SessionManager {
   }
 
   async readProject(id: string, options: ProjectReadOptions = {}, signal?: AbortSignal): Promise<ProjectSummary> {
+    await this.refreshSharedState();
     return traced('project.read', { 'project.id': id, 'operation.id': options.waitForOperation }, async () => {
       this.projects.get(id);
       if (options.waitForOperation) {
@@ -389,6 +636,7 @@ export class SessionManager {
     return structuredClone({ ...session, turns, historyError: this.historyErrors.get(id) });
   }
   async read(id: string): Promise<Session> {
+    await this.refreshSharedState();
     const session = this.lookup(id);
     if (session.settings.executionMode === 'sandbox') {
       const snapshot = await this.snapshot(id);
@@ -409,6 +657,7 @@ export class SessionManager {
         const turns = page.turns.map(native => {
           const current = session.turns.find(turn => turn.nativeTurnId === native.id || turn.id === native.id);
           return withNativeUserInput(current ? { ...native, ...current, nativeTurnId: native.id,
+            additionalUserInputs: native.additionalUserInputs ?? current.additionalUserInputs,
             prompt: current.prompt || native.prompt, items: native.items.map(item => ({ ...current.items.find(old => old.id === item.id), ...item })).concat(current.items.filter(item => !native.items.some(other => other.id === item.id))),
             ...(current.userInputRequests ? { userInputRequests: current.userInputRequests } : {}) } : native);
         });
@@ -666,12 +915,17 @@ export class SessionManager {
   private projectSummary(project: Project): ProjectSummary {
     return structuredClone({ ...project, status: project.status ?? (project.archivedAt ? 'archived' : 'active'), archivedAt: project.archivedAt ?? null, sessionCount: [...this.sessions.values()].filter(session => session.projectId === project.id).length,
       latestBackup: project.latestBackup,
-      activeSessionId: this.projects.activeSessionId(project.id) });
+      activeSessionId: this.projects.activeSessionId(project.id)
+        ?? [...this.sessions.values()].find(session => session.projectId === project.id && session.status === 'running')?.id ?? null });
   }
 
   getProject(id: string): ProjectSummary { return this.projectSummary(this.projects.get(id)); }
 
   async createProject(input: ProjectInput, settings?: Settings): Promise<ProjectSummary> {
+    return this.projectMutation('project-create', () => this.createProjectLocal(input, settings));
+  }
+
+  private async createProjectLocal(input: ProjectInput, settings?: Settings): Promise<ProjectSummary> {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     const valid = await this.validateSettings(settings ?? { ...this.defaults, executionMode: 'sandbox', workingDirectory: this.defaults.executionMode === 'sandbox' ? this.defaults.workingDirectory : this.sandboxWorkingDirectory });
     const project = await this.projects.create(input, valid);
@@ -680,6 +934,10 @@ export class SessionManager {
   }
 
   async updateProject(id: string, input: ProjectUpdate): Promise<ProjectSummary> {
+    return this.projectMutation(id, () => this.updateProjectLocal(id, input));
+  }
+
+  private async updateProjectLocal(id: string, input: ProjectUpdate): Promise<ProjectSummary> {
     await this.projects.update(id, input);
     return this.readProject(id);
   }
@@ -712,6 +970,10 @@ export class SessionManager {
 
   /** Opening is idempotent: join preparation, or start one resume of the existing box. */
   async enterProject(id: string): Promise<ProjectSummary> {
+    return this.projectMutation(id, () => this.enterProjectLocal(id));
+  }
+
+  private async enterProjectLocal(id: string): Promise<ProjectSummary> {
     const pending = this.projectEntries.get(id);
     if (pending) return pending;
     const request = Promise.resolve().then(async () => {
@@ -744,7 +1006,7 @@ export class SessionManager {
   private async submitProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'], options: { imageVersionId?: string } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-    await this.sandboxOperations.start(id, kind, options);
+    await this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options));
   }
 
   async refreshProjectSandboxRuntime(id: string): Promise<ProjectSummary> {
@@ -761,7 +1023,38 @@ export class SessionManager {
     options: { useExistingBackup?: boolean } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-    await this.sandboxOperations.run(id, kind, options);
+    const { done } = await this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options));
+    await done;
+  }
+
+  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>) {
+    return this.projectMutation(id, async () => {
+      if (!this.coordinator) return action();
+      const lease = await this.coordinator.tryAcquire(`project-maintenance:${id}`);
+      if (!lease) throw new HttpError(409, '项目正在其他实例执行维护，请稍后重试');
+      this.projectLeases.set(id, lease);
+      try {
+        for (const session of await this.state.listSessions()) if (session.projectId === id
+          && (session.status === 'running' || session.turns.some(turn => turn.status === 'running'))) {
+          throw new HttpError(409, '项目正在使用，请等待任务结束后重试');
+        }
+        // A running marker whose owning connection disappeared is an orphan,
+        // not evidence that every other API's work should fail on startup.
+        const project = this.projects.get(id);
+        if (project.sandboxOperation?.status === 'running') await this.projects.updateSandboxOperation(id,
+          { ...project.sandboxOperation, status: 'failed', error: '原执行实例已离线，请重试操作。', updatedAt: new Date().toISOString() });
+        lease.assertHeld();
+        const { done } = await action();
+        const guarded = done.finally(async () => {
+          this.projectLeases.delete(id);
+          await lease.release();
+        });
+        void guarded.catch(() => {});
+        return { done: guarded };
+      } catch (error) {
+        this.projectLeases.delete(id); await lease.release(); throw error;
+      }
+    });
   }
 
   async scheduledArchiveForProject(id: string) {
@@ -775,9 +1068,30 @@ export class SessionManager {
     Number(process.env.SANDBOX_SCHEDULED_ARCHIVE_THRESHOLD_MS ?? 30 * 60 * 1000);
 
   async scheduledArchive() {
+    if (!this.coordinator) return this.scheduledArchiveLocal();
+    const lease = await this.coordinator.tryAcquire('sandbox-lifecycle-scheduler');
+    if (!lease) return;
+    try { await this.scheduledArchiveLocal(); }
+    finally { await lease.release(); }
+  }
+
+  private async scheduledArchiveLocal() {
     if (this.closing) return;
+    await this.refreshSharedState();
     const now = Date.now();
     for (const project of this.projects.list()) {
+      if (this.coordinator && project.status === 'active' && project.sandbox) {
+        const sessions = [...this.sessions.values()].filter(session => session.projectId === project.id);
+        const lastActivity = Math.max(Date.parse(project.sandbox.lastActiveAt ?? project.createdAt),
+          ...sessions.map(session => Date.parse(session.updatedAt)));
+        if (!sessions.some(session => session.status === 'running') && now - lastActivity >= this.autoCheckpointAfterMs) {
+          const observed = await this.liveProject(project, true);
+          if (observed.sandbox?.status === 'ready') {
+            await this.checkpointProjectSandbox(project.id).catch(() => {});
+            continue;
+          }
+        }
+      }
       if (project.status === 'archived' && !project.sandboxArtifactsCleanedAt) {
         await this.archiveProjectNow(project.id).catch(() => {});
         continue;
@@ -786,9 +1100,13 @@ export class SessionManager {
         await this.archiveProjectNow(project.id).catch(() => {});
         continue;
       }
-      if (project.pendingSandboxCleanup?.length) await this.sandboxOperations?.retryCleanup(project.id).catch(() => {});
+      if (project.pendingSandboxCleanup?.length) await this.projectMutation(project.id, async () => {
+        const { done } = await this.startProjectOperation(project.id, async () => ({ done: this.sandboxOperations!.retryCleanup(project.id) }));
+        await done;
+      }).catch(() => {});
       if (!project.sandbox || project.status === 'archived') continue;
-      const last = this.lastScheduledArchive.get(project.id) ?? 0;
+      const last = Math.max(this.lastScheduledArchive.get(project.id) ?? (Date.parse(project.createdAt) || 0),
+        ...((project.remoteArchives ?? []).map(archive => Date.parse(archive.createdAt) || 0)));
       if (now - last >= this.scheduledArchiveInterval) {
         this.lastScheduledArchive.set(project.id, now);
         await this.scheduledArchiveForProject(project.id).catch(() => {});
@@ -801,8 +1119,12 @@ export class SessionManager {
     if (!remote) return 0;
     let removed = 0;
     for (const project of this.projects.list().filter(p => p.status === 'archived')) {
-      removed += await pruneRemoteArchives(project.remoteArchives ?? [], project.backupRetentionCount ?? 2,
-        remote, id => this.projects.removeRemoteArchive(project.id, id));
+      removed += await this.projectMutation(project.id, async () => {
+        const current = this.projects.get(project.id);
+        if (current.status !== 'archived' || this.projects.isMaintaining(project.id)) return 0;
+        return pruneRemoteArchives(current.remoteArchives ?? [], current.backupRetentionCount ?? 2,
+          remote, id => this.projects.removeRemoteArchive(project.id, id));
+      });
     }
     return removed;
   }
@@ -818,6 +1140,7 @@ export class SessionManager {
   }
 
   private async ensureProjectSandbox(id: string): Promise<void> {
+    await this.refreshSharedState();
     if (this.projects.isMaintaining(id)) throw new HttpError(409, '项目环境正在维护，请稍后重试');
     const project = await this.liveProject(this.projects.get(id));
     if (project.status === 'archived') {
@@ -849,6 +1172,20 @@ export class SessionManager {
   }
 
   async deleteProject(id: string) {
+    return this.projectMutation(id, async () => {
+      if (!this.coordinator) return this.deleteProjectLocal(id);
+      const lease = await this.coordinator.tryAcquire(`project-maintenance:${id}`);
+      if (!lease) throw new HttpError(409, '项目正在维护，请稍后重试');
+      try {
+        if ((await this.state.listSessions()).some(session => session.projectId === id && session.status === 'running'))
+          throw new HttpError(409, '请先停止项目中的任务');
+        lease.assertHeld();
+        await this.deleteProjectLocal(id);
+      } finally { await lease.release(); }
+    });
+  }
+
+  private async deleteProjectLocal(id: string) {
     await this.projects.delete(id, async project => {
       const sessions = [...this.sessions.values()].filter(session => session.projectId === id);
       for (const session of sessions) await Promise.allSettled([...(this.uploads.get(session.id) ?? [])]);
@@ -874,6 +1211,8 @@ export class SessionManager {
     this.historyErrors.delete(id);
     this.userInputAnswers.delete(id);
     this.subscribers.delete(id);
+    clearInterval(this.subscriptionPolls.get(id)?.timer);
+    this.subscriptionPolls.delete(id);
     this.writer.forget(id);
   }
 
@@ -926,6 +1265,10 @@ export class SessionManager {
   }
 
   async create(input: { projectId?: string; settings?: Partial<Settings>; threadId?: string; title?: string } = {}): Promise<Session> {
+    return this.projectMutation(input.projectId ?? 'project-create', () => this.createLocal(input));
+  }
+
+  private async createLocal(input: { projectId?: string; settings?: Partial<Settings>; threadId?: string; title?: string }): Promise<Session> {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     let project = input.projectId ? this.projects.get(input.projectId) : undefined;
     let release = this.projects.acquire(project?.id);
@@ -954,9 +1297,13 @@ export class SessionManager {
   }
 
   async update(id: string, input: { title?: string; settings?: Partial<Settings>; archived?: boolean }): Promise<Session> {
+    return this.sessionMutation(id, () => this.updateLocal(id, input));
+  }
+
+  private async updateLocal(id: string, input: { title?: string; settings?: Partial<Settings>; archived?: boolean }): Promise<Session> {
     const session = this.lookup(id);
-    if (this.active.has(id)) throw new HttpError(409, '请先停止当前任务再修改会话');
-    if (input.archived && (session.status === 'running' || session.turns.some(turn => turn.status === 'running'))) {
+    if (this.active.has(id) || session.status === 'running') throw new HttpError(409, '请先停止当前任务再修改会话');
+    if (input.archived && session.turns.some(turn => turn.status === 'running')) {
       throw new HttpError(409, '请先停止当前任务再归档会话');
     }
     if (input.settings?.executionMode && input.settings.executionMode !== (session.settings.executionMode || 'local')) throw new HttpError(400, '已有会话不能切换执行环境，请新建任务');
@@ -975,8 +1322,12 @@ export class SessionManager {
   }
 
   async delete(id: string) {
+    return this.sessionMutation(id, () => this.deleteLocal(id));
+  }
+
+  private async deleteLocal(id: string) {
     const session = this.lookup(id);
-    if (this.active.has(id)) throw new HttpError(409, '请先停止当前任务');
+    if (this.active.has(id) || session.status === 'running') throw new HttpError(409, '请先停止当前任务');
     const release = this.projects.acquire(session.projectId);
     this.deleting.add(id);
     try {
@@ -996,9 +1347,30 @@ export class SessionManager {
     this.subscribers.set(id, subscribers);
     subscribers.add(callback);
     callback({ type: 'snapshot', session: this.get(id) });
+    if (this.coordinator && !this.subscriptionPolls.has(id)) {
+      const poll: { timer: ReturnType<typeof setInterval>; pending?: Promise<void>; last?: string } = {
+        timer: setInterval(() => {
+          if (this.closing || poll.pending || this.active.has(id)) return;
+          poll.pending = (async () => {
+            const session = await this.read(id);
+            const serialized = JSON.stringify(session);
+            if (serialized !== poll.last) {
+              poll.last = serialized;
+              this.publish(id, { type: 'state', session });
+            }
+          })().catch(() => {}).finally(() => { poll.pending = undefined; });
+        }, 500),
+      };
+      poll.timer.unref();
+      this.subscriptionPolls.set(id, poll);
+    }
     return () => {
       subscribers.delete(callback);
-      if (!subscribers.size) this.subscribers.delete(id);
+      if (!subscribers.size) {
+        this.subscribers.delete(id);
+        clearInterval(this.subscriptionPolls.get(id)?.timer);
+        this.subscriptionPolls.delete(id);
+      }
     };
   }
 
@@ -1016,6 +1388,7 @@ export class SessionManager {
       id: turn.id, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
       codexAccepted: turn.codexAccepted, error: turn.error,
       prompt: turn.prompt,
+      additionalUserInputs: turn.additionalUserInputs,
       images: turn.images,
       items: turn.items,
       userInputRequests: turn.userInputRequests,
@@ -1027,10 +1400,18 @@ export class SessionManager {
       const { blockEstimates, blockTokenizer, blockTexts, ...value } = session.contextUsage;
       return value;
     })();
-    return this.writer.run(session.id, () => this.state.saveSession({ ...session, contextUsage: contextUsage || undefined, turns }));
+    const next = structuredClone({ ...session, contextUsage: contextUsage || undefined, turns });
+    return this.writer.run(session.id, async () => {
+      await this.state.saveSession(next, this.coordinator ? this.savedSessions.get(session.id) : undefined);
+      this.savedSessions.set(session.id, structuredClone(next));
+    });
   }
 
   async uploadImage(id: string, content: Uint8Array, extension: string): Promise<string> {
+    return this.sessionMutation(id, () => this.uploadImageLocal(id, content, extension));
+  }
+
+  private async uploadImageLocal(id: string, content: Uint8Array, extension: string): Promise<string> {
     const session = this.lookup(id);
     if (session.projectId && this.projects.get(session.projectId).status === 'archived') throw new HttpError(409, '项目已归档，请先恢复项目');
     const release = this.projects.acquire(session.projectId);
@@ -1052,6 +1433,10 @@ export class SessionManager {
   }
 
   async startTurn(id: string, prompt: string, images: string[] = []): Promise<string> {
+    return this.sessionMutation(id, () => this.startTurnLocal(id, prompt, images));
+  }
+
+  private async startTurnLocal(id: string, prompt: string, images: string[] = []): Promise<string> {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     let session = this.lookup(id);
     if (session.projectId && this.projects.get(session.projectId).status !== 'active') {
@@ -1067,7 +1452,11 @@ export class SessionManager {
     if (this.active.has(id) || session.turns.some(turn => turn.status === 'running')) throw new HttpError(409, '当前会话已有任务正在执行');
     const previous = structuredClone(session);
     // Reserve the session synchronously, before validating attachments or saving state.
-    const execution = this.reserveTurn(session);
+    const lease = await this.coordinator?.tryAcquire(`session-execution:${id}`);
+    if (lease === null) throw new HttpError(409, '当前会话已有任务正在执行');
+    let execution: ActiveExecution;
+    try { execution = this.reserveTurn(session, lease); }
+    catch (error) { await lease?.release(); throw error; }
     try {
       session.settings = normalizeExecutionSettings(session.settings);
       // Older uploads may still be queued in a browser when storage is moved.
@@ -1091,13 +1480,17 @@ export class SessionManager {
       return turn.id;
     } catch (error) {
       this.sessions.set(id, previous);
-      execution.finish();
+      await execution.finish();
       this.publish(id, { type: 'state', session: this.get(id) });
       throw error;
     }
   }
 
   async stop(id: string) {
+    return this.sessionMutation(id, () => this.stopLocal(id));
+  }
+
+  private async stopLocal(id: string) {
     const current = this.lookup(id);
     const execution = this.active.get(id);
     if (execution) {
@@ -1108,14 +1501,22 @@ export class SessionManager {
 
     const pending = current.turns.slice().reverse().find(turn => this.canRecover(current, turn));
     if (pending) {
+      if (this.coordinator && this.sandbox?.interrupt) {
+        await this.sandbox.interrupt(current, pending);
+        return;
+      }
       const recovery = this.reserveTurn(current);
       recovery.turnId = pending.id;
       try {
         recovery.controller.abort();
         this.executeTurn(current, pending, recovery, true);
         await recovery.done;
-      } catch (error) { recovery.finish(); throw error; }
+      } catch (error) { await recovery.finish(); throw error; }
       return;
+    }
+
+    if (this.coordinator && current.turns.some(turn => turn.status === 'running')) {
+      throw new HttpError(409, '任务正在提交，请稍后重试停止');
     }
 
     // A Web restart or an unexpected worker exit can leave a persisted
@@ -1213,6 +1614,11 @@ export class SessionManager {
 
   async close() {
     this.closing = true;
+    clearInterval(this.recoveryTimer);
+    for (const poll of this.subscriptionPolls.values()) clearInterval(poll.timer);
+    await Promise.allSettled([...this.subscriptionPolls.values()].map(poll => poll.pending));
+    this.subscriptionPolls.clear();
+    await this.reconciling;
     await this.lifecycle?.close();
     await this.sandboxOperations?.close();
     await Promise.allSettled(this.danglingDeletions.values());

@@ -68,7 +68,10 @@ test('adapter keeps delta snapshots immutable and emits compaction events', () =
  const delta = adapter.accept({ method: 'item/agentMessage/delta', params: { itemId: 'a', delta: 'hi' } })[0];
  assert.equal(first.item.text, ''); assert.equal(delta.item.text, 'hi');
  assert.deepEqual(adapter.accept({ method: 'item/completed', params: { item: { type: 'contextCompaction', id: 'c' } } }), [{ type: 'item.completed', item: { id: 'c', type: 'context_compaction', status: 'completed' } }]);
- assert.equal(adapter.accept({ method: 'turn/completed', params: { turn: { status: 'interrupted' } } })[0].type, 'turn.failed');
+ assert.deepEqual(adapter.accept({ method: 'turn/completed', params: { turn: { status: 'interrupted' } } })[0],
+  { type: 'turn.failed', cancelled: true, error: { message: 'Turn interrupted' } });
+ assert.deepEqual(adapter.accept({ method: 'turn/completed', params: { turn: { status: 'failed', error: { message: 'model error' } } } })[0],
+  { type: 'turn.failed', error: { message: 'model error' } });
 });
 test('native stdio initialize smoke (installed Codex, no model request)', { skip: spawnSync('codex', ['--version']).status !== 0 }, async () => {
  const client = await CodexAppServerClient.spawn({ requestTimeoutMs: 10_000 });

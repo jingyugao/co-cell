@@ -25,6 +25,7 @@
     "test:integration:full": "node scripts/integration/run.mjs full",
     "test:integration:lifecycle": "node scripts/integration/run.mjs lifecycle",
     "test:integration:user-input": "node scripts/integration/run.mjs user-input",
+    "test:integration:multi-api": "node scripts/integration/run.mjs multi-api",
     "test:integration:agent": "node scripts/integration/run.mjs agent",
     "test:integration:core": "node scripts/integration/run.mjs core",
     "test:integration:extended": "node scripts/integration/run.mjs extended",

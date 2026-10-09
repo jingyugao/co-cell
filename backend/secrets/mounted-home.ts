@@ -3,13 +3,14 @@ import { chmod, lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promise
 import { dirname, join } from 'node:path';
 import type { ProvisionedToolFile } from '../../protocol/secret-types.js';
 import { credentialPath } from './policy.js';
+import type { SharedCoordinator } from '../infra/storage/coordination.js';
 
 type Binding = Pick<ProvisionedToolFile, 'tool' | 'secretId' | 'path' | 'version'>;
 
 /** Native CLI files live here, rather than in the checkpoint or an API response. */
 export class MountedToolHomes {
   private pending = new Map<string, Promise<void>>();
-  constructor(private root: string) {}
+  constructor(private root: string, private coordinator?: SharedCoordinator) {}
   private locations(projectId: string) {
     if (!/^[a-z0-9][a-z0-9-]{0,54}$/.test(projectId)) throw new Error('Invalid project identity');
     return { home: join(this.root, 'runtime/debug-homes', projectId),
@@ -39,7 +40,10 @@ export class MountedToolHomes {
   }
   publish(projectId: string, resolveFiles: () => Promise<ProvisionedToolFile[]>) {
     const previous = this.pending.get(projectId) ?? Promise.resolve();
-    const current = previous.catch(() => {}).then(async () => this.write(projectId, await resolveFiles()));
+    const current = previous.catch(() => {}).then(() => {
+      const publish = async () => this.write(projectId, await resolveFiles());
+      return this.coordinator ? this.coordinator.run(`mounted-tool-home:${projectId}`, publish) : publish();
+    });
     this.pending.set(projectId, current);
     return current.finally(() => { if (this.pending.get(projectId) === current) this.pending.delete(projectId); });
   }

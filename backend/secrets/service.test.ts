@@ -16,6 +16,8 @@ import { join } from 'node:path';
 import { SandboxLifecycle } from '@co-cell/sandbox';
 import { SandboxRuntimeConfig } from '../sandboxes/runtime-config.js';
 import type { CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
+import { MemoryCoordinator } from '../infra/storage/coordination.js';
+import { MountedToolHomes } from './mounted-home.js';
 
 export class MemorySecrets implements SecretRepository {
   records = new Map<string, StoredSecret>(); history: StoredVersion[] = [];
@@ -187,6 +189,40 @@ test('native HOME rejects multi-file credentials and path collisions before chan
     await assert.rejects(service.saveSelections(projectId, [{ tool: 'first', secretId: a.id }, { tool: 'second', secretId: b.id }]), /路径不能重复/);
     assert.deepEqual((await service.grants(projectId)).map(grant => grant.tool), ['first']);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('mounted credential HOME publications serialize across API instances', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-home-lock-'));
+  const coordinator = new MemoryCoordinator();
+  const first = new MountedToolHomes(root, coordinator), second = new MountedToolHomes(root, coordinator);
+  let startFirst!: () => void, releaseFirst!: () => void;
+  const firstStarted = new Promise<void>(resolve => { startFirst = resolve; });
+  const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+  let secondResolved = false;
+  try {
+    await Promise.all([first.init(), second.init()]);
+    const firstWrite = first.publish('project-one', async () => {
+      startFirst(); await firstGate;
+      return [{ tool: 'custom' as const, secretId: 'first', path: 'auth', content: Buffer.from('first').toString('base64'), mutable: false, version: 1 }];
+    });
+    await firstStarted;
+    const secondWrite = second.publish('project-one', async () => {
+      secondResolved = true;
+      return [{ tool: 'custom' as const, secretId: 'second', path: 'token', content: Buffer.from('second').toString('base64'), mutable: false, version: 2 }];
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(secondResolved, false, 'second instance waits before resolving and publishing its snapshot');
+    releaseFirst();
+    await Promise.all([firstWrite, secondWrite]);
+    const manifest = JSON.parse(await readFile(join(root, 'runtime/project-homes/project-one/home-files.json'), 'utf8'));
+    assert.deepEqual(manifest.map((entry: { secretId: string }) => entry.secretId), ['second']);
+    await assert.rejects(readFile(join(root, 'runtime/debug-homes/project-one/auth')), { code: 'ENOENT' });
+    assert.equal(await readFile(join(root, 'runtime/debug-homes/project-one/token'), 'utf8'), 'second');
+  } finally {
+    releaseFirst();
+    await coordinator.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 test('local file provisioning and last commit wins sync do not check current selections or live Sandbox status', async () => {
   const { repository, projectId, crypto } = fixture();

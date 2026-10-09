@@ -4,7 +4,8 @@ import { startBrowserProxy } from './proxy.mjs';
 
 export const test = base.extend({
   environment: [async ({}, use, testInfo) => {
-    const environment = new LiveEnvironment(liveConfig(), {
+    const environment = new LiveEnvironment(liveConfig({ ...process.env,
+      COCELL_E2E_BASE_URL: process.env.COCELL_E2E_API_A_URL ?? process.env.COCELL_E2E_BASE_URL }), {
       journal: testInfo.outputPath('resources.json'), step: (name, run) => base.step(name, run),
     });
     await environment.persist();

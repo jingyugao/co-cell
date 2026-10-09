@@ -38,6 +38,13 @@ config:
 service:
   port: 3001
 
+# Requires the shared MySQL coordinator and shared writable application data.
+# replicas: 1 uses Recreate for the initial coordinated-image migration;
+# replicas: 2 or more uses RollingUpdate after every Pod has shared-state support.
+multiApi:
+  enabled: false
+  replicas: 2
+
 ingress:
   enabled: false
   previewSubdomains: false

@@ -22,10 +22,12 @@ export class ProjectService {
   private maintenance = new Set<string>();
   private creatingWeeklyProjects = new Set<string>();
   private writer = new RecordWriteQueue();
-  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo, private now: () => Date = () => new Date()) {}
+  private saved = new Map<string, Project>();
+  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo, private now: () => Date = () => new Date(), private shared = false) {}
 
   async init() {
     for (const project of await this.state.listProjects()) {
+      this.saved.set(project.id, structuredClone(project));
       if (!project.id || !project.name || !project.workingDirectory) throw new Error(`Invalid project state: ${project.id}`);
       // Older records used archivedAt as a two-state flag. Keep their archive
       // timestamp, but make the new lifecycle durable on first startup.
@@ -34,7 +36,7 @@ export class ProjectService {
       if (project.status === 'completed' && !project.completedAt) { project.completedAt = project.updatedAt; migratedStatus = true; }
       if (project.status === 'archived' && !project.archivedAt) { project.archivedAt = project.updatedAt; migratedStatus = true; }
       if (!project.type) { project.type = project.requirementUrl ? 2 : 1; migratedStatus = true; }
-      if (project.sandboxOperation?.status === 'running') {
+      if (!this.shared && project.sandboxOperation?.status === 'running') {
         project.sandboxOperation = { ...project.sandboxOperation, status: 'failed', error: '服务重启，操作未确认完成，请重试。', updatedAt: new Date().toISOString() };
         migratedStatus = true;
       }
@@ -44,10 +46,35 @@ export class ProjectService {
     }
   }
 
+  async refresh(skipIds: ReadonlySet<string> = new Set()) {
+    if (!this.shared) return;
+    // Capture baseline identities before the list query. If a local save finishes
+    // while that query is in flight, its new saved baseline tells us the list
+    // snapshot may predate the write; only then do we need a point read.
+    const baselines = new Map(this.saved);
+    const projects = await this.state.listProjects();
+    const snapshot = new Map(projects.map(project => [project.id, project]));
+    const ids = new Set([...snapshot.keys(), ...this.records.keys()]);
+    // Queue behind local writes. The bulk snapshot is sufficient unless a save
+    // advanced this record's baseline after the snapshot began.
+    await Promise.all([...ids].map(id => this.writer.run(id, async () => {
+      if (skipIds.has(id) || this.maintenance.has(id) || this.operations.has(id)
+        || this.deleting.has(id) || this.activeSessions.has(id)) return;
+      const project = this.saved.get(id) === baselines.get(id)
+        ? snapshot.get(id)
+        : await this.state.getProject(id);
+      if (!project) { this.cancelReads(id); this.records.delete(id); this.saved.delete(id); return; }
+      if (project.sandboxOperation?.status === 'running') this.cancelReads(id);
+      this.clearSandboxStatus(project);
+      this.records.set(id, project);
+      this.saved.set(id, structuredClone(project));
+    })));
+  }
+
   list(): Project[] { return [...this.records.values()].map(project => structuredClone(project)); }
   find(id: string): Project | undefined { return structuredClone(this.records.get(id)); }
   isDeleting(id: string): boolean { return this.deleting.has(id); }
-  isMaintaining(id: string): boolean { return this.maintenance.has(id); }
+  isMaintaining(id: string): boolean { return this.maintenance.has(id) || (this.shared && this.records.get(id)?.sandboxOperation?.status === 'running'); }
   activeSessionId(id: string): string | null { return this.activeSessions.get(id)?.values().next().value ?? null; }
 
   get(id: string): Project {
@@ -126,7 +153,7 @@ export class ProjectService {
   }
 
   private assertAvailable(id: string) {
-    if (this.maintenance.has(id)) throw new HttpError(409, '项目沙箱正在维护，请稍后重试');
+    if (this.isMaintaining(id)) throw new HttpError(409, '项目沙箱正在维护，请稍后重试');
   }
 
   beginMaintenance(id: string): () => void {
@@ -201,7 +228,8 @@ export class ProjectService {
       mutate(next);
       this.clearSandboxStatus(next);
       next.updatedAt = new Date().toISOString();
-      await this.state.saveProject(next);
+      await this.state.saveProject(next, this.shared ? this.saved.get(id) : undefined);
+      this.saved.set(id, structuredClone(next));
       // Commit only the fields this operation owns; an unrelated edit may have
       // reserved its own write while storage was pending.
       current.sandbox = next.sandbox;
@@ -366,7 +394,11 @@ export class ProjectService {
   }
 
   private save(project: Project): Promise<void> {
-    return this.writer.run(project.id, () => this.state.saveProject(project));
+    const next = structuredClone(project);
+    return this.writer.run(project.id, async () => {
+      await this.state.saveProject(next, this.shared ? this.saved.get(project.id) : undefined);
+      this.saved.set(project.id, structuredClone(next));
+    });
   }
   async close(): Promise<void> { await this.writer.drain(); }
 }

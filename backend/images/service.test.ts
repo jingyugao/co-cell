@@ -9,6 +9,7 @@ import { installImageRoutes } from './routes.js';
 import { installProjectsRoutes } from '../projects/routes.js';
 import { HttpError } from '../../util/errors.js';
 import type { Project } from '../../protocol/types.js';
+import { MemoryCoordinator } from '../infra/storage/coordination.js';
 
 function fixture() {
   const documents = new Map<string, ImageRecord>();
@@ -56,10 +57,10 @@ function fixture() {
     if (path.startsWith('/v1/operations/')) return json(operations.get(decodeURIComponent(path.slice('/v1/operations/'.length))));
     throw new Error(`Unexpected path ${path}`);
   } });
-  const catalog = () => new ImageCatalog(store, client, 'cocell', {
+  const catalog = (coordinator?: MemoryCoordinator) => new ImageCatalog(store, client, 'cocell', {
     listTags: async () => ({ tags: [...upstream.keys()] }),
     resolveTag: async (_repository, tag) => { const digest = upstream.get(tag); if (!digest) throw new HttpError(404, 'Tag 不存在'); return digest; },
-  }, () => projects);
+  }, () => projects, coordinator);
   function finish(operationId: string, source: string) {
     const operation = operations.get(operationId)!;
     operation.status = 'succeeded'; operation.result = { importedImageId: operationId };
@@ -70,6 +71,34 @@ function fixture() {
   return { catalog, documents, submissions, deletions, projects, operations, images, upstream, finish,
     rejectDeletion: (reject: boolean) => { rejectDeletion = reject; }, loseResponse: () => { loseResponse = true; } };
 }
+
+test('image catalog refreshes durable records under a shared lock and shares live restore reservations', async () => {
+  const f = fixture(), coordinator = new MemoryCoordinator();
+  const firstCatalog = f.catalog(coordinator), secondCatalog = f.catalog(coordinator);
+  await Promise.all([firstCatalog.init(), secondCatalog.init()]);
+  const repository = await firstCatalog.addRepository({ name: 'Shared', category: '开发', repository: 'team/shared' });
+  await assert.rejects(secondCatalog.addRepository({ name: 'Shared', category: '开发', repository: 'team/shared' }), /该镜像仓库已添加/);
+
+  const first = (await firstCatalog.sync(repository.id, { tag: 'v1' })).versions[0];
+  f.finish(first.operationId!, first.source);
+  await firstCatalog.list();
+  const second = (await firstCatalog.sync(repository.id, { tag: 'v2' })).versions[0];
+  f.finish(second.operationId!, second.source);
+  await firstCatalog.list();
+  const pinned = (await firstCatalog.resolve(repository.id, first.id))!;
+  const reservation = await firstCatalog.acquireRestoreSelection({ id: 'archived-project', name: 'archived',
+    executionMode: 'sandbox', workingDirectory: '/workspace', status: 'archived', imageSelection: pinned,
+    requirementUrl: null, createdAt: '', updatedAt: '' }, second.id);
+  await assert.rejects(secondCatalog.removeVersion(repository.id, second.id), /正在被创建或恢复/);
+  await reservation.release();
+  f.projects.push({ id: 'restore-p', name: 'restore-p', executionMode: 'sandbox', workingDirectory: '/workspace',
+    status: 'archived', imageSelection: pinned, requirementUrl: null, createdAt: '', updatedAt: '',
+    sandboxOperation: { kind: 'restore', phase: '恢复 Sandbox', status: 'failed', updatedAt: '', imageSelection: reservation.selection } });
+  await assert.rejects(secondCatalog.removeVersion(repository.id, second.id), /恢复操作仍引用此版本/);
+  delete f.projects[0].sandboxOperation;
+  await secondCatalog.removeVersion(repository.id, second.id);
+  await coordinator.close();
+});
 
 test('version cleanup protects pinned projects, backups, defaults and in-flight restore reservations', async () => {
   const f = fixture(); const catalog = f.catalog(); await catalog.init();
@@ -89,9 +118,9 @@ test('version cleanup protects pinned projects, backups, defaults and in-flight 
   await assert.rejects(catalog.removeVersion(repo.id, first.id), /依赖原镜像的备份/);
   project.remoteArchives[0].portable = true;
   const restore = await catalog.acquireRestoreSelection(project);
-  assert.equal(restore.selection?.versionId, second.id); restore.release();
+  assert.equal(restore.selection?.versionId, second.id); await restore.release();
   const oldRestore = await catalog.acquireRestoreSelection(project, first.id);
-  await assert.rejects(catalog.removeVersion(repo.id, first.id), /创建或恢复操作/); oldRestore.release();
+  await assert.rejects(catalog.removeVersion(repo.id, first.id), /创建或恢复操作/); await oldRestore.release();
   project.pendingSandboxCleanup = [{ id: 'stale', template: 'cocell', status: 'unavailable', workingDirectory: project.workingDirectory, image: { id: original.image, reference: original.image, repoDigests: [] } }];
   await assert.rejects(catalog.removeVersion(repo.id, first.id), /待清理环境/);
   project.pendingSandboxCleanup = [];
@@ -292,7 +321,7 @@ test('deprecation persists, blocks new selections and moves restore default with
   await assert.rejects(restarted.setDefault(repo.id, first.id), /已弃用/);
   await assert.rejects(restarted.acquireRestoreSelection(project, first.id), /已弃用/);
   const restore = await restarted.acquireRestoreSelection(project);
-  assert.equal(restore.selection?.versionId, second.id); restore.release();
+  assert.equal(restore.selection?.versionId, second.id); await restore.release();
   await restarted.setDeprecated(repo.id, second.id, true);
   assert.equal((await restarted.list()).find(value => value.id === repo.id)?.defaultVersionId, undefined);
   await assert.rejects(restarted.acquireRestoreSelection(project), /没有可恢复/);
@@ -350,7 +379,7 @@ test('managed repositories hide duplicate imports while pinned imports still res
   const project: Project = { id: 'p', name: 'existing', status: 'active', executionMode: 'sandbox', workingDirectory: '/home/agent/workspace',
     requirementUrl: null, createdAt: '', updatedAt: '', imageSelection: pinned };
   const reservation = await catalog.acquireRestoreSelection(project);
-  assert.deepEqual(reservation.selection, pinned); reservation.release();
+  assert.deepEqual(reservation.selection, pinned); await reservation.release();
 });
 
 test('sync rebuilds unchanged upstream content when the platform tool installation changes', async () => {

@@ -55,6 +55,25 @@ test('native reply IDs resolve each async question after history reconstruction'
   assert.equal(source.userInputRequests, undefined);
 });
 
+test('answers injected within a native turn are indexed without replacing its original prompt', () => {
+  const second = { questionItemId: JSON.stringify(['request_user_input_async', 'call_async_question', 1]),
+    question: '检查哪些接口？', answer: 'eth0' };
+  const source: Turn = { id: 'same-native-turn', prompt: '原始用户请求', images: [], status: 'completed', codexAccepted: true,
+    startedAt: '2026-10-03T00:00:00.000Z', itemTimestamps: { call_async_question: '2026-10-03T00:00:30.000Z' },
+    items: [{ id: 'call_async_question', type: 'agent_message', text: '', delivery: 'async',
+      questions: [{ title: reply.question }, { title: second.question }] }] };
+  const continued: Turn = { ...source, prompt: '原始用户请求',
+    additionalUserInputs: [envelope([reply]), envelope([second])], items: [] };
+  const answers: NativeUserInputAnswers = new Map();
+  collectNativeUserInputAnswers([continued], answers);
+  const request = withNativeUserInput(source, answers).userInputRequests![0];
+  assert.equal(continued.prompt, '原始用户请求');
+  assert.deepEqual(continued.additionalUserInputs, [envelope([reply]), envelope([second])]);
+  assert.equal(request.status, 'answered');
+  assert.deepEqual(request.answers, [reply.answer, second.answer]);
+  assert.equal(request.answerTurnId, 'same-native-turn');
+});
+
 test('unaccepted, unrelated, malformed and partial native replies cannot answer a question', () => {
   const source: Turn = { id: 'source', prompt: '', images: [], status: 'completed', codexAccepted: true,
     startedAt: '2026-10-03T00:00:00.000Z', items: [{ id: 'call_async_question', type: 'agent_message', text: '', delivery: 'async',

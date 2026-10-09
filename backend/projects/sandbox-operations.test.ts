@@ -375,6 +375,8 @@ test('archived portable restore switches image only after history verification a
   const f = await fixture(project('archived', { status: 'archived', sandbox: undefined, remoteArchives: [ref], imageSelection: old }));
   const calls: string[] = [];
   let failHistory = true, releases = 0;
+  const selectedProjects: Array<Project['imageSelection']> = [];
+  const selectedVersions: Array<string | undefined> = [];
   const remoteRuntime: SandboxRuntime = { ...runtime({}, calls),
     async currentImageIdentity(target) { return { id: target!.imageSelection!.image, reference: target!.imageSelection!.image, repoDigests: [] }; },
     async verifyHistory(_box, threads) { assert.deepEqual(threads, ref.threadIds); if (failHistory) throw new Error('history not ready'); },
@@ -389,7 +391,7 @@ test('archived portable restore switches image only after history verification a
   };
   const operations = new ProjectSandboxOperations({ projects: f.projects, runtime: remoteRuntime,
     threadIds: () => ref.threadIds, detached: async () => {},
-    selectRestoreImage: async () => ({ selection: next, release() { releases++; } }),
+    selectRestoreImage: async (project, versionId) => { selectedProjects.push(project.imageSelection); selectedVersions.push(versionId); return { selection: next, release() { releases++; } }; },
     saveSandbox: async (id, box, restored, image) => {
       assert.equal(f.projects.get(id).imageSelection?.versionId, old.versionId);
       await f.projects.updateSandbox(id, box, restored, image);
@@ -399,10 +401,14 @@ test('archived portable restore switches image only after history verification a
     await assert.rejects(operations.run('archived', 'restore'), /history not ready/);
     assert.equal(f.projects.get('archived').status, 'archived'); assert.equal(f.projects.get('archived').sandbox, undefined);
     assert.deepEqual(f.projects.get('archived').imageSelection, old); assert.deepEqual(f.projects.get('archived').remoteArchives, [ref]);
+    assert.deepEqual(f.projects.get('archived').sandboxOperation?.imageSelection, next, 'failed restore keeps its staged image durable');
     assert.equal(releases, 1);
     failHistory = false;
     await operations.run('archived', 'restore');
     assert.equal(f.projects.get('archived').status, 'active'); assert.deepEqual(f.projects.get('archived').imageSelection, next);
+    assert.deepEqual(selectedProjects[1], next, 'retry reuses the durable staged selection');
+    assert.equal(selectedVersions[1], next.versionId);
+    assert.equal(f.projects.get('archived').sandboxOperation?.imageSelection, undefined, 'successful restore clears the staged reference');
     assert.equal(f.projects.get('archived').sandbox?.id, 'new'); assert.equal(releases, 2);
     await assert.rejects(operations.run('archived', 'restore', { imageVersionId: 'v1' }), /仅归档项目/);
   } finally { await operations.close(); await f.close(); }

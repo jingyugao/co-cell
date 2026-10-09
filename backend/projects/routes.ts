@@ -99,7 +99,7 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
     const reservation = imageId ? await images!.acquireSelection(imageId, imageVersionId!) : undefined;
     try {
       return c.json(await manager.createProject({ ...input, ...(reservation?.selection ? { imageSelection: reservation.selection } : {}) }), 201);
-    } finally { reservation?.release(); }
+    } finally { await reservation?.release(); }
   });
   app.get('/api/projects/:id', async c => {
     c.header('Cache-Control', 'no-store');

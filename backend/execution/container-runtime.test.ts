@@ -20,6 +20,28 @@ test('history maintenance keeps BUSY classification through runtime error saniti
   } finally { release?.(); await runtime.close(); }
 });
 
+test('interrupt sends a remote native turn interruption without recovering the turn', async () => {
+  let address: unknown;
+  let rpc: unknown;
+  const reader = {
+    read: async (sandboxId: string, action: (client: { turnInterrupt(params: unknown): Promise<void> }) => Promise<void>) => {
+      address = sandboxId;
+      return action({ turnInterrupt: async params => { rpc = params; } });
+    },
+    close: async () => {},
+  } as unknown as AppServerReader;
+  const runtime = new ContainerCodexRuntime({ provider: {} as SandboxProvider,
+    sandboxes: { close: async () => {} } as unknown as ProjectSandboxes, apiKey: 'test-secret', appServerReader: reader,
+    paths: { root: '/workspace', runtime: '/runtime', codexHome: '/codex', node: '/node' }, prepareRemote: async () => false });
+
+  await runtime.interrupt({ threadId: 'thread-one', sandbox: { id: 'box-one' } } as Session,
+    { id: 'turn-one', nativeTurnId: 'native-turn-one' } as Session['turns'][number]);
+
+  assert.equal(address, 'box-one');
+  assert.deepEqual(rpc, { threadId: 'thread-one', turnId: 'native-turn-one' });
+  await runtime.close();
+});
+
 test('health verification uses a non-resuming connection and never prepares the environment', async () => {
   let probes = 0;
   const handle = { commands: { run: async () => { probes++; throw new Error('probe failed'); } } } as unknown as SandboxHandle;

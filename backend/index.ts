@@ -22,6 +22,7 @@ import { RuntimeLog } from './infra/diagnostics/runtime-log.js';
 import { installProductionStatic } from './infra/http/static-files.js';
 import { modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
+import { MySqlCoordinator } from './infra/storage/coordination.js';
 import { SecretCrypto } from './secrets/crypto.js';
 import { SecretService } from './secrets/service.js';
 import { SharedFiles } from './shared-files/service.js';
@@ -31,7 +32,11 @@ import { loadSharedMountConfig } from './shared-files/config.js';
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 const shutdownTracing = initializeTracing();
 const mysqlUrl = process.env.MYSQL_URL?.trim() ?? '';
-const webState = createWebStateStore(mysqlUrl);
+const multiApiFlag = process.env.COCELL_MULTI_API ?? '0';
+if (multiApiFlag !== '0' && multiApiFlag !== '1') throw new Error('COCELL_MULTI_API must be 0 or 1');
+const multiApi = multiApiFlag === '1';
+const coordinator = multiApi ? new MySqlCoordinator(mysqlUrl) : undefined;
+const webState = createWebStateStore(mysqlUrl, { preserveLiveItems: multiApi });
 const port = Number(process.env.PORT || 3000);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be between 1 and 65535');
 const apiKey = process.env.CODEX_API_KEY || process.env.OPENAI_API_KEY;
@@ -65,16 +70,20 @@ const appServerEnv = {...(apiKey?{CODEX_API_KEY:apiKey}:{}),...(process.env.OPEN
   ...(process.env.CODEX_MODEL_METADATA_JSON ? { CODEX_MODEL_METADATA_JSON: process.env.CODEX_MODEL_METADATA_JSON } : {})};
 const sharedDirectory = await loadSharedMountConfig();
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
-if (sharedDirectory) await publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
+if (sharedDirectory) {
+  const publish = () => publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
+  if (coordinator) await coordinator.run('cocell-shared-startup-config', publish);
+  else await publish();
+}
 for(const name of ['CELLBOX_API_URL','CELLBOX_PROFILE','COCELL_ACCESS_TOKEN'])if(!process.env[name])throw new Error(name+' is required for Cellbox Kubernetes mode');
 if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOKEN must contain at least 32 bytes');
 const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,clientId:process.env.CELLBOX_CLIENT_ID,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',stateDirectory:resolve('data/cellbox-operations')});
 await cellboxProvider.initialize();
 let manager: SessionManager;
 const secrets = new SecretService(webState.secretRepository, secretCrypto);
-if (sharedDirectory) await secrets.mountHomes(sharedDataRoot);
+if (sharedDirectory) await secrets.mountHomes(sharedDataRoot, coordinator);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
-  error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); });
+  error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); }, multiApi ? 0 : undefined);
 const cellboxRuntime=new CellboxRuntimeIntegration({provider:cellboxProvider,profileId:process.env.CELLBOX_PROFILE!,appServerArgs:appServerArguments,
   extensions: [appServerReader.extension],
   env:appServerEnv, sharedDirectory, ...(sharedDirectory ? { sharedDataRoot } : {}),
@@ -102,7 +111,8 @@ if (process.env.OPENAI_BASE_URL) {
 }
 const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_MS ?? 60 * 60 * 1000);
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
-const sandboxManager = new SandboxManager({ provider, logger: runtimeLog, policy: { autoCheckpointAfterMs }, lifecycle: cellboxRuntime.lifecycle });
+const sandboxManager = new SandboxManager({ provider, logger: runtimeLog,
+  policy: { autoCheckpointAfterMs: multiApi ? Number.MAX_SAFE_INTEGER : autoCheckpointAfterMs }, lifecycle: cellboxRuntime.lifecycle });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
 const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
@@ -120,22 +130,38 @@ if (!Number.isFinite(archivedReclaimAfterMs) || archivedReclaimAfterMs < 0) thro
 manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtime, sandboxWorkingDirectory, runtimeLog,
   webImagesDirectory, {
     archivedReclaimAfterMs,
+    autoCheckpointAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
-  }, notifications);
+  }, notifications, coordinator);
 // Project tables must exist before the Secret schema's foreign keys are created.
-await webState.init();
-await notifications.init();
-await secrets.init();
+const initializeSchemas = async () => { await webState.init(); await notifications.init(); await secrets.init(); };
+if (coordinator) await coordinator.run('cocell-schema-init', initializeSchemas);
+else await initializeSchemas();
 await manager.init();
 // Paused instances are configured on resume. Running instances survive a web
 // service restart; compare their durable acknowledgements before writing slots.
-for (const project of manager.listProjects()) {
-  if (project.status === 'archived' || !project.sandbox) continue;
-  try { await cellboxRuntime.reconcile({ id: project.id, projectId: project.id, updatedAt: project.updatedAt,
-    settings: { workingDirectory: project.sandbox.workingDirectory }, sandbox: project.sandbox }); }
-  catch (error) { runtimeLog.write({ event: 'sandbox.runtime_config_reconcile_failed', projectId: project.id, error }); }
-}
-const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.env.CELLBOX_PROFILE!, undefined, () => manager.listProjects());
+const reconcileProjects = async () => {
+  await manager.refreshSharedState();
+  for (const project of manager.listProjects()) {
+    if (project.status === 'archived' || !project.sandbox) continue;
+    const reconcile = async () => {
+      await manager.refreshSharedState();
+      if (manager.list().some(session => session.projectId === project.id && session.status === 'running')) return;
+      await cellboxRuntime.reconcile({ id: project.id, projectId: project.id, updatedAt: project.updatedAt,
+        settings: { workingDirectory: project.sandbox!.workingDirectory }, sandbox: project.sandbox });
+    };
+    try {
+      if (coordinator) await coordinator.run(`project-control:${project.id}`, reconcile);
+      else await reconcile();
+    } catch (error) { runtimeLog.write({ event: 'sandbox.runtime_config_reconcile_failed', projectId: project.id, error }); }
+  }
+};
+if (coordinator) {
+  const lease = await coordinator.tryAcquire('cocell-runtime-config-reconcile');
+  if (lease) try { await reconcileProjects(); } finally { await lease.release(); }
+} else await reconcileProjects();
+const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.env.CELLBOX_PROFILE!, undefined,
+  () => webState.listProjects(), coordinator);
 await imageCatalog.init();
 manager.setImageCatalog(imageCatalog);
 const config: AppConfig = { models: availableModels, sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
@@ -147,7 +173,8 @@ const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
-  inventory, new SharedFiles(sharedDataRoot, sharedDirectory), undefined, notifications, { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,projects:()=>manager.listProjects() }, imageCatalog, secrets);
+  inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), undefined, notifications,
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,projects:()=>manager.listProjects() }, imageCatalog, secrets);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }
@@ -169,5 +196,6 @@ const archiveInterval = setInterval(() => { void manager.scheduledArchive().catc
 archiveInterval.unref();
 async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await manager.close(); await cellboxRuntime.close(); await sandboxManager.close();
   clearInterval(archiveInterval);
+  await coordinator?.close();
   await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); await shutdownTracing?.(); }
 process.on('SIGINT', () => void shutdown()); process.on('SIGTERM', () => void shutdown());

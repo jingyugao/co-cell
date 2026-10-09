@@ -6,6 +6,7 @@ import type { ImageCatalogStore, ImageRecord, ImageVersionRecord } from './store
 import { prepareImageRequest } from './build-command.js';
 import { HttpError } from '../../util/errors.js';
 import { DockerRegistryClient, normalizeRepository, registryImageReference, type ImageRegistry } from './registry.js';
+import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 
 const publicImage = ({ versionLifecycle: _lifecycle, deletedAt: _deletedAt, ...record }: ImageRecord): ManagedImage => ({ ...record,
   versions: record.versions.filter(version => !version.deletedAt).map(({ request: _request, requiresRegistryAuth, ...version }) => ({ ...version, registryAuthRequired: requiresRegistryAuth })) });
@@ -23,10 +24,18 @@ export class ImageCatalog {
   private queue: Promise<unknown> = Promise.resolve();
   private reservations = new Map<string, number>();
   constructor(private store: ImageCatalogStore, private client: CellboxClient, private profileId: string,
-    private registry: ImageRegistry = new DockerRegistryClient(), private projects: () => Project[] = () => []) {}
-  async init() { for (const image of await this.store.listImages()) this.records.set(image.id, image); }
+    private registry: ImageRegistry = new DockerRegistryClient(), private projects: () => Project[] | Promise<Project[]> = () => [],
+    private coordinator?: SharedCoordinator) {}
+  async init() { await this.loadRecords(); }
+  private async loadRecords() {
+    const records = await this.store.listImages();
+    this.records = new Map(records.map(image => [image.id, image]));
+  }
   private exclusive<T>(work: () => Promise<T>): Promise<T> {
-    const task = this.queue.catch(() => {}).then(work);
+    const task = this.queue.catch(() => {}).then(() => {
+      const refreshAndRun = async () => { await this.loadRecords(); return work(); };
+      return this.coordinator ? this.coordinator.run('managed-image-catalog', refreshAndRun) : refreshAndRun();
+    });
     this.queue = task;
     return task;
   }
@@ -137,9 +146,11 @@ export class ImageCatalog {
     if (image.registryAuthRequired && !auth) throw new HttpError(400, '请提供私有仓库用户名和 Token，平台不保存这些凭证');
     return image;
   }
-  async tags(imageId: string, auth?: RegistryAuth, last?: string) {
-    const image = this.repository(imageId, auth);
-    return this.registry.listTags(image.repository!, auth, { last, limit: 100 });
+  tags(imageId: string, auth?: RegistryAuth, last?: string) {
+    return this.exclusive(async () => {
+      const image = this.repository(imageId, auth);
+      return this.registry.listTags(image.repository!, auth, { last, limit: 100 });
+    });
   }
   sync(imageId: string, input: SyncImageVersionInput): Promise<ManagedImage> {
     return this.exclusive(async () => {
@@ -223,15 +234,21 @@ export class ImageCatalog {
   acquireSelection(imageId: string, versionId: string) {
     return this.exclusive(async () => this.reserve(await this.resolveAvailable(imageId, versionId)));
   }
-  private reserve(selection?: ProjectImageSelection) {
+  private async reserve(selection?: ProjectImageSelection) {
     const key = selection?.image;
+    let lease: SharedLease | undefined;
+    if (key && this.coordinator) {
+      lease = await this.coordinator.tryAcquire(`image-reservation:${key}`) ?? undefined;
+      if (!lease) throw new HttpError(409, '此镜像版本正在被其他项目创建或恢复');
+    }
     if (key) this.reservations.set(key, (this.reservations.get(key) ?? 0) + 1);
     let released = false;
-    return { selection, release: () => {
+    return { selection, release: async () => {
       if (released || !key) return;
       released = true;
       const count = (this.reservations.get(key) ?? 1) - 1;
       if (count) this.reservations.set(key, count); else this.reservations.delete(key);
+      await lease?.release();
     } };
   }
   acquireRestoreSelection(project: Project, versionId?: string) {
@@ -292,7 +309,7 @@ export class ImageCatalog {
       if (!stored || stored.origin !== 'managed') throw new HttpError(404, '镜像仓库不存在');
       if (stored.deletedAt) return;
       if (stored.versions.some(version => !version.deletedAt)) throw new HttpError(409, '请先清理仓库的所有版本');
-      if (this.projects().some(project => project.imageSelection?.imageId === imageId))
+      if ((await this.projects()).some(project => project.imageSelection?.imageId === imageId || project.sandboxOperation?.imageSelection?.imageId === imageId))
         throw new HttpError(409, '仍有项目引用此镜像仓库');
       const record = structuredClone(stored);
       record.deletedAt = new Date().toISOString();
@@ -306,24 +323,33 @@ export class ImageCatalog {
     if (!record || record.deletedAt || !version) throw new HttpError(404, '镜像或版本不存在');
     return { record, version };
   }
-  private blockers(record: ImageRecord, version: ImageVersionRecord) {
+  private async blockers(record: ImageRecord, version: ImageVersionRecord) {
     const blockers: string[] = [];
     if (record.defaultVersionId === version.id) blockers.push('仓库默认版本，请先指定其他默认版本');
     if (['submitting', 'queued', 'running', 'unknown'].includes(version.status)) blockers.push('版本仍在同步或导入结果待确认');
-    if (version.image && this.reservations.has(version.image)) blockers.push('版本正在被创建或恢复操作使用');
-    for (const project of this.projects()) {
+    if (version.image && (this.reservations.has(version.image) || await this.hasSharedReservation(version.image))) blockers.push('版本正在被创建或恢复操作使用');
+    for (const project of await this.projects()) {
       const selected = project.imageSelection;
       if (project.status !== 'archived' && selected && (selected.versionId === version.id || selected.image === version.image)) blockers.push(`项目「${project.name}」仍固定此版本`);
+      const staged = project.sandboxOperation?.status !== 'succeeded' ? project.sandboxOperation?.imageSelection : undefined;
+      if (staged && (staged.versionId === version.id || staged.image === version.image)) blockers.push(`项目「${project.name}」的恢复操作仍引用此版本`);
       if ([project.sandbox, ...(project.pendingSandboxCleanup ?? [])].some(box => box && version.image && box.image?.id === version.image)) blockers.push(`项目「${project.name}」仍有 Sandbox 或待清理环境使用此镜像`);
       if (project.remoteArchives?.some(ref => ref.storageType !== 'oss' && !ref.portable && ref.imageId === version.image)) blockers.push(`项目「${project.name}」有依赖原镜像的备份`);
     }
     return [...new Set(blockers)];
   }
+  private async hasSharedReservation(image: string) {
+    if (!this.coordinator) return false;
+    const lease = await this.coordinator.tryAcquire(`image-reservation:${image}`);
+    if (!lease) return true;
+    await lease.release();
+    return false;
+  }
   usage(imageId: string, versionId: string): Promise<ImageVersionUsage> {
     return this.exclusive(async () => {
       await this.refresh();
       const { record, version } = this.cleanupVersion(imageId, versionId);
-      const blockers = this.blockers(record, version);
+      const blockers = await this.blockers(record, version);
       const remote = version.importedImageId ? await this.client.imageUsage(version.importedImageId) : undefined;
       if (remote) blockers.push(...remote.blockers.map(reason => usageLabels[reason] ?? 'Cellbox 检测到此镜像仍不可清理'));
       return { deletable: blockers.length === 0 && (!remote || remote.deletable), blockers, manifestShared: remote?.manifestShared ?? false };
@@ -333,7 +359,7 @@ export class ImageCatalog {
     return this.exclusive(async () => {
       await this.refresh();
       const { record: stored, version: original } = this.cleanupVersion(imageId, versionId);
-      const blockers = this.blockers(stored, original);
+      const blockers = await this.blockers(stored, original);
       if (blockers.length) throw new HttpError(409, blockers.join('；'));
       const record = structuredClone(stored), version = record.versions.find(value => value.id === versionId)!;
       if (!version.importedImageId) {

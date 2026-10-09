@@ -63,6 +63,43 @@ else
 fi
 preview_args=()
 mount_args=()
+multi_api_args=()
+if [[ -n "${COCELL_MULTI_API:-}" ]]; then
+  case "$COCELL_MULTI_API" in
+    0)
+      if [[ -n "${COCELL_API_REPLICAS:-}${COCELL_MULTI_API_BOOTSTRAP:-}" ]]; then
+        echo "COCELL_API_REPLICAS and COCELL_MULTI_API_BOOTSTRAP require COCELL_MULTI_API=1" >&2
+        exit 2
+      fi
+      multi_api_args+=(--set multiApi.enabled=false)
+      ;;
+    1)
+      api_replicas="${COCELL_API_REPLICAS:-2}"
+      if [[ -n "${COCELL_MULTI_API_BOOTSTRAP:-}" ]]; then
+        case "$COCELL_MULTI_API_BOOTSTRAP" in
+          0) ;;
+          1)
+            if [[ -n "${COCELL_API_REPLICAS:-}" && "$COCELL_API_REPLICAS" != 1 ]]; then
+              echo "COCELL_MULTI_API_BOOTSTRAP=1 requires COCELL_API_REPLICAS=1 or unset" >&2
+              exit 2
+            fi
+            api_replicas=1
+            ;;
+          *) echo "COCELL_MULTI_API_BOOTSTRAP must be 0 or 1" >&2; exit 2 ;;
+        esac
+      fi
+      if [[ ! "$api_replicas" =~ ^[1-9][0-9]*$ ]]; then
+        echo "COCELL_API_REPLICAS must be a positive integer" >&2
+        exit 2
+      fi
+      multi_api_args+=(--set multiApi.enabled=true --set "multiApi.replicas=${api_replicas}")
+      ;;
+    *) echo "COCELL_MULTI_API must be 0 or 1" >&2; exit 2 ;;
+  esac
+elif [[ -n "${COCELL_API_REPLICAS:-}${COCELL_MULTI_API_BOOTSTRAP:-}" ]]; then
+  echo "Set COCELL_MULTI_API=1 to configure API replicas or bootstrap mode" >&2
+  exit 2
+fi
 mount_config="${COCELL_MOUNTS_CONFIG:-$repo_root/deploy/local/mounts.json}"
 if [[ -f "$mount_config" ]]; then
   uv run --no-project python "$repo_root/deploy/scripts/cellbox/mount_config.py" >/dev/null
@@ -98,6 +135,7 @@ helm upgrade "$release" "$chart" \
   --namespace "$namespace" \
   "${values_args[@]}" \
   "${preview_args[@]}" \
+  "${multi_api_args[@]}" \
   "${mount_args[@]}" \
   --set-string "image.repository=${image_repository}" \
   --set-string "image.tag=${image_tag}" \

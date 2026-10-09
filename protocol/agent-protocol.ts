@@ -27,6 +27,6 @@ export type ThreadEvent =
   | { type: 'thread.started'; thread_id: string }
   | { type: 'turn.started'; turn_id?: string }
   | { type: 'turn.completed'; usage: Usage }
-  | { type: 'turn.failed'; error: { message: string } }
+  | { type: 'turn.failed'; error: { message: string }; cancelled?: boolean }
   | { type: 'item.started' | 'item.updated' | 'item.completed'; item: ThreadItem }
   | { type: 'error'; message: string };

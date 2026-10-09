@@ -16,9 +16,16 @@ metadata:
   labels:
     {{- include "co-cell.labels" . | nindent 4 }}
 spec:
-  replicas: 1
+  replicas: {{ ternary .Values.multiApi.replicas 1 .Values.multiApi.enabled }}
   strategy:
+    {{- if and .Values.multiApi.enabled (gt (int .Values.multiApi.replicas) 1) }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- else }}
     type: Recreate
+    {{- end }}
   selector:
     matchLabels:
       {{- include "co-cell.selectorLabels" . | nindent 6 }}
@@ -77,6 +84,8 @@ spec:
               value: "3001"
             - name: NODE_ENV
               value: production
+            - name: COCELL_MULTI_API
+              value: {{ ternary "1" "0" .Values.multiApi.enabled | quote }}
             - name: HOME
               value: /app/data/home
             - name: CODEX_HOME
@@ -153,18 +162,24 @@ spec:
               value: {{ toJson . | quote }}
             {{- end }}
           startupProbe:
-            tcpSocket:
+            httpGet:
+              path: /healthz
               port: http
+            timeoutSeconds: 5
             periodSeconds: 5
             failureThreshold: 24
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /healthz
               port: http
+            timeoutSeconds: 5
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /healthz
               port: http
+            timeoutSeconds: 5
             periodSeconds: 20
             failureThreshold: 3
           resources:

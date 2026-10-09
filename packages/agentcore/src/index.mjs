@@ -112,6 +112,15 @@ export class CodexAppServerClient extends EventEmitter {
   threadStart(params) { return this.request('thread/start', params); }
   threadResume(params) { return this.request('thread/resume', params); }
   turnStart(params) { return this.request('turn/start', params); }
+  async steerTurn(threadId, expectedTurnId, text) {
+    try {
+      await this.request('turn/steer', { threadId, expectedTurnId, input: [{ type: 'text', text, text_elements: [] }] });
+      return true;
+    } catch (error) {
+      if (error instanceof AppServerRpcError && /no active turn/i.test(error.rpc.message)) return false;
+      throw error;
+    }
+  }
   turnInterrupt(params) { return this.request('turn/interrupt', params); }
   fail(error) {
     if (this.failure || this.closed) return;
@@ -182,7 +191,9 @@ export class AppServerEventAdapter {
       return [];
     }
     if (method === 'turn/completed') {
-      if (p.turn.status !== 'completed') return [{ type: 'turn.failed', error: { message: p.turn.error?.message ?? `Turn ${p.turn.status}` } }];
+      if (p.turn.status !== 'completed') return [{ type: 'turn.failed',
+        ...( ['interrupted', 'cancelled', 'canceled', 'aborted'].includes(p.turn.status) ? { cancelled: true } : {}),
+        error: { message: p.turn.error?.message ?? `Turn ${p.turn.status}` } }];
       return [{ type: 'turn.completed', usage: this.usage }];
     }
     if (method === 'error') return [{ type: 'error', message: p.error?.message ?? 'App Server error' }];
@@ -233,6 +244,10 @@ export class Codex {
 }
 export class Thread {
   constructor(codex, options, id = null) { this.codex = codex; this.options = options; this.id = id; this.running = false; }
+  async steer(text) {
+    if (!this.activeClient || !this.activeTurnId) return false;
+    return this.activeClient.steerTurn(this.id, this.activeTurnId, text);
+  }
   async runStreamed(input, options = {}) { return { events: this.execute(input, options) }; }
   async *execute(input, { signal, outputSchema } = {}) {
     if (this.running) throw new Error('A turn is already running on this thread');
@@ -266,6 +281,7 @@ export class Thread {
         ...(opts.model ? { model: opts.model } : {}),
         ...(opts.modelReasoningEffort ? { effort: opts.modelReasoningEffort } : {}), ...(outputSchema ? { outputSchema } : {}) });
       turnId = result.turn.id;
+      this.activeClient = client; this.activeTurnId = turnId;
       signal?.addEventListener('abort', abort, { once: true });
       if (signal?.aborted) abort();
       const adapter = new AppServerEventAdapter();
@@ -281,6 +297,7 @@ export class Thread {
       }
       throw new Error('App Server stream ended before turn completion');
     } finally {
+      this.activeClient = undefined; this.activeTurnId = undefined;
       signal?.removeEventListener('abort', abort);
       await stream?.return();
       await client?.close();

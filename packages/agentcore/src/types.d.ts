@@ -140,6 +140,8 @@ export type TurnCompletedEvent = {
 export type TurnFailedEvent = {
     type: "turn.failed";
     error: ThreadError;
+    /** True when the native turn ended because it was interrupted or cancelled. */
+    cancelled?: boolean;
 };
 /** Emitted when a new item is added to the thread. Typically the item is initially "in progress". */
 export type ItemStartedEvent = {

@@ -27,6 +27,8 @@ export interface SandboxRuntime {
   run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
   recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
   detach(turn: Turn): void;
+  interrupt?(session: Session, turn: Turn): Promise<void>;
+  steer?(session: Session, turn: Turn, text: string): Promise<boolean>;
   service?(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response>;
   file(session: WorkspaceTarget, path: string, signal?: AbortSignal): Promise<WorkspaceFileResult>;
   fileResponse?(session: WorkspaceTarget, path: string, request: Request): Promise<Response>;
@@ -325,10 +327,17 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       ...(rawTurn.completedAt ? { completedAt: new Date(rawTurn.completedAt * 1000).toISOString() } : {}),
       ...(rawTurn.error?.message ? { error: rawTurn.error.message } : {}) };
     const adapter = new AppServerEventAdapter();
+    let hasOriginalPrompt = false;
     for (const entry of rawTurn.items ?? []) {
       const item = entry.item ?? entry;
       if (item.type === 'userMessage') {
-        turn.prompt = (item.content ?? []).filter((part: any) => part.type === 'text').map((part: any) => part.text ?? '').join('');
+        const text = (item.content ?? []).filter((part: any) => part.type === 'text').map((part: any) => part.text ?? '').join('');
+        if (!hasOriginalPrompt) {
+          turn.prompt = text;
+          hasOriginalPrompt = true;
+        } else {
+          (turn.additionalUserInputs ??= []).push(text);
+        }
         continue;
       }
       const converted = adapter.convert(item);
@@ -398,7 +407,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
           return;
         }
         if (native.status === 'failed' || native.status === 'cancelled') {
-          yield { type: 'turn.failed', error: { message: native.error ?? (native.status === 'cancelled' ? 'Turn cancelled' : 'Turn failed') } };
+          yield { type: 'turn.failed', ...(native.status === 'cancelled' ? { cancelled: true } : {}),
+            error: { message: native.error ?? (native.status === 'cancelled' ? 'Turn cancelled' : 'Turn failed') } };
           return;
         }
         await waitFor(1000, observerSignal);
@@ -507,6 +517,17 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         ...(options.cursor ? { cursor: options.cursor } : {}) });
       return { turns: (response.data ?? []).map((rawTurn: any) => this.mapAppServerTurn(rawTurn)), nextCursor: response.nextCursor ?? null };
     }, options.signal).catch(error => { throw this.safeError(error); });
+  }
+  async steer(session: Session, turn: Turn, text: string): Promise<boolean> {
+    if (!session.sandbox || !session.threadId || !turn.nativeTurnId) return false;
+    return this.reader.read(session.sandbox.id, client => client.steerTurn(session.threadId!, turn.nativeTurnId!, text));
+  }
+  async interrupt(session: Session, turn: Turn): Promise<void> {
+    if (!session.sandbox || !session.threadId || !turn.nativeTurnId) {
+      throw new Error('App Server turn interruption information is incomplete');
+    }
+    await this.reader.read(session.sandbox.id, client =>
+      client.turnInterrupt({ threadId: session.threadId!, turnId: turn.nativeTurnId! }));
   }
   async subagents(session: Session, signal?: AbortSignal): Promise<SubagentConversation[]> {
     if (!session.threadId) return [];

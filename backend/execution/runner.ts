@@ -15,7 +15,10 @@ type TurnExecutionDependencies = {
   publish(message: StreamMessage): void;
   snapshot(): Session;
   updateSandbox(sandbox: NonNullable<Session['sandbox']>): Promise<void>;
+  /** Whether this process still owns the right to persist this execution. */
+  canPersist?(): boolean;
   recovering?: boolean;
+  onSteer?(steer: (text: string) => Promise<boolean>): void;
 };
 
 /** Runs one turn and persists each event before publishing it to subscribers. */
@@ -23,6 +26,13 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
   const { client, sandbox, logger, save, publish, snapshot, updateSandbox } = dependencies;
   let terminalFailure: string | undefined;
   let detached = false;
+  let ownershipLost = false;
+  const assertCanPersist = () => {
+    if (dependencies.canPersist && !dependencies.canPersist()) {
+      ownershipLost = true;
+      throw new TurnObserverDetached();
+    }
+  };
   const started = Date.now();
   const log = (event: string, extra: Record<string, unknown> = {}) => {
     void logger?.write({ event, sessionId: session.id, projectId: session.projectId, turnId: turn.id,
@@ -31,23 +41,31 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
   };
   log('turn.started');
   try {
+    assertCanPersist();
     const { model, executionMode, ...settings } = session.settings;
     const options: ThreadOptions = { ...settings, ...(model ? { model } : {}), approvalPolicy: 'never', skipGitRepoCheck: true };
     let events: AsyncGenerator<AgentEvent>;
     if (executionMode === 'sandbox') {
       if (!sandbox) throw new HttpError(503, 'Sandbox 未配置，无法运行此沙箱会话');
       const observe = dependencies.recovering ? sandbox.recover.bind(sandbox) : sandbox.run.bind(sandbox);
-      events = observe(session, turn, controller.signal, sandbox => updateSandbox(sandbox));
+      if (sandbox.steer) dependencies.onSteer?.(text => sandbox.steer!(session, turn, text));
+      events = observe(session, turn, controller.signal, async sandbox => {
+        assertCanPersist();
+        await updateSandbox(sandbox);
+        assertCanPersist();
+      });
     } else {
       const thread: Thread = session.threadId ? client.resumeThread(session.threadId, options) : client.startThread(options);
+      dependencies.onSteer?.(text => thread.steer(text));
       const input: Input = turn.images.length ? [{ type: 'text', text: turn.prompt }, ...turn.images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
       ({ events } = await thread.runStreamed(input, { signal: controller.signal }));
     }
     let terminal = Boolean(dependencies.recovering && (turn.status === 'completed' || turn.status === 'failed'));
     for await (const event of events) {
+      assertCanPersist();
       // The CLI can emit the actual failure before throwing a generic nonzero
       // exit error. Only retain a terminal failure, never a recovered retry.
-      if (event.type === 'turn.failed') terminalFailure = event.error.message.trim() ? event.error.message : undefined;
+      if (event.type === 'turn.failed') terminalFailure = !event.cancelled && event.error.message.trim() ? event.error.message : undefined;
       else if (event.type === 'turn.started' || event.type === 'turn.completed') terminalFailure = undefined;
       if (event.type === 'thread.started') session.threadId = event.thread_id;
       if (event.type === 'runtime.context_usage') session.contextUsage = { ...event.contextUsage };
@@ -67,7 +85,9 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
         });
       }
       if (event.type === 'turn.completed' || event.type === 'turn.failed') terminal = true;
+      assertCanPersist();
       await save();
+      assertCanPersist();
       publish({ type: 'sdk', turnId: turn.id, event });
     }
     if (!terminal) throw new Error(turn.error || 'Codex 事件流提前结束，未收到完成事件');
@@ -81,6 +101,7 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
       else delete turn.error;
     }
   } finally {
+    if (ownershipLost || dependencies.canPersist?.() === false) return;
     if (detached) {
       turn.phase = 'recovering';
       session.status = 'running';
@@ -103,7 +124,9 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
     session.status = turn.status;
     session.updatedAt = turn.completedAt;
     log('turn.finished', { status: turn.status, durationMs: Date.now() - started, error: turn.error });
+    if (dependencies.canPersist && !dependencies.canPersist()) { ownershipLost = true; return; }
     await save();
+    if (dependencies.canPersist && !dependencies.canPersist()) { ownershipLost = true; return; }
     publish({ type: 'state', session: snapshot() });
   }
 }

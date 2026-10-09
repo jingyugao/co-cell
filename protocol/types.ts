@@ -67,6 +67,8 @@ export interface Turn {
   segment?: number;
   compactions?: Array<{ segment: number; timestamp: string; beforeItemIndex: number }>;
   nativeTurnId?: string;
+  /** User messages injected into an accepted native turn after its original prompt. */
+  additionalUserInputs?: string[];
   /** Confirmed by the App Server turn.started event, not by saving a web submission. */
   codexAccepted?: boolean;
   /** Browser-only failure observed by the currently open page. Never persisted. */
@@ -95,6 +97,8 @@ export interface ProjectSandboxOperation {
   /** Resume completion confirms runtime restoration; health diagnostics do not gate it. */
 	/** Persisted intention ID used for remote operation idempotency. */
 	id?: string;
+  /** Image reserved by an in-flight or uncertain archived restore. */
+  imageSelection?: ProjectImageSelection;
   kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild';
   phase: string;
   status: 'running' | 'failed' | 'succeeded';

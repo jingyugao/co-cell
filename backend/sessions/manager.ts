@@ -1,3 +1,4 @@
+import type { ModelService } from '../models/service.js';
 import { traced, traceEvent } from '@co-cell/sandbox';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -142,6 +143,8 @@ export class SessionManager {
   }
 
 	get remoteArchives() { return this.sandbox?.remoteArchives; }
+  private models?: ModelService;
+  setModelService(models: ModelService) { this.models = models; }
   setImageCatalog(catalog: ImageCatalog) { this.imageCatalog = catalog; }
 
   get sharedStateEnabled() { return Boolean(this.coordinator); }
@@ -1291,9 +1294,13 @@ export class SessionManager {
         || (input.settings?.workingDirectory && posix.normalize(input.settings.workingDirectory) !== project.workingDirectory))) throw new HttpError(400, '会话必须使用项目的执行环境和工作目录');
       const executionMode = project?.executionMode ?? input.settings?.executionMode ?? this.defaults.executionMode;
       if (input.threadId && executionMode === 'sandbox') throw new HttpError(400, 'Sandbox 项目不能导入本机 thread，请在已有 Sandbox 会话中继续');
-      const settings = await this.validateSettings({ ...this.defaults,
+      const modelDefaults = await this.models?.defaultSelection();
+      const proposed = { ...this.defaults, ...modelDefaults,
         ...(executionMode !== this.defaults.executionMode ? { networkAccessEnabled: executionMode === 'sandbox' } : {}), ...input.settings,
-        ...(project ? { executionMode: project.executionMode, workingDirectory: project.workingDirectory } : {}), });
+        ...(project ? { executionMode: project.executionMode, workingDirectory: project.workingDirectory } : {}), };
+      if (input.settings?.model !== undefined && !input.settings.modelEntryId) delete proposed.modelEntryId;
+      const selected = await this.models?.selection(proposed, true);
+      const settings = await this.validateSettings({ ...proposed, ...(selected ? { model: selected.model, modelEntryId: selected.modelEntryId } : {}) });
       if (!project && settings.executionMode === 'sandbox') {
         project = await this.projects.create({ name: input.title ?? '新项目' }, settings);
         // A caller creating a session without a project waits for its implicit
@@ -1322,7 +1329,11 @@ export class SessionManager {
     }
     if (input.settings?.executionMode && input.settings.executionMode !== (session.settings.executionMode || 'local')) throw new HttpError(400, '已有会话不能切换执行环境，请新建任务');
     if (session.projectId && input.settings?.workingDirectory && posix.normalize(input.settings.workingDirectory) !== session.settings.workingDirectory) throw new HttpError(400, '项目会话不能修改工作目录');
-    const settings = input.settings ? await this.validateSettings({ ...session.settings, ...input.settings }) : normalizeExecutionSettings(session.settings);
+    const proposed = { ...session.settings, ...input.settings };
+    if (input.settings?.model !== undefined && !input.settings.modelEntryId && input.settings.model !== session.settings.model) delete proposed.modelEntryId;
+    const changedModel = proposed.model !== session.settings.model || proposed.modelEntryId !== session.settings.modelEntryId;
+    const selected = changedModel ? await this.models?.selection(proposed, true) : undefined;
+    const settings = input.settings ? await this.validateSettings({ ...proposed, ...(selected ? { model: selected.model, modelEntryId: selected.modelEntryId } : {}) }) : normalizeExecutionSettings(session.settings);
     this.lookup(id);
     // Re-check after filesystem validation so a concurrent turn cannot change settings mid-run.
     if (this.active.has(id)) throw new HttpError(409, '任务正在执行');
@@ -1582,6 +1593,7 @@ export class SessionManager {
       }
     }
     if (this.active.has(id) || running()) throw new HttpError(409, '当前会话已有任务正在执行');
+    await this.models?.selection(session.settings);
     if (session.projectId && session.settings.executionMode === 'sandbox') {
       await this.ensureProjectSandbox(session.projectId);
       if (this.closing) throw new HttpError(503, '服务正在关闭');

@@ -10,6 +10,7 @@ import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxLease, Sandbox
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import { readCellboxWorkspaceFile, cellboxWorkspaceFileResponse } from '../sandboxes/cellbox-files.js';
 import { holdResponse } from '../../util/http-stream.js';
+import type { ThreadOptions } from '../../packages/agentcore/src/index.mjs';
 import type { AgentEvent } from '../../protocol/types.js';
 import type { Session, SubagentConversation, Turn } from '../../protocol/types.js';
 import type { NativeHistory } from './native-history.mjs';
@@ -69,6 +70,7 @@ export interface ContainerRuntimeOptions {
   apiKey: string;
   baseUrl?: string;
   modelConfig?: Record<string, unknown>;
+  resolveModel?: (session: Session) => Promise<Pick<ThreadOptions, 'model' | 'modelProvider' | 'providerConfig'>>;
   configOverrides?: string[];
   sharedDataDirectory?: URL;
   sharedFilesMounted?: (sandboxId: string) => boolean;
@@ -277,6 +279,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     let connection: Awaited<ReturnType<AppServerReader['acquire']>> | undefined;
     let detached = false;
     try {
+      const modelOptions = await this.options.resolveModel?.(session);
       entry = await this.acquire(session, true, onSandbox, turn.id, startupSignal);
       // Publish the global AGENTS.md and shared docs before every turn.
       await this.prepareEnvironment(session, entry, startupSignal);
@@ -295,7 +298,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         configOverrides: this.options.configOverrides, appServerClient: connection.client });
       this.appServerObservers.set(turn.id, codex);
       observer.signal.throwIfAborted();
-      const options = { workingDirectory: session.settings.workingDirectory, ...(session.settings.model ? { model: session.settings.model } : {}),
+      const options = { workingDirectory: session.settings.workingDirectory, ...(session.settings.model ? { model: session.settings.model } : {}), ...modelOptions,
         modelReasoningEffort: session.settings.modelReasoningEffort, sandboxMode: 'danger-full-access' as const,
         webSearchMode: session.settings.webSearchMode, networkAccessEnabled: true, approvalPolicy: 'never' as const, skipGitRepoCheck: true };
       const thread = session.threadId ? codex.resumeThread(session.threadId, options) : codex.startThread(options);

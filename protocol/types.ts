@@ -58,6 +58,8 @@ export interface Settings {
   executionMode?: 'local' | 'sandbox';
   workingDirectory: string;
   model: string;
+  /** Stable channel-model identity; absent on legacy sessions. */
+  modelEntryId?: string;
   modelReasoningEffort: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'persistent';
   sandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access';
   webSearchMode: 'disabled' | 'cached' | 'live';
@@ -266,6 +268,7 @@ export interface SandboxInventory {
   sandboxes: SandboxRecord[];
 }
 export interface AppConfig {
+  modelOptions?: import('./model-types.js').ModelOption[];
   /** Models discovered from the configured upstream, when available. */
   models?: string[];
   localWorkingDirectory?: string;

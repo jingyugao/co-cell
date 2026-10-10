@@ -9,6 +9,7 @@ const settingsSchema = z.object({
   executionMode: z.enum(['local', 'sandbox']),
   workingDirectory: z.string().trim().min(1).max(4096),
   model: z.string().trim().max(200),
+  modelEntryId: z.string().trim().min(1).max(100),
   modelReasoningEffort: z.enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent']),
   sandboxMode: z.enum(['read-only', 'workspace-write', 'danger-full-access']),
   webSearchMode: z.enum(['disabled', 'cached', 'live']),

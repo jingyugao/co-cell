@@ -1,3 +1,5 @@
+import { ModelService } from './models/service.js';
+import { ModelGateway } from './models/gateway.js';
 import { initializeTracing } from './infra/diagnostics/tracing.js';
 import { ImageCatalog } from './images/service.js';
 import { createServer } from 'node:http';
@@ -65,8 +67,14 @@ if (process.env.SANDBOX_PROVIDER && process.env.SANDBOX_PROVIDER !== 'cellbox') 
 const cellboxKind=process.env.CELLBOX_KIND??'k8s-resumable';
 if(cellboxKind!=='k8s-resumable')throw new Error('This CoCell Cellbox adapter requires CELLBOX_KIND=k8s-resumable');
 const cocellPublicUrl = process.env.COCELL_PUBLIC_URL || `http://127.0.0.1:${port}`;
-const appServerArguments=appServerArgs(modelConfig, configOverrides).slice(1);
-const appServerEnv = {...(apiKey?{CODEX_API_KEY:apiKey}:{}),...(process.env.OPENAI_BASE_URL?{OPENAI_BASE_URL:process.env.OPENAI_BASE_URL}:{}),
+// Managed threads supply a scoped gateway provider. Do not publish upstream keys
+// into Sandbox startup environments or shared runtime configuration.
+const sandboxModelConfig = process.env.OPENAI_BASE_URL ? { ...modelConfig, model_provider: 'cocell_managed',
+  model_providers: { cocell_managed: { name: 'CoCell managed models',
+    base_url: `${toolBrokerUrl.replace(/\/$/, '')}/api/model-runtime/unconfigured/v1`,
+    wire_api: 'responses', supports_websockets: false, requires_openai_auth: false } } } : modelConfig;
+const appServerArguments=appServerArgs(sandboxModelConfig, configOverrides).slice(1);
+const appServerEnv = {...(apiKey && !process.env.OPENAI_BASE_URL ? {CODEX_API_KEY:apiKey} : {}),
   ...(process.env.CODEX_MODEL_METADATA_JSON ? { CODEX_MODEL_METADATA_JSON: process.env.CODEX_MODEL_METADATA_JSON } : {})};
 const sharedDirectory = await loadSharedMountConfig();
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
@@ -101,7 +109,8 @@ let availableModels = [...MODEL_OPTIONS];
 if (process.env.OPENAI_BASE_URL) {
   try {
     const modelsUrl = new URL('models', `${process.env.OPENAI_BASE_URL.replace(/\/+$/, '')}/`);
-    const response = await fetch(modelsUrl, { headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {} });
+    const response = await fetch(modelsUrl, { headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+      redirect: 'error', signal: AbortSignal.timeout(15_000) });
     if (response.ok) {
       const body = await response.json() as { data?: Array<{ id?: unknown }> };
       const discovered = (body.data ?? []).map(item => typeof item.id === 'string' ? item.id.trim() : '').filter(Boolean);
@@ -109,6 +118,8 @@ if (process.env.OPENAI_BASE_URL) {
     } else runtimeLog.write({ event: 'models.discovery_failed', status: response.status });
   } catch (error) { runtimeLog.write({ event: 'models.discovery_failed', error }); }
 }
+const models = new ModelService(webState.modelRepository, secretCrypto, { endpoint: process.env.OPENAI_BASE_URL, apiKey, model: defaults.model, models: availableModels });
+const modelGateway = new ModelGateway(models, secretCrypto, toolBrokerUrl, webState.modelRuntimeRepository, proxyKind !== 'new-api');
 const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_MS ?? 60 * 60 * 1000);
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
 const sandboxManager = new SandboxManager({ provider, logger: runtimeLog,
@@ -116,6 +127,7 @@ const sandboxManager = new SandboxManager({ provider, logger: runtimeLog,
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
 const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
+  resolveModel: session => modelGateway.threadOptions(session),
   logger: runtimeLog, baseUrl: process.env.OPENAI_BASE_URL, modelConfig, configOverrides,
   sharedDataDirectory: pathToFileURL(`${sharedDataRoot}/`),
   ...(sharedDirectory ? { sharedFilesMounted: (id: string) => cellboxRuntime.usesSharedDirectory(id) } : {}),
@@ -133,8 +145,9 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
     autoCheckpointAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   }, notifications, coordinator);
+manager.setModelService(models);
 // Project tables must exist before the Secret schema's foreign keys are created.
-const initializeSchemas = async () => { await webState.init(); await notifications.init(); await secrets.init(); };
+const initializeSchemas = async () => { await webState.init(); await notifications.init(); await secrets.init(); await models.init(); await webState.modelRuntimeRepository.init(); };
 if (coordinator) await coordinator.run('cocell-schema-init', initializeSchemas);
 else await initializeSchemas();
 await manager.init();
@@ -174,7 +187,7 @@ const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
   inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), undefined, notifications,
-  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,projects:()=>manager.listProjects() }, imageCatalog, secrets);
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,projects:()=>manager.listProjects() }, imageCatalog, secrets, models, modelGateway);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }

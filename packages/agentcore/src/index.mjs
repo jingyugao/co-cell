@@ -273,13 +273,20 @@ export class Thread {
       this.codex.streams.add(stream);
       const opts = this.options;
       const threadConfig = {
+        ...(opts.providerConfig ?? {}),
         ...(opts.webSearchMode ? { web_search: opts.webSearchMode } : {}),
         ...(opts.networkAccessEnabled !== undefined ? { 'sandbox_workspace_write.network_access': opts.networkAccessEnabled } : {}),
         ...(opts.additionalDirectories?.length ? { 'sandbox_workspace_write.writable_roots': opts.additionalDirectories } : {}),
       };
-      const params = { ...(opts.model ? { model: opts.model } : {}), cwd: opts.workingDirectory,
+      const params = { ...(opts.model ? { model: opts.model } : {}), ...(opts.modelProvider ? { modelProvider: opts.modelProvider } : {}), cwd: opts.workingDirectory,
         approvalPolicy: opts.approvalPolicy ?? 'never', sandbox: opts.sandboxMode ?? 'workspace-write', config: threadConfig };
-      const response = await client.request(this.id ? 'thread/resume' : 'thread/start', { ...params, ...(this.id ? { threadId: this.id } : {}) });
+      let response = await client.request(this.id ? 'thread/resume' : 'thread/start', { ...params, ...(this.id ? { threadId: this.id } : {}) });
+      // Loaded App Server threads retain their original provider on resume.
+      // Adopt the managed session gateway once by forking the full native history.
+      // Subsequent turns keep that provider and thread, changing only the gateway route.
+      if (this.id && opts.modelProvider && response.modelProvider && response.modelProvider !== opts.modelProvider) {
+        response = await client.request('thread/fork', { ...params, threadId: this.id });
+      }
       this.id = response.thread.id;
       yield { type: 'thread.started', thread_id: this.id };
       signal?.throwIfAborted();

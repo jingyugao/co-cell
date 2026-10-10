@@ -1,3 +1,5 @@
+import { MySqlModelRuntimeRepository } from '../../models/runtime-repository.js';
+import { MySqlModelRepository } from '../../models/repository.js';
 import { traced } from '@co-cell/sandbox';
 import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
@@ -70,10 +72,14 @@ function requireMySqlUrl(value: string | undefined): string {
 /** Web metadata and sandbox-local ~/.codex are intentionally separate. */
 export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   private pool: Pool;
+  readonly modelRuntimeRepository: MySqlModelRuntimeRepository;
+  readonly modelRepository: MySqlModelRepository;
   readonly secretRepository: MySqlSecretRepository;
   readonly notificationRepository: MySqlNotificationRepository;
   constructor(url: string) {
     this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' });
+    this.modelRuntimeRepository = new MySqlModelRuntimeRepository(this.pool);
+    this.modelRepository = new MySqlModelRepository(this.pool);
     this.secretRepository = new MySqlSecretRepository(this.pool);
     this.notificationRepository = new MySqlNotificationRepository(this.pool);
   }

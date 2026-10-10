@@ -103,6 +103,7 @@ export interface ProjectSandboxOperation {
 	id?: string;
   /** Image reserved by an in-flight or uncertain archived restore. */
   imageSelection?: ProjectImageSelection;
+  /** Checkpoint includes a verified workspace backup before completion; backup is a legacy operation kind. */
   kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild';
   phase: string;
   status: 'running' | 'failed' | 'succeeded';

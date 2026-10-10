@@ -55,6 +55,8 @@ export const test = base.extend({
         else if (method === 'POST' && path.endsWith('/open')) {
           status = 202;
           if (data.sandbox?.status === 'paused' && data.sandboxOperation?.status !== 'running') data.sandboxOperation = operation('resume');
+        } else if (method === 'POST' && path.endsWith('/sandbox/checkpoint')) {
+          data.sandboxOperation = operation('checkpoint'); status = 202;
         } else if (method === 'POST' && path.endsWith('/rebuild')) { data.sandboxOperation = operation(data.sandbox ? 'rebuild' : 'create'); status = 202; }
       } else if (path === '/api/sessions' && method === 'GET') data = [session];
       else if (path === '/api/sessions/old-session/events') {

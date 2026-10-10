@@ -19,18 +19,18 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
   return renderToStaticMarkup(<ProjectsPage
     projects={projects} config={config} loading={false} initialView={initialView}
     onRefresh={async () => projects} onCreate={async () => project()} onUpdate={async () => project()}
-    onRebuildSandbox={async () => project()} onBackup={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()}
+    onRebuildSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()}
     onOpenProject={() => {}} onMenu={() => {}} onBack={() => {}}
   />);
 }
 
-test('normal sandbox exposes backup and archive, with only the latest backup', () => {
+test('normal sandbox offers checkpoint backup without standalone backup', () => {
   const html = page([project({ sandbox: { id: 'current', status: 'ready', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);
   assert.match(html, /就绪/);
   assert.match(html, /Checkpoint · 暂停/);
   assert.match(html, /aria-label="项目操作"/);
   assert.match(html, /aria-label="Sandbox 操作"/);
-  assert.match(html, /立即备份/);
+  assert.doesNotMatch(html, /立即备份/);
   assert.doesNotMatch(html, /归档项目/);
   assert.match(html, /最新备份/);
   assert.doesNotMatch(html, /查看归档|备份记录|历史备份/);

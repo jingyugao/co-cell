@@ -33,7 +33,7 @@ test('sweep archives only completed Sandbox projects after the grace period', as
   }, now: () => now });
   await service.sweep();
   assert.deepEqual(reclaimed, ['eligible', 'paused']);
-  assert.deepEqual(existingBackups, ['eligible', 'paused']);
+  assert.deepEqual(existingBackups, [], 'automatic reclamation must preserve the latest disk contents');
   await service.close();
 });
 

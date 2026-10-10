@@ -306,9 +306,12 @@ test('a remote viewer observes an accepted turn when reloaded sandbox metadata h
   } finally { f.control.terminal.resolve('completed'); await f.close(); }
 });
 
-test('scheduled archive leaves a newly created project alone until its archive interval elapses', async () => {
+test('scheduler never periodically backs up a running project, even after the former interval', async () => {
   const f = await fixture();
   try {
+    const project = (await f.state.getProject(f.projectId))!;
+    project.createdAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    await f.state.saveProject(project);
     const api = await f.start();
     await api.scheduledArchive();
     assert.equal(f.control.archiveCaptures, 0);

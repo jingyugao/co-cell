@@ -123,7 +123,8 @@ export class CellboxClient {
   private request<T>(method: string, path: string, options: {
     body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
   } = {}): Promise<T> {
-    return traced('cellbox.http', { 'http.request.method': method, 'url.path': path.split('?')[0] },
+    return traced('cellbox.http', { 'http.request.method': method, 'url.path': path.split('?')[0],
+      'http.request.timeout_ms': options.timeoutMs ?? this.requestTimeoutMs },
       () => this.requestImpl<T>(method, path, options));
   }
   private async requestImpl<T>(method: string, path: string, options: {
@@ -222,8 +223,9 @@ export class CellboxClient {
   restoreBox(input: { profileId: string; ownerKey: string; archiveId: string; importedImageId?: string; acceptImageChange?: boolean }, key: string) {
     return this.request<CellboxOperation>('POST', '/v1/boxes:restore', { body: input, key });
   }
-  actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string) {
-    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { key });
+  actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string,
+    options: { timeoutMs?: number } = {}) {
+    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { key, timeoutMs: options.timeoutMs });
   }
   /** Purge owned artifacts after destruction; old APIs must fail rather than silently skip cleanup. */
   purgeBoxArtifacts(id: string) {

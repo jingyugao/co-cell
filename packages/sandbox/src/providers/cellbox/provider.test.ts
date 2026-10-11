@@ -8,6 +8,8 @@ import test from 'node:test';
 import { CellboxClient, CellboxError } from './client.js';
 import { CellboxSandboxProvider } from './provider.js';
 
+const wait = (milliseconds: number) => new Promise<void>(resolve => setTimeout(resolve, milliseconds));
+
 test('operation completion uses long polling immediately without a polling delay', async () => {
   let calls = 0;
   const operation = { id: 'op-resume', kind: 'resume', targetId: 'box-a', status: 'running' as const, version: 1, createdAt: new Date().toISOString() };
@@ -23,6 +25,71 @@ test('operation completion uses long polling immediately without a polling delay
   const result = provider.waitForOperation(operation, 1000);
   assert.equal(calls, 1);
   assert.equal((await result).status, 'succeeded');
+});
+
+test('resume waits for synchronous terminal response and skips operation polling', async () => {
+  const http = await fixture();
+  let finishResume!: () => void;
+  const gate = new Promise<void>(resolve => { finishResume = resolve; });
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s', operationTimeoutMs: 250 });
+    const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { cellboxIdempotencyKey: 'create-sync-resume', projectId: 'sync-resume' } });
+    await provider.checkpoint(box.sandboxId);
+    http.setResumeResponseMode('terminal');
+    http.setResumeGate(gate);
+    let resumeTimeoutMs: number | undefined;
+    const actBox = provider.client.actBox.bind(provider.client);
+    provider.client.actBox = (id, action, key, options) => {
+      if (action === 'resume') resumeTimeoutMs = options?.timeoutMs;
+      return actBox(id, action, key, options);
+    };
+    const beforeResume = http.calls.length;
+    let settled = false;
+    const connecting = provider.connect(box.sandboxId).finally(() => { settled = true; });
+    for (let attempt = 0; attempt < 50 && !http.calls.slice(beforeResume).some(call => call.path.endsWith(':resume')); attempt++) await wait(1);
+    assert(http.calls.slice(beforeResume).some(call => call.path.endsWith(':resume')));
+    await wait(10);
+    assert.equal(settled, false, 'connect remains pending until the resume response is terminal');
+    finishResume();
+    await connecting;
+    assert.equal(resumeTimeoutMs, 60_250, 'resume HTTP timeout includes the configured operation limit plus response margin');
+    assert.equal((await provider.getInfo(box.sandboxId)).state, 'running');
+    assert.equal(http.calls.slice(beforeResume).filter(call => call.method === 'GET' && call.path.startsWith('/v1/operations/')).length, 0);
+  } finally { finishResume(); await http.close(); }
+});
+
+test('resume propagates a synchronous terminal error without polling', async () => {
+  const http = await fixture();
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
+    const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { cellboxIdempotencyKey: 'create-sync-resume-error', projectId: 'sync-resume-error' } });
+    await provider.checkpoint(box.sandboxId);
+    http.setResumeResponseMode('error');
+    const beforeResume = http.calls.length;
+    await assert.rejects(provider.connect(box.sandboxId), error => error instanceof CellboxError
+      && error.code === 'TIMEOUT' && error.message === 'resume startup timed out');
+    assert.equal(http.calls.slice(beforeResume).filter(call => call.method === 'GET' && call.path.startsWith('/v1/operations/')).length, 0);
+  } finally { await http.close(); }
+});
+
+test('resume request timeout reports unknown outcome without retrying the mutation', async () => {
+  let submissions = 0;
+  const client = new CellboxClient({ baseUrl: 'http://cellbox.test', fetch: async (_input, init) => {
+    submissions++;
+    return new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      if (signal?.aborted) { reject(new Error('aborted')); return; }
+      signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    });
+  } });
+  const keepAlive = setTimeout(() => {}, 100);
+  try {
+    await assert.rejects(client.actBox('box-a', 'resume', 'stable-resume-key', { timeoutMs: 10 }), error =>
+      error instanceof CellboxError && error.code === 'UNKNOWN_OUTCOME' && !error.message.includes('aborted'));
+  } finally { clearTimeout(keepAlive); }
+  assert.equal(submissions, 1);
 });
 
 const capabilities = { exec: true, files: true, http: true, websocket: true, pty: false,
@@ -64,6 +131,8 @@ async function fixture() {
   let fileContents: Buffer = Buffer.from('content');
   let profileProvider = 'resumable-k8s-pod';
   let pending = false;
+  let resumeResponseMode: 'accepted' | 'terminal' | 'error' = 'accepted';
+  let resumeGate: Promise<void> | undefined;
   let execResult = { stdout: '', stderr: '', exitCode: 0, truncated: false };
   let execOperationFails = false;
   let execState: 'exited' | 'unknown' = 'exited';
@@ -120,9 +189,14 @@ async function fixture() {
           rejection.update?.(box);
           json(res, 409, { error: { code: rejection.code, message: 'resume rejected' } }); return;
         }
+        if (action === 'resume' && resumeResponseMode === 'error') {
+          json(res, 502, { error: { code: 'TIMEOUT', message: 'resume startup timed out' } }); return;
+        }
+        if (action === 'resume') await resumeGate;
         box.phase = action === 'suspend' ? 'suspended' : action === 'resume' ? 'running' : 'deleted';
         if (action === 'resume') box.generation = (box.generation as number) + 1;
-        const value = op(action, boxMatch[1], { boxId: boxMatch[1] }); operations.set(value.id, value); json(res, 202, value); return;
+        const value = op(action, boxMatch[1], { boxId: boxMatch[1] }); operations.set(value.id, value);
+        json(res, action === 'resume' && resumeResponseMode === 'terminal' ? 200 : 202, value); return;
       }
     }
     const execMatch = url.pathname.match(/^\/v1\/boxes\/(box-[^/]+)\/execs$/);
@@ -163,6 +237,8 @@ async function fixture() {
     setProfileProvider(value: string) { profileProvider = value; },
     setFileContents(value: Buffer) { fileContents = value; },
     setPending(value: boolean) { pending = value; },
+    setResumeResponseMode(value: typeof resumeResponseMode) { resumeResponseMode = value; },
+    setResumeGate(value: Promise<void> | undefined) { resumeGate = value; },
     rejectResume(code: string, update?: (box: Record<string, unknown>) => void) { resumeRejection = { code, update }; },
     setExecResult(value: typeof execResult) { execResult = value; },
     setExecOperationFails(value: boolean) { execOperationFails = value; },

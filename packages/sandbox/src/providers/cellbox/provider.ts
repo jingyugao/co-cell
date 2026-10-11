@@ -142,10 +142,11 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   waitForOperation(op: CellboxOperation, timeoutMs?: number, signal?: AbortSignal) { return this.wait(op, timeoutMs, signal); }
   inspectOperation(id: string) { return this.client.getOperation(id); }
   private async act(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string) {
-    return this.wait(await this.client.actBox(id, action, key));
+    const timeoutMs = action === 'resume' ? this.maxWaitMs + 60_000 : undefined;
+    return this.wait(await this.client.actBox(id, action, key, { timeoutMs }));
   }
   private async resumeSuspended(box: CellboxBox) {
-    return traced('cellbox.resume.admission', { 'sandbox.id': box.id, 'sandbox.generation': box.generation }, async () => {
+    return traced('cellbox.resume.request', { 'sandbox.id': box.id, 'sandbox.generation': box.generation }, async () => {
       const key = `cocell-resume-${box.id}-${box.generation}`;
       try { await this.act(box.id, 'resume', key); }
       catch (error) {

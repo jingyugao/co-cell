@@ -1088,17 +1088,20 @@ export class SessionManager {
     if (this.closing) return;
     await this.refreshSharedState();
     const now = Date.now();
+    const idle = (project: Project) => {
+      if (project.status !== 'active' || !project.sandbox) return false;
+      const sessions = [...this.sessions.values()].filter(session => session.projectId === project.id);
+      const lastActivity = Math.max(Date.parse(project.sandbox.lastActiveAt ?? project.createdAt),
+        ...sessions.map(session => Date.parse(session.updatedAt)));
+      return !sessions.some(session => session.status === 'running') && now - lastActivity >= this.autoCheckpointAfterMs;
+    };
     for (const project of this.projects.list()) {
-      if (project.status === 'active' && project.sandbox) {
-        const sessions = [...this.sessions.values()].filter(session => session.projectId === project.id);
-        const lastActivity = Math.max(Date.parse(project.sandbox.lastActiveAt ?? project.createdAt),
-          ...sessions.map(session => Date.parse(session.updatedAt)));
-        if (!sessions.some(session => session.status === 'running') && now - lastActivity >= this.autoCheckpointAfterMs) {
-          const observed = await this.liveProject(project, true);
-          if (observed.sandbox?.status === 'ready') {
-            await this.checkpointProjectSandbox(project.id).catch(() => {});
-            continue;
-          }
+      if (idle(project)) {
+        const observed = await this.liveProject(project, true);
+        if (observed.sandbox?.status === 'ready') {
+          await this.startProjectOperation(project.id, () => this.sandboxOperations!.start(project.id, 'checkpoint'),
+            current => current.sandbox?.id === project.sandbox?.id && idle(current)).catch(() => {});
+          continue;
         }
       }
       if (project.status === 'archived' && !project.sandboxArtifactsCleanedAt) {

@@ -133,6 +133,19 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   private async act(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string) {
     return this.wait(await this.client.actBox(id, action, key));
   }
+  private async resumeSuspended(box: CellboxBox) {
+    const key = `cocell-resume-${box.id}-${box.generation}`;
+    try { await this.act(box.id, 'resume', key); }
+    catch (error) {
+      if (!(error instanceof CellboxError) || error.code !== 'OPERATION_EXPIRED') throw error;
+      // An expired key is a rejected admission, not an unknown mutation result.
+      // Recheck the suspension before submitting a fresh attempt. Never rotate
+      // keys on transport failures, changed generations or active operations.
+      const current = await this.box(box.id);
+      if (current.phase !== 'suspended' || current.generation !== box.generation || current.operationId) throw error;
+      await this.act(box.id, 'resume', `${key}-${randomUUID()}`);
+    }
+  }
   private async createJournal(ownerKey: string) {
     if (!this.stateDirectory) throw new CellboxError('INVALID_REQUEST', 'Create requires metadata.cellboxIdempotencyKey or provider stateDirectory');
     await mkdir(this.stateDirectory, { recursive: true, mode: 0o700 });
@@ -191,7 +204,7 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     await this.ready();
     let box = await this.box(id);
     if (box.phase === 'suspended') {
-      await this.act(id, 'resume', `cocell-resume-${id}-${box.generation}`);
+      await this.resumeSuspended(box);
       box = await this.box(id);
     }
     if (box.phase !== 'running') throw new CellboxError('CONFLICT', `Box ${id} is ${box.phase}`);
@@ -244,7 +257,7 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     const box = await this.box(id);
     if (checkpointId !== `cellbox-suspended:${id}:${box.generation}` || box.phase !== 'suspended')
       throw new CellboxError('CONFLICT', 'The same-node Cellbox suspension is no longer available');
-    await this.act(id, 'resume', `cocell-resume-${id}-${box.generation}`);
+    await this.resumeSuspended(box);
   }
   /** Explicit cold restart preserves the Box-owned HOME; never creates or restores a Box. */
   async rebuildPersistent(id: string, key: string) {

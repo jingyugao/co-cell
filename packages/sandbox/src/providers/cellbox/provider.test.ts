@@ -68,6 +68,7 @@ async function fixture() {
   let execOperationFails = false;
   let execState: 'exited' | 'unknown' = 'exited';
   let purgeUnavailable = false;
+  let resumeRejection: { code: string; update?: (box: Record<string, unknown>) => void } | undefined;
   const json = (res: ServerResponse, status: number, value: unknown) => {
     res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value));
   };
@@ -114,6 +115,11 @@ async function fixture() {
       if (req.method === 'GET') { json(res, 200, box); return; }
       if (boxMatch[2]) {
         const action = boxMatch[2];
+        if (action === 'resume' && resumeRejection) {
+          const rejection = resumeRejection; resumeRejection = undefined;
+          rejection.update?.(box);
+          json(res, 409, { error: { code: rejection.code, message: 'resume rejected' } }); return;
+        }
         box.phase = action === 'suspend' ? 'suspended' : action === 'resume' ? 'running' : 'deleted';
         if (action === 'resume') box.generation = (box.generation as number) + 1;
         const value = op(action, boxMatch[1], { boxId: boxMatch[1] }); operations.set(value.id, value); json(res, 202, value); return;
@@ -157,12 +163,51 @@ async function fixture() {
     setProfileProvider(value: string) { profileProvider = value; },
     setFileContents(value: Buffer) { fileContents = value; },
     setPending(value: boolean) { pending = value; },
+    rejectResume(code: string, update?: (box: Record<string, unknown>) => void) { resumeRejection = { code, update }; },
     setExecResult(value: typeof execResult) { execResult = value; },
     setExecOperationFails(value: boolean) { execOperationFails = value; },
     setExecState(value: 'exited' | 'unknown') { execState = value; },
     setPurgeUnavailable(value: boolean) { purgeUnavailable = value; },
     close: () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) };
 }
+
+for (const method of ['connect', 'restore'] as const) test(`${method} renews an expired resume key only after checking the same idle suspension`, async () => {
+  const http = await fixture();
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
+    const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { cellboxIdempotencyKey: 'create-resume', projectId: 'resume' } });
+    const checkpoint = await provider.checkpoint(box.sandboxId);
+    http.rejectResume('OPERATION_EXPIRED');
+    if (method === 'connect') await provider.connect(box.sandboxId);
+    else await provider.restore(box.sandboxId, checkpoint.id);
+    const attempts = http.calls.filter(call => call.path.endsWith(':resume'));
+    assert.equal(attempts.length, 2);
+    assert.notEqual(attempts[0].key, attempts[1].key);
+    const between = http.calls.slice(http.calls.indexOf(attempts[0]) + 1, http.calls.indexOf(attempts[1]));
+    assert(between.some(call => call.method === 'GET' && call.path === `/v1/boxes/${box.sandboxId}`));
+    assert.equal((await provider.getInfo(box.sandboxId)).state, 'running');
+  } finally { await http.close(); }
+});
+
+for (const scenario of ['unknown outcome', 'changed generation', 'running', 'active operation'] as const)
+  test(`resume does not rotate its key with ${scenario}`, async () => {
+    const http = await fixture();
+    try {
+      const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
+      const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+        metadata: { cellboxIdempotencyKey: 'create-resume', projectId: 'resume' } });
+      await provider.checkpoint(box.sandboxId);
+      const code = scenario === 'unknown outcome' ? 'UNKNOWN_OUTCOME' : 'OPERATION_EXPIRED';
+      http.rejectResume(code, current => {
+        if (scenario === 'changed generation') current.generation = Number(current.generation) + 1;
+        if (scenario === 'running') current.phase = 'running';
+        if (scenario === 'active operation') current.operationId = 'op-concurrent';
+      });
+      await assert.rejects(provider.connect(box.sandboxId), error => error instanceof CellboxError && error.code === code);
+      assert.equal(http.calls.filter(call => call.path.endsWith(':resume')).length, 1);
+    } finally { await http.close(); }
+  });
 
 test('destruction requires artifact purge and removes only the matching local create journal', async () => {
   const http = await fixture();

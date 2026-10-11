@@ -15,8 +15,14 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
   });
   await env.step('Checkpoint both projects; reads and rejected task submissions must not resume them', async () => {
     await Promise.all(projects.map(async project => {
+      await env.request(`/api/projects/${project.id}/backup`, { method: 'POST', expectedStatus: 409 });
       await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 });
-      await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+      const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+      const archive = checkpointed.remoteArchives?.[0];
+      assert(archive && archive.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(archive.sha256), 'Checkpoint did not publish a verified archive reference');
+      assert.equal(archive.sourceSandboxId, project.sandbox.id);
+      assert(Array.isArray(archive.threadIds));
+      project.checkpointArchiveId = archive.id;
       // An empty conversation is metadata and may be created while paused.
       // Executing a turn is the readiness boundary.
       const session = await env.json('/api/sessions', { method: 'POST', expectedStatus: 201, body: { projectId: project.id } });
@@ -35,7 +41,9 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
     const reopened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: 202 });
     assert.equal(reopened.sandboxOperation.id, ready.sandboxOperation.id);
     await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 });
-    await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+    const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+    assert.notEqual(checkpointed.remoteArchives?.[0]?.id, project.checkpointArchiveId, 'A later Checkpoint must publish a new archive reference');
+    assert.equal(checkpointed.remoteArchives?.[0]?.sourceSandboxId, project.sandbox.id);
     return { operationId: ready.sandboxOperation.id, sandboxId: ready.sandbox.id };
   });
   await env.step('Simultaneous entry into two paused projects completes both restores', async () => {

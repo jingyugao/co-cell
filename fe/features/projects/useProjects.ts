@@ -60,14 +60,11 @@ export function useProjects() {
   const rebuildSandbox = useCallback((id: string, imageVersionId?: string) => runSandboxOperation(id, projects.find(project => project.id === id)?.remoteArchives?.length ? 'restore' : 'create', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST', body: JSON.stringify(imageVersionId ? { imageVersionId } : {}) }),
   ), [projects, runSandboxOperation]);
-  const backupProject = useCallback((id: string) => runSandboxOperation(id, 'backup', () =>
-    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/backup`, { method: 'POST' }),
-  ), [runSandboxOperation]);
   const resumeSandbox = useCallback((id: string) => runSandboxOperation(id, 'resume', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/resume`, { method: 'POST' }),
   ), [runSandboxOperation]);
   const checkpointSandbox = useCallback((id: string) => runSandboxOperation(id, 'checkpoint', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/checkpoint`, { method: 'POST' }),
   ), [runSandboxOperation]);
-  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, rebuildSandbox, backupProject, resumeSandbox, checkpointSandbox };
+  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, rebuildSandbox, resumeSandbox, checkpointSandbox };
 }

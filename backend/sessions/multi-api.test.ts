@@ -306,13 +306,57 @@ test('a remote viewer observes an accepted turn when reloaded sandbox metadata h
   } finally { f.control.terminal.resolve('completed'); await f.close(); }
 });
 
-test('scheduled archive leaves a newly created project alone until its archive interval elapses', async () => {
+test('scheduler never periodically backs up a running project, even after the former interval', async () => {
   const f = await fixture();
   try {
+    const project = (await f.state.getProject(f.projectId))!;
+    project.createdAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    await f.state.saveProject(project);
     const api = await f.start();
     await api.scheduledArchive();
     assert.equal(f.control.archiveCaptures, 0);
     assert.equal((await f.state.getProject(f.projectId))?.sandboxOperation, undefined);
+  } finally { await f.close(); }
+});
+
+for (const pending of ['archive', 'source', 'cleanup'] as const) test(`scheduler discards stale ${pending} cleanup after another API finishes`, async () => {
+  const f = await fixture();
+  try {
+    const api = await f.start();
+    const project = (await f.state.getProject(f.projectId))!;
+    project.status = pending === 'archive' ? 'archived' : 'completed';
+    if (pending === 'source') project.archiveCleanupSourceId = project.sandbox!.id;
+    if (pending === 'cleanup') project.pendingSandboxCleanup = [project.sandbox!];
+    await f.state.saveProject(project);
+    const originalRun = f.coordinator.run.bind(f.coordinator);
+    const originalAcquire = f.coordinator.tryAcquire.bind(f.coordinator);
+    let maintenanceAcquisitions = 0;
+    f.coordinator.tryAcquire = async key => {
+      if (key === `project-maintenance:${f.projectId}`) maintenanceAcquisitions++;
+      return originalAcquire(key);
+    };
+    let refreshed = false;
+    f.coordinator.run = async (key, action) => {
+      if (key === `project-control:${f.projectId}` && !refreshed) {
+        refreshed = true;
+        // The other API finishes after the scan, before this API gets control.
+        project.status = 'archived';
+        project.sandboxArtifactsCleanedAt = new Date().toISOString();
+        delete project.sandbox;
+        delete project.archiveCleanupSourceId;
+        delete project.pendingSandboxCleanup;
+        await f.state.saveProject(project);
+      }
+      return originalRun(key, action);
+    };
+    await api.scheduledArchive();
+    assert.equal(refreshed, true);
+    assert.equal((await f.state.getProject(f.projectId))?.sandboxOperation, undefined,
+      'An obsolete scan must not start another archive operation');
+    assert.equal(maintenanceAcquisitions, 0, 'An obsolete scan must not acquire maintenance');
+    const lease = await originalAcquire(`project-maintenance:${f.projectId}`);
+    assert.ok(lease, 'Completed cleanup must leave maintenance available');
+    await lease.release();
   } finally { await f.close(); }
 });
 

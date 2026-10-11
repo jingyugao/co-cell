@@ -22,15 +22,14 @@ export async function homeRebuild(env) {
     assert(result.text.trim(), 'Agent did not complete a real conversation');
     return result;
   };
-  await env.step('Prepare a workspace file and real conversation, then capture an archive', async () => {
+  await env.step('Prepare a workspace file and real conversation, then Checkpoint and verify its archive', async () => {
     await write(filename, before);
     assert.equal(await read(), before);
     initial = await record();
-    const backedUp = await env.json(`/api/projects/${project.id}/backup`, {
-      method: 'POST', body: {}, expectedStatus: 202, timeoutMs: env.config.operationTimeout,
-    });
-    assert.equal(backedUp.sandboxOperation.status, 'succeeded');
-    archive = backedUp.remoteArchives[0];
+    await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 202 });
+    const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+    archive = checkpointed.remoteArchives?.[0];
+    assert(archive, 'Checkpoint did not publish a workspace archive');
     assert(archive.sizeBytes > 0 && archive.threadIds.includes(initial.session.threadId));
     return { archiveId: archive.id, threadId: initial.session.threadId };
   });

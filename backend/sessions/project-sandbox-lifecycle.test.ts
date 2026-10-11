@@ -21,9 +21,11 @@ test('archiving deletes current and legacy attachment caches and blocks new uplo
   const box: SandboxState = { id: 'archive-box', status: 'ready', template: 'default', workingDirectory: defaults.workingDirectory };
   const reference = { id: 'archive-1', createdAt: new Date().toISOString(), sizeBytes: 10, sha256: 'a'.repeat(64),
     imageId: 'image', sourceSandboxId: box.id, threadIds: [] };
+  let paused = false;
   const runtime = {
     async close() {}, async rebuild(_target, save) { await save(box); },
-    async querySandbox(value) { return { ...value, status: 'ready' as const }; },
+    async querySandbox(value) { return { ...value, status: paused ? 'paused' as const : 'ready' as const }; },
+    async checkpoint(value) { paused = true; return { ...value.sandbox!, status: 'paused' as const }; },
     async verifySandbox() {}, async fenceSandbox() {}, async detachSandbox() {}, async deleteDanglingSandbox() {},
     remoteArchives: { async capture() { return reference; }, async inspect() { return reference; },
       async restore() { throw new Error('unused'); }, async activate() {} },
@@ -61,6 +63,7 @@ test('project creation verifies readiness; resume preserves the box without repe
   let saveBinding!: (value: SandboxState) => Promise<void>;
   let verifications = 0, inspections = 0, createCalls = 0, resumeCalls = 0, queryCalls = 0;
   let failVerification = false;
+  let failCapture = false;
   let failResume = false;
   let resumeBarrier = Promise.resolve();
   const runtime = {
@@ -78,6 +81,9 @@ test('project creation verifies readiness; resume preserves the box without repe
     async resume(target, save) { resumeCalls++; assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'ready' }; await save({ ...providerBox });
       await resumeBarrier;
       if (failResume) throw new Error('Runtime restore outcome unavailable'); },
+    remoteArchives: { async capture(target) { assert.equal(target.sandbox?.status, 'paused'); if (failCapture) throw new Error('archive storage unavailable'); return { id: 'archive-checkpoint', createdAt: new Date().toISOString(), sizeBytes: 10, sha256: 'a'.repeat(64), imageId: 'image', sourceSandboxId: box.id }; },
+      async inspect(ref) { return ref; }, async restore() { throw new Error('unused'); }, async activate() {} },
+    async fenceSandbox() {}, async detachSandbox() {}, async deleteDanglingSandbox() {},
     async delete(target) { assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'unavailable' }; await saveBinding({ ...providerBox }); },
   } satisfies Partial<SandboxRuntime>;
   const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
@@ -218,6 +224,11 @@ test('project creation verifies readiness; resume preserves the box without repe
     assert.equal(rebuilt.sandbox?.id, box.id);
     // Runtime persistence during deletion must respect the deletion guard
     // without failing or resurrecting the project.
+    failCapture = true;
+    await assert.rejects(manager.deleteProject(created.id), /archive storage unavailable/);
+    assert.equal((await manager.readProject(created.id)).sandbox?.status, 'paused');
+    assert.equal((await state.listProjects()).length, 1, 'failed backup must preserve project and source disk');
+    failCapture = false;
     await manager.deleteProject(created.id);
     assert.equal((await state.listProjects()).length, 0);
     assert.throws(() => manager.getProject(created.id), /不存在/);
@@ -256,5 +267,39 @@ test('rebuild endpoint chooses mounted HOME despite an existing older archive', 
     assert.equal(manager.getProject('mounted-project').sandbox?.id, box.id);
     assert.equal(manager.getProject('mounted-project').sandboxOperation?.status, 'succeeded');
     assert.equal(rebuilt, true);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('single-API idle checkpoint also backs up the paused workspace', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-idle-backup-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  let paused = false, captures = 0;
+  const runtime = {
+    async close() {},
+    async querySandbox(value) { return { ...value, status: paused ? 'paused' as const : 'ready' as const }; },
+    async checkpoint(value) { paused = true; return { ...value.sandbox!, status: 'paused' as const }; },
+    remoteArchives: { async capture(value) { assert.equal(value.sandbox?.status, 'paused'); captures++; return {
+      id: 'idle-archive', sourceSandboxId: 'idle-box', imageId: 'image', createdAt: new Date().toISOString(), sizeBytes: 10, sha256: 'a'.repeat(64),
+    }; }, async inspect(ref) { return ref; }, async restore() { throw new Error('unused'); }, async activate() {} },
+  } satisfies Partial<SandboxRuntime>;
+  await state.init();
+  await state.saveProject({ id: 'idle-project', name: 'idle project', status: 'active', executionMode: 'sandbox', requirementUrl: null,
+    workingDirectory: defaults.workingDirectory, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(),
+    sandbox: { id: 'idle-box', status: 'ready', template: 'default', workingDirectory: defaults.workingDirectory } });
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
+  try {
+    await manager.init();
+    await manager.scheduledArchive();
+    await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
+    assert.equal(paused, true);
+    assert.equal(captures, 1);
+    const project = await manager.readProject('idle-project');
+    assert.equal(project.sandboxOperation?.kind, 'checkpoint');
+    assert.equal(project.sandboxOperation?.status, 'succeeded');
+    assert.equal(project.remoteArchives?.[0].id, 'idle-archive');
+    await manager.scheduledArchive();
+    assert.equal(captures, 1, 'later scheduler ticks must not periodically back up a paused project');
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

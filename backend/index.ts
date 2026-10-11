@@ -123,7 +123,8 @@ const modelGateway = new ModelGateway(models, secretCrypto, toolBrokerUrl, webSt
 const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_MS ?? 60 * 60 * 1000);
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
 const sandboxManager = new SandboxManager({ provider, logger: runtimeLog,
-  policy: { autoCheckpointAfterMs: multiApi ? Number.MAX_SAFE_INTEGER : autoCheckpointAfterMs }, lifecycle: cellboxRuntime.lifecycle });
+  // Project lifecycle owns idle checkpoints so every pause includes its disk backup.
+  policy: { autoCheckpointAfterMs: Number.MAX_SAFE_INTEGER }, lifecycle: cellboxRuntime.lifecycle });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
 const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',

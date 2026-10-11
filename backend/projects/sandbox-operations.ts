@@ -100,6 +100,7 @@ export class ProjectSandboxOperations {
   /** Persist acceptance before returning; the caller can poll while the task runs. */
   async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
     const project = this.deps.projects.get(id);
+    if (kind === 'checkpoint' && project.status === 'archived') throw new HttpError(409, '已归档项目不能暂停');
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
     if (project.archiveCleanupSourceId && kind !== 'archive') throw new HttpError(409, '项目归档清理尚未完成，请先重试归档');
     const release = this.deps.projects.beginMaintenance(id);
@@ -146,7 +147,7 @@ export class ProjectSandboxOperations {
         else if (kind === 'resume') await this.resume(id);
         else if (kind === 'backup') {
           if (project.status === 'archived') throw new HttpError(409, '已归档项目不能立即备份');
-          await this.backup(id);
+          throw new HttpError(409, '请使用 Checkpoint 暂停并备份；运行中的项目不再单独备份');
         } else if (kind === 'refresh') await this.refreshRuntime(id);
         else await this.archive(id, options.useExistingBackup === true);
         this.deps.assertHeld?.(id);
@@ -164,8 +165,12 @@ export class ProjectSandboxOperations {
           phase: this.deps.projects.get(id).sandboxOperation?.phase,
           error,
         });
-        await this.deps.projects.updateSandboxOperation(id, { ...this.deps.projects.get(id).sandboxOperation!, kind, phase: this.deps.projects.get(id).sandboxOperation?.phase ?? '检查环境',
-          status: 'failed', error: error instanceof HttpError ? error.message : '操作失败，请重试；详细原因请查看服务端日志。', updatedAt: new Date().toISOString() });
+        const failed = this.deps.projects.get(id).sandboxOperation!;
+        const backupFailedAfterPause = kind === 'checkpoint' && ['从暂停磁盘备份数据', '校验备份'].includes(failed.phase);
+        await this.deps.projects.updateSandboxOperation(id, { ...failed, kind,
+          status: 'failed', error: backupFailedAfterPause
+            ? '沙箱已暂停，磁盘备份失败；请重试磁盘备份，详细原因请查看服务端日志。'
+            : error instanceof HttpError ? error.message : '操作失败，请重试；详细原因请查看服务端日志。', updatedAt: new Date().toISOString() });
         throw error;
       } finally {
         this.recordTiming(id, this.deps.projects.get(id).sandboxOperation?.status ?? 'failed');
@@ -226,15 +231,17 @@ export class ProjectSandboxOperations {
 
   private async checkpoint(id: string) {
     const { projects, runtime } = this.deps;
-    if (projects.get(id).status === 'archived') throw new HttpError(409, '已归档项目不能暂停');
     const project = await this.inspect(id);
-    if (project.sandbox?.status !== 'ready') throw new HttpError(409, '仅运行中的 Sandbox 可以创建 Checkpoint');
-    if (!runtime.checkpoint) throw new HttpError(503, 'Sandbox 不支持 Checkpoint');
-    await runtime.verifySandbox?.(project.sandbox);
-    await this.phase(id, '保存 Checkpoint 并暂停');
-    const paused = await runtime.checkpoint(target(project));
-    if (paused.status !== 'paused') throw new Error('Checkpoint 完成后 Sandbox 未暂停');
-    await this.deps.saveSandbox(id, paused, false);
+    if (!project.sandbox || !['ready', 'paused'].includes(project.sandbox.status)) throw new HttpError(409, '仅运行中或已暂停的 Sandbox 可以创建 Checkpoint');
+    if (project.sandbox.status === 'ready') {
+      if (!runtime.checkpoint) throw new HttpError(503, 'Sandbox 不支持 Checkpoint');
+      await runtime.verifySandbox?.(project.sandbox);
+      await this.phase(id, '保存 Checkpoint 并暂停');
+      const paused = await runtime.checkpoint(target(project));
+      if (paused.status !== 'paused') throw new Error('Checkpoint 完成后 Sandbox 未暂停');
+      await this.deps.saveSandbox(id, paused, false);
+    }
+    await this.backup(id);
   }
 
   private async inspect(id: string) {
@@ -246,10 +253,9 @@ export class ProjectSandboxOperations {
   private async backup(id: string) {
     const project = await this.inspect(id);
     const runtime = this.deps.runtime;
-    if (project.sandbox?.status !== 'ready') throw new HttpError(409, 'Sandbox 不正常，无法生成新备份');
+    if (project.sandbox?.status !== 'paused') throw new HttpError(409, '请先暂停 Sandbox，再从磁盘生成备份');
     if (!runtime.remoteArchives) throw new HttpError(503, 'Cellbox 归档不可用');
-    await runtime.verifySandbox?.(project.sandbox);
-    await this.phase(id, '备份数据');
+    await this.phase(id, '从暂停磁盘备份数据');
     const started = Date.now();
     const captured = await runtime.remoteArchives.capture(target(project), this.operationKey(id, 'capture'));
     const reference: RemoteArchiveRef = { ...captured, threadIds: this.deps.threadIds(id) };
@@ -385,7 +391,7 @@ export class ProjectSandboxOperations {
       if (project.sandbox) {
         // Legacy status flags could leave a live binding. Preserve its data
         // before reclaiming it rather than interpreting the flag as a backup.
-        if (project.sandbox.status === 'ready') await this.backup(id);
+        if (['ready', 'paused'].includes(project.sandbox.status)) await this.checkpoint(id);
         else await this.latestRemote(id);
       }
       const pending = new Map((project.pendingSandboxCleanup ?? []).map(sandbox => [sandbox.id, sandbox]));
@@ -409,8 +415,8 @@ export class ProjectSandboxOperations {
     }
     if (project.archiveCleanupSourceId || useExistingBackup) {
       await this.latestRemote(id);
-    } else if (project.sandbox?.status === 'ready') {
-      await this.backup(id);
+    } else if (project.sandbox && ['ready', 'paused'].includes(project.sandbox.status)) {
+      await this.checkpoint(id);
     } else {
       await this.latestRemote(id);
       if (!useExistingBackup) throw new HttpError(409, '当前环境无法生成新备份，请确认使用已有备份归档；未备份数据不会保存');
@@ -440,7 +446,7 @@ export class ProjectSandboxOperations {
       throw new HttpError(409, 'Cellbox 归档只能恢复到相同镜像，无法切换镜像版本');
     }
     await this.phase(id, '备份当前环境');
-    await this.backup(id);
+    await this.checkpoint(id);
     await this.restore(id, true);
   }
 

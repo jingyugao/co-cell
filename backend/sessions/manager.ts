@@ -131,7 +131,6 @@ export class SessionManager {
             await this.save(session);
             this.publish(session.id, { type: 'state', session: this.get(session.id) });
           }
-          this.lastScheduledArchive.delete(id);
         },
       });
       this.lifecycle = new SandboxLifecycleService({
@@ -974,8 +973,7 @@ export class SessionManager {
   }
 
   async backupProjectNow(id: string): Promise<ProjectSummary> {
-    await this.runProjectSandboxOperation(id, 'backup');
-    return this.readProject(id);
+    throw new HttpError(409, '请使用 Checkpoint 暂停并备份；运行中的项目不再单独备份');
   }
 
   async resumeProjectSandbox(id: string): Promise<ProjectSummary> {
@@ -1035,15 +1033,21 @@ export class SessionManager {
   }
 
   private async runProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'],
-    options: { useExistingBackup?: boolean } = {}) {
+    options: { useExistingBackup?: boolean } = {}, eligible?: (project: Project) => boolean) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-    const { done } = await this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options));
+    const { done } = await this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options), eligible);
     await done;
   }
 
-  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>) {
+  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>, eligible?: (project: Project) => boolean) {
     return this.projectMutation(id, async () => {
+      // A scheduler snapshot can outlive another API's completed cleanup. Check
+      // again under project-control before taking maintenance ownership.
+      if (eligible) {
+        const current = this.projects.find(id);
+        if (!current || this.projects.isMaintaining(id) || !eligible(current)) return { done: Promise.resolve() };
+      }
       if (!this.coordinator) return action();
       const lease = await this.coordinator.tryAcquire(`project-maintenance:${id}`);
       if (!lease) throw new HttpError(409, '项目正在其他实例执行维护，请稍后重试');
@@ -1072,16 +1076,6 @@ export class SessionManager {
     });
   }
 
-  async scheduledArchiveForProject(id: string) {
-    const project = await this.liveProject(this.projects.get(id));
-    if (!project.sandbox || project.status === 'archived' || project.sandbox.status !== 'ready') return;
-    await this.backupProjectNow(id);
-  }
-
-  private lastScheduledArchive = new Map<string, number>();
-  private readonly scheduledArchiveInterval =
-    Number(process.env.SANDBOX_SCHEDULED_ARCHIVE_THRESHOLD_MS ?? 30 * 60 * 1000);
-
   async scheduledArchive() {
     if (!this.coordinator) return this.scheduledArchiveLocal();
     const lease = await this.coordinator.tryAcquire('sandbox-lifecycle-scheduler');
@@ -1095,7 +1089,7 @@ export class SessionManager {
     await this.refreshSharedState();
     const now = Date.now();
     for (const project of this.projects.list()) {
-      if (this.coordinator && project.status === 'active' && project.sandbox) {
+      if (project.status === 'active' && project.sandbox) {
         const sessions = [...this.sessions.values()].filter(session => session.projectId === project.id);
         const lastActivity = Math.max(Date.parse(project.sandbox.lastActiveAt ?? project.createdAt),
           ...sessions.map(session => Date.parse(session.updatedAt)));
@@ -1108,23 +1102,17 @@ export class SessionManager {
         }
       }
       if (project.status === 'archived' && !project.sandboxArtifactsCleanedAt) {
-        await this.archiveProjectNow(project.id).catch(() => {});
+        await this.runProjectSandboxOperation(project.id, 'archive', {},
+          current => current.status === 'archived' && !current.sandboxArtifactsCleanedAt).catch(() => {});
         continue;
       }
       if (project.archiveCleanupSourceId) {
-        await this.archiveProjectNow(project.id).catch(() => {});
+        await this.runProjectSandboxOperation(project.id, 'archive', {}, current => Boolean(current.archiveCleanupSourceId)).catch(() => {});
         continue;
       }
-      if (project.pendingSandboxCleanup?.length) await this.projectMutation(project.id, async () => {
-        const { done } = await this.startProjectOperation(project.id, async () => ({ done: this.sandboxOperations!.retryCleanup(project.id) }));
-        await done;
-      }).catch(() => {});
-      if (!project.sandbox || project.status === 'archived') continue;
-      const last = Math.max(this.lastScheduledArchive.get(project.id) ?? (Date.parse(project.createdAt) || 0),
-        ...((project.remoteArchives ?? []).map(archive => Date.parse(archive.createdAt) || 0)));
-      if (now - last >= this.scheduledArchiveInterval) {
-        this.lastScheduledArchive.set(project.id, now);
-        await this.scheduledArchiveForProject(project.id).catch(() => {});
+      if (project.pendingSandboxCleanup?.length) {
+        await this.startProjectOperation(project.id, async () => ({ done: this.sandboxOperations!.retryCleanup(project.id) }),
+          current => Boolean(current.pendingSandboxCleanup?.length)).then(({ done }) => done).catch(() => {});
       }
     }
   }
@@ -1191,16 +1179,24 @@ export class SessionManager {
       if (!this.coordinator) return this.deleteProjectLocal(id);
       const lease = await this.coordinator.tryAcquire(`project-maintenance:${id}`);
       if (!lease) throw new HttpError(409, '项目正在维护，请稍后重试');
+      this.projectLeases.set(id, lease);
       try {
         if ((await this.state.listSessions()).some(session => session.projectId === id && session.status === 'running'))
           throw new HttpError(409, '请先停止项目中的任务');
         lease.assertHeld();
         await this.deleteProjectLocal(id);
-      } finally { await lease.release(); }
+      } finally { this.projectLeases.delete(id); await lease.release(); }
     });
   }
 
   private async deleteProjectLocal(id: string) {
+    const current = this.projects.get(id);
+    if (current.executionMode === 'sandbox' && current.sandbox) {
+      if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
+      // Preserve and verify the latest workspace before deleting its source.
+      // The caller already holds this project's maintenance lease.
+      await this.sandboxOperations.run(id, 'archive');
+    }
     await this.projects.delete(id, async project => {
       const sessions = [...this.sessions.values()].filter(session => session.projectId === id);
       for (const session of sessions) await Promise.allSettled([...(this.uploads.get(session.id) ?? [])]);

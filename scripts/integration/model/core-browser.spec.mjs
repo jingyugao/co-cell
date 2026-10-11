@@ -21,7 +21,16 @@ test('core: real browser creates a project, sends commands and reloads an active
   const ready = await env.waitProject(projectId, { kind: 'create', status: 'ready' });
   const editor = page.getByRole('textbox', { name: '任务描述', exact: true });
   const send = page.getByRole('button', { name: '发送任务', exact: true });
-  await page.getByRole('combobox', { name: '切换模型', exact: true }).selectOption(env.config.model);
+  const appConfig = await env.json('/api/config');
+  const modelOptions = appConfig.modelOptions;
+  assert(Array.isArray(modelOptions), 'API config did not provide managed model options');
+  const candidates = modelOptions.filter(option => option.model === env.config.model);
+  const configuredDefault = candidates.find(option => option.id === appConfig.defaults?.modelEntryId);
+  const selectedModel = configuredDefault ?? (candidates.length === 1 ? candidates[0] : undefined);
+  assert(selectedModel, candidates.length
+    ? `Model ${env.config.model} is ambiguous across channels; configure it as the default model or provide a unique option`
+    : `Model ${env.config.model} is not available in API model options`);
+  await page.getByRole('combobox', { name: '切换模型', exact: true }).selectOption(selectedModel.id);
   await editor.fill(`This is a real browser integration test. Do not use subagents, credentials or external systems. Run a foreground Node command that writes ${filename} with started-${marker}, prints started-${marker}, then waits 25 seconds and replaces its content with completed-${marker}. Use exec_command yield_time_ms=1000 and poll the same command until completion. Reply exactly completed-${marker}. Do not detach the command.`);
   await expect(send).toBeEnabled({ timeout: env.config.operationTimeout });
   const accepted = page.waitForResponse(response => response.status() === 202 && response.request().method() === 'POST'
@@ -32,7 +41,7 @@ test('core: real browser creates a project, sends commands and reloads an active
   const { turnId } = await response.json();
   const session = await env.json(`/api/sessions/${sessionId}`);
   await env.step('Reload after the agent command starts; preserve the active native turn', async () => {
-    await waitCommandStart(env, session, `started-${marker}`);
+    await waitCommandStart(env, session, marker);
     const running = await env.json(`/api/sessions/${sessionId}`);
     assert.equal(running.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId)?.status, 'running');
     await page.reload();

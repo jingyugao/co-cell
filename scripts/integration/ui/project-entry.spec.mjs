@@ -6,10 +6,20 @@ test('marking a checkpointed project completed keeps it paused and explains auto
   await page.getByRole('button', { name: /^已完成 \d+$/ }).click();
   const card = page.getByRole('article', { name: '暂停项目', exact: true });
   await expect(card.getByRole('button', { name: '恢复使用中', exact: true })).toBeVisible();
-  await expect(card.getByText('有可用归档备份时，完成满 1 天后会保留已有备份并清理暂停环境，不恢复运行。', { exact: true })).toBeVisible();
+  await expect(card.getByText('完成满 1 天后会从磁盘备份最新数据并清理暂停环境，不恢复运行。', { exact: true })).toBeVisible();
+  await expect(card.getByRole('button', { name: '立即备份', exact: true })).toHaveCount(0);
   expect(ui.projects.get('paused').status).toBe('completed');
   expect(ui.projects.get('paused').sandbox.status).toBe('paused');
   expect(ui.calls.filter(call => call.method === 'POST')).toEqual([]);
+});
+
+test('failed paused Checkpoint offers retry for its disk backup', async ({ page, ui }) => {
+  ui.projects.get('paused').sandboxOperation = { id: 'failed-checkpoint', kind: 'checkpoint', status: 'failed', error: '归档失败' };
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '暂停项目', exact: true });
+  await expect(card.getByRole('button', { name: '重试磁盘备份', exact: true })).toBeVisible();
+  await card.getByRole('button', { name: '重试磁盘备份', exact: true }).click();
+  await expect.poll(() => ui.count('POST', '/api/projects/paused/sandbox/checkpoint')).toBe(1);
 });
 
 test('paused entry permits drafting while one resume is pending', async ({ page, ui }) => {

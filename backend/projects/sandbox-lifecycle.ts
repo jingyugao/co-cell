@@ -12,7 +12,7 @@ export interface SandboxLifecycleOptions {
   now?: () => number;
 }
 
-/** Reclaims completed projects using their existing archives after the grace period. */
+/** After the grace period, backs up completed projects before reclaiming their sandboxes. */
 export class SandboxLifecycleService {
   private readonly archivedReclaimAfterMs: number;
   private readonly scanIntervalMs: number;
@@ -51,7 +51,7 @@ export class SandboxLifecycleService {
     const eligible = (await this.options.listProjects()).filter(project => {
       if (project.executionMode !== 'sandbox') return false;
       if (project.status !== 'completed') return false;
-      // Paused projects retain their existing archive without waking execution.
+      // Paused projects are backed up from disk without waking execution.
       // Unhealthy/missing environments still require explicit confirmation.
       if (project.sandbox?.status !== 'ready' && project.sandbox?.status !== 'paused' && !project.archiveCleanupSourceId) return false;
       const timestamp = Date.parse(project.completedAt ?? '');
@@ -59,7 +59,7 @@ export class SandboxLifecycleService {
     });
     for (const project of eligible) {
       if (this.closed) break;
-      try { await this.options.reclaim(project.id, { useExistingBackup: true }); }
+      try { await this.options.reclaim(project.id, { useExistingBackup: false }); }
       catch { /* A busy project or transient failure is retried by a later sweep. */ }
     }
   }

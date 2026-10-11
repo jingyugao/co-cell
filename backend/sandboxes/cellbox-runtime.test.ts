@@ -443,3 +443,27 @@ test('environment preparation and readiness retries never distribute credentials
     assert.equal(credentialWrites.length, 0);
   } finally { await runtime.close(); }
 });
+
+test('paused default images capture through Cellbox disk archives without guest commands or credentials', async () => {
+  const previous = process.env.OSS_ENDPOINT;
+  process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
+  const fake = fakeProvider();
+  fake.provider.client.runTool = async () => { assert.fail('paused capture must not execute in the guest'); };
+  fake.provider.connectForSetup = async () => { assert.fail('paused capture must not connect or resume'); };
+  let captures = 0;
+  fake.provider.captureArchive = async (id, key) => {
+    assert.equal(id, target.sandbox.id); assert.equal(key, 'paused-disk'); captures++;
+    return { id: 'capture-paused', kind: 'archive', targetId: id, status: 'succeeded', version: 1,
+      createdAt: new Date().toISOString(), result: { archiveId: fake.archive.id } };
+  };
+  const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {} });
+  try {
+    const archive = await runtime.remoteArchives.capture({ ...target, sandbox: { ...target.sandbox, status: 'paused' } }, 'paused-disk');
+    assert.equal(archive.id, fake.archive.id);
+    assert.equal(captures, 1);
+    assert.equal(fake.credentialWrites.length, 0);
+  } finally {
+    await runtime.close();
+    if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;
+  }
+});

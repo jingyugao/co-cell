@@ -1,4 +1,4 @@
-.PHONY: build up start down restart logs ps deploy-co-cell deploy-cellbox-controller deploy-cellbox-api deploy-cocell-sandbox deploy-debug-mount deploy-all
+.PHONY: build up start down restart logs ps deploy-co-cell deploy-cellbox-controller deploy-cellbox-api deploy-cellbox-local-metadata deploy-cocell-sandbox deploy-debug-mount deploy-all
 
 COMPOSE := docker compose
 SERVICE := swarm-hive
@@ -26,7 +26,7 @@ ps:
 	$(COMPOSE) ps
 
 ifneq ($(COCELL_DEPLOY_ENV_LOADED),1)
-deploy-co-cell deploy-cellbox-api deploy-cellbox-controller deploy-cocell-sandbox deploy-debug-mount deploy-all:
+deploy-co-cell deploy-cellbox-api deploy-cellbox-controller deploy-cellbox-local-metadata deploy-cocell-sandbox deploy-debug-mount deploy-all:
 	node deploy/scripts/with-env.mjs $(MAKE) COCELL_DEPLOY_ENV_LOADED=1 $@
 else
 deploy-co-cell:
@@ -41,6 +41,11 @@ deploy-cellbox-controller:
 	@test -n "$${CELLBOX_SOURCE_DIR:-}" || { echo "Set CELLBOX_SOURCE_DIR to the Cellbox source directory" >&2; exit 2; }
 	@test -n "$${COCELL_REGISTRY_ENDPOINT:-}" || { echo "Set COCELL_REGISTRY_ENDPOINT to the local HTTP registry origin" >&2; exit 2; }
 	uv run --no-project python deploy/scripts/k8s/deploy-cellbox-controller.py "$$CELLBOX_SOURCE_DIR"
+
+deploy-cellbox-local-metadata:
+	@test -n "$${CELLBOX_SOURCE_DIR:-}" || { echo "Set CELLBOX_SOURCE_DIR to the Cellbox source directory" >&2; exit 2; }
+	@test -n "$${COCELL_REGISTRY_ENDPOINT:-}" || { echo "Set COCELL_REGISTRY_ENDPOINT to the local HTTP registry origin" >&2; exit 2; }
+	uv run --no-project python deploy/scripts/k8s/deploy-cellbox-local-metadata.py "$$CELLBOX_SOURCE_DIR"
 
 deploy-cocell-sandbox:
 	@test -n "$${CELLBOX_SOURCE_DIR:-}" || { echo "Set CELLBOX_SOURCE_DIR to the Cellbox source directory" >&2; exit 2; }

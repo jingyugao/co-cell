@@ -22,10 +22,21 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
   const statePath = `/home/agent/.cocell-warm-${runId}.json`;
   const markerPath = '/home/agent/.cocell-warm-isolation-marker';
   const cases = [];
+  const imageName = process.env.COCELL_E2E_WARM_HOME_IMAGE;
+  let selection;
+  if (imageName) {
+    const images = await env.json('/api/images');
+    const image = images.find(item => item.name === imageName);
+    const version = image?.versions.find(item => item.id === image.defaultVersionId);
+    assert(version?.status === 'succeeded' && version.projectReady,
+      `Image ${imageName} needs a ready default version`);
+    selection = { imageId: image.id, imageVersionId: version.id, image: version.image };
+  }
 
   const inspectBox = async (project, { active = true } = {}) => {
     const box = await readJSON(['get', 'cellboxes.cellbox.local', `cellbox-${project.sandbox.id}`]);
     assert(box.spec.persistentHome, `Box ${project.sandbox.id} must use persistent HOME`);
+    if (selection) assert.equal(box.spec.container.image, selection.image, 'Box did not use the selected image');
     assert(box.status.specHash, `Box ${project.sandbox.id} has no finalized template hash`);
     if (!active) return { box };
     assert(box.status.podName && box.status.podUID, `Box ${project.sandbox.id} has no active Pod identity`);
@@ -67,20 +78,27 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
   };
 
   const guestJSON = async (podName, code) => JSON.parse(await kubectl([
-    'exec', podName, '--', '/usr/local/bin/node', '-e', code,
+    // kubectl exec inherits the base image's HOME, while CoCell tools select
+    // the mounted agent HOME. Match that tool environment for these probes.
+    'exec', podName, '--', '/usr/bin/env', 'HOME=/home/agent', '/usr/local/bin/node', '-e', code,
   ]));
 
   const startWorker = async (podName, marker) => {
     const worker = `const fs=require('node:fs'),crypto=require('node:crypto');const fd=fs.openSync(${JSON.stringify(statePath)},'a');const state={pid:process.pid,count:0,marker:${JSON.stringify(marker)},memoryToken:crypto.randomUUID()};const write=()=>{state.count++;fs.writeSync(fd,JSON.stringify(state)+'\\n');fs.fsyncSync(fd)};write();setInterval(write,150);`;
     const launcher = `const {spawn}=require('node:child_process');const c=spawn('/usr/local/bin/node',['-e',${JSON.stringify(worker)}],{detached:true,stdio:'ignore'});c.unref();process.stdout.write(JSON.stringify({pid:c.pid,uid:process.getuid(),home:process.env.HOME}));`;
-    const started = await guestJSON(podName, launcher);
-    assert.equal(started.uid, 0, 'Isolation check must run as container root');
+    // gVisor intentionally kills runtime-exec descendants during restore.
+    // Start via the same init-owned guest supervisor used by CoCell commands.
+    const request = JSON.stringify({ argv: ['/usr/local/bin/node', '-e', launcher], timeoutMs: 10_000 });
+    const executed = await guestJSON(podName,
+      `fetch('http://127.0.0.1:40000/v1/exec',{method:'POST',headers:{'Content-Type':'application/json'},body:${JSON.stringify(request)},signal:AbortSignal.timeout(15000)}).then(async r=>{if(!r.ok)throw new Error(await r.text());console.log(JSON.stringify(await r.json()))}).catch(e=>{console.error(e);process.exitCode=1});`);
+    assert.equal(executed.exitCode, 0, executed.stderr);
+    const started = JSON.parse(executed.stdout);
     assert.equal(started.home, '/home/agent');
     return started.pid;
   };
 
   const workerState = async podName => guestJSON(podName,
-    `const fs=require('node:fs');const p=${JSON.stringify(statePath)};let text;try{text=fs.readFileSync(p,'utf8')}catch(e){if(e.code==='ENOENT'){console.log(JSON.stringify({ready:false,reason:'state file not created'}));process.exit(0)}throw e}const rows=text.split('\\n');let s;for(let i=rows.length-1;i>=0&&!s;i--){try{s=JSON.parse(rows[i])}catch{}}if(!s){console.log(JSON.stringify({ready:false,reason:'no complete state record'}));process.exit(0)}let alive=true;try{process.kill(s.pid,0)}catch{alive=false}console.log(JSON.stringify({...s,ready:true,alive,uid:process.getuid(),markerFile:fs.readFileSync(${JSON.stringify(markerPath)},'utf8')}));`);
+    `const fs=require('node:fs');const p=${JSON.stringify(statePath)};let text;try{text=fs.readFileSync(p,'utf8')}catch(e){if(e.code==='ENOENT'){console.log(JSON.stringify({ready:false,reason:'state file not created'}));process.exit(0)}throw e}const rows=text.split('\\n');let s;for(let i=rows.length-1;i>=0&&!s;i--){try{s=JSON.parse(rows[i])}catch{}}if(!s){console.log(JSON.stringify({ready:false,reason:'no complete state record'}));process.exit(0)}let alive=false;try{alive=!/^State:\\s+Z/m.test(fs.readFileSync('/proc/'+s.pid+'/status','utf8'))}catch{}console.log(JSON.stringify({...s,ready:true,alive,uid:process.getuid(),markerFile:fs.readFileSync(${JSON.stringify(markerPath)},'utf8')}));`);
 
   const waitForWorkerState = async (podName, predicate, description, timeoutMs = 10_000) => {
     const deadline = Date.now() + timeoutMs;
@@ -102,7 +120,11 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
 
   await env.step('Create two same-template projects with independent persistent HOME directories', async () => {
     for (const index of [0, 1]) {
-      const created = await env.createProject(`warm-home-${index}`);
+      const created = selection
+        ? await env.json('/api/projects', { method: 'POST', expectedStatus: 201,
+          body: { name: env.name(`warm-home-${index}`), type: 1,
+            imageId: selection.imageId, imageVersionId: selection.imageVersionId } })
+        : await env.createProject(`warm-home-${index}`);
       const ready = await env.waitProject(created.id, { kind: 'create', status: 'ready', operationId: created.sandboxOperation.id });
       cases.push({ project: ready, marker: `home-${index}-${runId}` });
     }

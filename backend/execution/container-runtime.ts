@@ -726,12 +726,13 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   async resume(target: WorkspaceTarget, onSandbox: SaveSandbox) {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
-    const entry = await traced('sandbox.acquire', { 'sandbox.id': target.sandbox.id },
-      () => this.acquire(target, false, onSandbox, undefined, undefined, true));
-    try {
-      await traced('sandbox.prepare_environment', { 'sandbox.id': target.sandbox.id },
-        () => this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)));
-    } finally { await this.release(entry); }
+    return traced('sandbox.resume', { 'sandbox.id': target.sandbox.id }, async () => {
+      const entry = await this.acquire(target, false, onSandbox, undefined, undefined, true);
+      try {
+        await traced('sandbox.prepare_environment', { 'sandbox.id': target.sandbox!.id },
+          () => this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)));
+      } finally { await this.release(entry); }
+    });
   }
 
   async checkpoint(target: WorkspaceTarget) {

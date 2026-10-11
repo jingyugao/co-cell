@@ -1,5 +1,4 @@
 import type { SandboxExtension, SandboxLifecycleContext } from './types.js';
-import { traced } from './tracing.js';
 
 export class SandboxExtensionError extends Error {
   constructor(readonly extension: string, readonly phase: 'pre' | 'post', cause: unknown) {
@@ -23,9 +22,7 @@ export class SandboxLifecycle {
       for (const extension of this.extensions) {
         try {
           if (!extension.pre) continue;
-          const release = await traced('sandbox.lifecycle.hook', { 'sandbox.lifecycle.action': context.action,
-            'sandbox.lifecycle.extension': extension.name, 'sandbox.lifecycle.phase': 'pre' },
-          () => extension.pre!(this.snapshot(context)));
+          const release = await extension.pre(this.snapshot(context));
           if (release) releases.push(release);
         } catch (error) { throw new SandboxExtensionError(extension.name, 'pre', error); }
       }
@@ -36,9 +33,7 @@ export class SandboxLifecycle {
       for (const extension of this.extensions) {
         if (!extension.error) continue;
         try {
-          await traced('sandbox.lifecycle.hook', { 'sandbox.lifecycle.action': context.action,
-            'sandbox.lifecycle.extension': extension.name, 'sandbox.lifecycle.phase': 'error' },
-          () => Promise.resolve(extension.error!(this.snapshot(context), error)));
+          await Promise.resolve(extension.error(this.snapshot(context), error));
         } catch { /* Preserve the operation's failure. */ }
       }
       throw error;
@@ -51,9 +46,7 @@ export class SandboxLifecycle {
     for (const extension of this.extensions) {
       if (!extension[phase]) continue;
       try {
-        await traced('sandbox.lifecycle.hook', { 'sandbox.lifecycle.action': context.action,
-          'sandbox.lifecycle.extension': extension.name, 'sandbox.lifecycle.phase': phase },
-        () => Promise.resolve(extension[phase]!(this.snapshot(context))));
+        await Promise.resolve(extension[phase]!(this.snapshot(context)));
       }
       catch (error) { throw new SandboxExtensionError(extension.name, phase, error); }
     }

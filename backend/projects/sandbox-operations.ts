@@ -148,9 +148,18 @@ export class ProjectSandboxOperations {
           throw new HttpError(409, '请使用 Checkpoint 暂停并备份；运行中的项目不再单独备份');
         } else if (kind === 'refresh') await this.refreshRuntime(id);
         else await this.archive(id, options.useExistingBackup === true);
-        this.deps.assertHeld?.(id);
-        await this.deps.projects.updateSandboxOperation(id, { ...this.deps.projects.get(id).sandboxOperation!, kind,
-          phase: '完成', status: 'succeeded', imageSelection: undefined, updatedAt: new Date().toISOString() });
+        const publish = async () => {
+          if (kind === 'resume') {
+            const resumed = this.deps.projects.get(id).sandbox;
+            if (!resumed) throw new HttpError(503, 'Sandbox 恢复后缺少运行实例');
+            await this.deps.saveSandbox(id, { ...resumed, status: 'ready' }, false);
+          }
+          this.deps.assertHeld?.(id);
+          await this.deps.projects.updateSandboxOperation(id, { ...this.deps.projects.get(id).sandboxOperation!, kind,
+            phase: '完成', status: 'succeeded', imageSelection: undefined, updatedAt: new Date().toISOString() });
+        };
+        if (kind === 'resume') await traced('project.resume.publish', { 'project.id': id, 'operation.id': operationId }, publish);
+        else await publish();
       } catch (error) {
         this.deps.assertHeld?.(id);
         // Keep the user-facing state deliberately concise, but always retain the
@@ -296,13 +305,10 @@ export class ProjectSandboxOperations {
     if (!runtime.resume) throw new HttpError(503, 'Sandbox 不支持恢复运行');
     await this.phase(id, '恢复运行');
     await runtime.resume(target(current), sandbox => this.deps.saveSandbox(id, sandbox, false));
-    const resumed = projects.get(id).sandbox;
-    if (!resumed) throw new HttpError(503, 'Sandbox 恢复后缺少运行实例');
     // Cellbox completes after restoring the execution and unquiescing Guest;
     // its health diagnostics run asynchronously. The next real App Server
     // connection performs initialize/protocol validation without a duplicate
     // probe or temporary WebSocket stream blocking another lifecycle action.
-    await this.deps.saveSandbox(id, { ...resumed, status: 'ready' }, false);
   }
 
   private async rememberCleanup(id: string, sandbox: SandboxState) {

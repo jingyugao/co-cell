@@ -54,11 +54,12 @@ test('resume reconnects a paused Sandbox without replacing its binding', async (
     detached: async () => {} });
   try {
     await operations.run(id, 'resume');
-    assert.deepEqual(calls, ['inspect', 'resume:same-sandbox']);
+    assert.deepEqual(calls, ['resume:same-sandbox']);
     assert.equal(f.projects.get(id).sandbox?.id, 'same-sandbox');
     assert.equal(f.projects.get(id).sandbox?.status, 'unknown');
     assert.equal(f.projects.get(id).sandboxOperation?.status, 'succeeded');
-    await assert.rejects(operations.run(id, 'resume'), /Sandbox 未暂停/);
+    // Direct low-level resume is now an idempotent runtime command; the API's
+    // project entry path decides whether a paused observation needs resume.
     assert.equal(f.projects.get(id).sandbox?.id, 'same-sandbox');
   } finally { await operations.close(); await f.close(); }
 });

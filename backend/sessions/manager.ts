@@ -93,6 +93,9 @@ export class SessionManager {
   private recoveryTimer?: ReturnType<typeof setInterval>;
   private reconciling?: Promise<void>;
   private projectLeases = new Map<string, SharedLease>();
+  private apiInstanceId = randomUUID();
+  private apiPresence?: SharedLease;
+  private registeringPresence?: Promise<void>;
   private autoCheckpointAfterMs: number;
   private mutations = new Map<string, number>();
   private subscriptionPolls = new Map<string, SubscriptionWatch>();
@@ -117,6 +120,12 @@ export class SessionManager {
       this.sandboxOperations = new ProjectSandboxOperations({
         projects: this.projects, runtime: sandbox,
         assertHeld: id => this.projectLeases.get(id)?.assertHeld(),
+        assertResumeOwner: ownerId => {
+          if (!this.coordinator) return;
+          if (ownerId !== this.apiInstanceId || !this.apiPresence) throw new HttpError(503, '恢复执行实例已失去所有权');
+          this.apiPresence.assertHeld();
+        },
+        resumeOwnerSignal: () => this.apiPresence?.signal,
         threadIds: id => [...this.sessions.values()].filter(session => session.projectId === id).flatMap(session => session.threadId ? [session.threadId] : []),
         saveSandbox: (id, value, restore, image) => this.updateSandbox(id, id, value, restore, image),
         selectRestoreImage: async (project, versionId) => this.imageCatalog
@@ -184,6 +193,7 @@ export class SessionManager {
           return;
         }
         const protectedScope = () => this.active.has(id) || this.deleting.has(id)
+          || this.mutations.has(`session:${id}`)
           || this.mutations.has(this.sessions.get(id)?.projectId ?? `session:${id}`);
         if (protectedScope()) return;
         const session = baselines.get(id) === this.savedSessions.get(id)
@@ -215,16 +225,39 @@ export class SessionManager {
     });
   }
 
-  private async sessionMutation<T>(id: string, action: () => Promise<T>): Promise<T> {
+  private async sessionMutation<T>(id: string, action: () => Promise<T>, projectAdmission = true): Promise<T> {
     if (!this.coordinator) return action();
     const session = await this.state.getSession(id);
     if (!session) throw new HttpError(404, '会话不存在');
-    return this.projectMutation(session.projectId ?? `session:${id}`, action);
+    const mutate = () => this.coordinator!.run(`session-control:${id}`, async () => {
+      if (!this.active.has(id)) await this.writer.run(id, async () => {
+        const latest = await this.state.getSession(id);
+        if (!latest) throw new HttpError(404, '会话不存在');
+        if (this.active.has(id)) return;
+        const local = this.sessions.get(id);
+        this.savedSessions.set(id, structuredClone(latest));
+        latest.turns = latest.turns.map(turn => {
+          const old = local?.turns.find(value => value.id === turn.id);
+          return old ? { ...old, ...turn, items: turn.items.length ? turn.items : old.items } : turn;
+        });
+        this.sessions.set(id, latest);
+      });
+      const scope = `session:${id}`;
+      this.mutations.set(scope, (this.mutations.get(scope) ?? 0) + 1);
+      try { return await action(); }
+      finally {
+        const count = this.mutations.get(scope)! - 1;
+        if (count) this.mutations.set(scope, count); else this.mutations.delete(scope);
+      }
+    });
+    return projectAdmission ? this.projectMutation(session.projectId ?? `session:${id}`, mutate) : mutate();
   }
 
   private async recoverSharedExecutions() {
     if (!this.coordinator || this.closing || this.reconciling) return;
     this.reconciling = (async () => {
+      try { await this.ensureApiPresence(); }
+      catch (error) { if (this.closing) return; throw error; }
       await this.refreshSharedState();
       for (const candidate of [...this.sessions.values()]) {
         if (this.closing || this.active.has(candidate.id)) continue;
@@ -271,6 +304,10 @@ export class SessionManager {
       }
       for (const project of this.projects.list()) {
         if (this.closing || project.sandboxOperation?.status !== 'running' || this.projectLeases.has(project.id)) continue;
+        if (project.sandboxOperation.resume) {
+          await this.recoverResume(project);
+          continue;
+        }
         await this.projectMutation(project.id, async () => {
           const lease = await this.coordinator!.tryAcquire(`project-maintenance:${project.id}`);
           if (!lease) return;
@@ -296,6 +333,7 @@ export class SessionManager {
 
   async init() {
     await this.state.init();
+    await this.ensureApiPresence();
     await this.projects.init();
     for (const session of await this.state.listSessions()) {
       this.savedSessions.set(session.id, structuredClone(session));
@@ -629,7 +667,7 @@ export class SessionManager {
   }
 
   async readProject(id: string, options: ProjectReadOptions = {}, signal?: AbortSignal): Promise<ProjectSummary> {
-    await this.refreshSharedState();
+    await this.projects.refreshOne(id);
     this.projects.get(id);
     if (options.waitForOperation) {
       await traced('project.wait', { 'operation.id': options.waitForOperation }, async () => {
@@ -638,6 +676,7 @@ export class SessionManager {
       traceEvent('project.wait.finished');
     }
     signal?.throwIfAborted();
+    if (options.waitForOperation) await this.projects.refreshOne(id);
     return this.projectSummary(await this.liveProject(this.projects.get(id), true));
   }
 
@@ -1010,7 +1049,7 @@ export class SessionManager {
 
   /** Opening is idempotent: join preparation, or start one resume of the existing box. */
   async enterProject(id: string): Promise<ProjectSummary> {
-    return this.projectMutation(id, () => this.enterProjectLocal(id));
+    return this.enterProjectLocal(id);
   }
 
   private async enterProjectLocal(id: string): Promise<ProjectSummary> {
@@ -1018,6 +1057,7 @@ export class SessionManager {
     if (pending) return pending;
     const request = Promise.resolve().then(async () => {
       if (this.closing) throw new HttpError(503, '服务正在关闭');
+      await this.projects.refreshOne(id);
       let project = this.projects.get(id);
       if (project.status !== 'active') throw new HttpError(409, '项目未处于使用中状态，请先恢复项目');
       if (project.executionMode !== 'sandbox' || this.projects.isMaintaining(id)) return this.readProject(id);
@@ -1057,7 +1097,8 @@ export class SessionManager {
     })() : undefined;
     try {
       const admission = () => traced('project.operation.admission', { 'project.id': id, 'sandbox.operation.kind': kind },
-        () => this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options), undefined, resumeTrace));
+        () => kind === 'resume' ? this.startResumeOperation(id, resumeTrace!)
+          : this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options)));
       await (resumeTrace ? context.with(resumeTrace.context, admission) : admission());
       if (resumeTrace) {
         resumeTrace.admissionComplete = true;
@@ -1095,7 +1136,93 @@ export class SessionManager {
     await done;
   }
 
-  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>, eligible?: (project: Project) => boolean, lifetime?: ProjectResumeTrace) {
+  private async ensureApiPresence() {
+    if (!this.coordinator || !this.sandbox) return;
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    if (this.apiPresence && !this.apiPresence.signal.aborted) return;
+    if (this.registeringPresence) return this.registeringPresence;
+    this.registeringPresence = (async () => {
+      await this.apiPresence?.release();
+      // A new ownership epoch keeps every old worker fenced, even after this
+      // same process reconnects to MySQL and starts accepting work again.
+      const ownerId = randomUUID();
+      const presence = await this.coordinator!.tryAcquire(`api-instance:${ownerId}`);
+      if (!presence) throw new Error('Unable to register API instance');
+      if (this.closing) { await presence.release(); throw new HttpError(503, '服务正在关闭'); }
+      this.apiInstanceId = ownerId;
+      this.apiPresence = presence;
+    })();
+    try { await this.registeringPresence; }
+    finally { this.registeringPresence = undefined; }
+  }
+
+  private async startResumeOperation(id: string, lifetime: ProjectResumeTrace) {
+    await this.ensureApiPresence();
+    const admit = async () => {
+      await this.projects.refreshOne(id);
+      const project = this.projects.get(id);
+      const operation = project.sandboxOperation;
+      if (operation?.status === 'running' && operation.kind === 'resume' && operation.id
+        && operation.resume?.sandboxId === project.sandbox?.id) {
+        return { joined: true, operationId: operation.id, done: Promise.resolve() };
+      }
+      const sessions = await this.state.listProjectSessions(id);
+      if (sessions.some(session => session.status === 'running' || session.turns.some(turn => turn.status === 'running')))
+        throw new HttpError(409, '项目正在使用，请等待任务结束后重试');
+      return context.with(lifetime.context, () => this.sandboxOperations!.startResume(id, this.apiInstanceId));
+    };
+    // This key is shared with turn/checkpoint/delete admission. No provider RPC,
+    // global refresh or restore wait belongs in its critical section.
+    const admitted = this.coordinator ? await this.coordinator.tryRun(`project-control:${id}`, admit) : { value: await admit() };
+    if (!admitted) throw new HttpError(409, '项目正在提交其他操作，请稍后重试');
+    const result = admitted.value;
+    lifetime.handedOff = true;
+    lifetime.span.setAttributes({ 'operation.id': result.operationId, 'operation.joined': result.joined });
+    const done = result.joined ? this.waitResumeCompletion(id, result.operationId) : result.done;
+    void done.then(() => this.completeProjectResumeWork(lifetime), error => this.completeProjectResumeWork(lifetime, error));
+    return { done };
+  }
+
+  private async waitResumeCompletion(id: string, operationId: string): Promise<void> {
+    while (!this.closing) {
+      const project = await this.state.getProject(id);
+      const operation = project?.sandboxOperation;
+      if (!project || operation?.id !== operationId) throw new HttpError(409, '恢复操作已变化，请刷新项目状态');
+      if (operation.status === 'succeeded') return;
+      if (operation.status === 'failed') throw new HttpError(502, operation.error ?? '恢复失败');
+      await new Promise<void>(resolve => setTimeout(resolve, 50));
+    }
+    throw new HttpError(503, '服务正在关闭');
+  }
+
+  private async recoverResume(project: Project) {
+    const operation = project.sandboxOperation!;
+    const intent = operation.resume!;
+    if (!operation.id || !this.sandboxOperations || !this.apiPresence || this.apiPresence.signal.aborted) return;
+    if (intent.ownerId === this.apiInstanceId && this.sandboxOperations.hasResume(project.id, operation.id)) return;
+    await this.coordinator!.run(`project-control:${project.id}`, async () => {
+      // A live instance can be slow without being dead. Only a lost presence
+      // connection permits takeover; no elapsed-time lease can steal its work.
+      const deadOwner = intent.ownerId === this.apiInstanceId ? undefined
+        : await this.coordinator!.tryAcquire(`api-instance:${intent.ownerId}`);
+      if (deadOwner === null) return;
+      try {
+        const latest = await this.state.getProject(project.id);
+        const current = latest?.sandboxOperation;
+        if (!current || current.id !== operation.id || current.status !== 'running'
+          || current.resume?.ownerId !== intent.ownerId) return;
+        await this.projects.refreshOne(project.id);
+        this.apiPresence!.assertHeld();
+        const result = await this.sandboxOperations!.startResume(project.id, this.apiInstanceId,
+          { operationId: operation.id!, previousOwnerId: intent.ownerId });
+        void result.done.catch(() => {});
+      } catch (error) {
+        if (!(error instanceof HttpError && error.status === 409)) throw error;
+      } finally { await deadOwner?.release(); }
+    });
+  }
+
+  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>, eligible?: (project: Project) => boolean) {
     return this.projectMutation(id, async () => {
       // A scheduler snapshot can outlive another API's completed cleanup. Check
       // again under project-control before taking maintenance ownership.
@@ -1103,20 +1230,15 @@ export class SessionManager {
         const current = this.projects.find(id);
         if (!current || this.projects.isMaintaining(id) || !eligible(current)) return { done: Promise.resolve() };
       }
-      if (!this.coordinator) {
-        const result = lifetime ? await context.with(lifetime.context, action) : await action();
-        if (lifetime) {
-          lifetime.handedOff = true;
-          void result.done.then(() => this.completeProjectResumeWork(lifetime), error => this.completeProjectResumeWork(lifetime, error));
-        }
-        return result;
-      }
+      if (this.projects.get(id).sandboxOperation?.status === 'running' && this.projects.get(id).sandboxOperation?.resume)
+        throw new HttpError(409, '项目正在恢复，请等待恢复完成');
+      if (!this.coordinator) return action();
       const lease = await traced('project.maintenance_lease.acquire', { 'project.id': id },
         () => this.coordinator!.tryAcquire(`project-maintenance:${id}`));
       if (!lease) throw new HttpError(409, '项目正在其他实例执行维护，请稍后重试');
       this.projectLeases.set(id, lease);
       try {
-        const sessions = await this.state.listSessions();
+        const sessions = await this.state.listProjectSessions(id);
         for (const session of sessions) if (session.projectId === id
           && (session.status === 'running' || session.turns.some(turn => turn.status === 'running'))) {
           throw new HttpError(409, '项目正在使用，请等待任务结束后重试');
@@ -1127,30 +1249,16 @@ export class SessionManager {
         if (project.sandboxOperation?.status === 'running') await this.projects.updateSandboxOperation(id,
           { ...project.sandboxOperation, status: 'failed', error: '原执行实例已离线，请重试操作。', updatedAt: new Date().toISOString() });
         lease.assertHeld();
-        const { done } = lifetime
-          ? await context.with(lifetime.context, action)
-          : await action();
-        if (lifetime) lifetime.handedOff = true;
-        if (lifetime) {
-          const accepted = this.projects.get(id).sandboxOperation;
-          if (accepted?.id) lifetime.span.setAttribute('operation.id', accepted.id);
-          const sandboxId = this.projects.get(id).sandbox?.id;
-          if (sandboxId) lifetime.span.setAttribute('sandbox.id', sandboxId);
-        }
+        const { done } = await action();
         const guarded = done.finally(async () => {
           this.projectLeases.delete(id);
-          if (lifetime) await context.with(lifetime.context, () => lease.release());
-          else await lease.release();
+          await lease.release();
         });
-        if (lifetime) {
-          void guarded.then(() => this.completeProjectResumeWork(lifetime), error => this.completeProjectResumeWork(lifetime, error));
-        }
         void guarded.catch(() => {});
         return { done: guarded };
       } catch (error) {
         this.projectLeases.delete(id);
-        try { if (lifetime) await context.with(lifetime.context, () => lease.release()); else await lease.release(); }
-        finally { if (lifetime) this.completeProjectResumeWork(lifetime, error); }
+        await lease.release();
         throw error;
       }
     });
@@ -1259,12 +1367,13 @@ export class SessionManager {
 
   async deleteProject(id: string) {
     return this.projectMutation(id, async () => {
+      if (this.projects.isMaintaining(id)) throw new HttpError(409, '项目正在维护，请等待操作完成');
       if (!this.coordinator) return this.deleteProjectLocal(id);
       const lease = await this.coordinator.tryAcquire(`project-maintenance:${id}`);
       if (!lease) throw new HttpError(409, '项目正在维护，请稍后重试');
       this.projectLeases.set(id, lease);
       try {
-        if ((await this.state.listSessions()).some(session => session.projectId === id && session.status === 'running'))
+        if ((await this.state.listProjectSessions(id)).some(session => session.status === 'running' || session.turns.some(turn => turn.status === 'running')))
           throw new HttpError(409, '请先停止项目中的任务');
         lease.assertHeld();
         await this.deleteProjectLocal(id);
@@ -1397,7 +1506,7 @@ export class SessionManager {
   }
 
   async update(id: string, input: { title?: string; settings?: Partial<Settings>; archived?: boolean }): Promise<Session> {
-    return this.sessionMutation(id, () => this.updateLocal(id, input));
+    return this.sessionMutation(id, () => this.updateLocal(id, input), false);
   }
 
   private async updateLocal(id: string, input: { title?: string; settings?: Partial<Settings>; archived?: boolean }): Promise<Session> {
@@ -1715,7 +1824,7 @@ export class SessionManager {
   }
 
   async stop(id: string) {
-    return this.sessionMutation(id, () => this.stopLocal(id));
+    return this.sessionMutation(id, () => this.stopLocal(id), false);
   }
 
   private async stopLocal(id: string) {
@@ -1843,6 +1952,7 @@ export class SessionManager {
   async close() {
     this.closing = true;
     clearInterval(this.recoveryTimer);
+    await Promise.allSettled([this.registeringPresence]);
     for (const poll of this.subscriptionPolls.values()) { clearInterval(poll.timer); poll.observation?.controller.abort(); }
     await Promise.allSettled([...this.subscriptionPolls.values()].map(poll => poll.pending));
     await Promise.allSettled([...this.subscriptionPolls.values()].map(poll => poll.observation?.done));
@@ -1866,6 +1976,6 @@ export class SessionManager {
       await Promise.all([this.writer.drain(), this.projects.close()]);
       await this.notifications?.close();
       await this.state.close();
-    } finally { await this.logger?.flush(); }
+    } finally { await this.apiPresence?.release(); await this.logger?.flush(); }
   }
 }

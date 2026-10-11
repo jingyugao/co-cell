@@ -11,7 +11,10 @@ import { mergeRecord } from './record-merge.js';
 
 export interface WebStateStore {
   init(): Promise<void>; listProjects(): Promise<Project[]>; listSessions(): Promise<Session[]>;
+  listProjectSessions(projectId: string): Promise<Session[]>;
   getProject(id: string): Promise<Project | undefined>; getSession(id: string): Promise<Session | undefined>;
+  /** The synchronous mutation runs against the latest project in a short transaction. */
+  mutateProject(id: string, mutate: (current: Project) => void): Promise<Project>;
   saveProject(project: Project, previous?: Project): Promise<void>; saveSession(session: Session, previous?: Session): Promise<void>;
   deleteProject(id: string): Promise<void>; deleteSession(id: string): Promise<void>; close(): Promise<void>;
 }
@@ -101,6 +104,14 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   }
   async listSessions(): Promise<Session[]> {
     const [rows] = await this.pool.query<Array<RowDataPacket & { document: Session | string }>>('SELECT document FROM sessions');
+    return this.sessionsFromRows(rows);
+  }
+  async listProjectSessions(projectId: string): Promise<Session[]> {
+    const [rows] = await this.pool.query<Array<RowDataPacket & { document: Session | string }>>(
+      'SELECT document FROM sessions WHERE project_id = ?', [projectId]);
+    return this.sessionsFromRows(rows);
+  }
+  private sessionsFromRows(rows: Array<{ document: Session | string }>): Session[] {
     const sessions: Session[] = [];
     for (const row of rows) {
       // A submission that never reached Codex has no App Server history.
@@ -108,6 +119,26 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       if (session) sessions.push(session);
     }
     return sessions;
+  }
+  async mutateProject(id: string, mutate: (current: Project) => void): Promise<Project> {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [rows] = await connection.query<Array<RowDataPacket & { document: Project | string }>>(
+        'SELECT document FROM projects WHERE id = ? FOR UPDATE', [id]);
+      if (!rows[0]) throw new HttpError(409, '项目已删除');
+      const project = hydrateProject(this.document<Project>(rows[0].document));
+      const before = JSON.stringify(persistedProject(project));
+      mutate(project);
+      if (project.id !== id) throw new Error('Project mutation cannot change its identity');
+      const document = persistedProject(project);
+      if (JSON.stringify(document) !== before) await this.saveProjectDocumentWith(connection, project, document);
+      await connection.commit();
+      return hydrateProject(project);
+    } catch (error) {
+      await connection.rollback().catch(() => undefined);
+      throw error;
+    } finally { connection.release(); }
   }
   async getProject(id: string): Promise<Project | undefined> {
     const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects WHERE id = ?', [id]);

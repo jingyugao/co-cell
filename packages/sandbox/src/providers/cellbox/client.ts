@@ -233,8 +233,11 @@ export class CellboxClient {
     return this.request<CellboxOperation>('POST', '/v1/boxes:restore', { body: input, key });
   }
   actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string,
-    options: { timeoutMs?: number } = {}) {
-    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { key, timeoutMs: options.timeoutMs });
+    options: { timeoutMs?: number; expectedGeneration?: number; signal?: AbortSignal } = {}) {
+    if (options.expectedGeneration !== undefined && (!Number.isSafeInteger(options.expectedGeneration) || options.expectedGeneration < 1))
+      throw new CellboxError('INVALID_REQUEST', 'expectedGeneration must be a positive safe integer');
+    const body = options.expectedGeneration === undefined ? undefined : { expectedGeneration: options.expectedGeneration };
+    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { key, body, timeoutMs: options.timeoutMs, signal: options.signal });
   }
   /** Purge owned artifacts after destruction; old APIs must fail rather than silently skip cleanup. */
   purgeBoxArtifacts(id: string) {

@@ -76,8 +76,9 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     if (!this.profileId || this.maxWaitMs < 1 || this.retryMs < 1)
       throw new CellboxError('INVALID_REQUEST', 'Valid profileId and operation wait bounds are required');
   }
-  async initialize() {
-    const profile = (await this.client.listProfiles()).find(value => value.id === this.profileId);
+  async initialize(signal?: AbortSignal) {
+    this.checkConnectAbort(signal);
+    const profile = (await this.client.listProfiles(signal)).find(value => value.id === this.profileId);
     if (!profile) throw new CellboxError('NOT_FOUND', `Cellbox profile ${this.profileId} is unavailable to this client`);
     if (profile.provider !== 'resumable-k8s-pod' || profile.capabilities.suspend !== 'same-node-checkpoint')
       throw new CellboxError('UNSUPPORTED_CAPABILITY', `Cellbox profile ${this.profileId} is not a resumable Kubernetes pod`);
@@ -93,15 +94,19 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     this.initialized = true;
     return profile;
   }
-  private async ready() { if (!this.initialized) await this.initialize(); }
-  private async box(id: string) {
-    const box = await this.client.getBox(id);
+  private checkConnectAbort(signal?: AbortSignal) {
+    if (signal?.aborted) throw new CellboxError('TRANSPORT', 'Cellbox connect was cancelled before completion');
+  }
+  private async ready(signal?: AbortSignal) { if (!this.initialized) await this.initialize(signal); }
+  private async box(id: string, signal?: AbortSignal) {
+    const box = await this.client.getBox(id, signal);
     if (box.profileId !== this.profileId) throw new CellboxError('CONFLICT', `Box ${id} uses another profile`);
     if (this.workspace && box.workspace !== this.workspace)
       throw new CellboxError('CONFLICT', `Box ${id} workspace differs from configured workspace`);
     return box;
   }
   private async wait(op: CellboxOperation, timeoutMs = this.maxWaitMs, signal?: AbortSignal): Promise<CellboxOperation> {
+    if (signal?.aborted) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`);
     // Synchronous Cellbox resume already returns a terminal Operation. Avoid
     // emitting a zero-duration waiter span when there was no long poll.
     if (op.status === 'succeeded') return op;
@@ -146,22 +151,41 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   }
   waitForOperation(op: CellboxOperation, timeoutMs?: number, signal?: AbortSignal) { return this.wait(op, timeoutMs, signal); }
   inspectOperation(id: string) { return this.client.getOperation(id); }
-  private async act(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string) {
+  private async act(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string,
+    expectedGeneration?: number, signal?: AbortSignal) {
     const timeoutMs = action === 'resume' ? this.maxWaitMs + 60_000 : undefined;
-    return this.wait(await this.client.actBox(id, action, key, { timeoutMs }));
+    this.checkConnectAbort(signal);
+    return this.wait(await this.client.actBox(id, action, key, { timeoutMs, expectedGeneration, signal }), this.maxWaitMs, signal);
   }
-  private async resumeSuspended(box: CellboxBox) {
+  private async resumeSuspended(box: CellboxBox, signal?: AbortSignal) {
     const key = `cocell-resume-${box.id}-${box.generation}`;
-    try { await this.act(box.id, 'resume', key); }
+    try { await this.act(box.id, 'resume', key, box.generation, signal); }
     catch (error) {
       if (!(error instanceof CellboxError) || error.code !== 'OPERATION_EXPIRED') throw error;
       // An expired key is a rejected admission, not an unknown mutation result.
       // Recheck the suspension before submitting a fresh attempt. Never rotate
       // keys on transport failures, changed generations or active operations.
-      const current = await this.box(box.id);
+      this.checkConnectAbort(signal);
+      const current = await this.box(box.id, signal);
       if (current.phase !== 'suspended' || current.generation !== box.generation || current.operationId) throw error;
-      await this.act(box.id, 'resume', `${key}-${randomUUID()}`);
+      this.checkConnectAbort(signal);
+      await this.act(box.id, 'resume', `${key}-${randomUUID()}`, box.generation, signal);
     }
+  }
+  private async joinResume(box: CellboxBox, signal?: AbortSignal): Promise<CellboxBox> {
+    if (!box.operationId) throw new CellboxError('CONFLICT', `Box ${box.id} is resuming without an operation identity`);
+    this.checkConnectAbort(signal);
+    const operation = await this.client.getOperation(box.operationId, signal);
+    if (operation.id !== box.operationId || operation.kind !== 'resume' || operation.targetId !== box.id)
+      throw new CellboxError('CONFLICT', `Box ${box.id} is associated with another lifecycle operation`);
+    await this.wait(operation, this.maxWaitMs, signal);
+    this.checkConnectAbort(signal);
+    const current = await this.box(box.id, signal);
+    if (current.phase !== 'running')
+      throw new CellboxError('CONFLICT', `Box ${box.id} resume operation completed while it is ${current.phase}`);
+    if (current.operationId)
+      throw new CellboxError('CONFLICT', `Box ${box.id} still has active operation ${current.operationId}`);
+    return current;
   }
   private async createJournal(ownerKey: string) {
     if (!this.stateDirectory) throw new CellboxError('INVALID_REQUEST', 'Create requires metadata.cellboxIdempotencyKey or provider stateDirectory');
@@ -217,12 +241,18 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     if (box.phase !== 'running' && !(staged && box.phase === 'staged')) throw new CellboxError('CONFLICT', `Created box ${box.id} is ${box.phase}`);
     return this.handle(box);
   }
-  async connect(id: string): Promise<SandboxHandle> {
-    await this.ready();
-    let box = await this.box(id);
+  async connect(id: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<SandboxHandle> {
+    const { signal } = options;
+    this.checkConnectAbort(signal);
+    await this.ready(signal);
+    this.checkConnectAbort(signal);
+    let box = await this.box(id, signal);
     if (box.phase === 'suspended') {
-      await this.resumeSuspended(box);
-      box = await this.box(id);
+      await this.resumeSuspended(box, signal);
+      this.checkConnectAbort(signal);
+      box = await this.box(id, signal);
+    } else if (box.phase === 'resuming' || (box.phase === 'running' && box.operationId)) {
+      box = await this.joinResume(box, signal);
     }
     if (box.phase !== 'running') throw new CellboxError('CONFLICT', `Box ${id} is ${box.phase}`);
     return this.handle(box);
@@ -250,9 +280,10 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   }
   private boxInfo(box: CellboxBox): SandboxInfo {
     const startedAt = new Date(box.createdAt);
-    return { sandboxId: box.id, state: box.phase === 'running' ? 'running' : box.phase === 'suspended' ? 'paused' : 'unknown',
+    return { sandboxId: box.id, state: !box.operationId && box.phase === 'running' ? 'running' : !box.operationId && box.phase === 'suspended' ? 'paused' : 'unknown',
       startedAt, endAt: new Date('9999-12-31T23:59:59.999Z'),
-      metadata: { ownerKey: box.ownerKey, profileId: box.profileId, generation: String(box.generation), phase: box.phase },
+      metadata: { ownerKey: box.ownerKey, profileId: box.profileId, generation: String(box.generation), phase: box.phase,
+        ...(box.operationId ? { operationId: box.operationId } : {}) },
       templateIdentity: { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] } };
   }
   async pause(id: string) {
@@ -270,11 +301,14 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     if (box.phase !== 'suspended') throw new CellboxError('CONFLICT', `Box ${id} did not suspend`);
     return { id: `cellbox-suspended:${id}:${box.generation}`, createdAt: new Date().toISOString() };
   }
-  async restore(id: string, checkpointId: string): Promise<void> {
-    const box = await this.box(id);
+  async restore(id: string, checkpointId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    const { signal } = options;
+    this.checkConnectAbort(signal);
+    const box = await this.box(id, signal);
+    this.checkConnectAbort(signal);
     if (checkpointId !== `cellbox-suspended:${id}:${box.generation}` || box.phase !== 'suspended')
       throw new CellboxError('CONFLICT', 'The same-node Cellbox suspension is no longer available');
-    await this.resumeSuspended(box);
+    await this.resumeSuspended(box, signal);
   }
   /** Explicit cold restart preserves the Box-owned HOME; never creates or restores a Box. */
   async rebuildPersistent(id: string, key: string) {

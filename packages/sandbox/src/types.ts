@@ -95,7 +95,7 @@ export interface SandboxPolicy {
 
 export interface SandboxCheckpointProvider {
   checkpoint(sandboxId: string): Promise<SandboxCheckpoint>;
-  restore(sandboxId: string, checkpointId: string): Promise<void>;
+  restore(sandboxId: string, checkpointId: string, options?: { signal?: AbortSignal }): Promise<void>;
 }
 
 export interface SandboxProvider {
@@ -104,7 +104,7 @@ export interface SandboxProvider {
     lifecycle: { onTimeout: 'pause'; autoResume: false };
     metadata?: Record<string, string>;
   }): Promise<SandboxHandle>;
-  connect(sandboxId: string, options: { timeoutMs: number }): Promise<SandboxHandle>;
+  connect(sandboxId: string, options: { timeoutMs: number; signal?: AbortSignal }): Promise<SandboxHandle>;
   /** Connect to an already running/staged instance without resuming it. */
   connectForSetup?(sandboxId: string): Promise<SandboxHandle>;
   getInfo(sandboxId: string): Promise<SandboxInfo>;
@@ -133,6 +133,8 @@ export interface SandboxLifecycleContext {
   sandbox?: SandboxHandle;
   record?: SandboxRecord;
   metadata?: Record<string, string>;
+  /** Cancels the lifecycle transition when its owning acquire is no longer active. */
+  signal?: AbortSignal;
 }
 /** Hooks are awaited in registration order. A failed pre hook prevents the operation. */
 export interface SandboxExtension {

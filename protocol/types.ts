@@ -103,6 +103,8 @@ export interface ProjectSandboxOperation {
   /** Resume completion confirms runtime restoration; health diagnostics do not gate it. */
 	/** Persisted intention ID used for remote operation idempotency. */
 	id?: string;
+  /** Resume intent and API ownership; recovery preserves the operation identity. */
+  resume?: { sandboxId: string; ownerId: string };
   /** Image reserved by an in-flight or uncertain archived restore. */
   imageSelection?: ProjectImageSelection;
   /** Checkpoint includes a verified workspace backup before completion; backup is a legacy operation kind. */

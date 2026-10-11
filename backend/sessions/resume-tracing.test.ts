@@ -14,10 +14,10 @@ import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { installProjectsRoutes } from '../projects/routes.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 import { traceHttpRequest } from '../infra/diagnostics/tracing.js';
-import type { SharedCoordinator } from '../infra/storage/coordination.js';
+import { MemoryCoordinator } from '../infra/storage/coordination.js';
 import { SessionManager, type CodexClient } from './manager.js';
 
-test('open resume has one lifecycle span across admission, detached work and lease release', async () => {
+test('open resume keeps one lifecycle span through detached work and durable completion', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-resume-trace-'));
   const exporter = new InMemorySpanExporter();
   const provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
@@ -31,23 +31,8 @@ test('open resume has one lifecycle span across admission, detached work and lea
   let resumeStarted!: () => void;
   const started = new Promise<void>(resolve => { resumeStarted = resolve; });
   const barrier = new Promise<void>(resolve => { finishResume = resolve; });
-  let releasedParent = '';
-  let resumeAlreadyExportedAtRelease = false;
-  let holdRelease = false;
-  let leaseReleased!: () => void, finishRelease!: () => void;
-  const leaseRelease = new Promise<void>(resolve => { leaseReleased = resolve; });
-  const releaseBarrier = new Promise<void>(resolve => { finishRelease = resolve; });
-  const coordinator: SharedCoordinator = {
-    async run<T>(_key: string, action: () => Promise<T>) { return action(); },
-    async tryAcquire() {
-      return { signal: new AbortController().signal, assertHeld() {}, async release() {
-        releasedParent = trace.getActiveSpan()?.spanContext().spanId ?? '';
-        resumeAlreadyExportedAtRelease = exporter.getFinishedSpans().some(span => span.name === 'project.resume');
-        if (holdRelease) { leaseReleased(); await releaseBarrier; }
-      } };
-    },
-    async close() {},
-  };
+  let finishTerminalCommit: () => void = () => {};
+  const coordinator = new MemoryCoordinator();
   const runtime = {
     async close() {},
     async rebuild(_target, save) { await save(sandbox); },
@@ -61,7 +46,8 @@ test('open resume has one lifecycle span across admission, detached work and lea
     },
     async verifySandbox() {}, async fenceSandbox() {}, async detachSandbox() {}, async deleteDanglingSandbox() {},
   } satisfies Partial<SandboxRuntime>;
-  const manager = new SessionManager({} as CodexClient, directory, defaults, new MemoryWebStateStore(),
+  const state = new MemoryWebStateStore();
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state,
     runtime as unknown as SandboxRuntime, defaults.workingDirectory, undefined, join(directory, 'images'), {}, undefined, coordinator);
   const app = new Hono();
   app.use('*', traceHttpRequest);
@@ -75,7 +61,25 @@ test('open resume has one lifecycle span across admission, detached work and lea
     await manager.checkpointProjectSandbox(projectId);
     await operations().close();
 
-    holdRelease = true;
+    let terminalCommitReached!: () => void;
+    const terminalCommitStarted = new Promise<void>(resolve => { terminalCommitReached = resolve; });
+    const terminalCommitBarrier = new Promise<void>(resolve => { finishTerminalCommit = resolve; });
+    let terminalMutationParent = '';
+    const mutateProject = state.mutateProject.bind(state);
+    state.mutateProject = async (id, mutate) => {
+      const current = await state.getProject(id);
+      if (current?.sandboxOperation?.status === 'running' && current.sandboxOperation.kind === 'resume') {
+        const projected = structuredClone(current);
+        mutate(projected);
+        const projectedOperation = projected.sandboxOperation;
+        if (projectedOperation && projectedOperation.id === current.sandboxOperation.id && projectedOperation.status !== 'running') {
+          terminalMutationParent = trace.getActiveSpan()?.spanContext().spanId ?? '';
+          terminalCommitReached();
+          await terminalCommitBarrier;
+        }
+      }
+      return mutateProject(id, mutate);
+    };
     const caller = new AbortController();
     const response = await app.request(`/api/projects/${projectId}/open`, { method: 'POST', signal: caller.signal });
     assert.equal(response.status, 202);
@@ -87,32 +91,33 @@ test('open resume has one lifecycle span across admission, detached work and lea
     assert.equal(beforeCompletion.some(span => span.name === 'project.resume'), false,
       'the project lifecycle span remains open after the accepted HTTP response');
     finishResume();
-    await operations().close();
-    await leaseRelease;
+    await terminalCommitStarted;
     assert.equal(exporter.getFinishedSpans().some(span => ['project.resume', 'project.request'].includes(span.name)), false,
-      'both operation and request envelope stay open through maintenance lease release');
-    holdRelease = false;
-    finishRelease();
+      'the request envelope and lifecycle span stay open while terminal state is not durable');
+    finishTerminalCommit();
+    await operations().close();
     await new Promise<void>(resolve => setImmediate(resolve));
 
     const spans = exporter.getFinishedSpans();
     const request = spans.find(span => span.name === 'http.request');
     const envelope = spans.find(span => span.name === 'project.request');
     const resume = spans.find(span => span.name === 'project.resume');
+    const publish = spans.find(span => span.name === 'project.resume.publish');
     const admission = spans.find(span => span.name === 'project.operation.admission' && span.attributes['sandbox.operation.kind'] === 'resume');
     const runtimeSpan = spans.find(span => span.name === 'test.resume.runtime');
-    assert(envelope && request && resume && admission && runtimeSpan,
+    assert(envelope && request && resume && publish && admission && runtimeSpan,
       `expected request/resume/admission/runtime spans; got ${spans.map(span => `${span.name}:${span.attributes['sandbox.operation.kind'] ?? ''}:${span.parentSpanContext?.spanId ?? ''}`).join(', ')}`);
     assert.equal(resume.parentSpanContext?.spanId, envelope.spanContext().spanId);
     assert.equal(request.parentSpanContext?.spanId, envelope.spanContext().spanId);
     assert.equal(response.headers.get('X-Trace-Id'), envelope.spanContext().traceId);
     assert.equal(admission.parentSpanContext?.spanId, resume.spanContext().spanId);
-    assert.equal(runtimeSpan.parentSpanContext?.spanId, resume.spanContext().spanId);
+    assert.equal(runtimeSpan.parentSpanContext?.spanId, resume.spanContext().spanId,
+      'runtime restoration belongs to the full lifecycle, not the completed admission');
+    assert.equal(publish.parentSpanContext?.spanId, resume.spanContext().spanId);
     assert.equal(resume.attributes['project.operation.async'], true);
     assert.equal(typeof resume.attributes['operation.id'], 'string');
     assert.equal(resume.attributes['sandbox.id'], sandbox.id);
-    assert.equal(releasedParent, resume.spanContext().spanId, 'maintenance lease release keeps the lifecycle context');
-    assert.equal(resumeAlreadyExportedAtRelease, false, 'lifecycle span stays open until lease release completes');
+    assert.equal(terminalMutationParent, publish.spanContext().spanId, 'terminal persistence retains the publish context');
     const nanos = (time: [number, number]) => BigInt(time[0]) * 1_000_000_000n + BigInt(time[1]);
     const endNanos = (span: typeof resume) => nanos(span.endTime);
     assert(endNanos(resume) >= endNanos(runtimeSpan));
@@ -141,11 +146,12 @@ test('open resume has one lifecycle span across admission, detached work and lea
     assert.equal(failedResume.status.code, 2, 'failed runtime work marks the lifecycle span as failed');
     const failedEnvelope = exporter.getFinishedSpans().filter(span => span.name === 'project.request').at(-1);
     assert.equal(failedEnvelope?.status.code, 2, 'accepted operation failure reaches the enclosing request lifecycle');
-    assert.equal(releasedParent, failedResume.spanContext().spanId, 'failed work still releases the lease in lifecycle context');
+    assert.equal(failedResume.attributes['project.operation.async'], true, 'failed detached work retains its lifecycle span');
   } finally {
     finishResume();
-    finishRelease();
+    finishTerminalCommit();
     await manager.close();
+    await coordinator.close();
     await rm(directory, { recursive: true, force: true });
     await provider.shutdown();
   }

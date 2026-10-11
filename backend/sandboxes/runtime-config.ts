@@ -19,6 +19,22 @@ export interface SandboxRuntimeConfigOptions {
   sharedDataRoot?: string;
 }
 
+function assertActive(signal?: AbortSignal) {
+  if (signal?.aborted) throw signal.reason ?? new DOMException('Lifecycle operation aborted', 'AbortError');
+}
+
+function awaitActive<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  assertActive(signal);
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', abort);
+    const abort = () => { cleanup(); reject(signal.reason ?? new DOMException('Lifecycle operation aborted', 'AbortError')); };
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    if (signal.aborted) abort();
+  });
+}
+
 /** Distributes protected configuration only at lifecycle boundaries. */
 export class SandboxRuntimeConfig {
   private readonly pending = new Map<string, Promise<void>>();
@@ -30,8 +46,13 @@ export class SandboxRuntimeConfig {
     post: async context => {
       if (['create', 'connect', 'restore', 'reconcile'].includes(context.action)) await this.sync(context);
       if (context.action === 'destroy' && context.sandboxId) {
+        assertActive(context.signal);
         await this.options.secrets?.repository.forgetRuntime(context.sandboxId);
-        if (this.options.sharedDataRoot) await mountedRuntime(this.options.sharedDataRoot, context.sandboxId).remove();
+        assertActive(context.signal);
+        if (this.options.sharedDataRoot) {
+          await mountedRuntime(this.options.sharedDataRoot, context.sandboxId).remove();
+          assertActive(context.signal);
+        }
         this.legacyGuests.delete(context.sandboxId);
         for (const key of this.legacyDigests.keys()) if (key.startsWith(`${context.sandboxId}:`)) this.legacyDigests.delete(key);
       }
@@ -47,21 +68,30 @@ export class SandboxRuntimeConfig {
   private async sync(context: Readonly<SandboxLifecycleContext>, archive = false) {
     const boxId = context.sandboxId;
     if (!boxId) throw new Error('Sandbox identity is required for runtime configuration');
+    assertActive(context.signal);
     const previous = this.pending.get(boxId) ?? Promise.resolve();
     const startedAt = new Date().toISOString(), started = performance.now();
-    const current = previous.catch(() => {}).then(() => this.apply(boxId, context, archive));
+    const current = previous.catch(() => {}).then(() => {
+      assertActive(context.signal);
+      return this.apply(boxId, context, archive);
+    });
     this.pending.set(boxId, current);
+    // Keep the serialized queue attached to current even if this caller stops
+    // waiting. A later lifecycle action must not overtake an in-flight write.
+    void current.finally(() => { if (this.pending.get(boxId) === current) this.pending.delete(boxId); }).catch(() => {});
     let status = 'succeeded';
-    try { await current; } catch (error) { status = 'failed'; throw error; }
+    try { await awaitActive(current, context.signal); } catch (error) { status = 'failed'; throw error; }
     finally {
-      if (this.pending.get(boxId) === current) this.pending.delete(boxId);
       void this.options.logger?.write({ event: 'sandbox.runtime_stage', phase: archive ? 'archive.credentials' : 'runtime.credentials', sandboxId: boxId,
         status, startedAt, finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - started) });
     }
   }
 
   private async apply(boxId: string, context: Readonly<SandboxLifecycleContext>, archive: boolean) {
-    const box = await this.options.provider.client.getBox(boxId);
+    const signal = context.signal;
+    assertActive(signal);
+    const box = await this.options.provider.client.getBox(boxId, signal);
+    assertActive(signal);
     if (!box.capabilities.protectedTools) return;
     if (box.phase !== 'running' && box.phase !== 'staged') throw new Error(`Cannot configure Cellbox in phase ${box.phase}`);
     const generation = box.generation;
@@ -70,6 +100,7 @@ export class SandboxRuntimeConfig {
     const restoreRuntimeConfig = context.metadata?.restoreRuntimeConfig === 'true';
     const repository = this.options.secrets?.repository;
     const previous = await repository?.runtime(boxId);
+    assertActive(signal);
     // The provisioning revision survives execution changes. The legacy SQL
     // generation column stores it; Cellbox's live generation still fences writes.
     const revision = previous?.generation ?? generation;
@@ -81,6 +112,7 @@ export class SandboxRuntimeConfig {
     let applied: Record<string, string>;
     if (this.options.secrets) {
       applied = await repository!.runtimeConfig(boxId, revision);
+      assertActive(signal);
       slots = {};
       if (archive) {
         slots = {
@@ -93,15 +125,23 @@ export class SandboxRuntimeConfig {
           ?? (context.resourceKey.startsWith('project:') ? context.resourceKey.slice('project:'.length) : previous?.projectId);
         if (!projectId) throw new Error('Project identity is required for tool credentials');
         if (!this.options.toolBrokerUrl) throw new Error('COCELL_TOOL_BROKER_URL is required');
-        if (!previous || previous.projectId !== projectId) await this.options.secrets.registerRuntime(boxId, projectId, revision);
+        if (!previous || previous.projectId !== projectId) {
+          assertActive(signal);
+          await this.options.secrets.registerRuntime(boxId, projectId, revision);
+          assertActive(signal);
+        }
         if (home) {
+          assertActive(signal);
           await this.options.secrets.publishHome(projectId);
+          assertActive(signal);
           const config: ToolHomeRuntimeConfig = { mode: 'home', boxId, url: this.options.toolBrokerUrl };
           slots = { cocell_tool_runtime: Buffer.from(JSON.stringify(config)) };
         } else {
           // Existing images retain the delivery contract saved in their checkpoint.
           if (!['connect', 'reconcile'].includes(context.action) || !applied.cocell_tool_runtime || (restoreRuntimeConfig && !mount)) {
-            const config: ToolRuntimeConfig = { mode: 'files', boxId, revision, url: this.options.toolBrokerUrl, files: await this.options.secrets.provision(projectId),
+            const provisionedFiles = await this.options.secrets.provision(projectId);
+            assertActive(signal);
+            const config: ToolRuntimeConfig = { mode: 'files', boxId, revision, url: this.options.toolBrokerUrl, files: provisionedFiles,
               // Compatibility with checkpointed older runners; no authentication.
               generation: revision, token: boxId };
             const bytes = Buffer.from(JSON.stringify(config));
@@ -109,6 +149,7 @@ export class SandboxRuntimeConfig {
             slots = { cocell_tool_runtime: bytes };
           } else if (mount) {
             const bytes = await mount.read();
+            assertActive(signal);
             if (createHash('sha256').update(bytes).digest('hex') !== applied.cocell_tool_runtime)
               throw new Error('Mounted runtime configuration differs from its acknowledged snapshot');
             if (restoreRuntimeConfig) slots = { cocell_tool_runtime: bytes };
@@ -117,6 +158,7 @@ export class SandboxRuntimeConfig {
       }
     } else {
       slots = await this.legacySlots(archive);
+      assertActive(signal);
       const key = `${boxId}:${generation}`;
       applied = this.legacyDigests.get(key) ?? {};
       this.legacyDigests.set(key, applied);
@@ -125,29 +167,37 @@ export class SandboxRuntimeConfig {
     const changed = Object.fromEntries(Object.entries(slots).filter(([slot]) => restoreRuntimeConfig || applied[slot] !== digests[slot]));
     let pointerDigest: string | undefined;
     if (mount && slots.cocell_tool_runtime) {
+      assertActive(signal);
       await mount.publish(slots.cocell_tool_runtime);
+      assertActive(signal);
       const pointer = Buffer.from(JSON.stringify(mount.descriptor));
       pointerDigest = createHash('sha256').update(pointer).digest('hex');
       // The descriptor is unchanged by checkpoint/resume and survives in the
       // restored filesystem. Ordinary resume does not touch either file.
       if (previousPointer === pointerDigest && !restoreRuntimeConfig) delete changed.cocell_tool_runtime;
       else changed.cocell_tool_runtime = pointer;
-      if ((await this.options.provider.client.getBox(boxId)).generation !== generation)
+      if ((await this.options.provider.client.getBox(boxId, signal)).generation !== generation)
         throw new Error('Cellbox generation changed during runtime configuration');
+      assertActive(signal);
     }
     if (!Object.keys(changed).length && !pointerDigest) return;
     const acknowledge = async () => {
       const acknowledged = { ...digests, ...(pointerDigest ? { cocell_tool_runtime_mount: pointerDigest } : {}) };
+      assertActive(signal);
       if (repository) await repository.markRuntimeConfigs(boxId, revision, acknowledged);
+      assertActive(signal);
       Object.assign(applied, acknowledged);
     };
     if (!Object.keys(changed).length) { await acknowledge(); return; }
     if (box.capabilities.credentialBatch && !this.legacyGuests.has(boxId)) {
       try {
-        await this.options.provider.client.writeCredentials(boxId, generation, changed);
+        assertActive(signal);
+        await this.options.provider.client.writeCredentials(boxId, generation, changed, signal);
+        assertActive(signal);
       } catch (error) {
         // An older Guest image can coexist briefly with the new API during rollout.
         if (!(error instanceof CellboxError && error.code === 'NOT_FOUND')) throw error;
+        assertActive(signal);
         this.legacyGuests.add(boxId);
       }
       if (!this.legacyGuests.has(boxId)) {
@@ -157,12 +207,19 @@ export class SandboxRuntimeConfig {
     }
     for (const [slot, bytes] of Object.entries(changed)) {
       const digest = digests[slot];
-      await this.options.provider.client.writeCredential(boxId, slot, bytes);
+      assertActive(signal);
+      await this.options.provider.client.writeCredential(boxId, slot, bytes, signal);
+      assertActive(signal);
       // Do not acknowledge a write against a generation that changed mid-sync.
-      if ((await this.options.provider.client.getBox(boxId)).generation !== generation)
+      if ((await this.options.provider.client.getBox(boxId, signal)).generation !== generation)
         throw new Error('Cellbox generation changed during runtime configuration');
+      assertActive(signal);
       if (!mount) {
-        if (repository) await repository.markRuntimeConfig(boxId, revision, slot, digest);
+        if (repository) {
+          assertActive(signal);
+          await repository.markRuntimeConfig(boxId, revision, slot, digest);
+        }
+        assertActive(signal);
         applied[slot] = digest;
       }
     }

@@ -34,10 +34,21 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
   });
   await env.step('Two entries into the same project share one operation and keep the sandbox ID', async () => {
     const project = projects[0];
-    const entries = await Promise.all([0, 1].map(() => env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: 202 })));
-    assert.equal(entries[0].sandboxOperation.kind, 'resume'); assert.equal(entries[0].sandboxOperation.id, entries[1].sandboxOperation.id);
+    // Different API instances may collide before the first short admission
+    // commits. That contender reports conflict immediately; it must not queue
+    // another lifecycle action behind the first restore.
+    const attempts = await Promise.all([0, 1].map(() => env.request(`/api/projects/${project.id}/open`, {
+      method: 'POST', expectedStatus: [202, 409],
+    })));
+    const entries = attempts.filter(attempt => attempt.response.status === 202).map(attempt => attempt.data);
+    assert(entries.length > 0, 'At least one concurrent entry must be admitted');
+    assert.equal(entries[0].sandboxOperation.kind, 'resume');
+    for (const entry of entries) assert.equal(entry.sandboxOperation.id, entries[0].sandboxOperation.id);
+    const name = `${env.name('concurrency-0')} renamed`;
+    await env.json(`/api/projects/${project.id}`, { method: 'PATCH', body: { name } });
     const ready = await env.waitProject(project.id, { kind: 'resume', status: 'ready', operationId: entries[0].sandboxOperation.id });
     assert.equal(ready.sandbox.id, project.sandbox.id);
+    assert.equal(ready.name, name, 'Resume completion must preserve an unrelated metadata edit');
     const reopened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: 202 });
     assert.equal(reopened.sandboxOperation.id, ready.sandboxOperation.id);
     await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 });

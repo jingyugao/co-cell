@@ -45,6 +45,11 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 500): Promise<voi
   }
 }
 
+async function waitForConnectWaiters(manager: SandboxManager, resourceKey: string, count: number): Promise<void> {
+  const internals = manager as unknown as { entries: Map<string, { connecting?: { waiters: number } }> };
+  await waitUntil(() => internals.entries.get(resourceKey)?.connecting?.waiters === count);
+}
+
 const record = (status: SandboxRecord['status'] = 'paused'): SandboxRecord => ({
   id: 'sandbox-1', template: 'template-1', status,
   lastActiveAt: new Date(0).toISOString(),
@@ -176,6 +181,231 @@ test('concurrent acquire connects once and registers both usages', async () => {
   await manager.close();
 });
 
+test('aborting one acquire waiter leaves the shared connection for remaining waiters', async () => {
+  const fake = fixture('paused');
+  let connectStarted!: (signal: AbortSignal | undefined) => void;
+  const started = new Promise<AbortSignal | undefined>(resolve => { connectStarted = resolve; });
+  let finishConnect!: () => void;
+  const connectGate = new Promise<void>(resolve => { finishConnect = resolve; });
+  const original = fake.provider.connect;
+  fake.provider.connect = async (id, options) => {
+    connectStarted(options.signal);
+    await connectGate;
+    options.signal?.throwIfAborted();
+    return original(id, options);
+  };
+  const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record(), async () => {});
+  const firstAbort = new AbortController();
+  const secondAbort = new AbortController();
+  const first = manager.acquire('resource', { usageId: 'one', signal: firstAbort.signal });
+  const sharedSignal = await started;
+  const second = manager.acquire('resource', { usageId: 'two', signal: secondAbort.signal });
+  await waitForConnectWaiters(manager, 'resource', 2);
+  firstAbort.abort(new Error('owner one disconnected'));
+  await assert.rejects(first, /owner one disconnected/);
+  assert.equal(sharedSignal?.aborted, false, 'one caller must not cancel another caller’s connection');
+  finishConnect();
+  const lease = await second;
+  assert.equal(fake.counts.connect, 1);
+  await lease.release();
+  await manager.close();
+});
+
+test('aborting every acquire waiter cancels connect and skips lifecycle post hooks', async () => {
+  const fake = fixture('paused');
+  let connectStarted!: (signal: AbortSignal | undefined) => void;
+  const started = new Promise<AbortSignal | undefined>(resolve => { connectStarted = resolve; });
+  let finishConnect!: () => void;
+  const connectGate = new Promise<void>(resolve => { finishConnect = resolve; });
+  let postHooks = 0;
+  fake.provider.connect = async (_id, options) => {
+    connectStarted(options.signal);
+    // Simulate a provider that returns despite cancellation; the manager and
+    // lifecycle must still prevent post hooks and handle installation.
+    await connectGate;
+    return fake.handle;
+  };
+  const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 },
+    lifecycle: new SandboxLifecycle([{ name: 'resume-hooks', post: async () => { postHooks++; } }]) });
+  manager.track('resource', record(), async () => {});
+  const firstAbort = new AbortController();
+  const secondAbort = new AbortController();
+  const first = manager.acquire('resource', { usageId: 'one', signal: firstAbort.signal });
+  const sharedSignal = await started;
+  const second = manager.acquire('resource', { usageId: 'two', signal: secondAbort.signal });
+  await waitForConnectWaiters(manager, 'resource', 2);
+  firstAbort.abort(new Error('first owner disconnected'));
+  await assert.rejects(first, /first owner disconnected/);
+  assert.equal(sharedSignal?.aborted, false);
+  secondAbort.abort(new Error('last owner disconnected'));
+  await assert.rejects(second, /last owner disconnected/);
+  await waitUntil(() => sharedSignal?.aborted === true);
+  finishConnect();
+  await manager.close();
+  assert.equal(postHooks, 0, 'a canceled connection must not execute post hooks');
+  assert.notEqual(manager.peek('resource')?.status, 'ready', 'canceled connect must not publish a ready binding');
+});
+
+test('inspect does not wait for an in-flight restore/connect', async () => {
+  const fake = fixture('paused');
+  let connectStarted!: () => void;
+  const started = new Promise<void>(resolve => { connectStarted = resolve; });
+  let finishConnect!: () => void;
+  const connectGate = new Promise<void>(resolve => { finishConnect = resolve; });
+  const connect = fake.provider.connect;
+  fake.provider.connect = async (...args) => {
+    connectStarted();
+    await connectGate;
+    return connect(...args);
+  };
+  const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record(), async () => {});
+  const acquiring = manager.acquire('resource', { usageId: 'turn-1' });
+  await started;
+  try {
+    const observation = await Promise.race([
+      manager.inspect('resource'),
+      wait(100).then(() => { throw new Error('inspect waited for connect'); }),
+    ]);
+    assert.equal(observation.info?.state, 'paused');
+    assert.equal(observation.record.operation, 'resuming');
+  } finally { finishConnect(); }
+  const lease = await acquiring;
+  assert.equal(manager.peek('resource')?.status, 'ready');
+  await lease.release();
+  await manager.close();
+});
+
+test('an inspect started before connect cannot overwrite the newer connection state', async () => {
+  const fake = fixture('paused');
+  let inspectStarted!: () => void;
+  const started = new Promise<void>(resolve => { inspectStarted = resolve; });
+  let finishInspect!: () => void;
+  const inspectGate = new Promise<void>(resolve => { finishInspect = resolve; });
+  const getInfo = fake.provider.getInfo;
+  let first = true;
+  fake.provider.getInfo = async id => {
+    if (first) {
+      first = false;
+      const stale = await getInfo(id);
+      inspectStarted();
+      await inspectGate;
+      return stale;
+    }
+    return getInfo(id);
+  };
+  const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record(), async () => {});
+  const inspecting = manager.inspect('resource');
+  await started;
+  const lease = await manager.acquire('resource', { usageId: 'turn-1' });
+  await lease.release();
+  try {
+    finishInspect();
+    const stale = await inspecting;
+    assert.equal(stale.info, undefined, 'a superseded response is not returned as a current observation');
+    assert.equal(manager.peek('resource')?.status, 'ready');
+  } finally {
+    finishInspect();
+    await manager.close();
+  }
+});
+
+test('inspect rechecks the binding after snapshotting a deleted entry', async () => {
+  const fake = fixture('running');
+  const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', { ...record('deleted'), id: 'sandbox-old' }, async () => {});
+  let snapshotReady!: () => void;
+  const ready = new Promise<void>(resolve => { snapshotReady = resolve; });
+  let releaseSnapshot!: () => void;
+  const gate = new Promise<void>(resolve => { releaseSnapshot = resolve; });
+  const internal = manager as unknown as { lock: (key: string, action: () => Promise<unknown>) => Promise<unknown> };
+  const originalLock = internal.lock.bind(manager);
+  let pauseAfterSnapshot = true;
+  internal.lock = async (key, action) => {
+    const result = await originalLock(key, action);
+    if (pauseAfterSnapshot) {
+      pauseAfterSnapshot = false;
+      snapshotReady();
+      await gate;
+    }
+    return result;
+  };
+
+  const inspecting = manager.inspect('resource');
+  await ready;
+  await manager.replace('resource', 'sandbox-old', record('paused'));
+  releaseSnapshot();
+  const observation = await inspecting;
+  assert.equal(observation.record.id, 'sandbox-1');
+  assert.equal(observation.record.status, 'paused');
+  await manager.close();
+});
+
+test('destructive operations fail promptly while an acquire is connecting', async () => {
+  const fake = fixture('paused');
+  let connectStarted!: () => void;
+  const started = new Promise<void>(resolve => { connectStarted = resolve; });
+  let finishConnect!: () => void;
+  const connectGate = new Promise<void>(resolve => { finishConnect = resolve; });
+  const connect = fake.provider.connect;
+  fake.provider.connect = async (...args) => {
+    connectStarted();
+    await connectGate;
+    return connect(...args);
+  };
+  const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record(), async () => {});
+  const acquiring = manager.acquire('resource', { usageId: 'turn-1' });
+  await started;
+  try {
+    const failFast = <T>(operation: Promise<T>) => Promise.race([
+      assert.rejects(operation, SandboxBusyError),
+      wait(100).then(() => { throw new Error('destructive operation waited for connect'); }),
+    ]);
+    await Promise.all([
+      failFast(manager.pause('resource')),
+      failFast(manager.destroy('resource')),
+      failFast(manager.untrack('resource', 'sandbox-1')),
+      failFast(manager.replace('resource', 'sandbox-1', { ...record(), id: 'sandbox-2' })),
+    ]);
+    assert.equal(fake.counts.pause, 0);
+    assert.equal(fake.counts.kill, 0);
+    assert.equal(manager.peek('resource')?.id, 'sandbox-1');
+  } finally { finishConnect(); }
+  const lease = await acquiring;
+  await lease.release();
+  await manager.close();
+});
+
+test('close drains an in-flight connect after leaving the resource lock', async () => {
+  const fake = fixture('paused');
+  let connectStarted!: () => void;
+  const started = new Promise<void>(resolve => { connectStarted = resolve; });
+  let finishConnect!: () => void;
+  const connectGate = new Promise<void>(resolve => { finishConnect = resolve; });
+  const connect = fake.provider.connect;
+  fake.provider.connect = async (...args) => {
+    connectStarted();
+    await connectGate;
+    return connect(...args);
+  };
+  const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record(), async () => {});
+  const acquiring = manager.acquire('resource', { usageId: 'turn-1' });
+  await started;
+  let closed = false;
+  const closing = manager.close().then(() => { closed = true; });
+  await wait(5);
+  assert.equal(closed, false);
+  finishConnect();
+  const lease = await acquiring;
+  await closing;
+  assert.equal(closed, true);
+  await lease.release();
+});
+
 test('detached usage stays busy and the same usage can recover it', async () => {
   const fake = fixture('running');
   const persist = async () => {};
@@ -260,6 +490,48 @@ test('checkpointed sandbox restores before reconnecting and clears its checkpoin
   assert.deepEqual(hooks, ['pre:checkpoint', 'post:checkpoint', 'pre:resume', 'post:resume']);
   assert.equal(manager.peek('resource')?.checkpoint, undefined);
   await lease.release();
+  await manager.close();
+});
+
+test('retry clears a checkpoint consumed by a restore whose owner aborted before local cleanup', async () => {
+  let state: 'running' | 'paused' = 'paused';
+  let restores = 0, connects = 0;
+  const handle = { sandboxId: 'sandbox-1', setTimeout: async () => {} } as unknown as SandboxHandle;
+  let restoreStarted!: (signal: AbortSignal | undefined) => void;
+  const started = new Promise<AbortSignal | undefined>(resolve => { restoreStarted = resolve; });
+  let finishRestore!: () => void;
+  const restoreGate = new Promise<void>(resolve => { finishRestore = resolve; });
+  const provider: SandboxProvider & { checkpoint(id: string): Promise<{ id: string; createdAt: string }>; restore(id: string, checkpointId: string, options?: { signal?: AbortSignal }): Promise<void> } = {
+    create: async () => handle,
+    connect: async () => { connects++; assert.equal(state, 'running'); return handle; },
+    getInfo: async () => ({ sandboxId: 'sandbox-1', state, startedAt: new Date(), endAt: new Date(Date.now() + 60_000) }),
+    pause: async () => true, kill: async () => true,
+    checkpoint: async () => ({ id: 'checkpoint-1', createdAt: new Date().toISOString() }),
+    restore: async (_id, _checkpointId, options) => {
+      restores++;
+      state = 'running'; // Remote restore was accepted before the owner disconnected.
+      restoreStarted(options?.signal);
+      await restoreGate; // Deliberately return success despite the aborted signal.
+    },
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', { ...record('paused'), checkpoint: { id: 'checkpoint-1', createdAt: new Date().toISOString() } }, async () => {});
+  const owner = new AbortController();
+  const first = manager.acquire('resource', { usageId: 'resume-owner', signal: owner.signal });
+  const restoreSignal = await started;
+  owner.abort(new Error('resume owner lost'));
+  await assert.rejects(first, /resume owner lost/);
+  assert.equal(restoreSignal?.aborted, true, 'checkpoint restore receives the shared flight cancellation');
+  finishRestore();
+  const internals = manager as unknown as { entries: Map<string, { connecting?: unknown }> };
+  await waitUntil(() => !internals.entries.get('resource')?.connecting);
+  assert.equal(manager.peek('resource')?.checkpoint?.id, 'checkpoint-1', 'unknown restore outcome stays recorded until provider state is rechecked');
+
+  const retry = await manager.acquire('resource', { usageId: 'retry-owner' });
+  assert.equal(restores, 1, 'running provider state proves the old checkpoint was consumed');
+  assert.equal(connects, 1);
+  assert.equal(manager.peek('resource')?.checkpoint, undefined);
+  await retry.release();
   await manager.close();
 });
 

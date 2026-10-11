@@ -160,15 +160,20 @@ test('project creation verifies readiness; resume preserves the box without repe
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(notified, false, 'runtime ready alone cannot finish the wait');
     assert.equal(queryCalls, beforeWaitQueries, 'waiting for completion does not poll the provider');
-    const saveProject = state.saveProject.bind(state);
+    const mutateProject = state.mutateProject.bind(state);
     let persistReached!: () => void, commitResult!: () => void;
     const persistenceStarted = new Promise<void>(resolve => { persistReached = resolve; });
     const persistenceBarrier = new Promise<void>(resolve => { commitResult = resolve; });
-    state.saveProject = async project => {
-      if (project.sandboxOperation?.id === operationId && project.sandboxOperation.status === 'succeeded') {
-        persistReached(); await persistenceBarrier;
+    state.mutateProject = async (id, mutate) => {
+      const current = await state.getProject(id);
+      if (current?.sandboxOperation?.id === operationId && current.sandboxOperation.status === 'running') {
+        const projected = structuredClone(current);
+        mutate(projected);
+        if (projected.sandboxOperation?.id === operationId && projected.sandboxOperation.status === 'succeeded') {
+          persistReached(); await persistenceBarrier;
+        }
       }
-      await saveProject(project);
+      return mutateProject(id, mutate);
     };
     const projectService = (manager as unknown as { projects: ProjectService }).projects;
     finishResume(); await persistenceStarted;
@@ -183,7 +188,7 @@ test('project creation verifies readiness; resume preserves the box without repe
     assert.equal(completion.sandboxOperation?.status, 'succeeded');
     assert.equal(isProjectSandboxReady(completion), true);
     assert.equal(projectService.isMaintaining(created.id), false, 'notified clients can begin execution');
-    state.saveProject = saveProject;
+    state.mutateProject = mutateProject;
     await operations().close();
     assert.equal(resumeCalls, 1, 'concurrent entries and repeated entry during preparation share one resume');
     await manager.enterProject(created.id);

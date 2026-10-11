@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import test from 'node:test';
-import { CellboxClient, CellboxError } from './client.js';
+import { CellboxClient, CellboxError, type CellboxOperation } from './client.js';
 import { CellboxSandboxProvider } from './provider.js';
 
 const wait = (milliseconds: number) => new Promise<void>(resolve => setTimeout(resolve, milliseconds));
@@ -39,9 +39,13 @@ test('resume waits for synchronous terminal response and skips operation polling
     http.setResumeResponseMode('terminal');
     http.setResumeGate(gate);
     let resumeTimeoutMs: number | undefined;
+    let resumeExpectedGeneration: number | undefined;
     const actBox = provider.client.actBox.bind(provider.client);
     provider.client.actBox = (id, action, key, options) => {
-      if (action === 'resume') resumeTimeoutMs = options?.timeoutMs;
+      if (action === 'resume') {
+        resumeTimeoutMs = options?.timeoutMs;
+        resumeExpectedGeneration = options?.expectedGeneration;
+      }
       return actBox(id, action, key, options);
     };
     const beforeResume = http.calls.length;
@@ -54,6 +58,7 @@ test('resume waits for synchronous terminal response and skips operation polling
     finishResume();
     await connecting;
     assert.equal(resumeTimeoutMs, 60_250, 'resume HTTP timeout includes the configured operation limit plus response margin');
+    assert.equal(resumeExpectedGeneration, 1, 'resume is fenced to the observed Box generation');
     assert.equal((await provider.getInfo(box.sandboxId)).state, 'running');
     assert.equal(http.calls.slice(beforeResume).filter(call => call.method === 'GET' && call.path.startsWith('/v1/operations/')).length, 0);
   } finally { finishResume(); await http.close(); }
@@ -90,6 +95,57 @@ test('resume request timeout reports unknown outcome without retrying the mutati
       error instanceof CellboxError && error.code === 'UNKNOWN_OUTCOME' && !error.message.includes('aborted'));
   } finally { clearTimeout(keepAlive); }
   assert.equal(submissions, 1);
+});
+
+test('aborting connect leaves Cellbox resume outcome unknown and performs no fallback work', async () => {
+  const http = await fixture();
+  let finishResume!: () => void;
+  const gate = new Promise<void>(resolve => { finishResume = resolve; });
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
+    const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { cellboxIdempotencyKey: 'create-abort-connect', projectId: 'abort-connect' } });
+    await provider.checkpoint(box.sandboxId);
+    http.setResumeGate(gate);
+    const controller = new AbortController();
+    const before = http.calls.length;
+    const connecting = provider.connect(box.sandboxId, { timeoutMs: 60_000, signal: controller.signal });
+    for (let attempt = 0; attempt < 50 && !http.calls.slice(before).some(call => call.path.endsWith(':resume')); attempt++) await wait(1);
+    const resumeCallIndex = http.calls.findIndex((call, index) => index >= before && call.path.endsWith(':resume'));
+    assert.notEqual(resumeCallIndex, -1, 'resume request was submitted before abort');
+    assert.deepEqual(http.calls[resumeCallIndex].body, { expectedGeneration: 1 });
+    controller.abort();
+    await assert.rejects(connecting, error => error instanceof CellboxError && error.code === 'UNKNOWN_OUTCOME');
+    finishResume();
+    await wait(10);
+    assert.equal(http.calls.slice(before).filter(call => call.path.endsWith(':resume')).length, 1);
+    assert.equal(http.calls.slice(resumeCallIndex + 1).length, 0, 'cancelled connect did no post-resume fetch or key-rotation work');
+  } finally { finishResume(); await http.close(); }
+});
+
+test('aborting checkpoint restore cancels its waiter without retrying resume', async () => {
+  const http = await fixture();
+  let finishResume!: () => void;
+  const gate = new Promise<void>(resolve => { finishResume = resolve; });
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
+    const box = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { cellboxIdempotencyKey: 'create-abort-restore', projectId: 'abort-restore' } });
+    const checkpoint = await provider.checkpoint(box.sandboxId);
+    http.setResumeGate(gate);
+    const controller = new AbortController();
+    const before = http.calls.length;
+    const restoring = provider.restore(box.sandboxId, checkpoint.id, { signal: controller.signal });
+    for (let attempt = 0; attempt < 50 && !http.calls.slice(before).some(call => call.path.endsWith(':resume')); attempt++) await wait(1);
+    const resumeIndex = http.calls.findIndex((call, index) => index >= before && call.path.endsWith(':resume'));
+    assert.notEqual(resumeIndex, -1, 'restore submitted the fenced resume');
+    controller.abort();
+    await assert.rejects(restoring, error => error instanceof CellboxError && error.code === 'UNKNOWN_OUTCOME');
+    finishResume();
+    await wait(10);
+    assert.equal(http.calls.slice(before).filter(call => call.path.endsWith(':resume')).length, 1);
+    assert.equal(http.calls.slice(resumeIndex + 1).length, 0, 'cancelled restore performed no follow-up work');
+  } finally { finishResume(); await http.close(); }
 });
 
 const capabilities = { exec: true, files: true, http: true, websocket: true, pty: false,
@@ -133,6 +189,7 @@ async function fixture() {
   let pending = false;
   let resumeResponseMode: 'accepted' | 'terminal' | 'error' = 'accepted';
   let resumeGate: Promise<void> | undefined;
+  let operationGate: Promise<void> | undefined;
   let execResult = { stdout: '', stderr: '', exitCode: 0, truncated: false };
   let execOperationFails = false;
   let execState: 'exited' | 'unknown' = 'exited';
@@ -141,10 +198,10 @@ async function fixture() {
   const json = (res: ServerResponse, status: number, value: unknown) => {
     res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value));
   };
-  const op = (kind: string, targetId: string, result: Record<string, string> = {}) =>
+  const op = (kind: string, targetId: string, result: Record<string, string> = {}): CellboxOperation =>
     ({ id: `op-${++counter}`, kind, targetId, status: pending ? 'running' : 'succeeded', version: 1,
       createdAt: new Date().toISOString(), result });
-  const operations = new Map<string, ReturnType<typeof op>>();
+  const operations = new Map<string, CellboxOperation>();
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
     assert.equal(req.headers.authorization, undefined, 'Cellbox requests must not need a token');
     const chunks: Buffer[] = [];
@@ -205,10 +262,19 @@ async function fixture() {
       operations.set(value.id, value); json(res, 202, value); return;
     }
     if (url.pathname.startsWith('/v1/operations/')) {
+      await operationGate;
       const value = operations.get(url.pathname.split('/').at(-1)!);
       if (value?.status === 'running') {
         value.status = value.kind === 'exec' && execOperationFails ? 'failed' : 'succeeded';
         if (value.status === 'failed') (value as typeof value & { error?: { code: string; message: string } }).error = { code: 'TIMEOUT', message: 'runtime deadline' };
+        if (value.status === 'succeeded' && value.kind === 'resume') {
+          const box = boxes.get(value.targetId);
+          if ((box?.phase === 'resuming' || box?.phase === 'running') && box.operationId === value.id) {
+            box.phase = 'running';
+            box.generation = Number(box.generation) + 1;
+            delete box.operationId;
+          }
+        }
       }
       json(res, 200, value); return;
     }
@@ -237,6 +303,8 @@ async function fixture() {
     setProfileProvider(value: string) { profileProvider = value; },
     setFileContents(value: Buffer) { fileContents = value; },
     setPending(value: boolean) { pending = value; },
+    setOperation(value: CellboxOperation) { operations.set(value.id, value); },
+    setOperationGate(value: Promise<void> | undefined) { operationGate = value; },
     setResumeResponseMode(value: typeof resumeResponseMode) { resumeResponseMode = value; },
     setResumeGate(value: Promise<void> | undefined) { resumeGate = value; },
     rejectResume(code: string, update?: (box: Record<string, unknown>) => void) { resumeRejection = { code, update }; },
@@ -263,6 +331,95 @@ for (const method of ['connect', 'restore'] as const) test(`${method} renews an 
     const between = http.calls.slice(http.calls.indexOf(attempts[0]) + 1, http.calls.indexOf(attempts[1]));
     assert(between.some(call => call.method === 'GET' && call.path === `/v1/boxes/${box.sandboxId}`));
     assert.equal((await provider.getInfo(box.sandboxId)).state, 'running');
+  } finally { await http.close(); }
+});
+
+test('connect joins the Box-identified resume operation instead of submitting a second resume', async () => {
+  const http = await fixture();
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s', retryDelayMs: 1 });
+    const created = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { cellboxIdempotencyKey: 'create-join-resume', projectId: 'join-resume' } });
+    const box = http.boxes.get(created.sandboxId)!;
+    box.phase = 'resuming';
+    box.operationId = 'op-join-resume';
+    http.setOperation({ id: 'op-join-resume', kind: 'resume', targetId: created.sandboxId, status: 'running', version: 1,
+      createdAt: new Date().toISOString() });
+
+    const connected = await provider.connect(created.sandboxId);
+    assert.equal(connected.sandboxId, created.sandboxId);
+    assert.equal(box.phase, 'running');
+    assert(http.calls.some(call => call.method === 'GET' && call.path.startsWith('/v1/operations/op-join-resume')));
+    assert.equal(http.calls.filter(call => call.path.endsWith(':resume')).length, 0);
+  } finally { await http.close(); }
+});
+
+test('running Box with an active resume operation is not ready until that operation is terminal', async () => {
+  const http = await fixture();
+  let finishOperation!: () => void;
+  const gate = new Promise<void>(resolve => { finishOperation = resolve; });
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
+    const created = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { cellboxIdempotencyKey: 'create-running-resume-op', projectId: 'running-resume-op' } });
+    const box = http.boxes.get(created.sandboxId)!;
+    box.phase = 'running';
+    box.operationId = 'op-running-resume';
+    http.setOperation({ id: 'op-running-resume', kind: 'resume', targetId: created.sandboxId, status: 'running', version: 1,
+      createdAt: new Date().toISOString() });
+    http.setOperationGate(gate);
+    const info = await provider.getInfo(created.sandboxId);
+    assert.equal(info.state, 'unknown', 'manager must not reuse a cached handle while Cellbox has an active operation');
+    assert.equal(info.metadata?.operationId, 'op-running-resume');
+
+    const before = http.calls.length;
+    let settled = false;
+    const connecting = provider.connect(created.sandboxId).finally(() => { settled = true; });
+    for (let attempt = 0; attempt < 50 && !http.calls.slice(before).some(call => call.path.startsWith('/v1/operations/op-running-resume')); attempt++) await wait(1);
+    assert(http.calls.slice(before).some(call => call.path.startsWith('/v1/operations/op-running-resume')));
+    await wait(10);
+    assert.equal(settled, false, 'connect waits for terminal operation publication');
+    finishOperation();
+    const connected = await connecting;
+    assert.equal(connected.sandboxId, created.sandboxId);
+    assert.equal(box.phase, 'running');
+    assert.equal(box.operationId, undefined);
+    assert.equal(http.calls.slice(before).filter(call => call.path.endsWith(':resume')).length, 0);
+  } finally { finishOperation(); await http.close(); }
+});
+
+test('connect reports the result of a failed in-flight resume operation', async () => {
+  const http = await fixture();
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
+    const created = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { cellboxIdempotencyKey: 'create-failed-join', projectId: 'failed-join' } });
+    const box = http.boxes.get(created.sandboxId)!;
+    box.phase = 'resuming';
+    box.operationId = 'op-failed-resume';
+    http.setOperation({ id: 'op-failed-resume', kind: 'resume', targetId: created.sandboxId, status: 'failed', version: 2,
+      createdAt: new Date().toISOString(), error: { code: 'RUNTIME_ERROR', message: 'restore failed' } });
+
+    await assert.rejects(provider.connect(created.sandboxId), error => error instanceof CellboxError
+      && error.code === 'RUNTIME_ERROR' && error.message === 'restore failed');
+    assert.equal(http.calls.filter(call => call.path.endsWith(':resume')).length, 0);
+  } finally { await http.close(); }
+});
+
+test('connect refuses to join a resuming Box when operation identity does not match', async () => {
+  const http = await fixture();
+  try {
+    const provider = new CellboxSandboxProvider({ baseUrl: http.baseUrl, profileId: 'k8s' });
+    const created = await provider.create('k8s', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+      metadata: { cellboxIdempotencyKey: 'create-invalid-join', projectId: 'invalid-join' } });
+    const box = http.boxes.get(created.sandboxId)!;
+    box.phase = 'resuming';
+    box.operationId = 'op-foreign-operation';
+    http.setOperation({ id: 'op-foreign-operation', kind: 'suspend', targetId: created.sandboxId, status: 'running', version: 1,
+      createdAt: new Date().toISOString() });
+
+    await assert.rejects(provider.connect(created.sandboxId), error => error instanceof CellboxError && error.code === 'CONFLICT');
+    assert.equal(http.calls.filter(call => call.path.endsWith(':resume')).length, 0);
   } finally { await http.close(); }
 });
 

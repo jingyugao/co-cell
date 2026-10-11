@@ -45,7 +45,7 @@ export interface SandboxRuntime {
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   rebuildPersistent?(target: WorkspaceTarget, key: string, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
-  resume?(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
+  resume?(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>, signal?: AbortSignal): Promise<void>;
   checkpoint?(target: WorkspaceTarget): Promise<SandboxState>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
   verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
@@ -724,13 +724,15 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     await this.resume(target, onSandbox);
   }
 
-  async resume(target: WorkspaceTarget, onSandbox: SaveSandbox) {
+  async resume(target: WorkspaceTarget, onSandbox: SaveSandbox, signal?: AbortSignal) {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
+    signal?.throwIfAborted();
     return traced('sandbox.resume', { 'sandbox.id': target.sandbox.id }, async () => {
-      const entry = await this.acquire(target, false, onSandbox, undefined, undefined, true);
+      const entry = await this.acquire(target, false, onSandbox, undefined, signal, true);
       try {
+        signal?.throwIfAborted();
         await traced('sandbox.prepare_environment', { 'sandbox.id': target.sandbox!.id },
-          () => this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)));
+          () => this.prepareEnvironment(target, entry, signal ? AbortSignal.any([signal, AbortSignal.timeout(300_000)]) : AbortSignal.timeout(300_000)));
       } finally { await this.release(entry); }
     });
   }

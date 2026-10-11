@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { trace } from '@opentelemetry/api';
 import { traced } from '@co-cell/sandbox';
 import { MemoryCoordinator, MySqlCoordinator } from './coordination.js';
 
 const wait = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
 
-test('MySQL coordination traces connection, lock, and cleanup as children without recording lock keys', async () => {
+test('MySQL coordination traces only connection acquisition and keeps the borrowed callback under its caller', async () => {
   const exporter = new InMemorySpanExporter();
   const provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
   provider.register();
@@ -22,20 +23,22 @@ test('MySQL coordination traces connection, lock, and cleanup as children withou
     }),
   });
   try {
+    let callbackParent: string | undefined;
     await traced('project.control_lock', { 'project.id': 'project-1' },
-      () => coordinator.run('project-control:project-1', async () => {}));
+      () => coordinator.run('project-control:project-1', async () => {
+        callbackParent = trace.getActiveSpan()?.spanContext().spanId;
+      }));
     const spans = exporter.getFinishedSpans();
     const control = spans.find(span => span.name === 'project.control_lock');
     assert(control);
-    for (const name of ['coordination.mysql.connection.acquire', 'coordination.mysql.lock.acquire',
-      'coordination.mysql.lock.release', 'coordination.mysql.connection.close']) {
-      const stage = spans.find(span => span.name === name);
-      assert(stage, `missing ${name}`);
-      assert.equal(stage.parentSpanContext?.spanId, control.spanContext().spanId);
-      assert.equal(stage.spanContext().traceId, control.spanContext().traceId);
-      assert.equal(stage.attributes['coordination.lock.scope'], 'project-control');
-      assert.equal(JSON.stringify(stage.attributes).includes('project-1'), false);
-    }
+    assert.equal(callbackParent, control.spanContext().spanId);
+    const acquire = spans.find(span => span.name === 'coordination.mysql.connection.acquire');
+    assert(acquire, 'missing connection acquisition span');
+    assert.equal(acquire.parentSpanContext?.spanId, control.spanContext().spanId);
+    assert.equal(acquire.spanContext().traceId, control.spanContext().traceId);
+    assert.equal(acquire.attributes['coordination.lock.scope'], 'project-control');
+    assert.equal(JSON.stringify(acquire.attributes).includes('project-1'), false);
+    assert.deepEqual(spans.map(span => span.name).sort(), ['coordination.mysql.connection.acquire', 'project.control_lock']);
   } finally {
     await coordinator.close();
     await provider.shutdown();

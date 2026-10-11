@@ -161,9 +161,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     }
     let releaseRemote: (() => Promise<void>) | undefined;
     try {
-      releaseRemote = await traced('sandbox.remote_usage.acquire', { 'sandbox.id': lease.record.id },
-        () => this.options.acquireRemoteUsage?.(lease.record.id, initialization ? target.settings.workingDirectory : undefined)
-          ?? Promise.resolve(undefined));
+      releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id, initialization ? target.settings.workingDirectory : undefined);
       signal?.throwIfAborted();
     } catch (error) {
       try { await releaseRemote?.(); } finally { await lease.release(); }
@@ -175,11 +173,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private async release(entry: Entry, failed = false, detached = false) {
     try {
       try {
-        await traced('sandbox.remote_usage.release', { 'sandbox.id': entry.metadata.id },
-          () => entry.releaseRemote?.() ?? Promise.resolve());
+        await entry.releaseRemote?.();
       } finally {
-        await traced('sandbox.lease.release', { 'sandbox.id': entry.metadata.id },
-          () => entry.lease.release({ detached }));
+        await entry.lease.release({ detached });
       }
     }
     catch (error) {
@@ -735,7 +731,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     try {
       await traced('sandbox.prepare_environment', { 'sandbox.id': target.sandbox.id },
         () => this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)));
-    } finally { await traced('sandbox.release', { 'sandbox.id': target.sandbox.id }, () => this.release(entry)); }
+    } finally { await this.release(entry); }
   }
 
   async checkpoint(target: WorkspaceTarget) {

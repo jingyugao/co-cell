@@ -89,26 +89,23 @@ export class MySqlCoordinator implements SharedCoordinator {
     try { connection = await traced('coordination.mysql.connection.acquire', attributes, () => this.connectionFactory()); }
     catch { throw new Error('Unable to connect to the coordination database'); }
     if (this.closed) {
-      await traced('coordination.mysql.connection.close', attributes, () => connection.end().catch(() => {}));
+      await connection.end().catch(() => {});
       throw new Error('Coordinator is closed');
     }
 
     let acquired = false;
     try {
-      const [rows] = await traced('coordination.mysql.lock.acquire', {
-        ...attributes, 'coordination.lock.wait_seconds': waitSeconds,
-      }, () => connection.query('SELECT GET_LOCK(?, ?) AS acquired', [lock, waitSeconds]));
+      const [rows] = await connection.query('SELECT GET_LOCK(?, ?) AS acquired', [lock, waitSeconds]);
       const value = (rows as Array<{ acquired: number | null }>)[0]?.acquired;
       acquired = value === 1;
       if (!acquired) {
-        await traced('coordination.mysql.connection.close', attributes, () => connection.end().catch(() => {}));
+        await connection.end().catch(() => {});
         return null;
       }
       return this.makeLease(key, lock, connection);
     } catch {
-      if (acquired) await traced('coordination.mysql.lock.release', attributes,
-        () => connection.query('SELECT RELEASE_LOCK(?)', [lock]).then(() => undefined).catch(() => undefined));
-      await traced('coordination.mysql.connection.close', attributes, () => connection.end().catch(() => {}));
+      if (acquired) await connection.query('SELECT RELEASE_LOCK(?)', [lock]).then(() => undefined).catch(() => undefined);
+      await connection.end().catch(() => {});
       throw new Error('Unable to acquire the coordination lock');
     }
   }
@@ -131,9 +128,8 @@ export class MySqlCoordinator implements SharedCoordinator {
       controller.abort(reason);
       clearInterval(heartbeat);
       if (transportLost) connection.destroy?.();
-      // Heartbeat callbacks inherit the acquisition context even after its span
-      // has ended. Keep cleanup spans independent instead of parenting them to
-      // that stale context.
+      // Heartbeat callbacks inherit the acquisition context after its span has
+      // ended. Keep cleanup work independent of that stale tracing context.
       void context.with(ROOT_CONTEXT, () => lease.release());
     };
     lease = {
@@ -151,14 +147,12 @@ export class MySqlCoordinator implements SharedCoordinator {
           if (!connectionLost) {
             await checking?.catch(() => {});
             try {
-              await traced('coordination.mysql.lock.release', { 'coordination.lock.scope': key.split(':', 1)[0] ?? 'unknown' },
-                () => connection.query('SELECT RELEASE_LOCK(?)', [lock]).then(() => undefined));
+              await connection.query('SELECT RELEASE_LOCK(?)', [lock]).then(() => undefined);
             }
             catch { /* Closing the owning connection also releases the server lock. */ }
           }
           if (connectionLost) connection.destroy?.();
-          await traced('coordination.mysql.connection.close', { 'coordination.lock.scope': key.split(':', 1)[0] ?? 'unknown' },
-            () => connection.end().catch(() => {}));
+          await connection.end().catch(() => {});
           this.leases.delete(lease);
         })();
         return released;
@@ -210,10 +204,7 @@ export class MySqlCoordinator implements SharedCoordinator {
     while (!lease && Date.now() < deadline) {
       if (this.closed) throw new Error('Coordinator is closed');
       lease = await this.acquire(key, Math.min(1, Math.max(0, Math.ceil((deadline - Date.now()) / 1000))));
-      if (!lease) await traced('coordination.lock.retry_delay', {
-        'coordination.lock.scope': key.split(':', 1)[0] ?? 'unknown',
-        'coordination.lock.retry_delay_ms': 25,
-      }, () => sleep(25));
+      if (!lease) await sleep(25);
     }
     if (!lease) throw new Error('Timed out waiting for the coordination lock');
     const held = lease as ActiveLease;

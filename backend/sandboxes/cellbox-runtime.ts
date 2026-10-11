@@ -161,7 +161,9 @@ export class CellboxRuntimeIntegration {
         });
         this.preparations.set(handle.sandboxId, current);
         try {
-            await this.timed('product.prepare', handle.sandboxId, () => current);
+            // The caller owns sandbox.prepare_environment; keep the stage log
+            // without a duplicate span around the same work.
+            await this.timed('product.prepare', handle.sandboxId, () => current, false);
         }
         finally {
             if (this.preparations.get(handle.sandboxId) === current)
@@ -250,11 +252,11 @@ export class CellboxRuntimeIntegration {
         this.releases.add(release);
         return release;
     }
-    private async timed<T>(phase: string, sandboxId: string, action: () => Promise<T>): Promise<T> {
+    private async timed<T>(phase: string, sandboxId: string, action: () => Promise<T>, recordSpan = true): Promise<T> {
         const startedAt = new Date().toISOString();
         const started = performance.now();
         let status = 'succeeded';
-        try { return await traced(phase, { 'sandbox.id': sandboxId }, action); }
+        try { return await (recordSpan ? traced(phase, { 'sandbox.id': sandboxId }, action) : action()); }
         catch (error) { status = 'failed'; throw error; }
         finally {
             void this.options.logger?.write({ event: 'sandbox.runtime_stage', phase, sandboxId, status,

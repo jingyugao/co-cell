@@ -1,5 +1,7 @@
 import type { ModelService } from '../models/service.js';
 import { traced, traceEvent } from '@co-cell/sandbox';
+import { retainProjectRequestTrace } from '../infra/diagnostics/tracing.js';
+import { context, SpanStatusCode, trace as traceApi, type Context, type Span } from '@opentelemetry/api';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
@@ -40,6 +42,10 @@ type ActiveExecution = {
   finish(): Promise<void>;
 };
 class NativeTurnAcceptancePending extends Error {}
+type ProjectResumeTrace = {
+  context: Context; span: Span; handedOff: boolean; admissionComplete: boolean; workComplete: boolean; ended: boolean;
+  request?: ReturnType<typeof retainProjectRequestTrace>; error?: unknown;
+};
 type SubscriptionWatch = {
   timer: ReturnType<typeof setInterval>;
   pending?: Promise<void>;
@@ -198,15 +204,15 @@ export class SessionManager {
 
   private async projectMutation<T>(id: string, action: () => Promise<T>): Promise<T> {
     if (!this.coordinator) return action();
-    return traced('project.control_lock', { 'project.id': id }, () => this.coordinator!.run(`project-control:${id}`, async () => {
-      await traced('project.state.refresh_shared', { 'project.id': id }, () => this.refreshSharedState());
+    return this.coordinator!.run(`project-control:${id}`, async () => {
+      await this.refreshSharedState();
       this.mutations.set(id, (this.mutations.get(id) ?? 0) + 1);
       try { return await action(); }
       finally {
         const count = this.mutations.get(id)! - 1;
         if (count) this.mutations.set(id, count); else this.mutations.delete(id);
       }
-    }));
+    });
   }
 
   private async sessionMutation<T>(id: string, action: () => Promise<T>): Promise<T> {
@@ -624,18 +630,15 @@ export class SessionManager {
 
   async readProject(id: string, options: ProjectReadOptions = {}, signal?: AbortSignal): Promise<ProjectSummary> {
     await this.refreshSharedState();
-    return traced('project.read', { 'project.id': id, 'operation.id': options.waitForOperation }, async () => {
-      this.projects.get(id);
-      if (options.waitForOperation) {
-        await traced('project.wait', { 'operation.id': options.waitForOperation }, async () => {
-          await this.sandboxOperations?.wait(id, options.waitForOperation!, options.waitMs ?? PROJECT_OPERATION_WAIT_MS, signal);
-        });
-        traceEvent('project.wait.finished');
-      }
-      signal?.throwIfAborted();
-      return traced('project.live_view', { 'project.id': id }, async () =>
-        this.projectSummary(await this.liveProject(this.projects.get(id), true)));
-    });
+    this.projects.get(id);
+    if (options.waitForOperation) {
+      await traced('project.wait', { 'operation.id': options.waitForOperation }, async () => {
+        await this.sandboxOperations?.wait(id, options.waitForOperation!, options.waitMs ?? PROJECT_OPERATION_WAIT_MS, signal);
+      });
+      traceEvent('project.wait.finished');
+    }
+    signal?.throwIfAborted();
+    return this.projectSummary(await this.liveProject(this.projects.get(id), true));
   }
 
   async snapshot(id: string): Promise<Session> {
@@ -981,6 +984,30 @@ export class SessionManager {
     return this.readProject(id);
   }
 
+  private finishProjectResumeTrace(lifetime: ProjectResumeTrace, error?: unknown) {
+    if (lifetime.ended) return;
+    context.with(lifetime.context, () => {
+      if (error !== undefined) {
+        lifetime.error = error;
+        lifetime.span.setStatus({ code: SpanStatusCode.ERROR });
+        lifetime.span.setAttribute('error.type', error instanceof Error ? error.name : 'Error');
+      }
+      this.endProjectResumeTraceIfComplete(lifetime);
+    });
+  }
+
+  private completeProjectResumeWork(lifetime: ProjectResumeTrace, error?: unknown) {
+    lifetime.workComplete = true;
+    this.finishProjectResumeTrace(lifetime, error);
+  }
+
+  private endProjectResumeTraceIfComplete(lifetime: ProjectResumeTrace) {
+    if (lifetime.ended || !lifetime.admissionComplete || !lifetime.workComplete) return;
+    lifetime.ended = true;
+    lifetime.span.end();
+    lifetime.request?.release(lifetime.error);
+  }
+
   /** Opening is idempotent: join preparation, or start one resume of the existing box. */
   async enterProject(id: string): Promise<ProjectSummary> {
     return this.projectMutation(id, () => this.enterProjectLocal(id));
@@ -1019,8 +1046,35 @@ export class SessionManager {
   private async submitProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'], options: { imageVersionId?: string } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-    await traced('project.operation.admission', { 'project.id': id, 'sandbox.operation.kind': kind },
-      () => this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options)));
+    const resumeTrace: ProjectResumeTrace | undefined = kind === 'resume' ? (() => {
+      const request = retainProjectRequestTrace();
+      const parent = request?.context ?? context.active();
+      const span = traceApi.getTracer('co-cell.project').startSpan('project.resume', {
+        attributes: { 'project.id': id, 'sandbox.operation.kind': kind, 'project.operation.async': true },
+      }, parent);
+      return { context: traceApi.setSpan(parent, span), span, request, handedOff: false,
+        admissionComplete: false, workComplete: false, ended: false };
+    })() : undefined;
+    try {
+      const admission = () => traced('project.operation.admission', { 'project.id': id, 'sandbox.operation.kind': kind },
+        () => this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options), undefined, resumeTrace));
+      await (resumeTrace ? context.with(resumeTrace.context, admission) : admission());
+      if (resumeTrace) {
+        resumeTrace.admissionComplete = true;
+        const accepted = this.projects.get(id).sandboxOperation;
+        if (accepted?.id) resumeTrace.span.setAttribute('operation.id', accepted.id);
+        if (this.projects.get(id).sandbox?.id) resumeTrace.span.setAttribute('sandbox.id', this.projects.get(id).sandbox!.id);
+        resumeTrace.span.addEvent('project.resume.accepted');
+        this.endProjectResumeTraceIfComplete(resumeTrace);
+      }
+    } catch (error) {
+      if (resumeTrace) {
+        resumeTrace.admissionComplete = true;
+        if (!resumeTrace.handedOff) resumeTrace.workComplete = true;
+        this.finishProjectResumeTrace(resumeTrace, error);
+      }
+      throw error;
+    }
   }
 
   async refreshProjectSandboxRuntime(id: string): Promise<ProjectSummary> {
@@ -1041,7 +1095,7 @@ export class SessionManager {
     await done;
   }
 
-  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>, eligible?: (project: Project) => boolean) {
+  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>, eligible?: (project: Project) => boolean, lifetime?: ProjectResumeTrace) {
     return this.projectMutation(id, async () => {
       // A scheduler snapshot can outlive another API's completed cleanup. Check
       // again under project-control before taking maintenance ownership.
@@ -1049,13 +1103,20 @@ export class SessionManager {
         const current = this.projects.find(id);
         if (!current || this.projects.isMaintaining(id) || !eligible(current)) return { done: Promise.resolve() };
       }
-      if (!this.coordinator) return action();
+      if (!this.coordinator) {
+        const result = lifetime ? await context.with(lifetime.context, action) : await action();
+        if (lifetime) {
+          lifetime.handedOff = true;
+          void result.done.then(() => this.completeProjectResumeWork(lifetime), error => this.completeProjectResumeWork(lifetime, error));
+        }
+        return result;
+      }
       const lease = await traced('project.maintenance_lease.acquire', { 'project.id': id },
         () => this.coordinator!.tryAcquire(`project-maintenance:${id}`));
       if (!lease) throw new HttpError(409, '项目正在其他实例执行维护，请稍后重试');
       this.projectLeases.set(id, lease);
       try {
-        const sessions = await traced('project.active_session_check', { 'project.id': id }, () => this.state.listSessions());
+        const sessions = await this.state.listSessions();
         for (const session of sessions) if (session.projectId === id
           && (session.status === 'running' || session.turns.some(turn => turn.status === 'running'))) {
           throw new HttpError(409, '项目正在使用，请等待任务结束后重试');
@@ -1066,15 +1127,31 @@ export class SessionManager {
         if (project.sandboxOperation?.status === 'running') await this.projects.updateSandboxOperation(id,
           { ...project.sandboxOperation, status: 'failed', error: '原执行实例已离线，请重试操作。', updatedAt: new Date().toISOString() });
         lease.assertHeld();
-        const { done } = await action();
+        const { done } = lifetime
+          ? await context.with(lifetime.context, action)
+          : await action();
+        if (lifetime) lifetime.handedOff = true;
+        if (lifetime) {
+          const accepted = this.projects.get(id).sandboxOperation;
+          if (accepted?.id) lifetime.span.setAttribute('operation.id', accepted.id);
+          const sandboxId = this.projects.get(id).sandbox?.id;
+          if (sandboxId) lifetime.span.setAttribute('sandbox.id', sandboxId);
+        }
         const guarded = done.finally(async () => {
           this.projectLeases.delete(id);
-          await lease.release();
+          if (lifetime) await context.with(lifetime.context, () => lease.release());
+          else await lease.release();
         });
+        if (lifetime) {
+          void guarded.then(() => this.completeProjectResumeWork(lifetime), error => this.completeProjectResumeWork(lifetime, error));
+        }
         void guarded.catch(() => {});
         return { done: guarded };
       } catch (error) {
-        this.projectLeases.delete(id); await lease.release(); throw error;
+        this.projectLeases.delete(id);
+        try { if (lifetime) await context.with(lifetime.context, () => lease.release()); else await lease.release(); }
+        finally { if (lifetime) this.completeProjectResumeWork(lifetime, error); }
+        throw error;
       }
     });
   }

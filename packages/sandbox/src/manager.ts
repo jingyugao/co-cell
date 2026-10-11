@@ -488,7 +488,7 @@ export class SandboxManager {
   private async connect(resourceKey: string, entry: Entry): Promise<SandboxHandle> {
     let info: SandboxInfo;
     try {
-      info = await traced('sandbox.provider.inspect', { 'sandbox.id': entry.record.id }, () => this.provider.getInfo(entry.record.id));
+      info = await this.provider.getInfo(entry.record.id);
     } catch (error) {
       if (this.notFound(error)) {
         await this.recordFailure(resourceKey, entry, 'not_accessible', error);
@@ -528,8 +528,7 @@ export class SandboxManager {
         }));
         context.sandbox = connected;
         context.record = cloneRecord(entry.record);
-        context.metadata = (await traced('sandbox.provider.post_connect_inspect', { 'sandbox.id': entry.record.id },
-          () => this.provider.getInfo(entry!.record.id))).metadata;
+        context.metadata = (await this.provider.getInfo(entry.record.id)).metadata;
         return connected;
       });
       entry.sandbox = sandbox;
@@ -685,11 +684,7 @@ export class SandboxManager {
 
   private async persist(resourceKey: string, entry: Entry): Promise<void> {
     try {
-      await traced('sandbox.record.persist', {
-        'sandbox.id': entry.record.id,
-        'sandbox.record.status': entry.record.status,
-        ...(entry.record.operation ? { 'sandbox.record.operation': entry.record.operation } : {}),
-      }, () => entry.persist(cloneRecord(entry.record)));
+      await entry.persist(cloneRecord(entry.record));
       entry.persistencePending = false;
     } catch (error) {
       entry.persistencePending = true;
@@ -789,9 +784,7 @@ export class SandboxManager {
     const gate = new Promise<void>(resolve => { release = resolve; });
     const tail = previous.then(() => gate);
     this.locks.set(resourceKey, tail);
-    await traced('sandbox.resource_lock.wait', {
-      'sandbox.resource.kind': resourceKey.startsWith('project:') ? 'project' : resourceKey.startsWith('session:') ? 'session' : 'other',
-    }, () => previous);
+    await previous;
     try {
       return await action();
     } finally {

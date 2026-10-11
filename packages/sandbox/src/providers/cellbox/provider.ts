@@ -102,6 +102,11 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     return box;
   }
   private async wait(op: CellboxOperation, timeoutMs = this.maxWaitMs, signal?: AbortSignal): Promise<CellboxOperation> {
+    // Synchronous Cellbox resume already returns a terminal Operation. Avoid
+    // emitting a zero-duration waiter span when there was no long poll.
+    if (op.status === 'succeeded') return op;
+    if (op.status === 'failed')
+      throw new CellboxError(op.error?.code ?? 'CONFLICT', op.error?.message ?? `Cellbox ${op.kind} failed`);
     return traced('cellbox.operation.wait', {
       'cellbox.operation.kind': op.kind,
       'cellbox.operation.wait_limit_ms': timeoutMs,
@@ -146,19 +151,17 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     return this.wait(await this.client.actBox(id, action, key, { timeoutMs }));
   }
   private async resumeSuspended(box: CellboxBox) {
-    return traced('cellbox.resume.request', { 'sandbox.id': box.id, 'sandbox.generation': box.generation }, async () => {
-      const key = `cocell-resume-${box.id}-${box.generation}`;
-      try { await this.act(box.id, 'resume', key); }
-      catch (error) {
-        if (!(error instanceof CellboxError) || error.code !== 'OPERATION_EXPIRED') throw error;
-        // An expired key is a rejected admission, not an unknown mutation result.
-        // Recheck the suspension before submitting a fresh attempt. Never rotate
-        // keys on transport failures, changed generations or active operations.
-        const current = await this.box(box.id);
-        if (current.phase !== 'suspended' || current.generation !== box.generation || current.operationId) throw error;
-        await this.act(box.id, 'resume', `${key}-${randomUUID()}`);
-      }
-    });
+    const key = `cocell-resume-${box.id}-${box.generation}`;
+    try { await this.act(box.id, 'resume', key); }
+    catch (error) {
+      if (!(error instanceof CellboxError) || error.code !== 'OPERATION_EXPIRED') throw error;
+      // An expired key is a rejected admission, not an unknown mutation result.
+      // Recheck the suspension before submitting a fresh attempt. Never rotate
+      // keys on transport failures, changed generations or active operations.
+      const current = await this.box(box.id);
+      if (current.phase !== 'suspended' || current.generation !== box.generation || current.operationId) throw error;
+      await this.act(box.id, 'resume', `${key}-${randomUUID()}`);
+    }
   }
   private async createJournal(ownerKey: string) {
     if (!this.stateDirectory) throw new CellboxError('INVALID_REQUEST', 'Create requires metadata.cellboxIdempotencyKey or provider stateDirectory');
@@ -215,16 +218,14 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     return this.handle(box);
   }
   async connect(id: string): Promise<SandboxHandle> {
-    return traced('cellbox.provider.connect', { 'sandbox.id': id }, async () => {
-      await this.ready();
-      let box = await this.box(id);
-      if (box.phase === 'suspended') {
-        await this.resumeSuspended(box);
-        box = await this.box(id);
-      }
-      if (box.phase !== 'running') throw new CellboxError('CONFLICT', `Box ${id} is ${box.phase}`);
-      return this.handle(box);
-    });
+    await this.ready();
+    let box = await this.box(id);
+    if (box.phase === 'suspended') {
+      await this.resumeSuspended(box);
+      box = await this.box(id);
+    }
+    if (box.phase !== 'running') throw new CellboxError('CONFLICT', `Box ${id} is ${box.phase}`);
+    return this.handle(box);
   }
   /** Restore candidates accept agent setup while staged; no resume or activation occurs here. */
   async connectForSetup(id: string): Promise<SandboxHandle> {

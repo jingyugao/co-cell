@@ -1,4 +1,5 @@
 import { injectTraceHeaders, traced } from '../../tracing.js';
+import { SpanKind } from '@opentelemetry/api';
 /** The internal Cellbox REST contract. Calls require no Cellbox credential. */
 export interface CellboxCapabilities {
   exec: boolean; files: boolean; http: boolean; websocket: boolean;
@@ -123,9 +124,17 @@ export class CellboxClient {
   private request<T>(method: string, path: string, options: {
     body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
   } = {}): Promise<T> {
-    return traced('cellbox.http', { 'http.request.method': method, 'url.path': path.split('?')[0],
+    // GETs and non-lifecycle mutations are usually metadata, leases, or
+    // maintenance calls. Keep trace context flowing through them, while
+    // retaining spans for the box lifecycle and exec operations.
+    const endpoint = path.split('?')[0];
+    const coreMutation = method === 'POST' && (endpoint === '/v1/boxes' || endpoint === '/v1/boxes:restore'
+      || /^\/v1\/boxes\/[^/]+:(?:suspend|resume|destroy|activate|reconcile|rebuild)$/.test(endpoint)
+      || /^\/v1\/boxes\/[^/]+\/execs$/.test(endpoint));
+    if (!coreMutation) return this.requestImpl<T>(method, path, options);
+    return traced('cellbox.http.client', { 'http.request.method': method, 'url.path': path.split('?')[0],
       'http.request.timeout_ms': options.timeoutMs ?? this.requestTimeoutMs },
-      () => this.requestImpl<T>(method, path, options));
+    () => this.requestImpl<T>(method, path, options), SpanKind.CLIENT);
   }
   private async requestImpl<T>(method: string, path: string, options: {
     body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;

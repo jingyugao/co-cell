@@ -36,9 +36,7 @@ export class ProjectSandboxOperations {
   private async phase(id: string, phase: string) {
     this.deps.assertHeld?.(id);
     const operation = this.deps.projects.get(id).sandboxOperation!;
-    await traced('project.operation.phase.persist', { 'project.id': id, 'sandbox.operation.kind': operation.kind,
-      'sandbox.operation.phase': phase },
-    () => this.deps.projects.updateSandboxOperation(id, { ...operation, phase, updatedAt: new Date().toISOString() }));
+    await this.deps.projects.updateSandboxOperation(id, { ...operation, phase, updatedAt: new Date().toISOString() });
     this.recordTiming(id, 'running', phase);
   }
 
@@ -137,9 +135,7 @@ export class ProjectSandboxOperations {
     } catch (error) { try { await reservation?.release(); } catch {} finally { release(); } throw error; }
     const pending = { operationId, waiters: new Set<() => void>() };
     this.pending.set(id, pending);
-    const task = Promise.resolve().then(() => traced(`project.sandbox.${kind}`, {
-      'project.id': id, 'operation.id': operationId, 'sandbox.id': project.sandbox?.id,
-    }, async () => {
+    const execute = async () => {
       try {
         if (kind === 'create') await this.create(id);
         else if (kind === 'rebuild') await this.rebuild(id);
@@ -187,7 +183,14 @@ export class ProjectSandboxOperations {
         for (const finish of pending.waiters) finish();
         traceEvent('project.waiters.notified');
       }
-    }));
+    };
+    // Resume already has a lifetime span in SessionManager which begins
+    // before admission and ends after the maintenance lease is released.
+    // Avoid a second, same-duration worker envelope; other operations retain
+    // their worker span because they do not have that lifecycle parent.
+    const task = Promise.resolve().then(() => kind === 'resume' ? execute() : traced(`project.sandbox.${kind}`, {
+      'project.id': id, 'operation.id': operationId, 'sandbox.id': project.sandbox?.id,
+    }, execute));
     this.tasks.add(task);
     void task.finally(() => this.tasks.delete(task)).catch(() => {});
     return { done: task };

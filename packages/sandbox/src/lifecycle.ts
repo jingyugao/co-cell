@@ -22,11 +22,11 @@ export class SandboxLifecycle {
     try {
       for (const extension of this.extensions) {
         try {
-          await traced('sandbox.lifecycle.hook', { 'sandbox.lifecycle.action': context.action,
-            'sandbox.lifecycle.extension': extension.name, 'sandbox.lifecycle.phase': 'pre' }, async () => {
-            const release = await extension.pre?.(this.snapshot(context));
-            if (release) releases.push(release);
-          });
+          if (!extension.pre) continue;
+          const release = await traced('sandbox.lifecycle.hook', { 'sandbox.lifecycle.action': context.action,
+            'sandbox.lifecycle.extension': extension.name, 'sandbox.lifecycle.phase': 'pre' },
+          () => extension.pre!(this.snapshot(context)));
+          if (release) releases.push(release);
         } catch (error) { throw new SandboxExtensionError(extension.name, 'pre', error); }
       }
       const result = await operation();
@@ -34,10 +34,11 @@ export class SandboxLifecycle {
       return result;
     } catch (error) {
       for (const extension of this.extensions) {
+        if (!extension.error) continue;
         try {
           await traced('sandbox.lifecycle.hook', { 'sandbox.lifecycle.action': context.action,
             'sandbox.lifecycle.extension': extension.name, 'sandbox.lifecycle.phase': 'error' },
-          () => Promise.resolve(extension.error?.(this.snapshot(context), error)));
+          () => Promise.resolve(extension.error!(this.snapshot(context), error)));
         } catch { /* Preserve the operation's failure. */ }
       }
       throw error;
@@ -48,10 +49,11 @@ export class SandboxLifecycle {
 
   private async hooks(phase: 'post', context: SandboxLifecycleContext) {
     for (const extension of this.extensions) {
+      if (!extension[phase]) continue;
       try {
         await traced('sandbox.lifecycle.hook', { 'sandbox.lifecycle.action': context.action,
           'sandbox.lifecycle.extension': extension.name, 'sandbox.lifecycle.phase': phase },
-        () => Promise.resolve(extension[phase]?.(this.snapshot(context))));
+        () => Promise.resolve(extension[phase]!(this.snapshot(context))));
       }
       catch (error) { throw new SandboxExtensionError(extension.name, phase, error); }
     }

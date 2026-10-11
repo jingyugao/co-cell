@@ -1,8 +1,46 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { traced } from '@co-cell/sandbox';
 import { MemoryCoordinator, MySqlCoordinator } from './coordination.js';
 
 const wait = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+test('MySQL coordination traces connection, lock, and cleanup as children without recording lock keys', async () => {
+  const exporter = new InMemorySpanExporter();
+  const provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+  provider.register();
+  const coordinator = new MySqlCoordinator('mysql://user:secret@db.example.test/cocell', {
+    connectionFactory: async () => ({
+      async query(sql) {
+        if (sql.includes('GET_LOCK')) return [[{ acquired: 1 }], []];
+        if (sql.includes('RELEASE_LOCK')) return [[{ released: 1 }], []];
+        throw new Error('unexpected query');
+      },
+      async end() {},
+    }),
+  });
+  try {
+    await traced('project.control_lock', { 'project.id': 'project-1' },
+      () => coordinator.run('project-control:project-1', async () => {}));
+    const spans = exporter.getFinishedSpans();
+    const control = spans.find(span => span.name === 'project.control_lock');
+    assert(control);
+    for (const name of ['coordination.mysql.connection.acquire', 'coordination.mysql.lock.acquire',
+      'coordination.mysql.lock.release', 'coordination.mysql.connection.close']) {
+      const stage = spans.find(span => span.name === name);
+      assert(stage, `missing ${name}`);
+      assert.equal(stage.parentSpanContext?.spanId, control.spanContext().spanId);
+      assert.equal(stage.spanContext().traceId, control.spanContext().traceId);
+      assert.equal(stage.attributes['coordination.lock.scope'], 'project-control');
+      assert.equal(JSON.stringify(stage.attributes).includes('project-1'), false);
+    }
+  } finally {
+    await coordinator.close();
+    await provider.shutdown();
+  }
+});
 
 test('memory coordination serializes callers and supports scoped reentrancy', async () => {
   const coordinator = new MemoryCoordinator();

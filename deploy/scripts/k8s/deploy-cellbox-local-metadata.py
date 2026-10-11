@@ -5,7 +5,7 @@ import base64
 from contextlib import contextmanager
 import json
 import os
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import socket
 import subprocess
 import sys
@@ -102,6 +102,15 @@ def main():
     release.check_lifecycle_operations()
     with api_reader(release) as (read, _):
         before = inventory(read)
+    journal = Path("tmp/cellbox-local-metadata-migration.json")
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    with journal.open("w", opener=lambda path, flags: os.open(path, flags, 0o600)) as stream:
+        json.dump({"context": release.context, "namespace": release.namespace, "release": release.release,
+                   "node": node, "hostPath": host_path, "apiImage": api_image,
+                   "controllerImage": controller_image, "inventory": before}, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    print(f"Migration inventory saved to {journal}", flush=True)
     # Stop every old writer before importing. Neither a rolling migration nor
     # automatic rollback to the now-stale remote metadata is safe.
     run(*release.kube("scale", "deployment/cellbox-api", "--replicas=0", namespace=release.api_namespace))

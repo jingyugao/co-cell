@@ -1033,15 +1033,21 @@ export class SessionManager {
   }
 
   private async runProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'],
-    options: { useExistingBackup?: boolean } = {}) {
+    options: { useExistingBackup?: boolean } = {}, eligible?: (project: Project) => boolean) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-    const { done } = await this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options));
+    const { done } = await this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options), eligible);
     await done;
   }
 
-  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>) {
+  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>, eligible?: (project: Project) => boolean) {
     return this.projectMutation(id, async () => {
+      // A scheduler snapshot can outlive another API's completed cleanup. Check
+      // again under project-control before taking maintenance ownership.
+      if (eligible) {
+        const current = this.projects.find(id);
+        if (!current || this.projects.isMaintaining(id) || !eligible(current)) return { done: Promise.resolve() };
+      }
       if (!this.coordinator) return action();
       const lease = await this.coordinator.tryAcquire(`project-maintenance:${id}`);
       if (!lease) throw new HttpError(409, '项目正在其他实例执行维护，请稍后重试');
@@ -1096,17 +1102,18 @@ export class SessionManager {
         }
       }
       if (project.status === 'archived' && !project.sandboxArtifactsCleanedAt) {
-        await this.archiveProjectNow(project.id).catch(() => {});
+        await this.runProjectSandboxOperation(project.id, 'archive', {},
+          current => current.status === 'archived' && !current.sandboxArtifactsCleanedAt).catch(() => {});
         continue;
       }
       if (project.archiveCleanupSourceId) {
-        await this.archiveProjectNow(project.id).catch(() => {});
+        await this.runProjectSandboxOperation(project.id, 'archive', {}, current => Boolean(current.archiveCleanupSourceId)).catch(() => {});
         continue;
       }
-      if (project.pendingSandboxCleanup?.length) await this.projectMutation(project.id, async () => {
-        const { done } = await this.startProjectOperation(project.id, async () => ({ done: this.sandboxOperations!.retryCleanup(project.id) }));
-        await done;
-      }).catch(() => {});
+      if (project.pendingSandboxCleanup?.length) {
+        await this.startProjectOperation(project.id, async () => ({ done: this.sandboxOperations!.retryCleanup(project.id) }),
+          current => Boolean(current.pendingSandboxCleanup?.length)).then(({ done }) => done).catch(() => {});
+      }
     }
   }
 

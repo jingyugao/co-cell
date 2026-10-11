@@ -319,6 +319,34 @@ test('scheduler never periodically backs up a running project, even after the fo
   } finally { await f.close(); }
 });
 
+test('idle scheduler rechecks activity after another API resumes the project', async () => {
+  const f = await fixture();
+  try {
+    const api = await f.start();
+    const project = (await f.state.getProject(f.projectId))!;
+    project.sandbox!.lastActiveAt = new Date(0).toISOString();
+    await f.state.saveProject(project);
+    const session = (await f.state.getSession(f.sessionId))!;
+    session.updatedAt = new Date(0).toISOString();
+    await f.state.saveSession(session);
+    const originalRun = f.coordinator.run.bind(f.coordinator);
+    let refreshed = false;
+    f.coordinator.run = async (key, action) => {
+      if (key === `project-control:${f.projectId}` && !refreshed) {
+        refreshed = true;
+        project.sandbox!.lastActiveAt = new Date().toISOString();
+        await f.state.saveProject(project);
+      }
+      return originalRun(key, action);
+    };
+    await api.scheduledArchive();
+    assert.equal(refreshed, true);
+    assert.equal((await f.state.getProject(f.projectId))?.sandboxOperation, undefined,
+      'A resume after the idle scan must prevent an immediate automatic checkpoint');
+    assert.equal(f.control.maintenanceCalls, 0);
+  } finally { await f.close(); }
+});
+
 for (const pending of ['archive', 'source', 'cleanup'] as const) test(`scheduler discards stale ${pending} cleanup after another API finishes`, async () => {
   const f = await fixture();
   try {

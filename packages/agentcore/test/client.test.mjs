@@ -163,3 +163,35 @@ test('a rejected WebSocket upgrade preserves its connection error and closes wit
   assert(Date.now() - start < 2000, 'Failed upgrade waited for a nonexistent WebSocket close acknowledgement');
  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
+
+test('managed provider is scoped per thread and forks legacy history only when loaded provider cannot change', async t => {
+ const { Codex } = await import('../src/index.mjs');
+ const client = new CodexAppServerClient();
+ const calls = [];
+ let loadedProvider = 'legacy';
+ t.mock.method(client, 'request', async (method, params) => {
+  calls.push({ method, params });
+  if (method === 'thread/fork') { loadedProvider = params.modelProvider; return { thread: { id: 'managed-history' }, modelProvider: loadedProvider }; }
+  return { thread: { id: params.threadId ?? 'new-thread' }, modelProvider: loadedProvider };
+ });
+ t.mock.method(client, 'turnStart', async params => {
+  calls.push({ method: 'turn/start', params });
+  client.emit('notification', { method: 'turn/completed', params: { threadId: params.threadId, turn: { id: 'turn', status: 'completed' } } });
+  return { turn: { id: 'turn' } };
+ });
+ const codex = new Codex({ appServerClient: client });
+ const options = { model: 'gpt-example', modelProvider: 'session_provider', providerConfig: { 'model_providers.session_provider': { base_url: 'http://gateway/session/v1' } } };
+ try {
+  const first = [];
+  for await (const event of (await codex.resumeThread('legacy-history', options).runStreamed('hello')).events) first.push(event);
+  assert.equal(first[0].thread_id, 'managed-history');
+  assert.deepEqual(calls.slice(0, 2).map(call => call.method), ['thread/resume', 'thread/fork']);
+  assert.equal(calls[1].params.threadId, 'legacy-history');
+  assert.equal(calls[1].params.config['model_providers.session_provider'].base_url, 'http://gateway/session/v1');
+  calls.length = 0;
+  for await (const _ of (await codex.resumeThread('managed-history', { ...options, model: 'next-model' }).runStreamed('again')).events) {}
+  assert.deepEqual(calls.map(call => call.method), ['thread/resume', 'turn/start']);
+  assert.equal(calls[1].params.model, 'next-model');
+  assert.equal(calls[1].params.threadId, 'managed-history');
+ } finally { await codex.close(); await client.close(); }
+});

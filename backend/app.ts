@@ -1,3 +1,6 @@
+import { installModelRoutes } from './models/routes.js';
+import type { ModelService } from './models/service.js';
+import { installModelGateway, type ModelGateway } from './models/gateway.js';
 import { installImageRoutes } from './images/routes.js';
 import type { ImageCatalog } from './images/service.js';
 import { traceHttpRequest } from './infra/diagnostics/tracing.js';
@@ -25,10 +28,11 @@ import type { SecretService } from './secrets/service.js';
 import { installSecretRoutes } from './secrets/routes.js';
 import { installPwaAssets } from './infra/http/pwa.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, modelGateway?: ModelGateway) {
   const app = new Hono();
   app.get('/healthz', c => c.text('ok'));
   app.use('/api/*', traceHttpRequest);
+  if (modelGateway) installModelGateway(app, modelGateway);
   if (operatorAccess) installOperatorAccess(app, {
     ...operatorAccess,
     serviceProxy: (projectId, port, path, request) =>
@@ -64,7 +68,9 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
     return c.json({ error: '服务器处理失败，请查看服务端日志' }, 500);
   });
 
-  app.get('/api/config', c => c.json(config));
+  app.get('/api/config', async c => c.json(models ? { ...config, modelOptions: await models.options(),
+    defaults: { ...config.defaults, ...await models.defaultSelection() } } : config));
+  if (models) installModelRoutes(app, models);
   installProjectsRoutes(app, manager, operatorAccess?.previewSubdomains
     ? { publicUrl: operatorAccess.publicUrl, token: operatorAccess.token } : undefined, images);
   installSessionsRoutes(app, manager, config);

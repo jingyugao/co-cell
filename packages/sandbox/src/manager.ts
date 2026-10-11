@@ -1,5 +1,6 @@
 import { SandboxBusyError, SandboxManagerError, SandboxPersistenceError } from './errors.js';
 import { SandboxLifecycle, SandboxExtensionError } from './lifecycle.js';
+import { traced } from './tracing.js';
 import type {
   AcquireSandboxOptions,
   SandboxManagerOptions,
@@ -487,7 +488,7 @@ export class SandboxManager {
   private async connect(resourceKey: string, entry: Entry): Promise<SandboxHandle> {
     let info: SandboxInfo;
     try {
-      info = await this.provider.getInfo(entry.record.id);
+      info = await traced('sandbox.provider.inspect', { 'sandbox.id': entry.record.id }, () => this.provider.getInfo(entry.record.id));
     } catch (error) {
       if (this.notFound(error)) {
         await this.recordFailure(resourceKey, entry, 'not_accessible', error);
@@ -518,15 +519,17 @@ export class SandboxManager {
         // A checkpointed provider has no runnable instance until restore. Do
         // this before connect: providers correctly reject a stopped instance.
         if (entry.record.checkpoint && this.checkpointProvider) {
-          await this.checkpointProvider.restore(entry.record.id, entry.record.checkpoint.id);
+          await traced('sandbox.checkpoint.restore', { 'sandbox.id': entry.record.id },
+            () => this.checkpointProvider!.restore(entry!.record.id, entry!.record.checkpoint!.id));
           await this.change(resourceKey, entry, { checkpoint: undefined });
         }
-        const connected = await this.provider.connect(entry.record.id, {
+        const connected = await traced('sandbox.provider.connect', { 'sandbox.id': entry.record.id }, () => this.provider.connect(entry!.record.id, {
           timeoutMs: this.policy.timeoutMs,
-        });
+        }));
         context.sandbox = connected;
         context.record = cloneRecord(entry.record);
-        context.metadata = (await this.provider.getInfo(entry.record.id)).metadata;
+        context.metadata = (await traced('sandbox.provider.post_connect_inspect', { 'sandbox.id': entry.record.id },
+          () => this.provider.getInfo(entry!.record.id))).metadata;
         return connected;
       });
       entry.sandbox = sandbox;
@@ -682,7 +685,11 @@ export class SandboxManager {
 
   private async persist(resourceKey: string, entry: Entry): Promise<void> {
     try {
-      await entry.persist(cloneRecord(entry.record));
+      await traced('sandbox.record.persist', {
+        'sandbox.id': entry.record.id,
+        'sandbox.record.status': entry.record.status,
+        ...(entry.record.operation ? { 'sandbox.record.operation': entry.record.operation } : {}),
+      }, () => entry.persist(cloneRecord(entry.record)));
       entry.persistencePending = false;
     } catch (error) {
       entry.persistencePending = true;
@@ -782,7 +789,9 @@ export class SandboxManager {
     const gate = new Promise<void>(resolve => { release = resolve; });
     const tail = previous.then(() => gate);
     this.locks.set(resourceKey, tail);
-    await previous;
+    await traced('sandbox.resource_lock.wait', {
+      'sandbox.resource.kind': resourceKey.startsWith('project:') ? 'project' : resourceKey.startsWith('session:') ? 'session' : 'other',
+    }, () => previous);
     try {
       return await action();
     } finally {

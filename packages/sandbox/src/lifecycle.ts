@@ -1,4 +1,5 @@
 import type { SandboxExtension, SandboxLifecycleContext } from './types.js';
+import { traced } from './tracing.js';
 
 export class SandboxExtensionError extends Error {
   constructor(readonly extension: string, readonly phase: 'pre' | 'post', cause: unknown) {
@@ -21,8 +22,11 @@ export class SandboxLifecycle {
     try {
       for (const extension of this.extensions) {
         try {
-          const release = await extension.pre?.(this.snapshot(context));
-          if (release) releases.push(release);
+          await traced('sandbox.lifecycle.hook', { 'sandbox.lifecycle.action': context.action,
+            'sandbox.lifecycle.extension': extension.name, 'sandbox.lifecycle.phase': 'pre' }, async () => {
+            const release = await extension.pre?.(this.snapshot(context));
+            if (release) releases.push(release);
+          });
         } catch (error) { throw new SandboxExtensionError(extension.name, 'pre', error); }
       }
       const result = await operation();
@@ -30,7 +34,11 @@ export class SandboxLifecycle {
       return result;
     } catch (error) {
       for (const extension of this.extensions) {
-        try { await extension.error?.(this.snapshot(context), error); } catch { /* Preserve the operation's failure. */ }
+        try {
+          await traced('sandbox.lifecycle.hook', { 'sandbox.lifecycle.action': context.action,
+            'sandbox.lifecycle.extension': extension.name, 'sandbox.lifecycle.phase': 'error' },
+          () => Promise.resolve(extension.error?.(this.snapshot(context), error)));
+        } catch { /* Preserve the operation's failure. */ }
       }
       throw error;
     } finally {
@@ -40,7 +48,11 @@ export class SandboxLifecycle {
 
   private async hooks(phase: 'post', context: SandboxLifecycleContext) {
     for (const extension of this.extensions) {
-      try { await extension[phase]?.(this.snapshot(context)); }
+      try {
+        await traced('sandbox.lifecycle.hook', { 'sandbox.lifecycle.action': context.action,
+          'sandbox.lifecycle.extension': extension.name, 'sandbox.lifecycle.phase': phase },
+        () => Promise.resolve(extension[phase]?.(this.snapshot(context))));
+      }
       catch (error) { throw new SandboxExtensionError(extension.name, phase, error); }
     }
   }

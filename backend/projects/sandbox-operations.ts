@@ -36,7 +36,9 @@ export class ProjectSandboxOperations {
   private async phase(id: string, phase: string) {
     this.deps.assertHeld?.(id);
     const operation = this.deps.projects.get(id).sandboxOperation!;
-    await this.deps.projects.updateSandboxOperation(id, { ...operation, phase, updatedAt: new Date().toISOString() });
+    await traced('project.operation.phase.persist', { 'project.id': id, 'sandbox.operation.kind': operation.kind,
+      'sandbox.operation.phase': phase },
+    () => this.deps.projects.updateSandboxOperation(id, { ...operation, phase, updatedAt: new Date().toISOString() }));
     this.recordTiming(id, 'running', phase);
   }
 

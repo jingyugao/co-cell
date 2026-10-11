@@ -198,15 +198,15 @@ export class SessionManager {
 
   private async projectMutation<T>(id: string, action: () => Promise<T>): Promise<T> {
     if (!this.coordinator) return action();
-    return this.coordinator.run(`project-control:${id}`, async () => {
-      await this.refreshSharedState();
+    return traced('project.control_lock', { 'project.id': id }, () => this.coordinator!.run(`project-control:${id}`, async () => {
+      await traced('project.state.refresh_shared', { 'project.id': id }, () => this.refreshSharedState());
       this.mutations.set(id, (this.mutations.get(id) ?? 0) + 1);
       try { return await action(); }
       finally {
         const count = this.mutations.get(id)! - 1;
         if (count) this.mutations.set(id, count); else this.mutations.delete(id);
       }
-    });
+    }));
   }
 
   private async sessionMutation<T>(id: string, action: () => Promise<T>): Promise<T> {
@@ -1019,7 +1019,8 @@ export class SessionManager {
   private async submitProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'], options: { imageVersionId?: string } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-    await this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options));
+    await traced('project.operation.admission', { 'project.id': id, 'sandbox.operation.kind': kind },
+      () => this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options)));
   }
 
   async refreshProjectSandboxRuntime(id: string): Promise<ProjectSummary> {
@@ -1049,11 +1050,13 @@ export class SessionManager {
         if (!current || this.projects.isMaintaining(id) || !eligible(current)) return { done: Promise.resolve() };
       }
       if (!this.coordinator) return action();
-      const lease = await this.coordinator.tryAcquire(`project-maintenance:${id}`);
+      const lease = await traced('project.maintenance_lease.acquire', { 'project.id': id },
+        () => this.coordinator!.tryAcquire(`project-maintenance:${id}`));
       if (!lease) throw new HttpError(409, '项目正在其他实例执行维护，请稍后重试');
       this.projectLeases.set(id, lease);
       try {
-        for (const session of await this.state.listSessions()) if (session.projectId === id
+        const sessions = await traced('project.active_session_check', { 'project.id': id }, () => this.state.listSessions());
+        for (const session of sessions) if (session.projectId === id
           && (session.status === 'running' || session.turns.some(turn => turn.status === 'running'))) {
           throw new HttpError(409, '项目正在使用，请等待任务结束后重试');
         }

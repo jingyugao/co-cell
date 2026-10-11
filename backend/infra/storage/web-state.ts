@@ -96,16 +96,23 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sessions (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NULL, thread_id VARCHAR(191) NULL, title VARCHAR(255) NOT NULL, status ENUM('idle','running','completed','failed','cancelled') NOT NULL, archived_at DATETIME(3) NULL, started_at DATETIME(3) NOT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL, INDEX sessions_project_updated (project_id, updated_at), CONSTRAINT sessions_project_fk FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.notificationRepository.init();
   }
-  async listProjects(): Promise<Project[]> { const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects'); return rows.map(row => hydrateProject(this.document<Project>(row.document))); }
+  async listProjects(): Promise<Project[]> {
+    return traced('mysql.projects.list', { 'db.system': 'mysql' }, async () => {
+      const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects');
+      return rows.map(row => hydrateProject(this.document<Project>(row.document)));
+    });
+  }
   async listSessions(): Promise<Session[]> {
-    const [rows] = await this.pool.query<Array<RowDataPacket & { document: Session | string }>>('SELECT document FROM sessions');
-    const sessions: Session[] = [];
-    for (const row of rows) {
-      // A submission that never reached Codex has no App Server history.
-      const session = this.hydrateStoredSession(this.document<Session & { pendingTurns?: Turn[] }>(row.document));
-      if (session) sessions.push(session);
-    }
-    return sessions;
+    return traced('mysql.sessions.list', { 'db.system': 'mysql' }, async () => {
+      const [rows] = await this.pool.query<Array<RowDataPacket & { document: Session | string }>>('SELECT document FROM sessions');
+      const sessions: Session[] = [];
+      for (const row of rows) {
+        // A submission that never reached Codex has no App Server history.
+        const session = this.hydrateStoredSession(this.document<Session & { pendingTurns?: Turn[] }>(row.document));
+        if (session) sessions.push(session);
+      }
+      return sessions;
+    });
   }
   async getProject(id: string): Promise<Project | undefined> {
     const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects WHERE id = ?', [id]);
@@ -178,18 +185,22 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     save: (executor: Pick<Pool, 'query'>, id: string, merged: unknown) => Promise<void>,
     prepareIncoming: (previous: unknown, incoming: unknown, latest: unknown) => unknown = (_previous, next) => next) {
     if (!this.pool.getConnection) throw new Error('MySQL pool does not support transactions');
-    const connection = await this.pool.getConnection();
+    const attributes = { 'db.system': 'mysql', 'db.record.table': table, 'db.operation': 'metadata_merge' };
+    const connection = await traced('mysql.record.connection.acquire', attributes, () => this.pool.getConnection!());
     try {
-      await connection.beginTransaction();
-      const [rows] = await connection.query<Array<RowDataPacket & { document: unknown }>>(`SELECT document FROM ${table} WHERE id = ? FOR UPDATE`, [id]);
+      await traced('mysql.record.transaction.begin', attributes, () => connection.beginTransaction());
+      const [rows] = await traced('mysql.record.transaction.row_lock', attributes,
+        () => connection.query<Array<RowDataPacket & { document: unknown }>>(`SELECT document FROM ${table} WHERE id = ? FOR UPDATE`, [id]));
       if (!rows[0]) throw new HttpError(409, '记录已被删除，请刷新后重试');
       const latest = typeof rows[0].document === 'string' ? JSON.parse(rows[0].document) as unknown : rows[0].document;
-      const effectiveIncoming = prepareIncoming(previous, incoming, latest);
-      const merged = mergeRecord(previous, effectiveIncoming, latest);
+      const merged = await traced('mysql.record.merge', attributes, async () => {
+        const effectiveIncoming = prepareIncoming(previous, incoming, latest);
+        return mergeRecord(previous, effectiveIncoming, latest);
+      });
       await save(connection, id, merged);
-      await connection.commit();
+      await traced('mysql.record.transaction.commit', attributes, () => connection.commit());
     } catch (error) {
-      await connection.rollback().catch(() => undefined);
+      await traced('mysql.record.transaction.rollback', attributes, () => connection.rollback().catch(() => undefined));
       throw error;
     } finally { connection.release(); }
   }

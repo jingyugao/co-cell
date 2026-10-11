@@ -161,7 +161,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     }
     let releaseRemote: (() => Promise<void>) | undefined;
     try {
-      releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id, initialization ? target.settings.workingDirectory : undefined);
+      releaseRemote = await traced('sandbox.remote_usage.acquire', { 'sandbox.id': lease.record.id },
+        () => this.options.acquireRemoteUsage?.(lease.record.id, initialization ? target.settings.workingDirectory : undefined)
+          ?? Promise.resolve(undefined));
       signal?.throwIfAborted();
     } catch (error) {
       try { await releaseRemote?.(); } finally { await lease.release(); }
@@ -171,7 +173,15 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   private async release(entry: Entry, failed = false, detached = false) {
-    try { try { await entry.releaseRemote?.(); } finally { await entry.lease.release({ detached }); } }
+    try {
+      try {
+        await traced('sandbox.remote_usage.release', { 'sandbox.id': entry.metadata.id },
+          () => entry.releaseRemote?.() ?? Promise.resolve());
+      } finally {
+        await traced('sandbox.lease.release', { 'sandbox.id': entry.metadata.id },
+          () => entry.lease.release({ detached }));
+      }
+    }
     catch (error) {
       void this.options.logger?.write({ event: 'sandbox.release_failed', sandboxId: entry.metadata.id, message: this.safeError(error).message });
       if (!failed) throw this.safeError(error);
@@ -722,7 +732,10 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
     const entry = await traced('sandbox.acquire', { 'sandbox.id': target.sandbox.id },
       () => this.acquire(target, false, onSandbox, undefined, undefined, true));
-    try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await traced('sandbox.release', { 'sandbox.id': target.sandbox.id }, () => this.release(entry)); }
+    try {
+      await traced('sandbox.prepare_environment', { 'sandbox.id': target.sandbox.id },
+        () => this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)));
+    } finally { await traced('sandbox.release', { 'sandbox.id': target.sandbox.id }, () => this.release(entry)); }
   }
 
   async checkpoint(target: WorkspaceTarget) {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Session, Turn } from '../../../protocol/types.js';
 import { mergeSession } from './useSessionStream.js';
+import { applySdkEvent } from '../../../util/session-events.js';
 
 const now = '2026-09-24T00:00:00.000Z';
 const turn = (id: string, startedAt: string): Turn => ({ id, prompt: id, images: [], status: 'completed',
@@ -20,6 +21,27 @@ test('paged history remains visible after an SSE state update', () => {
   assert.deepEqual(merged.turns.map(item => item.id), ['older', 'latest']);
   assert.deepEqual(merged.turns[1].items, latest.items);
   assert.equal(merged.historyNextCursor, 'next-old-page');
+});
+
+test('native acceptance replaces the pending frame and keeps subsequent stream events on one turn', () => {
+  const pending = { ...turn('web-turn', now), status: 'running' as const, items: [], codexAccepted: false };
+  const accepted = { ...pending, nativeTurnId: 'native-turn', codexAccepted: true };
+  const merged = mergeSession({ ...base, turns: [pending] }, { ...base, turns: [accepted] });
+  assert.equal(merged.turns.length, 1);
+  const streamed = applySdkEvent(merged, pending.id, { type: 'item.completed', item: turn('answer', now).items[0] });
+  const history = { ...accepted, id: 'native-turn', status: 'completed' as const, items: streamed.turns[0].items };
+  const completed = mergeSession(streamed, { ...base, turns: [history] });
+  assert.equal(completed.turns.length, 1);
+  assert.deepEqual(completed.turns[0].items, history.items);
+});
+
+test('a stale pending snapshot matches the accepted turn by its CoCell ID', () => {
+  const pending = { ...turn('web-turn', now), status: 'running' as const, items: [] };
+  const accepted = { ...pending, nativeTurnId: 'native-turn', codexAccepted: true, items: turn('answer', now).items };
+  const merged = mergeSession({ ...base, turns: [accepted] }, { ...base, turns: [pending] });
+  assert.equal(merged.turns.length, 1);
+  assert.equal(merged.turns[0].nativeTurnId, 'native-turn');
+  assert.deepEqual(merged.turns[0].items, accepted.items);
 });
 
 test('an accepted failed turn is not labelled as a failed browser submission', () => {

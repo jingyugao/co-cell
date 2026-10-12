@@ -1,6 +1,5 @@
 import { installModelRoutes } from './models/routes.js';
 import type { ModelService } from './models/service.js';
-import { installModelGateway, type ModelGateway } from './models/gateway.js';
 import { installImageRoutes } from './images/routes.js';
 import type { ImageCatalog } from './images/service.js';
 import { traceHttpRequest } from './infra/diagnostics/tracing.js';
@@ -28,11 +27,10 @@ import type { SecretService } from './secrets/service.js';
 import { installSecretRoutes } from './secrets/routes.js';
 import { installPwaAssets } from './infra/http/pwa.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, modelGateway?: ModelGateway) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService) {
   const app = new Hono();
   app.get('/healthz', c => c.text('ok'));
   app.use('/api/*', traceHttpRequest);
-  if (modelGateway) installModelGateway(app, modelGateway);
   if (operatorAccess) installOperatorAccess(app, {
     ...operatorAccess,
     serviceProxy: (projectId, port, path, request) =>

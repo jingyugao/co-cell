@@ -4,18 +4,15 @@ import { createServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { Hono } from 'hono';
-import { getRequestListener } from '@hono/node-server';
 import { Codex, CodexAppServerClient, type Thread } from '../../packages/agentcore/src/index.mjs';
-import { ModelGateway, installModelGateway } from './gateway.js';
+import { DirectModelProvider } from './direct-provider.js';
 import type { ModelService } from './service.js';
-import { SecretCrypto } from '../secrets/crypto.js';
 import type { Session } from '../../protocol/types.js';
 
 // Exercise the pinned App Server's real resume/fork behavior. Only the remote
-// model is replaced with a loopback Responses peer; no credentials or tokens.
-test('native loaded threads change gateway channels without losing their conversation', { timeout: 30_000 }, async () => {
-  const home = await mkdtemp(join(tmpdir(), 'cocell-gateway-native-'));
+// model is replaced with a loopback Responses peer using synthetic credentials.
+test('native threads use channels directly and preserve history across endpoint and key changes', { timeout: 30_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cocell-direct-native-'));
   const requests: Array<{ path: string; key?: string; input: string }> = [];
   const upstream = createServer(async (req, res) => {
     let input = ''; for await (const chunk of req) input += chunk;
@@ -37,18 +34,10 @@ test('native loaded threads change gateway channels without losing their convers
   await new Promise<void>(done => upstream.listen(0, '127.0.0.1', done));
   const upstreamUrl = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
   let channel = 'a';
+  let key = 'key-a';
   const service = { selection: async () => ({ model: 'gpt-6-sol', modelEntryId: channel, channelId: channel,
-    endpoint: `${upstreamUrl}/${channel}/v1`, apiKey: `key-${channel}` }) } as unknown as ModelService;
-  const snapshots = new Map<string, string>();
-  const app = new Hono();
-  const web = createServer(getRequestListener(app.fetch));
-  await new Promise<void>(done => web.listen(0, '127.0.0.1', done));
-  const gateway = new ModelGateway(service, new SecretCrypto(Buffer.alloc(32, 2).toString('base64')),
-    `http://127.0.0.1:${(web.address() as { port: number }).port}`, {
-      init: async () => {}, save: async (id, value) => { snapshots.set(id, value); }, load: async id => snapshots.get(id),
-      delete: async id => { snapshots.delete(id); },
-    });
-  installModelGateway(app, gateway);
+    endpoint: `${upstreamUrl}/${channel}/v1`, apiKey: key }) } as unknown as ModelService;
+  const provider = new DirectModelProvider(service);
   let client: CodexAppServerClient | undefined;
   let codex: Codex | undefined;
   try {
@@ -66,20 +55,33 @@ test('native loaded threads change gateway channels without losing their convers
       'model_providers.legacy': { name: 'legacy', base_url: `${upstreamUrl}/a/v1`, wire_api: 'responses', experimental_bearer_token: 'key-a', supports_websockets: false },
     } }), 'Remember the first message.');
     const session = { id: '11111111-1111-4111-8111-111111111111', settings: { model: 'gpt-6-sol' } } as Session;
-    const managed = await collect(codex.resumeThread(legacy, { ...common, ...await gateway.threadOptions(session) }), 'Second message.');
-    assert.notEqual(managed, legacy, 'the loaded legacy thread must adopt the managed gateway');
+    const direct = await collect(codex.resumeThread(legacy, { ...common, ...await provider.threadOptions(session) }), 'Second message.');
+    assert.notEqual(direct, legacy, 'the loaded legacy thread must adopt the direct provider');
+    const unchanged = await collect(codex.resumeThread(direct, { ...common, ...await provider.threadOptions(session) }), 'Third message.');
+    assert.equal(unchanged, direct, 'an unchanged channel must retain the native thread');
     channel = 'b';
-    const resumed = await collect(codex.resumeThread(managed, { ...common, ...await gateway.threadOptions(session) }), 'Third message.');
-    assert.equal(resumed, managed, 'changing channels must retain the managed thread');
+    key = 'key-b';
+    const changed = await collect(codex.resumeThread(direct, { ...common, ...await provider.threadOptions(session) }), 'Fourth message.');
+    assert.notEqual(changed, direct, 'a changed endpoint must adopt the new direct provider');
+    key = 'rotated-key-b';
+    const rotated = await collect(codex.resumeThread(changed, { ...common, ...await provider.threadOptions(session) }), 'Fifth message.');
+    assert.notEqual(rotated, changed, 'a changed key must be adopted by the loaded thread');
+    await codex.close(); await client.close();
+    client = await CodexAppServerClient.spawn({ command: resolve('node_modules/.bin/codex'), args: ['app-server'], cwd: home,
+      env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, NO_PROXY: '127.0.0.1,localhost' } });
+    codex = new Codex({ appServerClient: client });
+    const restored = await collect(codex.resumeThread(rotated, { ...common, ...await provider.threadOptions(session) }), 'After restart.');
+    assert.equal(restored, rotated, 'a restored direct thread must retain its conversation');
     assert.deepEqual(requests.map(request => [request.path, request.key]), [
-      ['/a/v1/responses', 'Bearer key-a'], ['/a/v1/responses', 'Bearer key-a'], ['/b/v1/responses', 'Bearer key-b'],
+      ['/a/v1/responses', 'Bearer key-a'], ['/a/v1/responses', 'Bearer key-a'], ['/a/v1/responses', 'Bearer key-a'],
+      ['/b/v1/responses', 'Bearer key-b'], ['/b/v1/responses', 'Bearer rotated-key-b'], ['/b/v1/responses', 'Bearer rotated-key-b'],
     ]);
-    assert.match(requests[2].input, /Remember the first message/);
-    assert.match(requests[2].input, /Second message/);
-    assert.match(requests[2].input, /Third message/);
+    for (const message of ['Remember the first message', 'Second message', 'Third message', 'Fourth message', 'Fifth message', 'After restart']) {
+      assert.match(requests[5].input, new RegExp(message));
+    }
   } finally {
     await codex?.close(); await client?.close();
-    await Promise.all([upstream, web].map(server => new Promise<void>(done => { server.closeAllConnections(); server.close(() => done()); })));
+    await new Promise<void>(done => { upstream.closeAllConnections(); upstream.close(() => done()); });
     await rm(home, { recursive: true, force: true });
   }
 });

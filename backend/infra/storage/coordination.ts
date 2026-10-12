@@ -1,6 +1,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
-import { createConnection, type Connection } from 'mysql2/promise';
+import { createConnection } from 'mysql2/promise';
+import { context, ROOT_CONTEXT } from '@opentelemetry/api';
+import { traced } from '@co-cell/sandbox';
 
 export interface SharedLease {
   readonly signal: AbortSignal;
@@ -10,6 +12,7 @@ export interface SharedLease {
 
 export interface SharedCoordinator {
   run<T>(key: string, action: () => Promise<T>): Promise<T>;
+  tryRun<T>(key: string, action: () => Promise<T>): Promise<{ value: T } | null>;
   tryAcquire(key: string): Promise<SharedLease | null>;
   close(): Promise<void>;
 }
@@ -47,10 +50,17 @@ function databaseName(mysqlUrl: string): string {
 
 /** MySQL named locks are connection-scoped and shared by all API processes. */
 export class MySqlCoordinator implements SharedCoordinator {
+  private static readonly maxIdleConnections = 4;
   private readonly database: string;
   private readonly context = new AsyncLocalStorage<RunContext>();
   private readonly leases = new Set<ActiveLease>();
+  private readonly leaseConnections = new Map<ActiveLease, QueryConnection>();
+  private readonly idleConnections: QueryConnection[] = [];
+  private readonly acquiringConnections = new Set<QueryConnection>();
+  private readonly pendingAcquisitions = new Set<Promise<unknown>>();
+  private readonly disposedConnections = new WeakSet<object>();
   private closed = false;
+  private closing?: Promise<void>;
 
   constructor(mysqlUrl: string, private readonly options: {
     connectionFactory?: CoordinatorConnectionFactory;
@@ -75,6 +85,51 @@ export class MySqlCoordinator implements SharedCoordinator {
     return createHash('sha256').update(`${this.database}\0${key}`).digest('hex');
   }
 
+  private async checkout(key: string): Promise<{ connection: QueryConnection; reused: boolean }> {
+    if (this.closed) throw new Error('Coordinator is closed');
+    const idle = this.idleConnections.pop();
+    if (idle) {
+      this.acquiringConnections.add(idle);
+      return { connection: idle, reused: true };
+    }
+    const attributes = {
+      'coordination.lock.scope': key.split(':', 1)[0] ?? 'unknown',
+      'coordination.connection.reused': false,
+    };
+    return traced('coordination.mysql.connection.acquire', attributes, async () => {
+      const pending = this.connectionFactory().then(async connection => {
+        if (this.closed) {
+          await this.dispose(connection);
+          throw new Error('Coordinator is closed');
+        }
+        this.acquiringConnections.add(connection);
+        return connection;
+      });
+      this.pendingAcquisitions.add(pending);
+      try { return { connection: await pending, reused: false }; }
+      finally { this.pendingAcquisitions.delete(pending); }
+    });
+  }
+
+  private async dispose(connection: QueryConnection) {
+    if (this.disposedConnections.has(connection)) return;
+    this.disposedConnections.add(connection);
+    const idleIndex = this.idleConnections.indexOf(connection);
+    if (idleIndex >= 0) this.idleConnections.splice(idleIndex, 1);
+    this.acquiringConnections.delete(connection);
+    try { connection.destroy?.(); } catch { /* The physical close is best effort; end still runs. */ }
+    await connection.end().catch(() => {});
+  }
+
+  private async returnConnection(connection: QueryConnection, reusable: boolean) {
+    this.acquiringConnections.delete(connection);
+    if (reusable && !this.closed && this.idleConnections.length < MySqlCoordinator.maxIdleConnections) {
+      this.idleConnections.push(connection);
+      return;
+    }
+    await this.dispose(connection);
+  }
+
   async tryAcquire(key: string): Promise<SharedLease | null> {
     return this.acquire(key, 0);
   }
@@ -83,23 +138,31 @@ export class MySqlCoordinator implements SharedCoordinator {
     if (this.closed) throw new Error('Coordinator is closed');
     const lock = this.lockName(key);
     let connection: QueryConnection;
-    try { connection = await this.connectionFactory(); }
+    try { connection = (await this.checkout(key)).connection; }
     catch { throw new Error('Unable to connect to the coordination database'); }
-    if (this.closed) { await connection.end().catch(() => {}); throw new Error('Coordinator is closed'); }
+    if (this.closed) {
+      await this.dispose(connection);
+      throw new Error('Coordinator is closed');
+    }
 
-    let acquired = false;
     try {
       const [rows] = await connection.query('SELECT GET_LOCK(?, ?) AS acquired', [lock, waitSeconds]);
       const value = (rows as Array<{ acquired: number | null }>)[0]?.acquired;
-      acquired = value === 1;
-      if (!acquired) {
-        await connection.end().catch(() => {});
+      if (value === 0) {
+        await this.returnConnection(connection, true);
         return null;
+      }
+      if (value !== 1) throw new Error('Coordination lock acquisition is uncertain');
+      this.acquiringConnections.delete(connection);
+      if (this.closed) {
+        await this.dispose(connection);
+        throw new Error('Coordinator is closed');
       }
       return this.makeLease(key, lock, connection);
     } catch {
-      if (acquired) await connection.query('SELECT RELEASE_LOCK(?)', [lock]).catch(() => {});
-      await connection.end().catch(() => {});
+      // A failed GET_LOCK response may have acquired the server lock before
+      // the connection failed. Disposing the physical connection releases it.
+      await this.dispose(connection);
       throw new Error('Unable to acquire the coordination lock');
     }
   }
@@ -122,7 +185,9 @@ export class MySqlCoordinator implements SharedCoordinator {
       controller.abort(reason);
       clearInterval(heartbeat);
       if (transportLost) connection.destroy?.();
-      void lease.release();
+      // Heartbeat callbacks inherit the acquisition context after its span has
+      // ended. Keep cleanup work independent of that stale tracing context.
+      void context.with(ROOT_CONTEXT, () => lease.release());
     };
     lease = {
       key,
@@ -138,16 +203,19 @@ export class MySqlCoordinator implements SharedCoordinator {
         released = (async () => {
           if (!connectionLost) {
             await checking?.catch(() => {});
-            try { await connection.query('SELECT RELEASE_LOCK(?)', [lock]); }
-            catch { /* Closing the owning connection also releases the server lock. */ }
+            try {
+              const [rows] = await connection.query('SELECT RELEASE_LOCK(?) AS released', [lock]);
+              reusable = (rows as Array<{ released: number | null }>)[0]?.released === 1;
+            } catch { /* Failed release leaves server-lock ownership uncertain. */ }
           }
-          if (connectionLost) connection.destroy?.();
-          await connection.end().catch(() => {});
+          await this.returnConnection(connection, !connectionLost && reusable);
           this.leases.delete(lease);
+          this.leaseConnections.delete(lease);
         })();
         return released;
       },
     };
+    let reusable = false;
     heartbeat = setInterval(() => {
       if (!held || checking) return;
       checking = (async () => {
@@ -170,6 +238,7 @@ export class MySqlCoordinator implements SharedCoordinator {
     }, this.options.heartbeatMs ?? 5_000);
     heartbeat.unref?.();
     this.leases.add(lease);
+    this.leaseConnections.set(lease, connection);
     return lease;
   }
 
@@ -208,12 +277,47 @@ export class MySqlCoordinator implements SharedCoordinator {
     finally { await lease.release(); }
   }
 
+  async tryRun<T>(key: string, action: () => Promise<T>): Promise<{ value: T } | null> {
+    validateKey(key);
+    const inherited = this.context.getStore();
+    const current = inherited?.get(key);
+    if (current) {
+      if (current.signal.aborted) current.assertHeld();
+      let active = true;
+      try { current.assertHeld(); } catch (error) {
+        if (current.signal.aborted) throw error;
+        active = false;
+      }
+      if (active) return { value: await action() };
+    }
+    const lease = await this.tryAcquire(key);
+    if (!lease) return null;
+    const context = new Map(inherited ?? []);
+    context.set(key, lease as ActiveLease);
+    try {
+      const value = await this.context.run(context, action);
+      lease.assertHeld();
+      return { value };
+    } finally { await lease.release(); }
+  }
+
   async close(): Promise<void> {
+    if (this.closing) return this.closing;
     if (this.closed) return;
     this.closed = true;
     const leases = [...this.leases];
     for (const lease of leases) lease.controller.abort(new Error('Coordinator is closed'));
-    await Promise.all(leases.map(lease => lease.release()));
+    const activeConnections = new Set(this.leaseConnections.values());
+    const acquiring = [...this.acquiringConnections].filter(connection => !activeConnections.has(connection));
+    this.closing = (async () => {
+      await Promise.all([
+        ...leases.map(lease => lease.release()),
+        ...acquiring.map(connection => this.dispose(connection)),
+        ...this.idleConnections.splice(0).map(connection => this.dispose(connection)),
+      ]);
+      await Promise.allSettled([...this.pendingAcquisitions]);
+    })();
+    await this.closing;
   }
 }
 
@@ -290,6 +394,30 @@ export class MemoryCoordinator implements SharedCoordinator {
       }
       finally { await lease.release(); }
     }
+  }
+
+  async tryRun<T>(key: string, action: () => Promise<T>): Promise<{ value: T } | null> {
+    validateKey(key);
+    const inherited = this.context.getStore();
+    const current = inherited?.get(key);
+    if (current) {
+      if (current.signal.aborted) current.assertHeld();
+      let active = true;
+      try { current.assertHeld(); } catch (error) {
+        if (current.signal.aborted) throw error;
+        active = false;
+      }
+      if (active) return { value: await action() };
+    }
+    const lease = await this.tryAcquire(key);
+    if (!lease) return null;
+    const context = new Map(inherited ?? []);
+    context.set(key, lease as ActiveLease);
+    try {
+      const value = await this.context.run(context, action);
+      lease.assertHeld();
+      return { value };
+    } finally { await lease.release(); }
   }
 
   async close(): Promise<void> {

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises';
 import { posix } from 'node:path';
+import { traced, traceEvent } from '../../tracing.js';
 import type { CheckpointableSandboxProvider, SandboxCheckpoint, SandboxCommandHandle, SandboxCommandResult, SandboxHandle, SandboxInfo, SandboxProvider } from '../../types.js';
 import { CellboxClient, CellboxError, type CellboxBox, type CellboxClientOptions, type CellboxOperation, type CellboxProfile } from './client.js';
 
@@ -75,8 +76,9 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     if (!this.profileId || this.maxWaitMs < 1 || this.retryMs < 1)
       throw new CellboxError('INVALID_REQUEST', 'Valid profileId and operation wait bounds are required');
   }
-  async initialize() {
-    const profile = (await this.client.listProfiles()).find(value => value.id === this.profileId);
+  async initialize(signal?: AbortSignal) {
+    this.checkConnectAbort(signal);
+    const profile = (await this.client.listProfiles(signal)).find(value => value.id === this.profileId);
     if (!profile) throw new CellboxError('NOT_FOUND', `Cellbox profile ${this.profileId} is unavailable to this client`);
     if (profile.provider !== 'resumable-k8s-pod' || profile.capabilities.suspend !== 'same-node-checkpoint')
       throw new CellboxError('UNSUPPORTED_CAPABILITY', `Cellbox profile ${this.profileId} is not a resumable Kubernetes pod`);
@@ -92,59 +94,100 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     this.initialized = true;
     return profile;
   }
-  private async ready() { if (!this.initialized) await this.initialize(); }
-  private async box(id: string) {
-    const box = await this.client.getBox(id);
+  private checkConnectAbort(signal?: AbortSignal) {
+    if (signal?.aborted) throw new CellboxError('TRANSPORT', 'Cellbox connect was cancelled before completion');
+  }
+  private async ready(signal?: AbortSignal) { if (!this.initialized) await this.initialize(signal); }
+  private async box(id: string, signal?: AbortSignal) {
+    const box = await this.client.getBox(id, signal);
     if (box.profileId !== this.profileId) throw new CellboxError('CONFLICT', `Box ${id} uses another profile`);
     if (this.workspace && box.workspace !== this.workspace)
       throw new CellboxError('CONFLICT', `Box ${id} workspace differs from configured workspace`);
     return box;
   }
   private async wait(op: CellboxOperation, timeoutMs = this.maxWaitMs, signal?: AbortSignal): Promise<CellboxOperation> {
-    const until = Date.now() + timeoutMs;
-    let current = op;
-    for (;;) {
-      if (current.status === 'succeeded') return current;
-      if (current.status === 'failed')
-        throw new CellboxError(current.error?.code ?? 'CONFLICT', current.error?.message ?? `Cellbox ${current.kind} failed`);
-      if (signal?.aborted) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`);
-      const remaining = until - Date.now();
-      if (remaining <= 0) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} is still pending after the wait limit`);
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), Math.min(15_000, Math.max(1, until - Date.now())));
-      try { current = await this.client.getOperation(op.id, signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, Math.min(10_000, remaining)); }
-      catch (error) {
-        if (signal?.aborted) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`, undefined, undefined, { cause: error });
-        if (Date.now() >= until) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} may still be pending`, undefined, undefined, { cause: error });
-        if (error instanceof CellboxError && error.code === 'TRANSPORT') {
-          await new Promise<void>((resolve, reject) => {
-            const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, Math.min(this.retryMs, Math.max(1, until - Date.now())));
-            const abort = () => { clearTimeout(timer); reject(new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`)); };
-            signal?.addEventListener('abort', abort, { once: true });
-          });
-          continue;
+    if (signal?.aborted) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`);
+    // Synchronous Cellbox resume already returns a terminal Operation. Avoid
+    // emitting a zero-duration waiter span when there was no long poll.
+    if (op.status === 'succeeded') return op;
+    if (op.status === 'failed')
+      throw new CellboxError(op.error?.code ?? 'CONFLICT', op.error?.message ?? `Cellbox ${op.kind} failed`);
+    return traced('cellbox.operation.wait', {
+      'cellbox.operation.kind': op.kind,
+      'cellbox.operation.wait_limit_ms': timeoutMs,
+    }, async () => {
+      let lastStatus: CellboxOperation['status'] | undefined;
+      const until = Date.now() + timeoutMs;
+      let current = op;
+      for (;;) {
+        if (current.status !== lastStatus) {
+          traceEvent('cellbox.operation.status', { 'operation.status': current.status, 'operation.version': current.version });
+          lastStatus = current.status;
         }
-        throw error;
-      } finally { clearTimeout(timer); }
-    }
+        if (current.status === 'succeeded') return current;
+        if (current.status === 'failed')
+          throw new CellboxError(current.error?.code ?? 'CONFLICT', current.error?.message ?? `Cellbox ${current.kind} failed`);
+        if (signal?.aborted) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`);
+        const remaining = until - Date.now();
+        if (remaining <= 0) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} is still pending after the wait limit`);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), Math.min(15_000, Math.max(1, until - Date.now())));
+        try { current = await this.client.getOperation(op.id, signal ? AbortSignal.any([signal, controller.signal]) : controller.signal, Math.min(10_000, remaining)); }
+        catch (error) {
+          if (signal?.aborted) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`, undefined, undefined, { cause: error });
+          if (Date.now() >= until) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} may still be pending`, undefined, undefined, { cause: error });
+          if (error instanceof CellboxError && error.code === 'TRANSPORT') {
+            await new Promise<void>((resolve, reject) => {
+              const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, Math.min(this.retryMs, Math.max(1, until - Date.now())));
+              const abort = () => { clearTimeout(timer); reject(new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`)); };
+              signal?.addEventListener('abort', abort, { once: true });
+            });
+            continue;
+          }
+          throw error;
+        } finally { clearTimeout(timer); }
+      }
+    });
   }
   waitForOperation(op: CellboxOperation, timeoutMs?: number, signal?: AbortSignal) { return this.wait(op, timeoutMs, signal); }
   inspectOperation(id: string) { return this.client.getOperation(id); }
-  private async act(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string) {
-    return this.wait(await this.client.actBox(id, action, key));
+  private async act(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string,
+    expectedGeneration?: number, signal?: AbortSignal) {
+    const timeoutMs = action === 'resume' ? this.maxWaitMs + 60_000 : undefined;
+    this.checkConnectAbort(signal);
+    return this.wait(await this.client.actBox(id, action, key, { timeoutMs, expectedGeneration, signal }), this.maxWaitMs, signal);
   }
-  private async resumeSuspended(box: CellboxBox) {
+  private async resumeSuspended(box: CellboxBox, signal?: AbortSignal) {
     const key = `cocell-resume-${box.id}-${box.generation}`;
-    try { await this.act(box.id, 'resume', key); }
+    try { await this.act(box.id, 'resume', key, box.generation, signal); }
     catch (error) {
       if (!(error instanceof CellboxError) || error.code !== 'OPERATION_EXPIRED') throw error;
       // An expired key is a rejected admission, not an unknown mutation result.
       // Recheck the suspension before submitting a fresh attempt. Never rotate
       // keys on transport failures, changed generations or active operations.
-      const current = await this.box(box.id);
+      this.checkConnectAbort(signal);
+      const current = await this.box(box.id, signal);
       if (current.phase !== 'suspended' || current.generation !== box.generation || current.operationId) throw error;
-      await this.act(box.id, 'resume', `${key}-${randomUUID()}`);
+      this.checkConnectAbort(signal);
+      await this.act(box.id, 'resume', `${key}-${randomUUID()}`, box.generation, signal);
     }
+  }
+  private async joinResume(box: CellboxBox, signal?: AbortSignal): Promise<CellboxBox> {
+    if (!box.operationId) throw new CellboxError('CONFLICT', `Box ${box.id} is resuming without an operation identity`);
+    this.checkConnectAbort(signal);
+    const operation = await this.client.getOperation(box.operationId, signal);
+    if (operation.id !== box.operationId || !['resume', 'ensure-running'].includes(operation.kind) || operation.targetId !== box.id)
+      throw new CellboxError('CONFLICT', `Box ${box.id} is associated with another lifecycle operation`);
+    const completed = await this.wait(operation, this.maxWaitMs, signal);
+    this.checkConnectAbort(signal);
+    const current = completed.box ?? await this.box(box.id, signal);
+    if (current.id !== box.id || current.profileId !== this.profileId || (this.workspace && current.workspace !== this.workspace))
+      throw new CellboxError('CONFLICT', `Box ${box.id} lifecycle operation returned an unexpected identity`);
+    if (current.phase !== 'running')
+      throw new CellboxError('CONFLICT', `Box ${box.id} lifecycle operation completed while it is ${current.phase}`);
+    if (current.operationId)
+      throw new CellboxError('CONFLICT', `Box ${box.id} still has active operation ${current.operationId}`);
+    return current;
   }
   private async createJournal(ownerKey: string) {
     if (!this.stateDirectory) throw new CellboxError('INVALID_REQUEST', 'Create requires metadata.cellboxIdempotencyKey or provider stateDirectory');
@@ -196,19 +239,46 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
       await this.saveCreateJournal(journal.path, { key, boxId: op.targetId });
     await this.wait(op);
     const box = await this.box(op.targetId);
-    if (box.phase === 'suspended') return this.connect(box.id);
+    if (box.phase === 'suspended') {
+      const ensured = await this.ensureRunning(box.id, { operationKey: `cocell-create-ensure-${key}`, expectedGeneration: box.generation });
+      return ensured.handle;
+    }
     if (box.phase !== 'running' && !(staged && box.phase === 'staged')) throw new CellboxError('CONFLICT', `Created box ${box.id} is ${box.phase}`);
     return this.handle(box);
   }
-  async connect(id: string): Promise<SandboxHandle> {
-    await this.ready();
-    let box = await this.box(id);
-    if (box.phase === 'suspended') {
-      await this.resumeSuspended(box);
-      box = await this.box(id);
+  async connect(id: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<SandboxHandle> {
+    const { signal } = options;
+    this.checkConnectAbort(signal);
+    await this.ready(signal);
+    this.checkConnectAbort(signal);
+    let box = await this.box(id, signal);
+    if (box.phase === 'resuming' || (box.phase === 'running' && box.operationId)) {
+      box = await this.joinResume(box, signal);
     }
     if (box.phase !== 'running') throw new CellboxError('CONFLICT', `Box ${id} is ${box.phase}`);
     return this.handle(box);
+  }
+  async ensureRunning(id: string, options: { operationKey: string; expectedGeneration?: number; signal?: AbortSignal }) {
+    const { operationKey, expectedGeneration, signal } = options;
+    if (!operationKey.trim()) throw new CellboxError('INVALID_REQUEST', 'ensure-running requires an operation key');
+    this.checkConnectAbort(signal);
+    await this.ready(signal);
+    const operation = await this.client.ensureRunning(id, operationKey, {
+      expectedGeneration, signal, timeoutMs: this.maxWaitMs + 60_000,
+    });
+    this.checkConnectAbort(signal);
+    if (operation.id.length === 0 || !['ensure-running', 'resume'].includes(operation.kind) || operation.targetId !== id)
+      throw new CellboxError('PROTOCOL', `Cellbox returned an unrelated ensure-running operation for Box ${id}`, undefined, operationKey);
+    if (operation.status === 'failed')
+      throw new CellboxError(operation.error?.code ?? 'CONFLICT', operation.error?.message ?? `Cellbox could not ensure Box ${id} is running`, undefined, operationKey);
+    if (operation.status !== 'succeeded' || !operation.box)
+      throw new CellboxError('PROTOCOL', `Cellbox ensure-running for Box ${id} did not return a completed Box snapshot`, undefined, operationKey);
+    const box = operation.box;
+    if (box.id !== id || box.profileId !== this.profileId || (this.workspace && box.workspace !== this.workspace))
+      throw new CellboxError('CONFLICT', `Cellbox ensure-running returned an unexpected Box identity`, undefined, operationKey);
+    if (box.phase !== 'running' || box.operationId)
+      throw new CellboxError('PROTOCOL', `Cellbox ensure-running completed while Box ${id} is ${box.phase}`, undefined, operationKey);
+    return { handle: this.handle(box), info: this.boxInfo(box) };
   }
   /** Restore candidates accept agent setup while staged; no resume or activation occurs here. */
   async connectForSetup(id: string): Promise<SandboxHandle> {
@@ -233,9 +303,12 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   }
   private boxInfo(box: CellboxBox): SandboxInfo {
     const startedAt = new Date(box.createdAt);
-    return { sandboxId: box.id, state: box.phase === 'running' ? 'running' : box.phase === 'suspended' ? 'paused' : 'unknown',
-      startedAt, endAt: new Date('9999-12-31T23:59:59.999Z'),
-      metadata: { ownerKey: box.ownerKey, profileId: box.profileId, generation: String(box.generation), phase: box.phase },
+    return { sandboxId: box.id, state: !box.operationId && box.phase === 'running' ? 'running' : !box.operationId && box.phase === 'suspended' ? 'paused' : 'unknown',
+      startedAt,
+      metadata: { ownerKey: box.ownerKey, profileId: box.profileId, generation: String(box.generation), phase: box.phase,
+        ...(box.operationId ? { operationId: box.operationId } : {}),
+        ...(box.executionId ? { executionId: box.executionId } : {}) },
+      capabilities: { ...box.capabilities },
       templateIdentity: { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] } };
   }
   async pause(id: string) {
@@ -253,11 +326,14 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     if (box.phase !== 'suspended') throw new CellboxError('CONFLICT', `Box ${id} did not suspend`);
     return { id: `cellbox-suspended:${id}:${box.generation}`, createdAt: new Date().toISOString() };
   }
-  async restore(id: string, checkpointId: string): Promise<void> {
-    const box = await this.box(id);
+  async restore(id: string, checkpointId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    const { signal } = options;
+    this.checkConnectAbort(signal);
+    const box = await this.box(id, signal);
+    this.checkConnectAbort(signal);
     if (checkpointId !== `cellbox-suspended:${id}:${box.generation}` || box.phase !== 'suspended')
       throw new CellboxError('CONFLICT', 'The same-node Cellbox suspension is no longer available');
-    await this.resumeSuspended(box);
+    await this.resumeSuspended(box, signal);
   }
   /** Explicit cold restart preserves the Box-owned HOME; never creates or restores a Box. */
   async rebuildPersistent(id: string, key: string) {
@@ -348,14 +424,13 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   private handle(box: CellboxBox): SandboxHandle & { getServiceAccess(port: number): Promise<CellboxServiceAccess> } {
     const id = box.id;
     const workspace = box.workspace;
-    let commandTimeout = 30_000;
     const execute = async (command: string, options: RunOptions = {}) => {
       validAgent(options.user);
       if (!command || typeof command !== 'string') throw new CellboxError('INVALID_REQUEST', 'Command is required');
       if (Buffer.byteLength(command) > 8192) throw new CellboxError('INVALID_REQUEST', 'Cellbox shell command exceeds the 8192-byte guest argument limit');
       const cwd = options.cwd === undefined ? undefined : workspacePath(options.cwd, workspace);
       if (options.cwd !== undefined && cwd === undefined) throw new CellboxError('INVALID_REQUEST', 'Command cwd must be inside Cellbox workspace');
-      const timeoutMs = options.timeoutMs ?? commandTimeout;
+      const timeoutMs = options.timeoutMs ?? 30_000;
       if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000)
         throw new CellboxError('INVALID_REQUEST', 'Command timeoutMs must be 1..300000');
       const current = await this.box(id);
@@ -408,7 +483,6 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     return { sandboxId: id, getHost: () => new URL(this.client.origin).hostname,
       getServiceUrl: async port => (await this.serviceRoute(id, port)).url,
       getServiceAccess: port => this.getServiceAccess(id, port),
-      setTimeout: async timeoutMs => { if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new CellboxError('INVALID_REQUEST', 'Timeout must be positive'); commandTimeout = Math.min(timeoutMs, 300_000); },
       commands: { run: execute as SandboxHandle['commands']['run'] },
       files: {
         readResponse: async (path, options = {}) => {

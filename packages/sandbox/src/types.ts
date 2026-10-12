@@ -10,7 +10,6 @@ export interface SandboxHandle {
   getHost(port: number): string;
   /** Provider-specific externally reachable URL for a service bound to sandbox localhost. */
   getServiceUrl?(port: number): Promise<string>;
-  setTimeout(timeoutMs: number): Promise<void>;
   commands: {
     run(command: string, options: {
       user?: string; signal?: AbortSignal; timeoutMs?: number; background: true;
@@ -37,7 +36,9 @@ export interface SandboxHandle {
 }
 export interface SandboxInfo {
   sandboxId: string; state: 'running' | 'paused' | 'unknown';
-  startedAt: Date; endAt: Date; metadata?: Record<string, string>;
+  startedAt: Date; endAt?: Date; metadata?: Record<string, string>;
+  /** Provider capabilities observed with this state snapshot. */
+  capabilities?: Record<string, boolean | string>;
   templateIdentity?: {
     reference: string;
     id: string;
@@ -95,7 +96,7 @@ export interface SandboxPolicy {
 
 export interface SandboxCheckpointProvider {
   checkpoint(sandboxId: string): Promise<SandboxCheckpoint>;
-  restore(sandboxId: string, checkpointId: string): Promise<void>;
+  restore(sandboxId: string, checkpointId: string, options?: { signal?: AbortSignal }): Promise<void>;
 }
 
 export interface SandboxProvider {
@@ -104,7 +105,13 @@ export interface SandboxProvider {
     lifecycle: { onTimeout: 'pause'; autoResume: false };
     metadata?: Record<string, string>;
   }): Promise<SandboxHandle>;
-  connect(sandboxId: string, options: { timeoutMs: number }): Promise<SandboxHandle>;
+  connect(sandboxId: string, options: { timeoutMs: number; signal?: AbortSignal }): Promise<SandboxHandle>;
+  /** Performs an explicit ensure-running lifecycle operation and returns its authoritative snapshot. */
+  ensureRunning?(sandboxId: string, options: {
+    operationKey: string; expectedGeneration?: number; signal?: AbortSignal;
+  }): Promise<{ handle: SandboxHandle; info: SandboxInfo }>;
+  /** Renews a real provider-owned lease. Providers without leases omit this capability. */
+  renew?(sandboxId: string, timeoutMs: number): Promise<SandboxInfo>;
   /** Connect to an already running/staged instance without resuming it. */
   connectForSetup?(sandboxId: string): Promise<SandboxHandle>;
   getInfo(sandboxId: string): Promise<SandboxInfo>;
@@ -133,6 +140,9 @@ export interface SandboxLifecycleContext {
   sandbox?: SandboxHandle;
   record?: SandboxRecord;
   metadata?: Record<string, string>;
+  observation?: SandboxInfo;
+  /** Cancels the lifecycle transition when its owning acquire is no longer active. */
+  signal?: AbortSignal;
 }
 /** Hooks are awaited in registration order. A failed pre hook prevents the operation. */
 export interface SandboxExtension {
@@ -149,6 +159,8 @@ export interface AcquireSandboxOptions {
   usageId: string;
   purpose?: string;
   signal?: AbortSignal;
+  /** Stable idempotency key for an explicit ensure-running request. */
+  operationKey?: string;
   /** Registers an existing record when track() was not called first. */
   record?: SandboxRecord;
   /** Required with record/create when the resource has not already been tracked. */
@@ -161,6 +173,7 @@ export interface SandboxLease {
   readonly resourceKey: string;
   readonly usageId: string;
   readonly sandbox: SandboxHandle;
+  readonly info?: SandboxInfo;
   /** Returns a defensive snapshot of the current record. */
   readonly record: SandboxRecord;
   /** Aborted if the manager invalidates this resource handle. */

@@ -11,6 +11,7 @@ import { runTurn } from '../execution/runner.js';
 import { ProjectSandboxes } from './project-sandboxes.js';
 import type { WorkspaceTarget } from './types.js';
 import { CellboxError } from '../../packages/sandbox/src/providers/cellbox/client.js';
+import { CellboxSandboxProvider, type CellboxBox, type CellboxOperation } from '../../packages/sandbox/src/providers/cellbox/index.js';
 type TurnExecutionDependencies = Parameters<typeof runTurn>[3];
 const runtimePaths = { root: '/home/agent/workspace/.cocell', runtime: '/home/agent/workspace/.cocell/runtime',
   codexHome: '/home/agent/workspace/.cocell/codex', node: '/usr/local/bin/node' };
@@ -145,7 +146,6 @@ function fixture() {
   const counts = { create: 0, connect: 0, kill: 0, renew: 0 };
   const sandbox = {
     sandboxId: 'test-sandbox',
-    setTimeout: async () => { counts.renew++; },
     files: { exists: async () => { assert.fail('workspace reads must not inspect the Codex installation'); } },
     commands: { run: async () => ({ stdout: JSON.stringify({ confirmed: true }) }) },
   } as unknown as SandboxHandle;
@@ -166,6 +166,61 @@ function fixture() {
   const record: SandboxState = { id: sandbox.sandboxId, template: 'base', status: 'ready', workingDirectory: target.settings.workingDirectory };
   return { counts, sandbox, provider, manager, projects, target, record };
 }
+
+test('default mounted-home resume uses one Cellbox ensure command and no GET, prepare, renew, or save', async () => {
+  const calls: Array<{ method: string; path: string; body?: unknown; key?: string }> = [];
+  const capabilities = { exec: true, files: true, http: true, websocket: true, pty: false, reconnectExec: false,
+    freeze: false, suspend: 'same-node-checkpoint' as const, archives: 'workspace-best-effort', protectedTools: false,
+    sharedDirectory: true };
+  const box: CellboxBox = { id: 'test-sandbox', ownerKey: 'project:project-resume', profileId: 'k8s', phase: 'running',
+    generation: 9, resourceVersion: 12, image: 'mybox:latest', workspace: '/home/agent/workspace', capabilities,
+    createdAt: new Date(0).toISOString() };
+  const provider = new CellboxSandboxProvider({ baseUrl: 'http://cellbox.test', profileId: 'k8s', fetch: async (input, init) => {
+    const url = new URL(String(input));
+    const method = init?.method ?? 'GET';
+    const headers = new Headers(init?.headers);
+    const raw = init?.body;
+    calls.push({ method, path: url.pathname, ...(raw ? { body: JSON.parse(String(raw)) } : {}),
+      ...(headers.get('idempotency-key') ? { key: headers.get('idempotency-key')! } : {}) });
+    if (url.pathname === '/v1/profiles') return Response.json([{ id: 'k8s', provider: 'resumable-k8s-pod',
+      capabilities, runtime: 'k8s', behavior: 'resumable', kind: 'k8s-resumable', image: 'mybox:latest',
+      workspace: '/home/agent/workspace', agent: { uid: 1000, gid: 1000 }, cpu: 2, memoryMiB: 4096 }]);
+    if (url.pathname === `/v1/boxes/${box.id}:ensure-running` && method === 'POST') {
+      const operation: CellboxOperation = { id: 'resume-operation', kind: 'ensure-running', targetId: box.id,
+        status: 'succeeded', version: 1, createdAt: new Date().toISOString(), box };
+      return Response.json(operation);
+    }
+    assert.fail(`unexpected Cellbox request: ${method} ${url.pathname}`);
+  } });
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
+  const projects = new ProjectSandboxes(manager, 'k8s');
+  let saves = 0, preparations = 0, remoteUsage = 0;
+  const target: WorkspaceTarget = { id: 'session-resume', projectId: 'project-resume',
+    settings: { workingDirectory: runtimePaths.root }, updatedAt: new Date().toISOString(),
+    sandbox: { id: box.id, template: 'k8s', status: 'unknown', workingDirectory: runtimePaths.root } };
+  // Simulate a process recovered from durable state with a checkpoint marker
+  // and stale unknown status; Cellbox ensure-running owns the recovery.
+  manager.track(`project:${target.projectId}`, { id: box.id, template: 'k8s', status: 'unavailable',
+    checkpoint: { id: 'cellbox-checkpoint', createdAt: new Date(0).toISOString() } }, async () => { saves++; });
+  projects.track(target, async () => { saves++; });
+  const runtime = new ContainerCodexRuntime({ paths: runtimePaths, sandboxes: projects, provider, apiKey: '',
+    sharedFilesMounted: () => true,
+    prepareRemote: async () => { preparations++; return true; },
+    acquireRemoteUsage: async () => { remoteUsage++; return async () => {}; } });
+  try {
+    const result = await runtime.resume(target, undefined, 'project-resume-op');
+    assert.equal(result.status, 'ready');
+    assert.deepEqual(calls.map(call => [call.method, call.path]), [
+      ['GET', '/v1/profiles'], ['POST', `/v1/boxes/${box.id}:ensure-running`],
+    ]);
+    assert.equal(calls[1].key, 'project-resume-op');
+    assert.equal(calls.filter(call => call.method === 'GET' && call.path.startsWith('/v1/boxes/')).length, 0);
+    assert.equal(saves, 0);
+    assert.equal(preparations, 0);
+    assert.equal(remoteUsage, 0);
+    assert.equal(manager.peek(`project:${target.projectId}`)?.checkpoint, undefined);
+  } finally { await runtime.close(); await manager.close(); }
+});
 
 test('live Sandbox queries ignore reference status without preparing, connecting or persisting', async () => {
   const { provider, projects, counts, target, record } = fixture();

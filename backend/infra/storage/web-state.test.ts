@@ -307,6 +307,66 @@ test('baseline project writes lock and merge the latest stored document before u
   assert.equal(stored.description, 'written by another instance');
 });
 
+test('project mutation uses the latest locked row, skips no-op writes, and rolls back callback failures', async () => {
+  const id = 'mutate-project';
+  const latest: Project = {
+    id, name: 'latest name', requirementUrl: null, requirementStatus: 'externally refreshed',
+    executionMode: 'sandbox', workingDirectory: '/latest', backupRetentionCount: 9,
+    createdAt: now, updatedAt: now,
+  };
+  let stored = structuredClone(latest);
+  let writes = 0;
+  let rollbacks = 0;
+  let commits = 0;
+  let releases = 0;
+  const statements: string[] = [];
+  const connection = {
+    async beginTransaction() { statements.push('begin'); },
+    async commit() { commits++; statements.push('commit'); },
+    async rollback() { rollbacks++; statements.push('rollback'); },
+    release() { releases++; },
+    async query(sql: string, values?: unknown[]) {
+      statements.push(sql);
+      if (sql.includes('FOR UPDATE')) return [[{ document: structuredClone(stored) }], []];
+      writes++;
+      stored = JSON.parse(String(values?.[8]));
+      return [[], []];
+    },
+  };
+  const store = Object.create(MySqlWebStateStore.prototype) as MySqlWebStateStore;
+  (store as unknown as { pool: unknown }).pool = { getConnection: async () => connection };
+
+  const result = await store.mutateProject(id, current => { current.name = 'callback name'; });
+  assert.equal(result.name, 'callback name');
+  assert.equal(stored.name, 'callback name');
+  assert.equal(stored.requirementStatus, 'externally refreshed');
+  assert.equal(stored.backupRetentionCount, 9);
+  assert.equal(stored.workingDirectory, '/latest');
+  assert.equal(statements[0], 'begin');
+  assert.equal(statements[1], 'SELECT document FROM projects WHERE id = ? FOR UPDATE');
+  assert.match(statements[2], /^INSERT INTO projects/);
+  assert.equal(statements[3], 'commit');
+  assert.equal(writes, 1);
+
+  const priorStored = structuredClone(stored);
+  statements.length = 0;
+  const noOp = await store.mutateProject(id, () => {});
+  assert.equal(noOp.name, priorStored.name);
+  assert.equal(writes, 1, 'a no-op mutation commits without issuing a project write');
+  assert.equal(commits, 2);
+  assert.equal(rollbacks, 0);
+
+  const failure = new Error('callback rejected');
+  statements.length = 0;
+  await assert.rejects(store.mutateProject(id, () => { throw failure; }), error => error === failure);
+  assert.deepEqual(stored, priorStored);
+  assert.equal(writes, 1, 'a rejected callback never reaches the upsert');
+  assert.equal(rollbacks, 1);
+  assert.equal(commits, 2);
+  assert.equal(releases, 3, 'each transaction releases its dedicated connection');
+  assert.equal(statements.at(-1), 'rollback');
+});
+
 test('legacy submissions without an accepted Codex turn are hidden without writes', async () => {
   const failed: Session = { ...session, threadId: null, status: 'failed', turns: [{ ...session.turns[0],
     codexAccepted: false, nativeTurnId: undefined, status: 'failed', items: [] }] };

@@ -260,3 +260,52 @@ test('a generation change during delivery is not acknowledged and activation wai
   assert.equal(JSON.parse(fake.writes[1].bytes).boxId, 'box-one');
   assert.equal(fake.acknowledgements.has('box-one:2'), false);
 });
+
+test('an aborted queued runtime configuration never starts after the prior configuration finishes', async () => {
+  const fake = fixture();
+  const runtime = new SandboxRuntimeConfig(fake.options);
+  const lifecycle = new SandboxLifecycle([runtime.extension]);
+  let releaseRead!: () => void, enteredRead!: () => void;
+  const readGate = new Promise<void>(resolve => { releaseRead = resolve; });
+  const entered = new Promise<void>(resolve => { enteredRead = resolve; });
+  const getBox = fake.provider.client.getBox.bind(fake.provider.client);
+  let reads = 0;
+  fake.provider.client.getBox = async (id, signal) => {
+    if (++reads === 1) { enteredRead(); await readGate; }
+    return getBox(id, signal);
+  };
+  try {
+    const first = lifecycle.run({ action: 'reconcile', resourceKey: 'project:project-one', sandboxId: 'box-one' }, async () => {});
+    await entered;
+    const controller = new AbortController();
+    const queued = lifecycle.run({ action: 'connect', resourceKey: 'project:project-one', sandboxId: 'box-one', signal: controller.signal }, async () => {});
+    controller.abort();
+    await assert.rejects(queued, /abort/i);
+    releaseRead();
+    await first;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(reads, 2, 'only the active configuration performed its initial and generation-fence Box reads');
+    assert.equal(fake.writes.length, 1, 'only the first active configuration wrote credentials');
+    assert.equal(fake.acknowledgements.size, 1, 'the cancelled queued configuration added no acknowledgement');
+    assert.equal(fake.provisions(), 1, 'cancelled queued configuration did not provision credentials');
+  } finally { releaseRead(); }
+});
+
+test('cancellation after credential provisioning prevents writes and acknowledgements', async () => {
+  const fake = fixture();
+  let releaseProvision!: () => void, enteredProvision!: () => void;
+  const provisionGate = new Promise<void>(resolve => { releaseProvision = resolve; });
+  const entered = new Promise<void>(resolve => { enteredProvision = resolve; });
+  fake.options.secrets.provision = async () => { enteredProvision(); await provisionGate; return []; };
+  const controller = new AbortController();
+  try {
+    const lifecycle = new SandboxLifecycle([new SandboxRuntimeConfig(fake.options).extension]);
+    const configuring = lifecycle.run({ action: 'reconcile', resourceKey: 'project:project-one', sandboxId: 'box-one', signal: controller.signal }, async () => {});
+    await entered;
+    controller.abort();
+    releaseProvision();
+    await assert.rejects(configuring, /runtime-config post failed/i);
+    assert.equal(fake.writes.length, 0, 'aborted provisioning did not write guest credentials');
+    assert.equal(fake.acknowledgements.size, 0, 'aborted provisioning was not acknowledged');
+  } finally { releaseProvision(); }
+});

@@ -46,7 +46,8 @@ test('session gateway snapshots isolate channels and refresh routes without chan
   const responses = await Promise.all([send(a), send(b)]);
   assert.deepEqual(responses.map(response => response.status), [200, 200]);
   for (const response of responses) assert.match(await response.text(), /response.completed/);
-  assert.deepEqual(requests.map(request => [request.path, request.authorization]), [['/a/responses', 'Bearer key-a'], ['/b/responses', 'Bearer key-b']]);
+  assert.deepEqual([...requests].sort((a, b) => a.path.localeCompare(b.path)).map(request => [request.path, request.authorization]),
+    [['/a/responses', 'Bearer key-a'], ['/b/responses', 'Bearer key-b']]);
   assert.equal([...values.values()].some(value => value.includes('key-a') || value.includes('key-b')), false);
   // A catalog change alone must not affect an already running session.
   current = { ...current, endpoint: `${root}/c`, apiKey: 'key-c' };

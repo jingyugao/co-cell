@@ -9,6 +9,10 @@ import { PROJECT_OPERATION_WAIT_MS } from '../../protocol/types.js';
 
 type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
 
+function projectOperationResponse(c: Context, project: Awaited<ReturnType<ProjectRoutesManager['enterProject']>>) {
+  return c.json(project, project.sandboxOperation?.status === 'running' ? 202 : 200);
+}
+
 export async function proxyProjectService(manager: Pick<SessionManager, 'projectService'>, projectId: string, port: number,
   path: string, request: Request, prefix: string, isolatedOrigin = false): Promise<Response> {
   const response = await manager.projectService(projectId, port, path, request);
@@ -47,8 +51,10 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
     const input = z.object({ imageVersionId: z.string().min(1).max(256).optional() }).strict().parse(parsed);
     return c.json(await manager.rebuildProjectSandbox(c.req.param('id'), input.imageVersionId), 202);
   });
-  app.post('/api/projects/:id/open', async c => c.json(await manager.enterProject(c.req.param('id')), 202));
-  app.post('/api/projects/:id/sandbox/resume', async c => c.json(await manager.resumeProjectSandbox(c.req.param('id')), 202));
+  app.post('/api/projects/:id/open', async c => projectOperationResponse(c,
+    await manager.enterProject(c.req.param('id'), c.req.raw.signal)));
+  app.post('/api/projects/:id/sandbox/resume', async c => projectOperationResponse(c,
+    await manager.resumeProjectSandbox(c.req.param('id'), c.req.raw.signal)));
   app.post('/api/projects/:id/sandbox/checkpoint', async c => c.json(await manager.checkpointProjectSandbox(c.req.param('id')), 202));
   app.post('/api/projects/:id/sandbox/refresh-runtime', async c => c.json(await manager.refreshProjectSandboxRuntime(c.req.param('id')), 202));
   const content = async (c: Context) => {

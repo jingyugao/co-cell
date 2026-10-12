@@ -43,10 +43,11 @@ test('resume reconnects a paused Sandbox without replacing its binding', async (
   const control: { status: SandboxState['status'] } = { status: 'paused' };
   const sandboxRuntime: SandboxRuntime = {
     ...runtime(control, calls),
-    async resume(value, save) {
+    async resume(value, _signal, operationKey) {
       calls.push(`resume:${value.sandbox?.id}`);
+      assert.equal(operationKey, f.projects.get(id).sandboxOperation?.id);
       control.status = 'ready';
-      await save({ ...value.sandbox!, status: 'ready' });
+      return { ...value.sandbox!, status: 'ready' };
     },
   };
   const operations = new ProjectSandboxOperations({ projects: f.projects, runtime: sandboxRuntime,
@@ -54,12 +55,39 @@ test('resume reconnects a paused Sandbox without replacing its binding', async (
     detached: async () => {} });
   try {
     await operations.run(id, 'resume');
-    assert.deepEqual(calls, ['inspect', 'resume:same-sandbox']);
+    assert.deepEqual(calls, ['resume:same-sandbox']);
     assert.equal(f.projects.get(id).sandbox?.id, 'same-sandbox');
     assert.equal(f.projects.get(id).sandbox?.status, 'unknown');
     assert.equal(f.projects.get(id).sandboxOperation?.status, 'succeeded');
-    await assert.rejects(operations.run(id, 'resume'), /Sandbox 未暂停/);
+    assert.equal(f.projects.get(id).sandboxOperation?.result?.sandbox.status, 'ready');
     assert.equal(f.projects.get(id).sandbox?.id, 'same-sandbox');
+  } finally { await operations.close(); await f.close(); }
+});
+
+test('a lost Cellbox response preserves the project intent and recovery replays its exact key', async () => {
+  const id = 'resume-unknown-outcome';
+  const f = await fixture(project(id, { sandbox: sandbox('same-sandbox', 'paused') }));
+  const keys: Array<string | undefined> = [];
+  let uncertain = true;
+  const operations = new ProjectSandboxOperations({ projects: f.projects,
+    runtime: { ...runtime({}, []), async resume(value, _signal, key) {
+      keys.push(key);
+      if (uncertain) throw Object.assign(new Error('response lost after acceptance'), { code: 'UNKNOWN_OUTCOME' });
+      return { ...value.sandbox!, status: 'ready' };
+    } },
+    threadIds: () => [], saveSandbox: async () => { assert.fail('resume must return its result instead of persisting callbacks'); },
+    detached: async () => {} });
+  try {
+    const accepted = await operations.startResume(id, 'api-a');
+    await accepted.done;
+    assert.equal(f.projects.get(id).sandboxOperation?.status, 'running');
+    assert.equal(operations.hasResume(id, accepted.operationId), false);
+    uncertain = false;
+    const recovered = await operations.startResume(id, 'api-b', { operationId: accepted.operationId, previousOwnerId: 'api-a' });
+    await recovered.done;
+    assert.deepEqual(keys, [accepted.operationId, accepted.operationId]);
+    assert.equal(f.projects.get(id).sandboxOperation?.status, 'succeeded');
+    assert.equal(f.projects.get(id).sandboxOperation?.result?.sandbox.id, 'same-sandbox');
   } finally { await operations.close(); await f.close(); }
 });
 
@@ -69,9 +97,10 @@ for (const outcome of ['succeeded', 'failed'] as const) test(`operation waits ob
   let finishResume!: () => void;
   const barrier = new Promise<void>(resolve => { finishResume = resolve; });
   const operations = new ProjectSandboxOperations({ projects: f.projects,
-    runtime: { ...runtime({ status: 'paused' }, []), async resume() {
+    runtime: { ...runtime({ status: 'paused' }, []), async resume(value) {
       await barrier;
       if (outcome === 'failed') throw new Error('restore failed');
+      return { ...value.sandbox!, status: 'ready' };
     } },
     threadIds: () => [], saveSandbox: async (projectId, value) => { await f.projects.updateSandbox(projectId, value, false); },
     detached: async () => {} });
@@ -466,7 +495,7 @@ test('retry after a cold rebuild prepares the ready execution without rebuilding
         rebuilds++; control.status = 'ready'; await save({ ...value.sandbox!, status: 'ready' });
         throw new Error('configuration temporarily failed');
       },
-      async resume(value, save) { preparations++; await save({ ...value.sandbox!, status: 'ready' }); },
+      async resume(value) { preparations++; return { ...value.sandbox!, status: 'ready' }; },
     }, threadIds: () => [], saveSandbox: async (projectId, value) => { await f.projects.updateSandbox(projectId, value, false); },
     detached: async () => { assert.fail('must retain binding'); } });
   try {

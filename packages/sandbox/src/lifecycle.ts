@@ -20,17 +20,25 @@ export class SandboxLifecycle {
     const releases: Array<() => void> = [];
     try {
       for (const extension of this.extensions) {
+        this.assertNotAborted(context.signal);
         try {
-          const release = await extension.pre?.(this.snapshot(context));
+          if (!extension.pre) continue;
+          const release = await extension.pre(this.snapshot(context));
           if (release) releases.push(release);
         } catch (error) { throw new SandboxExtensionError(extension.name, 'pre', error); }
+        this.assertNotAborted(context.signal);
       }
+      this.assertNotAborted(context.signal);
       const result = await operation();
+      this.assertNotAborted(context.signal);
       await this.hooks('post', context);
       return result;
     } catch (error) {
-      for (const extension of this.extensions) {
-        try { await extension.error?.(this.snapshot(context), error); } catch { /* Preserve the operation's failure. */ }
+      for (const extension of context.signal?.aborted ? [] : this.extensions) {
+        if (!extension.error) continue;
+        try {
+          await Promise.resolve(extension.error(this.snapshot(context), error));
+        } catch { /* Preserve the operation's failure. */ }
       }
       throw error;
     } finally {
@@ -40,9 +48,18 @@ export class SandboxLifecycle {
 
   private async hooks(phase: 'post', context: SandboxLifecycleContext) {
     for (const extension of this.extensions) {
-      try { await extension[phase]?.(this.snapshot(context)); }
+      this.assertNotAborted(context.signal);
+      if (!extension[phase]) continue;
+      try {
+        await Promise.resolve(extension[phase]!(this.snapshot(context)));
+      }
       catch (error) { throw new SandboxExtensionError(extension.name, phase, error); }
+      this.assertNotAborted(context.signal);
     }
+  }
+
+  private assertNotAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
   }
 
   private snapshot(context: SandboxLifecycleContext): Readonly<SandboxLifecycleContext> {

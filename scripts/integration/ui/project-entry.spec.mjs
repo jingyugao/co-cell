@@ -78,6 +78,21 @@ test('paused session opens SSE immediately and defers native history until ready
   await expect(ui.send).toBeEnabled(); await expect(ui.editor).toHaveValue('旧会话恢复时输入');
 });
 
+test('switching sessions inside one project does not reopen the workspace', async ({ page, ui }) => {
+  ui.complete('paused');
+  await page.goto('/sessions/old-session');
+  await expect.poll(() => ui.count('POST', '/api/projects/paused/open')).toBe(1);
+  await expect(ui.editor).toBeEditable();
+
+  const navigation = page.getByRole('button', { name: '打开导航', exact: true });
+  if (await navigation.isVisible()) await navigation.click();
+  await page.getByRole('button', { name: '同项目的另一个会话 · 暂停项目', exact: true }).click();
+  await expect.poll(() => ui.count('GET', '/api/sessions/second-session/events')).toBeGreaterThan(0);
+  await expect(ui.editor).toBeEditable();
+  await page.waitForTimeout(300);
+  expect(ui.count('POST', '/api/projects/paused/open')).toBe(1);
+});
+
 test('running conversation accepts an added message and preserves repeated input order', async ({ page, ui }) => {
   ui.setRunning();
   ui.complete('paused');
@@ -101,7 +116,11 @@ test('entry joins checkpoint then resumes once after checkpoint completes', asyn
   ui.checkpoint('paused', true); await page.goto('/projects/paused');
   await expect(ui.editor).toBeEditable(); await ui.editor.fill('Checkpoint 期间输入');
   await expect.poll(() => ui.count('POST', '/api/projects/paused/open')).toBe(1);
-  await expect(ui.send).toBeDisabled(); ui.checkpoint('paused', false);
+  await expect(ui.send).toBeDisabled();
+  // Model the backend's 1.5s open wait budget expiring while checkpoint runs.
+  await page.waitForTimeout(1600);
+  expect(ui.count('POST', '/api/projects/paused/open')).toBe(1);
+  ui.checkpoint('paused', false);
   await expect.poll(() => ui.count('POST', '/api/projects/paused/open')).toBe(2);
   expect(ui.projects.get('paused').sandboxOperation.kind).toBe('resume');
   ui.complete('paused'); await expect(ui.send).toBeEnabled(); await expect(ui.editor).toHaveValue('Checkpoint 期间输入');

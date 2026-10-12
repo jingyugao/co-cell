@@ -169,7 +169,7 @@ export default function App() {
   const projectReadOnly = Boolean(project && !canEnterProject(project));
   const sandboxNotReady = Boolean(project && !isProjectSandboxReady(project));
   const entryProjectId = !loading && page === 'chat' && project && canEnterProject(project) ? project.id : null;
-  const entry = useProjectEntry(entryProjectId, `${entryProjectId ?? ''}:${selected ?? 'new'}`, enterProject, refreshProject);
+  const entry = useProjectEntry(entryProjectId, entryProjectId ?? '', enterProject, refreshProject);
   const [retryingEntry, setRetryingEntry] = useState(false);
   const environmentPending = sandboxNotReady && (retryingEntry || (!entry.error && (entry.pending || project?.sandboxOperation?.status === 'running')));
   async function retryProjectEntry() {

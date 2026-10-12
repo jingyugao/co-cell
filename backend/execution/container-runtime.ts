@@ -45,7 +45,7 @@ export interface SandboxRuntime {
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   rebuildPersistent?(target: WorkspaceTarget, key: string, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
-  resume?(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
+  resume?(target: WorkspaceTarget, signal?: AbortSignal, operationKey?: string): Promise<SandboxState>;
   checkpoint?(target: WorkspaceTarget): Promise<SandboxState>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
   verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
@@ -62,8 +62,8 @@ export type NativeTurnObservation = { type: 'snapshot'; turn: Turn } | { type: '
 export type { AppServerEndpoint } from './app-server-reader.js';
 export interface ContainerRuntimeOptions {
   paths: { root: string; runtime: string; codexHome: string; node: string };
-  prepareRemote: (sandbox: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal) => Promise<boolean>;
-  acquireRemoteUsage?: (sandboxId: string, initializationDirectory?: string) => Promise<() => Promise<void>>;
+  prepareRemote: (sandbox: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal, info?: SandboxInfo) => Promise<boolean>;
+  acquireRemoteUsage?: (sandboxId: string, initializationDirectory?: string, info?: SandboxInfo) => Promise<() => Promise<void>>;
   remoteArchives?: import('../archives/remote.js').RemoteArchives;
   sandboxes: ProjectSandboxes;
   provider: SandboxProvider;
@@ -91,6 +91,7 @@ type Entry = {
   lease: SandboxLease;
   preparation: Preparation;
   releaseRemote?: () => Promise<void>;
+  info?: SandboxInfo;
 };
 export class TurnObserverDetached extends Error {
   constructor() { super('Web observer detached'); this.name = 'TurnObserverDetached'; }
@@ -161,17 +162,23 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     }
     let releaseRemote: (() => Promise<void>) | undefined;
     try {
-      releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id, initialization ? target.settings.workingDirectory : undefined);
+      releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id, initialization ? target.settings.workingDirectory : undefined, lease.info);
       signal?.throwIfAborted();
     } catch (error) {
       try { await releaseRemote?.(); } finally { await lease.release(); }
       throw error;
     }
-    return { sandbox: lease.sandbox, get metadata() { return lease.record; }, lease, preparation, releaseRemote };
+    return { sandbox: lease.sandbox, get metadata() { return lease.record; }, lease, preparation, releaseRemote, info: lease.info };
   }
 
   private async release(entry: Entry, failed = false, detached = false) {
-    try { try { await entry.releaseRemote?.(); } finally { await entry.lease.release({ detached }); } }
+    try {
+      try {
+        await entry.releaseRemote?.();
+      } finally {
+        await entry.lease.release({ detached });
+      }
+    }
     catch (error) {
       void this.options.logger?.write({ event: 'sandbox.release_failed', sandboxId: entry.metadata.id, message: this.safeError(error).message });
       if (!failed) throw this.safeError(error);
@@ -220,7 +227,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   private async prepareEnvironment(target: WorkspaceTarget, entry: Entry, executionSignal: AbortSignal) {
     return this.prepare(entry, executionSignal, async () => {
-      const fresh = await this.options.prepareRemote(entry.sandbox, target, executionSignal);
+      const fresh = await this.options.prepareRemote(entry.sandbox, target, executionSignal, entry.info);
       if (this.options.sharedFilesMounted?.(entry.sandbox.sandboxId)) return;
       // Older instances without the directory mount still receive snapshots.
       const sharedData = this.options.sharedDataDirectory ?? SHARED_DATA;
@@ -709,20 +716,43 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
   async rebuildPersistent(target: WorkspaceTarget, key: string, onSandbox: SaveSandbox) {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在，无法沿用挂载目录');
+    this.sandboxes.track(target, onSandbox);
     const provider = this.options.provider as SandboxProvider & { rebuildPersistent?: (id: string, key: string) => Promise<void> };
     if (!provider.rebuildPersistent) throw new HttpError(503, 'Sandbox 不支持保留挂载目录重建');
     this.runtimePreparations.delete(target.sandbox.id);
     await this.sandboxes.manager.lifecycle.run({ action: 'reconcile', resourceKey: `project:${target.projectId ?? target.id}`, sandboxId: target.sandbox.id, metadata: { restoreRuntimeConfig: 'true' } },
       () => provider.rebuildPersistent!(target.sandbox!.id, key));
     await this.sandboxes.inspect(target);
-    await this.resume(target, onSandbox);
+    await onSandbox(await this.resume(target, undefined, `cocell-rebuild-resume-${key}`));
   }
 
-  async resume(target: WorkspaceTarget, onSandbox: SaveSandbox) {
+  async resume(target: WorkspaceTarget, signal?: AbortSignal, operationKey = `cocell-resume-${randomUUID()}`): Promise<SandboxState> {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
-    const entry = await traced('sandbox.acquire', { 'sandbox.id': target.sandbox.id },
-      () => this.acquire(target, false, onSandbox, undefined, undefined, true));
-    try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await traced('sandbox.release', { 'sandbox.id': target.sandbox.id }, () => this.release(entry)); }
+    signal?.throwIfAborted();
+    return traced('sandbox.resume', { 'sandbox.id': target.sandbox.id }, async () => {
+      const { lease, info } = await this.sandboxes.ensureRunning(target, operationKey, signal);
+      const preparation = this.runtimePreparations.get(lease.record.id) ?? {};
+      this.runtimePreparations.set(lease.record.id, preparation);
+      const entry: Entry = { sandbox: lease.sandbox, get metadata() { return lease.record; }, lease, preparation, info };
+      const mountedDefaultWorkspace = target.settings.workingDirectory === this.root
+        && this.options.sharedFilesMounted !== undefined
+        && info.capabilities?.sharedDirectory === true;
+      if (mountedDefaultWorkspace) {
+        try { return { ...target.sandbox! }; }
+        finally { await lease.release(); }
+      }
+      let releaseRemote: (() => Promise<void>) | undefined;
+      try {
+        releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id, target.settings.workingDirectory, info);
+        entry.releaseRemote = releaseRemote;
+        signal?.throwIfAborted();
+        await traced('sandbox.prepare_environment', { 'sandbox.id': target.sandbox!.id },
+          () => this.prepareEnvironment(target, entry, signal ? AbortSignal.any([signal, AbortSignal.timeout(300_000)]) : AbortSignal.timeout(300_000)));
+        return { ...target.sandbox! };
+      } finally {
+        try { await releaseRemote?.(); } finally { await lease.release(); }
+      }
+    });
   }
 
   async checkpoint(target: WorkspaceTarget) {

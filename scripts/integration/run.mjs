@@ -11,6 +11,7 @@ loadDeployEnv();
 const profiles = {
   ui: ['harness', 'ui-desktop', 'ui-mobile'],
   live: ['live'],
+  'warm-home': ['live'],
   full: ['harness', 'ui-desktop', 'ui-mobile', 'live', 'model'],
   reads: ['model'],
   lifecycle: ['model'],
@@ -27,6 +28,7 @@ if (profile === '--help' || profile === 'help') {
 
 pnpm test:integration                   Local browser regression; no cluster or model
 pnpm test:integration:live              Deployed API + browser; creates isolated projects
+pnpm exec node scripts/integration/run.mjs warm-home  Strict two-Box persistent HOME warm-pool restore check
 pnpm test:integration:full              All suites, including real model turns
 pnpm test:integration:reads             Real conversation history and direct subagents
 pnpm test:integration:lifecycle         Real files, process continuity, backup/restore
@@ -66,8 +68,11 @@ All other runs clean up their own projects, including on failure. Model suites u
     ...(profile === 'user-input' ? ['--grep=asynchronous user input'] : []),
     ...(profile === 'multi-api' ? ['--grep=multi-api coordination'] : []),
     ...(profile === 'agent' ? ['--grep=real agent creates files'] : []),
+    ...(profile === 'warm-home' ? ['--grep=persistent HOME restores from a shared warm pool'] : []),
     ...(['core', 'extended'].includes(profile) ? [`--grep-invert=prepared image tools|native .* HOME|deployed Git proxy${profile === 'core' ? '|conversation reads|nightly:|project lifecycle with real model' : ''}`] : []),
-    ...forwardedArgs], { stdio: 'inherit', env: { ...process.env, ...transport.env, COCELL_E2E_PROFILE: profile, COCELL_E2E_OUTPUT_DIR: output } });
+    ...forwardedArgs], { stdio: 'inherit', env: { ...process.env, ...transport.env, COCELL_E2E_PROFILE: profile,
+      COCELL_E2E_WARM_HOME_TEST: profile === 'warm-home' ? '1' : process.env.COCELL_E2E_WARM_HOME_TEST,
+      COCELL_E2E_OUTPUT_DIR: output } });
   // Let Playwright tear down fixtures on the first interrupt.
   process.on('SIGINT', () => child.kill('SIGINT'));
   process.on('SIGTERM', () => child.kill('SIGTERM'));

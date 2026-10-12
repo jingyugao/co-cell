@@ -4,6 +4,7 @@ import { writeFile } from 'node:fs/promises';
 import { posix } from 'node:path';
 import { SandboxLifecycle, type SandboxExtension, type SandboxHandle, type SandboxLifecycleContext } from '@co-cell/sandbox';
 import { CellboxError, CellboxSandboxProvider, type CellboxArchive } from '../../packages/sandbox/src/providers/cellbox/index.js';
+import type { SandboxInfo } from '../../packages/sandbox/src/types.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import type { AppServerEndpoint } from '../execution/container-runtime.js';
 import type { RemoteArchives } from '../archives/remote.js';
@@ -117,7 +118,7 @@ export class CellboxRuntimeIntegration {
             activate: async (candidate) => {
                 await this.lifecycle.run({ action: 'activate', resourceKey: `sandbox:${candidate.id}`, sandboxId: candidate.id }, async () => {
                     const handle = await options.provider.connectForSetup(candidate.id);
-                    await this.prepare(handle, { id: candidate.id, settings: { workingDirectory: candidate.workingDirectory }, sandbox: candidate, updatedAt: new Date().toISOString() }, AbortSignal.timeout(120000), false);
+                    await this.prepare(handle, { id: candidate.id, settings: { workingDirectory: candidate.workingDirectory }, sandbox: candidate, updatedAt: new Date().toISOString() }, AbortSignal.timeout(120000), undefined, false);
                     const box = await options.provider.client.getBox(candidate.id);
                     if (box.phase === 'staged') await this.timed('cellbox.activate', candidate.id,
                         () => options.provider.activateBox(candidate.id, `cocell-activate-${candidate.id}`));
@@ -146,22 +147,30 @@ export class CellboxRuntimeIntegration {
             },
         };
     }
-    async prepare(handle: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal, wait = true): Promise<boolean> {
+    async prepare(handle: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal, observation?: SandboxInfo, wait = true): Promise<boolean> {
         const previous = this.preparations.get(handle.sandboxId) ?? Promise.resolve();
         let fresh = false;
         const current = previous.catch(() => { }).then(async () => {
-            const box = await this.options.provider.client.getBox(handle.sandboxId);
-            if (box.phase !== 'running' && box.phase !== 'staged') throw new Error(`Cellbox is ${box.phase}`);
-            if (this.options.sharedDirectory && box.capabilities.sharedDirectory) this.sharedMounts.add(handle.sandboxId);
+            const box = observation ? undefined : await this.options.provider.client.getBox(handle.sandboxId);
+            const phase = observation?.metadata?.phase ?? box?.phase;
+            const generationString = observation?.metadata?.generation;
+            const generation = observation ? Number(generationString) : box?.generation;
+            if ((observation && observation.sandboxId !== handle.sandboxId) || (phase !== 'running' && phase !== 'staged')
+                || !Number.isSafeInteger(generation) || generation! < 1)
+                throw new Error(`Cellbox snapshot does not describe a prepared running Box ${handle.sandboxId}`);
+            const sharedDirectory = observation ? observation.capabilities?.sharedDirectory === true : box?.capabilities.sharedDirectory === true;
+            if (this.options.sharedDirectory && sharedDirectory) this.sharedMounts.add(handle.sandboxId);
             else this.sharedMounts.delete(handle.sandboxId);
             const cached = this.prepared.get(handle.sandboxId);
-            fresh = !cached || cached.generation !== box.generation || cached.workspace !== target.settings.workingDirectory;
+            fresh = !cached || cached.generation !== generation || cached.workspace !== target.settings.workingDirectory;
             if (fresh) await this.prepareOnce(handle, target, signal, wait);
-            if (wait) this.prepared.set(handle.sandboxId, { generation: box.generation, workspace: target.settings.workingDirectory });
+            if (wait) this.prepared.set(handle.sandboxId, { generation: generation!, workspace: target.settings.workingDirectory });
         });
         this.preparations.set(handle.sandboxId, current);
         try {
-            await this.timed('product.prepare', handle.sandboxId, () => current);
+            // The caller owns sandbox.prepare_environment; keep the stage log
+            // without a duplicate span around the same work.
+            await this.timed('product.prepare', handle.sandboxId, () => current, false);
         }
         finally {
             if (this.preparations.get(handle.sandboxId) === current)
@@ -230,12 +239,13 @@ export class CellboxRuntimeIntegration {
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         return { url: url.href, headers: access.headers };
     }
-    async acquireUsage(boxId: string, initializationDirectory?: string): Promise<() => Promise<void>> {
+    async acquireUsage(boxId: string, initializationDirectory?: string, observation?: SandboxInfo): Promise<() => Promise<void>> {
         // Mounted default-workspace initialization does no remote I/O. The
         // project usage remains held locally; the subsequent RPC holds an API
         // stream fence. Custom directories, legacy setup and execution keep leases.
         if (initializationDirectory === workspace && this.options.sharedDirectory &&
-            (await this.options.provider.client.getBox(boxId)).capabilities.sharedDirectory) return async () => {};
+            (observation ? observation.sandboxId === boxId && observation.capabilities?.sharedDirectory === true
+                : (await this.options.provider.client.getBox(boxId)).capabilities.sharedDirectory)) return async () => {};
         const lease = await this.options.provider.createLease(boxId, 'cocell-product', 180);
         return this.keepAlive(() => this.options.provider.renewLease(lease.id, 'cocell-product', 180).then(() => { }), () => this.options.provider.releaseLease(lease.id));
     }
@@ -250,11 +260,11 @@ export class CellboxRuntimeIntegration {
         this.releases.add(release);
         return release;
     }
-    private async timed<T>(phase: string, sandboxId: string, action: () => Promise<T>): Promise<T> {
+    private async timed<T>(phase: string, sandboxId: string, action: () => Promise<T>, recordSpan = true): Promise<T> {
         const startedAt = new Date().toISOString();
         const started = performance.now();
         let status = 'succeeded';
-        try { return await traced(phase, { 'sandbox.id': sandboxId }, action); }
+        try { return await (recordSpan ? traced(phase, { 'sandbox.id': sandboxId }, action) : action()); }
         catch (error) { status = 'failed'; throw error; }
         finally {
             void this.options.logger?.write({ event: 'sandbox.runtime_stage', phase, sandboxId, status,

@@ -1,8 +1,8 @@
-import { context, propagation, SpanStatusCode, trace, type Attributes } from '@opentelemetry/api';
+import { context, propagation, SpanKind, SpanStatusCode, trace, type Attributes } from '@opentelemetry/api';
 
 /** Optional instrumentation: without a registered provider these are no-op spans. */
-export function traced<T>(name: string, attributes: Attributes, action: () => Promise<T>): Promise<T> {
-  return trace.getTracer('co-cell.sandbox').startActiveSpan(name, { attributes }, async span => {
+export function traced<T>(name: string, attributes: Attributes, action: () => Promise<T>, kind = SpanKind.INTERNAL): Promise<T> {
+  return trace.getTracer('co-cell.sandbox').startActiveSpan(name, { attributes, kind }, async span => {
     try { return await action(); }
     catch (error) {
       span.setStatus({ code: SpanStatusCode.ERROR });

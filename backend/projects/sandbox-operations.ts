@@ -20,7 +20,7 @@ const target = (project: Project): WorkspaceTarget => ({ id: project.id, project
 
 export class ProjectSandboxOperations {
   private tasks = new Set<Promise<void>>();
-  private pending = new Map<string, { operationId: string; waiters: Set<() => void> }>();
+  private pending = new Map<string, { operationId: string; waiters: Set<() => void>; done?: Promise<void> }>();
   private timings = new Map<string, { operationId: string; kind: string; started: number; phaseStarted: number; phase: string }>();
   constructor(private deps: {
     projects: ProjectService;
@@ -31,6 +31,8 @@ export class ProjectSandboxOperations {
     detached: (id: string) => Promise<void>;
     logger?: RuntimeLog;
     assertHeld?: (id: string) => void;
+    assertResumeOwner?: (ownerId: string) => void;
+    resumeOwnerSignal?: () => AbortSignal | undefined;
   }) {}
 
   private async phase(id: string, phase: string) {
@@ -99,6 +101,7 @@ export class ProjectSandboxOperations {
 
   /** Persist acceptance before returning; the caller can poll while the task runs. */
   async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
+    if (kind === 'resume') return this.startResume(id, 'local');
     const project = this.deps.projects.get(id);
     if (kind === 'checkpoint' && project.status === 'archived') throw new HttpError(409, '已归档项目不能暂停');
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
@@ -135,16 +138,13 @@ export class ProjectSandboxOperations {
     } catch (error) { try { await reservation?.release(); } catch {} finally { release(); } throw error; }
     const pending = { operationId, waiters: new Set<() => void>() };
     this.pending.set(id, pending);
-    const task = Promise.resolve().then(() => traced(`project.sandbox.${kind}`, {
-      'project.id': id, 'operation.id': operationId, 'sandbox.id': project.sandbox?.id,
-    }, async () => {
+    const execute = async () => {
       try {
         if (kind === 'create') await this.create(id);
         else if (kind === 'rebuild') await this.rebuild(id);
         else if (kind === 'checkpoint') await this.checkpoint(id);
         else if (kind === 'restore') await this.restore(id,
           project.sandboxOperation?.status === 'failed' && ['create', 'resume'].includes(project.sandboxOperation.kind), reservation);
-        else if (kind === 'resume') await this.resume(id);
         else if (kind === 'backup') {
           if (project.status === 'archived') throw new HttpError(409, '已归档项目不能立即备份');
           throw new HttpError(409, '请使用 Checkpoint 暂停并备份；运行中的项目不再单独备份');
@@ -185,10 +185,72 @@ export class ProjectSandboxOperations {
         for (const finish of pending.waiters) finish();
         traceEvent('project.waiters.notified');
       }
-    }));
+    };
+    const task = Promise.resolve().then(() => traced(`project.sandbox.${kind}`, {
+      'project.id': id, 'operation.id': operationId, 'sandbox.id': project.sandbox?.id,
+    }, execute));
     this.tasks.add(task);
     void task.finally(() => this.tasks.delete(task)).catch(() => {});
     return { done: task };
+  }
+
+  hasResume(id: string, operationId: string): boolean {
+    return this.pending.get(id)?.operationId === operationId;
+  }
+
+  /** Admission is short; the durable intent owns recovery, not a project-wide lease. */
+  async startResume(id: string, ownerId: string, recovery?: { operationId: string; previousOwnerId: string }) {
+    this.deps.assertResumeOwner?.(ownerId);
+    const admitted = await this.deps.projects.claimResume(id, ownerId, recovery);
+    const operation = admitted.project.sandboxOperation!;
+    const operationId = operation.id!;
+    if (!admitted.started) return { done: this.pending.get(id)?.done ?? Promise.resolve(), joined: true, operationId };
+    const expected = { operationId, ownerId, sandboxId: operation.resume!.sandboxId };
+    const pending: { operationId: string; waiters: Set<() => void>; done?: Promise<void> } = { operationId, waiters: new Set() };
+    this.pending.set(id, pending);
+    const started = Date.now();
+    this.timings.set(id, { operationId, kind: 'resume', started, phaseStarted: started, phase: '恢复运行' });
+    const execute = async () => {
+      try {
+        this.deps.assertResumeOwner?.(ownerId);
+        if (!this.deps.runtime.resume) throw new HttpError(503, 'Sandbox 不支持恢复运行');
+        const sandbox = await this.deps.runtime.resume!(target(admitted.project), this.deps.resumeOwnerSignal?.(), operationId);
+        if (!sandbox || sandbox.id !== expected.sandboxId || sandbox.status !== 'ready') {
+          throw new HttpError(502, 'Sandbox 恢复结果与当前操作不符');
+        }
+        this.deps.assertResumeOwner?.(ownerId);
+        await traced('project.resume.publish', { 'project.id': id, 'operation.id': operationId }, async () => {
+          if (!await this.deps.projects.finishResume(id, expected, { sandbox })) throw new HttpError(409, '恢复操作已由其他实例接管或项目环境已变化');
+        });
+      } catch (error) {
+        // A disconnected owner must never publish a failure over its successor.
+        this.deps.assertResumeOwner?.(ownerId);
+        if (error && typeof error === 'object' && 'code' in error
+          && (error.code === 'UNKNOWN_OUTCOME' || error.code === 'TRANSPORT')) {
+          // Cellbox owns the durable command. A lost HTTP response says nothing
+          // about its outcome; recovery will replay this same operation key.
+          void this.deps.logger?.write({ event: 'sandbox.resume_pending', projectId: id, operationId, error });
+          return;
+        }
+        await this.deps.projects.finishResume(id, expected, { error: error instanceof HttpError ? error.message : '恢复失败，请重试；详细原因请查看服务端日志。' });
+        // The terminal transaction may have committed before its acknowledgement
+        // was lost. Its exact durable result wins over that transport failure.
+        const committed = this.deps.projects.find(id)?.sandboxOperation;
+        if (committed?.id === operationId && committed.resume?.ownerId === ownerId && committed.status === 'succeeded') return;
+        void this.deps.logger?.write({ event: 'sandbox.operation_failed', operation: 'resume', projectId: id, operationId, error });
+        throw error;
+      } finally {
+        this.recordTiming(id, this.deps.projects.find(id)?.sandboxOperation?.status ?? 'failed');
+        if (this.pending.get(id) === pending) this.pending.delete(id);
+        for (const finish of pending.waiters) finish();
+        traceEvent('project.waiters.notified');
+      }
+    };
+    const done = Promise.resolve().then(execute);
+    pending.done = done;
+    this.tasks.add(done);
+    void done.finally(() => this.tasks.delete(done)).catch(() => {});
+    return { done, joined: false, operationId };
   }
 
   private async create(id: string) {
@@ -280,24 +342,6 @@ export class ProjectSandboxOperations {
         void this.deps.logger?.write({ event: 'sandbox.backup_retention_failed', projectId: id, error });
       });
     }
-  }
-
-  private async resume(id: string) {
-    const { projects, runtime } = this.deps;
-    const project = projects.get(id);
-    if (project.status === 'archived' || !project.sandbox) throw new HttpError(409, '项目没有可恢复运行的 Sandbox');
-    const current = await this.inspect(id);
-    if (current.sandbox?.status !== 'paused') throw new HttpError(409, 'Sandbox 未暂停，无需恢复运行');
-    if (!runtime.resume) throw new HttpError(503, 'Sandbox 不支持恢复运行');
-    await this.phase(id, '恢复运行');
-    await runtime.resume(target(current), sandbox => this.deps.saveSandbox(id, sandbox, false));
-    const resumed = projects.get(id).sandbox;
-    if (!resumed) throw new HttpError(503, 'Sandbox 恢复后缺少运行实例');
-    // Cellbox completes after restoring the execution and unquiescing Guest;
-    // its health diagnostics run asynchronously. The next real App Server
-    // connection performs initialize/protocol validation without a duplicate
-    // probe or temporary WebSocket stream blocking another lifecycle action.
-    await this.deps.saveSandbox(id, { ...resumed, status: 'ready' }, false);
   }
 
   private async rememberCleanup(id: string, sandbox: SandboxState) {

@@ -39,7 +39,13 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
       proxyProjectService(manager, projectId, port, path, request, '', true),
   });
   if (manager.sharedStateEnabled) app.use('/api/*', async (c, next) => {
-    if (new URL(c.req.url).pathname.startsWith('/api/tool-runtime/')) return next();
+    const pathname = new URL(c.req.url).pathname;
+    // These project-scoped routes refresh their own project from durable state.
+    // Keep the full multi-API reconciliation for every other route until it has
+    // an explicit scoped refresh contract of its own.
+    const projectScoped = c.req.method === 'GET' && /^\/api\/projects\/[^/]+$/.test(pathname)
+      || c.req.method === 'POST' && /^\/api\/projects\/[^/]+\/(?:open|sandbox\/resume)$/.test(pathname);
+    if (pathname.startsWith('/api/tool-runtime/') || projectScoped) return next();
     await manager.refreshSharedState();
     await next();
   });

@@ -1,6 +1,5 @@
 import { MySqlModelRuntimeRepository } from '../../models/runtime-repository.js';
 import { MySqlModelRepository } from '../../models/repository.js';
-import { traced } from '@co-cell/sandbox';
 import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import type { Project, Session, Turn } from '../../../protocol/types.js';
@@ -12,7 +11,10 @@ import { mergeRecord } from './record-merge.js';
 
 export interface WebStateStore {
   init(): Promise<void>; listProjects(): Promise<Project[]>; listSessions(): Promise<Session[]>;
+  listProjectSessions(projectId: string): Promise<Session[]>;
   getProject(id: string): Promise<Project | undefined>; getSession(id: string): Promise<Session | undefined>;
+  /** The synchronous mutation runs against the latest project in a short transaction. */
+  mutateProject(id: string, mutate: (current: Project) => void): Promise<Project>;
   saveProject(project: Project, previous?: Project): Promise<void>; saveSession(session: Session, previous?: Session): Promise<void>;
   deleteProject(id: string): Promise<void>; deleteSession(id: string): Promise<void>; close(): Promise<void>;
 }
@@ -96,9 +98,20 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sessions (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NULL, thread_id VARCHAR(191) NULL, title VARCHAR(255) NOT NULL, status ENUM('idle','running','completed','failed','cancelled') NOT NULL, archived_at DATETIME(3) NULL, started_at DATETIME(3) NOT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL, INDEX sessions_project_updated (project_id, updated_at), CONSTRAINT sessions_project_fk FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.notificationRepository.init();
   }
-  async listProjects(): Promise<Project[]> { const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects'); return rows.map(row => hydrateProject(this.document<Project>(row.document))); }
+  async listProjects(): Promise<Project[]> {
+    const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects');
+    return rows.map(row => hydrateProject(this.document<Project>(row.document)));
+  }
   async listSessions(): Promise<Session[]> {
     const [rows] = await this.pool.query<Array<RowDataPacket & { document: Session | string }>>('SELECT document FROM sessions');
+    return this.sessionsFromRows(rows);
+  }
+  async listProjectSessions(projectId: string): Promise<Session[]> {
+    const [rows] = await this.pool.query<Array<RowDataPacket & { document: Session | string }>>(
+      'SELECT document FROM sessions WHERE project_id = ?', [projectId]);
+    return this.sessionsFromRows(rows);
+  }
+  private sessionsFromRows(rows: Array<{ document: Session | string }>): Session[] {
     const sessions: Session[] = [];
     for (const row of rows) {
       // A submission that never reached Codex has no App Server history.
@@ -106,6 +119,26 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       if (session) sessions.push(session);
     }
     return sessions;
+  }
+  async mutateProject(id: string, mutate: (current: Project) => void): Promise<Project> {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [rows] = await connection.query<Array<RowDataPacket & { document: Project | string }>>(
+        'SELECT document FROM projects WHERE id = ? FOR UPDATE', [id]);
+      if (!rows[0]) throw new HttpError(409, '项目已删除');
+      const project = hydrateProject(this.document<Project>(rows[0].document));
+      const before = JSON.stringify(persistedProject(project));
+      mutate(project);
+      if (project.id !== id) throw new Error('Project mutation cannot change its identity');
+      const document = persistedProject(project);
+      if (JSON.stringify(document) !== before) await this.saveProjectDocumentWith(connection, project, document);
+      await connection.commit();
+      return hydrateProject(project);
+    } catch (error) {
+      await connection.rollback().catch(() => undefined);
+      throw error;
+    } finally { connection.release(); }
   }
   async getProject(id: string): Promise<Project | undefined> {
     const [rows] = await this.pool.query<Array<RowDataPacket & { document: Project | string }>>('SELECT document FROM projects WHERE id = ?', [id]);
@@ -197,14 +230,14 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     await this.saveProjectDocumentWith(executor, project, persistedProject(project));
   }
   private async saveProjectDocumentWith(executor: Pick<Pool, 'query'>, project: Project, document: unknown) {
-    await traced('mysql.projects.upsert', { 'project.id': project.id, 'operation.id': project.sandboxOperation?.id, 'operation.status': project.sandboxOperation?.status }, () => executor.query(`INSERT INTO projects (id,name,requirement_url,execution_mode,working_directory,archived_at,created_at,updated_at,document) VALUES (?,?,?,?,?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE name=VALUES(name),requirement_url=VALUES(requirement_url),execution_mode=VALUES(execution_mode),working_directory=VALUES(working_directory),archived_at=VALUES(archived_at),updated_at=VALUES(updated_at),document=VALUES(document)`, [project.id, project.name, project.requirementUrl, project.executionMode, project.workingDirectory, this.mysqlDate(project.archivedAt), this.mysqlDate(project.createdAt), this.mysqlDate(project.updatedAt), JSON.stringify(document)]));
+    await executor.query(`INSERT INTO projects (id,name,requirement_url,execution_mode,working_directory,archived_at,created_at,updated_at,document) VALUES (?,?,?,?,?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE name=VALUES(name),requirement_url=VALUES(requirement_url),execution_mode=VALUES(execution_mode),working_directory=VALUES(working_directory),archived_at=VALUES(archived_at),updated_at=VALUES(updated_at),document=VALUES(document)`, [project.id, project.name, project.requirementUrl, project.executionMode, project.workingDirectory, this.mysqlDate(project.archivedAt), this.mysqlDate(project.createdAt), this.mysqlDate(project.updatedAt), JSON.stringify(document)]);
   }
   private async saveSessionWith(executor: Pick<Pool, 'query'>, session: Session) {
     const document = session.settings.executionMode === 'sandbox' ? this.compactSandboxSession(session) : persistedSession(session);
     await this.saveSessionDocumentWith(executor, session, document);
   }
   private async saveSessionDocumentWith(executor: Pick<Pool, 'query'>, session: Session, document: unknown) {
-    await traced('mysql.sessions.upsert', { 'session.id': session.id, 'project.id': session.projectId }, () => executor.query(`INSERT INTO sessions (id,project_id,thread_id,title,status,archived_at,started_at,created_at,updated_at,document) VALUES (?,?,?,?,?,?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE project_id=VALUES(project_id),thread_id=VALUES(thread_id),title=VALUES(title),status=VALUES(status),archived_at=VALUES(archived_at),started_at=VALUES(started_at),updated_at=VALUES(updated_at),document=VALUES(document)`, [session.id, session.projectId ?? null, session.threadId, session.title, session.status, this.mysqlDate(session.archivedAt), this.mysqlDate(session.startedAt), this.mysqlDate(session.createdAt), this.mysqlDate(session.updatedAt), JSON.stringify(document)]));
+    await executor.query(`INSERT INTO sessions (id,project_id,thread_id,title,status,archived_at,started_at,created_at,updated_at,document) VALUES (?,?,?,?,?,?,?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE project_id=VALUES(project_id),thread_id=VALUES(thread_id),title=VALUES(title),status=VALUES(status),archived_at=VALUES(archived_at),started_at=VALUES(started_at),updated_at=VALUES(updated_at),document=VALUES(document)`, [session.id, session.projectId ?? null, session.threadId, session.title, session.status, this.mysqlDate(session.archivedAt), this.mysqlDate(session.startedAt), this.mysqlDate(session.createdAt), this.mysqlDate(session.updatedAt), JSON.stringify(document)]);
   }
   private compactSandboxSession(session: Session) {
     const { turns, historyNextCursor: _cursor, ...metadata } = session;

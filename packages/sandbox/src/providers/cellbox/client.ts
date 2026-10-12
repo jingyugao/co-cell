@@ -1,4 +1,5 @@
 import { injectTraceHeaders, traced } from '../../tracing.js';
+import { SpanKind } from '@opentelemetry/api';
 /** The internal Cellbox REST contract. Calls require no Cellbox credential. */
 export interface CellboxCapabilities {
   exec: boolean; files: boolean; http: boolean; websocket: boolean;
@@ -25,7 +26,7 @@ export type CellboxPhase = 'creating' | 'running' | 'freezing' | 'frozen' | 'unf
 export interface CellboxBox {
   id: string; ownerKey: string; profileId: string; phase: CellboxPhase; generation: number;
   resourceVersion: number; importedImageId?: string; image: string; imageId?: string; workspace: string;
-  capabilities: CellboxCapabilities; operationId?: string; createdAt: string;
+  capabilities: CellboxCapabilities; operationId?: string; executionId?: string; observedAt?: string; createdAt: string;
   error?: { code: string; message: string };
 }
 export interface CellboxImportedImage {
@@ -42,6 +43,8 @@ export interface CellboxOperation {
   id: string; kind: string; targetId: string; status: 'queued' | 'running' | 'succeeded' | 'failed';
   version: number; createdAt: string; finishedAt?: string;
   result?: Record<string, string>; error?: { code: string; message: string };
+  /** Authoritative terminal Box snapshot returned by ensure-running. */
+  box?: CellboxBox;
 }
 export interface CellboxExecution {
   id: string; boxId: string; operationId: string; state: 'running' | 'exited' | 'unknown';
@@ -123,8 +126,17 @@ export class CellboxClient {
   private request<T>(method: string, path: string, options: {
     body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
   } = {}): Promise<T> {
-    return traced('cellbox.http', { 'http.request.method': method, 'url.path': path.split('?')[0] },
-      () => this.requestImpl<T>(method, path, options));
+    // GETs and non-lifecycle mutations are usually metadata, leases, or
+    // maintenance calls. Keep trace context flowing through them, while
+    // retaining spans for the box lifecycle and exec operations.
+    const endpoint = path.split('?')[0];
+    const coreMutation = method === 'POST' && (endpoint === '/v1/boxes' || endpoint === '/v1/boxes:restore'
+      || /^\/v1\/boxes\/[^/]+:(?:suspend|resume|ensure-running|destroy|activate|reconcile|rebuild)$/.test(endpoint)
+      || /^\/v1\/boxes\/[^/]+\/execs$/.test(endpoint));
+    if (!coreMutation) return this.requestImpl<T>(method, path, options);
+    return traced('cellbox.http.client', { 'http.request.method': method, 'url.path': path.split('?')[0],
+      'http.request.timeout_ms': options.timeoutMs ?? this.requestTimeoutMs },
+    () => this.requestImpl<T>(method, path, options), SpanKind.CLIENT);
   }
   private async requestImpl<T>(method: string, path: string, options: {
     body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
@@ -222,8 +234,18 @@ export class CellboxClient {
   restoreBox(input: { profileId: string; ownerKey: string; archiveId: string; importedImageId?: string; acceptImageChange?: boolean }, key: string) {
     return this.request<CellboxOperation>('POST', '/v1/boxes:restore', { body: input, key });
   }
-  actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string) {
-    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { key });
+  actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string,
+    options: { timeoutMs?: number; expectedGeneration?: number; signal?: AbortSignal } = {}) {
+    if (options.expectedGeneration !== undefined && (!Number.isSafeInteger(options.expectedGeneration) || options.expectedGeneration < 1))
+      throw new CellboxError('INVALID_REQUEST', 'expectedGeneration must be a positive safe integer');
+    const body = options.expectedGeneration === undefined ? undefined : { expectedGeneration: options.expectedGeneration };
+    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { key, body, timeoutMs: options.timeoutMs, signal: options.signal });
+  }
+  ensureRunning(id: string, key: string, options: { expectedGeneration?: number; signal?: AbortSignal; timeoutMs?: number } = {}) {
+    if (options.expectedGeneration !== undefined && (!Number.isSafeInteger(options.expectedGeneration) || options.expectedGeneration < 1))
+      throw new CellboxError('INVALID_REQUEST', 'expectedGeneration must be a positive safe integer');
+    const body = options.expectedGeneration === undefined ? undefined : { expectedGeneration: options.expectedGeneration };
+    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:ensure-running`, { key, body, signal: options.signal, timeoutMs: options.timeoutMs });
   }
   /** Purge owned artifacts after destruction; old APIs must fail rather than silently skip cleanup. */
   purgeBoxArtifacts(id: string) {

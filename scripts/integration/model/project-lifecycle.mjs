@@ -122,7 +122,7 @@ export async function projectLifecycle(env) {
         archiveId: initialArchive.id, archiveSizeBytes: initialArchive.sizeBytes, archiveSha256: initialArchive.sha256 };
     });
     await step('Resume and verify the same Node process, files, and in-memory counter survived', async () => {
-      await json(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST', body: {}, expectedStatus: 202 });
+      await json(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST', body: {}, expectedStatus: [200, 202] });
       const resumed = await waitProject('resume', 'ready'); assert.equal(resumed.sandbox.id, originalSandboxId);
       assert.equal((await textFile('main.mjs')).sha256, source.sha256); await textFile('continuity.txt', initialContent);
       const current = await health(initialContent); checkSameProcess(firstHealth, current); firstHealth = current;
@@ -146,7 +146,7 @@ export async function projectLifecycle(env) {
         sha256: checkpointArchive.sha256, threadIds: checkpointArchive.threadIds };
     });
     await step('Resume the same process, then change the workspace to its final contents', async () => {
-      await json(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST', body: {}, expectedStatus: 202 });
+      await json(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST', body: {}, expectedStatus: [200, 202] });
       const resumed = await waitProject('resume', 'ready'); assert.equal(resumed.sandbox.id, originalSandboxId);
       const before = await health(resumedContent); checkSameProcess(firstHealth, before); firstHealth = before;
       const result = await turn(`Do not restart the service. Change only ${folder}/continuity.txt to ${latestContent} plus newline. Verify the running HTTP service reads this new value.`);

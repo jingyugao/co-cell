@@ -10,6 +10,16 @@ export class MemoryWebStateStore implements WebStateStore {
   async init() {}
   async listProjects() { return structuredClone([...this.projects.values()]); }
   async listSessions() { return structuredClone([...this.sessions.values()]); }
+  async listProjectSessions(projectId: string) { return structuredClone([...this.sessions.values()].filter(session => session.projectId === projectId)); }
+  async mutateProject(id: string, mutate: (current: Project) => void) {
+    const stored = this.projects.get(id);
+    if (!stored) throw new HttpError(409, '项目已删除');
+    const project = structuredClone(stored);
+    mutate(project);
+    if (project.id !== id) throw new Error('Project mutation cannot change its identity');
+    this.projects.set(id, structuredClone(project));
+    return structuredClone(project);
+  }
   async getProject(id: string) { return structuredClone(this.projects.get(id)); }
   async getSession(id: string) { return structuredClone(this.sessions.get(id)); }
   async saveProject(project: Project, previous?: Project) {

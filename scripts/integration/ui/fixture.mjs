@@ -17,6 +17,8 @@ export const test = base.extend({
     const notify = id => { for (const finish of waiters.get(id) ?? []) finish(); };
     page.on('requestfailed', request => cancelled.get(request)?.());
     const session = { id: 'old-session', projectId: 'paused', title: '旧会话', threadId: 'existing-thread', status: 'idle', settings: defaults, turns: [], archivedAt: null, createdAt: now, updatedAt: now };
+    const secondSession = { ...session, id: 'second-session', title: '同项目的另一个会话', threadId: 'second-thread' };
+    const sessions = new Map([[session.id, session], [secondSession.id, secondSession]]);
     const config = { defaults, sandbox: { provider: 'cellbox', enabled: true, image: 'default', workingDirectory }, codexVersion: 'integration', approvalPolicy: 'never', auth: 'api-key', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };
     page.on('pageerror', error => errors.push(error.message));
     await page.route('**/api/**', async route => {
@@ -58,20 +60,23 @@ export const test = base.extend({
         } else if (method === 'POST' && path.endsWith('/sandbox/checkpoint')) {
           data.sandboxOperation = operation('checkpoint'); status = 202;
         } else if (method === 'POST' && path.endsWith('/rebuild')) { data.sandboxOperation = operation(data.sandbox ? 'rebuild' : 'create'); status = 202; }
-      } else if (path === '/api/sessions' && method === 'GET') data = [session];
-      else if (path === '/api/sessions/old-session/events') {
-        await route.fulfill({ contentType: 'text/event-stream', body: `data: ${JSON.stringify({ type: 'snapshot', session })}\n\n` }); return;
-      } else if (path === '/api/sessions/old-session' && method === 'GET') {
-        historyReads.push(path); data = { ...session, turns: session.turns.length ? session.turns : [{ id: 'old-turn', prompt: '历史任务内容', images: [], items: [], status: 'completed', startedAt: now, completedAt: now }] };
-      } else if (path === '/api/sessions/old-session/turns' && method === 'POST') {
+      } else if (path === '/api/sessions' && method === 'GET') data = [...sessions.values()];
+      else if (path.startsWith('/api/sessions/') && path.endsWith('/events')) {
+        const currentSession = sessions.get(path.split('/')[3]);
+        await route.fulfill({ contentType: 'text/event-stream', body: `data: ${JSON.stringify({ type: 'snapshot', session: currentSession })}\n\n` }); return;
+      } else if (path.startsWith('/api/sessions/') && path.split('/').length === 4 && method === 'GET') {
+        const currentSession = sessions.get(path.split('/')[3]);
+        historyReads.push(path); data = { ...currentSession, turns: currentSession.turns.length ? currentSession.turns : [{ id: 'old-turn', prompt: '历史任务内容', images: [], items: [], status: 'completed', startedAt: now, completedAt: now }] };
+      } else if (path.endsWith('/turns') && method === 'POST') {
+        const currentSession = sessions.get(path.split('/')[3]);
         const input = request.postDataJSON(); submissions.push(input);
-        data = { turnId: session.turns.at(-1)?.id ?? 'old-turn' }; status = 202;
+        data = { turnId: currentSession.turns.at(-1)?.id ?? 'old-turn' }; status = 202;
       } else if (path.endsWith('/subagents')) data = [];
       else { errors.push(`Unexpected API call: ${method} ${path}`); data = { error: 'Unexpected test API call' }; status = 500; }
       if (!request.failure()) await route.fulfill({ status, json: data });
     });
     const ui = {
-      projects, calls, historyReads, submissions,
+      projects, calls, historyReads, submissions, sessions,
       editor: page.getByRole('textbox', { name: '任务描述', exact: true }),
       send: page.getByRole('button', { name: '发送任务', exact: true }),
       setRunning() { session.status = 'running'; session.turns = [{ id: 'native-turn', nativeTurnId: 'native-turn', prompt: '原始任务', additionalUserInputs: ['相同补充', '相同补充'], images: [], items: [], status: 'running', codexAccepted: true, startedAt: now }]; },

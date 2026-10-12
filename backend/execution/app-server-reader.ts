@@ -1,4 +1,5 @@
 import { abortable } from '../../util/abortable.js';
+import { setTimeout as delay } from 'node:timers/promises';
 import { AppServerRpcError, CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import type { SandboxExtension } from '@co-cell/sandbox';
 
@@ -36,6 +37,34 @@ export class AppServerReader {
 
   constructor(private endpoint: (id: string) => Promise<AppServerEndpoint>,
     private onCleanupError: (error: unknown) => void, private idleMs = 60_000) {}
+
+  /** A listener or a cached connection alone cannot prove a restored process is responsive. */
+  async waitUntilReady(id: string, signal?: AbortSignal, timeoutMs = 30_000): Promise<void> {
+    const deadline = AbortSignal.timeout(timeoutMs);
+    const waiting = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    for (;;) {
+      waiting.throwIfAborted();
+      try {
+        // Opening performs initialize; this read-only RPC also checks cached
+        // connections without starting a thread or consuming model tokens.
+        await this.read(id, async client => {
+          const response = await client.request('thread/loaded/list', {});
+          if (!Array.isArray(response?.data)) throw new Error('App Server readiness response is invalid');
+        }, waiting);
+        return;
+      } catch (error) {
+        waiting.throwIfAborted();
+        // Retry only startup transport races. A connected request waiting for
+        // restored pages keeps the entire deadline; RPC/protocol errors surface.
+        if (!(error instanceof Error) || ![
+          'App Server WebSocket connection failed',
+          'App Server WebSocket transport failed',
+          'App Server WebSocket closed',
+        ].includes(error.message)) throw error;
+        await delay(200, undefined, { signal: waiting });
+      }
+    }
+  }
 
   async read<T>(id: string, action: (client: CodexAppServerClient) => Promise<T>, signal?: AbortSignal): Promise<T> {
     const lease = await this.acquire(id, signal);

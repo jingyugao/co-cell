@@ -763,7 +763,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         && this.options.sharedFilesMounted !== undefined
         && info.capabilities?.sharedDirectory === true;
       if (mountedDefaultWorkspace) {
-        try { return { ...target.sandbox! }; }
+        try {
+          await traced('sandbox.appserver_ready', { 'sandbox.id': lease.record.id },
+            () => this.reader.waitUntilReady(lease.record.id, signal));
+          return { ...target.sandbox! };
+        }
         finally { await lease.release(); }
       }
       let releaseRemote: (() => Promise<void>) | undefined;
@@ -773,6 +777,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         signal?.throwIfAborted();
         await traced('sandbox.prepare_environment', { 'sandbox.id': target.sandbox!.id },
           () => this.prepareEnvironment(target, entry, signal ? AbortSignal.any([signal, AbortSignal.timeout(300_000)]) : AbortSignal.timeout(300_000)));
+        await traced('sandbox.appserver_ready', { 'sandbox.id': lease.record.id },
+          () => this.reader.waitUntilReady(lease.record.id, signal));
         return { ...target.sandbox! };
       } finally {
         try { await releaseRemote?.(); } finally { await lease.release(); }
@@ -786,15 +792,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   async verifySandbox(sandbox: SandboxState, timeoutMs?: number) {
-    if (timeoutMs !== undefined) return this.verifySandboxOnce(sandbox, timeoutMs);
-    const deadline = Date.now() + 30_000;
-    for (;;) {
-      try { return await this.verifySandboxOnce(sandbox, 5_000); }
-      catch (error) {
-        if (Date.now() >= deadline) throw this.safeError(error);
-        await new Promise(resolve => setTimeout(resolve, 1_000));
-      }
-    }
+    return this.verifySandboxOnce(sandbox, timeoutMs ?? 30_000);
   }
 
   async verifyHistory(sandbox: SandboxState, threadIds: string[]) {
@@ -811,26 +809,17 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   private async verifySandboxOnce(sandbox: SandboxState, timeoutMs: number) {
-    const info = await this.options.provider.getInfo(sandbox.id);
+    const signal = AbortSignal.timeout(timeoutMs);
+    const info = await abortable(this.options.provider.getInfo(sandbox.id), signal);
     if (info.state !== 'running') throw new HttpError(502, 'Sandbox 尚未就绪');
     if (!this.options.sharedFilesMounted?.(sandbox.id)) {
-      const handle = this.options.provider.connectForSetup
-        ? await this.options.provider.connectForSetup(sandbox.id)
-        : await this.options.provider.connect(sandbox.id, { timeoutMs });
-      await handle.commands.run(`test -d ${quote(sandbox.workingDirectory)} && test -d ${quote(this.codexHome)}`, { timeoutMs });
+      const handle = await abortable(this.options.provider.connectForSetup
+        ? this.options.provider.connectForSetup(sandbox.id)
+        : this.options.provider.connect(sandbox.id, { timeoutMs, signal }), signal);
+      await abortable(handle.commands.run(`test -d ${quote(sandbox.workingDirectory)} && test -d ${quote(this.codexHome)}`, { timeoutMs, signal }), signal);
     }
     if (!this.options.appServer) throw new HttpError(503, 'Sandbox App Server 未配置');
-    const endpoint = await this.options.appServer(sandbox.id);
-    const client = new CodexAppServerClient({ url: endpoint.url, headers: endpoint.headers, requestTimeoutMs: timeoutMs });
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let verified = false;
-    try {
-      await Promise.race([
-        client.connect(), // connect includes a real initialize RPC and protocol validation.
-        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new HttpError(502, 'Sandbox 服务验证超时')), timeoutMs); }),
-      ]);
-      verified = true;
-    } finally { if (timer) clearTimeout(timer); await this.closeVerificationClient(client, sandbox.id, verified); }
+    await this.reader.waitUntilReady(sandbox.id, signal, timeoutMs);
     sandbox.status = 'ready';
     sandbox.image = info.templateIdentity;
   }

@@ -4,6 +4,71 @@ import { AppServerRpcError, CodexAppServerClient } from '../../packages/agentcor
 import { AppServerReader } from './app-server-reader.js';
 import { SandboxLifecycle } from '@co-cell/sandbox';
 
+test('readiness waits for restored RPCs and reuses one initialized connection', async t => {
+  let connects = 0, requests = 0, finish!: () => void;
+  const restored = new Promise<void>(resolve => { finish = resolve; });
+  t.mock.method(CodexAppServerClient.prototype, 'connect', async () => { connects++; });
+  t.mock.method(CodexAppServerClient.prototype, 'close', async () => {});
+  t.mock.method(CodexAppServerClient.prototype, 'request', async (method: string, params: unknown) => {
+    assert.equal(method, 'thread/loaded/list');
+    assert.deepEqual(params, {});
+    requests++;
+    await restored;
+    return { data: [] };
+  });
+  const reader = new AppServerReader(async () => ({ url: 'ws://app-server.test' }), error => assert.fail(String(error)));
+  let ready = false;
+  try {
+    const waits = Promise.all([reader.waitUntilReady('box'), reader.waitUntilReady('box')]).then(() => { ready = true; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(ready, false, 'an open socket does not prove the restored process is ready');
+    assert.equal(connects, 1);
+    finish(); await waits;
+    await reader.waitUntilReady('box');
+    assert.equal(connects, 1, 'health checks and subsequent reads share the initialized connection');
+    assert.equal(requests, 3, 'each health check verifies a live response, including cached connections');
+  } finally { finish(); await reader.close(); }
+});
+
+test('readiness retries startup connection failure but surfaces RPC errors immediately', async t => {
+  let connects = 0, requests = 0, closes = 0;
+  t.mock.method(CodexAppServerClient.prototype, 'connect', async () => {
+    if (++connects === 1) throw new Error('App Server WebSocket connection failed');
+  });
+  t.mock.method(CodexAppServerClient.prototype, 'close', async () => { closes++; });
+  t.mock.method(CodexAppServerClient.prototype, 'request', async () => {
+    requests++;
+    throw new AppServerRpcError({ code: -32601, message: 'unsupported probe' }, 'thread/loaded/list');
+  });
+  const reader = new AppServerReader(async () => ({ url: 'ws://app-server.test' }), error => assert.fail(String(error)));
+  try {
+    await assert.rejects(reader.waitUntilReady('box', undefined, 2_000), /unsupported probe/);
+    assert.equal(connects, 2);
+    assert.equal(requests, 1);
+    assert.equal(closes, 1, 'failed startup socket is closed before reconnecting');
+  } finally { await reader.close(); }
+});
+
+test('a cancelled or timed-out readiness probe closes its connection without replay', async t => {
+  let requests = 0, closes = 0;
+  t.mock.method(CodexAppServerClient.prototype, 'connect', async () => {});
+  t.mock.method(CodexAppServerClient.prototype, 'close', async () => { closes++; });
+  t.mock.method(CodexAppServerClient.prototype, 'request', async () => { requests++; return new Promise(() => {}); });
+  const reader = new AppServerReader(async () => ({ url: 'ws://app-server.test' }), error => assert.fail(String(error)));
+  const keepAlive = setInterval(() => {}, 100);
+  try {
+    await assert.rejects(reader.waitUntilReady('box', undefined, 30), { name: 'TimeoutError' });
+    const controller = new AbortController();
+    const waiting = reader.waitUntilReady('box', controller.signal);
+    const cancelled = assert.rejects(waiting, /user cancelled/);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    controller.abort(new Error('user cancelled'));
+    await cancelled;
+    assert.equal(requests, 2);
+    assert.equal(closes, 2);
+  } finally { clearInterval(keepAlive); await reader.close(); }
+});
+
 test('concurrent reads share a connection; idle cleanup never delays results', async t => {
   let connects = 0, endpoints = 0, closes = 0;
   let finishCleanup!: () => void;

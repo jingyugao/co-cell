@@ -167,7 +167,7 @@ function fixture() {
   return { counts, sandbox, provider, manager, projects, target, record };
 }
 
-test('default mounted-home resume uses one Cellbox ensure command and no GET, prepare, renew, or save', async () => {
+test('default mounted-home resume waits for Codex with one ensure command and no metadata GET, prepare, renew, or save', async t => {
   const calls: Array<{ method: string; path: string; body?: unknown; key?: string }> = [];
   const capabilities = { exec: true, files: true, http: true, websocket: true, pty: false, reconnectExec: false,
     freeze: false, suspend: 'same-node-checkpoint' as const, archives: 'workspace-best-effort', protectedTools: false,
@@ -203,12 +203,32 @@ test('default mounted-home resume uses one Cellbox ensure command and no GET, pr
   manager.track(`project:${target.projectId}`, { id: box.id, template: 'k8s', status: 'unavailable',
     checkpoint: { id: 'cellbox-checkpoint', createdAt: new Date(0).toISOString() } }, async () => { saves++; });
   projects.track(target, async () => { saves++; });
+  let finishHealth!: () => void;
+  const health = new Promise<void>(resolve => { finishHealth = resolve; });
+  let probes = 0, completed = false, stall = false;
+  let checkingCancelled!: () => void;
+  const cancelledCheck = new Promise<void>(resolve => { checkingCancelled = resolve; });
+  t.mock.method(CodexAppServerClient.prototype, 'connect', async () => {});
+  t.mock.method(CodexAppServerClient.prototype, 'close', async () => {});
+  t.mock.method(CodexAppServerClient.prototype, 'request', async (method: string) => {
+    assert.equal(method, 'thread/loaded/list');
+    probes++;
+    if (stall) { checkingCancelled(); return new Promise(() => {}); }
+    await health;
+    return { data: [] };
+  });
   const runtime = new ContainerCodexRuntime({ paths: runtimePaths, sandboxes: projects, provider, apiKey: '',
+    appServer: async () => ({ url: 'ws://app-server.test' }),
     sharedFilesMounted: () => true,
     prepareRemote: async () => { preparations++; return true; },
     acquireRemoteUsage: async () => { remoteUsage++; return async () => {}; } });
   try {
-    const result = await runtime.resume(target, undefined, 'project-resume-op');
+    const pending = runtime.resume(target, undefined, 'project-resume-op').then(value => { completed = true; return value; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(completed, false, 'Cellbox running must not complete resume before Codex responds');
+    assert.equal(probes, 1);
+    finishHealth();
+    const result = await pending;
     assert.equal(result.status, 'ready');
     assert.deepEqual(calls.map(call => [call.method, call.path]), [
       ['GET', '/v1/profiles'], ['POST', `/v1/boxes/${box.id}:ensure-running`],
@@ -219,7 +239,16 @@ test('default mounted-home resume uses one Cellbox ensure command and no GET, pr
     assert.equal(preparations, 0);
     assert.equal(remoteUsage, 0);
     assert.equal(manager.peek(`project:${target.projectId}`)?.checkpoint, undefined);
-  } finally { await runtime.close(); await manager.close(); }
+    stall = true;
+    const controller = new AbortController();
+    const cancelled = assert.rejects(runtime.resume(target, controller.signal, 'project-cancelled-wait'), /entry cancelled/);
+    await cancelledCheck;
+    controller.abort(new Error('entry cancelled'));
+    await cancelled;
+    assert.equal(calls.filter(call => call.method === 'POST').length, 2, 'cancelling readiness must not submit another restore');
+    assert.equal(target.sandbox?.id, box.id, 'readiness cancellation preserves the restored Box');
+    assert.equal(manager.peek(`project:${target.projectId}`)?.checkpoint, undefined, 'a consumed checkpoint must not be replayed');
+  } finally { finishHealth(); await runtime.close(); await manager.close(); }
 });
 
 test('live Sandbox queries ignore reference status without preparing, connecting or persisting', async () => {

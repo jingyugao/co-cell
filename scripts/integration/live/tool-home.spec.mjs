@@ -101,7 +101,7 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 });
     await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
     const start = performance.now();
-    const opened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: 202 });
+    const opened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: [200, 202] });
     const resumed = await env.waitProject(project.id, { kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id });
     const observedReadyMs = performance.now() - start;
     assert.equal(resumed.sandbox.id, project.sandbox.id);

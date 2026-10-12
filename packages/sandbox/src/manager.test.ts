@@ -16,13 +16,7 @@ function fixture(initial: 'running' | 'paused' = 'paused', connectDelay = 0) {
   let state = initial;
   let endAt = new Date(Date.now() + 60_000);
   const counts = { create: 0, connect: 0, inspect: 0, renew: 0, pause: 0, kill: 0 };
-  const handle = {
-    sandboxId: 'sandbox-1',
-    async setTimeout(timeoutMs: number) {
-      counts.renew += 1;
-      endAt = new Date(Date.now() + timeoutMs);
-    },
-  } as unknown as SandboxHandle;
+  const handle = { sandboxId: 'sandbox-1' } as unknown as SandboxHandle;
   const info = (): SandboxInfo => ({
     sandboxId: 'sandbox-1', metadata: {},
     startedAt: new Date(0), endAt, state,
@@ -31,6 +25,7 @@ function fixture(initial: 'running' | 'paused' = 'paused', connectDelay = 0) {
     async create() { counts.create += 1; state = 'running'; return handle; },
     async connect() { counts.connect += 1; if (connectDelay) await wait(connectDelay); state = 'running'; return handle; },
     async getInfo() { counts.inspect += 1; return info(); },
+    async renew(_id, timeoutMs) { counts.renew += 1; endAt = new Date(Date.now() + timeoutMs); return info(); },
     async pause() { counts.pause += 1; state = 'paused'; return true; },
     async kill() { counts.kill += 1; return true; },
   };
@@ -467,7 +462,7 @@ test('inspect does not connect or renew a paused sandbox', async () => {
 test('checkpointed sandbox restores before reconnecting and clears its checkpoint record', async () => {
   let state: 'running' | 'paused' = 'running';
   const calls: string[] = [];
-  const handle = { sandboxId: 'sandbox-1', setTimeout: async () => {} } as unknown as SandboxHandle;
+  const handle = { sandboxId: 'sandbox-1' } as unknown as SandboxHandle;
   const provider: SandboxProvider & { checkpoint(id: string): Promise<{ id: string; createdAt: string }>; restore(id: string, checkpointId: string): Promise<void> } = {
     create: async () => handle,
     connect: async () => { calls.push('connect'); assert.equal(state, 'running'); return handle; },
@@ -496,7 +491,7 @@ test('checkpointed sandbox restores before reconnecting and clears its checkpoin
 test('retry clears a checkpoint consumed by a restore whose owner aborted before local cleanup', async () => {
   let state: 'running' | 'paused' = 'paused';
   let restores = 0, connects = 0;
-  const handle = { sandboxId: 'sandbox-1', setTimeout: async () => {} } as unknown as SandboxHandle;
+  const handle = { sandboxId: 'sandbox-1' } as unknown as SandboxHandle;
   let restoreStarted!: (signal: AbortSignal | undefined) => void;
   const started = new Promise<AbortSignal | undefined>(resolve => { restoreStarted = resolve; });
   let finishRestore!: () => void;
@@ -553,6 +548,272 @@ test('multiple usages share renewal while inspect and idle scans never renew', a
   const afterRelease = fake.counts.renew;
   await wait(30);
   assert.equal(fake.counts.renew, afterRelease);
+  await manager.close();
+});
+
+test('explicit ensure-running uses one keyed provider command and never persists manager transitions', async () => {
+  const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
+  let reads = 0, writes = 0;
+  const lifecycleActions: string[] = [];
+  const calls: Array<{ key: string; expectedGeneration?: number }> = [];
+  const provider: SandboxProvider = {
+    create: async () => handle,
+    connect: async () => { assert.fail('ensure-running must not fall back to connect'); },
+    getInfo: async () => {
+      reads++;
+      if (reads === 1) return { sandboxId: 'sandbox-1', state: 'paused', startedAt: new Date(0), endAt: new Date(9999999999999), metadata: { generation: '3' } };
+      assert.fail('ensure-running must use its returned snapshot');
+    },
+    ensureRunning: async (_id, options) => {
+      calls.push({ key: options.operationKey, expectedGeneration: options.expectedGeneration });
+      return { handle, info: { sandboxId: 'sandbox-1', state: 'running', startedAt: new Date(0), endAt: new Date(9999999999999),
+        metadata: { generation: '8', phase: 'running' }, capabilities: { sharedDirectory: true } } };
+    },
+    pause: async () => true, kill: async () => true,
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 },
+    lifecycle: new SandboxLifecycle([{ name: 'record-actions', pre: async context => { lifecycleActions.push(`pre:${context.action}`); },
+      post: async context => { lifecycleActions.push(`post:${context.action}`); } }]) });
+  manager.track('resource', { ...record('paused'), version: 4, checkpoint: { id: 'checkpoint-1', createdAt: new Date(0).toISOString() } }, async () => { writes++; });
+  // Seed a stale local observation. Explicit resume must trust the operation
+  // key and returned snapshot instead of fencing against this cached generation.
+  await manager.inspect('resource');
+  reads = 0;
+  const lease = await manager.ensureRunning('resource', 'resume-op-123');
+  assert.deepEqual(calls, [{ key: 'resume-op-123', expectedGeneration: undefined }]);
+  assert.equal(reads, 0);
+  assert.equal(writes, 0);
+  assert.equal(lease.info?.capabilities?.sharedDirectory, true);
+  assert.equal(lease.record.status, 'ready');
+  assert.equal(lease.record.checkpoint, undefined, 'checkpoint is cleared locally after provider ensure succeeds');
+  assert.deepEqual(lifecycleActions, ['pre:resume', 'post:resume']);
+  await lease.release();
+  assert.equal(writes, 0, 'ephemeral resume usage release must not persist project metadata');
+  assert.deepEqual(manager.peek('resource')?.operation, undefined);
+  await manager.close();
+});
+
+test('ordinary acquire only attaches to a running Cellbox and never invokes ensure-running', async () => {
+  const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
+  let state: SandboxInfo['state'] = 'running';
+  let connects = 0, ensures = 0, restores = 0;
+  const provider: SandboxProvider & { checkpoint(id: string): Promise<{ id: string; createdAt: string }>; restore(id: string, checkpointId: string): Promise<void> } = {
+    create: async () => handle,
+    connect: async () => { connects++; return handle; },
+    getInfo: async () => ({ sandboxId: 'sandbox-1', state, startedAt: new Date(0), metadata: { generation: '4' } }),
+    ensureRunning: async () => { ensures++; throw new Error('ordinary acquire must not ensure-running'); },
+    checkpoint: async () => ({ id: 'checkpoint', createdAt: new Date().toISOString() }),
+    restore: async () => { restores++; },
+    pause: async () => true, kill: async () => true,
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), async () => {});
+  try {
+    const lease = await manager.acquire('resource', { usageId: 'normal-work' });
+    await lease.release();
+    assert.equal(connects, 1);
+    assert.equal(ensures, 0);
+
+    state = 'paused';
+    manager.track('paused-resource', { ...record('paused'), id: 'sandbox-1',
+      checkpoint: { id: 'legacy-checkpoint', createdAt: new Date(0).toISOString() } }, async () => {});
+    await assert.rejects(manager.acquire('paused-resource', { usageId: 'normal-work' }), /explicit ensure-running is required/);
+    assert.equal(connects, 1, 'paused ordinary acquire is rejected before provider connect');
+    assert.equal(ensures, 0, 'paused ordinary acquire does not submit a lifecycle command');
+    assert.equal(restores, 0, 'Cellbox checkpoint markers are not implicitly restored');
+  } finally { await manager.close(); }
+});
+
+test('explicit running ensure coexists with an active usage, while pause remains busy', async () => {
+  const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
+  let ensures = 0, pauses = 0;
+  const provider: SandboxProvider = {
+    create: async () => handle,
+    connect: async () => handle,
+    getInfo: async () => ({ sandboxId: 'sandbox-1', state: 'running', startedAt: new Date(0), metadata: { generation: '7' } }),
+    ensureRunning: async () => {
+      ensures++;
+      return { handle, info: { sandboxId: 'sandbox-1', state: 'running', startedAt: new Date(0),
+        metadata: { generation: '7', phase: 'running' } } };
+    },
+    pause: async () => { pauses++; return true; },
+    kill: async () => true,
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), async () => {});
+  const usageIds = () => [...((manager as unknown as { entries: Map<string, { usages: Map<string, unknown> }> })
+    .entries.get('resource')?.usages.keys() ?? [])];
+  try {
+    const original = await manager.acquire('resource', { usageId: 'active-session' });
+    const operation = await manager.ensureRunning('resource', 'resume-operation');
+    assert.equal(ensures, 1, 'explicit ensure reaches the provider despite a live local usage');
+    assert.deepEqual(usageIds(), ['active-session', 'operation:resume-operation']);
+
+    await operation.release();
+    assert.deepEqual(usageIds(), ['active-session'], 'releasing the temporary operation lease preserves the original lease');
+    await assert.rejects(manager.pause('resource'), { code: 'busy' });
+    assert.equal(pauses, 0, 'pause remains protected while the original execution owns its usage');
+
+    await original.release();
+    await manager.pause('resource');
+    assert.equal(pauses, 1, 'pause is allowed after the execution usage releases');
+  } finally { await manager.close(); }
+});
+
+test('Cellbox suspended ensure preserves the provider BUSY error and the existing usage', async () => {
+  const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
+  const busy = Object.assign(new Error('sandbox has an active execution'), {
+    name: 'CellboxError', code: 'BUSY', idempotencyKey: 'busy-resume-key',
+  });
+  const provider: SandboxProvider = {
+    create: async () => handle,
+    connect: async () => handle,
+    getInfo: async () => ({ sandboxId: 'sandbox-1', state: 'running', startedAt: new Date(0), metadata: { generation: '7' } }),
+    ensureRunning: async () => { throw busy; },
+    pause: async () => true,
+    kill: async () => true,
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), async () => {});
+  const usageIds = () => [...((manager as unknown as { entries: Map<string, { usages: Map<string, unknown> }> })
+    .entries.get('resource')?.usages.keys() ?? [])];
+  try {
+    const original = await manager.acquire('resource', { usageId: 'active-session' });
+    await assert.rejects(manager.ensureRunning('resource', 'busy-resume-key'), (error: unknown) => {
+      assert.equal(error, busy, 'provider BUSY is propagated without wrapping or losing its identity');
+      assert.equal((error as typeof busy).code, 'BUSY');
+      assert.equal((error as typeof busy).idempotencyKey, 'busy-resume-key');
+      return true;
+    });
+    assert.deepEqual(usageIds(), ['active-session']);
+    await original.release();
+  } finally { await manager.close(); }
+});
+
+test('same-key ensure-running calls join one provider command and share operation usage', async () => {
+  const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
+  let submissions = 0;
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const provider: SandboxProvider = {
+    create: async () => handle,
+    connect: async () => { assert.fail('ensure-running must not fall back to connect'); },
+    getInfo: async () => { assert.fail('ensure-running must not inspect before submission'); },
+    ensureRunning: async () => {
+      submissions++;
+      await gate;
+      return { handle, info: { sandboxId: 'sandbox-1', state: 'running', startedAt: new Date(0), endAt: new Date(9999999999999) } };
+    },
+    pause: async () => true, kill: async () => true,
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('paused'), async () => {});
+  try {
+    const first = manager.ensureRunning('resource', 'same-operation');
+    await waitForConnectWaiters(manager, 'resource', 1);
+    const second = manager.ensureRunning('resource', 'same-operation');
+    await waitForConnectWaiters(manager, 'resource', 2);
+    assert.equal(submissions, 1);
+    finish();
+    const [firstLease, secondLease] = await Promise.all([first, second]);
+    assert.equal(submissions, 1);
+    await firstLease.release();
+    assert.equal(manager.peek('resource')?.status, 'ready');
+    await secondLease.release();
+  } finally { finish(); await manager.close(); }
+});
+
+test('close waits for an in-flight ensure-running command and its local publication', async () => {
+  const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
+  let finish!: () => void;
+  let submitted!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const didSubmit = new Promise<void>(resolve => { submitted = resolve; });
+  const provider: SandboxProvider = {
+    create: async () => handle,
+    connect: async () => { assert.fail('ensure-running must not fall back to connect'); },
+    getInfo: async () => { assert.fail('ensure-running must not inspect before submission'); },
+    ensureRunning: async () => {
+      submitted();
+      await gate;
+      return { handle, info: { sandboxId: 'sandbox-1', state: 'running', startedAt: new Date(0),
+        metadata: { generation: '2', phase: 'running' } } };
+    },
+    pause: async () => true, kill: async () => true,
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('paused'), async () => {});
+  try {
+    const ensuring = manager.ensureRunning('resource', 'close-waits-key');
+    await didSubmit;
+    let closed = false;
+    const closing = manager.close().then(() => { closed = true; });
+    await wait(10);
+    assert.equal(closed, false, 'close must await the provider command, not only resource locks');
+    finish();
+    const lease = await ensuring;
+    await closing;
+    assert.equal(closed, true);
+    assert.equal(lease.record.status, 'ready', 'local state publication completes before close returns');
+  } finally { finish(); await manager.close(); }
+});
+
+test('recovered unknown checkpoint record resumes through one explicit command with no connect hook or persistence', async () => {
+  const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
+  const actions: string[] = [];
+  let restores = 0, reads = 0, writes = 0, commands = 0;
+  const provider: SandboxProvider & { checkpoint(id: string): Promise<{ id: string; createdAt: string }>; restore(id: string, checkpointId: string): Promise<void> } = {
+    create: async () => handle,
+    connect: async () => { assert.fail('recovered resume must not run connect'); },
+    getInfo: async () => { reads++; assert.fail('recovered resume must trust the ensure snapshot'); },
+    ensureRunning: async (_id, options) => {
+      commands++;
+      assert.equal(options.operationKey, 'durable-project-operation');
+      assert.equal(options.expectedGeneration, undefined);
+      return { handle, info: { sandboxId: 'sandbox-1', state: 'running', startedAt: new Date(0),
+        metadata: { phase: 'running', generation: '12' } } };
+    },
+    checkpoint: async () => ({ id: 'new-checkpoint', createdAt: new Date().toISOString() }),
+    restore: async () => { restores++; },
+    pause: async () => true, kill: async () => true,
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 },
+    lifecycle: new SandboxLifecycle([{ name: 'record-actions', pre: async context => { actions.push(`pre:${context.action}`); },
+      post: async context => { actions.push(`post:${context.action}`); } }]) });
+  manager.track('resource', { ...record('unavailable'), checkpoint: { id: 'old-checkpoint', createdAt: new Date(0).toISOString() } }, async () => { writes++; });
+  try {
+    const lease = await manager.ensureRunning('resource', 'durable-project-operation');
+    assert.equal(commands, 1);
+    assert.equal(reads, 0);
+    assert.equal(restores, 0);
+    assert.equal(writes, 0);
+    assert.deepEqual(actions, ['pre:resume', 'post:resume']);
+    assert.equal(lease.record.checkpoint, undefined);
+    await lease.release();
+  } finally { await manager.close(); }
+});
+
+test('unknown ensure-running outcome preserves provider code, key, and resumable local operation', async () => {
+  const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
+  const error = Object.assign(new Error('submission response lost'), { name: 'CellboxError', code: 'UNKNOWN_OUTCOME', idempotencyKey: 'resume-op-unknown' });
+  let writes = 0;
+  const provider: SandboxProvider = {
+    create: async () => handle,
+    connect: async () => { assert.fail('ensure-running must not fall back to connect'); },
+    getInfo: async () => { assert.fail('ensure-running must not inspect before submission'); },
+    ensureRunning: async () => { throw error; },
+    pause: async () => true, kill: async () => true,
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('paused'), async () => { writes++; });
+  await assert.rejects(manager.ensureRunning('resource', 'resume-op-unknown'), (caught: unknown) => {
+    assert.equal(caught, error);
+    assert.equal((caught as typeof error).code, 'UNKNOWN_OUTCOME');
+    assert.equal((caught as typeof error).idempotencyKey, 'resume-op-unknown');
+    return true;
+  });
+  assert.equal(manager.peek('resource')?.operation, 'resuming');
+  assert.equal(writes, 0);
   await manager.close();
 });
 

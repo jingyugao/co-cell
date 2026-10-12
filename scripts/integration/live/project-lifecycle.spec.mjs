@@ -7,7 +7,7 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
     for (let i = 0; i < 2; i++) {
       const created = await env.createProject(`concurrency-${i}`);
       assert.equal(created.sandboxOperation.kind, 'create');
-      const opened = await env.json(`/api/projects/${created.id}/open`, { method: 'POST', expectedStatus: 202 });
+      const opened = await env.json(`/api/projects/${created.id}/open`, { method: 'POST', expectedStatus: [200, 202] });
       assert.equal(opened.sandboxOperation.id, created.sandboxOperation.id);
       projects.push(await env.waitProject(created.id, { kind: 'create', status: 'ready', operationId: created.sandboxOperation.id }));
     }
@@ -38,9 +38,9 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
     // commits. That contender reports conflict immediately; it must not queue
     // another lifecycle action behind the first restore.
     const attempts = await Promise.all([0, 1].map(() => env.request(`/api/projects/${project.id}/open`, {
-      method: 'POST', expectedStatus: [202, 409],
+      method: 'POST', expectedStatus: [200, 202, 409],
     })));
-    const entries = attempts.filter(attempt => attempt.response.status === 202).map(attempt => attempt.data);
+    const entries = attempts.filter(attempt => [200, 202].includes(attempt.response.status)).map(attempt => attempt.data);
     assert(entries.length > 0, 'At least one concurrent entry must be admitted');
     assert.equal(entries[0].sandboxOperation.kind, 'resume');
     for (const entry of entries) assert.equal(entry.sandboxOperation.id, entries[0].sandboxOperation.id);
@@ -49,8 +49,9 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
     const ready = await env.waitProject(project.id, { kind: 'resume', status: 'ready', operationId: entries[0].sandboxOperation.id });
     assert.equal(ready.sandbox.id, project.sandbox.id);
     assert.equal(ready.name, name, 'Resume completion must preserve an unrelated metadata edit');
-    const reopened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: 202 });
-    assert.equal(reopened.sandboxOperation.id, ready.sandboxOperation.id);
+    const reopened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: [200, 202] });
+    assert.equal(reopened.sandboxOperation.kind, 'resume');
+    assert.equal(reopened.sandbox.id, ready.sandbox.id);
     await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 });
     const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
     assert.notEqual(checkpointed.remoteArchives?.[0]?.id, project.checkpointArchiveId, 'A later Checkpoint must publish a new archive reference');
@@ -60,7 +61,7 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
   await env.step('Simultaneous entry into two paused projects completes both restores', async () => {
     return Promise.all(projects.map(async project => {
       const start = performance.now();
-      const opened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: 202 });
+      const opened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: [200, 202] });
       const ready = await env.waitProject(project.id, { kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id });
       assert.equal(ready.sandbox.id, project.sandbox.id);
       return { projectId: project.id, durationMs: performance.now() - start, operationId: ready.sandboxOperation.id };

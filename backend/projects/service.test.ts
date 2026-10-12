@@ -228,19 +228,23 @@ test('a queued same-instance rename cannot regress a committed resume or disappe
   assert.equal(durable.name, 'renamed while resume commits');
 });
 
-test('resume provider callbacks are captured without intermediate writes and reject another Box', async () => {
+test('resume publishes one isolated result and rejects a result for another Box', async () => {
   const state = new MemoryState([project()]);
   const service = new ProjectService(state, undefined, undefined, true);
   await service.init();
+  const claim = await service.claimResume('project-1', 'api-a');
+  const expected = { operationId: claim.project.sandboxOperation!.id!, ownerId: 'api-a', sandboxId: 'sandbox-1' };
   const writes = state.projectWrites;
-  const final = await service.withResumeSandbox('project-1', 'sandbox-1', async () => {
-    await service.updateSandbox('project-1', { ...service.get('project-1').sandbox!, status: 'ready', pausedAt: undefined });
-    await assert.rejects(service.updateSandbox('project-1', { ...service.get('project-1').sandbox!, id: 'different-box' }), /身份已变化/);
-  });
-  assert.equal(final?.id, 'sandbox-1');
-  assert.equal(final?.status, 'ready');
+  const result = { ...claim.project.sandbox!, status: 'ready' as const };
+  await assert.rejects(service.finishResume('project-1', expected, { sandbox: { ...result, id: 'different-box' } }), /身份已变化/);
   assert.equal(state.projectWrites, writes);
-  assert.equal(service.get('project-1').sandbox?.pausedAt, undefined, 'captured callbacks do not mutate the shared cache');
+  assert.equal(await service.finishResume('project-1', expected, { sandbox: result }), true);
+  result.id = 'mutated-by-caller';
+  const stored = await state.getProject('project-1');
+  assert.equal(stored?.sandboxOperation?.result?.sandbox.id, 'sandbox-1');
+  assert.equal(stored?.sandboxOperation?.result?.sandbox.status, 'ready');
+  assert.equal(stored?.sandbox?.status, 'unknown', 'an operation result is not the live runtime state');
+  assert.equal(state.projectWrites, writes + 1);
 });
 
 test('shared refresh waits for in-flight writes, honors skipped scopes, and refreshes baselines safely', async () => {

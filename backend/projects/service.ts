@@ -1,5 +1,4 @@
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { Project, ProjectStatus, ProjectType, Settings } from '../../protocol/types.js';
@@ -12,7 +11,6 @@ import { readRequirementInfo } from './requirements.js';
 
 export type ProjectInput = { name?: string; requirementUrl?: string | null; type?: ProjectType; imageSelection?: ProjectImageSelection };
 export type ProjectUpdate = Partial<Omit<ProjectInput, 'imageSelection'>> & { status?: ProjectStatus; backupRetentionCount?: number };
-type ResumeSandboxCapture = { projectId: string; sandboxId: string; sandbox?: NonNullable<Project['sandbox']> };
 
 /** Owns project records and guards operations against concurrent deletion. */
 export class ProjectService {
@@ -26,7 +24,6 @@ export class ProjectService {
   private creatingWeeklyProjects = new Set<string>();
   private writer = new RecordWriteQueue();
   private saved = new Map<string, Project>();
-  private resumeSandboxCapture = new AsyncLocalStorage<ResumeSandboxCapture>();
   constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo, private now: () => Date = () => new Date(), private shared = false) {}
 
   async init() {
@@ -40,7 +37,10 @@ export class ProjectService {
       if (project.status === 'completed' && !project.completedAt) { project.completedAt = project.updatedAt; migratedStatus = true; }
       if (project.status === 'archived' && !project.archivedAt) { project.archivedAt = project.updatedAt; migratedStatus = true; }
       if (!project.type) { project.type = project.requirementUrl ? 2 : 1; migratedStatus = true; }
-      if (!this.shared && project.sandboxOperation?.status === 'running') {
+      const recoverableResume = project.sandboxOperation?.kind === 'resume'
+        && project.sandboxOperation.id && project.sandboxOperation.resume?.ownerId
+        && project.sandboxOperation.resume.sandboxId === project.sandbox?.id;
+      if (!this.shared && project.sandboxOperation?.status === 'running' && !recoverableResume) {
         project.sandboxOperation = { ...project.sandboxOperation, status: 'failed', error: '服务重启，操作未确认完成，请重试。', updatedAt: new Date().toISOString() };
         migratedStatus = true;
       }
@@ -294,6 +294,11 @@ export class ProjectService {
           ...operation,
           phase: outcome.error ? '恢复失败' : '恢复完成',
           status: outcome.error ? 'failed' : 'succeeded',
+          // This is the result of this operation, not a live runtime cache.
+          // Readers joining on another API can return the same committed result
+          // without inspecting or reconnecting the sandbox a second time.
+          result: !outcome.error && outcome.sandbox
+            ? { sandbox: { ...structuredClone(current.sandbox), status: outcome.sandbox.status } } : undefined,
           ...(outcome.error ? { error: outcome.error } : { error: undefined }),
           updatedAt: now,
         };
@@ -312,15 +317,6 @@ export class ProjectService {
       this.saved.set(id, structuredClone(project));
     });
     return finished;
-  }
-
-  /** Capture the provider's final Sandbox callback and defer its durable write. */
-  async withResumeSandbox(id: string, sandboxId: string, action: () => Promise<void>) {
-    const current = this.records.get(id);
-    if (!current || current.sandbox?.id !== sandboxId) throw new HttpError(409, '项目 Sandbox 已变化');
-    const capture: ResumeSandboxCapture = { projectId: id, sandboxId };
-    await this.resumeSandboxCapture.run(capture, action);
-    return capture.sandbox ? structuredClone(capture.sandbox) : undefined;
   }
 
   async setPendingSandboxCleanup(id: string, sandboxes: NonNullable<Project['pendingSandboxCleanup']>) {
@@ -495,12 +491,6 @@ export class ProjectService {
   }
 
   async updateSandbox(id: string, sandbox: NonNullable<Project['sandbox']>, restoreProject = false, restoreImage?: ProjectImageSelection): Promise<boolean> {
-    const capture = this.resumeSandboxCapture.getStore();
-    if (capture?.projectId === id) {
-      if (sandbox.id !== capture.sandboxId) throw new HttpError(409, '恢复期间 Sandbox 身份已变化');
-      capture.sandbox = structuredClone(sandbox);
-      return true;
-    }
     const project = this.records.get(id);
     if (!project || this.deleting.has(id)) return false;
     await this.mutateSandboxMetadata(id, next => {

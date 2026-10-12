@@ -106,14 +106,27 @@ test('rebuild endpoint returns the newly bound Sandbox for an archived project',
   }
 });
 
-test('resume endpoint returns the resumed project', async () => {
+test('resume endpoint returns 200 after its operation reaches a terminal state', async () => {
   const app = new Hono();
   installProjectsRoutes(app, {
     resumeProjectSandbox: async (id: string) => ({ id, sandbox: { id: 'same-sandbox', status: 'ready' } }) as never,
   } as unknown as Parameters<typeof installProjectsRoutes>[1]);
   const response = await app.request('/api/projects/project-to-resume/sandbox/resume', { method: 'POST' });
-  assert.equal(response.status, 202);
+  assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { id: 'project-to-resume', sandbox: { id: 'same-sandbox', status: 'ready' } });
+});
+
+test('open endpoint returns 202 only while its accepted operation is still running', async () => {
+  const app = new Hono();
+  let operationStatus: 'running' | 'succeeded' = 'running';
+  installProjectsRoutes(app, { enterProject: async (id: string) => ({ id,
+    sandboxOperation: { id: 'op-1', kind: 'resume', status: operationStatus, phase: '恢复中', updatedAt: new Date().toISOString() },
+  }) as never } as unknown as Parameters<typeof installProjectsRoutes>[1]);
+  const accepted = await app.request('/api/projects/project-1/open', { method: 'POST' });
+  assert.equal(accepted.status, 202);
+  operationStatus = 'succeeded';
+  const completed = await app.request('/api/projects/project-1/open', { method: 'POST' });
+  assert.equal(completed.status, 200);
 });
 
 test('project reads forward an exact bounded operation wait and reject unbounded waits', async () => {

@@ -105,6 +105,8 @@ export interface ProjectSandboxOperation {
 	id?: string;
   /** Resume intent and API ownership; recovery preserves the operation identity. */
   resume?: { sandboxId: string; ownerId: string };
+  /** Runtime snapshot durably published by a completed resume operation. */
+  result?: { sandbox: SandboxState };
   /** Image reserved by an in-flight or uncertain archived restore. */
   imageSelection?: ProjectImageSelection;
   /** Checkpoint includes a verified workspace backup before completion; backup is a legacy operation kind. */
@@ -179,19 +181,21 @@ export interface ArchiveVersionSummary {
   label: string;
 }
 
-/** POST /api/projects/:id/open returns this immediately after joining preparation or accepting
- * a paused sandbox resume. It does not imply readiness; GET remains read-only. */
+/** POST /api/projects/:id/open and /sandbox/resume wait briefly for the accepted operation.
+ * A 200 response means the operation reached a durable terminal state; 202 means it is still
+ * running and can be followed with GET waitForOperation. */
 export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null;
   /** Cellbox archive versions, newest first. */
   archiveVersions?: ArchiveVersionSummary[];
 }
 
 export const PROJECT_OPERATION_WAIT_MS = 10_000;
+export const PROJECT_OPEN_WAIT_MS = 1_500;
 
 /** GET /api/projects/:id remains read-only. Optional query parameters wait for
- * this exact operation to finish (success or failure), then return a live view.
- * Already finished/replaced operations return immediately; a timeout returns
- * the current view. Disconnecting only cancels the wait, never the operation. */
+ * this durable operation to finish (success or failure), then return its latest
+ * persisted view. An operation replaced before completion returns the current
+ * view; a timeout returns the current view. Disconnecting cancels only this wait. */
 export interface ProjectReadOptions {
   waitForOperation?: string;
   /** Integer milliseconds, 0 through PROJECT_OPERATION_WAIT_MS; default 10s. */

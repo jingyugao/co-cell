@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
-import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type Project, type ProjectSummary, type Session, type SessionSummary, type SessionTurnPage, type Settings, type StreamMessage, type SubagentConversation, type Turn } from '../../protocol/types.js';
+import { PROJECT_OPERATION_WAIT_MS, PROJECT_OPEN_WAIT_MS, type ProjectReadOptions, type Project, type ProjectSummary, type Session, type SessionSummary, type SessionTurnPage, type Settings, type StreamMessage, type SubagentConversation, type Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
@@ -73,7 +73,6 @@ export class SessionManager {
   private notifications?: NotificationStore;
   private projects: ProjectService;
   private sandboxOperations?: ProjectSandboxOperations;
-  private projectEntries = new Map<string, Promise<ProjectSummary>>();
   private imageCatalog?: ImageCatalog;
   private danglingDeletions = new Map<string, Promise<void>>();
   private sessions = new Map<string, Session>();
@@ -92,6 +91,7 @@ export class SessionManager {
   private refreshing?: Promise<void>;
   private recoveryTimer?: ReturnType<typeof setInterval>;
   private reconciling?: Promise<void>;
+  private localResumeRecovery?: Promise<void>;
   private projectLeases = new Map<string, SharedLease>();
   private apiInstanceId = randomUUID();
   private apiPresence?: SharedLease;
@@ -331,6 +331,37 @@ export class SessionManager {
     try { await this.reconciling; } finally { this.reconciling = undefined; }
   }
 
+  /** Recover durable resume intents in single-process installations too. */
+  private async recoverLocalResumes() {
+    if (this.coordinator || this.closing || !this.sandboxOperations || this.localResumeRecovery) return;
+    this.localResumeRecovery = (async () => {
+      for (const candidate of await this.state.listProjects()) {
+        if (this.closing) return;
+        const observed = candidate.sandboxOperation;
+        if (observed?.status !== 'running' || observed.kind !== 'resume' || !observed.id || !observed.resume
+          || this.sandboxOperations!.hasResume(candidate.id, observed.id)) continue;
+        await this.projects.refreshOne(candidate.id);
+        if (this.closing) return;
+        const latest = await this.state.getProject(candidate.id);
+        const operation = latest?.sandboxOperation;
+        const resume = operation?.resume;
+        if (this.closing) return;
+        if (!operation || operation.id !== observed.id || operation.status !== 'running' || operation.kind !== 'resume'
+          || !resume || this.sandboxOperations!.hasResume(candidate.id, operation.id)) continue;
+        try {
+          const resumed = await this.sandboxOperations!.startResume(candidate.id, this.apiInstanceId,
+            { operationId: operation.id, previousOwnerId: resume.ownerId });
+          void resumed.done.catch(() => {});
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 409) continue;
+          throw error;
+        }
+      }
+    })();
+    try { await this.localResumeRecovery; }
+    finally { this.localResumeRecovery = undefined; }
+  }
+
   async init() {
     await this.state.init();
     await this.ensureApiPresence();
@@ -453,6 +484,12 @@ export class SessionManager {
       await this.recoverSharedExecutions();
       this.recoveryTimer = setInterval(() => {
         void this.recoverSharedExecutions().catch(error => console.error('Shared execution recovery failed:', error.message));
+      }, 1000);
+      this.recoveryTimer.unref();
+    } else {
+      await this.recoverLocalResumes();
+      this.recoveryTimer = setInterval(() => {
+        void this.recoverLocalResumes().catch(error => console.error('Local resume recovery failed:', error.message));
       }, 1000);
       this.recoveryTimer.unref();
     }
@@ -671,13 +708,71 @@ export class SessionManager {
     this.projects.get(id);
     if (options.waitForOperation) {
       await traced('project.wait', { 'operation.id': options.waitForOperation }, async () => {
-        await this.sandboxOperations?.wait(id, options.waitForOperation!, options.waitMs ?? PROJECT_OPERATION_WAIT_MS, signal);
+        await this.waitForProjectOperation(id, options.waitForOperation!, options.waitMs ?? PROJECT_OPERATION_WAIT_MS, signal);
       });
       traceEvent('project.wait.finished');
     }
     signal?.throwIfAborted();
     if (options.waitForOperation) await this.projects.refreshOne(id);
+    // Operation wait reads are backed by the durable project document. Avoid a
+    // second provider status request after the operation has published its
+    // terminal sandbox snapshot; readiness comes from operation completion.
+    if (options.waitForOperation) return this.projectSummary(await this.projectAfterOperation(this.projects.get(id), options.waitForOperation));
     return this.projectSummary(await this.liveProject(this.projects.get(id), true));
+  }
+
+  private async waitForProjectOperation(id: string, operationId: string, waitMs: number,
+    signal?: AbortSignal): Promise<Project | undefined> {
+    const deadline = Date.now() + Math.max(0, waitMs);
+    let localWaitFailed = false;
+    while (true) {
+      signal?.throwIfAborted();
+      if (this.closing) throw new HttpError(503, '服务正在关闭');
+      const project = await this.state.getProject(id);
+      if (!project || project.sandboxOperation?.id !== operationId || project.sandboxOperation.status !== 'running') return project;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return project;
+
+      // The operation owner wakes local resume waiters after its durable commit.
+      // Other replicas have no in-memory waiter, so they check the authoritative
+      // document at a bounded cadence instead of spinning on an absent Promise.
+      if (!localWaitFailed && this.sandboxOperations?.hasResume(id, operationId)) {
+        try { await this.sandboxOperations.wait(id, operationId, Math.min(1_000, remaining), signal); }
+        catch (error) {
+          signal?.throwIfAborted();
+          if (this.closing) throw error;
+          // Local task rejection is not the persisted operation's terminal
+          // outcome. Fall back to bounded durable polling after re-reading it.
+          localWaitFailed = true;
+        }
+      } else {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(done, Math.min(100, remaining));
+          const abort = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); reject(signal?.reason); };
+          function done() { signal?.removeEventListener('abort', abort); resolve(); }
+          signal?.addEventListener('abort', abort, { once: true });
+          if (signal?.aborted) abort();
+        });
+      }
+    }
+  }
+
+  private async projectAfterOperation(project: Project, operationId: string): Promise<Project> {
+    const operation = project.sandboxOperation;
+    if (operation?.id !== operationId || operation.status !== 'succeeded' || !project.sandbox) return project;
+    const result = operation.result?.sandbox;
+    if (result?.id === project.sandbox.id) return { ...project, sandbox: structuredClone(result) };
+    // Older completed resume records predate the durable result snapshot. Keep
+    // them readable by querying once; a current resume always carries its own
+    // terminal runtime snapshot and never takes this fallback.
+    if (operation.kind === 'resume') return this.liveProject(project, true);
+    if (!['checkpoint', 'create', 'restore', 'rebuild', 'refresh'].includes(operation.kind)) return project;
+    // Durable terminal lifecycle state is the readiness boundary. Project
+    // storage deliberately omits provider state, so derive only the outcome
+    // established by this exact completed operation rather than issuing a
+    // second provider health/status request.
+    const status = operation.kind === 'checkpoint' ? 'paused' : 'ready';
+    return { ...project, sandbox: { ...project.sandbox, status } };
   }
 
   async snapshot(id: string): Promise<Session> {
@@ -1018,9 +1113,15 @@ export class SessionManager {
     throw new HttpError(409, '请使用 Checkpoint 暂停并备份；运行中的项目不再单独备份');
   }
 
-  async resumeProjectSandbox(id: string): Promise<ProjectSummary> {
+  async resumeProjectSandbox(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
     await this.submitProjectSandboxOperation(id, 'resume');
-    return this.readProject(id);
+    await this.projects.refreshOne(id);
+    const accepted = this.projects.get(id).sandboxOperation;
+    if (accepted?.id && accepted.status === 'running')
+      await this.waitForProjectOperation(id, accepted.id, PROJECT_OPEN_WAIT_MS, signal);
+    signal?.throwIfAborted();
+    await this.projects.refreshOne(id);
+    return this.projectSummary(await this.projectAfterOperation(this.projects.get(id), accepted?.id ?? ''));
   }
 
   private finishProjectResumeTrace(lifetime: ProjectResumeTrace, error?: unknown) {
@@ -1048,34 +1149,62 @@ export class SessionManager {
   }
 
   /** Opening is idempotent: join preparation, or start one resume of the existing box. */
-  async enterProject(id: string): Promise<ProjectSummary> {
-    return this.enterProjectLocal(id);
+  async enterProject(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
+    return this.enterProjectLocal(id, signal);
   }
 
-  private async enterProjectLocal(id: string): Promise<ProjectSummary> {
-    const pending = this.projectEntries.get(id);
-    if (pending) return pending;
-    const request = Promise.resolve().then(async () => {
-      if (this.closing) throw new HttpError(503, '服务正在关闭');
+  private async enterProjectLocal(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
+    const deadline = Date.now() + PROJECT_OPEN_WAIT_MS;
+    signal?.throwIfAborted();
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    await this.projects.refreshOne(id);
+    let project = this.projects.get(id);
+    if (project.status !== 'active') throw new HttpError(409, '项目未处于使用中状态，请先恢复项目');
+
+    while (project.executionMode === 'sandbox') {
+      const operation = project.sandboxOperation;
+      if (operation?.status === 'running' && operation.id) {
+        const remaining = Math.max(0, deadline - Date.now());
+        await this.waitForProjectOperation(id, operation.id, remaining, signal);
+        signal?.throwIfAborted();
+        await this.projects.refreshOne(id);
+        project = this.projects.get(id);
+        if (project.sandboxOperation?.id === operation.id && project.sandboxOperation.status === 'running') break;
+        if (project.sandboxOperation?.id === operation.id && operation.kind !== 'checkpoint'
+          && project.sandboxOperation.status === 'succeeded') break;
+        if (project.sandboxOperation?.id === operation.id && project.sandboxOperation.status === 'failed') break;
+        // A completed Checkpoint leaves the box paused. Continue below and
+        // accept one ensure-running resume for this project.
+        continue;
+      }
+
+      if (operation?.status === 'failed' && operation.kind !== 'resume') break;
+      if (!project.sandbox) break;
+      if (this.projects.isMaintaining(id)) return this.readProject(id);
+
+      // Opening an already active conversation must not force another restore;
+      // session execution owns its runtime lease. Idle project entry submits the
+      // ensure-running operation. The runtime owns the live-state check because
+      // the persisted Sandbox record intentionally carries no provider status.
+      const sessions = await this.state.listProjectSessions(id);
+      if (sessions.some(session => session.status === 'running' || session.turns.some(turn => turn.status === 'running')))
+        return this.readProject(id);
+      await this.submitProjectSandboxOperation(id, 'resume');
       await this.projects.refreshOne(id);
-      let project = this.projects.get(id);
-      if (project.status !== 'active') throw new HttpError(409, '项目未处于使用中状态，请先恢复项目');
-      if (project.executionMode !== 'sandbox' || this.projects.isMaintaining(id)) return this.readProject(id);
-      const revision = project.updatedAt;
-      const operationId = project.sandboxOperation?.id;
-      const observed = await this.liveProject(project);
-      // Another lifecycle action may have started while the provider was read.
       project = this.projects.get(id);
-      if (this.closing) throw new HttpError(503, '服务正在关闭');
-      if (project.status !== 'active') throw new HttpError(409, '项目未处于使用中状态，请先恢复项目');
-      if (this.projects.isMaintaining(id) || project.updatedAt !== revision || project.sandboxOperation?.id !== operationId
-        || project.sandbox?.id !== observed.sandbox?.id) return this.readProject(id);
-      if (observed.sandbox?.status === 'paused') await this.submitProjectSandboxOperation(id, 'resume');
-      return this.readProject(id);
-    });
-    this.projectEntries.set(id, request);
-    try { return await request; }
-    finally { if (this.projectEntries.get(id) === request) this.projectEntries.delete(id); }
+      const accepted = project.sandboxOperation;
+      if (accepted?.status === 'running' && accepted.id) {
+        const remaining = Math.max(0, deadline - Date.now());
+        await this.waitForProjectOperation(id, accepted.id, remaining, signal);
+        signal?.throwIfAborted();
+        await this.projects.refreshOne(id);
+        project = this.projects.get(id);
+      }
+      break;
+    }
+    signal?.throwIfAborted();
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    return this.projectSummary(await this.projectAfterOperation(project, project.sandboxOperation?.id ?? ''));
   }
 
   async checkpointProjectSandbox(id: string): Promise<ProjectSummary> {
@@ -1162,8 +1291,12 @@ export class SessionManager {
       await this.projects.refreshOne(id);
       const project = this.projects.get(id);
       const operation = project.sandboxOperation;
+      const resume = operation?.resume;
       if (operation?.status === 'running' && operation.kind === 'resume' && operation.id
-        && operation.resume?.sandboxId === project.sandbox?.id) {
+        && resume && resume.sandboxId === project.sandbox?.id) {
+        if (!this.coordinator && resume.ownerId && !this.sandboxOperations!.hasResume(id, operation.id))
+          return this.sandboxOperations!.startResume(id, this.apiInstanceId,
+            { operationId: operation.id, previousOwnerId: resume.ownerId });
         return { joined: true, operationId: operation.id, done: Promise.resolve() };
       }
       const sessions = await this.state.listProjectSessions(id);
@@ -1179,19 +1312,31 @@ export class SessionManager {
     lifetime.handedOff = true;
     lifetime.span.setAttributes({ 'operation.id': result.operationId, 'operation.joined': result.joined });
     const done = result.joined ? this.waitResumeCompletion(id, result.operationId) : result.done;
-    void done.then(() => this.completeProjectResumeWork(lifetime), error => this.completeProjectResumeWork(lifetime, error));
+    void done.then(async () => {
+      try {
+        // A local worker may resolve with UNKNOWN_OUTCOME while the durable
+        // operation is still running. The persisted terminal state, not local
+        // Promise settlement, closes the lifecycle span.
+        await this.waitResumeCompletion(id, result.operationId);
+        this.completeProjectResumeWork(lifetime);
+      } catch (error) { this.completeProjectResumeWork(lifetime, error); }
+    }, async error => {
+      // Likewise, a local rejection can mean only that its transport response
+      // was lost. Wait for durable completion/recovery or API shutdown first.
+      try {
+        await this.waitResumeCompletion(id, result.operationId);
+        this.completeProjectResumeWork(lifetime);
+      } catch { this.completeProjectResumeWork(lifetime, error); }
+    });
     return { done };
   }
 
   private async waitResumeCompletion(id: string, operationId: string): Promise<void> {
-    while (!this.closing) {
-      const project = await this.state.getProject(id);
-      const operation = project?.sandboxOperation;
-      if (!project || operation?.id !== operationId) throw new HttpError(409, '恢复操作已变化，请刷新项目状态');
-      if (operation.status === 'succeeded') return;
-      if (operation.status === 'failed') throw new HttpError(502, operation.error ?? '恢复失败');
-      await new Promise<void>(resolve => setTimeout(resolve, 50));
-    }
+    const project = await this.waitForProjectOperation(id, operationId, Number.MAX_SAFE_INTEGER);
+    const operation = project?.sandboxOperation;
+    if (!project || operation?.id !== operationId) throw new HttpError(409, '恢复操作已变化，请刷新项目状态');
+    if (operation.status === 'succeeded') return;
+    if (operation.status === 'failed') throw new HttpError(502, operation.error ?? '恢复失败');
     throw new HttpError(503, '服务正在关闭');
   }
 
@@ -1958,6 +2103,7 @@ export class SessionManager {
     await Promise.allSettled([...this.subscriptionPolls.values()].map(poll => poll.observation?.done));
     this.subscriptionPolls.clear();
     await this.reconciling;
+    await this.localResumeRecovery;
     await this.lifecycle?.close();
     await this.sandboxOperations?.close();
     await Promise.allSettled(this.danglingDeletions.values());

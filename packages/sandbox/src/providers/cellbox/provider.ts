@@ -176,13 +176,15 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     if (!box.operationId) throw new CellboxError('CONFLICT', `Box ${box.id} is resuming without an operation identity`);
     this.checkConnectAbort(signal);
     const operation = await this.client.getOperation(box.operationId, signal);
-    if (operation.id !== box.operationId || operation.kind !== 'resume' || operation.targetId !== box.id)
+    if (operation.id !== box.operationId || !['resume', 'ensure-running'].includes(operation.kind) || operation.targetId !== box.id)
       throw new CellboxError('CONFLICT', `Box ${box.id} is associated with another lifecycle operation`);
-    await this.wait(operation, this.maxWaitMs, signal);
+    const completed = await this.wait(operation, this.maxWaitMs, signal);
     this.checkConnectAbort(signal);
-    const current = await this.box(box.id, signal);
+    const current = completed.box ?? await this.box(box.id, signal);
+    if (current.id !== box.id || current.profileId !== this.profileId || (this.workspace && current.workspace !== this.workspace))
+      throw new CellboxError('CONFLICT', `Box ${box.id} lifecycle operation returned an unexpected identity`);
     if (current.phase !== 'running')
-      throw new CellboxError('CONFLICT', `Box ${box.id} resume operation completed while it is ${current.phase}`);
+      throw new CellboxError('CONFLICT', `Box ${box.id} lifecycle operation completed while it is ${current.phase}`);
     if (current.operationId)
       throw new CellboxError('CONFLICT', `Box ${box.id} still has active operation ${current.operationId}`);
     return current;
@@ -237,7 +239,10 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
       await this.saveCreateJournal(journal.path, { key, boxId: op.targetId });
     await this.wait(op);
     const box = await this.box(op.targetId);
-    if (box.phase === 'suspended') return this.connect(box.id);
+    if (box.phase === 'suspended') {
+      const ensured = await this.ensureRunning(box.id, { operationKey: `cocell-create-ensure-${key}`, expectedGeneration: box.generation });
+      return ensured.handle;
+    }
     if (box.phase !== 'running' && !(staged && box.phase === 'staged')) throw new CellboxError('CONFLICT', `Created box ${box.id} is ${box.phase}`);
     return this.handle(box);
   }
@@ -247,15 +252,33 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     await this.ready(signal);
     this.checkConnectAbort(signal);
     let box = await this.box(id, signal);
-    if (box.phase === 'suspended') {
-      await this.resumeSuspended(box, signal);
-      this.checkConnectAbort(signal);
-      box = await this.box(id, signal);
-    } else if (box.phase === 'resuming' || (box.phase === 'running' && box.operationId)) {
+    if (box.phase === 'resuming' || (box.phase === 'running' && box.operationId)) {
       box = await this.joinResume(box, signal);
     }
     if (box.phase !== 'running') throw new CellboxError('CONFLICT', `Box ${id} is ${box.phase}`);
     return this.handle(box);
+  }
+  async ensureRunning(id: string, options: { operationKey: string; expectedGeneration?: number; signal?: AbortSignal }) {
+    const { operationKey, expectedGeneration, signal } = options;
+    if (!operationKey.trim()) throw new CellboxError('INVALID_REQUEST', 'ensure-running requires an operation key');
+    this.checkConnectAbort(signal);
+    await this.ready(signal);
+    const operation = await this.client.ensureRunning(id, operationKey, {
+      expectedGeneration, signal, timeoutMs: this.maxWaitMs + 60_000,
+    });
+    this.checkConnectAbort(signal);
+    if (operation.id.length === 0 || !['ensure-running', 'resume'].includes(operation.kind) || operation.targetId !== id)
+      throw new CellboxError('PROTOCOL', `Cellbox returned an unrelated ensure-running operation for Box ${id}`, undefined, operationKey);
+    if (operation.status === 'failed')
+      throw new CellboxError(operation.error?.code ?? 'CONFLICT', operation.error?.message ?? `Cellbox could not ensure Box ${id} is running`, undefined, operationKey);
+    if (operation.status !== 'succeeded' || !operation.box)
+      throw new CellboxError('PROTOCOL', `Cellbox ensure-running for Box ${id} did not return a completed Box snapshot`, undefined, operationKey);
+    const box = operation.box;
+    if (box.id !== id || box.profileId !== this.profileId || (this.workspace && box.workspace !== this.workspace))
+      throw new CellboxError('CONFLICT', `Cellbox ensure-running returned an unexpected Box identity`, undefined, operationKey);
+    if (box.phase !== 'running' || box.operationId)
+      throw new CellboxError('PROTOCOL', `Cellbox ensure-running completed while Box ${id} is ${box.phase}`, undefined, operationKey);
+    return { handle: this.handle(box), info: this.boxInfo(box) };
   }
   /** Restore candidates accept agent setup while staged; no resume or activation occurs here. */
   async connectForSetup(id: string): Promise<SandboxHandle> {
@@ -281,9 +304,11 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   private boxInfo(box: CellboxBox): SandboxInfo {
     const startedAt = new Date(box.createdAt);
     return { sandboxId: box.id, state: !box.operationId && box.phase === 'running' ? 'running' : !box.operationId && box.phase === 'suspended' ? 'paused' : 'unknown',
-      startedAt, endAt: new Date('9999-12-31T23:59:59.999Z'),
+      startedAt,
       metadata: { ownerKey: box.ownerKey, profileId: box.profileId, generation: String(box.generation), phase: box.phase,
-        ...(box.operationId ? { operationId: box.operationId } : {}) },
+        ...(box.operationId ? { operationId: box.operationId } : {}),
+        ...(box.executionId ? { executionId: box.executionId } : {}) },
+      capabilities: { ...box.capabilities },
       templateIdentity: { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] } };
   }
   async pause(id: string) {
@@ -399,14 +424,13 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   private handle(box: CellboxBox): SandboxHandle & { getServiceAccess(port: number): Promise<CellboxServiceAccess> } {
     const id = box.id;
     const workspace = box.workspace;
-    let commandTimeout = 30_000;
     const execute = async (command: string, options: RunOptions = {}) => {
       validAgent(options.user);
       if (!command || typeof command !== 'string') throw new CellboxError('INVALID_REQUEST', 'Command is required');
       if (Buffer.byteLength(command) > 8192) throw new CellboxError('INVALID_REQUEST', 'Cellbox shell command exceeds the 8192-byte guest argument limit');
       const cwd = options.cwd === undefined ? undefined : workspacePath(options.cwd, workspace);
       if (options.cwd !== undefined && cwd === undefined) throw new CellboxError('INVALID_REQUEST', 'Command cwd must be inside Cellbox workspace');
-      const timeoutMs = options.timeoutMs ?? commandTimeout;
+      const timeoutMs = options.timeoutMs ?? 30_000;
       if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000)
         throw new CellboxError('INVALID_REQUEST', 'Command timeoutMs must be 1..300000');
       const current = await this.box(id);
@@ -459,7 +483,6 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     return { sandboxId: id, getHost: () => new URL(this.client.origin).hostname,
       getServiceUrl: async port => (await this.serviceRoute(id, port)).url,
       getServiceAccess: port => this.getServiceAccess(id, port),
-      setTimeout: async timeoutMs => { if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new CellboxError('INVALID_REQUEST', 'Timeout must be positive'); commandTimeout = Math.min(timeoutMs, 300_000); },
       commands: { run: execute as SandboxHandle['commands']['run'] },
       files: {
         readResponse: async (path, options = {}) => {

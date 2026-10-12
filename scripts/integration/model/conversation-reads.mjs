@@ -146,7 +146,7 @@ export async function conversationReads(env) {
     for (const result of results) if (result.status === 'rejected') throw result.reason;
     const accepted = results.at(-1).value;
     const paused = await env.waitProject(projectId, { kind: 'checkpoint', status: 'paused', operationId: accepted.sandboxOperation.id });
-    const opened = await json(`/api/projects/${projectId}/open`, { method: 'POST', expectedStatus: 202 });
+    const opened = await json(`/api/projects/${projectId}/open`, { method: 'POST', expectedStatus: [200, 202] });
     const ready = await env.waitProject(projectId, { kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id });
     assert.equal(ready.sandbox.id, paused.sandbox.id);
     const fresh = await json(`/api/sessions/${sessionId}`);

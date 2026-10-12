@@ -38,12 +38,15 @@ test('open resume keeps one lifecycle span through detached work and durable com
     async rebuild(_target, save) { await save(sandbox); },
     async querySandbox(value) { return { ...value, status: paused ? 'paused' as const : 'ready' as const }; },
     async checkpoint(value) { paused = true; return { ...value.sandbox!, status: 'paused' as const }; },
-    async resume(_target, save) {
+    async resume(_target) {
       await traced('test.resume.runtime', {}, async () => { resumeStarted(); await barrier; });
       if (failResume) throw new Error('runtime restore failed');
       paused = false;
-      await save({ ...sandbox, status: 'ready' });
+      return { ...sandbox, status: 'ready' as const };
     },
+    remoteArchives: { async capture(target) { return { id: 'trace-checkpoint', createdAt: new Date().toISOString(), sizeBytes: 1,
+      sha256: 'a'.repeat(64), imageId: 'test-image', sourceSandboxId: target.sandbox!.id }; },
+      async inspect(reference) { return reference; }, async restore() { throw new Error('unused'); }, async activate() {} },
     async verifySandbox() {}, async fenceSandbox() {}, async detachSandbox() {}, async deleteDanglingSandbox() {},
   } satisfies Partial<SandboxRuntime>;
   const state = new MemoryWebStateStore();
@@ -82,7 +85,7 @@ test('open resume keeps one lifecycle span through detached work and durable com
     };
     const caller = new AbortController();
     const response = await app.request(`/api/projects/${projectId}/open`, { method: 'POST', signal: caller.signal });
-    assert.equal(response.status, 202);
+    assert.equal(response.status, 202, JSON.stringify(await response.clone().json()));
     caller.abort();
     await started;
 
@@ -138,7 +141,7 @@ test('open resume keeps one lifecycle span through detached work and durable com
     await operations().close();
     failResume = true;
     const failedResponse = await app.request(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST' });
-    assert.equal(failedResponse.status, 202);
+    assert.equal(failedResponse.status, 200, 'a terminal restore failure is returned synchronously with its operation state');
     await operations().close();
     await new Promise<void>(resolve => setImmediate(resolve));
     const failedResume = exporter.getFinishedSpans().filter(span => span.name === 'project.resume').at(-1);

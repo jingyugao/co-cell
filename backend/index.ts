@@ -132,8 +132,8 @@ const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provide
   logger: runtimeLog, baseUrl: process.env.OPENAI_BASE_URL, modelConfig, configOverrides,
   sharedDataDirectory: pathToFileURL(`${sharedDataRoot}/`),
   ...(sharedDirectory ? { sharedFilesMounted: (id: string) => cellboxRuntime.usesSharedDirectory(id) } : {}),
-  appServer, appServerReader, paths:CELLBOX_PRODUCT_PATHS, prepareRemote:(handle,target,signal)=>cellboxRuntime.prepare(handle,target,signal),
-  acquireRemoteUsage:(id, initializationDirectory)=>cellboxRuntime.acquireUsage(id, initializationDirectory), remoteArchives:cellboxRuntime.remoteArchives,
+  appServer, appServerReader, paths:CELLBOX_PRODUCT_PATHS, prepareRemote:(handle,target,signal,info)=>cellboxRuntime.prepare(handle,target,signal,info),
+  acquireRemoteUsage:(id, initializationDirectory,info)=>cellboxRuntime.acquireUsage(id, initializationDirectory,info), remoteArchives:cellboxRuntime.remoteArchives,
   serviceAccess:(id:string,port:number)=>cellboxProvider.getServiceAccess(id,port) });
 const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || 'data/web-state');
 const webImagesDirectory = resolve(process.env.CODEX_WEB_IMAGES_DIR || 'data/images');

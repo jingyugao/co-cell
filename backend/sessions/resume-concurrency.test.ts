@@ -39,12 +39,12 @@ async function fixture() {
     const runtime = {
       async close() {},
       async querySandbox(sandbox) { return { ...sandbox, status: ready ? 'ready' as const : 'paused' as const }; },
-      async resume(target, save, signal) {
+      async resume(target, signal) {
         worker.calls++; worker.signal = signal; worker.started.resolve();
         // Deliberately emulate a remote call that was accepted before cancellation.
         await worker.finish.promise;
         ready = true;
-        await save({ ...target.sandbox!, status: 'ready', pausedAt: undefined });
+        return { ...target.sandbox!, status: 'ready', pausedAt: undefined };
       },
     } satisfies Partial<SandboxRuntime>;
     const manager = new SessionManager({} as CodexClient, directory, settings, state, runtime as SandboxRuntime,
@@ -76,6 +76,22 @@ test('two APIs join one resume without a project lease; metadata edits survive i
     f.state.saveProject = async (...args) => { callbackWrites++; return save(...args); };
     const accepted = await a.resumeProjectSandbox(f.project.id);
     await f.workers[0].started.promise;
+    let crossReplicaWaitFinished = false;
+    const waitStartedAt = Date.now();
+    const crossReplicaWait = b.readProject(f.project.id, { waitForOperation: accepted.sandboxOperation!.id!, waitMs: 300 })
+      .then(project => { crossReplicaWaitFinished = true; return project; });
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal(crossReplicaWaitFinished, false, 'a replica without a local waiter must honor the durable wait budget');
+    const timedOut = await crossReplicaWait;
+    assert.ok(Date.now() - waitStartedAt >= 250, 'cross-replica waiting should poll state rather than return immediately');
+    assert.equal(timedOut.sandboxOperation?.status, 'running');
+    const waiterController = new AbortController();
+    const cancelledWait = b.readProject(f.project.id, { waitForOperation: accepted.sandboxOperation!.id!, waitMs: 5_000 }, waiterController.signal);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    waiterController.abort(new Error('caller stopped waiting'));
+    await assert.rejects(cancelledWait, /caller stopped waiting/);
+    assert.equal((await f.state.getProject(f.project.id))?.sandboxOperation?.status, 'running', 'cancelling a waiter leaves durable work running');
+    assert.equal(f.workers[0].signal?.aborted, false, 'HTTP waiter cancellation must not cancel the runtime owner');
     const joined = await b.resumeProjectSandbox(f.project.id);
     assert.equal(joined.sandboxOperation?.id, accepted.sandboxOperation?.id);
     assert.equal(f.workers[1].calls, 0);
@@ -192,4 +208,45 @@ test('an API reconnects with a new owner epoch while its cancelled worker is sti
     assert.equal(finished?.sandboxOperation?.status, 'succeeded');
     assert.equal(finished?.sandboxOperation?.resume?.ownerId, recovered?.sandboxOperation?.resume?.ownerId);
   } finally { await f.close(); }
+});
+
+test('single-API startup replays an unknown resume outcome with the same durable operation ID', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-local-resume-recovery-'));
+  const state = new MemoryWebStateStore();
+  const at = new Date().toISOString();
+  const operationId = 'resume-recovery-operation';
+  const project: Project = { id: 'resume-project', name: 'Resume test', status: 'active', requirementUrl: null,
+    executionMode: 'sandbox', workingDirectory: settings.workingDirectory, completedAt: null, archivedAt: null,
+    createdAt: at, updatedAt: at, sandbox: { id: 'resume-box', status: 'paused', template: 'test',
+      workingDirectory: settings.workingDirectory, pausedAt: at },
+    sandboxOperation: { id: operationId, kind: 'resume', phase: '恢复中', status: 'running', updatedAt: at,
+      resume: { sandboxId: 'resume-box', ownerId: 'previous-api' } } };
+  await state.saveProject(project);
+  let calls = 0;
+  const operationIds: string[] = [];
+  const runtime = {
+    async close() {},
+    async querySandbox(sandbox) { return { ...sandbox, status: 'paused' as const }; },
+    async resume(target, _signal, currentOperationId) {
+      assert(currentOperationId);
+      calls++; operationIds.push(currentOperationId);
+      if (calls === 1) throw Object.assign(new Error('response lost after accepting command'), { code: 'UNKNOWN_OUTCOME' });
+      return { ...target.sandbox!, status: 'ready' as const, pausedAt: undefined };
+    },
+  } satisfies Partial<SandboxRuntime>;
+  const manager = new SessionManager({} as CodexClient, directory, settings, state, runtime as SandboxRuntime);
+  try {
+    await manager.init();
+    const deadline = Date.now() + 4_000;
+    let current = await state.getProject(project.id);
+    while (current?.sandboxOperation?.status === 'running' && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+      current = await state.getProject(project.id);
+    }
+    assert.equal(current?.sandboxOperation?.id, operationId);
+    assert.equal(current?.sandboxOperation?.status, 'succeeded', JSON.stringify(current?.sandboxOperation));
+    assert.equal(calls, 2, 'the local reconciler retries the unknown operation after its first worker exits');
+    assert.deepEqual(operationIds, [operationId, operationId], 'recovery preserves Cellbox idempotency identity');
+    assert.equal(current?.sandboxOperation?.result?.sandbox.id, 'resume-box');
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

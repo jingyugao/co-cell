@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { SandboxManager, SandboxLease, SandboxRecord } from '@co-cell/sandbox';
+import type { SandboxManager, SandboxLease, SandboxRecord, SandboxInfo } from '@co-cell/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
 
@@ -96,6 +96,7 @@ export class ProjectSandboxes {
     save?: SaveSandbox;
     usageId?: string;
     signal?: AbortSignal;
+    operationKey?: string;
   } = {}): Promise<SandboxLease> {
     const binding = this.track(target, options.save);
     if (options.create && !binding.save) throw new Error('项目沙箱的持久化入口尚未配置');
@@ -104,6 +105,7 @@ export class ProjectSandboxes {
       usageId: options.usageId ?? randomUUID(),
       purpose: options.usageId ? 'execution' : 'workspace',
       signal: options.signal,
+      operationKey: options.operationKey,
       persist: binding.persist,
       ...(options.create ? { create: {
         template: this.template,
@@ -116,6 +118,17 @@ export class ProjectSandboxes {
     });
     target.sandbox = this.project(lease.record, binding.workingDirectory);
     return lease;
+  }
+
+  async ensureRunning(target: WorkspaceTarget, operationKey: string, signal?: AbortSignal): Promise<{
+    lease: SandboxLease; info: SandboxInfo;
+  }> {
+    if (!target.sandbox) throw new Error('Project Sandbox does not exist');
+    this.track(target);
+    const key = resourceKey(target);
+    const lease = await this.manager.ensureRunning(key, operationKey, signal);
+    target.sandbox = this.project(lease.record, this.bindings.get(key)!.workingDirectory);
+    return { lease, info: lease.info! };
   }
 
   async inspect(target: WorkspaceTarget) {

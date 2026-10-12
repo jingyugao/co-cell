@@ -78,9 +78,9 @@ test('project creation verifies readiness; resume preserves the box without repe
     async verifySandbox() { verifications++; if (failVerification) throw new Error('App Server unavailable'); },
     async inspect() { inspections++; },
     async checkpoint(target) { assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'paused' }; return { ...providerBox }; },
-    async resume(target, save) { resumeCalls++; assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'ready' }; await save({ ...providerBox });
+    async resume(target) { resumeCalls++; assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'ready' };
       await resumeBarrier;
-      if (failResume) throw new Error('Runtime restore outcome unavailable'); },
+      if (failResume) throw new Error('Runtime restore outcome unavailable'); return { ...providerBox }; },
     remoteArchives: { async capture(target) { assert.equal(target.sandbox?.status, 'paused'); if (failCapture) throw new Error('archive storage unavailable'); return { id: 'archive-checkpoint', createdAt: new Date().toISOString(), sizeBytes: 10, sha256: 'a'.repeat(64), imageId: 'image', sourceSandboxId: box.id }; },
       async inspect(ref) { return ref; }, async restore() { throw new Error('unused'); }, async activate() {} },
     async fenceSandbox() {}, async detachSandbox() {}, async deleteDanglingSandbox() {},
@@ -192,7 +192,7 @@ test('project creation verifies readiness; resume preserves the box without repe
     await operations().close();
     assert.equal(resumeCalls, 1, 'concurrent entries and repeated entry during preparation share one resume');
     await manager.enterProject(created.id);
-    assert.equal(resumeCalls, 1, 'entering a ready project does not start another operation');
+    assert.equal(resumeCalls, 2, 'a new idle project entry rechecks runtime through ensure-running');
     assert.equal(verifications, 2, 'creation and checkpoint inspect health; resume relies on runtime completion');
     assert.equal((await manager.readProject(created.id)).sandbox?.id, box.id);
     assert.equal(createCalls, 1, 'resume must not provision a second sandbox');

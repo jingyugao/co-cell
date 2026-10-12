@@ -166,7 +166,7 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
       assert.equal(before.box.status.phase, 'Suspended');
       const candidates = await waitForCandidates(before.box, 1);
       const candidateIdentities = candidates.map(pod => ({ name: pod.metadata.name, uid: pod.metadata.uid }));
-      const opened = await env.json(`/api/projects/${testCase.project.id}/open`, { method: 'POST', expectedStatus: 202 });
+      const opened = await env.json(`/api/projects/${testCase.project.id}/open`, { method: 'POST', expectedStatus: [200, 202] });
       assert.equal(opened.sandboxOperation.kind, 'resume');
       const resumed = await env.waitProject(testCase.project.id, {
         kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id,

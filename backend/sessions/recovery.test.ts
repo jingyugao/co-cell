@@ -55,6 +55,10 @@ test('legacy running turns are cancelled on restart instead of resubmitted', asy
 test('an accepted App Server turn is recovered after restart without submitting its prompt again', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'hive-app-server-recovery-'));
   let recoveries = 0, launches = 0, tracked = 0;
+  let markRecoveryStarted!: () => void;
+  let finishRecovery!: () => void;
+  const recoveryStarted = new Promise<void>(resolve => { markRecoveryStarted = resolve; });
+  const recoveryGate = new Promise<void>(resolve => { finishRecovery = resolve; });
   const runtime = {
     ...provisioning,
     async close() {},
@@ -62,6 +66,8 @@ test('an accepted App Server turn is recovered after restart without submitting 
     async *run() { launches++; assert.fail('must not resubmit an accepted App Server turn'); },
     async *recover(_session: Session, turn: Turn) {
       recoveries++;
+      markRecoveryStarted();
+      await recoveryGate;
       yield { type: 'turn.started' as const, turn_id: 'native-turn' };
       yield { type: 'item.completed' as const, item: { id: 'answer', type: 'agent_message' as const, text: 'finished remotely' } };
       yield { type: 'turn.completed' as const, usage: { input_tokens: 0, cached_input_tokens: 0, cache_write_input_tokens: 0,
@@ -88,7 +94,10 @@ test('an accepted App Server turn is recovered after restart without submitting 
     await state.saveSession(session);
 
     await second.init();
-    assert.equal(second.get(session.id).turns[0].phase, 'recovering');
+    await recoveryStarted;
+    const phaseWhileRecoveryIsBlocked = second.get(session.id).turns[0].phase;
+    finishRecovery();
+    assert.equal(phaseWhileRecoveryIsBlocked, 'recovering');
     await second.waitForIdle(session.id);
     const recovered = second.get(session.id);
     assert.equal(tracked, 1);

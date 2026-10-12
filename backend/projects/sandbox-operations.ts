@@ -214,8 +214,10 @@ export class ProjectSandboxOperations {
       try {
         this.deps.assertResumeOwner?.(ownerId);
         if (!this.deps.runtime.resume) throw new HttpError(503, 'Sandbox 不支持恢复运行');
-        const sandbox = await this.deps.projects.withResumeSandbox(id, expected.sandboxId,
-          () => this.deps.runtime.resume!(target(admitted.project), value => this.deps.saveSandbox(id, value, false), this.deps.resumeOwnerSignal?.()));
+        const sandbox = await this.deps.runtime.resume!(target(admitted.project), this.deps.resumeOwnerSignal?.(), operationId);
+        if (!sandbox || sandbox.id !== expected.sandboxId || sandbox.status !== 'ready') {
+          throw new HttpError(502, 'Sandbox 恢复结果与当前操作不符');
+        }
         this.deps.assertResumeOwner?.(ownerId);
         await traced('project.resume.publish', { 'project.id': id, 'operation.id': operationId }, async () => {
           if (!await this.deps.projects.finishResume(id, expected, { sandbox })) throw new HttpError(409, '恢复操作已由其他实例接管或项目环境已变化');
@@ -223,6 +225,13 @@ export class ProjectSandboxOperations {
       } catch (error) {
         // A disconnected owner must never publish a failure over its successor.
         this.deps.assertResumeOwner?.(ownerId);
+        if (error && typeof error === 'object' && 'code' in error
+          && (error.code === 'UNKNOWN_OUTCOME' || error.code === 'TRANSPORT')) {
+          // Cellbox owns the durable command. A lost HTTP response says nothing
+          // about its outcome; recovery will replay this same operation key.
+          void this.deps.logger?.write({ event: 'sandbox.resume_pending', projectId: id, operationId, error });
+          return;
+        }
         await this.deps.projects.finishResume(id, expected, { error: error instanceof HttpError ? error.message : '恢复失败，请重试；详细原因请查看服务端日志。' });
         // The terminal transaction may have committed before its acknowledgement
         // was lost. Its exact durable result wins over that transport failure.

@@ -42,6 +42,29 @@ test('legacy mode keeps its local API host check', async () => {
   } })).status, 403);
 });
 
+test('project open, resume, and exact status reads use scoped refresh while other APIs keep shared refresh', async () => {
+  let refreshes = 0;
+  const manager = {
+    dataDirectory: '/tmp/cocell-access-test', sharedStateEnabled: true,
+    async refreshSharedState() { refreshes++; },
+    async readProject(id: string) { return { id }; },
+    async enterProject(id: string) { return { id }; },
+    async resumeProjectSandbox(id: string) { return { id }; },
+    listProjects: () => [],
+  };
+  const app = createApp(manager as never, {} as AppConfig, ['localhost:3000'],
+    { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) });
+
+  assert.equal((await app.request('http://localhost:3000/api/projects/project-1', { headers: { host: 'localhost:3000' } })).status, 200);
+  assert.equal((await app.request('http://localhost:3000/api/projects/project-1?waitForOperation=op-1', { headers: { host: 'localhost:3000' } })).status, 200);
+  assert.equal((await app.request('http://localhost:3000/api/projects/project-1/open', { method: 'POST', headers: { host: 'localhost:3000' } })).status, 200);
+  assert.equal((await app.request('http://localhost:3000/api/projects/project-1/sandbox/resume', { method: 'POST', headers: { host: 'localhost:3000' } })).status, 200);
+  assert.equal(refreshes, 0);
+
+  assert.equal((await app.request('http://localhost:3000/api/config', { headers: { host: 'localhost:3000' } })).status, 200);
+  assert.equal(refreshes, 1, 'unmigrated APIs still receive shared-state refresh');
+});
+
 test('Cellbox service preview requires operator access and isolates sandbox headers', async () => {
   const projectId = '11111111-1111-4111-8111-111111111111';
   const manager = {

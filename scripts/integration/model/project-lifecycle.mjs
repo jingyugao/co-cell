@@ -109,7 +109,9 @@ export async function projectLifecycle(env) {
     });
     let initialArchive;
     await step('Checkpoint the sandbox, verify its workspace archive, and reject standalone backup', async () => {
-      await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 202 });
+      const checkpointed = await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
+      assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
+      assert.equal(checkpointed.sandbox.status, 'paused');
       const paused = await waitProject('checkpoint', 'paused'); assert.equal(paused.sandbox.id, originalSandboxId);
       initialArchive = paused.remoteArchives?.[0];
       assert(initialArchive && initialArchive.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(initialArchive.sha256));
@@ -122,7 +124,9 @@ export async function projectLifecycle(env) {
         archiveId: initialArchive.id, archiveSizeBytes: initialArchive.sizeBytes, archiveSha256: initialArchive.sha256 };
     });
     await step('Resume and verify the same Node process, files, and in-memory counter survived', async () => {
-      await json(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST', body: {}, expectedStatus: [200, 202] });
+      const resumeResponse = await json(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
+      assert.equal(resumeResponse.sandboxOperation.status, 'succeeded');
+      assert.equal(resumeResponse.sandbox.status, 'ready');
       const resumed = await waitProject('resume', 'ready'); assert.equal(resumed.sandbox.id, originalSandboxId);
       assert.equal((await textFile('main.mjs')).sha256, source.sha256); await textFile('continuity.txt', initialContent);
       const current = await health(initialContent); checkSameProcess(firstHealth, current); firstHealth = current;
@@ -136,7 +140,9 @@ export async function projectLifecycle(env) {
     });
     let checkpointArchive;
     await step('Checkpoint the resumed workspace after its first file change', async () => {
-      await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 202 });
+      const checkpointed = await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
+      assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
+      assert.equal(checkpointed.sandbox.status, 'paused');
       const paused = await waitProject('checkpoint', 'paused');
       checkpointArchive = paused.remoteArchives?.[0];
       assert(checkpointArchive && checkpointArchive.id !== initialArchive.id, 'Checkpoint did not create a new archive');
@@ -146,7 +152,9 @@ export async function projectLifecycle(env) {
         sha256: checkpointArchive.sha256, threadIds: checkpointArchive.threadIds };
     });
     await step('Resume the same process, then change the workspace to its final contents', async () => {
-      await json(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST', body: {}, expectedStatus: [200, 202] });
+      const resumeResponse = await json(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
+      assert.equal(resumeResponse.sandboxOperation.status, 'succeeded');
+      assert.equal(resumeResponse.sandbox.status, 'ready');
       const resumed = await waitProject('resume', 'ready'); assert.equal(resumed.sandbox.id, originalSandboxId);
       const before = await health(resumedContent); checkSameProcess(firstHealth, before); firstHealth = before;
       const result = await turn(`Do not restart the service. Change only ${folder}/continuity.txt to ${latestContent} plus newline. Verify the running HTTP service reads this new value.`);
@@ -156,7 +164,9 @@ export async function projectLifecycle(env) {
     });
     let backup;
     await step('Final Checkpoint captures and verifies the latest workspace and conversation', async () => {
-      await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 202 });
+      const checkpointed = await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
+      assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
+      assert.equal(checkpointed.sandbox.status, 'paused');
       const paused = await waitProject('checkpoint', 'paused'); backup = paused.remoteArchives?.[0];
       assert(backup && backup.id !== checkpointArchive.id, 'Final Checkpoint did not create a fresh archive');
       assert(backup.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(backup.sha256));
@@ -171,7 +181,7 @@ export async function projectLifecycle(env) {
     });
     await step('Clean up the completed project with a fresh disk archive and no resume', async () => {
       const previousArchiveId = backup.id;
-      const archived = await json(`/api/projects/${projectId}/archive`, { method: 'POST', body: {}, expectedStatus: 202, timeoutMs: operationTimeout });
+      const archived = await json(`/api/projects/${projectId}/archive`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
       assert.equal(archived.status, 'archived'); assert.equal(archived.sandbox, undefined);
       assert.equal(archived.sandboxOperation.status, 'succeeded'); assert(!archived.pendingSandboxCleanup?.length, 'Sandbox deletion is still pending');
       backup = archived.remoteArchives[0]; assert(backup.threadIds.includes(threadId));
@@ -182,7 +192,10 @@ export async function projectLifecycle(env) {
       return { deletedSandboxId: originalSandboxId, archiveId: backup.id };
     });
     await step('Rebuild from backup and verify restored files and original conversation history', async () => {
-      await json(`/api/projects/${projectId}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 202 });
+      const rebuilt = await json(`/api/projects/${projectId}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
+      assert.equal(rebuilt.sandboxOperation.status, 'succeeded');
+      assert.equal(rebuilt.sandboxOperation.kind, 'restore');
+      assert.equal(rebuilt.sandbox.status, 'ready');
       const restored = await waitProject('restore', 'ready'); assert.equal(restored.status, 'active');
       assert.notEqual(restored.sandbox.id, originalSandboxId); report.restoredSandboxId = restored.sandbox.id;
       assert.equal((await textFile('main.mjs')).sha256, source.sha256); await textFile('start.mjs'); await textFile('continuity.txt', latestContent);

@@ -26,7 +26,9 @@ export async function homeRebuild(env) {
     await write(filename, before);
     assert.equal(await read(), before);
     initial = await record();
-    await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 202 });
+    const checkpointResponse = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    assert.equal(checkpointResponse.sandboxOperation.status, 'succeeded');
+    assert.equal(checkpointResponse.sandbox.status, 'paused');
     const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
     archive = checkpointed.remoteArchives?.[0];
     assert(archive, 'Checkpoint did not publish a workspace archive');
@@ -34,10 +36,16 @@ export async function homeRebuild(env) {
     return { archiveId: archive.id, threadId: initial.session.threadId };
   });
   await env.step('Activate the restored archive before adding newer data', async () => {
-    await env.json(`/api/projects/${project.id}/archive`, {
-      method: 'POST', body: { useExistingBackup: true }, expectedStatus: 202, timeoutMs: env.config.operationTimeout,
+    const archived = await env.json(`/api/projects/${project.id}/archive`, {
+      method: 'POST', body: { useExistingBackup: true }, expectedStatus: 200, timeoutMs: env.config.operationTimeout,
     });
-    await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 202 });
+    assert.equal(archived.status, 'archived');
+    assert.equal(archived.sandboxOperation.status, 'succeeded');
+    assert.equal(archived.sandbox, undefined);
+    const restoredNow = await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    assert.equal(restoredNow.sandboxOperation.status, 'succeeded');
+    assert.equal(restoredNow.sandboxOperation.kind, 'restore');
+    assert.equal(restoredNow.sandbox.status, 'ready');
     const restored = await env.waitProject(project.id, { kind: 'restore', status: 'ready' });
     assert.notEqual(restored.sandbox.id, ready.sandbox.id);
     ready = restored;
@@ -62,7 +70,9 @@ export async function homeRebuild(env) {
   await env.step('Lose the test execution and rebuild the same HOME without archive rollback', async () => {
     const failure = await failTestSandbox(env, project.id);
     await env.waitProject(project.id, { status: 'unavailable' });
-    await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 202 });
+    const rebuild = await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    assert.equal(rebuild.sandboxOperation.status, 'succeeded');
+    assert.equal(rebuild.sandbox.status, 'ready');
     const rebuilt = await env.waitProject(project.id, { kind: 'rebuild', status: 'ready' });
     assert.equal(rebuilt.sandbox.id, ready.sandbox.id, 'Rebuild replaced the HOME owner');
     assert.equal(rebuilt.remoteArchives[0].id, archive.id);

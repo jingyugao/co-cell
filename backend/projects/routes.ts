@@ -10,7 +10,8 @@ import { PROJECT_OPERATION_WAIT_MS } from '../../protocol/types.js';
 type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
 
 function projectOperationResponse(c: Context, project: Awaited<ReturnType<ProjectRoutesManager['enterProject']>>) {
-  return c.json(project, project.sandboxOperation?.status === 'running' ? 202 : 200);
+  if (project.sandboxOperation?.status === 'running') throw new HttpError(503, '沙箱操作尚未完成，请查询项目状态');
+  return c.json(project, 200);
 }
 
 export async function proxyProjectService(manager: Pick<SessionManager, 'projectService'>, projectId: string, port: number,
@@ -41,22 +42,22 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
     try { parsed = body ? JSON.parse(body) : {}; }
     catch { throw new HttpError(400, '请求 JSON 无效'); }
     const input = z.object({ useExistingBackup: z.boolean().optional() }).strict().parse(parsed);
-    return c.json(await manager.archiveProjectNow(c.req.param('id'), input), 202);
+    return projectOperationResponse(c, await manager.archiveProjectNow(c.req.param('id'), input));
   });
-  app.post('/api/projects/:id/backup', async c => c.json(await manager.backupProjectNow(c.req.param('id')), 202));
+  app.post('/api/projects/:id/backup', async c => projectOperationResponse(c, await manager.backupProjectNow(c.req.param('id'))));
   app.post('/api/projects/:id/sandbox/rebuild', async c => {
     const body = await c.req.text();
     let parsed: unknown;
     try { parsed = body ? JSON.parse(body) : {}; } catch { throw new HttpError(400, '请求 JSON 无效'); }
     const input = z.object({ imageVersionId: z.string().min(1).max(256).optional() }).strict().parse(parsed);
-    return c.json(await manager.rebuildProjectSandbox(c.req.param('id'), input.imageVersionId), 202);
+    return projectOperationResponse(c, await manager.rebuildProjectSandbox(c.req.param('id'), input.imageVersionId));
   });
   app.post('/api/projects/:id/open', async c => projectOperationResponse(c,
     await manager.enterProject(c.req.param('id'), c.req.raw.signal)));
   app.post('/api/projects/:id/sandbox/resume', async c => projectOperationResponse(c,
     await manager.resumeProjectSandbox(c.req.param('id'), c.req.raw.signal)));
-  app.post('/api/projects/:id/sandbox/checkpoint', async c => c.json(await manager.checkpointProjectSandbox(c.req.param('id')), 202));
-  app.post('/api/projects/:id/sandbox/refresh-runtime', async c => c.json(await manager.refreshProjectSandboxRuntime(c.req.param('id')), 202));
+  app.post('/api/projects/:id/sandbox/checkpoint', async c => projectOperationResponse(c, await manager.checkpointProjectSandbox(c.req.param('id'))));
+  app.post('/api/projects/:id/sandbox/refresh-runtime', async c => projectOperationResponse(c, await manager.refreshProjectSandboxRuntime(c.req.param('id'))));
   const content = async (c: Context) => {
     const path = c.req.query('path');
     if (!path) throw new HttpError(400, '缺少文件路径');

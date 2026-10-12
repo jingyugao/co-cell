@@ -74,11 +74,15 @@ test('two APIs join one resume without a project lease; metadata edits survive i
       if (JSON.stringify(current) !== before) mutations++;
     });
     f.state.saveProject = async (...args) => { callbackWrites++; return save(...args); };
-    const accepted = await a.resumeProjectSandbox(f.project.id);
+    let primarySettled = false;
+    const primaryRequest = a.resumeProjectSandbox(f.project.id).then(project => { primarySettled = true; return project; });
     await f.workers[0].started.promise;
+    const accepted = await f.state.getProject(f.project.id);
+    assert.equal(accepted?.sandboxOperation?.status, 'running');
+    const operationId = accepted!.sandboxOperation!.id!;
     let crossReplicaWaitFinished = false;
     const waitStartedAt = Date.now();
-    const crossReplicaWait = b.readProject(f.project.id, { waitForOperation: accepted.sandboxOperation!.id!, waitMs: 300 })
+    const crossReplicaWait = b.readProject(f.project.id, { waitForOperation: operationId, waitMs: 300 })
       .then(project => { crossReplicaWaitFinished = true; return project; });
     await new Promise(resolve => setTimeout(resolve, 40));
     assert.equal(crossReplicaWaitFinished, false, 'a replica without a local waiter must honor the durable wait budget');
@@ -86,15 +90,18 @@ test('two APIs join one resume without a project lease; metadata edits survive i
     assert.ok(Date.now() - waitStartedAt >= 250, 'cross-replica waiting should poll state rather than return immediately');
     assert.equal(timedOut.sandboxOperation?.status, 'running');
     const waiterController = new AbortController();
-    const cancelledWait = b.readProject(f.project.id, { waitForOperation: accepted.sandboxOperation!.id!, waitMs: 5_000 }, waiterController.signal);
+    const cancelledWait = b.readProject(f.project.id, { waitForOperation: operationId, waitMs: 5_000 }, waiterController.signal);
     await new Promise(resolve => setTimeout(resolve, 30));
     waiterController.abort(new Error('caller stopped waiting'));
     await assert.rejects(cancelledWait, /caller stopped waiting/);
     assert.equal((await f.state.getProject(f.project.id))?.sandboxOperation?.status, 'running', 'cancelling a waiter leaves durable work running');
     assert.equal(f.workers[0].signal?.aborted, false, 'HTTP waiter cancellation must not cancel the runtime owner');
-    const joined = await b.resumeProjectSandbox(f.project.id);
-    assert.equal(joined.sandboxOperation?.id, accepted.sandboxOperation?.id);
+    let joinSettled = false;
+    const joinedRequest = b.resumeProjectSandbox(f.project.id).then(project => { joinSettled = true; return project; });
     assert.equal(f.workers[1].calls, 0);
+    await new Promise(resolve => setTimeout(resolve, 1_600));
+    assert.equal(primarySettled, false, 'the initiating API call waits beyond the old 1.5s budget');
+    assert.equal(joinSettled, false, 'a second API joins the durable operation and waits for its terminal result');
     for (const scope of ['project-control', 'project-maintenance']) {
       const lease = await f.coordinator.tryAcquire(`${scope}:${f.project.id}`);
       assert(lease, `${scope} must not be held during restore`);
@@ -107,10 +114,15 @@ test('two APIs join one resume without a project lease; metadata edits survive i
     await f.recover(b);
     assert.equal(f.workers[1].calls, 0, 'a live owner must never be stolen');
     f.workers[0].finish.resolve();
+    const [primary, joined] = await Promise.all([primaryRequest, joinedRequest]);
+    assert.equal(primary.sandboxOperation?.id, operationId);
+    assert.equal(joined.sandboxOperation?.id, operationId);
+    assert.equal(primary.sandboxOperation?.status, 'succeeded');
+    assert.equal(joined.sandboxOperation?.status, 'succeeded');
     await f.drain(a);
     const finished = await f.state.getProject(f.project.id);
     assert.equal(finished?.name, 'Edited during restore');
-    assert.equal(finished?.sandboxOperation?.id, accepted.sandboxOperation?.id);
+    assert.equal(finished?.sandboxOperation?.id, operationId);
     assert.equal(finished?.sandboxOperation?.status, 'succeeded');
     assert.equal(finished?.sandbox?.pausedAt, undefined);
     assert.equal(mutations, 2, 'normal resume persists acceptance and completion only');
@@ -145,8 +157,10 @@ test('a lost terminal commit acknowledgement observes durable success without re
       }
       return result;
     };
-    await api.resumeProjectSandbox(f.project.id);
+    const request = api.resumeProjectSandbox(f.project.id);
+    await f.workers[0].started.promise;
     f.workers[0].finish.resolve();
+    await request;
     await f.drain(api);
     assert(lost);
     assert.equal((await f.state.getProject(f.project.id))?.sandboxOperation?.status, 'succeeded');
@@ -158,8 +172,10 @@ test('a dead API resume is recovered under the same operation ID and its late re
   const f = await fixture();
   try {
     const a = await f.start(), b = await f.start();
-    const accepted = await a.resumeProjectSandbox(f.project.id);
+    const originalRequest = a.resumeProjectSandbox(f.project.id).then(value => ({ value }), error => ({ error }));
     await f.workers[0].started.promise;
+    const accepted = await f.state.getProject(f.project.id);
+    const operationId = accepted!.sandboxOperation!.id!;
     const presence = (a as unknown as { apiPresence: SharedLease & { controller: AbortController } }).apiPresence;
     presence.controller.abort(new Error('simulated connection loss'));
     await presence.release();
@@ -167,20 +183,24 @@ test('a dead API resume is recovered under the same operation ID and its late re
     await f.recover(b);
     await f.workers[1].started.promise;
     const transferred = await f.state.getProject(f.project.id);
-    assert.equal(transferred?.sandboxOperation?.id, accepted.sandboxOperation?.id);
-    assert.notEqual(transferred?.sandboxOperation?.resume?.ownerId, accepted.sandboxOperation?.resume?.ownerId);
+    assert.equal(transferred?.sandboxOperation?.id, operationId);
+    assert.notEqual(transferred?.sandboxOperation?.resume?.ownerId, accepted?.sandboxOperation?.resume?.ownerId);
     f.workers[0].finish.resolve();
     await f.drain(a);
     assert.equal((await f.state.getProject(f.project.id))?.sandboxOperation?.status, 'running', 'late old owner cannot complete or fail the successor');
     f.workers[1].finish.resolve();
+    await originalRequest;
     await f.drain(b);
     assert.equal((await f.state.getProject(f.project.id))?.sandboxOperation?.status, 'succeeded');
-    await a.resumeProjectSandbox(f.project.id);
+    const reconnectRequest = a.resumeProjectSandbox(f.project.id);
+    await f.workers[0].started.promise;
+    f.workers[0].finish.resolve();
+    await reconnectRequest;
     await f.drain(a);
     const reconnected = await f.state.getProject(f.project.id);
     assert.equal(f.workers[0].calls, 2, 'the disconnected API can resume again without a restart');
     assert.equal(f.workers[0].signal?.aborted, false);
-    assert.notEqual(reconnected?.sandboxOperation?.resume?.ownerId, accepted.sandboxOperation?.resume?.ownerId);
+    assert.notEqual(reconnected?.sandboxOperation?.resume?.ownerId, accepted?.sandboxOperation?.resume?.ownerId);
     assert.equal(reconnected?.sandboxOperation?.status, 'succeeded');
   } finally { await f.close(); }
 });
@@ -189,20 +209,23 @@ test('an API reconnects with a new owner epoch while its cancelled worker is sti
   const f = await fixture();
   try {
     const api = await f.start();
-    const accepted = await api.resumeProjectSandbox(f.project.id);
+    const originalRequest = api.resumeProjectSandbox(f.project.id).then(value => ({ value }), error => ({ error }));
     await f.workers[0].started.promise;
+    const accepted = await f.state.getProject(f.project.id);
+    const operationId = accepted!.sandboxOperation!.id!;
     const oldSignal = f.workers[0].signal;
     const presence = (api as unknown as { apiPresence: SharedLease & { controller: AbortController } }).apiPresence;
     presence.controller.abort(new Error('simulated connection loss'));
     await presence.release();
     await f.recover(api);
     const recovered = await f.state.getProject(f.project.id);
-    assert.equal(recovered?.sandboxOperation?.id, accepted.sandboxOperation?.id);
-    assert.notEqual(recovered?.sandboxOperation?.resume?.ownerId, accepted.sandboxOperation?.resume?.ownerId);
+    assert.equal(recovered?.sandboxOperation?.id, operationId);
+    assert.notEqual(recovered?.sandboxOperation?.resume?.ownerId, accepted?.sandboxOperation?.resume?.ownerId);
     assert.equal(f.workers[0].calls, 2);
     assert.equal(oldSignal?.aborted, true);
     assert.equal(f.workers[0].signal?.aborted, false);
     f.workers[0].finish.resolve();
+    await originalRequest;
     await f.drain(api);
     const finished = await f.state.getProject(f.project.id);
     assert.equal(finished?.sandboxOperation?.status, 'succeeded');

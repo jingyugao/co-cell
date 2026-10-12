@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
-import { PROJECT_OPERATION_WAIT_MS, PROJECT_OPEN_WAIT_MS, type ProjectReadOptions, type Project, type ProjectSummary, type Session, type SessionSummary, type SessionTurnPage, type Settings, type StreamMessage, type SubagentConversation, type Turn } from '../../protocol/types.js';
+import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type Project, type ProjectSummary, type Session, type SessionSummary, type SessionTurnPage, type Settings, type StreamMessage, type SubagentConversation, type Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
@@ -1114,13 +1114,11 @@ export class SessionManager {
   }
 
   async resumeProjectSandbox(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
+    signal?.throwIfAborted();
     await this.submitProjectSandboxOperation(id, 'resume');
     await this.projects.refreshOne(id);
     const accepted = this.projects.get(id).sandboxOperation;
-    if (accepted?.id && accepted.status === 'running')
-      await this.waitForProjectOperation(id, accepted.id, PROJECT_OPEN_WAIT_MS, signal);
     signal?.throwIfAborted();
-    await this.projects.refreshOne(id);
     return this.projectSummary(await this.projectAfterOperation(this.projects.get(id), accepted?.id ?? ''));
   }
 
@@ -1154,7 +1152,6 @@ export class SessionManager {
   }
 
   private async enterProjectLocal(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
-    const deadline = Date.now() + PROJECT_OPEN_WAIT_MS;
     signal?.throwIfAborted();
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     await this.projects.refreshOne(id);
@@ -1164,12 +1161,12 @@ export class SessionManager {
     while (project.executionMode === 'sandbox') {
       const operation = project.sandboxOperation;
       if (operation?.status === 'running' && operation.id) {
-        const remaining = Math.max(0, deadline - Date.now());
-        await this.waitForProjectOperation(id, operation.id, remaining, signal);
+        await this.waitForProjectOperation(id, operation.id, Number.MAX_SAFE_INTEGER, signal);
         signal?.throwIfAborted();
         await this.projects.refreshOne(id);
         project = this.projects.get(id);
-        if (project.sandboxOperation?.id === operation.id && project.sandboxOperation.status === 'running') break;
+        if (project.sandboxOperation?.id === operation.id && project.sandboxOperation.status === 'running')
+          throw new HttpError(503, '服务关闭前操作尚未完成，请查询项目状态');
         if (project.sandboxOperation?.id === operation.id && operation.kind !== 'checkpoint'
           && project.sandboxOperation.status === 'succeeded') break;
         if (project.sandboxOperation?.id === operation.id && project.sandboxOperation.status === 'failed') break;
@@ -1180,7 +1177,7 @@ export class SessionManager {
 
       if (operation?.status === 'failed' && operation.kind !== 'resume') break;
       if (!project.sandbox) break;
-      if (this.projects.isMaintaining(id)) return this.readProject(id);
+      if (this.projects.isMaintaining(id)) throw new HttpError(409, '项目正在维护，请稍后重试');
 
       // Opening an already active conversation must not force another restore;
       // session execution owns its runtime lease. Idle project entry submits the
@@ -1192,14 +1189,6 @@ export class SessionManager {
       await this.submitProjectSandboxOperation(id, 'resume');
       await this.projects.refreshOne(id);
       project = this.projects.get(id);
-      const accepted = project.sandboxOperation;
-      if (accepted?.status === 'running' && accepted.id) {
-        const remaining = Math.max(0, deadline - Date.now());
-        await this.waitForProjectOperation(id, accepted.id, remaining, signal);
-        signal?.throwIfAborted();
-        await this.projects.refreshOne(id);
-        project = this.projects.get(id);
-      }
       break;
     }
     signal?.throwIfAborted();
@@ -1219,7 +1208,7 @@ export class SessionManager {
       const request = retainProjectRequestTrace();
       const parent = request?.context ?? context.active();
       const span = traceApi.getTracer('co-cell.project').startSpan('project.resume', {
-        attributes: { 'project.id': id, 'sandbox.operation.kind': kind, 'project.operation.async': true },
+        attributes: { 'project.id': id, 'sandbox.operation.kind': kind, 'project.operation.async': false },
       }, parent);
       return { context: traceApi.setSpan(parent, span), span, request, handedOff: false,
         admissionComplete: false, workComplete: false, ended: false };
@@ -1228,7 +1217,7 @@ export class SessionManager {
       const admission = () => traced('project.operation.admission', { 'project.id': id, 'sandbox.operation.kind': kind },
         () => kind === 'resume' ? this.startResumeOperation(id, resumeTrace!)
           : this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options)));
-      await (resumeTrace ? context.with(resumeTrace.context, admission) : admission());
+      const accepted = await (resumeTrace ? context.with(resumeTrace.context, admission) : admission());
       if (resumeTrace) {
         resumeTrace.admissionComplete = true;
         const accepted = this.projects.get(id).sandboxOperation;
@@ -1237,6 +1226,7 @@ export class SessionManager {
         resumeTrace.span.addEvent('project.resume.accepted');
         this.endProjectResumeTraceIfComplete(resumeTrace);
       }
+      await accepted.done;
     } catch (error) {
       if (resumeTrace) {
         resumeTrace.admissionComplete = true;
@@ -1312,23 +1302,23 @@ export class SessionManager {
     lifetime.handedOff = true;
     lifetime.span.setAttributes({ 'operation.id': result.operationId, 'operation.joined': result.joined });
     const done = result.joined ? this.waitResumeCompletion(id, result.operationId) : result.done;
-    void done.then(async () => {
+    const completion = done.then(async () => {
       try {
         // A local worker may resolve with UNKNOWN_OUTCOME while the durable
         // operation is still running. The persisted terminal state, not local
         // Promise settlement, closes the lifecycle span.
         await this.waitResumeCompletion(id, result.operationId);
         this.completeProjectResumeWork(lifetime);
-      } catch (error) { this.completeProjectResumeWork(lifetime, error); }
+      } catch (error) { this.completeProjectResumeWork(lifetime, error); throw error; }
     }, async error => {
       // Likewise, a local rejection can mean only that its transport response
       // was lost. Wait for durable completion/recovery or API shutdown first.
       try {
         await this.waitResumeCompletion(id, result.operationId);
         this.completeProjectResumeWork(lifetime);
-      } catch { this.completeProjectResumeWork(lifetime, error); }
+      } catch { this.completeProjectResumeWork(lifetime, error); throw error; }
     });
-    return { done };
+    return { done: completion };
   }
 
   private async waitResumeCompletion(id: string, operationId: string): Promise<void> {

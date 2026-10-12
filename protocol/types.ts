@@ -181,16 +181,15 @@ export interface ArchiveVersionSummary {
   label: string;
 }
 
-/** POST /api/projects/:id/open and /sandbox/resume wait briefly for the accepted operation.
- * A 200 response means the operation reached a durable terminal state; 202 means it is still
- * running and can be followed with GET waitForOperation. */
+/** Project Sandbox mutation requests wait for durable completion. Creation returns
+ * 201, other operations return 200 with a terminal result, or a request error.
+ * Running operations may still be observed through read-only queries after a disconnect. */
 export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null;
   /** Cellbox archive versions, newest first. */
   archiveVersions?: ArchiveVersionSummary[];
 }
 
 export const PROJECT_OPERATION_WAIT_MS = 10_000;
-export const PROJECT_OPEN_WAIT_MS = 1_500;
 
 /** GET /api/projects/:id remains read-only. Optional query parameters wait for
  * this durable operation to finish (success or failure), then return its latest

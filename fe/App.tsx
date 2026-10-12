@@ -97,7 +97,7 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const refreshConfig = useCallback(() => { void api<AppConfig>('/api/config').then(setConfig).catch(() => {}); }, []);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, rebuildSandbox, resumeSandbox, checkpointSandbox } = useProjects();
+  const { projects, refreshProjects, enterProject, createProject, updateProject, rebuildSandbox, resumeSandbox, checkpointSandbox } = useProjects();
   const [selectedProject, setSelectedProject] = useState<string | null>(() => readRoute().explicit ? readRoute().projectId : localStorage.getItem('codex-project'));
   const [selected, setSelected] = useState<string | null>(() => readRoute().explicit ? readRoute().sessionId : localStorage.getItem('codex-session'));
   const archivedProjectAccess = useRef<string | null>(null);
@@ -147,8 +147,10 @@ export default function App() {
     await Promise.all([refreshSessions(), refreshProjects()]);
   }, [refreshSessions, refreshProjects]);
   const project = projects.find(item => item.id === selectedProject) ?? null;
+  const entryProjectId = !loading && page === 'chat' && project && canEnterProject(project) ? project.id : null;
+  const entry = useProjectEntry(entryProjectId, entryProjectId ?? '', enterProject);
   const { session, setSession, connected, loadOlder, loadingOlder, loadingHistory } = useSessionStream({
-    selected, enabled: !loading, historyReady: !project || isProjectSandboxReady(project), onState: refreshWorkspace, onError: setError,
+    selected, enabled: !loading, historyReady: !project || (isProjectSandboxReady(project) && !entry.pending), onState: refreshWorkspace, onError: setError,
   });
   const { prompt, setPrompt, setSessionDraft, moveToSession } = usePromptDraft(
     selected ? `session:${selected}` : `project:${selectedProject ?? ''}:new`,
@@ -168,8 +170,6 @@ export default function App() {
   const needsProject = !session && !project;
   const projectReadOnly = Boolean(project && !canEnterProject(project));
   const sandboxNotReady = Boolean(project && !isProjectSandboxReady(project));
-  const entryProjectId = !loading && page === 'chat' && project && canEnterProject(project) ? project.id : null;
-  const entry = useProjectEntry(entryProjectId, entryProjectId ?? '', enterProject, refreshProject);
   const [retryingEntry, setRetryingEntry] = useState(false);
   const environmentPending = sandboxNotReady && (retryingEntry || (!entry.error && (entry.pending || project?.sandboxOperation?.status === 'running')));
   async function retryProjectEntry() {

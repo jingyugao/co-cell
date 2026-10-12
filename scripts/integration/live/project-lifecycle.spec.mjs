@@ -7,8 +7,9 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
     for (let i = 0; i < 2; i++) {
       const created = await env.createProject(`concurrency-${i}`);
       assert.equal(created.sandboxOperation.kind, 'create');
-      const opened = await env.json(`/api/projects/${created.id}/open`, { method: 'POST', expectedStatus: [200, 202] });
+      const opened = await env.json(`/api/projects/${created.id}/open`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
       assert.equal(opened.sandboxOperation.id, created.sandboxOperation.id);
+      assert.equal(opened.sandboxOperation.status, 'succeeded');
       projects.push(await env.waitProject(created.id, { kind: 'create', status: 'ready', operationId: created.sandboxOperation.id }));
     }
     return projects.map(project => ({ projectId: project.id, sandboxId: project.sandbox.id }));
@@ -16,7 +17,9 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
   await env.step('Checkpoint both projects; reads and rejected task submissions must not resume them', async () => {
     await Promise.all(projects.map(async project => {
       await env.request(`/api/projects/${project.id}/backup`, { method: 'POST', expectedStatus: 409 });
-      await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 });
+      const checkpointResponse = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+      assert.equal(checkpointResponse.sandboxOperation.status, 'succeeded');
+      assert.equal(checkpointResponse.sandbox.status, 'paused');
       const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
       const archive = checkpointed.remoteArchives?.[0];
       assert(archive && archive.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(archive.sha256), 'Checkpoint did not publish a verified archive reference');
@@ -38,22 +41,27 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
     // commits. That contender reports conflict immediately; it must not queue
     // another lifecycle action behind the first restore.
     const attempts = await Promise.all([0, 1].map(() => env.request(`/api/projects/${project.id}/open`, {
-      method: 'POST', expectedStatus: [200, 202, 409],
+      method: 'POST', expectedStatus: [200, 409],
     })));
-    const entries = attempts.filter(attempt => [200, 202].includes(attempt.response.status)).map(attempt => attempt.data);
+    const entries = attempts.filter(attempt => attempt.response.status === 200).map(attempt => attempt.data);
     assert(entries.length > 0, 'At least one concurrent entry must be admitted');
-    assert.equal(entries[0].sandboxOperation.kind, 'resume');
-    for (const entry of entries) assert.equal(entry.sandboxOperation.id, entries[0].sandboxOperation.id);
+    for (const entry of entries) {
+      assert.equal(entry.sandboxOperation.kind, 'resume');
+      assert.equal(entry.sandboxOperation.status, 'succeeded');
+      assert.equal(entry.sandboxOperation.id, entries[0].sandboxOperation.id);
+    }
     const name = `${env.name('concurrency-0')} renamed`;
     await env.json(`/api/projects/${project.id}`, { method: 'PATCH', body: { name } });
     const ready = await env.waitProject(project.id, { kind: 'resume', status: 'ready', operationId: entries[0].sandboxOperation.id });
     assert.equal(ready.sandbox.id, project.sandbox.id);
     assert.equal(ready.name, name, 'Resume completion must preserve an unrelated metadata edit');
-    const reopened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: [200, 202] });
+    const reopened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(reopened.sandboxOperation.kind, 'resume');
+    assert.equal(reopened.sandboxOperation.status, 'succeeded');
     assert.equal(reopened.sandbox.id, ready.sandbox.id);
-    await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 });
-    const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+    const checkpointed = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
+    assert.equal(checkpointed.sandbox.status, 'paused');
     assert.notEqual(checkpointed.remoteArchives?.[0]?.id, project.checkpointArchiveId, 'A later Checkpoint must publish a new archive reference');
     assert.equal(checkpointed.remoteArchives?.[0]?.sourceSandboxId, project.sandbox.id);
     return { operationId: ready.sandboxOperation.id, sandboxId: ready.sandbox.id };
@@ -61,7 +69,9 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
   await env.step('Simultaneous entry into two paused projects completes both restores', async () => {
     return Promise.all(projects.map(async project => {
       const start = performance.now();
-      const opened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: [200, 202] });
+      const opened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+      assert.equal(opened.sandboxOperation.status, 'succeeded');
+      assert.equal(opened.sandbox.status, 'ready');
       const ready = await env.waitProject(project.id, { kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id });
       assert.equal(ready.sandbox.id, project.sandbox.id);
       return { projectId: project.id, durationMs: performance.now() - start, operationId: ready.sandboxOperation.id };
@@ -69,8 +79,9 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
   });
   await env.step('Restored App Servers can complete another checkpoint', async () => {
     for (const project of projects) {
-      await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 });
-      await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+      const checkpointed = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+      assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
+      assert.equal(checkpointed.sandbox.status, 'paused');
     }
   });
 });

@@ -15,7 +15,7 @@ type ProjectRequestTrace = {
   ended: boolean;
 };
 
-/** Retain the project request root for accepted asynchronous lifecycle work. */
+/** Retain the project request root until the admitted lifecycle work completes. */
 export function retainProjectRequestTrace(): { context: Context; release(error?: unknown): void } | undefined {
   const lifecycle = context.active().getValue(projectRequestTraceKey) as ProjectRequestTrace | undefined;
   if (!lifecycle || lifecycle.ended) return;
@@ -42,7 +42,7 @@ function endProjectRequestTraceIfComplete(lifecycle: ProjectRequestTrace) {
   lifecycle.span.end();
 }
 
-function isAsyncProjectLifecycleRequest(method: string, path: string) {
+function isProjectLifecycleRequest(method: string, path: string) {
   return method === 'POST' && /^\/api\/projects\/[^/]+\/(?:open|sandbox\/resume)$/.test(path);
 }
 
@@ -67,7 +67,7 @@ export const traceHttpRequest: MiddlewareHandler = async (c, next) => {
   return context.with(parent, async () => {
     const tracer = trace.getTracer('co-cell.http');
     const attributes = { 'http.request.method': c.req.method, 'url.path': c.req.path };
-    if (!isAsyncProjectLifecycleRequest(c.req.method, c.req.path)) {
+    if (!isProjectLifecycleRequest(c.req.method, c.req.path)) {
       return tracer.startActiveSpan('http.request', { kind: SpanKind.SERVER, attributes }, async span => {
         try {
           await next();

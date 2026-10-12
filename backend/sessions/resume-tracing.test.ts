@@ -17,7 +17,7 @@ import { traceHttpRequest } from '../infra/diagnostics/tracing.js';
 import { MemoryCoordinator } from '../infra/storage/coordination.js';
 import { SessionManager, type CodexClient } from './manager.js';
 
-test('open resume keeps one lifecycle span through detached work and durable completion', async () => {
+test('open resume keeps one lifecycle span through runtime work and durable completion', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-resume-trace-'));
   const exporter = new InMemorySpanExporter();
   const provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
@@ -83,14 +83,16 @@ test('open resume keeps one lifecycle span through detached work and durable com
       }
       return mutateProject(id, mutate);
     };
-    const caller = new AbortController();
-    const response = await app.request(`/api/projects/${projectId}/open`, { method: 'POST', signal: caller.signal });
-    assert.equal(response.status, 202, JSON.stringify(await response.clone().json()));
-    caller.abort();
+    let responseSettled = false;
+    const responsePromise = Promise.resolve(app.request(`/api/projects/${projectId}/open`, { method: 'POST' }))
+      .then(response => { responseSettled = true; return response; });
     await started;
+    await new Promise(resolve => setTimeout(resolve, 1_600));
+    assert.equal(responseSettled, false, 'open remains pending while runtime restore exceeds the old 1.5s budget');
 
     const beforeCompletion = exporter.getFinishedSpans();
-    assert(beforeCompletion.some(span => span.name === 'http.request'));
+    assert.equal(beforeCompletion.some(span => span.name === 'http.request'), false,
+      'the synchronous HTTP request remains open until lifecycle completion');
     assert.equal(beforeCompletion.some(span => span.name === 'project.resume'), false,
       'the project lifecycle span remains open after the accepted HTTP response');
     finishResume();
@@ -98,6 +100,10 @@ test('open resume keeps one lifecycle span through detached work and durable com
     assert.equal(exporter.getFinishedSpans().some(span => ['project.resume', 'project.request'].includes(span.name)), false,
       'the request envelope and lifecycle span stay open while terminal state is not durable');
     finishTerminalCommit();
+    const response = await responsePromise;
+    assert.equal(response.status, 200);
+    const responseProject = await response.json() as { sandboxOperation?: { status?: string } };
+    assert.equal(responseProject.sandboxOperation?.status, 'succeeded');
     await operations().close();
     await new Promise<void>(resolve => setImmediate(resolve));
 
@@ -117,7 +123,8 @@ test('open resume keeps one lifecycle span through detached work and durable com
     assert.equal(runtimeSpan.parentSpanContext?.spanId, resume.spanContext().spanId,
       'runtime restoration belongs to the full lifecycle, not the completed admission');
     assert.equal(publish.parentSpanContext?.spanId, resume.spanContext().spanId);
-    assert.equal(resume.attributes['project.operation.async'], true);
+    assert.equal(resume.attributes['project.operation.async'], false,
+      'the lifecycle span now belongs to the synchronous open request');
     assert.equal(typeof resume.attributes['operation.id'], 'string');
     assert.equal(resume.attributes['sandbox.id'], sandbox.id);
     assert.equal(terminalMutationParent, publish.spanContext().spanId, 'terminal persistence retains the publish context');
@@ -141,15 +148,17 @@ test('open resume keeps one lifecycle span through detached work and durable com
     await operations().close();
     failResume = true;
     const failedResponse = await app.request(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST' });
-    assert.equal(failedResponse.status, 200, 'a terminal restore failure is returned synchronously with its operation state');
+    assert.ok(failedResponse.status >= 400, 'a terminal restore failure is an HTTP error');
     await operations().close();
+    assert.equal((await state.getProject(projectId))?.sandboxOperation?.status, 'failed',
+      'the failure remains readable in durable project history');
     await new Promise<void>(resolve => setImmediate(resolve));
     const failedResume = exporter.getFinishedSpans().filter(span => span.name === 'project.resume').at(-1);
     assert(failedResume);
     assert.equal(failedResume.status.code, 2, 'failed runtime work marks the lifecycle span as failed');
     const failedEnvelope = exporter.getFinishedSpans().filter(span => span.name === 'project.request').at(-1);
     assert.equal(failedEnvelope?.status.code, 2, 'accepted operation failure reaches the enclosing request lifecycle');
-    assert.equal(failedResume.attributes['project.operation.async'], true, 'failed detached work retains its lifecycle span');
+    assert.equal(failedResume.attributes['project.operation.async'], false, 'failed runtime work retains the synchronous lifecycle span');
   } finally {
     finishResume();
     finishTerminalCommit();

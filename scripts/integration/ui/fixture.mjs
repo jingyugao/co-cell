@@ -13,9 +13,35 @@ export const test = base.extend({
     // These cases test the real React application, separately from the live suites.
     const projects = new Map([['paused', project('paused', '暂停项目')], ['other', project('other', '另一个项目', 'ready')]]);
     const calls = [], historyReads = [], submissions = [], errors = [];
-    const waiters = new Map(), cancelled = new Map();
-    const notify = id => { for (const finish of waiters.get(id) ?? []) finish(); };
-    page.on('requestfailed', request => cancelled.get(request)?.());
+    const pendingRoutes = new Map(), pendingByRequest = new Map();
+    const rememberPending = (id, route, kind, call) => {
+      const pending = pendingRoutes.get(id) ?? new Set();
+      const record = { route, kind, call };
+      pending.add(record); pendingRoutes.set(id, pending); pendingByRequest.set(route.request(), { id, record });
+    };
+    const forgetPending = (id, record) => {
+      const pending = pendingRoutes.get(id);
+      pending?.delete(record);
+      if (!pending?.size) pendingRoutes.delete(id);
+      pendingByRequest.delete(record.route.request());
+    };
+    const fulfillPending = async (id, { status = 200, error } = {}) => {
+      const pending = [...(pendingRoutes.get(id) ?? [])];
+      await Promise.all(pending.map(async record => {
+        const { route, kind } = record;
+        forgetPending(id, record);
+        try {
+          const responseStatus = error ? 500 : kind === 'create' ? 201 : status;
+          const data = error ? { error } : projects.get(id);
+          record.call.status = responseStatus;
+          await route.fulfill({ status: responseStatus, json: data });
+        } catch { /* The browser may have cancelled its wait while the durable operation continues. */ }
+      }));
+    };
+    page.on('requestfailed', request => {
+      const pending = pendingByRequest.get(request);
+      if (pending) forgetPending(pending.id, pending.record);
+    });
     const session = { id: 'old-session', projectId: 'paused', title: '旧会话', threadId: 'existing-thread', status: 'idle', settings: defaults, turns: [], archivedAt: null, createdAt: now, updatedAt: now };
     const secondSession = { ...session, id: 'second-session', title: '同项目的另一个会话', threadId: 'second-thread' };
     const sessions = new Map([[session.id, session], [secondSession.id, secondSession]]);
@@ -24,7 +50,8 @@ export const test = base.extend({
     await page.route('**/api/**', async route => {
       const request = route.request(), url = new URL(request.url()), path = url.pathname, method = request.method();
       const waitForOperation = url.searchParams.get('waitForOperation');
-      calls.push({ path, method, ...(waitForOperation ? { waitForOperation } : {}) });
+      const call = { path, method, ...(waitForOperation ? { waitForOperation } : {}) };
+      calls.push(call);
       let data, status = 200;
       if (path === '/api/config') data = config;
       else if (path === '/api/notifications') data = [];
@@ -32,34 +59,31 @@ export const test = base.extend({
       else if (path === '/api/projects' && method === 'GET') data = [...projects.values()];
       else if (path === '/api/projects' && method === 'POST') {
         data = project('new', request.postDataJSON().name); delete data.sandbox;
-        data.sandboxOperation = operation('create'); projects.set('new', data); status = 201;
+        data.sandboxOperation = operation('create'); projects.set('new', data);
+        rememberPending('new', route, 'create', call); return;
       } else if (path.startsWith('/api/projects/')) {
         const id = path.split('/')[3]; data = projects.get(id);
         if (!data) { data = { error: '不存在' }; status = 404; }
-        else if (method === 'GET' && path === `/api/projects/${id}` && waitForOperation
-          && data.sandboxOperation?.id === waitForOperation && data.sandboxOperation.status === 'running') {
-          await new Promise(resolve => {
-            const pending = waiters.get(id) ?? new Set();
-            const finish = () => {
-              clearTimeout(timer); pending.delete(finish); cancelled.delete(request);
-              if (!pending.size) waiters.delete(id);
-              resolve();
-            };
-            const timer = setTimeout(finish, Number(url.searchParams.get('waitMs') ?? 10_000));
-            pending.add(finish); waiters.set(id, pending); cancelled.set(request, finish);
-          });
-          data = projects.get(id);
-        }
         else if (method === 'PATCH' && path === `/api/projects/${id}`) {
           const next = request.postDataJSON();
           if (next.status !== undefined) { data.status = next.status; data.completedAt = next.status === 'completed' ? now : null; }
         }
         else if (method === 'POST' && path.endsWith('/open')) {
-          status = 202;
-          if (data.sandbox?.status === 'paused' && data.sandboxOperation?.status !== 'running') data.sandboxOperation = operation('resume');
+          if (data.sandbox?.status === 'ready' && data.sandboxOperation?.status !== 'running') {
+            data.sandboxOperation = operation('resume', 'succeeded');
+            status = 200;
+          } else {
+            if (!(data.sandboxOperation?.kind === 'checkpoint' && data.sandboxOperation.status === 'running'))
+              data.sandboxOperation = operation('resume');
+            rememberPending(id, route, 'open', call); return;
+          }
         } else if (method === 'POST' && path.endsWith('/sandbox/checkpoint')) {
-          data.sandboxOperation = operation('checkpoint'); status = 202;
-        } else if (method === 'POST' && path.endsWith('/rebuild')) { data.sandboxOperation = operation(data.sandbox ? 'rebuild' : 'create'); status = 202; }
+          data.sandboxOperation = operation('checkpoint');
+          rememberPending(id, route, 'checkpoint', call); return;
+        } else if (method === 'POST' && path.endsWith('/rebuild')) {
+          data.sandboxOperation = operation(data.sandbox ? 'rebuild' : 'create');
+          rememberPending(id, route, 'rebuild', call); return;
+        }
       } else if (path === '/api/sessions' && method === 'GET') data = [...sessions.values()];
       else if (path.startsWith('/api/sessions/') && path.endsWith('/events')) {
         const currentSession = sessions.get(path.split('/')[3]);
@@ -73,7 +97,10 @@ export const test = base.extend({
         data = { turnId: currentSession.turns.at(-1)?.id ?? 'old-turn' }; status = 202;
       } else if (path.endsWith('/subagents')) data = [];
       else { errors.push(`Unexpected API call: ${method} ${path}`); data = { error: 'Unexpected test API call' }; status = 500; }
-      if (!request.failure()) await route.fulfill({ status, json: data });
+      if (!request.failure()) {
+        call.status = status;
+        await route.fulfill({ status, json: data });
+      }
     });
     const ui = {
       projects, calls, historyReads, submissions, sessions,
@@ -81,12 +108,39 @@ export const test = base.extend({
       send: page.getByRole('button', { name: '发送任务', exact: true }),
       setRunning() { session.status = 'running'; session.turns = [{ id: 'native-turn', nativeTurnId: 'native-turn', prompt: '原始任务', additionalUserInputs: ['相同补充', '相同补充'], images: [], items: [], status: 'running', codexAccepted: true, startedAt: now }]; },
       count: (method, path) => calls.filter(call => call.path === path && call.method === method).length,
-      complete(id) { const value = projects.get(id); value.sandbox = sandbox(id); value.sandboxOperation = operation(value.sandboxOperation?.kind ?? 'create', 'succeeded'); notify(id); },
-      fail(id, message) { const value = projects.get(id); value.sandboxOperation = operation(value.sandboxOperation?.kind ?? 'resume', 'failed', message); notify(id); },
-      checkpoint(id, running) { const value = projects.get(id); value.sandbox = sandbox(id, running ? 'ready' : 'paused'); value.sandboxOperation = operation('checkpoint', running ? 'running' : 'succeeded'); notify(id); },
+      async complete(id) {
+        const value = projects.get(id); value.sandbox = sandbox(id);
+        value.sandboxOperation = operation(value.sandboxOperation?.kind ?? 'create', 'succeeded');
+        await fulfillPending(id);
+      },
+      async fail(id, message) {
+        const value = projects.get(id);
+        value.sandboxOperation = operation(value.sandboxOperation?.kind ?? 'resume', 'failed', message);
+        await fulfillPending(id, { error: message });
+      },
+      async checkpoint(id, running) {
+        const value = projects.get(id);
+        value.sandbox = sandbox(id, running ? 'ready' : 'paused');
+        value.sandboxOperation = operation('checkpoint', running ? 'running' : 'succeeded');
+        if (!running) {
+          const pending = [...(pendingRoutes.get(id) ?? [])];
+          const entries = pending.filter(record => record.kind === 'open');
+          if (entries.length) value.sandboxOperation = operation('resume');
+          await Promise.all(pending.filter(record => record.kind === 'checkpoint').map(async record => {
+            forgetPending(id, record);
+            record.call.status = 200;
+            try { await record.route.fulfill({ status: 200, json: value }); } catch { /* Browser cancellation leaves the durable operation intact. */ }
+          }));
+        }
+      },
     };
     try { await use(ui); }
-    finally { for (const id of waiters.keys()) notify(id); }
+    finally {
+      await Promise.all([...pendingRoutes.entries()].flatMap(([id, records]) => [...records].map(async record => {
+        forgetPending(id, record);
+        try { await record.route.abort(); } catch { /* Request already completed or cancelled. */ }
+      })));
+    }
     expect(errors).toEqual([]);
   },
 });

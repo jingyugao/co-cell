@@ -15,7 +15,11 @@ test('prepared image tools use project credentials in a real conversation', asyn
   env.report.projectId = project.id;
   await env.waitProject(project.id, { kind: 'create', status: 'ready' });
   await env.json(`/api/projects/${project.id}/tool-grants`, { method: 'PUT', body: { selections } });
-  await env.json(`/api/projects/${project.id}/sandbox/refresh-runtime`, { method: 'POST', expectedStatus: 202 });
+  const refreshed = await env.json(`/api/projects/${project.id}/sandbox/refresh-runtime`, {
+    method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout,
+  });
+  assert.equal(refreshed.sandboxOperation.status, 'succeeded');
+  assert.equal(refreshed.sandbox.status, 'ready');
   await env.waitProject(project.id, { status: 'ready' });
   const session = await env.json('/api/sessions', { method: 'POST', expectedStatus: 201,
     body: { projectId: project.id, title: 'Prepared image tool verification', settings: { model: env.config.model, modelReasoningEffort: 'low', webSearchMode: 'disabled' } } });

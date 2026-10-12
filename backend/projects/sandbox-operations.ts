@@ -99,7 +99,7 @@ export class ProjectSandboxOperations {
     });
   }
 
-  /** Persist acceptance before returning; the caller can poll while the task runs. */
+  /** Persist ownership before starting; HTTP callers await done, schedulers track it. */
   async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
     if (kind === 'resume') return this.startResume(id, 'local');
     const project = this.deps.projects.get(id);

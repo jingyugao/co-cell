@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
 import test from 'node:test';
 import type { AppConfig } from '../../protocol/types.js';
 import { createApp } from '../app.js';
+import { serviceHost } from '../projects/service-host.js';
 
 const token = 'operator-test-token-with-at-least-32-characters';
 const publicUrl = 'https://cocell.example.test';
@@ -92,20 +92,26 @@ test('Cellbox service preview requires operator access and isolates sandbox head
   assert.match(response.headers.get('content-security-policy') ?? '', /^sandbox /);
 });
 
-test('preview subdomain routes a signed project and port and grants browser access without exposing the operator cookie', async t => {
-  const day = 24 * 60 * 60 * 1000;
-  let now = Date.now();
-  t.mock.method(Date, 'now', () => now);
+test('preview authorization automatically exchanges a one-use host-bound challenge and preserves application cookies', async () => {
   const projectId = '11111111-1111-4111-8111-111111111111';
+  const serviceHostName = serviceHost(projectId, 8765, publicUrl, token);
+  const serviceOrigin = `https://${serviceHostName}`;
+  const serviceUrl = `${serviceOrigin}/verify.txt?check=1`;
+  let proxyCalls = 0;
   const manager = {
     dataDirectory: '/tmp/cocell-access-test', listProjects: () => [],
-    async preview() { return `/api/projects/${projectId}/service/8765/verify.txt?check=1`; },
     async projectService(id: string, port: number, path: string, request: Request) {
+      proxyCalls++;
       assert.equal(id, projectId);
       assert.equal(port, 8765);
       assert.equal(path, '/verify.txt?check=1');
-      if (!request.headers.get('authorization')) assert.equal(request.headers.get('cookie')?.includes('cocell_preview'), true);
-      return new Response('verified', { headers: { location: 'http://localhost:8765/next', 'set-cookie': 'app=unsafe' } });
+      assert.equal(request.headers.get('authorization'), 'Basic application-credential');
+      assert.equal(request.headers.get('cookie'), 'app_session=application-cookie');
+      const headers = new Headers({ location: 'http://localhost:8765/next' });
+      headers.append('set-cookie', 'app_session=refreshed; Domain=cocell.example.test; Path=/; HttpOnly; Secure');
+      headers.append('set-cookie', 'app_preference=dark; Path=/; SameSite=Lax');
+      headers.append('set-cookie', '__Host-cocell_preview=forged; Path=/; Secure');
+      return new Response('verified', { headers });
     },
   };
   const app = createApp(manager as never, { sandbox: { enabled: true } } as AppConfig,
@@ -114,68 +120,99 @@ test('preview subdomain routes a signed project and port and grants browser acce
       projects: () => [{ id: projectId, executionMode: 'sandbox', sandbox: { id: 'box-1' }, status: 'active' }],
 
     });
-  const link = await app.request(`${publicUrl}/api/projects/${projectId}/preview?url=http%3A%2F%2Flocalhost%3A8765%2Fverify.txt%3Fcheck%3D1`,
-    { headers: { authorization: `Bearer ${token}` } });
-  assert.equal(link.status, 302);
-  const serviceUrl = link.headers.get('location')!;
-  assert.match(serviceUrl, /^https:\/\/p[0-9a-z]{1,4}-[0-9a-f]{12}\.cocell\.example\.test\/verify\.txt\?check=1$/);
-  assert.ok(new URL(serviceUrl).hostname.split('.')[0].length <= 18);
+
   const bootstrap = await app.request(serviceUrl);
   assert.equal(bootstrap.status, 303);
-  assert.match(bootstrap.headers.get('location') ?? '', /^https:\/\/cocell\.example\.test\/auth\/preview\?next=/);
+  const challengeCookie = bootstrap.headers.getSetCookie().find(value => value.startsWith('__Host-cocell_preview_challenge='));
+  assert.ok(challengeCookie);
+  assert.match(challengeCookie!, /Secure/);
+  assert.match(challengeCookie!, /HttpOnly/);
+  assert.match(challengeCookie!, /Max-Age=300/);
+  assert.doesNotMatch(challengeCookie!, /Domain=/i);
+  const challengePair = challengeCookie!.split(';')[0];
+  const previewAuthUrl = bootstrap.headers.get('location')!;
+  assert.match(previewAuthUrl, /^https:\/\/cocell\.example\.test\/auth\/preview\?next=/);
+  assert.match(previewAuthUrl, /challenge=[a-f0-9]{64}/);
+  assert.equal((await app.request(serviceUrl, { method: 'POST' })).status, 401);
+
+  const loginGate = await app.request(previewAuthUrl);
+  assert.equal(loginGate.status, 303);
+  assert.match(loginGate.headers.get('location') ?? '', /^\/auth\/login\?next=/);
+  const authPath = new URL(previewAuthUrl).pathname + new URL(previewAuthUrl).search;
   const signedIn = await app.request(`${publicUrl}/auth/login`, { method: 'POST',
     headers: { origin: publicUrl, 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ token }).toString() });
-  const operatorCookie = signedIn.headers.getSetCookie().find(value => value.startsWith('cocell_operator='))!.split(';')[0];
-  const previewGrant = await app.request(bootstrap.headers.get('location')!, { headers: { cookie: operatorCookie } });
+    body: new URLSearchParams({ token, next: authPath }).toString() });
+  assert.equal(signedIn.headers.get('location'), authPath);
+  const operatorCookie = signedIn.headers.getSetCookie().find(value => value.startsWith('__Host-cocell_operator='))!.split(';')[0];
+  const previewGrant = await app.request(previewAuthUrl, { headers: { cookie: operatorCookie } });
   assert.equal(previewGrant.status, 303);
-  assert.equal(previewGrant.headers.get('location'), serviceUrl);
-  const previewCookie = previewGrant.headers.getSetCookie().find(value => value.startsWith('cocell_preview='))!;
-  assert.match(previewCookie, /Domain=cocell\.example\.test/i);
-  assert.match(previewCookie, /Max-Age=2592000/);
-  const response = await app.request(serviceUrl, { headers: { cookie: previewCookie.split(';')[0] } });
+  const callbackUrl = previewGrant.headers.get('location')!;
+  assert.match(callbackUrl, new RegExp(`^${serviceOrigin.replaceAll('.', '\\.')}\\/__cocell/preview/callback\\?code=[A-Za-z0-9_-]{43}$`));
+  assert.ok(previewGrant.headers.getSetCookie().some(value => value.startsWith('cocell_preview=') && /Max-Age=0/.test(value)));
+  assert.ok(signedIn.headers.getSetCookie().some(value => value.startsWith('cocell_preview=') && /Max-Age=0/.test(value)));
+
+  const wrongHost = serviceHost(projectId, 8766, publicUrl, token);
+  const wrongHostAttempt = await app.request(`https://${wrongHost}${new URL(callbackUrl).pathname}${new URL(callbackUrl).search}`,
+    { headers: { cookie: challengePair } });
+  assert.equal(wrongHostAttempt.status, 403);
+  const missingChallenge = await app.request(callbackUrl);
+  assert.equal(missingChallenge.status, 403);
+  assert.equal(proxyCalls, 0);
+
+  const callback = await app.request(callbackUrl, { headers: { cookie: challengePair } });
+  assert.equal(callback.status, 303);
+  assert.equal(callback.headers.get('location'), '/verify.txt?check=1');
+  const previewCookie = callback.headers.getSetCookie().find(value => value.startsWith('__Host-cocell_preview='))!;
+  assert.match(previewCookie, /Secure/);
+  assert.match(previewCookie, /HttpOnly/);
+  assert.match(previewCookie, /SameSite=Lax/);
+  assert.match(previewCookie, /Max-Age=10800/);
+  assert.doesNotMatch(previewCookie, /Domain=/i);
+  const replay = await app.request(callbackUrl, { headers: { cookie: challengePair } });
+  assert.equal(replay.status, 403);
+
+  const response = await app.request(serviceUrl, { headers: {
+    cookie: `${operatorCookie}; ${previewCookie.split(';')[0]}; app_session=application-cookie`,
+    authorization: 'Basic application-credential', origin: serviceOrigin,
+  } });
   assert.equal(response.status, 200);
   assert.equal(await response.text(), 'verified');
   assert.equal(response.headers.get('location'), '/next');
-  assert.equal(response.headers.get('set-cookie'), null);
+  assert.deepEqual(response.headers.getSetCookie().map(value => value.split(';')[0]), [
+    'app_session=refreshed', 'app_preference=dark',
+  ]);
+  assert.ok(response.headers.getSetCookie().every(value => !/Domain=/i.test(value)));
   assert.equal(response.headers.get('content-security-policy'), null);
   assert.equal(response.headers.get('x-frame-options'), null);
-  assert.equal((await app.request(serviceUrl, { headers: { cookie: operatorCookie } })).status, 303);
-  assert.equal((await app.request(serviceUrl, { headers: { cookie: previewCookie.split(';')[0], origin: 'https://evil.example' } })).status, 403);
-  const tampered = new URL(serviceUrl);
-  const label = tampered.hostname.split('.')[0];
-  tampered.hostname = `${label.slice(0, -1)}${label.endsWith('0') ? '1' : '0'}.cocell.example.test`;
-  assert.equal((await app.request(tampered.href, {
-    headers: { authorization: `Bearer ${token}` },
-  })).status, 403);
-  const oldPayload = projectId.replaceAll('-', '') + (8765).toString(16).padStart(4, '0');
-  const oldSignature = createHmac('sha256', token).update(`cocell-service-host-v1\0${oldPayload}`).digest('hex').slice(0, 12);
-  const oldUrl = `https://p${oldPayload}${oldSignature}.cocell.example.test/verify.txt?check=1`;
-  assert.equal((await app.request(oldUrl, { headers: { authorization: `Bearer ${token}` } })).status, 200);
+  assert.equal(response.headers.get('referrer-policy'), 'same-origin');
+});
 
-  now += day;
-  const renewed = await app.request(serviceUrl, { headers: { cookie: previewCookie.split(';')[0] } });
-  assert.equal(renewed.status, 200);
-  assert.equal(await renewed.text(), 'verified');
-  const renewedCookies = renewed.headers.getSetCookie();
-  assert.equal(renewedCookies.length, 1);
-  assert.match(renewedCookies[0], /^cocell_preview=/);
-  assert.match(renewedCookies[0], /Domain=cocell\.example\.test/i);
-  assert.match(renewedCookies[0], /Max-Age=2592000/);
-  assert.equal(Number(renewedCookies[0].split('.')[1]), now + 30 * day);
-  assert.equal(renewed.headers.get('cache-control'), 'no-store');
-
-  const root = await app.request(`${publicUrl}/api/config`, { headers: {
-    cookie: `${operatorCookie}; ${previewCookie.split(';')[0]}`,
-  } });
-  assert.equal(root.status, 200);
-  const rootCookies = root.headers.getSetCookie();
-  assert.equal(rootCookies.length, 2);
-  assert.doesNotMatch(rootCookies.find(value => value.startsWith('cocell_operator='))!, /Domain=/i);
-  assert.match(rootCookies.find(value => value.startsWith('cocell_preview='))!, /Domain=cocell\.example\.test/i);
-
-  now += 30 * day;
-  const expired = await app.request(serviceUrl, { headers: { cookie: renewedCookies[0].split(';')[0] } });
-  assert.equal(expired.status, 303);
-  assert.equal(expired.headers.get('set-cookie'), null);
+test('preview grants cross API instances and discover projects created on another instance', async () => {
+  const { Hono } = await import('hono');
+  const { installOperatorAccess, isAuthenticatedPreviewRequest } = await import('./operator.js');
+  const { MemoryPreviewGrantStore } = await import('./preview-grants.js');
+  const projectId = '22222222-2222-4222-8222-222222222222';
+  const host = serviceHost(projectId, 8080, publicUrl, token);
+  const store = new MemoryPreviewGrantStore();
+  let visibleOnB = false;
+  let refreshes = 0;
+  const project = { id: projectId, executionMode: 'sandbox', sandbox: { id: 'box-shared' }, status: 'active' };
+  const appA = new Hono(), appB = new Hono();
+  const options = { token, publicUrl, previewSubdomains: true, previewGrants: store,
+    serviceProxy: async () => new Response('app') };
+  installOperatorAccess(appA, { ...options, projects: () => [project] });
+  installOperatorAccess(appB, { ...options, projects: () => visibleOnB ? [project] : [],
+    refreshProjects: async () => { refreshes++; visibleOnB = true; } });
+  const start = await appB.request(`https://${host}/login?next=%2Fdashboard`);
+  assert.equal(start.status, 303);
+  assert.equal(refreshes, 1);
+  const challenge = start.headers.getSetCookie().find(cookie => cookie.startsWith('__Host-cocell_preview_challenge='))!.split(';')[0];
+  const grant = await appA.request(start.headers.get('location')!, { headers: { authorization: `Bearer ${token}` } });
+  const finish = await appB.request(grant.headers.get('location')!, { headers: { cookie: challenge } });
+  assert.equal(finish.status, 303);
+  assert.equal(finish.headers.get('location'), '/login?next=%2Fdashboard');
+  assert.equal(finish.headers.get('referrer-policy'), 'no-referrer');
+  const cookie = finish.headers.getSetCookie().find(value => value.startsWith('__Host-cocell_preview='))!.split(';')[0];
+  assert.equal(isAuthenticatedPreviewRequest(new Headers({ cookie }), host, token), true);
+  assert.equal((await appA.request(grant.headers.get('location')!, { headers: { cookie: challenge } })).status, 403);
 });

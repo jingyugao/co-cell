@@ -38,6 +38,9 @@ importers:
       hono:
         specifier: 4.13.5
         version: 4.13.5
+      httpxy:
+        specifier: 0.5.5
+        version: 0.5.5
       js-tiktoken:
         specifier: 1.0.21
         version: 1.0.21
@@ -640,6 +643,9 @@ packages:
   html-url-attributes@3.0.1:
     resolution: {integrity: sha512-ol6UPyBWqsrO6EJySPz2O7ZSr856WDrEzM5zMqp+FJJLGMW35cLYmmZnl0vztAZxRUoNZJFTCohfjuIJ8I4QBQ==}
 
+  httpxy@0.5.5:
+    resolution: {integrity: sha512-uDjmnPyp1q4Sgzf3w+J/Fc6UqcCEj0x4Wjp7OqK5dGhNeDgpyrAmnS6ey8QWrX3SWDon2DMKf9sBa5X9+CVyMA==}
+
   iconv-lite@0.7.3:
     resolution: {integrity: sha512-IKXpvIzjnC9XTAUbVBcMfGS0EPaIXtW6v+zr+RRp+hqULEpo0owZax6wyRwPOJbWbzjYspQwusTsfVr0ifh4uQ==}
     engines: {node: '>=0.10.0'}
@@ -1088,7 +1094,9 @@ snapshots:
 
   '@co-cell/agentcore@file:packages/agentcore': {}
 
-  '@co-cell/sandbox@file:packages/sandbox': {}
+  '@co-cell/sandbox@file:packages/sandbox':
+    dependencies:
+      '@opentelemetry/api': 1.9.1
 
   '@esbuild/aix-ppc64@0.28.2':
     optional: true
@@ -1488,6 +1496,8 @@ snapshots:
   hono@4.13.5: {}
 
   html-url-attributes@3.0.1: {}
+
+  httpxy@0.5.5: {}
 
   iconv-lite@0.7.3:
     dependencies:

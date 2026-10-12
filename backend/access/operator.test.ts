@@ -30,7 +30,7 @@ function login(app: Hono, next = '/') {
 }
 
 test('protects UI and API, then issues a signed HttpOnly session', async () => {
-  const { app } = setup();
+  const { app } = setup({ previewSubdomains: true });
   const ui = await app.request(`${origin}/`);
   assert.equal(ui.status, 303);
   assert.equal(ui.headers.get('location'), '/auth/login?next=%2F');
@@ -46,16 +46,21 @@ test('protects UI and API, then issues a signed HttpOnly session', async () => {
   const signedIn = await login(app);
   assert.equal(signedIn.status, 303);
   assert.equal(signedIn.headers.get('location'), '/');
-  const cookie = signedIn.headers.get('set-cookie')!;
+  const cookie = signedIn.headers.getSetCookie().find(value => value.startsWith('__Host-cocell_operator='))!;
+  assert.match(cookie, /^__Host-cocell_operator=/);
   assert.match(cookie, /HttpOnly/);
   assert.match(cookie, /SameSite=Lax/);
   assert.match(cookie, /Secure/);
   assert.match(cookie, /Max-Age=2592000/);
   assert.doesNotMatch(cookie, /Domain=/);
   assert.doesNotMatch(cookie, new RegExp(token));
-  const signedExpiry = /^cocell_operator=v1\.(\d+)\./.exec(cookie)?.[1];
+  const signedExpiry = /^__Host-cocell_operator=v1\.(\d+)\./.exec(cookie)?.[1];
   assert.ok(signedExpiry && Number(signedExpiry) > Date.now());
   assert.ok(Number(signedExpiry) <= Date.now() + 30 * 24 * 60 * 60 * 1000);
+  const clearedPreview = signedIn.headers.getSetCookie().find(value => value.startsWith('cocell_preview='));
+  assert.ok(clearedPreview);
+  assert.match(clearedPreview!, /Domain=cocell\.example\.test/i);
+  assert.match(clearedPreview!, /Max-Age=0/);
   assert.equal((await app.request(`${origin}/api/data`, { headers: { cookie } })).status, 200);
   const page = await app.request(`${origin}/page`, { headers: { cookie } });
   assert.match(page.headers.get('content-security-policy') ?? '', /script-src 'self'/);
@@ -72,6 +77,7 @@ test('renews active sessions daily, accepts legacy sessions, and expires inactiv
   t.mock.method(Date, 'now', () => now);
   const { app } = setup();
   const initialCookie = (await login(app)).headers.get('set-cookie')!.split(';')[0];
+  assert.match(initialCookie, /^__Host-cocell_operator=/);
   const initialExpiry = Number(initialCookie.split('.')[1]);
   const fresh = await app.request(`${origin}/api/data`, { headers: { cookie: initialCookie } });
   assert.equal(fresh.headers.get('set-cookie'), null);
@@ -93,6 +99,7 @@ test('renews active sessions daily, accepts legacy sessions, and expires inactiv
   const legacySignature = createHmac('sha256', token).update(`cocell-operator-v1\0${legacyExpiry}`).digest('base64url');
   const legacy = await app.request(`${origin}/api/data`, { headers: { cookie: `cocell_operator=v1.${legacyExpiry}.${legacySignature}` } });
   assert.equal(legacy.status, 200);
+  assert.match(legacy.headers.get('set-cookie')!, /^__Host-cocell_operator=/);
   assert.match(legacy.headers.get('set-cookie')!, /Max-Age=2592000/);
 
   now = initialExpiry;
@@ -132,11 +139,14 @@ test('rejects tampered cookies, login CSRF, and cookie write CSRF', async () => 
   assert.equal((await app.request(`${origin}/api/data`, { headers: { cookie: tampered } })).status, 401);
   for (const expires of ['0', String(Date.now() - 1)]) {
     const signature = createHmac('sha256', token).update(`cocell-operator-v1\0${expires}`).digest('base64url');
-    assert.equal((await app.request(`${origin}/api/data`, { headers: {
-      cookie: `cocell_operator=v1.${expires}.${signature}`,
+  assert.equal((await app.request(`${origin}/api/data`, { headers: {
+      cookie: `__Host-cocell_operator=v1.${expires}.${signature}`,
     } })).status, 401);
   }
   assert.equal((await app.request(`${origin}/api/data`, { headers: { cookie: pair } })).status, 200);
+  assert.equal((await app.request(`${origin}/api/write`, { method: 'POST', headers: {
+    origin, 'content-type': 'application/json',
+  }, body: '{}' })).status, 401);
   assert.equal((await app.request(`${origin}/api/write`, { method: 'POST', headers: { cookie: pair } })).status, 403);
   assert.equal((await app.request(`${origin}/api/write`, { method: 'POST',
     headers: { cookie: pair, origin } })).status, 200);

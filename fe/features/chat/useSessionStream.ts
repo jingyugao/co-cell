@@ -34,17 +34,24 @@ export function mergeSession(current: Session | null, incoming: Session): Sessio
   if (!current || current.id !== incoming.id || incoming.settings.executionMode !== 'sandbox') return preserveClientFailures(incoming, current);
   const key = (turn: Turn) => turn.nativeTurnId ?? turn.id;
   const turns = new Map(current.turns.map(turn => [key(turn), turn]));
+  const turnIds = new Map(current.turns.map(turn => [turn.id, key(turn)]));
   for (const turn of incoming.turns) {
-    const previous = turns.get(key(turn));
+    // Acceptance adds a native ID to an existing CoCell turn. Match either
+    // identity and remove the old key before reindexing the merged turn.
+    const previousKey = turns.has(key(turn)) ? key(turn) : turnIds.get(turn.id);
+    const previous = previousKey === undefined ? undefined : turns.get(previousKey);
     const previousInputs = previous?.additionalUserInputs;
     const incomingInputs = turn.additionalUserInputs;
     const additionalUserInputs = !previousInputs ? incomingInputs : !incomingInputs ? previousInputs
       : previousInputs.every((value, index) => incomingInputs[index] === value) ? incomingInputs
         : incomingInputs.every((value, index) => previousInputs[index] === value) ? previousInputs : incomingInputs;
-    turns.set(key(turn), previous ? { ...previous, ...turn,
+    const merged = previous ? { ...previous, ...turn,
       prompt: turn.prompt || previous.prompt,
       additionalUserInputs,
-      items: turn.items.length ? turn.items : previous.items } : turn);
+      items: turn.items.length ? turn.items : previous.items } : turn;
+    if (previousKey !== undefined) turns.delete(previousKey);
+    turns.set(key(merged), merged);
+    turnIds.set(merged.id, key(merged));
   }
   const merged: Session = { ...incoming, turns: [...turns.values()].sort((left, right) => left.startedAt.localeCompare(right.startedAt)),
     historyNextCursor: current.historyNextCursor !== undefined ? current.historyNextCursor : incoming.historyNextCursor };

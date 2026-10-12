@@ -74,7 +74,10 @@ test('paused session opens SSE immediately and defers native history until ready
   await page.goto('/sessions/old-session'); await expect(ui.editor).toBeEditable(); await ui.editor.fill('旧会话恢复时输入');
   await expect.poll(() => ui.count('GET', '/api/sessions/old-session/events')).toBeGreaterThan(0);
   await page.waitForTimeout(500); expect(ui.historyReads).toHaveLength(0); await expect(ui.send).toBeDisabled();
+  expect(ui.count('GET', '/api/sessions/old-session/subagents')).toBe(0);
+  await expect(page.getByText('子代理对话暂时无法加载，正在自动重试。', { exact: true })).toHaveCount(0);
   ui.complete('paused'); await expect(page.getByText('历史任务内容', { exact: true })).toBeVisible();
+  await expect.poll(() => ui.count('GET', '/api/sessions/old-session/subagents')).toBeGreaterThan(0);
   await expect(ui.send).toBeEnabled(); await expect(ui.editor).toHaveValue('旧会话恢复时输入');
 });
 

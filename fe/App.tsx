@@ -183,7 +183,9 @@ export default function App() {
     finally { setRetryingEntry(false); }
   }
   const running = session?.status === 'running';
-  const { agents: subagents, error: subagentsError } = useSubagentConversations(session?.id ?? null, running);
+  const { agents: subagents, error: subagentsError } = useSubagentConversations(
+    session?.threadId && !sandboxNotReady ? session.id : null, running,
+  );
   // Native failed turns are execution history rather than user-visible chat.
   // `clientFailure` is injected below only for this browser page's failed POST.
   const conversationTurns = session?.turns ?? [];

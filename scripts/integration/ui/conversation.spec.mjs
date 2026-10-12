@@ -1,5 +1,27 @@
 import { test, expect } from './fixture.mjs';
 
+test('subagent read failures retry after readiness and clear the warning on success', async ({ page, ui }) => {
+  ui.complete('paused');
+  let reads = 0;
+  await page.route('**/api/sessions/old-session/subagents', async route => {
+    reads++;
+    await route.fulfill(reads === 1 ? { status: 503, json: { error: 'Sandbox 正忙，请稍后重试' } } : { json: [] });
+  });
+  await page.goto('/sessions/old-session');
+  const warning = page.getByText('子代理对话暂时无法加载，正在自动重试。', { exact: true });
+  await expect(warning).toBeVisible();
+  await expect.poll(() => reads).toBe(2);
+  await expect(warning).toHaveCount(0);
+});
+
+test('a session without a native thread does not request subagent history', async ({ page, ui }) => {
+  ui.complete('paused');
+  ui.sessions.get('old-session').threadId = null;
+  await page.goto('/sessions/old-session');
+  await expect(page.getByText('历史任务内容', { exact: true })).toBeVisible();
+  expect(ui.count('GET', '/api/sessions/old-session/subagents')).toBe(0);
+});
+
 test('first message stays in one frame when native acceptance precedes its stream event', async ({ page, ui }) => {
   ui.complete('paused');
   const session = ui.sessions.get('old-session');

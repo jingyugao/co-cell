@@ -3,9 +3,44 @@ import test from 'node:test';
 import type { AppConfig } from '../../protocol/types.js';
 import { createApp } from '../app.js';
 import { serviceHost } from '../projects/service-host.js';
+import { HttpError } from '../../util/errors.js';
 
 const token = 'operator-test-token-with-at-least-32-characters';
 const publicUrl = 'https://cocell.example.test';
+
+test('internal service host reaches tool authorization while preserving grant, origin, and operator checks', async () => {
+  const brokerUrl = 'http://co-cell.co-cell.svc.cluster.local.:3001';
+  const manager = { dataDirectory: '/tmp/cocell-access-test', listProjects: () => [] };
+  let calls = 0;
+  const secrets = { async authorize(boxId: string, tool: string, args: string[]) {
+    calls++;
+    assert.equal(boxId, 'box-one');
+    assert.deepEqual(args, ['version', '--client']);
+    if (tool !== 'kubectl') throw new HttpError(403, '项目未授权此工具的单文件凭证');
+    return { tool, args, home: '/home/debug/11111111-1111-4111-8111-111111111111', path: '.kube/config' };
+  } };
+  const app = createApp(manager as never, {} as AppConfig, ['cocell.example.test'],
+    { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },
+    undefined, undefined, undefined, { token, publicUrl, projects: () => [] }, undefined, secrets as never);
+  const authorize = (tool = 'kubectl', headers = {}, boxId = 'box-one') => app.request(`${brokerUrl}/api/tool-runtime/authorize`, {
+    method: 'POST', headers: { host: new URL(brokerUrl).host, 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ boxId, tool, args: ['version', '--client'] }),
+  });
+  const allowed = await authorize();
+  assert.equal(allowed.status, 200);
+  assert.equal((await allowed.json()).path, '.kube/config');
+  const denied = await authorize('mysql');
+  assert.equal(denied.status, 403);
+  assert.deepEqual(await denied.json(), { error: '项目未授权此工具的单文件凭证' });
+  assert.equal((await authorize('kubectl', {}, 'invalid/box')).status, 400);
+  assert.equal((await authorize('kubectl', { origin: 'https://foreign.example.test' })).status, 403);
+  assert.equal(calls, 2, 'invalid identities and browser origins must not reach authorization');
+  for (const [path, method] of [['/api/config', 'GET'], ['/api/secrets', 'GET'], ['/api/tool-runtime/authorize', 'GET'], ['/api/tool-runtime/other', 'POST']]) {
+    const response = await app.request(`${brokerUrl}${path}`, { method, headers: { host: new URL(brokerUrl).host, authorization: `Bearer ${token}` } });
+    assert.equal(response.status, 403);
+    assert.equal(await response.text(), 'Invalid host');
+  }
+});
 
 test('Cellbox mode protects existing API routes, accepts its HTTPS origin, and disables the Docker subdomain proxy', async () => {
   let proxyCalls = 0;

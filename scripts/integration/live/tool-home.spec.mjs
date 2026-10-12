@@ -69,6 +69,9 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     pod = await findPod();
     await savePermission(true);
     assert.equal(await findPod(), pod);
+    const version = await cli(['version', '--client']);
+    assert.equal(version.status, 0, version.stderr || version.error);
+    assert.match(version.stdout, /Client Version:/);
     const connection = await cli(['config', 'current-context']);
     assert.equal(connection.status, 0, connection.stderr || connection.error);
     const pods = await cli(['--context', process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? context, '-n', 'co-cell', 'get', 'pods', '-o', 'name']);

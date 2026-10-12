@@ -282,8 +282,8 @@ export class Thread {
         approvalPolicy: opts.approvalPolicy ?? 'never', sandbox: opts.sandboxMode ?? 'workspace-write', config: threadConfig };
       let response = await client.request(this.id ? 'thread/resume' : 'thread/start', { ...params, ...(this.id ? { threadId: this.id } : {}) });
       // Loaded App Server threads retain their original provider on resume.
-      // Adopt the managed session gateway once by forking the full native history.
-      // Subsequent turns keep that provider and thread, changing only the gateway route.
+      // Adopt a changed channel configuration by forking the full native history.
+      // Unchanged providers keep their thread across subsequent turns.
       if (this.id && opts.modelProvider && response.modelProvider && response.modelProvider !== opts.modelProvider) {
         response = await client.request('thread/fork', { ...params, threadId: this.id });
       }

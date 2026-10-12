@@ -4,6 +4,7 @@ import App from './App';
 import WorkspaceFilePage from './features/workspace-files/WorkspaceFileView';
 import { registerPwa } from './lib/pwa';
 import './styles.css';
+import 'katex/dist/katex.min.css';
 import './features/chat/Markdown.css';
 
 const fileRoute = /^\/projects\/([A-Za-z0-9_-]{1,100})\/files\/?$/.exec(window.location.pathname);

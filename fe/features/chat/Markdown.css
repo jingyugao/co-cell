@@ -9,6 +9,15 @@
   margin: 0 0 0.95em;
 }
 
+.markdown .katex { overflow-wrap: normal; }
+.markdown .katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.2em 0;
+  overscroll-behavior-x: contain;
+}
+
 .markdown h1,
 .markdown h2,
 .markdown h3,

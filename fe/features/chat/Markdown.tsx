@@ -1,6 +1,8 @@
 import { Children, createContext, isValidElement, memo, useContext, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 import { fileContentUrl, fileViewUrl, resolveResource, type ResourceContext } from '../../lib/resource-links';
 
 export type FileSelection = { path: string; line?: number; fragment?: string };
@@ -12,7 +14,30 @@ const localServiceHosts = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]',
 function normalizeServiceUrl(href: string): string {
   return /^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):\d{1,5}(?:[/?#]|$)/i.test(href) ? 'http://' + href : href;
 }
-type MarkdownNode = { type: string; value?: string; url?: string; children?: MarkdownNode[]; data?: { hProperties?: Record<string, unknown> } };
+type MarkdownNode = { type: string; value?: string; url?: string; children?: MarkdownNode[]; position?: { start: { offset?: number }; end: { offset?: number } }; data?: { hName?: string; hChildren?: unknown[]; hProperties?: Record<string, unknown> } };
+// Read the source before Markdown escapes consume \[ and \], or emphasis splits TeX subscripts.
+// Only standalone bracketed paragraphs containing TeX commands are treated as formulas.
+function remarkBracketMath() {
+  return (tree: MarkdownNode, file: { toString(): string }) => {
+    const source = file.toString();
+    const protectedContent = (node: MarkdownNode): boolean => ['inlineCode', 'link', 'linkReference', 'image', 'imageReference', 'html'].includes(node.type)
+      || Boolean(node.children?.some(protectedContent));
+    const walk = (node: MarkdownNode) => {
+      if (node.type === 'paragraph' && node.position && !protectedContent(node)) {
+        const raw = source.slice(node.position.start.offset, node.position.end.offset).trim();
+        const match = raw.match(/^\\\[([\s\S]*?)\\\]$/) ?? raw.match(/^\[([\s\S]*?)\]$/);
+        const value = match?.[1].trim();
+        if (value && /\\[a-zA-Z]+/.test(value)) {
+          node.type = 'math'; node.value = value; delete node.children;
+          node.data = { hName: 'div', hChildren: [{ type: 'element', tagName: 'code', properties: { className: ['language-math', 'math-display'] }, children: [{ type: 'text', value }] }] };
+          return;
+        }
+      }
+      node.children?.forEach(walk);
+    };
+    walk(tree);
+  };
+}
 function remarkHeadingIds({ prefix }: { prefix: string }) {
   return (tree: MarkdownNode) => {
     const counts = new Map<string, number>();
@@ -104,7 +129,7 @@ const components: Components = {
     : <span>{alt}</span>,
 };
 
-/** Standard Markdown + GFM; raw HTML stays text and unsafe URL schemes are filtered. */
+/** Markdown + GFM + TeX math; raw HTML stays text and unsafe URL schemes are filtered. */
 function Markdown({ text, projectId, workingDirectory, baseDirectory, onOpenFile }: { text: string } & MarkdownResources) {
   const id = useId();
   const renderers = useMemo<Components>(() => ({
@@ -120,7 +145,7 @@ function Markdown({ text, projectId, workingDirectory, baseDirectory, onOpenFile
       return target ? <img {...props} src={target} alt={alt || ''} loading="lazy" referrerPolicy="no-referrer" /> : <span>{alt || '无法定位图片'}</span>;
     },
   }), [id, projectId, workingDirectory, baseDirectory, onOpenFile]);
-  return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm, remarkLocalServices, [remarkHeadingIds, { prefix: `markdown-${id}-` }]]} urlTransform={url => {
+  return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath, remarkBracketMath, remarkLocalServices, [remarkHeadingIds, { prefix: `markdown-${id}-` }]]} rehypePlugins={[[rehypeKatex, { trust: false, strict: 'ignore' }]]} urlTransform={url => {
     // Custom file schemes are consumed by our renderers, never passed to the browser.
     if (resolveResource(url, { projectId, workingDirectory, baseDirectory })) return url;
     return defaultUrlTransform(normalizeServiceUrl(url));

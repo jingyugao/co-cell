@@ -70,6 +70,10 @@ export function useSessionStream({ selected, enabled, historyReady = true, onSta
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const loadingOlderRef = useRef(false);
+  const historyReadyRef = useRef(historyReady);
+  historyReadyRef.current = historyReady;
+  const canonicalHistory = useRef<string | null>(null);
+  if (!historyReady) canonicalHistory.current = null;
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   // Callers may recreate these handlers while refreshing workspace state. Keep
@@ -83,6 +87,7 @@ export function useSessionStream({ selected, enabled, historyReady = true, onSta
     // Wait until saved selections have been validated before showing history.
     if (!enabled) return;
     setSession(null); setConnected(false); setLoadingOlder(false); loadingOlderRef.current = false;
+    canonicalHistory.current = null;
     setLoadingHistory(Boolean(selected));
     if (!selected) { localStorage.removeItem('codex-session'); return; }
     localStorage.setItem('codex-session', selected);
@@ -106,7 +111,7 @@ export function useSessionStream({ selected, enabled, historyReady = true, onSta
           turnChanged = nextKey !== historyKey;
           // Reading native history updates sandbox metadata and emits state.
           // Only a turn transition should trigger another history read.
-          refreshHistory = data.type === 'state' && nextKey !== historyKey && data.session.status !== 'running';
+          refreshHistory = historyReadyRef.current && data.type === 'state' && nextKey !== historyKey && data.session.status !== 'running';
           historyKey = nextKey;
           const nextWorkspaceKey = JSON.stringify([nextKey, data.session.title, data.session.archivedAt,
             data.session.sandbox?.id, data.session.sandbox?.status]);
@@ -116,13 +121,15 @@ export function useSessionStream({ selected, enabled, historyReady = true, onSta
         if (turnChanged) ++revision;
         const eventRevision = revision;
         setSession(current => data.type === 'state' || data.type === 'snapshot'
-          ? mergeSession(current, data.session) : applyStream(current, data));
+          ? mergeSession(current, canonicalHistory.current === selected
+            ? { ...data.session, historyError: current?.historyError } : data.session) : applyStream(current, data));
         if (refreshWorkspace) void onStateRef.current().catch(() => {});
         if (refreshHistory) {
           // Native history now includes the completed call and its block costs.
           // Keep a failed local submission visible until a real page reload.
           void api<Session>(`/api/sessions/${selected}`).then(value => {
-            if (!alive || revision !== eventRevision) return;
+            if (!alive || revision !== eventRevision || !historyReadyRef.current) return;
+            canonicalHistory.current = selected;
             setSession(current => alive && revision === eventRevision ? mergeSession(current, value) : current);
           }).catch(error => { if (alive && revision === eventRevision) onErrorRef.current(errorMessage(error)); });
         }
@@ -138,7 +145,7 @@ export function useSessionStream({ selected, enabled, historyReady = true, onSta
     let alive = true;
     setLoadingHistory(true);
     api<Session>(`/api/sessions/${selected}`)
-      .then(value => { if (alive) setSession(current => mergeSession(current, value)); })
+      .then(value => { if (alive) { canonicalHistory.current = selected; setSession(current => mergeSession(current, value)); } })
       .catch(error => { if (alive) onErrorRef.current(errorMessage(error)); })
       .finally(() => { if (alive) setLoadingHistory(false); });
     return () => { alive = false; };

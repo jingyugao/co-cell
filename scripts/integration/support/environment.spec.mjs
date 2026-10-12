@@ -24,6 +24,41 @@ test('cleanup recovers a lost create response and never deletes an existing proj
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
+test('failed synchronous create assertion keeps the created project in cleanup ownership', async ({}, testInfo) => {
+  const projects = new Map();
+  const deleted = [];
+  let env;
+  const server = createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.method === 'POST' && req.url === '/api/projects') {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const request = JSON.parse(Buffer.concat(chunks).toString());
+      const project = { id: 'created', name: request.name, sandboxOperation: { status: 'running' },
+        sandbox: { id: 'box-created', status: 'preparing' } };
+      projects.set(project.id, project);
+      res.statusCode = 201; res.end(JSON.stringify(project)); return;
+    }
+    if (req.url === '/api/projects') { res.end(JSON.stringify([...projects.values()])); return; }
+    if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[]}'); return; }
+    const id = req.url.split('/').at(-1);
+    if (req.method === 'DELETE') { deleted.push(id); projects.delete(id); res.end('{"ok":true}'); return; }
+    if (req.method === 'GET' && projects.has(id)) projects.get(id).sandboxOperation.status = 'succeeded';
+    res.statusCode = projects.has(id) ? 200 : 404; res.end(JSON.stringify(projects.get(id) ?? { error: 'missing' }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  env = new LiveEnvironment(liveConfig({ COCELL_E2E_BASE_URL: `http://127.0.0.1:${server.address().port}`, COCELL_E2E_ACCESS_TOKEN: 'test-only-token' }),
+    { journal: testInfo.outputPath('resources.json') });
+  try {
+    await expect(env.createProject('synchronous-create')).rejects.toThrow('completed sandbox operation');
+    expect(env.projects.get('created')).toBe(env.name('synchronous-create'));
+    expect(env.boxes.has('box-created')).toBe(true);
+    await env.cleanup();
+    expect(deleted).toEqual(['created']);
+    expect(projects.has('created')).toBe(false);
+  } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
+});
+
 test('cleanup failures fail the suite and redact the operator token in evidence', async ({}, testInfo) => {
   const token = 'secret-that-must-never-appear';
   let env;

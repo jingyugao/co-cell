@@ -154,7 +154,9 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
 
   await env.step('Checkpoint both Boxes and wait for paused state', async () => {
     for (const { project } of cases) {
-      await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 });
+      const checkpointed = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+      assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
+      assert.equal(checkpointed.sandbox.status, 'paused');
       await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
     }
     return { paused: cases.map(({ project }) => project.sandbox.id) };
@@ -166,8 +168,10 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
       assert.equal(before.box.status.phase, 'Suspended');
       const candidates = await waitForCandidates(before.box, 1);
       const candidateIdentities = candidates.map(pod => ({ name: pod.metadata.name, uid: pod.metadata.uid }));
-      const opened = await env.json(`/api/projects/${testCase.project.id}/open`, { method: 'POST', expectedStatus: [200, 202] });
+      const opened = await env.json(`/api/projects/${testCase.project.id}/open`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
       assert.equal(opened.sandboxOperation.kind, 'resume');
+      assert.equal(opened.sandboxOperation.status, 'succeeded');
+      assert.equal(opened.sandbox.status, 'ready');
       const resumed = await env.waitProject(testCase.project.id, {
         kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id,
       });

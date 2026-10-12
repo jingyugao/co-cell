@@ -141,13 +141,19 @@ export class LiveEnvironment {
       const buffer = Buffer.from(await response.arrayBuffer());
       const text = buffer.toString('utf8');
       const data = method !== 'HEAD' && text && response.headers.get('content-type')?.includes('application/json') ? JSON.parse(text) : text;
-      if (method === 'POST' && path === '/api/projects' && response.status === 201 && data.id) {
+      const createdProject = method === 'POST' && path === '/api/projects' && response.status === 201 && data?.id;
+      if (createdProject) {
         this.projects.set(data.id, options.body.name); await this.persist();
       }
       if (method === 'POST' && path === '/api/sessions' && response.status === 201 && data.id) {
         this.sessions.add(data.id); await this.persist();
       }
       if (data?.id && this.projects.has(data.id) && data.sandbox?.id) this.boxes.add(data.sandbox.id);
+      if (createdProject) {
+        await this.persist();
+        assert.equal(data.sandboxOperation?.status, 'succeeded', 'Project creation response must contain a completed sandbox operation');
+        assert.equal(data.sandbox?.status, 'ready', 'Project creation response must contain a ready sandbox');
+      }
       const durationMs = performance.now() - start;
       this.report.requests.push({ method, path, status: response.status, durationMs });
       if (expectedStatus !== null) assert((Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus]).includes(response.status),

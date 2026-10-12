@@ -98,10 +98,14 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     assert.equal((await cli(['config', 'set-context', '--current', '--namespace=cocell-home-integration'])).status, 0);
     const refreshed = await fileState();
     assert.notEqual(refreshed.sha256, before.sha256);
-    await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 202 });
+    const checkpointed = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
+    assert.equal(checkpointed.sandbox.status, 'paused');
     await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
     const start = performance.now();
-    const opened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: [200, 202] });
+    const opened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    assert.equal(opened.sandboxOperation.status, 'succeeded');
+    assert.equal(opened.sandbox.status, 'ready');
     const resumed = await env.waitProject(project.id, { kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id });
     const observedReadyMs = performance.now() - start;
     assert.equal(resumed.sandbox.id, project.sandbox.id);
@@ -119,7 +123,9 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     const before = await fileState();
     const previousPod = pod;
     const lost = await failTestSandbox(env, project.id);
-    await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', expectedStatus: 202 });
+    const rebuild = await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    assert.equal(rebuild.sandboxOperation.status, 'succeeded');
+    assert.equal(rebuild.sandbox.status, 'ready');
     const rebuilt = await env.waitProject(project.id, { kind: 'rebuild', status: 'ready' });
     assert.equal(rebuilt.sandbox.id, lost.sandboxId);
     pod = await findPod();

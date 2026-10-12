@@ -89,19 +89,35 @@ test('project creation verifies readiness; resume preserves the box without repe
   const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
   const app = new Hono(); installProjectsRoutes(app, manager);
   const operations = () => (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations;
+  const waitFor = async <T>(read: () => Promise<T | undefined>, ready: (value: T | undefined) => boolean) => {
+    const deadline = Date.now() + 4_000;
+    let value = await read();
+    while (!ready(value) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      value = await read();
+    }
+    assert(ready(value), 'timed out waiting for durable lifecycle state');
+    return value as T;
+  };
   try {
     await manager.init();
-    const response = await app.request('/api/projects', { method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'immediate sandbox' }) });
-    assert.equal(response.status, 201);
-    const created = await response.json() as ProjectSummary;
-    assert.equal(created.sandboxOperation?.kind, 'create');
-    assert.equal(created.sandboxOperation?.status, 'running');
-    assert.equal((await state.listProjects())[0].sandboxOperation?.id, created.sandboxOperation?.id);
+    let createSettled = false;
+    const createResponse = Promise.resolve(app.request('/api/projects', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'immediate sandbox' }) }));
+    void createResponse.then(() => { createSettled = true; });
+    const creating = await waitFor(async () => (await state.listProjects())[0], project => project?.sandboxOperation?.kind === 'create');
+    const createOperationId = creating.sandboxOperation!.id!;
+    assert.equal(creating.sandboxOperation?.status, 'running');
+    await new Promise(resolve => setTimeout(resolve, 1_600));
+    assert.equal(createSettled, false, 'create must keep the request open while runtime preparation exceeds the old 1.5s budget');
+    assert.equal((await state.getProject(creating.id))?.sandboxOperation?.id, createOperationId,
+      'the in-flight operation remains readable from durable project history');
+    const created = creating as ProjectSummary;
     assert.equal(canEnterProject(created), true);
     assert.equal(isProjectSandboxReady(created), false);
-    const duringEntry = await (await app.request(`/api/projects/${created.id}/open`, { method: 'POST' })).json() as ProjectSummary;
-    assert.equal(duringEntry.sandboxOperation?.id, created.sandboxOperation?.id);
+    let duringEntrySettled = false;
+    const duringEntryResponse = Promise.resolve(app.request(`/api/projects/${created.id}/open`, { method: 'POST' }))
+      .then(response => { duringEntrySettled = true; return response; });
     await assert.rejects(manager.create({ projectId: created.id }), /维护/);
     const duringCreate = await (await app.request('/api/projects?refreshSandboxes=1')).json() as ProjectSummary[];
     assert.equal(duringCreate[0].sandbox?.status, 'ready', 'live provider status is returned during creation maintenance');
@@ -111,7 +127,17 @@ test('project creation verifies readiness; resume preserves the box without repe
     assert.equal(canEnterProject(duringCreate[0]), true);
     assert.equal(isProjectSandboxReady(duringCreate[0]), false);
     await assert.rejects(manager.checkpointProjectSandbox(created.id), /维护/);
-    finishPreparation(); await operations().close();
+    assert.equal(duringEntrySettled, false, 'open joins in-flight creation and waits for a usable sandbox');
+    finishPreparation();
+    const response = await createResponse;
+    assert.equal(response.status, 201);
+    const completedCreate = await response.json() as ProjectSummary;
+    assert.equal(completedCreate.sandboxOperation?.id, createOperationId);
+    assert.equal(completedCreate.sandboxOperation?.status, 'succeeded');
+    const duringEntry = await duringEntryResponse;
+    assert.equal(duringEntry.status, 200);
+    assert.equal((await duringEntry.json() as ProjectSummary).sandboxOperation?.status, 'succeeded');
+    await operations().close();
     assert.equal(createCalls, 1);
     assert.equal(verifications, 1);
     const readyAfterCreate = await manager.readProject(created.id);
@@ -136,7 +162,7 @@ test('project creation verifies readiness; resume preserves the box without repe
     }
     finally { finishTask(); }
     const checkpoint = await app.request(`/api/projects/${created.id}/sandbox/checkpoint`, { method: 'POST' });
-    assert.equal(checkpoint.status, 202);
+    assert.equal(checkpoint.status, 200);
     await operations().close();
     const pausedAfterCheckpoint = await manager.readProject(created.id);
     assert.equal(pausedAfterCheckpoint.sandbox?.status, 'paused');
@@ -144,15 +170,19 @@ test('project creation verifies readiness; resume preserves the box without repe
     assert.equal(isProjectSandboxReady(pausedAfterCheckpoint), false);
     let finishResume!: () => void;
     resumeBarrier = new Promise<void>(resolve => { finishResume = resolve; });
-    const opened = await Promise.all([1, 2].map(() => app.request(`/api/projects/${created.id}/open`, { method: 'POST' })));
-    assert.ok(opened.every(response => response.status === 202));
-    const entries = await Promise.all(opened.map(response => response.json() as Promise<ProjectSummary>));
-    assert.equal(entries[0].sandboxOperation?.id, entries[1].sandboxOperation?.id);
-    assert.equal(entries[0].sandboxOperation?.kind, 'resume');
-    assert.equal(isProjectSandboxReady(entries[0]), false);
-    await manager.enterProject(created.id);
+    let opensSettled = 0;
+    const opened = [1, 2].map(() => Promise.resolve(app.request(`/api/projects/${created.id}/open`, { method: 'POST' }))
+      .then(response => { opensSettled++; return response; }));
+    const resuming = await waitFor(() => state.getProject(created.id), project => project?.sandboxOperation?.kind === 'resume'
+      && project.sandboxOperation.status === 'running');
+    const operationId = resuming.sandboxOperation!.id!;
+    assert.equal(resumeCalls, 1);
+    await new Promise(resolve => setTimeout(resolve, 1_600));
+    assert.equal(opensSettled, 0, 'concurrent open requests must remain pending beyond the old 1.5s wait budget');
+    assert.equal((await state.getProject(created.id))?.sandboxOperation?.id, operationId,
+      'the running resume operation remains visible while callers wait');
+    const joinedEntry = manager.enterProject(created.id);
     await assert.rejects(manager.create({ projectId: created.id }), /维护/);
-    const operationId = entries[0].sandboxOperation!.id!;
     let notified = false;
     const beforeWaitQueries = queryCalls;
     const waitingResponse = Promise.resolve(app.request(`/api/projects/${created.id}?waitForOperation=${operationId}&waitMs=10000`))
@@ -189,6 +219,13 @@ test('project creation verifies readiness; resume preserves the box without repe
     assert.equal(isProjectSandboxReady(completion), true);
     assert.equal(projectService.isMaintaining(created.id), false, 'notified clients can begin execution');
     state.mutateProject = mutateProject;
+    const openResponses = await Promise.all(opened);
+    assert.ok(openResponses.every(response => response.status === 200));
+    const entries = await Promise.all(openResponses.map(response => response.json() as Promise<ProjectSummary>));
+    assert.equal(entries[0].sandboxOperation?.id, operationId);
+    assert.equal(entries[1].sandboxOperation?.id, operationId);
+    assert.ok(entries.every(entry => entry.sandboxOperation?.status === 'succeeded' && isProjectSandboxReady(entry)));
+    assert.equal((await joinedEntry).sandboxOperation?.status, 'succeeded');
     await operations().close();
     assert.equal(resumeCalls, 1, 'concurrent entries and repeated entry during preparation share one resume');
     await manager.enterProject(created.id);
@@ -207,7 +244,10 @@ test('project creation verifies readiness; resume preserves the box without repe
     providerBox = { ...box, status: 'paused' };
     await saveBinding({ ...providerBox });
     failResume = true;
-    await manager.resumeProjectSandbox(created.id); await operations().close();
+    let restoreFailure: unknown;
+    try { await manager.resumeProjectSandbox(created.id); } catch (error) { restoreFailure = error; }
+    assert.match(String(restoreFailure), /Runtime restore outcome unavailable/);
+    await operations().close();
     const failed = await manager.readProject(created.id);
     assert.equal(failed.sandboxOperation?.status, 'failed');
     assert.equal(canEnterProject(failed), true);
@@ -223,6 +263,7 @@ test('project creation verifies readiness; resume preserves the box without repe
       inspections: beforeFailedPoll.inspections, resumes: beforeFailedPoll.resumes, verifications: beforeFailedPoll.verifications,
     }, 'polling after failed restore only queries provider status');
     failVerification = false;
+    failResume = false;
     await manager.rebuildProjectSandbox(created.id); await operations().close();
     const rebuilt = await manager.readProject(created.id);
     assert.equal(canEnterProject(rebuilt), true);

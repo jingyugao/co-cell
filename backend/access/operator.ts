@@ -181,6 +181,9 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
 
   app.use('*', async (c, next) => {
     const path = new URL(c.req.url).pathname;
+    // Sandbox wrappers call these endpoints through the Kubernetes service host.
+    // Runtime routes validate Box identity and project tool grants themselves.
+    if (c.req.method === 'POST' && (/^\/api\/tool-runtime\/(authorize|start|files)$/.test(path) || /^\/api\/tool-runtime\/[0-9a-f-]{36}\/complete$/.test(path))) return next();
     const requestHost = (c.req.header('host') ?? new URL(c.req.url).host).toLowerCase();
     if (requestHost !== host) {
       let target = resolvePreviewHost?.(requestHost);
@@ -217,8 +220,6 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
       if (headers.get('authorization') === `Bearer ${options.token}`) headers.delete('authorization');
       return options.serviceProxy(target.projectId, target.port, path + new URL(c.req.url).search, new Request(c.req.raw, { headers }));
     }
-    // Internal tool-runtime endpoints are only exposed on the configured control-plane host.
-    if (c.req.method === 'POST' && (/^\/api\/tool-runtime\/(authorize|start|files)$/.test(path) || /^\/api\/tool-runtime\/[0-9a-f-]{36}\/complete$/.test(path))) return next();
     if (isPublicPwaAsset(path, c.req.method)) return next();
     if (path === '/auth/login' && ['GET', 'POST'].includes(c.req.method)) {
       return next();

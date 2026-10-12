@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
 import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type Project, type ProjectSummary, type Session, type SessionSummary, type SessionTurnPage, type Settings, type StreamMessage, type SubagentConversation, type Turn } from '../../protocol/types.js';
-import type { SandboxRuntime } from '../execution/container-runtime.js';
+import type { SandboxRuntime, ServiceProxyAccess } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
@@ -2036,6 +2036,30 @@ export class SessionManager {
     if (project.executionMode !== 'sandbox' || !this.sandbox) throw new HttpError(400, '此项目不使用 Sandbox 沙箱');
     if (!project.sandbox) throw new HttpError(409, '项目沙箱尚未创建，请先启动服务');
     return `/api/projects/${encodeURIComponent(projectId)}/service/${port}${url.pathname}${url.search}${url.hash}`;
+  }
+
+  /** Hold project and runtime leases until the native proxy closes its response/socket. */
+  async projectServiceAccess(projectId: string, port: number, method: string, requestSignal: AbortSignal): Promise<ServiceProxyAccess & { signal: AbortSignal }> {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, '服务端口无效');
+    await this.ensureProjectSandbox(projectId);
+    const project = this.projects.get(projectId);
+    if (!project.sandbox || !this.sandbox?.openServiceAccess) throw new HttpError(503, 'Sandbox 服务代理未配置');
+    const read = ['GET', 'HEAD'].includes(method) ? this.projects.beginRead(project.id) : undefined;
+    const releaseProject = read?.release ?? this.projects.acquire(project.id);
+    let projectReleased = false;
+    const release = () => { if (!projectReleased) { projectReleased = true; releaseProject(); } };
+    const signal = read ? AbortSignal.any([requestSignal, read.signal]) : requestSignal;
+    try {
+      const access = await this.sandbox.openServiceAccess(this.projectWorkspace(project), port, signal);
+      let released = false;
+      const done = async () => {
+        if (released) return;
+        released = true;
+        try { await access.release(); } finally { release(); }
+      };
+      if (signal.aborted) { await done(); signal.throwIfAborted(); }
+      return { ...access, signal, release: done };
+    } catch (error) { release(); read?.signal.throwIfAborted(); throw error; }
   }
 
   async projectService(projectId: string, port: number, path: string, request: Request): Promise<Response> {

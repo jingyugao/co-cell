@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { HttpError } from '../../util/errors.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { workspaceFileResponse } from '../workspaces/http-files.js';
+import { applicationCookies, applicationSetCookie, previewLocation } from './preview-policy.js';
 import { serviceHost } from './service-host.js';
 import { PROJECT_OPERATION_WAIT_MS } from '../../protocol/types.js';
 
@@ -16,20 +17,21 @@ function projectOperationResponse(c: Context, project: Awaited<ReturnType<Projec
 
 export async function proxyProjectService(manager: Pick<SessionManager, 'projectService'>, projectId: string, port: number,
   path: string, request: Request, prefix: string, isolatedOrigin = false): Promise<Response> {
-  const response = await manager.projectService(projectId, port, path, request);
+  const requestHeaders = new Headers(request.headers);
+  const cookie = isolatedOrigin ? applicationCookies(requestHeaders.get('cookie')) : undefined;
+  if (cookie) requestHeaders.set('cookie', cookie); else requestHeaders.delete('cookie');
+  const response = await manager.projectService(projectId, port, path, new Request(request, { headers: requestHeaders }));
   const headers = new Headers(response.headers);
   const location = headers.get('location');
-  if (location) {
-    try {
-      const target = new URL(location, `http://localhost:${port}${path}`);
-      if (['localhost', '127.0.0.1', '0.0.0.0'].includes(target.hostname) && Number(target.port || 80) === port)
-        headers.set('location', `${prefix}${target.pathname}${target.search}${target.hash}`);
-    } catch { /* Keep the upstream location. */ }
-  }
+  if (location) headers.set('location', previewLocation(location, port, path, prefix));
   headers.delete('set-cookie');
+  if (isolatedOrigin) for (const raw of response.headers.getSetCookie()) {
+    const cookie = applicationSetCookie(raw);
+    if (cookie) headers.append('set-cookie', cookie);
+  }
   headers.set('Cache-Control', 'no-store');
   if (!isolatedOrigin) headers.set('Content-Security-Policy', 'sandbox allow-scripts allow-forms allow-popups');
-  headers.set('Referrer-Policy', 'no-referrer');
+  headers.set('Referrer-Policy', isolatedOrigin ? 'same-origin' : 'no-referrer');
   headers.set('X-Content-Type-Options', 'nosniff');
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }

@@ -1,3 +1,4 @@
+import { proxyFetch } from 'httpxy';
 import { traced } from '@co-cell/sandbox';
 import { withNativeUserInput } from '../../util/user-input.js';
 import type { SandboxImageIdentity, SandboxState } from '../../protocol/sandbox-types.js';
@@ -21,6 +22,12 @@ import { HttpError } from '../../util/errors.js';
 import { abortable } from '../../util/abortable.js';
 import type { WorkspaceFileResult } from '../workspaces/files.js';
 
+export interface ServiceProxyAccess {
+  url: string;
+  headers: Record<string, string>;
+  release(): Promise<void>;
+}
+
 export interface SandboxRuntime {
   observe?(session: Session, turn: Turn, signal: AbortSignal): AsyncGenerator<NativeTurnObservation>;
 	remoteArchives?: import('../archives/remote.js').RemoteArchives;
@@ -32,6 +39,7 @@ export interface SandboxRuntime {
   detach(turn: Turn): void;
   interrupt?(session: Session, turn: Turn): Promise<void>;
   steer?(session: Session, turn: Turn, text: string): Promise<boolean>;
+  openServiceAccess?(session: WorkspaceTarget, port: number, signal: AbortSignal): Promise<ServiceProxyAccess>;
   service?(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response>;
   file(session: WorkspaceTarget, path: string, signal?: AbortSignal): Promise<WorkspaceFileResult>;
   fileResponse?(session: WorkspaceTarget, path: string, request: Request): Promise<Response>;
@@ -520,6 +528,22 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     void this.appServerObservers.get(turn.id)?.close();
   }
 
+  async openServiceAccess(session: WorkspaceTarget, port: number, signal: AbortSignal): Promise<ServiceProxyAccess> {
+    if (!this.options.serviceAccess) throw new HttpError(503, 'Sandbox 服务代理未配置');
+    const entry = await this.acquire(session, false, undefined, undefined, signal);
+    let released = false;
+    const release = async () => {
+      if (released) return;
+      released = true;
+      await this.release(entry, true);
+    };
+    try {
+      const access = await this.options.serviceAccess(entry.sandbox.sandboxId, port);
+      signal.throwIfAborted();
+      return { ...access, release };
+    } catch (error) { await release(); throw error; }
+  }
+
   async service(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response> {
     if (!this.options.serviceAccess) throw new HttpError(503, 'Sandbox 服务代理未配置');
     const entry = await this.acquire(session, false, undefined, undefined, request.signal);
@@ -537,10 +561,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         if (value !== null) headers.set(name, value);
       }
       const url = `${access.url.replace(/\/$/, '')}${path}`;
-      const upstream = await fetch(url, { method: request.method, headers,
-        body: ['GET', 'HEAD'].includes(request.method) ? undefined : await request.arrayBuffer(), redirect: 'manual', signal: request.signal });
+      const upstream = await proxyFetch(new URL(access.url).origin, url, { method: request.method, headers,
+        body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body, redirect: 'manual', signal: request.signal },
+        { changeOrigin: true });
       const outHeaders = new Headers();
-      for (const name of ['content-type', 'content-disposition', 'cache-control', 'etag', 'last-modified', 'location', 'accept-ranges', 'content-range']) {
+      for (const name of ['content-type', 'content-encoding', 'content-length', 'vary', 'content-disposition', 'cache-control', 'etag', 'last-modified', 'location', 'accept-ranges', 'content-range']) {
         const value = upstream.headers.get(name);
         if (value !== null) outHeaders.set(name, value);
       }

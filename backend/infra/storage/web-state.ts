@@ -1,3 +1,4 @@
+import { MySqlPreviewGrantStore } from '../../access/preview-grants.js';
 import { MySqlModelRuntimeRepository } from '../../models/runtime-repository.js';
 import { MySqlModelRepository } from '../../models/repository.js';
 import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
@@ -74,12 +75,14 @@ function requireMySqlUrl(value: string | undefined): string {
 /** Web metadata and sandbox-local ~/.codex are intentionally separate. */
 export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   private pool: Pool;
+  readonly previewGrants: MySqlPreviewGrantStore;
   readonly modelRuntimeRepository: MySqlModelRuntimeRepository;
   readonly modelRepository: MySqlModelRepository;
   readonly secretRepository: MySqlSecretRepository;
   readonly notificationRepository: MySqlNotificationRepository;
   constructor(url: string) {
     this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' });
+    this.previewGrants = new MySqlPreviewGrantStore(this.pool);
     this.modelRuntimeRepository = new MySqlModelRuntimeRepository(this.pool);
     this.modelRepository = new MySqlModelRepository(this.pool);
     this.secretRepository = new MySqlSecretRepository(this.pool);
@@ -93,6 +96,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     await this.pool.query('INSERT INTO managed_images (id,document) VALUES (?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE document=VALUES(document)', [image.id, JSON.stringify(image)]);
   }
   async init() {
+    await this.previewGrants.init();
     await this.pool.query(`CREATE TABLE IF NOT EXISTS managed_images (id CHAR(36) PRIMARY KEY, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS projects (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL, requirement_url TEXT NULL, execution_mode ENUM('sandbox','local') NOT NULL, working_directory TEXT NOT NULL, archived_at DATETIME(3) NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sessions (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NULL, thread_id VARCHAR(191) NULL, title VARCHAR(255) NOT NULL, status ENUM('idle','running','completed','failed','cancelled') NOT NULL, archived_at DATETIME(3) NULL, started_at DATETIME(3) NOT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL, INDEX sessions_project_updated (project_id, updated_at), CONSTRAINT sessions_project_fk FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);

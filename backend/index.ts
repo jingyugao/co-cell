@@ -1,3 +1,4 @@
+import { createPreviewProxy } from './projects/preview-proxy.js';
 import { ModelService } from './models/service.js';
 import { ModelGateway } from './models/gateway.js';
 import { initializeTracing } from './infra/diagnostics/tracing.js';
@@ -188,17 +189,29 @@ const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
   inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), undefined, notifications,
-  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,projects:()=>manager.listProjects() }, imageCatalog, secrets, models, modelGateway);
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, modelGateway);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }
 const listener = getRequestListener(app.fetch);
 const { isAuthenticatedDevRequest } = await import('./access/operator.js');
+const previewProxy = previewSubdomains ? createPreviewProxy({ publicUrl, token: process.env.COCELL_ACCESS_TOKEN!,
+  projects: () => manager.listProjects(), refreshProjects: () => manager.refreshSharedState(),
+  access: (projectId, port, method, signal) => manager.projectServiceAccess(projectId, port, method, signal),
+  onError: error => { void runtimeLog.write({ event: 'preview.proxy_failed', error }); },
+}) : undefined;
 const server = createServer((request, response) => {
-  if (!vite || /^\/(?:api|mcp|auth)(?:\/|\?|$)/.test(request.url??'') ||
-      !isAuthenticatedDevRequest(request,publicHost,process.env.COCELL_ACCESS_TOKEN!)) {
-    void listener(request,response);
-  } else vite.middlewares(request,response);
+  void (async () => {
+    if (previewProxy && await previewProxy.handle(request, response)) return;
+    if (!vite || /^\/(?:api|mcp|auth)(?:\/|\?|$)/.test(request.url??'') ||
+        !isAuthenticatedDevRequest(request,publicHost,process.env.COCELL_ACCESS_TOKEN!)) {
+      await listener(request,response);
+    } else vite.middlewares(request,response);
+  })().catch(error => { void runtimeLog.write({ event: 'preview.request_failed', error }); response.destroy(); });
+});
+server.on('upgrade', (request, socket, head) => {
+  if (!previewProxy) { socket.destroy(); return; }
+  void previewProxy.upgrade(request, socket as import('node:net').Socket, head).catch(() => socket.destroy());
 });
 server.listen(port, process.env.HOST || '127.0.0.1', () => {
   void runtimeLog.write({ event: 'service.started', port, model: defaults.model, executionMode: 'sandbox' });
@@ -208,7 +221,7 @@ let shuttingDown = false;
 // Periodic sandbox archive for active projects — every 30 minutes
 const archiveInterval = setInterval(() => { void manager.scheduledArchive().catch(() => {}); }, 60 * 1000);
 archiveInterval.unref();
-async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await manager.close(); await cellboxRuntime.close(); await sandboxManager.close();
+async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await previewProxy?.close(); await manager.close(); await cellboxRuntime.close(); await sandboxManager.close();
   clearInterval(archiveInterval);
   await coordinator?.close();
   await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); await shutdownTracing?.(); }

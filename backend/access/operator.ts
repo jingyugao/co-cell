@@ -1,13 +1,17 @@
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { Hono, type Context } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { setCookie } from 'hono/cookie';
 import { parseServiceHost } from '../projects/service-host.js';
+import { MemoryPreviewGrantStore, type PreviewGrantStore } from './preview-grants.js';
 import { isPublicPwaAsset } from '../../util/pwa-assets.js';
 
 const COOKIE = 'cocell_operator';
-const PREVIEW_COOKIE = 'cocell_preview';
+export const PREVIEW_COOKIE = '__Host-cocell_preview';
+const CHALLENGE_COOKIE = '__Host-cocell_preview_challenge';
+export const PREVIEW_CALLBACK = '/__cocell/preview/callback';
+const PREVIEW_TTL_MS = 3 * 60 * 60 * 1000;
 const MAX_LOGIN_BYTES = 4096;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_RENEW_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -15,6 +19,8 @@ export interface OperatorAccessOptions {
   token: string;
   publicUrl: string;
   previewSubdomains?: boolean;
+  previewGrants?: PreviewGrantStore;
+  refreshProjects?: () => Promise<void>;
   serviceProxy?: (projectId: string, port: number, path: string, request: Request) => Promise<Response>;
   projects: () => Array<{
     id: string;
@@ -63,7 +69,16 @@ export function isAuthenticatedOperatorRequest(headers: AuthHeaders, token: stri
     const bearer = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
     return fixedEqual(bearer, token);
   }
-  return sessionExpiry(sessionCookie(header(headers, 'cookie')), token) !== undefined;
+  const raw = header(headers, 'cookie');
+  const secureCookie = sessionCookie(raw, '__Host-cocell_operator');
+  return sessionExpiry(secureCookie ?? sessionCookie(raw), token) !== undefined;
+}
+
+/** Application Authorization headers are independent of platform authentication. */
+export function isAuthenticatedPreviewRequest(headers: AuthHeaders, host: string, token: string): boolean {
+  const authorization = header(headers, 'authorization');
+  if (authorization?.startsWith('Bearer ') && fixedEqual(authorization.slice(7), token)) return true;
+  return sessionExpiry(sessionCookie(header(headers, 'cookie'), PREVIEW_COOKIE), token, `preview:${host.toLowerCase()}`) !== undefined;
 }
 
 /** Vite must only receive authenticated asset requests in Cellbox mode. */
@@ -85,7 +100,7 @@ function safeReturnPath(input: string | null, publicOrigin: string): string {
   try { url = new URL(input, publicOrigin); } catch { return '/'; }
   if (url.origin !== publicOrigin || url.hash) return '/';
   if (url.pathname === '/auth/login') return '/';
-  return url.pathname;
+  return url.pathname + (url.pathname === '/auth/preview' ? url.search : '');
 }
 
 function safeLoginTarget(input: string | null, publicOrigin: string,
@@ -96,7 +111,7 @@ function safeLoginTarget(input: string | null, publicOrigin: string,
     const url = new URL(input);
     const root = new URL(publicOrigin);
     if (url.protocol !== root.protocol || url.username || url.password || url.hash ||
-      !resolvePreviewHost(url.host)) return '/';
+      url.pathname.startsWith('//') || !resolvePreviewHost(url.host)) return '/';
     return url.href;
   } catch { return '/'; }
 }
@@ -119,6 +134,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
   if (options.previewSubdomains && (publicUrl.protocol !== 'https:' || !publicUrl.hostname.includes('.'))) {
     throw new Error('Preview subdomains require an HTTPS public URL with a domain name');
   }
+  const grants = options.previewGrants ?? new MemoryPreviewGrantStore();
   const origin = publicUrl.origin;
   const host = publicUrl.host.toLowerCase();
   const resolvePreviewHost = options.previewSubdomains
@@ -130,7 +146,8 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     if (publicUrl.protocol === 'https:') c.header('Strict-Transport-Security', 'max-age=86400');
     const requestHost = (c.req.header('host') ?? new URL(c.req.url).host).toLowerCase();
     // no-referrer makes browser form POSTs send Origin: null, breaking the CSRF checks.
-    c.header('Referrer-Policy', requestHost === host ? 'same-origin' : 'no-referrer');
+    const pathname = new URL(c.req.url).pathname;
+    c.header('Referrer-Policy', pathname === PREVIEW_CALLBACK || requestHost === host && pathname === '/auth/preview' ? 'no-referrer' : 'same-origin');
     c.header('X-Content-Type-Options', 'nosniff');
     if (requestHost !== host) return;
     c.header('X-Frame-Options', 'DENY');
@@ -139,50 +156,69 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
       c.header('Content-Security-Policy', "script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
     }
   });
-  const setSessionCookie = (c: Context, scope: 'operator' | 'preview') => {
-    const expires = String(Date.now() + SESSION_TTL_MS);
-    // Initialize the context response so Hono preserves these headers when a
-    // downstream file or preview handler returns a raw Response.
+  const setSessionCookie = (c: Context, scope: 'operator' | 'preview', requestHost = host) => {
+    const ttl = scope === 'operator' ? SESSION_TTL_MS : PREVIEW_TTL_MS;
+    const expires = String(Date.now() + ttl);
+    const signatureScope = scope === 'operator' ? scope : `preview:${requestHost}`;
     c.res.headers.set('Cache-Control', 'no-store');
-    setCookie(c, scope === 'operator' ? COOKIE : PREVIEW_COOKIE, `v1.${expires}.${sessionSignature(options.token, expires, scope)}`, {
-      path: '/', ...(scope === 'preview' ? { domain: publicUrl.hostname } : {}),
-      httpOnly: true, sameSite: 'Lax', secure: publicUrl.protocol === 'https:', maxAge: SESSION_TTL_MS / 1000,
-    });
+    setCookie(c, scope === 'operator' ? (publicUrl.protocol === 'https:' ? '__Host-cocell_operator' : COOKIE) : PREVIEW_COOKIE,
+      `v1.${expires}.${sessionSignature(options.token, expires, signatureScope)}`, {
+        path: '/', httpOnly: true, sameSite: 'Lax', secure: publicUrl.protocol === 'https:', maxAge: ttl / 1000,
+      });
   };
-  const renewSessionCookie = (c: Context, scope: 'operator' | 'preview') => {
-    const expires = sessionExpiry(sessionCookie(c.req.header('cookie'), scope === 'operator' ? COOKIE : PREVIEW_COOKIE), options.token, scope);
-    if (expires !== undefined && expires - Date.now() <= SESSION_TTL_MS - SESSION_RENEW_INTERVAL_MS) {
-      setSessionCookie(c, scope);
-    }
+  const renewSessionCookie = (c: Context) => {
+    const raw = c.req.header('cookie');
+    const secureCookie = sessionCookie(raw, '__Host-cocell_operator');
+    const expires = sessionExpiry(secureCookie ?? sessionCookie(raw), options.token);
+    if (expires !== undefined && (secureCookie === undefined && publicUrl.protocol === 'https:' ||
+      expires - Date.now() <= SESSION_TTL_MS - SESSION_RENEW_INTERVAL_MS)) setSessionCookie(c, 'operator');
   };
-
-  if (options.previewSubdomains) app.use('*', bodyLimit({
-    maxSize: 12 * 1024 * 1024,
-    onError: c => c.text('Request too large', 413)
-  }));
+  const clearLegacyPreviewCookie = (c: Context) => {
+    if (!options.previewSubdomains) return;
+    setCookie(c, 'cocell_preview', '', { domain: publicUrl.hostname, path: '/', secure: true,
+      httpOnly: true, sameSite: 'Lax', maxAge: 0 });
+  };
 
   app.use('*', async (c, next) => {
     const path = new URL(c.req.url).pathname;
     const requestHost = (c.req.header('host') ?? new URL(c.req.url).host).toLowerCase();
-    // Internal tool-runtime endpoints route by Box ID without authentication.
-    if (c.req.method === 'POST' && (/^\/api\/tool-runtime\/(authorize|start|files)$/.test(path) || /^\/api\/tool-runtime\/[0-9a-f-]{36}\/complete$/.test(path))) return next();
     if (requestHost !== host) {
-      const target = resolvePreviewHost?.(requestHost);
+      let target = resolvePreviewHost?.(requestHost);
+      if (!target && requestHost.endsWith(`.${host}`)) {
+        await options.refreshProjects?.();
+        target = resolvePreviewHost?.(requestHost);
+      }
       if (!target || !options.serviceProxy) return c.text('Invalid host', 403);
       const serviceOrigin = `${publicUrl.protocol}//${requestHost}`;
-      const authorization = c.req.header('authorization');
-      const authenticated = authorization === undefined
-        ? sessionExpiry(sessionCookie(c.req.header('cookie'), PREVIEW_COOKIE), options.token, 'preview') !== undefined
-        : isAuthenticatedOperatorRequest(c.req.raw.headers, options.token);
-      if (!authenticated) {
+      if (path === PREVIEW_CALLBACK) {
+        if (c.req.method !== 'GET') return c.text('Method not allowed', 405);
+        c.header('Cache-Control', 'no-store');
+        c.header('Referrer-Policy', 'no-referrer');
+        const code = new URL(c.req.url).searchParams.get('code') ?? '';
+        const challenge = sessionCookie(c.req.header('cookie'), CHALLENGE_COOKIE) ?? '';
+        if (!/^[A-Za-z0-9_-]{43}$/.test(code) || !/^[A-Za-z0-9_-]{43}$/.test(challenge)) return c.text('Invalid preview grant', 403);
+        const grant = await grants.consume(code, requestHost, createHash('sha256').update(challenge).digest('hex'));
+        if (!grant) return c.text('Invalid or expired preview grant', 403);
+        setSessionCookie(c, 'preview', requestHost);
+        return c.redirect(grant.path, 303);
+      }
+      if (!isAuthenticatedPreviewRequest(c.req.raw.headers, requestHost, options.token)) {
+        if (!['GET', 'HEAD'].includes(c.req.method)) return c.text('Preview authentication required', 401);
+        const existing = sessionCookie(c.req.header('cookie'), CHALLENGE_COOKIE);
+        const challenge = existing && /^[A-Za-z0-9_-]{43}$/.test(existing) ? existing : randomBytes(32).toString('base64url');
+        setCookie(c, CHALLENGE_COOKIE, challenge, { path: '/', secure: true, httpOnly: true, sameSite: 'Lax', maxAge: 300 });
+        c.header('Cache-Control', 'no-store');
         const returnUrl = `${serviceOrigin}${path}${new URL(c.req.url).search}`;
-        return c.redirect(`${origin}/auth/preview?next=${encodeURIComponent(returnUrl)}`, 303);
+        return c.redirect(`${origin}/auth/preview?next=${encodeURIComponent(returnUrl)}&challenge=${createHash('sha256').update(challenge).digest('hex')}`, 303);
       }
       const requestOrigin = c.req.header('origin');
       if (requestOrigin && requestOrigin !== serviceOrigin) return c.text('Invalid origin', 403);
-      if (authorization === undefined) renewSessionCookie(c, 'preview');
-      return options.serviceProxy(target.projectId, target.port, path + new URL(c.req.url).search, c.req.raw);
+      const headers = new Headers(c.req.raw.headers);
+      if (headers.get('authorization') === `Bearer ${options.token}`) headers.delete('authorization');
+      return options.serviceProxy(target.projectId, target.port, path + new URL(c.req.url).search, new Request(c.req.raw, { headers }));
     }
+    // Internal tool-runtime endpoints are only exposed on the configured control-plane host.
+    if (c.req.method === 'POST' && (/^\/api\/tool-runtime\/(authorize|start|files)$/.test(path) || /^\/api\/tool-runtime\/[0-9a-f-]{36}\/complete$/.test(path))) return next();
     if (isPublicPwaAsset(path, c.req.method)) return next();
     if (path === '/auth/login' && ['GET', 'POST'].includes(c.req.method)) {
       return next();
@@ -191,8 +227,8 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     const authenticated = isAuthenticatedOperatorRequest(c.req.raw.headers, options.token);
     if (!authenticated) {
       if (path === '/auth/preview' && options.previewSubdomains) {
-        const target = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, resolvePreviewHost);
-        return c.redirect(`/auth/login?next=${encodeURIComponent(target)}`, 303);
+        const requested = new URL(c.req.url);
+        return c.redirect(`/auth/login?next=${encodeURIComponent(requested.pathname + requested.search)}`, 303);
       }
       if (path.startsWith('/api/')) {
         return c.json({ error: 'Authentication required' }, 401);
@@ -205,8 +241,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
       return c.json({ error: 'Invalid origin' }, 403);
     }
     if (authorization === undefined) {
-      renewSessionCookie(c, 'operator');
-      if (options.previewSubdomains) renewSessionCookie(c, 'preview');
+      renewSessionCookie(c);
     }
     return next();
   });
@@ -220,8 +255,8 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     c.header('Cache-Control', 'no-store');
     if (isAuthenticatedOperatorRequest(c.req.raw.headers, options.token)) {
       if (c.req.header('authorization') === undefined) {
-        renewSessionCookie(c, 'operator');
-        if (options.previewSubdomains) renewSessionCookie(c, 'preview');
+        renewSessionCookie(c);
+
       }
       return c.redirect(nextPath, 303);
     }
@@ -252,15 +287,26 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     }
     const nextPath = safeLoginTarget(form.get('next'), origin, resolvePreviewHost);
     setSessionCookie(c, 'operator');
-    if (options.previewSubdomains) setSessionCookie(c, 'preview');
+    clearLegacyPreviewCookie(c);
     c.header('Cache-Control', 'no-store');
     return c.redirect(nextPath, 303);
   });
 
-  if (options.previewSubdomains) app.get('/auth/preview', c => {
-    const target = safeLoginTarget(new URL(c.req.url).searchParams.get('next'), origin, resolvePreviewHost);
-    setSessionCookie(c, 'preview');
+  if (options.previewSubdomains) app.get('/auth/preview', async c => {
+    await options.refreshProjects?.();
+    const requested = new URL(c.req.url);
+    const target = safeLoginTarget(requested.searchParams.get('next'), origin, resolvePreviewHost);
+    const challenge = requested.searchParams.get('challenge') ?? '';
+    if (target === '/' || !/^[a-f0-9]{64}$/.test(challenge)) return c.text('Invalid preview target', 400);
+    const url = new URL(target);
+    const project = resolvePreviewHost?.(url.host);
+    if (!project || !options.projects().some(p => p.id === project.projectId && p.executionMode === 'sandbox' && p.sandbox && p.status !== 'archived'))
+      return c.text('Preview project unavailable', 403);
+    const code = await grants.issue({ host: url.host.toLowerCase(), path: url.pathname + url.search,
+      challenge, expires: Date.now() + 60_000 });
+    clearLegacyPreviewCookie(c);
     c.header('Cache-Control', 'no-store');
-    return c.redirect(target, 303);
+    c.header('Referrer-Policy', 'no-referrer');
+    return c.redirect(`${url.origin}${PREVIEW_CALLBACK}?code=${encodeURIComponent(code)}`, 303);
   });
 }

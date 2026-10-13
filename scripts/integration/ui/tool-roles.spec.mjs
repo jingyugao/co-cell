@@ -30,17 +30,15 @@ test('create a role with multiple MySQL and kubectl connections, set default, an
   await page.getByRole('button', { name: '新建角色', exact: true }).click();
   const form = page.locator('.role-form');
   await form.getByLabel('角色名称', { exact: true }).fill('数据运维');
-  await form.getByLabel('连接 1 工具').selectOption('mysql');
-  await form.getByLabel('连接 1 别名').fill('reporting');
-  await form.getByLabel('连接 1 认证 Secret').selectOption('mysql-reporting');
-  await form.getByRole('button', { name: '添加连接', exact: true }).click();
-  await form.getByLabel('连接 2 工具').selectOption('mysql');
-  await form.getByLabel('连接 2 别名').fill('warehouse');
-  await form.getByLabel('连接 2 认证 Secret').selectOption('mysql-warehouse');
-  await form.getByRole('button', { name: '添加连接', exact: true }).click();
-  await form.getByLabel('连接 3 工具').selectOption('kubectl');
-  await form.getByLabel('连接 3 别名').fill('staging');
-  await form.getByLabel('连接 3 认证 Secret').selectOption('kube-staging');
+  await expect(form.getByLabel('mysql 凭证：报表库')).not.toBeChecked();
+  await expect(form.getByLabel('mysql 凭证：数仓')).not.toBeChecked();
+  await expect(form.getByLabel('kubectl 凭证：测试集群')).not.toBeChecked();
+  await form.getByLabel('mysql 凭证：报表库').check();
+  await form.getByLabel('mysql 报表库 别名').fill('reporting');
+  await form.getByLabel('mysql 凭证：数仓').check();
+  await form.getByLabel('mysql 数仓 别名').fill('warehouse');
+  await form.getByLabel('kubectl 凭证：测试集群').check();
+  await form.getByLabel('kubectl 测试集群 别名').fill('staging');
   await form.getByRole('button', { name: '保存角色', exact: true }).click();
   await expect(page.getByRole('article').filter({ hasText: '数据运维' })).toBeVisible();
   expect(roleSave).toEqual({ name: '数据运维', connections: [
@@ -59,6 +57,47 @@ test('create a role with multiple MySQL and kubectl connections, set default, an
   await dialog.getByRole('button', { name: '保存', exact: true }).click();
   expect(projectSave).toEqual({ roleId: 'data-ops' });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test('editing a role preserves aliases, allows deselection, and replaces single-connection credentials', async ({ page, ui }) => {
+  const secrets = [
+    secret('mysql-reporting', '报表库', 'mysql'),
+    secret('mysql-warehouse', '数仓', 'mysql'),
+    secret('glab-old', '旧 GitLab', 'glab'),
+    secret('glab-new', '新 GitLab', 'glab'),
+  ];
+  const existingRole = {
+    id: 'data-ops', name: '数据运维', connections: [
+      { tool: 'mysql', alias: 'reporting', secretId: 'mysql-reporting' },
+      { tool: 'mysql', alias: 'warehouse', secretId: 'mysql-warehouse' },
+      { tool: 'glab', alias: 'gitlab', secretId: 'glab-old' },
+    ], createdAt: stamp, updatedAt: stamp,
+  };
+  let roleSave;
+  await page.route('**/api/secrets', route => route.fulfill({ json: secrets }));
+  await page.route('**/api/tool-roles**', async route => {
+    const request = route.request();
+    if (request.method() === 'PUT') {
+      roleSave = request.postDataJSON();
+      return route.fulfill({ json: { ...existingRole, ...roleSave } });
+    }
+    await route.fulfill({ json: { roles: [defaultRole, existingRole], defaultRoleId: defaultRole.id } });
+  });
+  await page.goto('/#connections');
+  const card = page.getByRole('article').filter({ hasText: '数据运维' });
+  await card.getByRole('button', { name: '编辑角色：数据运维', exact: true }).click();
+  const form = page.locator('.role-form');
+  await expect(form.getByLabel('mysql 报表库 别名')).toHaveValue('reporting');
+  await expect(form.getByLabel('mysql 数仓 别名')).toHaveValue('warehouse');
+  await expect(form.getByLabel('glab 凭证')).toHaveValue('glab-old');
+  await form.getByLabel('mysql 凭证：报表库').uncheck();
+  await form.getByLabel('glab 凭证').selectOption('glab-new');
+  await form.getByRole('button', { name: '保存角色', exact: true }).click();
+  await expect(page.locator('.role-form')).toHaveCount(0);
+  expect(roleSave).toEqual({ name: '数据运维', connections: [
+    { tool: 'mysql', alias: 'warehouse', secretId: 'mysql-warehouse' },
+    { tool: 'glab', alias: 'gitlab', secretId: 'glab-new' },
+  ] });
 });
 
 test('role catalog load failure blocks project role saves and no legacy controls or requests remain', async ({ page, ui }) => {

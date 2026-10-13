@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { CellboxClient, CellboxError, type CellboxImportedImage } from '../../packages/sandbox/src/providers/cellbox/client.js';
 import type { ManagedImage, AddImageRepositoryInput, RegistryAuth, SyncImageVersionInput, ProjectImageSelection, ImageVersionUsage } from '../../protocol/image-types.js';
 import type { Project } from '../../protocol/types.js';
@@ -9,7 +9,9 @@ import { DockerRegistryClient, normalizeRepository, registryImageReference, type
 import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 
 const publicImage = ({ versionLifecycle: _lifecycle, deletedAt: _deletedAt, ...record }: ImageRecord): ManagedImage => ({ ...record,
-  versions: record.versions.filter(version => !version.deletedAt).map(({ request: _request, requiresRegistryAuth, ...version }) => ({ ...version, registryAuthRequired: requiresRegistryAuth })) });
+  versions: record.versions.filter(version => !version.deletedAt).map(({ request: _request, preparationKey: _preparationKey, requiresRegistryAuth, ...version }) => ({ ...version, registryAuthRequired: requiresRegistryAuth })) });
+const preparationKey = (request: ImageVersionRecord['request']) => createHash('sha256')
+  .update(JSON.stringify([request.url, request.platform, request.buildCommand, request.runCommand])).digest('hex');
 const usageLabels: Record<string, string> = {
   'boxes-reference-image': 'Cellbox 中仍有环境或 Checkpoint 引用此镜像',
   'profiles-reference-image': '系统运行配置仍引用此镜像',
@@ -165,18 +167,36 @@ export class ImageCatalog {
         throw new HttpError(409, '已有版本正在同步或结果待确认，请等待完成或确认结果');
       }
       const digest = await this.registry.resolveTag(stored.repository!, input.tag, input.registryAuth);
-      const request = await prepareImageRequest(registryImageReference(stored.repository!, digest), stored.buildCommand);
+      const desired = await prepareImageRequest(registryImageReference(stored.repository!, digest), stored.buildCommand);
+      const key = preparationKey(desired);
       const existing = stored.versions.find(version => !version.deletedAt && !version.cleanup && version.version === input.tag);
-      if (existing?.upstreamDigest === digest && existing.status === 'succeeded' && existing.request.buildCommand === request.buildCommand) return publicImage(stored);
+      if (existing?.upstreamDigest === digest && existing.status === 'succeeded' && (existing.preparationKey ?? preparationKey(existing.request)) === key) return publicImage(stored);
+      // An unchanged source and operator script already produced a working
+      // environment. Repackage that immutable result when only our CLI payload
+      // changes, instead of re-running downloads and other operator side effects.
+      const prior = stored.versions.find(version => !version.deletedAt && !version.cleanup && version.status === 'succeeded'
+        && version.upstreamDigest === digest && version.buildCommand === stored.buildCommand && version.projectReady !== false
+        && version.importedImageId && version.image && /^[^\s@]+@sha256:[a-f0-9]{64}$/.test(version.image));
+      let request = desired, reuse = false;
+      if (prior) {
+        try {
+          const image = await this.client.getImage(prior.importedImageId!);
+          if (!image.deleting && image.image === prior.image) {
+            request = await prepareImageRequest(prior.image!); reuse = true;
+          }
+        } catch (error) {
+          if (!(error instanceof CellboxError) || error.code !== 'NOT_FOUND') throw error;
+        }
+      }
       const source = registryImageReference(stored.repository!, input.tag);
       const record = structuredClone(stored);
       const version: ImageVersionRecord = { id: randomUUID(), version: input.tag, source, upstreamDigest: digest,
-        status: 'submitting', createdAt: new Date().toISOString(), request, projectReady: true, requiresRegistryAuth: Boolean(input.registryAuth),
+        status: 'submitting', createdAt: new Date().toISOString(), request, preparationKey: key, projectReady: true, requiresRegistryAuth: !reuse && Boolean(input.registryAuth),
         ...(stored.buildCommand ? { buildCommand: stored.buildCommand } : {}), runCommand: request.runCommand };
       record.versions.unshift(version);
       // Save the exact request and key before submitting any external mutation.
       await this.save(record);
-      await this.submit(record, version, input.registryAuth);
+      await this.submit(record, version, reuse ? undefined : input.registryAuth);
       return publicImage(this.records.get(record.id)!);
     });
   }

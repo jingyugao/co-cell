@@ -4,6 +4,8 @@ import type { CellboxImportImageInput } from '../../packages/sandbox/src/provide
 export interface ImageVersionRecord extends ImageVersion {
   /** Exact request retained for idempotent retry; registry credentials are never stored. */
   request: Omit<CellboxImportImageInput, 'registryAuth'>;
+  /** Fingerprint of source + operator script + current CoCell packaging. */
+  preparationKey?: string;
   requiresRegistryAuth: boolean;
 }
 export interface ImageRecord extends Omit<ManagedImage, 'versions'> {

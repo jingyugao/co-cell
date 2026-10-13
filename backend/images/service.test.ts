@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { Hono } from 'hono';
 import { z } from 'zod';
@@ -64,12 +65,32 @@ function fixture() {
   function finish(operationId: string, source: string) {
     const operation = operations.get(operationId)!;
     operation.status = 'succeeded'; operation.result = { importedImageId: operationId };
-    images.set(operationId, { id: operationId, source, resolvedSource: `${source}@sha256:source`, image: `registry/prepared@sha256:${operationId}`,
+    const imageDigest = createHash('sha256').update(operationId).digest('hex');
+    images.set(operationId, { id: operationId, source, resolvedSource: `${source}@sha256:source`, image: `registry/prepared@sha256:${imageDigest}`,
       platform: 'linux/amd64', command: ['/usr/local/bin/node', '/opt/product/cocell/launcher.mjs'], env: {}, workingDir: '/home/agent/workspace',
       ports: [], warnings: ['runs as agent'], key: operationId, createdAt: new Date().toISOString() });
   }
   return { catalog, documents, submissions, deletions, projects, operations, images, upstream, finish,
     rejectDeletion: (reject: boolean) => { rejectDeletion = reject; }, loseResponse: () => { loseResponse = true; } };
+}
+
+async function completeSync(f: ReturnType<typeof fixture>, catalog: ImageCatalog, imageId: string, tag: string, auth?: { username: string; password: string }) {
+  const result = await catalog.sync(imageId, { tag, ...(auth ? { registryAuth: auth } : {}) });
+  const version = result.versions[0];
+  f.finish(version.operationId!, version.source);
+  await catalog.list();
+  return version;
+}
+
+function emulatePreFingerprintVersion(f: ReturnType<typeof fixture>, imageId: string, versionId: string) {
+  const record = f.documents.get(imageId)!;
+  const version = record.versions.find(value => value.id === versionId)!;
+  // Older records retained the exact Cellbox request but had no desired-request fingerprint.
+  // A stale platform packaging script simulates the previous CoCell payload.
+  version.request.buildCommand = 'old platform payload without the current native tooling';
+  delete version.preparationKey;
+  f.documents.set(imageId, structuredClone(record));
+  return structuredClone(version);
 }
 
 test('image catalog refreshes durable records under a shared lock and shares live restore reservations', async () => {
@@ -199,6 +220,81 @@ test('an upstream tag update creates a new pinned revision without changing exis
   const restarted = f.catalog(); await restarted.init();
   assert.deepEqual(await restarted.resolve(repo.id, original.id), selection);
   assert.notEqual((await restarted.resolve(repo.id, updated.versions[0].id))?.image, selection?.image);
+});
+
+test('native packaging refresh reuses an immutable prepared image and skips the operator build script', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const operatorCommand = 'cp /bundled/git /usr/local/bin/git';
+  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox',
+    buildCommand: operatorCommand, registryAuthRequired: true });
+  const auth = { username: 'synthetic-user', password: 'synthetic-password' };
+  const initial = await completeSync(f, catalog, repo.id, 'v1', auth);
+  assert.equal(f.submissions[0].body.registryAuth && (f.submissions[0].body.registryAuth as { password: string }).password, auth.password);
+  const prepared = emulatePreFingerprintVersion(f, repo.id, initial.id);
+
+  const refreshed = await catalog.sync(repo.id, { tag: 'v1', registryAuth: auth });
+  assert.equal(f.submissions.length, 2);
+  assert.equal(f.submissions[1].body.url, prepared.image);
+  assert.equal(f.submissions[1].body.registryAuth, undefined, 'upstream credentials must not reach the internal prepared-image import');
+  assert.doesNotMatch(String(f.submissions[1].body.buildCommand), /cp \/bundled\/git/);
+  assert.match(String(f.submissions[1].body.buildCommand), /launcher\.mjs/);
+  assert.doesNotMatch(JSON.stringify(refreshed), /preparationKey/);
+});
+
+test('retry after a failed repackaging sync reuses the earlier successful prepared image', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox',
+    buildCommand: 'cp /bundled/git /usr/local/bin/git' });
+  const initial = await completeSync(f, catalog, repo.id, 'v1');
+  const prepared = emulatePreFingerprintVersion(f, repo.id, initial.id);
+
+  const failed = await catalog.sync(repo.id, { tag: 'v1' });
+  const failedOperation = f.operations.get(failed.versions[0].operationId!)!;
+  failedOperation.status = 'failed'; failedOperation.error = { code: 'BUILD_FAILED', message: 'Cellbox unavailable' };
+  await catalog.list();
+  const retry = await catalog.sync(repo.id, { tag: 'v1' });
+  assert.equal(f.submissions.length, 3);
+  assert.equal(f.submissions[1].body.url, prepared.image);
+  assert.equal(f.submissions[2].body.url, prepared.image);
+  assert.equal(f.submissions[2].body.registryAuth, undefined);
+  assert.equal(retry.versions[0].status, 'running');
+});
+
+test('successful repackaging remains idempotent for the same source digest and operator command', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox',
+    buildCommand: 'cp /bundled/git /usr/local/bin/git' });
+  const initial = await completeSync(f, catalog, repo.id, 'v1');
+  emulatePreFingerprintVersion(f, repo.id, initial.id);
+
+  const repackaged = await completeSync(f, catalog, repo.id, 'v1');
+  assert.equal(f.submissions.length, 2);
+  const repeated = await catalog.sync(repo.id, { tag: 'v1' });
+  assert.equal(f.submissions.length, 2, 'an identical successful desired package must not start another import');
+  assert.equal(repeated.versions[0].id, repackaged.id);
+});
+
+test('changed upstream digest or operator build command forces a fresh upstream build', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const initialCommand = 'cp /bundled/git /usr/local/bin/git';
+  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox', buildCommand: initialCommand });
+  await completeSync(f, catalog, repo.id, 'v1');
+
+  const changedDigest = `sha256:${'b'.repeat(64)}`;
+  f.upstream.set('v1', changedDigest);
+  const sourceUpdate = await catalog.sync(repo.id, { tag: 'v1' });
+  assert.equal(f.submissions[1].body.url, `docker.io/team/mybox@${changedDigest}`);
+  assert.match(String(f.submissions[1].body.buildCommand), /cp \/bundled\/git/);
+  f.finish(sourceUpdate.versions[0].operationId!, sourceUpdate.versions[0].source);
+  await catalog.list();
+
+  const record = f.documents.get(repo.id)!;
+  record.buildCommand = 'echo changed-operator-command';
+  f.documents.set(repo.id, structuredClone(record));
+  const commandUpdate = await catalog.sync(repo.id, { tag: 'v1' });
+  assert.equal(f.submissions[2].body.url, `docker.io/team/mybox@${changedDigest}`);
+  assert.match(String(f.submissions[2].body.buildCommand), /echo changed-operator-command/);
+  assert.equal(commandUpdate.versions[0].status, 'running');
 });
 
 test('uncertain submission survives restart and retries the same request and key', async () => {
@@ -389,6 +485,7 @@ test('sync rebuilds unchanged upstream content when the platform tool installati
   await catalog.list();
   const saved = f.documents.get(repo.id)!;
   saved.versions[0].request.buildCommand = 'old launcher without proxies';
+  delete saved.versions[0].preparationKey;
   const restarted = f.catalog(); await restarted.init();
   const rebuilt = await restarted.sync(repo.id, { tag: 'v1' });
   assert.equal(rebuilt.versions.length, 2);

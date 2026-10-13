@@ -5,10 +5,18 @@ import { test, expect } from '../support/fixtures.mjs';
 import { failTestSandbox } from '../support/kubernetes.mjs';
 
 const exec = promisify(execFile);
+let ownedProjectId;
+let ownedRoleId;
 
 test.afterEach(async ({ environment: env }) => {
-  for (const id of env.projects.keys()) {
-    await env.json(`/api/projects/${id}/tool-permissions`, { method: 'PUT', body: { permissions: [] } });
+  if (!ownedProjectId && !ownedRoleId) return;
+  try {
+    if (ownedProjectId)
+      await env.json(`/api/projects/${ownedProjectId}/tool-role`, { method: 'PUT', body: { roleId: null } });
+  } finally {
+    if (ownedRoleId) await env.json(`/api/tool-roles/${ownedRoleId}`, { method: 'DELETE' });
+    ownedProjectId = undefined;
+    ownedRoleId = undefined;
   }
 });
 
@@ -23,19 +31,22 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
   assert(image?.defaultVersionId, 'Configure a default version of the native HOME image');
   const created = await env.json('/api/projects', { method: 'POST', expectedStatus: 201,
     body: { name: env.name('native-home'), type: 1, imageId: image.id, imageVersionId: image.defaultVersionId } });
+  ownedProjectId = created.id;
   const project = await env.waitProject(created.id, { kind: 'create', status: 'ready' });
   const credentialId = process.env.COCELL_E2E_TOOL_HOME_SECRET_ID;
   const secrets = await env.json('/api/secrets');
   const candidates = secrets.filter(secret => secret.tool === 'kubectl' && secret.enabled && secret.format === 'text');
   const credential = credentialId ? candidates.find(secret => secret.id === credentialId) : candidates.length === 1 ? candidates[0] : undefined;
-  assert(credential?.path, 'Configure one enabled kubectl file, or select the legacy binding explicitly with COCELL_E2E_TOOL_HOME_SECRET_ID');
-  if (credentialId) {
-    // Installations migrating from multiple legacy credentials already have
-    // explicit bindings. Seed only this test's binding; the deployed UI remains
-    // the authority for enabling and revoking its access.
-    await env.json(`/api/projects/${project.id}/tool-grants`, { method: 'POST',
-      body: { tool: 'kubectl', enabled: false, files: [{ secretId: credential.id, path: credential.path }] } });
-  }
+  assert(credential?.path, 'Configure one enabled kubectl file, or select it with COCELL_E2E_TOOL_HOME_SECRET_ID');
+  const mysqlId = process.env.COCELL_E2E_TOOL_HOME_MYSQL_SECRET_ID;
+  const mysqlCandidates = secrets.filter(secret => secret.tool === 'mysql' && secret.enabled && secret.format === 'text');
+  const mysqlCredential = mysqlId ? mysqlCandidates.find(secret => secret.id === mysqlId) : mysqlCandidates.length === 1 ? mysqlCandidates[0] : undefined;
+  assert(mysqlCredential?.path, 'Configure one enabled MySQL file, or select it with COCELL_E2E_TOOL_HOME_MYSQL_SECRET_ID');
+  const role = await env.json('/api/tool-roles', { method: 'POST', expectedStatus: 201, body: { name: env.name('native-home-role'), connections: [
+    { tool: 'kubectl', alias: 'cluster', secretId: credential.id }, { tool: 'mysql', alias: 'database', secretId: mysqlCredential.id },
+  ] } });
+  ownedRoleId = role.id;
+  await env.json(`/api/projects/${project.id}/tool-role`, { method: 'PUT', body: { roleId: role.id } });
   let pod;
   const findPod = async () => {
     const workloads = JSON.parse(await kubectl(['get', 'cellboxes', '-l', `cellbox.local/box-id=${project.sandbox.id}`, '-o', 'json']));
@@ -48,19 +59,23 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
   const guest = async code => JSON.parse(await kubectl(['exec', pod, '--', '/usr/local/bin/node', '-e', code]));
   const cli = args => guest(`const {spawnSync}=require('node:child_process');const r=spawnSync('/usr/local/bin/kubectl',${JSON.stringify(args)},{uid:11000,gid:11000,cwd:'/home/agent/workspace',env:{HOME:'/home/agent',PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:25000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.message}));`);
   const home = `/home/debug/${project.id}`;
-  const fileState = () => guest(`const fs=require('node:fs'),crypto=require('node:crypto');const p=${JSON.stringify(home + '/' + credential.path)};console.log(JSON.stringify(fs.existsSync(p)?{exists:true,sha256:crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')}:{exists:false}));`);
+  const kubectlPath = `.cocell/connections/kubectl/${credential.id}/config`;
+  const fileState = () => guest(`const fs=require('node:fs'),crypto=require('node:crypto');const p=${JSON.stringify(home + '/' + kubectlPath)};console.log(JSON.stringify(fs.existsSync(p)?{exists:true,sha256:crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')}:{exists:false}));`);
   const dialog = page.getByRole('dialog', { name: `${env.name('native-home')} 工具权限`, exact: true });
-  const group = dialog.getByRole('group', { name: 'kubectl', exact: true });
+  const catalog = await env.json('/api/tool-roles');
+  const defaultRole = catalog.roles.find(item => item.id === catalog.defaultRoleId);
+  assert(defaultRole);
+  const group = dialog.getByRole('group', { name: '项目角色', exact: true });
   const openPermissions = async () => {
     await page.goto('/#projects');
     await page.getByRole('article', { name: env.name('native-home'), exact: true }).getByRole('button', { name: '工具权限', exact: true }).click();
-    await expect(group.getByRole('radio')).toHaveCount(2);
+    await expect(group.getByRole('radio')).toHaveCount(catalog.roles.length + 1);
   };
   const savePermission = async enabled => {
     await openPermissions();
-    await group.getByRole('radio', { name: enabled ? '有' : '无', exact: true }).check();
+    await group.getByRole('radio', { name: enabled ? `${role.name}` : `${defaultRole.name} 默认角色`, exact: true }).check();
     const response = page.waitForResponse(response => response.request().method() === 'PUT'
-      && new URL(response.url()).pathname === `/api/projects/${project.id}/tool-permissions`);
+      && new URL(response.url()).pathname === `/api/projects/${project.id}/tool-role`);
     await dialog.getByRole('button', { name: '保存', exact: true }).click();
     assert.equal((await response).status(), 200);
     await expect(dialog).toHaveCount(0);
@@ -69,17 +84,17 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     pod = await findPod();
     await savePermission(true);
     assert.equal(await findPod(), pod);
-    const version = await cli(['version', '--client']);
+    const version = await cli(['--connection=cluster', 'version', '--client']);
     assert.equal(version.status, 0, version.stderr || version.error);
     assert.match(version.stdout, /Client Version:/);
-    const connection = await cli(['config', 'current-context']);
+    const connection = await cli(['--connection=cluster', 'config', 'current-context']);
     assert.equal(connection.status, 0, connection.stderr || connection.error);
-    const pods = await cli(['--context', process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? context, '-n', 'co-cell', 'get', 'pods', '-o', 'name']);
+    const pods = await cli(['--connection=cluster', '--context', process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? context, '-n', 'co-cell', 'get', 'pods', '-o', 'name']);
     assert.equal(pods.status, 0, pods.stderr);
     assert.match(pods.stdout, /^pod\//m);
     assert.equal((await fileState()).exists, true);
     await openPermissions();
-    await expect(group.getByRole('radio', { name: '有', exact: true })).toBeChecked();
+    await expect(group.getByRole('radio', { name: role.name, exact: true })).toBeChecked();
     const screenshot = test.info().outputPath('tool-permissions.png');
     await page.screenshot({ path: screenshot });
     await test.info().attach('deployed-tool-permissions', { path: screenshot, contentType: 'image/png' });
@@ -89,7 +104,7 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
   await env.step('Revocation immediately denies the agent CLI and removes its credential file', async () => {
     await savePermission(false);
     assert.equal(await findPod(), pod);
-    const denied = await cli(['config', 'current-context']);
+    const denied = await cli(['--connection=cluster', 'config', 'current-context']);
     assert.notEqual(denied.status, 0);
     assert.match(denied.stderr, /Tool authorization failed \(HTTP 403\)/);
     assert.equal((await fileState()).exists, false);
@@ -98,7 +113,7 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
   await env.step('Native CLI updates survive pause and resume without copying the original credential back', async () => {
     await savePermission(true);
     const before = await fileState();
-    assert.equal((await cli(['config', 'set-context', '--current', '--namespace=cocell-home-integration'])).status, 0);
+    assert.equal((await cli(['--connection=cluster', 'config', 'set-context', '--current', '--namespace=cocell-home-integration'])).status, 0);
     const refreshed = await fileState();
     assert.notEqual(refreshed.sha256, before.sha256);
     const checkpointed = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
@@ -115,14 +130,10 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     const previousPod = pod; pod = await findPod();
     assert.notEqual(pod, previousPod);
     assert.equal((await fileState()).sha256, refreshed.sha256);
-    assert.equal((await cli(['config', 'current-context'])).status, 0);
+    assert.equal((await cli(['--connection=cluster', 'config', 'current-context'])).status, 0);
     return { observedReadyMs, pod, nativeCredentialPreserved: true };
   });
   await env.step('Cold rebuild restores protected kubectl and MySQL while retaining native credential updates', async () => {
-    assert(secrets.some(secret => secret.tool === 'mysql' && secret.enabled && secret.format === 'text'),
-      'Cold rebuild verification requires an enabled MySQL credential');
-    await env.json(`/api/projects/${project.id}/tool-permissions`, { method: 'PUT',
-      body: { permissions: [{ tool: 'kubectl', enabled: true }, { tool: 'mysql', enabled: true }] } });
     const before = await fileState();
     const previousPod = pod;
     const lost = await failTestSandbox(env, project.id);
@@ -134,11 +145,11 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     pod = await findPod();
     assert.notEqual(pod, previousPod);
     assert.equal((await fileState()).sha256, before.sha256);
-    const resources = await cli(['--context', process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? context,
+    const resources = await cli(['--connection=cluster', '--context', process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? context,
       '-n', 'co-cell', 'get', 'pods', '-o', 'name']);
     assert.equal(resources.status, 0, resources.stderr);
     assert.match(resources.stdout, /^pod\//m);
-    const args = ['--login-path=' + (process.env.COCELL_E2E_TOOL_MYSQL_PROFILE ?? 'doris'), '-e', 'SELECT 1'];
+    const args = ['--connection=database', '-e', 'SELECT 1'];
     const mysql = await guest(`const {spawnSync}=require('node:child_process');const r=spawnSync('/usr/local/bin/mysql',${JSON.stringify(args)},{uid:11000,gid:11000,cwd:'/home/agent/workspace',env:{HOME:'/home/agent',PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:20000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.code}));`);
     assert.equal(mysql.status, 0, mysql.stderr || mysql.error);
     assert.equal(mysql.stdout.trim().split('\n').at(-1), '1');

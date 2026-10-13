@@ -6,8 +6,8 @@ import { credentialPath, toolName } from './policy.js';
 
 export const CONNECTION_ALIAS = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
 export const namedConnectionTool = (tool: string) => tool === 'mysql' || tool === 'kubectl';
-export function connectionPath(grant: ProjectToolGrant, roleManaged: boolean) {
-  return roleManaged && namedConnectionTool(grant.tool)
+export function connectionPath(grant: ProjectToolGrant) {
+  return namedConnectionTool(grant.tool)
     ? `.cocell/connections/${grant.tool}/${grant.files[0].secretId}/config`
     : grant.files[0].path;
 }
@@ -43,25 +43,20 @@ export class ToolRoles {
     return role;
   }
   async delete(id: string) { await this.repository.roles.deleteRole(id); return { ok: true }; }
-  async setDefault(roleId: string | null) { await this.repository.roles.setDefault(roleId); return this.catalog(); }
+  async setDefault(roleId: string) { await this.repository.roles.setDefault(roleId); return this.catalog(); }
   async state(projectId: string): Promise<ProjectRoleState> {
     const assignment = await this.repository.roles.assignment(projectId);
-    if (!assignment) return { roleId: null, legacy: true, connections: [] };
+    if (!assignment) return { roleId: null, connections: [] };
     const role = assignment.roleId ? (await this.catalog()).roles.find(role => role.id === assignment.roleId) : undefined;
-    return { roleId: assignment.roleId, legacy: false, connections: role?.connections ?? [] };
+    return { roleId: assignment.roleId, connections: role?.connections ?? [] };
   }
   async assign(projectId: string, roleId: string | null) {
-    if (!await this.repository.roleRuntimeReady(projectId)) throw new HttpError(409, '旧版 Sandbox 不支持角色授权，请先更新 Sandbox 并刷新运行配置');
     await this.repository.roles.assign(projectId, roleId);
     await this.refresh([projectId]);
     return this.state(projectId);
   }
-  async assertLegacy(projectId: string) {
-    if (await this.repository.roles.assignment(projectId)) throw new HttpError(409, '项目权限由角色管理，请修改或重新分配角色');
-  }
   async grants(projectId: string): Promise<ProjectToolGrant[]> {
     const state = await this.state(projectId);
-    if (state.legacy) return this.repository.grants(projectId);
     const grants: ProjectToolGrant[] = [];
     for (const connection of state.connections) {
       const secret = await this.repository.get(connection.secretId);
@@ -74,9 +69,7 @@ export class ToolRoles {
   }
   async allGrants() {
     const assignments = await this.repository.roles.assignments();
-    const assigned = new Set(assignments.map(item => item.projectId));
-    return [...(await this.repository.allGrants()).filter(grant => !assigned.has(grant.projectId)),
-      ...(await Promise.all(assignments.map(item => this.grants(item.projectId)))).flat()];
+    return (await Promise.all(assignments.map(item => this.grants(item.projectId)))).flat();
   }
 }
 

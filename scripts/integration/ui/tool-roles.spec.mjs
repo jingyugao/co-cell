@@ -1,11 +1,12 @@
 import { test, expect } from './fixture.mjs';
 
 const stamp = '2026-01-01T00:00:00Z';
+const defaultRole = { id: '00000000-0000-4000-8000-000000000001', name: '默认角色', connections: [], createdAt: stamp, updatedAt: stamp };
 const secret = (id, name, tool) => ({ id, name, tool, path: tool === 'mysql' ? '.my.cnf' : '.kube/config', format: 'text', mutable: true, enabled: true, version: 1, projectIds: [], requiresTextImport: false, createdAt: stamp, updatedAt: stamp });
 
 test('create a role with multiple MySQL and kubectl connections, set default, and assign it to a project', async ({ page, ui }) => {
   const secrets = [secret('mysql-reporting', '报表库', 'mysql'), secret('mysql-warehouse', '数仓', 'mysql'), secret('kube-staging', '测试集群', 'kubectl')];
-  let catalog = { roles: [], defaultRoleId: null }, roleSave, defaultSave, projectSave;
+  let catalog = { roles: [defaultRole], defaultRoleId: defaultRole.id }, roleSave, defaultSave, projectSave;
   await page.route('**/api/secrets', route => route.fulfill({ json: secrets }));
   await page.route('**/api/tool-roles**', async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
@@ -16,14 +17,14 @@ test('create a role with multiple MySQL and kubectl connections, set default, an
     if (request.method() === 'POST') {
       roleSave = request.postDataJSON();
       const role = { id: 'data-ops', ...roleSave, createdAt: stamp, updatedAt: stamp };
-      catalog = { roles: [role], defaultRoleId: null };
+      catalog = { roles: [defaultRole, role], defaultRoleId: defaultRole.id };
       return route.fulfill({ status: 201, json: role });
     }
     return route.fulfill({ json: catalog });
   });
   await page.route('**/api/projects/paused/tool-role', async route => {
-    if (route.request().method() === 'PUT') { projectSave = route.request().postDataJSON(); return route.fulfill({ json: { roleId: projectSave.roleId, legacy: false, connections: roleSave.connections } }); }
-    await route.fulfill({ json: { roleId: null, legacy: false, connections: [] } });
+    if (route.request().method() === 'PUT') { projectSave = route.request().postDataJSON(); return route.fulfill({ json: { roleId: projectSave.roleId, connections: roleSave.connections } }); }
+    await route.fulfill({ json: { roleId: defaultRole.id, connections: [] } });
   });
   await page.goto('/#connections');
   await page.getByRole('button', { name: '新建角色', exact: true }).click();
@@ -52,7 +53,7 @@ test('create a role with multiple MySQL and kubectl connections, set default, an
   await page.goto('/#projects');
   await page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('button', { name: '工具权限', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '暂停项目 工具权限', exact: true });
-  await dialog.getByRole('radio', { name: '数据运维 仅新项目默认', exact: true }).check();
+  await dialog.getByRole('radio', { name: '数据运维 默认角色', exact: true }).check();
   await expect(dialog.getByText('mysql --connection=reporting', { exact: true })).toBeVisible();
   await expect(dialog.getByText('kubectl --connection=staging', { exact: true })).toBeVisible();
   await dialog.getByRole('button', { name: '保存', exact: true }).click();
@@ -60,12 +61,12 @@ test('create a role with multiple MySQL and kubectl connections, set default, an
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
-test('role catalog load failure blocks project permission saves without falling back to legacy grants', async ({ page, ui }) => {
+test('role catalog load failure blocks project role saves and no legacy controls or requests remain', async ({ page, ui }) => {
   let projectSave;
   await page.route('**/api/tool-roles', route => route.fulfill({ status: 500, json: { error: '角色读取失败' } }));
   await page.route('**/api/projects/paused/tool-role', async route => {
     if (route.request().method() === 'PUT') projectSave = route.request().postDataJSON();
-    await route.fulfill({ json: { roleId: null, legacy: false, connections: [] } });
+    await route.fulfill({ json: { roleId: defaultRole.id, connections: [] } });
   });
   await page.goto('/#projects');
   await page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('button', { name: '工具权限', exact: true }).click();
@@ -73,5 +74,7 @@ test('role catalog load failure blocks project permission saves without falling 
   await expect(dialog.getByRole('alert')).toHaveText('角色读取失败');
   await expect(dialog.getByRole('button', { name: '保存', exact: true })).toBeDisabled();
   await expect(page.getByRole('radio', { name: '有', exact: true })).toHaveCount(0);
+  await expect(dialog.getByText('保留现有权限', { exact: true })).toHaveCount(0);
   expect(projectSave).toBeUndefined();
+  expect(ui.calls.some(call => call.path.endsWith('/tool-permissions'))).toBe(false);
 });

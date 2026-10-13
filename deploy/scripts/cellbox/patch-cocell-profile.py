@@ -55,13 +55,13 @@ profile["image"] = image
 trusted = profile.setdefault("trustedToolImages", [])
 if image not in trusted:
     trusted.append(image)
-if os.environ.get("COCELL_TOOL_RUNTIME_MOUNT_VERSION") == "1":
-    mounted = profile.setdefault("mountedToolRuntimeImages", [])
-    if image not in mounted:
-        mounted.append(image)
 if os.environ.get("COCELL_DEBUG_HOME_VERSION") == "1":
     if not profile.get("sharedReadOnlyHostPath"):
         raise SystemExit("Mounted debug HOME requires the shared directory")
+    # Required by Cellbox for mountedDebugHome, even without files-mode delivery.
+    mounted = profile.setdefault("mountedToolRuntimeImages", [])
+    if image not in mounted:
+        mounted.append(image)
     profile["debugReadWriteHostPath"] = profile["sharedReadOnlyHostPath"] + "/runtime/debug-homes"
     homes = profile.setdefault("debugHomeImages", [])
     if image not in homes:

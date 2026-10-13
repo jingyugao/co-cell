@@ -183,7 +183,7 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     const path = new URL(c.req.url).pathname;
     // Sandbox wrappers call these endpoints through the Kubernetes service host.
     // Runtime routes validate Box identity and project tool grants themselves.
-    if (c.req.method === 'POST' && (/^\/api\/tool-runtime\/(authorize|start|files)$/.test(path) || /^\/api\/tool-runtime\/[0-9a-f-]{36}\/complete$/.test(path))) return next();
+    if (c.req.method === 'POST' && path === '/api/tool-runtime/authorize') return next();
     const requestHost = (c.req.header('host') ?? new URL(c.req.url).host).toLowerCase();
     if (requestHost !== host) {
       let target = resolvePreviewHost?.(requestHost);

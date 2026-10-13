@@ -29,11 +29,7 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   inputArgs = invocation.args;
   options = { ...options, ...(invocation.cwd ? { cwd: invocation.cwd, gitEnv: invocation.gitEnv } : {}) };
   const config = options.config ?? JSON.parse(await readFile(process.env.COCELL_TOOL_RUNTIME, 'utf8'));
-  if (config.mode !== 'home') {
-    // Checkpointed images/configurations keep their original delivery contract.
-    const legacy = await import('./legacy-protected-tool.mjs');
-    return legacy.runProtectedTool(tool, inputArgs, { ...options, config });
-  }
+  if (config?.mode !== 'home') throw new Error(`Unsupported tool runtime mode '${String(config?.mode)}'; rebuild the Sandbox with mounted HOME credentials`);
   const decoded = decodeGitlabHost(tool, inputArgs);
   const boxId = toolRuntimeBoxId(config.boxId);
   if (!boxId) throw new Error('Invalid Box identity');

@@ -32,8 +32,6 @@ RUN mkdir -p /opt/cellbox/debug-bin \
 COPY --chmod=0755 deploy/box-wrap/launcher.mjs deploy/box-wrap/oss-archive-backup.mjs deploy/box-wrap/oss-archive-restore.mjs /opt/product/cocell/
 COPY --chmod=0755 deploy/box-wrap/tool-client.mjs /opt/product/cocell/deploy/box-wrap/
 COPY --chmod=0755 deploy/box-wrap/protected-tool.mjs /opt/product/cocell/deploy/box-wrap/
-COPY --chmod=0755 deploy/box-wrap/legacy-protected-tool.mjs /opt/product/cocell/deploy/box-wrap/
-COPY util/credential-files.mjs /opt/product/cocell/util/
 COPY util/tool-working-directory.mjs /opt/product/cocell/util/
 COPY util/gitlab-tool-host.mjs /opt/product/cocell/util/
 COPY util/tool-runtime-identity.mjs /opt/product/cocell/util/
@@ -43,7 +41,6 @@ RUN ln -s deploy/box-wrap/tool-client.mjs /opt/product/cocell/tool-client.mjs
 COPY --chmod=0755 deploy/box-wrap/tools/cocell-archive-backup /opt/cellbox/tools/cocell-archive-backup
 COPY --chmod=0755 deploy/box-wrap/tools/cocell-archive-restore /opt/cellbox/tools/cocell-archive-restore
 COPY --chmod=0755 deploy/box-wrap/tools/cocell-proxy /opt/cellbox/tools/cocell-proxy
-LABEL cocell.tool-runtime-mount="1"
 LABEL cocell.debug-home="1"
 
 ENV PATH=/usr/local/bin:/usr/bin:/bin

@@ -22,58 +22,28 @@ export interface SecretContent extends Partial<SecretFileBundle> {
   format: SecretFormat; content: string; requiresTextImport: boolean; version: number;
 }
 export interface SecretDeleteResult { ok: true }
-export interface ToolCompletionResult { saved: boolean; discarded?: boolean; versions?: Array<{ secretId: string; version: number }> }
 export interface ProvisionedToolFile {
   tool: ProxyTool; secretId: string; path: string; content: string; mutable: boolean; version: number;
-  /** Present for role-managed connections; older runtimes must fail closed. */
-  alias?: string;
+  alias: string;
   format?: SecretFormat;
 }
-export interface ToolRuntimeConfig {
-  mode: 'files'; boxId: string; revision: number; url: string; files: ProvisionedToolFile[];
-  /** Older runners read these aliases. token contains the plain Box ID. */
-  generation?: number; token?: string;
-}
-export interface ToolRuntimeIdentity { boxId: string }
-/** Stable descriptor retained in the checkpoint; ordinary resume leaves it unchanged. */
-export interface ToolRuntimeMount { mode: 'mount'; path: string }
 /** Stable across resume; carries no credential content or authentication token. */
 export interface ToolHomeRuntimeConfig { mode: 'home'; boxId: string; url: string }
 export interface ToolAuthorization { tool: ProxyTool; args: string[]; home: string; path: string }
-export interface ToolFileUpdate { secretId: string; content: string; baseVersion: number; format?: SecretFormat }
-export interface ToolFileSyncRequest extends ToolRuntimeIdentity { tool: ProxyTool; updates: ToolFileUpdate[]; exitCode: number }
-export interface ToolInvocationStartRequest extends ToolRuntimeIdentity { tool: ProxyTool; alias?: string; args: string[] }
-export interface ToolInvocationCompleteRequest extends ToolRuntimeIdentity { updates: Array<{ secretId: string; content: string }>; exitCode: number }
 export interface SecretVersion {
   id: string; source: 'operator' | 'tool'; baseVersion: number | null;
   createdAt: string; projectId: string | null; invocationId: string | null;
   changes: string[];
 }
 export interface SecretFileBinding { secretId: string; path: string }
-export interface ToolPolicy {
-  namespaces: string[]; resources: string[]; commandPrefixes: string[][];
-}
 export interface ProjectToolGrant {
   id: string; projectId: string; tool: ProxyTool; alias: string; enabled: boolean;
   files: SecretFileBinding[]; updatedAt: string;
-  /** Legacy documents can retain this field; authorization no longer uses it. */
-  policy?: ToolPolicy;
 }
-export type ProjectToolGrantInput = Omit<ProjectToolGrant, 'id' | 'projectId' | 'updatedAt'>;
-export interface ProjectToolSelection { tool: ProxyTool; secretId: string | null }
-export interface ProjectToolPermissionInput { tool: ProxyTool; enabled: boolean }
-/** Project controls only whether it can use a tool's configured credential. */
-export interface ProjectToolPermission extends ProjectToolPermissionInput { available: boolean; reason?: string }
-/** Only the protected tool runner receives this response, never the agent. */
-export interface ToolInvocationSetup {
-  id: string; tool: ProxyTool; args: string[];
-  files: Array<{ path: string; content: string; secretId: string; version: number; mutable: boolean; format?: SecretFormat }>;
-}
-
 /** Named credentials granted together to a project. */
 export interface RoleConnection { tool: ProxyTool; alias: string; secretId: string }
 export interface ToolRole { id: string; name: string; connections: RoleConnection[]; createdAt: string; updatedAt: string }
 export interface ToolRoleInput { name: string; connections: RoleConnection[] }
-export interface RoleCatalog { roles: ToolRole[]; defaultRoleId: string | null }
+export interface RoleCatalog { roles: ToolRole[]; defaultRoleId: string }
 export interface ProjectRoleAssignment { roleId: string | null }
-export interface ProjectRoleState extends ProjectRoleAssignment { legacy: boolean; connections: RoleConnection[] }
+export interface ProjectRoleState extends ProjectRoleAssignment { connections: RoleConnection[] }

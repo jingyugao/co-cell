@@ -4,6 +4,20 @@ import { promisify } from 'node:util';
 import { test } from '../support/fixtures.mjs';
 
 const exec = promisify(execFile);
+let ownedProjectId;
+let ownedRoleId;
+
+test.afterEach(async ({ environment: env }) => {
+  if (!ownedProjectId && !ownedRoleId) return;
+  try {
+    if (ownedProjectId)
+      await env.json(`/api/projects/${ownedProjectId}/tool-role`, { method: 'PUT', body: { roleId: null } });
+  } finally {
+    if (ownedRoleId) await env.json(`/api/tool-roles/${ownedRoleId}`, { method: 'DELETE' });
+    ownedProjectId = undefined;
+    ownedRoleId = undefined;
+  }
+});
 
 test('deployed Git proxy preserves nested repository and Go module-cache directories', async ({ environment: env }) => {
   test.skip(process.env.COCELL_E2E_TOOL_CWD_TEST !== '1', 'Requires a rebuilt HOME image with Git, Go and configured Git credentials');
@@ -15,8 +29,16 @@ test('deployed Git proxy preserves nested repository and Go module-cache directo
   assert(image?.defaultVersionId);
   const created = await env.json('/api/projects', { method: 'POST', expectedStatus: 201,
     body: { name: env.name('tool-cwd'), type: 1, imageId: image.id, imageVersionId: image.defaultVersionId } });
+  ownedProjectId = created.id;
   const project = await env.waitProject(created.id, { kind: 'create', status: 'ready' });
-  await env.json(`/api/projects/${project.id}/tool-permissions`, { method: 'PUT', body: { permissions: [{ tool: 'git', enabled: true }] } });
+  const secretId = process.env.COCELL_E2E_TOOL_GIT_SECRET_ID;
+  const secrets = (await env.json('/api/secrets')).filter(secret => secret.tool === 'git' && secret.enabled && secret.format === 'text');
+  const secret = secretId ? secrets.find(item => item.id === secretId) : secrets.length === 1 ? secrets[0] : undefined;
+  assert(secret, 'Configure one enabled Git credential, or select it with COCELL_E2E_TOOL_GIT_SECRET_ID');
+  const role = await env.json('/api/tool-roles', { method: 'POST', expectedStatus: 201, body: { name: env.name('git-cwd-role'),
+    connections: [{ tool: 'git', alias: 'repository', secretId: secret.id }] } });
+  ownedRoleId = role.id;
+  await env.json(`/api/projects/${project.id}/tool-role`, { method: 'PUT', body: { roleId: role.id } });
   const namespace = process.env.COCELL_E2E_CELLBOX_NAMESPACE ?? 'cell-box';
   const resources = JSON.parse((await exec('kubectl', ['--context', context, '-n', namespace, 'get', 'cellboxes',
     '-l', `cellbox.local/box-id=${project.sandbox.id}`, '-o', 'json'])).stdout);
@@ -41,6 +63,6 @@ console.log(JSON.stringify({repository:repo,metadata}));`;
     assert.match(evidence.metadata, /vcs=git/);
     await test.info().attach('git-cwd-evidence', { body: JSON.stringify(evidence), contentType: 'application/json' });
   } finally {
-    await env.json(`/api/projects/${project.id}/tool-permissions`, { method: 'PUT', body: { permissions: [] } });
+    await env.json(`/api/projects/${project.id}/tool-role`, { method: 'PUT', body: { roleId: null } });
   }
 });

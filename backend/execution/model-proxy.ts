@@ -1,5 +1,10 @@
 export type ModelProxyKind = 'new-api' | 'cliproxyapi' | 'litellm';
 
+// App Server uses our initialize clientInfo name as its default Originator.
+// CLIProxyAPI needs the Codex transport identity to emit response.failed;
+// its generic `error` SSE event is ignored by the Codex Responses parser.
+export const CODEX_MODEL_HTTP_HEADERS = Object.freeze({ originator: 'codex_cli_rs' });
+
 /** Keep the existing New API retry policy unless another proxy is selected. */
 export function modelProxyKind(env: NodeJS.ProcessEnv = process.env): ModelProxyKind {
   const kind = env.CODEX_PROXY_KIND || 'new-api';

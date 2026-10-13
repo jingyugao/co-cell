@@ -263,7 +263,7 @@ export interface SandboxRecord {
   state: 'running' | 'paused' | 'unknown';
   /** Lifecycle phase returned by the inventory source. */
   phase?: string;
-  inventorySource?: 'kubernetes' | 'oss';
+  inventorySource?: 'kubernetes' | 'node';
   pausedAt?: string;
   cpuCount: number;
   memoryMB: number;

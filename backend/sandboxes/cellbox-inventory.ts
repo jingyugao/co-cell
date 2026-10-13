@@ -7,7 +7,7 @@ export class CellboxSandboxInventory implements SandboxInventoryReader {
     async read(sessions: SessionSummary[], projects: ProjectSummary[] = []): Promise<SandboxInventory> {
         const inventory = await this.provider.listInventory();
         const rows = [...inventory.boxes.map(row => ({ ...row, inventorySource: 'kubernetes' as const })),
-            ...inventory.checkpoints.map(row => ({ ...row, inventorySource: 'oss' as const }))];
+            ...inventory.checkpoints.map(row => ({ ...row, inventorySource: 'node' as const }))];
         const byId = new Map(projects.map(project => [project.id, project]));
         const byBox = new Map(projects.filter(project => project.sandbox).map(project => [project.sandbox!.id, project]));
         const associations = new Map<string, NonNullable<SandboxRecord['sessions']>>();

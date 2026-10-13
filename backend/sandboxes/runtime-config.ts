@@ -130,6 +130,7 @@ export class SandboxRuntimeConfig {
           await this.options.secrets.registerRuntime(boxId, projectId, revision);
           assertActive(signal);
         }
+        if (!home) await repository!.prepareLegacyRuntime(boxId);
         if (home) {
           assertActive(signal);
           await this.options.secrets.publishHome(projectId);
@@ -180,9 +181,10 @@ export class SandboxRuntimeConfig {
         throw new Error('Cellbox generation changed during runtime configuration');
       assertActive(signal);
     }
-    if (!Object.keys(changed).length && !pointerDigest) return;
+    const roleRuntime: Record<string, string> = archive ? {} : { cocell_role_runtime: home ? 'home' : 'legacy' };
+    if (!Object.keys(changed).length && !pointerDigest && (archive || applied.cocell_role_runtime === roleRuntime.cocell_role_runtime)) return;
     const acknowledge = async () => {
-      const acknowledged = { ...digests, ...(pointerDigest ? { cocell_tool_runtime_mount: pointerDigest } : {}) };
+      const acknowledged = { ...digests, ...roleRuntime, ...(pointerDigest ? { cocell_tool_runtime_mount: pointerDigest } : {}) };
       assertActive(signal);
       if (repository) await repository.markRuntimeConfigs(boxId, revision, acknowledged);
       assertActive(signal);
@@ -223,7 +225,7 @@ export class SandboxRuntimeConfig {
         applied[slot] = digest;
       }
     }
-    if (mount) await acknowledge();
+    await acknowledge();
   }
 
   private async legacySlots(archive: boolean): Promise<Record<string, Uint8Array>> {

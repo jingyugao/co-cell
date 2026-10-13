@@ -194,6 +194,10 @@ async function runBundleTool(tool, args, config, options, request) {
 async function runFileTool(tool, args, config, options, request) {
   if (!Array.isArray(config.files)) throw new Error('Invalid local file configuration');
   const files = config.files.filter(file => file.tool === tool);
+  // Older executors can only bind one credential file per tool. A role may
+  // provision several named connections, so refusing the whole invocation is
+  // safer than silently selecting or caching one of them.
+  if (files.some(file => Object.hasOwn(file, 'alias'))) throw new Error('Named connections require mounted HOME runtime; rebuild the Sandbox');
   if (files.length > 1) throw new Error('Only one credential file per tool is supported');
   if (files[0]?.format === 'files') return runBundleTool(tool, args, config, { ...options, execute, readCredential, sensitiveValues }, request);
   const snapshot = createHash('sha256').update(JSON.stringify({ generation: config.revision ?? config.generation, files })).digest('hex');
@@ -277,6 +281,7 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   // Compatibility for Sandboxes provisioned with older executor images.
   const setup = await request('/api/tool-runtime/start', { tool, args: inputArgs });
   if (setup.tool !== tool || !Array.isArray(setup.files) || setup.files.length !== 1) throw new Error('Invalid tool setup');
+  if (setup.files.some(file => Object.hasOwn(file, 'alias'))) throw new Error('Named connections require mounted HOME runtime; rebuild the Sandbox');
   if (setup.files[0].format === 'files') {
     let completed = false;
     const result = await runBundleTool(tool, setup.args, { ...config, generation: 0, files: [{ ...setup.files[0], tool }] }, { ...options, execute, readCredential, sensitiveValues }, async (_path, body) => {

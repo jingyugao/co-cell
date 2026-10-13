@@ -24,7 +24,7 @@ export class ProjectService {
   private creatingWeeklyProjects = new Set<string>();
   private writer = new RecordWriteQueue();
   private saved = new Map<string, Project>();
-  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo, private now: () => Date = () => new Date(), private shared = false) {}
+  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo, private now: () => Date = () => new Date(), private shared = false, private onCreate?: (projectId: string) => Promise<void>) {}
 
   async init() {
     for (const project of await this.state.listProjects()) {
@@ -428,6 +428,12 @@ export class ProjectService {
         executionMode: settings.executionMode ?? 'local', workingDirectory: settings.workingDirectory,
         status: 'active', completedAt: null, archivedAt: null, createdAt: now, updatedAt: now };
       await this.import(project);
+      try { await this.onCreate?.(project.id); }
+      catch (error) {
+        await this.state.deleteProject(project.id);
+        this.records.delete(project.id); this.saved.delete(project.id);
+        throw error;
+      }
       return this.get(project.id);
     } finally { if (weekOf) this.creatingWeeklyProjects.delete(weekOf); }
   }

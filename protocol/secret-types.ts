@@ -25,6 +25,8 @@ export interface SecretDeleteResult { ok: true }
 export interface ToolCompletionResult { saved: boolean; discarded?: boolean; versions?: Array<{ secretId: string; version: number }> }
 export interface ProvisionedToolFile {
   tool: ProxyTool; secretId: string; path: string; content: string; mutable: boolean; version: number;
+  /** Present for role-managed connections; older runtimes must fail closed. */
+  alias?: string;
   format?: SecretFormat;
 }
 export interface ToolRuntimeConfig {
@@ -67,3 +69,11 @@ export interface ToolInvocationSetup {
   id: string; tool: ProxyTool; args: string[];
   files: Array<{ path: string; content: string; secretId: string; version: number; mutable: boolean; format?: SecretFormat }>;
 }
+
+/** Named credentials granted together to a project. */
+export interface RoleConnection { tool: ProxyTool; alias: string; secretId: string }
+export interface ToolRole { id: string; name: string; connections: RoleConnection[]; createdAt: string; updatedAt: string }
+export interface ToolRoleInput { name: string; connections: RoleConnection[] }
+export interface RoleCatalog { roles: ToolRole[]; defaultRoleId: string | null }
+export interface ProjectRoleAssignment { roleId: string | null }
+export interface ProjectRoleState extends ProjectRoleAssignment { legacy: boolean; connections: RoleConnection[] }

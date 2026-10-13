@@ -1,3 +1,4 @@
+import { ToolRoles, connectionPath, selectConnection } from './roles.js';
 import { randomUUID } from 'node:crypto';
 import type { ProjectToolGrant, ProjectToolGrantInput, ProjectToolSelection, ProxyTool, SecretInput, SecretUpdate, SecretMetadata, SecretContent, SecretDeleteResult, ToolInvocationSetup, ToolCompletionResult, ProvisionedToolFile, ToolFileUpdate } from '../../protocol/secret-types.js';
 import { HttpError } from '../../util/errors.js';
@@ -36,7 +37,10 @@ function inputBytes(input: SecretInput): Buffer {
 }
 export class SecretService {
   homes?: MountedToolHomes;
-  constructor(readonly repository: SecretRepository, private crypto: SecretCrypto) {}
+  readonly roles: ToolRoles;
+  constructor(readonly repository: SecretRepository, private crypto: SecretCrypto) {
+    this.roles = new ToolRoles(repository, ids => this.refreshHomes(ids));
+  }
   async init() { await this.repository.init(); }
   async mountHomes(root: string, coordinator?: SharedCoordinator) { this.homes = new MountedToolHomes(root, coordinator); await this.homes.init(); }
   publishHome(projectId: string) {
@@ -50,7 +54,10 @@ export class SecretService {
     }
   }
   private async boundProjects(secretId: string) {
-    return (await this.repository.allGrants()).filter(grant => grant.files.some(file => file.secretId === secretId)).map(grant => grant.projectId);
+    const [grants, catalog, assignments] = await Promise.all([this.repository.allGrants(), this.roles.catalog(), this.repository.roles.assignments()]);
+    const roles = new Set(catalog.roles.filter(role => role.connections.some(connection => connection.secretId === secretId)).map(role => role.id));
+    return [...grants.filter(grant => grant.files.some(file => file.secretId === secretId)).map(grant => grant.projectId),
+      ...assignments.filter(item => item.roleId && roles.has(item.roleId)).map(item => item.projectId)];
   }
   private metadata(secret: StoredSecret, projectIds: string[] = []): SecretMetadata {
     const { ciphertext: _ciphertext, currentVersionId: _versionId, alias: _alias, format, ...metadata } = secret;
@@ -60,7 +67,7 @@ export class SecretService {
   }
   private bundle(secret: StoredSecret) { return fileBundle(JSON.parse(this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('utf8'))); }
   async list() {
-    const [secrets, grants] = await Promise.all([this.repository.list(), this.repository.allGrants()]);
+    const [secrets, grants] = await Promise.all([this.repository.list(), this.roles.allGrants()]);
     return secrets.map(secret => this.metadata(this.withLegacyConfig(secret, grants), [...new Set(grants.filter(g => g.files.some(f => f.secretId === secret.id)).map(g => g.projectId))]));
   }
   private withLegacyConfig(secret: StoredSecret, grants: ProjectToolGrant[]): StoredSecret {
@@ -71,7 +78,7 @@ export class SecretService {
     return unique.length === 1 ? { ...secret, ...unique[0] } : secret;
   }
   private validateConfig(secret: StoredSecret) {
-    if (this.homes && secret.format !== 'text') throw new HttpError(400, '每种工具只支持一个原生文本凭证文件，请重新导入');
+    if (this.homes && secret.format !== 'text') throw new HttpError(400, '每份凭证只支持一个原生文本认证文件，请重新导入');
     if (!['text', 'files'].includes(secret.format)) throw new HttpError(409, '旧格式密钥需要重新导入原始文本文件');
     if (!secret.tool || !secret.path) throw new HttpError(400, '请填写工具名和认证文件路径');
     toolName(secret.tool);
@@ -118,7 +125,7 @@ export class SecretService {
     const versionId = randomUUID(), ciphertext = this.crypto.seal(id, versionId, bytes);
     if (changes.some(key => ['tool', 'path', 'content'].includes(key))) this.validateConfig({ ...next, currentVersionId: versionId, ciphertext });
     if (changes.some(key => ['tool', 'path'].includes(key))) {
-      const incompatible = (await this.repository.allGrants()).some(grant => grant.files.some(file => file.secretId === id
+      const incompatible = (await this.roles.allGrants()).some(grant => grant.files.some(file => file.secretId === id
         && (grant.tool !== next.tool || file.path !== next.path)));
       if (incompatible) throw new HttpError(400, '密钥已被项目使用，不能更改工具或认证文件配置');
     }
@@ -133,9 +140,9 @@ export class SecretService {
     const projects = await this.boundProjects(id);
     await this.repository.delete(id); await this.refreshHomes(projects); return { ok: true };
   }
-  grants(projectId: string) { return this.repository.grants(projectId); }
+  grants(projectId: string) { return this.roles.grants(projectId); }
   private async permissionStates(projectId: string) {
-    const [records, all] = await Promise.all([this.repository.list(), this.repository.allGrants()]);
+    const [records, all] = await Promise.all([this.repository.list(), this.roles.allGrants()]);
     const configured = records.map(secret => this.withLegacyConfig(secret, all));
     const current = all.filter(grant => grant.projectId === projectId);
     const names = [...new Set([...configured.flatMap(secret => secret.tool ? [secret.tool] : []), ...current.map(grant => grant.tool)])].sort();
@@ -157,6 +164,7 @@ export class SecretService {
     return (await this.permissionStates(projectId)).map(({ secret, grant: _grant, ...state }) => ({ ...state, available: !!secret }));
   }
   async savePermissions(projectId: string, permissions: ProjectToolPermissionInput[]): Promise<ProjectToolPermission[]> {
+    await this.roles.assertLegacy(projectId);
     if (permissions.length > 256 || new Set(permissions.map(value => value.tool)).size !== permissions.length)
       throw new HttpError(400, '每种工具只能配置一次，最多 256 种工具');
     const states = new Map((await this.permissionStates(projectId)).map(state => [state.tool, state]));
@@ -180,6 +188,7 @@ export class SecretService {
     return this.permissions(projectId);
   }
   async saveGrant(projectId: string, input: ProjectToolGrantInput) {
+    await this.roles.assertLegacy(projectId);
     if (input.files.length !== 1) throw new HttpError(400, '每种工具只能选择一个密钥');
     const file = input.files[0], path = credentialPath(file.path), secret = await this.requireSecret(file.secretId);
     if (secret.tool && (secret.tool !== input.tool || secret.path !== path)) throw new HttpError(400, '密钥所属工具或文件路径不匹配');
@@ -193,10 +202,11 @@ export class SecretService {
     return (await this.repository.grants(projectId)).find(value => value.tool === input.tool && value.alias === input.alias)!;
   }
   async saveSelections(projectId: string, selections: ProjectToolSelection[]) {
+    await this.roles.assertLegacy(projectId);
     if (selections.length > 256 || new Set(selections.map(value => value.tool)).size !== selections.length)
       throw new HttpError(400, '每种工具只能配置一次，最多 256 种工具');
     for (const { tool } of selections) toolName(tool);
-    const [current, all] = await Promise.all([this.repository.grants(projectId), this.repository.allGrants()]);
+    const [current, all] = await Promise.all([this.repository.grants(projectId), this.roles.allGrants()]);
     const grants: ProjectToolGrant[] = [];
     for (const { tool, secretId } of selections) {
       if (!secretId) continue;
@@ -212,19 +222,21 @@ export class SecretService {
     await this.refreshHomes([projectId]);
     return this.repository.grants(projectId);
   }
-  async deleteGrant(projectId: string, id: string) { await this.repository.deleteGrant(projectId, id); await this.refreshHomes([projectId]); }
+  async deleteGrant(projectId: string, id: string) { await this.roles.assertLegacy(projectId); await this.repository.deleteGrant(projectId, id); await this.refreshHomes([projectId]); }
   /** Resolve selected files at provisioning time, never on the CLI execution path. */
   async provision(projectId: string): Promise<ProvisionedToolFile[]> {
-    const grants = (await this.repository.grants(projectId)).filter(grant => grant.enabled);
+    const roleManaged = !(await this.roles.state(projectId)).legacy;
+    const grants = (await this.roles.grants(projectId)).filter(grant => grant.enabled);
     const files: ProvisionedToolFile[] = [];
     for (const grant of grants) {
-      if (grant.files.length !== 1 || grants.filter(value => value.tool === grant.tool).length !== 1) continue;
+      if (grant.files.length !== 1 || (!roleManaged && grants.filter(value => value.tool === grant.tool).length !== 1)) continue;
       const binding = grant.files[0], secret = await this.repository.get(binding.secretId);
       if (!secret?.enabled || !['text', 'files'].includes(secret.format)) continue;
       if (secret.tool && (secret.tool !== grant.tool || secret.path !== binding.path)) continue;
       toolName(grant.tool); credentialPath(binding.path);
       const content = this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('base64');
-      files.push({ tool: grant.tool, secretId: secret.id, path: binding.path, content, mutable: secret.mutable, version: secret.version,
+      files.push({ tool: grant.tool, secretId: secret.id, path: connectionPath(grant, roleManaged), content, mutable: secret.mutable, version: secret.version,
+        ...(roleManaged ? { alias: grant.alias } : {}),
         ...(secret.format === 'files' ? { format: 'files' as const } : {}) });
     }
     return files.sort((a, b) => a.tool.localeCompare(b.tool));
@@ -241,19 +253,25 @@ export class SecretService {
   /** Authorization returns a path and checked arguments, never credential bytes. */
   async authorize(boxId: string, tool: ProxyTool, args: string[]): Promise<ToolAuthorization> {
     const identity = await this.runtimeIdentity(boxId);
-    const grants = (await this.repository.grants(identity.projectId)).filter(grant => grant.enabled && grant.tool === tool);
-    if (grants.length !== 1 || grants[0].files.length !== 1) throw new HttpError(403, '项目未授权此工具的单文件凭证');
-    const binding = grants[0].files[0], secret = await this.requireSecret(binding.secretId);
+    const roleManaged = !(await this.roles.state(identity.projectId)).legacy;
+    const grants = (await this.roles.grants(identity.projectId)).filter(grant => grant.enabled && grant.tool === tool);
+    if (!roleManaged && grants.length !== 1) throw new HttpError(403, '项目未授权此工具的单文件凭证');
+    const selected = selectConnection(tool, args, grants), grant = selected.grant;
+    if (grant.files.length !== 1) throw new HttpError(403, '项目未授权此工具的单文件凭证');
+    const binding = grant.files[0], secret = await this.requireSecret(binding.secretId);
     if (!secret.enabled || secret.format !== 'text' || (secret.tool && (secret.tool !== tool || secret.path !== binding.path)))
       throw new HttpError(403, '工具凭证已停用或需要重新配置');
-    const path = credentialPath(binding.path), checked = validateToolArgs(tool, args, grants[0]);
+    const path = credentialPath(connectionPath(grant, roleManaged)), checked = validateToolArgs(tool, selected.args, grant);
     if (!this.homes || !await this.homes.ready(identity.projectId, { tool, secretId: secret.id, path, version: secret.version }))
       throw new HttpError(409, '凭证尚未更新到 debug HOME，请重新保存工具选择');
     return { tool, args: checked, home: `/home/debug/${identity.projectId}`, path };
   }
+
   /** Persist modified local files without checking the project's current selection. */
   async syncFiles(boxId: string, tool: ProxyTool, updates: ToolFileUpdate[], exitCode: number): Promise<ToolCompletionResult> {
-    const identity = await this.runtimeIdentity(boxId), now = new Date().toISOString(), id = randomUUID();
+    const identity = await this.runtimeIdentity(boxId);
+    await this.roles.assertLegacy(identity.projectId);
+    const now = new Date().toISOString(), id = randomUUID();
     if (new Set(updates.map(update => update.secretId)).size !== updates.length) throw new HttpError(400, 'Secret 更新不可重复');
     const changes: Array<{ secret: StoredSecret; version: StoredVersion }> = [];
     for (const update of updates) {
@@ -297,6 +315,7 @@ export class SecretService {
   }
   async start(boxId: string, tool: ProxyTool, _alias: string | undefined, args: string[]): Promise<ToolInvocationSetup> {
     const identity = await this.runtimeIdentity(boxId);
+    await this.roles.assertLegacy(identity.projectId);
     const grants = (await this.repository.grants(identity.projectId)).filter(g => g.enabled && g.tool === tool);
     if (grants.length !== 1) throw new HttpError(400, grants.length ? '工具存在旧的多密钥配置，请重新选择一个密钥' : '项目未选择此工具的凭证');
     const grant = grants[0], checked = validateToolArgs(tool, args, grant);
@@ -321,6 +340,7 @@ export class SecretService {
     const invocation = await this.repository.invocation(id);
     if (!invocation) throw new HttpError(404, '工具调用不存在');
     if (invocation.boxId !== boxId) throw new HttpError(400, '工具调用与 Box 不匹配');
+    await this.roles.assertLegacy(invocation.projectId);
     const identity = invocation;
     if (invocation.completedAt) return { saved: false };
     try {

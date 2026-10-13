@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { SecretContent, SecretDeleteResult, SecretMetadata, SecretVersion } from '../../../protocol/secret-types';
 import { TOOL_NAME_PATTERN } from '../../../util/tool-secrets';
 import { api, errorMessage } from '../../lib/api';
+import RoleManager from './RoleManager';
 import './SecretManager.css';
 
 export default function SecretManager() {
@@ -43,7 +44,7 @@ export default function SecretManager() {
     } catch { setError('请上传 UTF-8 编码的原始文本文件'); }
   }
   return <>
-    <div className="connections-heading"><div><h1>Secret 管理</h1><p>每种工具选择一个原生认证文件，保存在 debug HOME 中。</p></div><button className="primary-button" disabled={busy} onClick={() => void edit()}>新建 Secret</button></div>
+    <div className="connections-heading"><div><h1>Secret 管理</h1><p>每份 Secret 保存一个原生认证文件；MySQL 和 Kubernetes 可分别配置多个连接。</p></div><button className="primary-button" disabled={busy} onClick={() => void edit()}>新建 Secret</button></div>
     {error && <p className="connections-error" role="alert">{error}</p>}
     {editing && <form className="secret-form" onSubmit={async event => {
       event.preventDefault(); setBusy(true); setError('');
@@ -77,5 +78,6 @@ export default function SecretManager() {
       }}>更新记录</button><button className="secondary-button" disabled={busy} onClick={() => void remove(item)}>删除</button></div>
     </article>)}</div>}
     {history && <section className="secret-form"><div className="secret-actions"><h2>{history.name} · 更新记录</h2><button className="secondary-button" onClick={() => setHistory(null)}>关闭</button></div><table><thead><tr><th>提交时间</th><th>来源</th><th>修改项</th><th>基础版本</th><th>项目</th></tr></thead><tbody>{history.rows.map(row => <tr key={row.id}><td>{new Date(row.createdAt).toLocaleString()}</td><td>{row.source === 'operator' ? '管理员' : '工具回写'}</td><td>{row.changes.join(', ')}</td><td>{row.baseVersion ?? '新建'}</td><td>{row.projectId ?? '—'}</td></tr>)}</tbody></table></section>}
+    <RoleManager secrets={items} />
   </>;
 }

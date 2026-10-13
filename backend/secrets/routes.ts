@@ -20,6 +20,15 @@ const fileFields = {
 const grant = z.object({ tool, alias: alias.default('default'), enabled: z.boolean(), files: z.array(z.object({ secretId: id, path }).strict()).length(1), policy: policy.optional() }).strict();
 export function installSecretRoutes(app: Hono, secrets: SecretService, projectExists: (id: string) => boolean) {
   const project = (value: string) => { id.parse(value); if (!projectExists(value)) throw new HttpError(404, '项目不存在'); return value; };
+  const roleInput = z.object({ name: z.string().trim().min(1).max(100), connections: z.array(z.object({ tool, alias, secretId: id }).strict()).max(256) }).strict();
+  const assignment = z.object({ roleId: id.nullable() }).strict();
+  app.get('/api/tool-roles', async c => c.json(await secrets.roles.catalog()));
+  app.post('/api/tool-roles', async c => c.json(await secrets.roles.save(roleInput.parse(await c.req.json())), 201));
+  app.put('/api/tool-roles/default', async c => c.json(await secrets.roles.setDefault(assignment.parse(await c.req.json()).roleId)));
+  app.put('/api/tool-roles/:id', async c => c.json(await secrets.roles.save(roleInput.parse(await c.req.json()), id.parse(c.req.param('id')))));
+  app.delete('/api/tool-roles/:id', async c => c.json(await secrets.roles.delete(id.parse(c.req.param('id')))));
+  app.get('/api/projects/:id/tool-role', async c => c.json(await secrets.roles.state(project(c.req.param('id')))));
+  app.put('/api/projects/:id/tool-role', async c => c.json(await secrets.roles.assign(project(c.req.param('id')), assignment.parse(await c.req.json()).roleId)));
   app.get('/api/secrets', async c => c.json(await secrets.list()));
   app.post('/api/secrets', async c => c.json(await secrets.create(z.object({ name: z.string().trim().min(1).max(100), ...fileFields, format: fileFields.format.default('text'), mutable: z.boolean().default(false), tool, path }).strict().parse(await c.req.json())), 201));
   app.get('/api/secrets/:id/content', async c => c.json(await secrets.content(id.parse(c.req.param('id')))));

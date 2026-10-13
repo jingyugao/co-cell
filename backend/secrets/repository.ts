@@ -1,6 +1,7 @@
 import type { Pool, RowDataPacket, ResultSetHeader } from 'mysql2/promise';
 import type { ProjectToolGrant, ProxyTool, SecretFormat, SecretVersion } from '../../protocol/secret-types.js';
 import { HttpError } from '../../util/errors.js';
+import { MySqlRoleRepository, type RoleRepository } from './role-repository.js';
 
 export interface StoredSecret {
   /** Old formats remain readable until the operator replaces their contents. */
@@ -16,6 +17,7 @@ export interface StoredInvocation {
   createdAt: string; completedAt: string | null;
 }
 export interface SecretRepository {
+  readonly roles: RoleRepository;
   init(): Promise<void>;
   list(): Promise<StoredSecret[]>; get(id: string): Promise<StoredSecret | null>;
   save(secret: StoredSecret, version: StoredVersion | null): Promise<void>;
@@ -26,6 +28,8 @@ export interface SecretRepository {
   saveGrant(grant: ProjectToolGrant): Promise<void>; deleteGrant(projectId: string, id: string): Promise<void>;
   replaceGrants(projectId: string, grants: ProjectToolGrant[]): Promise<void>;
   registerRuntime(boxId: string, projectId: string, generation: number): Promise<void>;
+  roleRuntimeReady(projectId: string): Promise<boolean>;
+  prepareLegacyRuntime(boxId: string): Promise<void>;
   runtime(boxId: string): Promise<{ projectId: string; generation: number } | null>;
   runtimeConfig(boxId: string, generation: number): Promise<Record<string, string>>;
   markRuntimeConfig(boxId: string, generation: number, slot: string, digest: string): Promise<void>;
@@ -39,7 +43,8 @@ const parse = <T>(value: T | string): T => typeof value === 'string' ? JSON.pars
 const date = (value: string) => value.slice(0, 23).replace('T', ' ');
 
 export class MySqlSecretRepository implements SecretRepository {
-  constructor(private pool: Pool) {}
+  readonly roles: RoleRepository;
+  constructor(private pool: Pool) { this.roles = new MySqlRoleRepository(pool); }
   async init() {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS secrets (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL, format VARCHAR(10) NOT NULL, mutable BOOLEAN NOT NULL, enabled BOOLEAN NOT NULL, version BIGINT UNSIGNED NOT NULL, current_version_id CHAR(36) NOT NULL, ciphertext MEDIUMTEXT NOT NULL, created_at VARCHAR(30) NOT NULL, updated_at VARCHAR(30) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS secret_tool_configs (secret_id CHAR(36) PRIMARY KEY, tool VARCHAR(32) NOT NULL, path VARCHAR(256) NOT NULL, alias VARCHAR(64) NOT NULL, CONSTRAINT secret_tool_config_secret_fk FOREIGN KEY(secret_id) REFERENCES secrets(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
@@ -48,6 +53,7 @@ export class MySqlSecretRepository implements SecretRepository {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS project_tool_runtimes (box_id VARCHAR(200) PRIMARY KEY, project_id CHAR(36) NOT NULL, generation BIGINT UNSIGNED NOT NULL, CONSTRAINT tool_runtimes_project_fk FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sandbox_runtime_configs (box_id VARCHAR(200) NOT NULL, generation BIGINT UNSIGNED NOT NULL, slot VARCHAR(64) NOT NULL, digest CHAR(64) NOT NULL, applied_at VARCHAR(30) NOT NULL, PRIMARY KEY(box_id,generation,slot), CONSTRAINT runtime_configs_box_fk FOREIGN KEY(box_id) REFERENCES project_tool_runtimes(box_id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS tool_invocations (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, document JSON NOT NULL, completed_at DATETIME(3) NULL, exit_code INT NULL, INDEX invocation_project(project_id,completed_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    await this.roles.init();
   }
   private secret(row: RowDataPacket): StoredSecret {
     return { id: row.id, name: row.name, format: row.format, mutable: Boolean(row.mutable), enabled: Boolean(row.enabled), version: Number(row.version), currentVersionId: row.current_version_id, ciphertext: row.ciphertext, createdAt: row.created_at, updatedAt: row.updated_at, tool: row.tool ?? null, path: row.path ?? null, alias: row.alias ?? null };
@@ -122,6 +128,30 @@ export class MySqlSecretRepository implements SecretRepository {
   async deleteGrant(projectId: string, id: string) { await this.pool.query('DELETE FROM project_tool_grants WHERE project_id=? AND id=?', [projectId, id]); }
   async registerRuntime(boxId: string, projectId: string, generation: number) {
     await this.pool.query('INSERT INTO project_tool_runtimes(box_id,project_id,generation) VALUES(?,?,?) ON DUPLICATE KEY UPDATE project_id=VALUES(project_id),generation=VALUES(generation)', [boxId, projectId, generation]);
+  }
+  /** Fence role assignment before a legacy runner receives cached credentials. */
+  async prepareLegacyRuntime(boxId: string): Promise<void> {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [runtimes] = await connection.query<RowDataPacket[]>('SELECT project_id,generation FROM project_tool_runtimes WHERE box_id=?', [boxId]);
+      if (!runtimes.length) throw new Error('Runtime is not registered');
+      const runtime = runtimes[0];
+      await connection.query('SELECT id FROM projects WHERE id=? FOR UPDATE', [runtime.project_id]);
+      const [assignments] = await connection.query<RowDataPacket[]>('SELECT project_id FROM project_tool_roles WHERE project_id=? LOCK IN SHARE MODE', [runtime.project_id]);
+      if (assignments.length) throw new HttpError(409, 'Project roles require mounted HOME authorization; rebuild with a compatible Sandbox image');
+      await connection.query('INSERT INTO sandbox_runtime_configs(box_id,generation,slot,digest,applied_at) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE digest=VALUES(digest),applied_at=VALUES(applied_at)',
+        [boxId, runtime.generation, 'cocell_role_runtime', 'legacy', new Date().toISOString()]);
+      await connection.commit();
+    } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+  }
+  async roleRuntimeReady(projectId: string): Promise<boolean> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(`SELECT NOT EXISTS (
+      SELECT 1 FROM project_tool_runtimes r
+      LEFT JOIN sandbox_runtime_configs c ON c.box_id=r.box_id AND c.generation=r.generation AND c.slot=? AND c.digest=?
+      WHERE r.project_id=? AND c.box_id IS NULL
+    ) AS ready`, ['cocell_role_runtime', 'home', projectId]);
+    return Boolean(rows[0]?.ready);
   }
   async runtime(boxId: string) { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT project_id,generation FROM project_tool_runtimes WHERE box_id=?', [boxId]); return rows[0] ? { projectId: rows[0].project_id as string, generation: Number(rows[0].generation) } : null; }
   async runtimeConfig(boxId: string, generation: number) {

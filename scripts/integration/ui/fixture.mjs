@@ -54,6 +54,7 @@ export const test = base.extend({
       calls.push(call);
       let data, status = 200;
       if (path === '/api/config') data = config;
+      else if (path === '/api/tool-roles' && method === 'GET') data = { roles: [], defaultRoleId: null };
       else if (path === '/api/notifications') data = [];
       else if (path === '/api/images') data = [{ id: 'default', name: '系统默认镜像', category: '系统', origin: 'profile', versions: [{ id: 'default', version: '当前配置', status: 'succeeded', source: 'default', projectReady: true }] }];
       else if (path === '/api/projects' && method === 'GET') data = [...projects.values()];
@@ -64,6 +65,7 @@ export const test = base.extend({
       } else if (path.startsWith('/api/projects/')) {
         const id = path.split('/')[3]; data = projects.get(id);
         if (!data) { data = { error: '不存在' }; status = 404; }
+        else if (path === `/api/projects/${id}/tool-role`) data = { roleId: null, legacy: true, connections: [] };
         else if (method === 'PATCH' && path === `/api/projects/${id}`) {
           const next = request.postDataJSON();
           if (next.status !== undefined) { data.status = next.status; data.completedAt = next.status === 'completed' ? now : null; }

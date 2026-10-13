@@ -1,3 +1,4 @@
+import { MemoryRoleRepository } from './role-repository.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
@@ -20,9 +21,18 @@ import { MemoryCoordinator } from '../infra/storage/coordination.js';
 import { MountedToolHomes } from './mounted-home.js';
 
 export class MemorySecrets implements SecretRepository {
+  readonly roles = new MemoryRoleRepository(id => this.records.has(id));
   records = new Map<string, StoredSecret>(); history: StoredVersion[] = [];
   bindings = new Map<string, ProjectToolGrant>(); runs = new Map<string, StoredInvocation>();
   runtimes = new Map<string, { projectId: string; generation: number }>();
+  async prepareLegacyRuntime(boxId: string) {
+    const runtime = this.runtimes.get(boxId)!;
+    if (await this.roles.assignment(runtime.projectId)) throw new Error('Project roles require mounted HOME authorization');
+    await this.markRuntimeConfig(boxId, runtime.generation, 'cocell_role_runtime', 'legacy');
+  }
+  async roleRuntimeReady(projectId: string) {
+    return [...this.runtimes].filter(([, runtime]) => runtime.projectId === projectId).every(([boxId, runtime]) => this.configs.get(`${boxId}:${runtime.generation}`)?.cocell_role_runtime === 'home');
+  }
   async init() {}
   async list() { return [...this.records.values()]; }
   async get(id: string) { return this.records.get(id) ?? null; }
@@ -583,4 +593,97 @@ test('directory credentials allow contained file additions and deletions with bi
   await assert.rejects(service.syncFiles(token, 'custom.cli', update({ ...next, files: next.files.slice(1) }, 2), 0));
   await assert.rejects(service.syncFiles(token, 'custom.cli', update(next), 0));
   assert.equal((await service.content(secret.id)).version, 2);
+});
+
+test('project roles isolate named connections, revoke live HOME files, and block legacy bypasses', async () => {
+  const { service, repository, projectId, crypto } = fixture();
+  const root = await mkdtemp(join(tmpdir(), 'cocell-roles-'));
+  await service.mountHomes(root);
+  try {
+    const create = (name: string, tool: string) => service.create({ name, tool, path: tool === 'mysql' ? '.my.cnf' : '.kube/config', format: 'text', mutable: false, content: `fixture-${name}` });
+    const mysqlA = await create('analytics', 'mysql'), mysqlB = await create('warehouse', 'mysql');
+    const kubeA = await create('staging', 'kubectl'), kubeB = await create('production', 'kubectl');
+    const connections = [mysqlA, mysqlB, kubeA, kubeB].map(secret => ({ tool: secret.tool!, alias: secret.name, secretId: secret.id }));
+    const role = await service.roles.save({ name: 'Data operators', connections });
+    await service.roles.assign(projectId, role.id);
+    await service.publishHome(projectId);
+    await service.registerRuntime('role-box', projectId, 1);
+    await repository.markRuntimeConfig('role-box', 1, 'cocell_role_runtime', 'home');
+    await service.registerRuntime('other-box', randomUUID(), 1);
+    const files = await service.provision(projectId);
+    assert.equal(files.length, 4);
+    assert.equal(new Set(files.map(file => file.path)).size, 4);
+    assert.ok(files.every(file => file.alias));
+    for (const connection of connections) {
+      const args = connection.tool === 'mysql' ? ['-e', 'SELECT 1'] : ['get', 'pods'];
+      const auth = await service.authorize('role-box', connection.tool, [`--connection=${connection.alias}`, ...args]);
+      assert.ok(auth.path.includes(connection.secretId));
+      assert.ok(!auth.args.some(arg => arg.startsWith('--connection')));
+      assert.equal(await readFile(join(root, 'runtime/debug-homes', projectId, auth.path), 'utf8'), `fixture-${connection.alias}`);
+      await assert.rejects(service.authorize('other-box', connection.tool, [`--connection=${connection.alias}`, ...args]), /未授权/);
+    }
+    await assert.rejects(service.authorize('role-box', 'mysql', ['-e', 'SELECT 1']), /选择一个/);
+    await assert.rejects(service.authorize('role-box', 'mysql', ['--connection=missing', '-e', 'SELECT 1']), /未授权/);
+    await assert.rejects(service.authorize('role-box', 'mysql', ['--connection=analytics', '--connection=warehouse', '-e', 'SELECT 1']), /选择无效/);
+    await assert.rejects(service.authorize('role-box', 'kubectl', ['--connection=staging', '--kubeconfig=/tmp/other', 'get', 'pods']), /覆盖/);
+    await assert.rejects(service.savePermissions(projectId, [{ tool: 'mysql', enabled: true }]), /角色管理/);
+    await assert.rejects(service.saveSelections(projectId, [{ tool: 'mysql', secretId: mysqlA.id }]), /角色管理/);
+    await assert.rejects(service.start('role-box', 'mysql', 'analytics', ['-e', 'SELECT 1']), /角色管理/);
+    await assert.rejects(service.syncFiles('role-box', 'mysql', [], 0), /角色管理/);
+    const restarted = new SecretService(repository, crypto);
+    await restarted.mountHomes(root);
+    assert.deepEqual(await restarted.roles.state(projectId), await service.roles.state(projectId));
+    assert.ok((await restarted.authorize('role-box', 'mysql', ['--connection', 'analytics', '-e', 'SELECT 1'])).path.includes(mysqlA.id));
+    const mysqlPath = files.find(file => file.secretId === mysqlA.id)!.path;
+    await service.update(mysqlA.id, { enabled: false });
+    await assert.rejects(service.authorize('role-box', 'mysql', ['--connection=analytics', '-e', 'SELECT 1']), /未授权/);
+    await assert.rejects(readFile(join(root, 'runtime/debug-homes', projectId, mysqlPath)), { code: 'ENOENT' });
+    await service.roles.save({ name: role.name, connections: connections.filter(item => item.secretId === mysqlB.id) }, role.id);
+    await assert.rejects(service.authorize('role-box', 'kubectl', ['--connection=staging', 'get', 'pods']), /未授权/);
+    assert.equal((await service.provision(projectId)).length, 1);
+    await service.delete(mysqlB.id);
+    assert.equal((await service.provision(projectId)).length, 0);
+    await service.roles.assign(projectId, null);
+    assert.deepEqual(await service.roles.state(projectId), { roleId: null, legacy: false, connections: [] });
+    await assert.rejects(service.savePermissions(projectId, []), /角色管理/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('role API requires operator access and validates grants before changing roles', async () => {
+  const { service, projectId } = fixture();
+  const app = new Hono();
+  app.onError((error, c) => c.json({ error: error.message }, error instanceof HttpError ? error.status as 400 : 400));
+  installOperatorAccess(app, { token: 'operator-role-fixture-0123456789abcdef', publicUrl: 'https://app.example.test', projects: () => [] });
+  installSecretRoutes(app, service, id => id === projectId);
+  const headers = { Authorization: 'Bearer operator-role-fixture-0123456789abcdef', 'Content-Type': 'application/json' };
+  assert.equal((await app.request('https://app.example.test/api/tool-roles')).status, 401);
+  assert.equal((await app.request('https://app.example.test/api/tool-roles', { method: 'POST', body: JSON.stringify({ name: 'Denied', connections: [] }) })).status, 401);
+  const created = await app.request('https://app.example.test/api/tool-roles', { method: 'POST', headers, body: JSON.stringify({ name: 'No tools', connections: [] }) });
+  assert.equal(created.status, 201);
+  const role = await created.json();
+  assert.equal((await app.request('https://app.example.test/api/tool-roles/default', { method: 'PUT', headers, body: JSON.stringify({ roleId: role.id }) })).status, 200);
+  assert.equal((await app.request(`https://app.example.test/api/projects/${projectId}/tool-role`, { method: 'PUT', headers, body: JSON.stringify({ roleId: role.id }) })).status, 200);
+  assert.equal((await app.request(`https://app.example.test/api/tool-roles/${role.id}`, { method: 'DELETE', headers })).status, 409);
+  const secret = await service.create({ name: 'glab', tool: 'glab', path: '.config/glab/config.yml', format: 'text', content: 'fixture', mutable: false });
+  await assert.rejects(service.roles.save({ name: 'Wrong tool', connections: [{ tool: 'mysql', alias: 'db', secretId: secret.id }] }), /已启用/);
+  await assert.rejects(service.roles.save({ name: 'Duplicate', connections: [{ tool: 'glab', alias: 'a', secretId: secret.id }, { tool: 'glab', alias: 'b', secretId: secret.id }] }), /重复/);
+  assert.equal((await service.roles.catalog()).roles.length, 1);
+});
+
+test('legacy runtimes cannot receive role credentials or switch to roles until HOME authorization is acknowledged', async () => {
+  const { service, repository, projectId } = fixture();
+  const role = await service.roles.save({ name: 'Restricted', connections: [] });
+  await service.registerRuntime('legacy-box', projectId, 1);
+  await assert.rejects(service.roles.assign(projectId, role.id), /旧版 Sandbox/);
+  assert.equal((await service.roles.state(projectId)).legacy, true);
+  await repository.markRuntimeConfig('legacy-box', 1, 'cocell_role_runtime', 'home');
+  await service.roles.assign(projectId, role.id);
+  let writes = 0;
+  const provider = { client: {
+    getBox: async () => ({ phase: 'running', generation: 1, capabilities: { protectedTools: true, credentialBatch: true, mountedDebugHome: false } }),
+    writeCredentials: async () => { writes++; },
+  } } as unknown as CellboxSandboxProvider;
+  const host = new SandboxLifecycle([new SandboxRuntimeConfig({ provider, secrets: service, toolBrokerUrl: 'http://broker.example.test' }).extension]);
+  await assert.rejects(host.run({ action: 'connect', resourceKey: `project:${projectId}`, sandboxId: 'legacy-box' }, async () => {}), (error: unknown) => error instanceof Error && error.cause instanceof Error && /require mounted HOME/.test(error.cause.message));
+  assert.equal(writes, 0);
 });

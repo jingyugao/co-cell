@@ -10,9 +10,9 @@ test('real browser: immediate creation entry, draft retention and automatic resu
     await page.goto('/#projects');
     const start = performance.now();
     const creationResponse = page.waitForResponse(response => response.request().method() === 'POST'
-      && new URL(response.url()).pathname === '/api/projects');
+      && new URL(response.url()).pathname === '/api/projects', { timeout: env.config.operationTimeout });
     const entryResponse = page.waitForResponse(response => response.request().method() === 'POST'
-      && new URL(response.url()).pathname.endsWith('/open'));
+      && new URL(response.url()).pathname.endsWith('/open'), { timeout: env.config.operationTimeout });
     await createThroughUI(page, env.name('browser'));
     const createdResponse = await creationResponse;
     assert.equal(createdResponse.status(), 201);
@@ -52,7 +52,7 @@ test('real browser: immediate creation entry, draft retention and automatic resu
       return Array.isArray(body) ? body.find(project => project.id === id) : body;
     };
     const openedResponse = page.waitForResponse(response => response.request().method() === 'POST'
-      && new URL(response.url()).pathname === `/api/projects/${id}/open`);
+      && new URL(response.url()).pathname === `/api/projects/${id}/open`, { timeout: env.config.operationTimeout });
     const start = performance.now();
     await card.getByRole('button', { name: '进入项目' }).click();
     await expect(editor).toBeEditable(); await expect(editor).toHaveValue('创建时输入的草稿');

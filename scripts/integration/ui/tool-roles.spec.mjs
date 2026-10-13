@@ -17,7 +17,7 @@ test('create a role with multiple MySQL and kubectl connections, set default, an
     }
     if (request.method() === 'POST') {
       roleSave = request.postDataJSON();
-      savedRole = { id: 'data-ops', name: roleSave.name, connections: withCredentialNames(roleSave.connections, secrets), createdAt: stamp, updatedAt: stamp };
+      savedRole = { id: 'data-ops', name: roleSave.name, connections: withCredentialNames(roleSave.connections.map(connection => ({ ...connection, nativeNames: connection.tool === 'mysql' ? [connection.secretId === 'mysql-reporting' ? 'reporting' : "warehouse's"] : ['staging'] })), secrets), createdAt: stamp, updatedAt: stamp };
       catalog = { roles: [defaultRole, savedRole], defaultRoleId: defaultRole.id };
       return route.fulfill({ status: 201, json: savedRole });
     }
@@ -31,6 +31,8 @@ test('create a role with multiple MySQL and kubectl connections, set default, an
   await page.getByRole('button', { name: '新建角色', exact: true }).click();
   const form = page.locator('.role-form');
   await form.getByLabel('角色名称', { exact: true }).fill('数据运维');
+  await expect(form.getByText(/原生 login-path 或 context/)).toBeVisible();
+  await expect(form.getByText(/使用原生 login-path 名称区分/)).toBeVisible();
   await expect(form.getByLabel('mysql 凭证：报表库')).not.toBeChecked();
   await expect(form.getByLabel('mysql 凭证：数仓')).not.toBeChecked();
   await expect(form.getByLabel("kubectl 凭证：O'Reilly 测试集群")).not.toBeChecked();
@@ -40,6 +42,10 @@ test('create a role with multiple MySQL and kubectl connections, set default, an
   await expect(form.locator('input[aria-label*="别名"]')).toHaveCount(0);
   await form.getByRole('button', { name: '保存角色', exact: true }).click();
   await expect(page.getByRole('article').filter({ hasText: '数据运维' })).toBeVisible();
+  const roleCard = page.getByRole('article').filter({ hasText: '数据运维' });
+  await expect(roleCard.getByText('报表库', { exact: false })).toBeVisible();
+  await expect(roleCard.getByText('mysql --login-path=reporting', { exact: true })).toBeVisible();
+  await expect(roleCard.getByText('kubectl --context=staging', { exact: true })).toBeVisible();
   expect(roleSave).toEqual({ name: '数据运维', connections: [
     { tool: 'mysql', secretId: 'mysql-reporting' },
     { tool: 'mysql', secretId: 'mysql-warehouse' },
@@ -52,8 +58,9 @@ test('create a role with multiple MySQL and kubectl connections, set default, an
   await page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('button', { name: '工具权限', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '暂停项目 工具权限', exact: true });
   await dialog.getByRole('radio', { name: '数据运维 默认角色', exact: true }).check();
-  await expect(dialog.getByText("mysql --connection='报表库'", { exact: true })).toBeVisible();
-  await expect(dialog.getByText("kubectl --connection='O'\\''Reilly 测试集群'", { exact: true })).toBeVisible();
+  await expect(dialog.getByText('mysql --login-path=reporting', { exact: true })).toBeVisible();
+  await expect(dialog.getByText("mysql --login-path='warehouse'\\''s'", { exact: true })).toBeVisible();
+  await expect(dialog.getByText('kubectl --context=staging', { exact: true })).toBeVisible();
   await dialog.getByRole('button', { name: '保存', exact: true }).click();
   expect(projectSave).toEqual({ roleId: 'data-ops' });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);

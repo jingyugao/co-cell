@@ -63,7 +63,7 @@ export default function RoleManager({ secrets }: { secrets: SecretMetadata[] }) 
     {editing && <form className="secret-form role-form" onSubmit={event => void save(event)}>
       <h3>{editing === 'new' ? '新建角色' : `编辑 ${editing.name}`}</h3>
       <label>角色名称<input required maxLength={100} value={name} onChange={event => setName(event.target.value)} /></label>
-      <div className="role-connections-heading"><strong>工具凭证</strong><span>未选择凭证的工具不可用</span></div>
+      <div className="role-connections-heading"><strong>工具凭证</strong><span>未选择凭证的工具不可用；仅支持原生 login-path 或 context 的工具可选多个凭证。</span></div>
       <div className="role-tool-list">{tools.map(tool => {
         const selected = connections.filter(item => item.tool === tool);
         const available = usableSecrets.filter(item => item.tool === tool);
@@ -71,7 +71,7 @@ export default function RoleManager({ secrets }: { secrets: SecretMetadata[] }) 
         const secretName = (secretId: string) => secrets.find(item => item.id === secretId)?.name ?? '已删除的凭证';
         return <fieldset className="role-tool-group" key={tool} disabled={busy}>
           <legend>{tool}</legend>
-          <p className="role-tool-hint">{repeatable(tool) ? '可选择多个凭证。' : '最多选择一个凭证。'}</p>
+          <p className="role-tool-hint">{repeatable(tool) ? `可选择多个凭证，使用原生 ${tool === 'mysql' ? 'login-path' : 'context'} 名称区分。` : '最多选择一个凭证。'}</p>
           {repeatable(tool) ? <div className="role-credential-options">
             {!available.length && !unavailable.length && <p>暂无可用凭证，请先添加或启用此工具的文本凭证。</p>}
             {available.map(secret => {
@@ -92,7 +92,12 @@ export default function RoleManager({ secrets }: { secrets: SecretMetadata[] }) 
     </form>}
     {loading ? <p role="status">正在读取工具角色…</p> : !catalog?.roles.length ? <div className="connections-empty">暂无工具角色。角色可包含多个 MySQL 或 Kubernetes 连接。</div> : <div className="secret-list">{catalog.roles.map(role => <article className="connection-card role-card" key={role.id}>
       <div className="connection-profile-title"><strong>{role.name}</strong><span>{catalog.defaultRoleId === role.id ? '默认角色' : ''}</span></div>
-      {!role.connections.length ? <p>无工具连接</p> : <ul>{role.connections.map((connection, index) => <li key={`${connection.tool}-${connection.secretId}-${index}`}><strong>{connection.tool}</strong> · {secrets.find(secret => secret.id === connection.secretId)?.name ?? connection.alias}{['mysql', 'kubectl'].includes(connection.tool) && <code>{toolConnectionCommand(connection.tool, secrets.find(secret => secret.id === connection.secretId)?.name ?? connection.alias)}</code>}</li>)}</ul>}
+      {!role.connections.length ? <p>无工具连接</p> : <ul>{role.connections.map((connection, index) => {
+        const credential = secrets.find(secret => secret.id === connection.secretId);
+        const credentialName = credential?.name ?? connection.alias;
+        const nativeNames = credential?.nativeNames ?? connection.nativeNames;
+        return <li key={`${connection.tool}-${connection.secretId}-${index}`}><strong>{connection.tool}</strong> · {credentialName}{['mysql', 'kubectl'].includes(connection.tool) && nativeNames?.map(nativeName => <code key={nativeName}>{toolConnectionCommand(connection.tool, nativeName)}</code>)}</li>;
+      })}</ul>}
       <div className="secret-actions"><button className="secondary-button" disabled={busy || catalog.defaultRoleId === role.id} onClick={() => void setDefault(role.id)}>{catalog.defaultRoleId === role.id ? '当前默认角色' : '设为默认'}</button><button className="secondary-button" aria-label={`编辑角色：${role.name}`} disabled={busy} onClick={() => start(role)}>编辑</button><button className="secondary-button" disabled={busy} onClick={() => void remove(role)}>删除</button></div>
     </article>)}</div>}
   </section>;

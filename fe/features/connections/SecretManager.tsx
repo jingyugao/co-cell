@@ -60,7 +60,9 @@ export default function SecretManager() {
       <label>名称<input required maxLength={100} value={name} onChange={e => setName(e.target.value)} /></label>
       <label>工具名<input required maxLength={64} pattern={TOOL_NAME_PATTERN.source} value={tool} onChange={e => setTool(e.target.value)} placeholder="例如 mysql、kubectl 或自定义 CLI 名称" /></label>
       <label>认证文件路径<input required maxLength={256} value={path} onChange={e => setPath(e.target.value)} placeholder="例如 .my.cnf、.kube/config" /></label>
-      <p>路径相对于 debug HOME。内容按 UTF-8 文本原样使用，不做格式转换。</p>
+      {tool.trim() === 'mysql' ? <p>使用原生 login-path 选项组，例如 [doris]。角色授权的连接会合并为 .mylogin.cnf，通过 mysql --login-path=doris 使用；仅含 [client] 的文件使用凭证名称作为连接名。</p>
+        : tool.trim() === 'kubectl' ? <p>上传原生 kubeconfig。角色授权的账户会合并到 .kube/config，保留 context 原名，通过 kubectl --context=名称 使用。</p>
+          : <p>路径相对于 debug HOME。内容按 UTF-8 文本原样使用。</p>}
       {editing !== 'new' && (editing.requiresTextImport || editing.format !== 'text') && <p className="connections-error">旧格式需要重新导入一个原生文本认证文件。</p>}
       <label>上传文件<input type="file" onChange={e => void upload(e.target.files?.[0])} /></label>
       <label>认证内容<textarea required spellCheck={false} autoComplete="off" rows={12} value={content} onChange={e => setContent(e.target.value)} placeholder="粘贴工具原生认证文件的完整文本内容" /></label>

@@ -59,7 +59,9 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
   const guest = async code => JSON.parse(await kubectl(['exec', pod, '--', '/usr/local/bin/node', '-e', code]));
   const cli = args => guest(`const {spawnSync}=require('node:child_process');const r=spawnSync('/usr/local/bin/kubectl',${JSON.stringify(args)},{uid:11000,gid:11000,cwd:'/home/agent/workspace',env:{HOME:'/home/agent',PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:25000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.message}));`);
   const home = `/home/debug/${project.id}`;
-  const kubectlPath = `.cocell/connections/kubectl/${credential.id}/config`;
+  const kubectlPath = '.kube/config';
+  assert(credential.nativeNames?.length && mysqlCredential.nativeNames?.length, 'Native context/profile metadata is required');
+  const kubeContext = process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? credential.nativeNames[0], mysqlProfile = mysqlCredential.nativeNames[0];
   const fileState = () => guest(`const fs=require('node:fs'),crypto=require('node:crypto');const p=${JSON.stringify(home + '/' + kubectlPath)};console.log(JSON.stringify(fs.existsSync(p)?{exists:true,sha256:crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')}:{exists:false}));`);
   const dialog = page.getByRole('dialog', { name: `${env.name('native-home')} 工具权限`, exact: true });
   const catalog = await env.json('/api/tool-roles');
@@ -84,12 +86,12 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     pod = await findPod();
     await savePermission(true);
     assert.equal(await findPod(), pod);
-    const version = await cli([`--connection=${credential.name}`, 'version', '--client']);
+    const version = await cli([`--context=${kubeContext}`, 'version', '--client']);
     assert.equal(version.status, 0, version.stderr || version.error);
     assert.match(version.stdout, /Client Version:/);
-    const connection = await cli([`--connection=${credential.name}`, 'config', 'current-context']);
+    const connection = await cli([`--context=${kubeContext}`, 'config', 'current-context']);
     assert.equal(connection.status, 0, connection.stderr || connection.error);
-    const pods = await cli([`--connection=${credential.name}`, '--context', process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? context, '-n', 'co-cell', 'get', 'pods', '-o', 'name']);
+    const pods = await cli([`--context=${kubeContext}`, '-n', 'co-cell', 'get', 'pods', '-o', 'name']);
     assert.equal(pods.status, 0, pods.stderr);
     assert.match(pods.stdout, /^pod\//m);
     assert.equal((await fileState()).exists, true);
@@ -104,7 +106,7 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
   await env.step('Revocation immediately denies the agent CLI and removes its credential file', async () => {
     await savePermission(false);
     assert.equal(await findPod(), pod);
-    const denied = await cli([`--connection=${credential.name}`, 'config', 'current-context']);
+    const denied = await cli([`--context=${kubeContext}`, 'config', 'current-context']);
     assert.notEqual(denied.status, 0);
     assert.match(denied.stderr, /Tool authorization failed \(HTTP 403\)/);
     assert.equal((await fileState()).exists, false);
@@ -113,7 +115,7 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
   await env.step('Native CLI updates survive pause and resume without copying the original credential back', async () => {
     await savePermission(true);
     const before = await fileState();
-    assert.equal((await cli([`--connection=${credential.name}`, 'config', 'set-context', '--current', '--namespace=cocell-home-integration'])).status, 0);
+    assert.equal((await cli([`--context=${kubeContext}`, 'config', 'set-context', '--current', '--namespace=cocell-home-integration'])).status, 0);
     const refreshed = await fileState();
     assert.notEqual(refreshed.sha256, before.sha256);
     const checkpointed = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
@@ -130,7 +132,7 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     const previousPod = pod; pod = await findPod();
     assert.notEqual(pod, previousPod);
     assert.equal((await fileState()).sha256, refreshed.sha256);
-    assert.equal((await cli([`--connection=${credential.name}`, 'config', 'current-context'])).status, 0);
+    assert.equal((await cli([`--context=${kubeContext}`, 'config', 'current-context'])).status, 0);
     return { observedReadyMs, pod, nativeCredentialPreserved: true };
   });
   await env.step('Cold rebuild restores protected kubectl and MySQL while retaining native credential updates', async () => {
@@ -145,11 +147,11 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     pod = await findPod();
     assert.notEqual(pod, previousPod);
     assert.equal((await fileState()).sha256, before.sha256);
-    const resources = await cli([`--connection=${credential.name}`, '--context', process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? context,
+    const resources = await cli([`--context=${kubeContext}`,
       '-n', 'co-cell', 'get', 'pods', '-o', 'name']);
     assert.equal(resources.status, 0, resources.stderr);
     assert.match(resources.stdout, /^pod\//m);
-    const args = [`--connection=${mysqlCredential.name}`, '-e', 'SELECT 1'];
+    const args = [`--login-path=${mysqlProfile}`, '-e', 'SELECT 1'];
     const mysql = await guest(`const {spawnSync}=require('node:child_process');const r=spawnSync('/usr/local/bin/mysql',${JSON.stringify(args)},{uid:11000,gid:11000,cwd:'/home/agent/workspace',env:{HOME:'/home/agent',PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:20000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.code}));`);
     assert.equal(mysql.status, 0, mysql.stderr || mysql.error);
     assert.equal(mysql.stdout.trim().split('\n').at(-1), '1');

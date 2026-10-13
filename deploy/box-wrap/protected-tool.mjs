@@ -5,6 +5,29 @@ import { decodeWorkingDirectory } from '../../util/tool-working-directory.mjs';
 import { decodeGitlabHost } from '../../util/gitlab-tool-host.mjs';
 import { toolRuntimeBoxId } from '../../util/tool-runtime-identity.mjs';
 
+export class ToolAuthorizationError extends Error {}
+async function authorizationError(response) {
+  let detail = '';
+  if (response.status >= 400 && response.status < 500 && response.headers.get('content-type')?.includes('application/json')) {
+    const reader = response.body?.getReader();
+    try {
+      if (reader) {
+        const chunks = []; let size = 0;
+        while (true) {
+          const { done, value } = await reader.read(); if (done) break;
+          size += value.length; if (size > 4096) break; chunks.push(value);
+        }
+        if (size <= 4096) {
+          const value = JSON.parse(Buffer.concat(chunks).toString());
+          if (typeof value.error === 'string') detail = value.error.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 1024);
+        }
+      }
+    } catch { /* Keep the status if the broker response is malformed. */ }
+    finally { await reader?.cancel().catch(() => {}); }
+  }
+  return new ToolAuthorizationError(`Tool authorization failed (HTTP ${response.status})${detail ? ': ' + detail : ''}`);
+}
+
 function safePath(path) {
   return typeof path === 'string' && path.length > 0 && path.length <= 256 && !path.startsWith('/') && normalize(path) === path &&
     !/[\\\u0000-\u001f\u007f]/.test(path) && path.split('/').every(part => part && part !== '.' && part !== '..');
@@ -40,7 +63,7 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
     method: 'POST', redirect: 'error', signal: AbortSignal.timeout(4000),
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ boxId, tool, args: decoded.args }),
   });
-  if (!response.ok) throw new Error(`Tool authorization failed (HTTP ${response.status})`);
+  if (!response.ok) throw await authorizationError(response);
   const setup = await response.json();
   if (setup.tool !== tool || typeof setup.home !== 'string' || !/^\/home\/debug\/[a-f0-9-]{36}$/.test(setup.home) ||
       !safePath(setup.path) || !Array.isArray(setup.args) || setup.args.length > 32 ||
@@ -54,7 +77,10 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   if (tool === 'kubectl') env.KUBECONFIG = credential;
   if (tool === 'glab') env.GLAB_CONFIG_DIR = dirname(credential);
   if (tool === 'git') env.GIT_CONFIG_GLOBAL = credential;
-  const args = tool === 'mysql' ? [`--defaults-file=${credential}`, ...setup.args] : setup.args;
+  // --no-defaults still reads the native login file. Pin its path and omit all
+  // other option files so the account comes exclusively from role-granted HOME.
+  if (tool === 'mysql') env.MYSQL_TEST_LOGIN_FILE = credential;
+  const args = tool === 'mysql' ? ['--no-defaults', ...setup.args] : setup.args;
   const result = await execute(join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool), args, env, options.cwd ?? process.cwd());
   (options.stdout ?? process.stdout).write(result.stdout);
   (options.stderr ?? process.stderr).write(result.stderr);

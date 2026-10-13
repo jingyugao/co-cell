@@ -12,6 +12,8 @@ export interface SecretMetadata {
   version: number; createdAt: string; updatedAt: string; projectIds: string[];
   tool: ProxyTool | null; path: string | null; requiresTextImport: boolean;
   supportFilePaths?: string[];
+  /** Native MySQL login-path names or Kubernetes context names; no credential values. */
+  nativeNames?: string[];
   filePaths?: string[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity;
 }
 export interface SecretInput {
@@ -31,6 +33,8 @@ export interface SecretDeleteResult { ok: true }
 export interface ProvisionedToolFile {
   tool: ProxyTool; secretId: string; path: string; content: string; mutable: boolean; version: number;
   alias: string;
+  /** Revision of all credentials contributing to a merged native config. */
+  revision?: string;
   format?: SecretFormat;
 }
 /** Stable across resume; carries no credential content or authentication token. */
@@ -45,9 +49,10 @@ export interface SecretFileBinding { secretId: string; path: string }
 export interface ProjectToolGrant {
   id: string; projectId: string; tool: ProxyTool; alias: string; enabled: boolean;
   files: SecretFileBinding[]; updatedAt: string;
+  nativeNames?: string[];
 }
 /** Named credentials granted together to a project. alias is the current original credential name, never user-configurable. */
-export interface RoleConnection { tool: ProxyTool; alias: string; secretId: string }
+export interface RoleConnection { tool: ProxyTool; alias: string; secretId: string; nativeNames?: string[] }
 export interface ToolRole { id: string; name: string; connections: RoleConnection[]; createdAt: string; updatedAt: string }
 /** Connections are selected by credential ID; their names come from the credential. */
 export interface ToolRoleInput { name: string; connections: Array<Pick<RoleConnection, 'tool' | 'secretId'>> }

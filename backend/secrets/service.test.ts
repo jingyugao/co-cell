@@ -51,52 +51,52 @@ export function fixture() {
   return { repository, service, projectId, crypto };
 }
 
-test('project roles isolate named connections, revoke live HOME files, and block legacy bypasses', async () => {
-  const { service, repository, projectId, crypto } = fixture();
-  await service.init();
-  const root = await mkdtemp(join(tmpdir(), 'cocell-roles-'));
-  await service.mountHomes(root);
+test('project roles merge only granted native profiles, preserve unchanged HOME, and revoke live access', async () => {
+  const { service, repository, projectId, crypto } = fixture(); await service.init();
+  const root = await mkdtemp(join(tmpdir(), 'cocell-roles-')); await service.mountHomes(root);
   try {
-    const create = (name: string, tool: string) => service.create({ name, tool, path: tool === 'mysql' ? '.my.cnf' : '.kube/config', format: 'text', mutable: false, content: `fixture-${name}` });
+    const create = (name: string, tool: string) => service.create({ name: 'Credential ' + name, tool, path: tool === 'mysql' ? '.my.cnf' : '.kube/config', format: 'text', mutable: false,
+      content: tool === 'mysql' ? '[' + name + ']\nuser=fixture\npassword=synthetic-' + name + '\n'
+        : JSON.stringify({ apiVersion: 'v1', kind: 'Config', clusters: [{ name: 'shared', cluster: { server: 'https://' + name + '.example.test' } }], users: [{ name: 'admin', user: { token: 'synthetic-' + name } }], contexts: [{ name, context: { cluster: 'shared', user: 'admin' } }], 'current-context': name }) });
     const mysqlA = await create('analytics', 'mysql'), mysqlB = await create('warehouse', 'mysql');
     const kubeA = await create('staging', 'kubectl'), kubeB = await create('production', 'kubectl');
-    const connections = [mysqlA, mysqlB, kubeA, kubeB].map(secret => ({ tool: secret.tool!, alias: secret.name, secretId: secret.id }));
-    const role = await service.roles.save({ name: 'Data operators', connections });
-    await service.roles.assign(projectId, role.id);
-    await service.publishHome(projectId);
-    await service.registerRuntime('role-box', projectId, 1);
-    await service.registerRuntime('other-box', randomUUID(), 1);
-    const files = await service.provision(projectId);
-    assert.equal(files.length, 4);
-    assert.equal(new Set(files.map(file => file.path)).size, 4);
-    assert.ok(files.every(file => file.alias));
-    for (const connection of connections) {
-      const args = connection.tool === 'mysql' ? ['-e', 'SELECT 1'] : ['get', 'pods'];
-      const auth = await service.authorize('role-box', connection.tool, [`--connection=${connection.alias}`, ...args]);
-      assert.ok(auth.path.includes(connection.secretId));
-      assert.ok(!auth.args.some(arg => arg.startsWith('--connection')));
-      assert.equal(await readFile(join(root, 'runtime/debug-homes', projectId, auth.path), 'utf8'), `fixture-${connection.alias}`);
-      await assert.rejects(service.authorize('other-box', connection.tool, [`--connection=${connection.alias}`, ...args]), /未授权/);
+    const connections = [mysqlA, mysqlB, kubeA, kubeB].map(secret => ({ tool: secret.tool!, secretId: secret.id }));
+    const role = await service.roles.save({ name: 'Data operators', connections }); await service.roles.assign(projectId, role.id); await service.publishHome(projectId);
+    await service.registerRuntime('role-box', projectId, 1); await service.registerRuntime('other-box', randomUUID(), 1);
+    const files = await service.provision(projectId); assert.equal(files.length, 2);
+    assert.deepEqual(files.map(file => file.path).sort(), ['.kube/config', '.mylogin.cnf']);
+    const home = join(root, 'runtime/debug-homes', projectId);
+    const kube = JSON.parse(await readFile(join(home, '.kube/config'), 'utf8'));
+    assert.deepEqual(kube.contexts.map((item: { name: string }) => item.name), ['staging', 'production']);
+    for (const connection of role.connections) {
+      const name = connection.nativeNames![0];
+      const args = connection.tool === 'mysql' ? ['--login-path=' + name, '-e', 'SELECT 1'] : ['--context=' + name, 'get', 'pods'];
+      const auth = await service.authorize('role-box', connection.tool, args);
+      assert.equal(auth.path, connection.tool === 'mysql' ? '.mylogin.cnf' : '.kube/config');
+      assert.ok(!JSON.stringify(auth).includes('synthetic-'));
+      assert(auth.args.includes(args[0]));
+      await assert.rejects(service.authorize('other-box', connection.tool, args), /未授权/);
     }
-    await assert.rejects(service.authorize('role-box', 'mysql', ['-e', 'SELECT 1']), /选择一个/);
-    await assert.rejects(service.authorize('role-box', 'mysql', ['--connection=missing', '-e', 'SELECT 1']), /未授权/);
-    await assert.rejects(service.authorize('role-box', 'mysql', ['--connection=analytics', '--connection=warehouse', '-e', 'SELECT 1']), /选择无效/);
-    await assert.rejects(service.authorize('role-box', 'kubectl', ['--connection=staging', '--kubeconfig=/tmp/other', 'get', 'pods']), /覆盖/);
-    const restarted = new SecretService(repository, crypto);
-    await restarted.mountHomes(root);
+    await assert.rejects(service.authorize('role-box', 'mysql', ['-e', 'SELECT 1']), /login-path/);
+    await assert.rejects(service.authorize('role-box', 'mysql', ['--login-path=missing', '-e', 'SELECT 1']), /未授权/);
+    await assert.rejects(service.authorize('role-box', 'mysql', ['--login-path=analytics', '--login-path=warehouse', '-e', 'SELECT 1']), /名称无效/);
+    await assert.rejects(service.authorize('role-box', 'kubectl', ['--context=staging', '--kubeconfig=/tmp/other', 'get', 'pods']), /覆盖/);
+    await assert.rejects(service.authorize('role-box', 'mysql', ['--login-path=analytics', '--host=other', '-e', 'SELECT 1']), /mysql/);
+    const restarted = new SecretService(repository, crypto); await restarted.mountHomes(root); await restarted.init();
     assert.deepEqual(await restarted.roles.state(projectId), await service.roles.state(projectId));
-    assert.ok((await restarted.authorize('role-box', 'mysql', ['--connection', 'analytics', '-e', 'SELECT 1'])).path.includes(mysqlA.id));
-    const mysqlPath = files.find(file => file.secretId === mysqlA.id)!.path;
+    assert.equal((await restarted.authorize('role-box', 'mysql', ['--login-path', 'analytics', '-e', 'SELECT 1'])).path, '.mylogin.cnf');
+    const before = await readFile(join(home, '.mylogin.cnf')); await service.publishHome(projectId);
+    assert.deepEqual(await readFile(join(home, '.mylogin.cnf')), before);
     await service.update(mysqlA.id, { enabled: false });
-    await assert.rejects(service.authorize('role-box', 'mysql', ['--connection=analytics', '-e', 'SELECT 1']), /未授权/);
-    await assert.rejects(readFile(join(root, 'runtime/debug-homes', projectId, mysqlPath)), { code: 'ENOENT' });
+    await assert.rejects(service.authorize('role-box', 'mysql', ['--login-path=analytics', '-e', 'SELECT 1']), /未授权/);
+    assert.notDeepEqual(await readFile(join(home, '.mylogin.cnf')), before);
+    assert.equal((await service.authorize('role-box', 'mysql', ['--login-path=warehouse', '-e', 'SELECT 1'])).path, '.mylogin.cnf');
     await service.roles.save({ name: role.name, connections: connections.filter(item => item.secretId === mysqlB.id) }, role.id);
-    await assert.rejects(service.authorize('role-box', 'kubectl', ['--connection=staging', 'get', 'pods']), /未授权/);
-    assert.equal((await service.provision(projectId)).length, 1);
-    await service.delete(mysqlB.id);
-    assert.equal((await service.provision(projectId)).length, 0);
-    await service.roles.assign(projectId, null);
-    assert.deepEqual(await service.roles.state(projectId), { roleId: null, connections: [] });
+    await assert.rejects(service.authorize('role-box', 'kubectl', ['get', 'pods']), /未授权/);
+    await assert.rejects(readFile(join(home, '.kube/config')), { code: 'ENOENT' });
+    await service.delete(mysqlB.id); assert.equal((await service.provision(projectId)).length, 0);
+    await assert.rejects(readFile(join(home, '.mylogin.cnf')), { code: 'ENOENT' });
+    await service.roles.assign(projectId, null); assert.deepEqual(await service.roles.state(projectId), { roleId: null, connections: [] });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -158,7 +158,7 @@ test('bootstrap binds every historical project to empty Default, removes mounted
     const authorized = await service.authorize('historical-box', 'mysql', ['-e', 'SELECT 1']);
     await writeFile(join(root, 'runtime/debug-homes', projectId, authorized.path), 'native-refresh');
     const restarted = new SecretService(repository, crypto); await restarted.mountHomes(root); await restarted.init();
-    assert.deepEqual((await restarted.roles.state(projectId)).connections, preexisting.connections.map(connection => ({ ...connection, alias: secret.name })));
+    assert.deepEqual((await restarted.roles.state(projectId)).connections, preexisting.connections.map(connection => ({ ...connection, alias: secret.name, nativeNames: [secret.name] })));
     assert.equal(await readFile(join(root, 'runtime/debug-homes', projectId, authorized.path), 'utf8'), 'native-refresh');
     const newId = randomUUID(); repository.projectIds.add(newId);
     await repository.roles.assignDefault(newId);
@@ -200,27 +200,26 @@ test('native text secrets retain bytes and reject unsafe paths without granting 
 });
 
 
-test('connection selectors use original credential names and follow renames without widening access', async () => {
+test('native profile names survive credential-label edits and reject conflicting updates atomically', async () => {
   const { service, projectId } = fixture(); await service.init();
-  const root = await mkdtemp(join(tmpdir(), 'cocell-credential-names-'));
-  await service.mountHomes(root);
+  const root = await mkdtemp(join(tmpdir(), 'cocell-credential-names-')); await service.mountHomes(root);
   try {
-    const name = "MySQL · 报表 team's database";
-    const secret = await service.create({ name, tool: 'mysql', path: '.my.cnf', format: 'text', mutable: false, content: '[client]\nuser=fixture' });
+    const secret = await service.create({ name: 'MySQL · reports', tool: 'mysql', path: '.my.cnf', format: 'text', mutable: false, content: '[doris]\nuser=fixture' });
     const role = await service.roles.save({ name: 'Reports', connections: [{ tool: 'mysql', secretId: secret.id }] });
-    assert.equal(role.connections[0].alias, name);
-    await service.roles.assign(projectId, role.id);
-    await service.publishHome(projectId);
-    await service.registerRuntime('name-box', projectId, 1);
-    const auth = await service.authorize('name-box', 'mysql', ['--connection', name, '-e', 'SELECT 1']);
-    assert(auth.path.includes(secret.id));
-    assert(!auth.args.includes(name));
-    await service.update(secret.id, { name: 'doris' });
-    assert.equal((await service.roles.state(projectId)).connections[0].alias, 'doris');
-    assert((await service.authorize('name-box', 'mysql', ['--connection=doris', '-e', 'SELECT 1'])).path.includes(secret.id));
-    await assert.rejects(service.authorize('name-box', 'mysql', [`--connection=${name}`, '-e', 'SELECT 1']), /未授权/);
-    const duplicate = await service.create({ name: 'doris', tool: 'mysql', path: '.my.cnf', format: 'text', mutable: false, content: '[client]\nuser=other' });
-    await assert.rejects(service.roles.save({ name: role.name, connections: [secret, duplicate].map(item => ({ tool: 'mysql', secretId: item.id })) }, role.id), /重复/);
-    assert.equal((await service.roles.state(projectId)).connections.length, 1);
+    assert.deepEqual(role.connections[0].nativeNames, ['doris']);
+    await service.roles.assign(projectId, role.id); await service.publishHome(projectId); await service.registerRuntime('name-box', projectId, 1);
+    const auth = await service.authorize('name-box', 'mysql', ['--login-path=doris', '-e', 'SELECT 1']); assert.equal(auth.path, '.mylogin.cnf');
+    await service.update(secret.id, { name: 'Renamed credential' });
+    assert.deepEqual((await service.roles.state(projectId)).connections[0].nativeNames, ['doris']);
+    await service.authorize('name-box', 'mysql', ['--login-path=doris', '-e', 'SELECT 1']);
+    await assert.rejects(service.authorize('name-box', 'mysql', ['--login-path=Renamed credential', '-e', 'SELECT 1']), /未授权/);
+    const duplicate = await service.create({ name: 'Different label', tool: 'mysql', path: '.my.cnf', format: 'text', mutable: false, content: '[doris]\nuser=other' });
+    await assert.rejects(service.roles.save({ name: role.name, connections: [secret, duplicate].map(item => ({ tool: 'mysql', secretId: item.id })) }, role.id), /名称重复/);
+    await service.update(duplicate.id, { content: '[uat]\nuser=other' });
+    await service.roles.save({ name: role.name, connections: [secret, duplicate].map(item => ({ tool: 'mysql', secretId: item.id })) }, role.id);
+    const before = await service.content(duplicate.id);
+    await assert.rejects(service.update(duplicate.id, { content: '[doris]\nuser=other' }), /名称重复/);
+    assert.deepEqual(await service.content(duplicate.id), before);
+    await service.authorize('name-box', 'mysql', ['--login-path=uat', '-e', 'SELECT 1']);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

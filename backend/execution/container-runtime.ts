@@ -718,7 +718,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private sandboxObservation(sandbox: SandboxState, info?: SandboxInfo): SandboxState {
     if (!info) return { ...sandbox, status: 'unavailable' };
     const phase = info.metadata?.phase;
-    const status = info.state === 'running' ? 'ready' : info.state === 'paused' ? 'paused'
+    // Disk capture holds a provider operation on a suspended box. That fence
+    // prevents execution but does not change its paused runtime state.
+    const status = info.state === 'running' ? 'ready' : info.state === 'paused' || phase === 'suspended' ? 'paused'
       : ['creating', 'resuming', 'restoring', 'checkpointing', 'suspending', 'staged'].includes(phase ?? '') ? 'starting' : 'unavailable';
     return { ...sandbox, status, ...(info.templateIdentity ? { image: info.templateIdentity } : {}) };
   }

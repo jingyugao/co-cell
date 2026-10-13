@@ -19,7 +19,7 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
   return renderToStaticMarkup(<ProjectsPage
     projects={projects} config={config} loading={false} initialView={initialView}
     onRefresh={async () => projects} onCreate={async () => project()} onUpdate={async () => project()}
-    onRebuildSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()}
+    onRebuildSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()} onArchiveProject={async () => project()}
     onOpenProject={() => {}} onMenu={() => {}} onBack={() => {}}
   />);
 }
@@ -60,7 +60,7 @@ test('abnormal and missing sandboxes use the recovery-or-first-create paths', ()
   assert.match(missing, /进入项目/);
   assert.doesNotMatch(missing, /<button class="primary-button" disabled="">进入项目/);
   assert.match(missing, /重建 Sandbox/);
-  assert.doesNotMatch(missing, /恢复环境/);
+  assert.doesNotMatch(missing, /<button[^>]*>恢复环境<\/button>/);
 });
 
 test('paused sandbox shows its state and resumes the same environment', () => {
@@ -77,10 +77,24 @@ test('archived project restores from its latest backup and running operations di
 
   const running = page([project({
     sandbox: { id: 'current', status: 'ready', template: 'default', workingDirectory: '/workspace' },
-    sandboxOperation: { kind: 'backup', phase: '上传中', status: 'running', updatedAt: now },
+    sandboxOperation: { kind: 'checkpoint', phase: '暂停中', status: 'running', updatedAt: now },
   })]);
-  assert.match(running, /备份：上传中/);
+  assert.match(running, /Checkpoint：暂停中/);
   assert.match(running, /disabled=""/);
+});
+
+test('asynchronous disk backup does not block project entry or sandbox resume', () => {
+  const backupRunning = { id: 'backup-1', sandboxId: 'paused-box', status: 'running' as const, phase: '上传中', updatedAt: now };
+  const pausedRunning = page([project({ sandbox: { id: 'paused-box', status: 'paused', template: 'default', workingDirectory: '/workspace' }, sandboxBackup: backupRunning })]);
+  assert.match(pausedRunning, /磁盘备份：上传中/);
+  assert.match(pausedRunning, /<button class="secondary-button">恢复运行<\/button>/);
+  assert.match(pausedRunning, /<button class="primary-button"[^>]*>进入项目/);
+
+  const failed = page([project({ sandbox: { id: 'paused-box', status: 'paused', template: 'default', workingDirectory: '/workspace' }, sandboxBackup: { ...backupRunning, status: 'failed', error: '容量超限' } })]);
+  assert.match(failed, /磁盘备份失败/);
+  assert.match(failed, /重试磁盘备份/);
+  assert.match(failed, /<button class="secondary-button">恢复运行<\/button>/);
+  assert.match(failed, /<button class="primary-button"[^>]*>进入项目/);
 });
 
 test('a completed backup operation is not shown on the project card', () => {

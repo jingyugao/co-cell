@@ -66,5 +66,8 @@ export function useProjects() {
   const checkpointSandbox = useCallback((id: string) => runSandboxOperation(id, 'checkpoint', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/checkpoint`, { method: 'POST' }),
   ), [runSandboxOperation]);
-  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, rebuildSandbox, resumeSandbox, checkpointSandbox };
+  const archiveProject = useCallback((id: string, options: { useExistingBackup?: boolean } = {}) => runSandboxOperation(id, 'archive', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify(options) }),
+  ), [runSandboxOperation]);
+  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, rebuildSandbox, resumeSandbox, checkpointSandbox, archiveProject };
 }

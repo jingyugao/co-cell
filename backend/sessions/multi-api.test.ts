@@ -118,7 +118,7 @@ function runtimeFor(control: Control): SandboxRuntime {
   return runtime as SandboxRuntime;
 }
 
-async function fixture() {
+async function fixture(makeRuntime: (control: Control) => SandboxRuntime = runtimeFor) {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-multi-api-'));
   const coordinator = new MemoryCoordinator();
   const state = new MemoryWebStateStore();
@@ -139,7 +139,7 @@ async function fixture() {
     observeCalls: 0, observeReady: deferred<void>() };
   const managers: SessionManager[] = [];
   const start = async () => {
-    const manager = new SessionManager({} as CodexClient, directory, settings, state, runtimeFor(control), undefined, undefined,
+    const manager = new SessionManager({} as CodexClient, directory, settings, state, makeRuntime(control), undefined, undefined,
       undefined, undefined, undefined, coordinator);
     managers.push(manager);
     await manager.init();
@@ -155,6 +155,71 @@ async function fixture() {
     await rm(directory, { recursive: true, force: true });
   } };
 }
+
+test('checkpoint responds before backup and another API resumes even when capture fails', async () => {
+  const captured = deferred<void>();
+  const started = deferred<void>();
+  let paused = false, resumes = 0;
+  const f = await fixture(control => ({ ...runtimeFor(control),
+    async querySandbox(value) { return { ...value, status: paused ? 'paused' : 'ready' }; },
+    async verifySandbox() {},
+    async checkpoint(target) { paused = true; return { ...target.sandbox!, status: 'paused' }; },
+    async resume(target) { resumes++; paused = false; return { ...target.sandbox!, status: 'ready' }; },
+    remoteArchives: {
+      async capture() { started.resolve(); await captured.promise; throw new Error('object storage unavailable'); },
+      async inspect() { throw new Error('unused'); }, async restore() { throw new Error('unused'); }, async activate() {},
+    },
+  }));
+  try {
+    const apiA = await f.start(), apiB = await f.start();
+    const response = await apiA.checkpointProjectSandbox(f.projectId);
+    await started.promise;
+    assert.equal(response.sandboxOperation?.status, 'succeeded');
+    assert.equal(response.sandbox?.status, 'paused');
+    assert.equal(response.sandboxBackup?.status, 'running');
+    let completed = false;
+    const open = apiB.enterProject(f.projectId).then(value => { completed = true; return value; });
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(completed, false, 'resume waits until the disk reader releases the source');
+    assert.equal(resumes, 0);
+    assert.equal((await f.state.getProject(f.projectId))?.sandboxBackup?.status, 'running', 'other API must not fail the live owner');
+    captured.resolve();
+    const resumed = await open;
+    assert.equal(resumed.sandbox?.status, 'ready');
+    assert.equal(resumed.sandboxOperation?.status, 'succeeded');
+    assert.equal(resumed.sandboxBackup?.status, 'failed');
+    assert.equal(resumes, 1);
+    // Projects carrying the original combined checkpoint/backup error must
+    // also enter normally after upgrading, without requiring a successful retry.
+    await f.state.mutateProject(f.projectId, current => {
+      current.sandboxOperation = { id: 'legacy-pause', kind: 'checkpoint', status: 'failed', phase: '从暂停磁盘备份数据',
+        error: '沙箱已暂停，磁盘备份失败', updatedAt: new Date().toISOString() };
+      delete current.sandboxBackup;
+    });
+    paused = true;
+    const legacyEntry = await apiB.enterProject(f.projectId);
+    assert.equal(legacyEntry.sandbox?.status, 'ready');
+    assert.equal(legacyEntry.sandboxOperation?.kind, 'resume');
+    assert.equal(resumes, 2);
+  } finally { captured.resolve(); await f.close(); }
+});
+
+test('shared recovery releases an orphaned backup without failing the completed checkpoint', async () => {
+  const f = await fixture();
+  try {
+    const value = (await f.state.getProject(f.projectId))!;
+    value.sandboxOperation = { id: 'pause-1', kind: 'checkpoint', phase: '完成', status: 'succeeded', updatedAt: value.updatedAt };
+    value.sandboxBackup = { id: 'pause-1', sandboxId: value.sandbox!.id, phase: '校验备份', status: 'running', updatedAt: value.updatedAt };
+    await f.state.saveProject(value);
+    await f.start();
+    const recovered = (await f.state.getProject(f.projectId))!;
+    assert.equal(recovered.sandboxBackup?.status, 'failed');
+    assert.equal(recovered.sandboxOperation?.status, 'succeeded');
+    const lease = await f.coordinator.tryAcquire(`project-maintenance:${f.projectId}`);
+    assert.ok(lease);
+    await lease.release();
+  } finally { await f.close(); }
+});
 
 test('a second API appends messages to the accepted native turn and steers its async answer', async () => {
   const f = await fixture();

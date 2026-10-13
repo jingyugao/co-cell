@@ -109,7 +109,7 @@ export interface ProjectSandboxOperation {
   result?: { sandbox: SandboxState };
   /** Image reserved by an in-flight or uncertain archived restore. */
   imageSelection?: ProjectImageSelection;
-  /** Checkpoint includes a verified workspace backup before completion; backup is a legacy operation kind. */
+  /** Checkpoint completes when paused; its workspace backup has independent status. */
   kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild';
   phase: string;
   status: 'running' | 'failed' | 'succeeded';
@@ -124,6 +124,18 @@ export interface ProjectSandboxOperation {
 }
 /** 1: ordinary, 2: Feishu requirement, 3: weekly project. */
 export type ProjectType = 1 | 2 | 3;
+
+export interface ProjectSandboxBackup {
+  id: string;
+  sandboxId: string;
+  status: 'running' | 'failed' | 'succeeded';
+  phase: string;
+  error?: string;
+  durationMs?: number;
+  scannedBytes?: number;
+  verified?: boolean;
+  updatedAt: string;
+}
 
 export interface Project {
   id: string;
@@ -151,6 +163,8 @@ export interface Project {
   backupRetentionCount?: number;
   latestBackup?: LatestBackupSummary;
   sandboxOperation?: ProjectSandboxOperation;
+  /** Background workspace capture; failure never changes the checkpoint outcome. */
+  sandboxBackup?: ProjectSandboxBackup;
   /** Uncommitted replacement containers and retired containers awaiting cleanup. */
   pendingSandboxCleanup?: SandboxState[];
   /** Verified archive source awaiting deletion and archive finalization; survives retries/restarts. */
@@ -249,7 +263,7 @@ export interface SandboxRecord {
   state: 'running' | 'paused' | 'unknown';
   /** Lifecycle phase returned by the inventory source. */
   phase?: string;
-  inventorySource?: 'kubernetes' | 'oss';
+  inventorySource?: 'kubernetes' | 'node';
   pausedAt?: string;
   cpuCount: number;
   memoryMB: number;

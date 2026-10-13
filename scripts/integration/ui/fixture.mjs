@@ -68,6 +68,11 @@ export const test = base.extend({
           const next = request.postDataJSON();
           if (next.status !== undefined) { data.status = next.status; data.completedAt = next.status === 'completed' ? now : null; }
         }
+        else if (method === 'POST' && path.endsWith('/archive')) {
+          data.status = 'archived'; data.archivedAt = now; delete data.sandbox;
+          delete data.archiveCleanupSourceId; delete data.pendingSandboxCleanup;
+          data.sandboxOperation = operation('archive', 'succeeded');
+        }
         else if (method === 'POST' && path.endsWith('/open')) {
           if (data.sandbox?.status === 'ready' && data.sandboxOperation?.status !== 'running') {
             data.sandboxOperation = operation('resume', 'succeeded');
@@ -78,8 +83,14 @@ export const test = base.extend({
             rememberPending(id, route, 'open', call); return;
           }
         } else if (method === 'POST' && path.endsWith('/sandbox/checkpoint')) {
-          data.sandboxOperation = operation('checkpoint');
-          rememberPending(id, route, 'checkpoint', call); return;
+          if (data.sandbox?.status === 'paused') {
+            data.sandboxOperation = operation('checkpoint', 'succeeded');
+            data.sandboxBackup = { id: 'disk-backup', sandboxId: data.sandbox.id, status: 'running', phase: '排队中', updatedAt: now };
+            status = 200;
+          } else {
+            data.sandboxOperation = operation('checkpoint');
+            rememberPending(id, route, 'checkpoint', call); return;
+          }
         } else if (method === 'POST' && path.endsWith('/rebuild')) {
           data.sandboxOperation = operation(data.sandbox ? 'rebuild' : 'create');
           rememberPending(id, route, 'rebuild', call); return;
@@ -122,6 +133,7 @@ export const test = base.extend({
         const value = projects.get(id);
         value.sandbox = sandbox(id, running ? 'ready' : 'paused');
         value.sandboxOperation = operation('checkpoint', running ? 'running' : 'succeeded');
+        if (!running) value.sandboxBackup = { id: 'disk-backup', sandboxId: value.sandbox.id, status: 'running', phase: '扫描文件', updatedAt: now };
         if (!running) {
           const pending = [...(pendingRoutes.get(id) ?? [])];
           const entries = pending.filter(record => record.kind === 'open');

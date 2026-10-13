@@ -29,7 +29,7 @@ export async function homeRebuild(env) {
     const checkpointResponse = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(checkpointResponse.sandboxOperation.status, 'succeeded');
     assert.equal(checkpointResponse.sandbox.status, 'paused');
-    const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+    const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
     archive = checkpointed.remoteArchives?.[0];
     assert(archive, 'Checkpoint did not publish a workspace archive');
     assert(archive.sizeBytes > 0 && archive.threadIds.includes(initial.session.threadId));

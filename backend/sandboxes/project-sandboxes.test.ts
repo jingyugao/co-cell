@@ -269,6 +269,8 @@ test('live Sandbox queries ignore reference status without preparing, connecting
     }
     provider.getInfo = async id => ({ ...await original(id), state: 'paused', metadata: { phase: 'suspended' } });
     assert.equal((await runtime.querySandbox(source)).status, 'paused');
+    provider.getInfo = async id => ({ ...await original(id), state: 'unknown', metadata: { phase: 'suspended', operationId: 'disk-capture' } });
+    assert.equal((await runtime.querySandbox(source)).status, 'paused', 'background disk capture keeps the suspended runtime paused');
     provider.getInfo = async () => { throw new CellboxError('NOT_FOUND', 'gone'); };
     assert.equal((await runtime.querySandbox(source)).status, 'unavailable');
     provider.getInfo = async () => { throw new CellboxError('TRANSPORT', 'unreachable'); };

@@ -45,6 +45,11 @@ export class ProjectService {
         migratedStatus = true;
       }
       this.clearSandboxStatus(project);
+      if (!this.shared && project.sandboxBackup?.status === 'running') {
+        project.sandboxBackup = { ...project.sandboxBackup, status: 'failed',
+          error: '服务重启，磁盘备份未确认完成；可重试备份或恢复运行。', updatedAt: new Date().toISOString() };
+        migratedStatus = true;
+      }
       this.records.set(project.id, project);
       if (migratedStatus) await this.save(project);
     }
@@ -103,7 +108,8 @@ export class ProjectService {
   list(): Project[] { return [...this.records.values()].map(project => structuredClone(project)); }
   find(id: string): Project | undefined { return structuredClone(this.records.get(id)); }
   isDeleting(id: string): boolean { return this.deleting.has(id); }
-  isMaintaining(id: string): boolean { return this.maintenance.has(id) || this.records.get(id)?.sandboxOperation?.status === 'running'; }
+  isMaintaining(id: string): boolean { return this.maintenance.has(id) || this.records.get(id)?.sandboxOperation?.status === 'running'
+    || this.records.get(id)?.sandboxBackup?.status === 'running'; }
   activeSessionId(id: string): string | null { return this.activeSessions.get(id)?.values().next().value ?? null; }
 
   get(id: string): Project {
@@ -225,6 +231,10 @@ export class ProjectService {
     await this.mutateSandboxMetadata(id, project => { project.sandboxOperation = operation; });
   }
 
+  async updateSandboxBackup(id: string, backup: Project['sandboxBackup']) {
+    await this.mutateSandboxMetadata(id, project => { project.sandboxBackup = backup; });
+  }
+
   /** Atomically reserve or recover the current Box's resume operation. */
   async claimResume(id: string, ownerId: string, recovery?: { operationId: string; previousOwnerId: string }) {
     let started = false;
@@ -237,6 +247,7 @@ export class ProjectService {
           throw new HttpError(409, '项目没有可恢复的活动 Sandbox');
         }
         const sandboxId = current.sandbox.id;
+        if (current.sandboxBackup?.status === 'running') throw new HttpError(409, '磁盘备份正在读取，请等待后恢复运行');
         const existing = current.sandboxOperation;
         if (recovery && (existing?.id !== recovery.operationId || existing.status !== 'running'
           || existing.resume?.ownerId !== recovery.previousOwnerId)) throw new HttpError(409, '恢复操作已变化');
@@ -365,6 +376,7 @@ export class ProjectService {
       current.sandboxReclaimedAt = next.sandboxReclaimedAt;
       current.sandboxArtifactsCleanedAt = next.sandboxArtifactsCleanedAt;
       current.sandboxOperation = next.sandboxOperation;
+      current.sandboxBackup = next.sandboxBackup;
       current.pendingSandboxCleanup = next.pendingSandboxCleanup;
       current.archiveCleanupSourceId = next.archiveCleanupSourceId;
       if (commitLifecycle) {

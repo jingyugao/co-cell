@@ -48,6 +48,20 @@ class MemoryState implements WebStateStore {
   async close() {}
 }
 
+test('restart fails only an interrupted background backup and retains successful pause', async () => {
+  const value = project();
+  value.sandboxOperation = { id: 'pause-1', kind: 'checkpoint', status: 'succeeded', phase: '完成', updatedAt: value.updatedAt };
+  value.sandboxBackup = { id: 'pause-1', sandboxId: 'sandbox-1', status: 'running', phase: '校验备份', updatedAt: value.updatedAt };
+  const state = new MemoryState([value]);
+  const service = new ProjectService(state);
+  await service.init();
+  assert.equal(service.get(value.id).sandboxOperation?.status, 'succeeded');
+  assert.equal(service.get(value.id).sandboxBackup?.status, 'failed');
+  assert.equal(service.isMaintaining(value.id), false);
+  assert.equal((await state.getProject(value.id))?.sandboxBackup?.status, 'failed');
+  await service.close();
+});
+
 test('scoped shared refresh point-reads one project and skips protected projects', async () => {
   const second = { ...project(), id: 'project-2', name: 'Other project' };
   const state = new MemoryState([project(), second]);

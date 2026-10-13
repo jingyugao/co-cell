@@ -100,7 +100,7 @@ export class ProjectSandboxOperations {
   }
 
   /** Persist ownership before starting; HTTP callers await done, schedulers track it. */
-  async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
+  async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void>; settled?: Promise<void> }> {
     if (kind === 'resume') return this.startResume(id, 'local');
     const project = this.deps.projects.get(id);
     if (kind === 'checkpoint' && project.status === 'archived') throw new HttpError(409, '已归档项目不能暂停');
@@ -138,11 +138,19 @@ export class ProjectSandboxOperations {
     } catch (error) { try { await reservation?.release(); } catch {} finally { release(); } throw error; }
     const pending = { operationId, waiters: new Set<() => void>() };
     this.pending.set(id, pending);
+    // Pause is the HTTP completion boundary. The maintenance lease stays held
+    // until capture settles so the mounted HOME cannot change under its reader.
+    let pauseDone!: () => void;
+    let pauseFailed!: (error: unknown) => void;
+    const checkpointDone = kind === 'checkpoint' ? new Promise<void>((resolve, reject) => {
+      pauseDone = resolve; pauseFailed = reject;
+    }) : undefined;
+    let pausePublished = false;
     const execute = async () => {
       try {
         if (kind === 'create') await this.create(id);
         else if (kind === 'rebuild') await this.rebuild(id);
-        else if (kind === 'checkpoint') await this.checkpoint(id);
+        else if (kind === 'checkpoint') await this.checkpoint(id, false);
         else if (kind === 'restore') await this.restore(id,
           project.sandboxOperation?.status === 'failed' && ['create', 'resume'].includes(project.sandboxOperation.kind), reservation);
         else if (kind === 'backup') {
@@ -151,10 +159,32 @@ export class ProjectSandboxOperations {
         } else if (kind === 'refresh') await this.refreshRuntime(id);
         else await this.archive(id, options.useExistingBackup === true);
         this.deps.assertHeld?.(id);
+        if (kind === 'checkpoint') {
+          const sandbox = this.deps.projects.get(id).sandbox!;
+          // Reserve capture before publishing pause success: another API must
+          // never resume the mounted HOME in between those two durable writes.
+          await this.deps.projects.updateSandboxBackup(id, { id: operationId, sandboxId: sandbox.id,
+            status: 'running', phase: '从暂停磁盘备份数据', updatedAt: new Date().toISOString() });
+        }
         await this.deps.projects.updateSandboxOperation(id, { ...this.deps.projects.get(id).sandboxOperation!, kind,
           phase: '完成', status: 'succeeded', imageSelection: undefined, updatedAt: new Date().toISOString() });
+        if (kind === 'checkpoint') {
+          this.recordTiming(id, 'succeeded');
+          pausePublished = true;
+          pauseDone();
+          await this.backgroundBackup(id);
+        }
       } catch (error) {
+        if (pausePublished) {
+          void this.deps.logger?.write({ event: 'sandbox.backup_status_failed', projectId: id, operationId, error });
+          throw error;
+        }
         this.deps.assertHeld?.(id);
+        const backup = this.deps.projects.get(id).sandboxBackup;
+        if (kind === 'checkpoint' && backup?.id === operationId && backup.status === 'running') {
+          await this.deps.projects.updateSandboxBackup(id, { ...backup, status: 'failed',
+            error: '磁盘备份未能启动；可重试备份或恢复运行。', updatedAt: new Date().toISOString() });
+        }
         // Keep the user-facing state deliberately concise, but always retain the
         // provider error and operation context in the bounded server log. Without
         // this, restore failures are indistinguishable from one another in the UI.
@@ -166,11 +196,9 @@ export class ProjectSandboxOperations {
           error,
         });
         const failed = this.deps.projects.get(id).sandboxOperation!;
-        const backupFailedAfterPause = kind === 'checkpoint' && ['从暂停磁盘备份数据', '校验备份'].includes(failed.phase);
         await this.deps.projects.updateSandboxOperation(id, { ...failed, kind,
-          status: 'failed', error: backupFailedAfterPause
-            ? '沙箱已暂停，磁盘备份失败；请重试磁盘备份，详细原因请查看服务端日志。'
-            : error instanceof HttpError ? error.message : '操作失败，请重试；详细原因请查看服务端日志。', updatedAt: new Date().toISOString() });
+          status: 'failed', error: error instanceof HttpError ? error.message : '操作失败，请重试；详细原因请查看服务端日志。', updatedAt: new Date().toISOString() });
+        pauseFailed?.(error);
         throw error;
       } finally {
         this.recordTiming(id, this.deps.projects.get(id).sandboxOperation?.status ?? 'failed');
@@ -191,11 +219,16 @@ export class ProjectSandboxOperations {
     }, execute));
     this.tasks.add(task);
     void task.finally(() => this.tasks.delete(task)).catch(() => {});
-    return { done: task };
+    if (checkpointDone) void task.catch(error => pauseFailed(error));
+    return checkpointDone ? { done: checkpointDone, settled: task } : { done: task };
   }
 
   hasResume(id: string, operationId: string): boolean {
     return this.pending.get(id)?.operationId === operationId;
+  }
+
+  hasBackup(id: string, backupId: string): boolean {
+    return this.pending.get(id)?.operationId === backupId;
   }
 
   /** Admission is short; the durable intent owns recovery, not a project-wide lease. */
@@ -291,7 +324,7 @@ export class ProjectSandboxOperations {
     await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, false);
   }
 
-  private async checkpoint(id: string) {
+  private async checkpoint(id: string, capture = true) {
     const { projects, runtime } = this.deps;
     const project = await this.inspect(id);
     if (!project.sandbox || !['ready', 'paused'].includes(project.sandbox.status)) throw new HttpError(409, '仅运行中或已暂停的 Sandbox 可以创建 Checkpoint');
@@ -303,7 +336,20 @@ export class ProjectSandboxOperations {
       if (paused.status !== 'paused') throw new Error('Checkpoint 完成后 Sandbox 未暂停');
       await this.deps.saveSandbox(id, paused, false);
     }
-    await this.backup(id);
+    if (capture) await this.backup(id);
+  }
+
+  private async backgroundBackup(id: string) {
+    try {
+      await this.backup(id, true);
+    } catch (error) {
+      this.deps.assertHeld?.(id);
+      const backup = this.deps.projects.get(id).sandboxBackup!;
+      void this.deps.logger?.write({ event: 'sandbox.backup_failed', projectId: id,
+        sandboxId: backup.sandboxId, operationId: backup.id, phase: backup.phase, error });
+      await this.deps.projects.updateSandboxBackup(id, { ...backup, status: 'failed',
+        error: '磁盘备份失败；可重试备份或恢复运行，详细原因请查看服务端日志。', updatedAt: new Date().toISOString() });
+    }
   }
 
   private async inspect(id: string) {
@@ -312,12 +358,18 @@ export class ProjectSandboxOperations {
     return project;
   }
 
-  private async backup(id: string) {
+  private async backup(id: string, background = false) {
     const project = await this.inspect(id);
     const runtime = this.deps.runtime;
     if (project.sandbox?.status !== 'paused') throw new HttpError(409, '请先暂停 Sandbox，再从磁盘生成备份');
     if (!runtime.remoteArchives) throw new HttpError(503, 'Cellbox 归档不可用');
-    await this.phase(id, '从暂停磁盘备份数据');
+    const phase = async (value: string) => {
+      this.deps.assertHeld?.(id);
+      if (!background) return this.phase(id, value);
+      await this.deps.projects.updateSandboxBackup(id, { ...this.deps.projects.get(id).sandboxBackup!,
+        phase: value, updatedAt: new Date().toISOString() });
+    };
+    await phase('从暂停磁盘备份数据');
     const started = Date.now();
     const captured = await runtime.remoteArchives.capture(target(project), this.operationKey(id, 'capture'));
     const reference: RemoteArchiveRef = { ...captured, threadIds: this.deps.threadIds(id) };
@@ -325,16 +377,15 @@ export class ProjectSandboxOperations {
       || (project.sandbox.image?.id && reference.imageId !== project.sandbox.image.id)) {
       throw new HttpError(409, 'Cellbox 归档来源与当前 Sandbox 不符，操作已停止');
     }
-    await this.phase(id, '校验备份');
+    await phase('校验备份');
     const inspected = await runtime.remoteArchives.inspect(reference);
     if (!matchesRemoteArchive(reference, inspected)) {
       throw new HttpError(409, 'Cellbox 归档校验失败，操作已停止');
     }
     // Persist the reference before any archive operation may release the source box.
     await this.deps.projects.saveRemoteArchive(id, reference);
-    await this.deps.projects.updateSandboxOperation(id, { ...this.deps.projects.get(id).sandboxOperation!,
-      durationMs: Date.now() - started, scannedBytes: reference.sizeBytes, verified: true,
-      updatedAt: new Date().toISOString() });
+    const outcome = { durationMs: Date.now() - started, scannedBytes: reference.sizeBytes, verified: true,
+      updatedAt: new Date().toISOString() };
     if (runtime.remoteArchives.remove) {
       const current = this.deps.projects.get(id);
       await pruneRemoteArchives(current.remoteArchives ?? [], current.backupRetentionCount ?? 2,
@@ -342,6 +393,10 @@ export class ProjectSandboxOperations {
         void this.deps.logger?.write({ event: 'sandbox.backup_retention_failed', projectId: id, error });
       });
     }
+    this.deps.assertHeld?.(id);
+    if (background) await this.deps.projects.updateSandboxBackup(id, { ...this.deps.projects.get(id).sandboxBackup!,
+      ...outcome, phase: '完成', status: 'succeeded' });
+    else await this.deps.projects.updateSandboxOperation(id, { ...this.deps.projects.get(id).sandboxOperation!, ...outcome });
   }
 
   private async rememberCleanup(id: string, sandbox: SandboxState) {

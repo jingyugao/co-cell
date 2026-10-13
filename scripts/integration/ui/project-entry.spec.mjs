@@ -39,7 +39,7 @@ test('marking a checkpointed project completed keeps it paused and explains auto
 });
 
 test('failed paused Checkpoint offers retry for its disk backup', async ({ page, ui }) => {
-  ui.projects.get('paused').sandboxOperation = { id: 'failed-checkpoint', kind: 'checkpoint', status: 'failed', error: '归档失败' };
+  ui.projects.get('paused').sandboxBackup = { id: 'backup', sandboxId: 'paused-box', status: 'failed', phase: '上传', error: '归档失败', updatedAt: '2026-01-01T00:00:00Z' };
   await page.goto('/#projects');
   const card = page.getByRole('article', { name: '暂停项目', exact: true });
   await expect(card.getByRole('button', { name: '重试磁盘备份', exact: true })).toBeVisible();
@@ -47,6 +47,20 @@ test('failed paused Checkpoint offers retry for its disk backup', async ({ page,
   await expect.poll(() => ui.count('POST', '/api/projects/paused/sandbox/checkpoint')).toBe(1);
   await ui.checkpoint('paused', false);
   expect(ui.calls.find(call => call.path === '/api/projects/paused/sandbox/checkpoint')?.status).toBe(200);
+  await expect(card.getByRole('button', { name: '恢复运行', exact: true })).toBeEnabled();
+});
+
+test('background disk backup does not disable paused project entry or resume', async ({ page, ui }) => {
+  for (const status of ['running', 'failed']) {
+    const project = ui.projects.get('paused');
+    project.sandboxBackup = { id: 'backup', sandboxId: project.sandbox.id, status, phase: status === 'running' ? '上传中' : '上传', error: status === 'failed' ? '归档失败' : undefined, updatedAt: '2026-01-01T00:00:00Z' };
+    await page.goto('/#projects');
+    const card = page.getByRole('article', { name: '暂停项目', exact: true });
+    await expect(card.getByRole('button', { name: '进入项目', exact: true })).toBeEnabled();
+    await expect(card.getByRole('button', { name: '恢复运行', exact: true })).toBeEnabled();
+    if (status === 'running') await expect(card.getByText('磁盘备份：上传中', { exact: true })).toBeVisible();
+    else await expect(card.getByRole('alert')).toContainText('磁盘备份失败');
+  }
 });
 
 test('paused entry keeps the resume request open while preserving the editable draft', async ({ page, ui }) => {

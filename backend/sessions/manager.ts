@@ -303,8 +303,9 @@ export class SessionManager {
         });
       }
       for (const project of this.projects.list()) {
-        if (this.closing || project.sandboxOperation?.status !== 'running' || this.projectLeases.has(project.id)) continue;
-        if (project.sandboxOperation.resume) {
+        if (this.closing || (project.sandboxOperation?.status !== 'running' && project.sandboxBackup?.status !== 'running')
+          || this.projectLeases.has(project.id)) continue;
+        if (project.sandboxOperation?.resume && project.sandboxOperation.status === 'running') {
           await this.recoverResume(project);
           continue;
         }
@@ -323,6 +324,11 @@ export class SessionManager {
               lease.assertHeld();
               await this.projects.updateSandboxOperation(project.id, { ...latest.sandboxOperation,
                 status: 'failed', error: '原执行实例已离线，请重试操作。', updatedAt: new Date().toISOString() });
+            }
+            if (latest?.sandboxBackup?.status === 'running' && latest.sandboxBackup.id === project.sandboxBackup?.id) {
+              lease.assertHeld();
+              await this.projects.updateSandboxBackup(project.id, { ...latest.sandboxBackup, status: 'failed',
+                error: '备份执行实例已离线；可重试备份或恢复运行。', updatedAt: new Date().toISOString() });
             }
           } finally { await lease.release(); }
         });
@@ -1115,6 +1121,7 @@ export class SessionManager {
 
   async resumeProjectSandbox(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
     signal?.throwIfAborted();
+    await this.waitForSandboxBackup(id, signal);
     await this.submitProjectSandboxOperation(id, 'resume');
     await this.projects.refreshOne(id);
     const accepted = this.projects.get(id).sandboxOperation;
@@ -1159,6 +1166,12 @@ export class SessionManager {
     if (project.status !== 'active') throw new HttpError(409, '项目未处于使用中状态，请先恢复项目');
 
     while (project.executionMode === 'sandbox') {
+      if (project.sandboxBackup?.status === 'running') {
+        await this.waitForSandboxBackup(id, signal);
+        await this.projects.refreshOne(id);
+        project = this.projects.get(id);
+        continue;
+      }
       const operation = project.sandboxOperation;
       if (operation?.status === 'running' && operation.id) {
         await this.waitForProjectOperation(id, operation.id, Number.MAX_SAFE_INTEGER, signal);
@@ -1169,13 +1182,15 @@ export class SessionManager {
           throw new HttpError(503, '服务关闭前操作尚未完成，请查询项目状态');
         if (project.sandboxOperation?.id === operation.id && operation.kind !== 'checkpoint'
           && project.sandboxOperation.status === 'succeeded') break;
-        if (project.sandboxOperation?.id === operation.id && project.sandboxOperation.status === 'failed') break;
+        if (project.sandboxOperation?.id === operation.id && project.sandboxOperation.status === 'failed'
+          && operation.kind !== 'checkpoint') break;
         // A completed Checkpoint leaves the box paused. Continue below and
         // accept one ensure-running resume for this project.
         continue;
       }
 
-      if (operation?.status === 'failed' && operation.kind !== 'resume') break;
+      // Legacy checkpoints can have succeeded at pause but failed at backup.
+      if (operation?.status === 'failed' && !['resume', 'checkpoint'].includes(operation.kind)) break;
       if (!project.sandbox) break;
       if (this.projects.isMaintaining(id)) throw new HttpError(409, '项目正在维护，请稍后重试');
 
@@ -1199,6 +1214,34 @@ export class SessionManager {
   async checkpointProjectSandbox(id: string): Promise<ProjectSummary> {
     await this.submitProjectSandboxOperation(id, 'checkpoint');
     return this.readProject(id);
+  }
+
+  private async waitForSandboxBackup(id: string, signal?: AbortSignal) {
+    let recoveredAt = 0;
+    for (;;) {
+      signal?.throwIfAborted();
+      if (this.closing) throw new HttpError(503, '服务正在关闭');
+      await this.projects.refreshOne(id);
+      const backup = this.projects.get(id).sandboxBackup;
+      if (backup?.status !== 'running') return;
+      if (!this.coordinator && !this.sandboxOperations?.hasBackup(id, backup.id)) {
+        await this.projects.updateSandboxBackup(id, { ...backup, status: 'failed',
+          error: '磁盘备份未确认完成；可重试备份或恢复运行。', updatedAt: new Date().toISOString() });
+        continue;
+      }
+      // Reconcile a vanished owner instead of waiting forever after a restart.
+      if (this.coordinator && !this.projectLeases.has(id) && Date.now() - recoveredAt >= 1_000) {
+        await this.recoverSharedExecutions();
+        recoveredAt = Date.now();
+      }
+      await new Promise<void>((resolve, reject) => {
+        const finish = () => { signal?.removeEventListener('abort', abort); resolve(); };
+        const timer = setTimeout(finish, 100);
+        const abort = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); reject(signal?.reason); };
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted) abort();
+      });
+    }
   }
 
   private async submitProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'], options: { imageVersionId?: string } = {}) {
@@ -1357,7 +1400,7 @@ export class SessionManager {
     });
   }
 
-  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>, eligible?: (project: Project) => boolean) {
+  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void>; settled?: Promise<void> }>, eligible?: (project: Project) => boolean) {
     return this.projectMutation(id, async () => {
       // A scheduler snapshot can outlive another API's completed cleanup. Check
       // again under project-control before taking maintenance ownership.
@@ -1383,14 +1426,16 @@ export class SessionManager {
         const project = this.projects.get(id);
         if (project.sandboxOperation?.status === 'running') await this.projects.updateSandboxOperation(id,
           { ...project.sandboxOperation, status: 'failed', error: '原执行实例已离线，请重试操作。', updatedAt: new Date().toISOString() });
+        if (project.sandboxBackup?.status === 'running') await this.projects.updateSandboxBackup(id,
+          { ...project.sandboxBackup, status: 'failed', error: '备份执行实例已离线；可重试备份或恢复运行。', updatedAt: new Date().toISOString() });
         lease.assertHeld();
-        const { done } = await action();
-        const guarded = done.finally(async () => {
+        const { done, settled } = await action();
+        const guarded = (settled ?? done).finally(async () => {
           this.projectLeases.delete(id);
           await lease.release();
         });
         void guarded.catch(() => {});
-        return { done: guarded };
+        return { done: settled ? done : guarded };
       } catch (error) {
         this.projectLeases.delete(id);
         await lease.release();

@@ -165,7 +165,7 @@ export class LiveEnvironment {
   async createProject(label) {
     return this.json('/api/projects', { method: 'POST', expectedStatus: 201, body: { name: this.name(label), type: 1 } });
   }
-  async waitProject(id, { kind, status, operationId } = {}) {
+  async waitProject(id, { kind, status, operationId, waitForBackup = false } = {}) {
     const deadline = Date.now() + this.config.operationTimeout;
     while (Date.now() < deadline) {
       const project = await this.json(`/api/projects/${id}`, { timeoutMs: Math.min(30_000, Math.max(1, deadline - Date.now())) });
@@ -175,6 +175,14 @@ export class LiveEnvironment {
       if (operation?.status === 'failed') throw new Error(this.redact(operation.error ?? 'Project operation failed'));
       if (operation?.status === 'succeeded') {
         if (status) assert.equal(project.sandbox?.status, status);
+        if (waitForBackup) {
+          const backupStatus = project.sandboxBackup?.status;
+          if (backupStatus === 'failed') throw new Error(this.redact(project.sandboxBackup.error ?? 'Project disk backup failed'));
+          if (backupStatus !== 'succeeded') {
+            await delay(250, undefined, { signal: this.controller.signal });
+            continue;
+          }
+        }
         return project;
       }
       await delay(250, undefined, { signal: this.controller.signal });

@@ -20,7 +20,7 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
       const checkpointResponse = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
       assert.equal(checkpointResponse.sandboxOperation.status, 'succeeded');
       assert.equal(checkpointResponse.sandbox.status, 'paused');
-      const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+      const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
       const archive = checkpointed.remoteArchives?.[0];
       assert(archive && archive.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(archive.sha256), 'Checkpoint did not publish a verified archive reference');
       assert.equal(archive.sourceSandboxId, project.sandbox.id);
@@ -62,8 +62,9 @@ test('real projects: create, read-only pause, idempotent entry and two concurren
     const checkpointed = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
     assert.equal(checkpointed.sandbox.status, 'paused');
-    assert.notEqual(checkpointed.remoteArchives?.[0]?.id, project.checkpointArchiveId, 'A later Checkpoint must publish a new archive reference');
-    assert.equal(checkpointed.remoteArchives?.[0]?.sourceSandboxId, project.sandbox.id);
+    const archived = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
+    assert.notEqual(archived.remoteArchives?.[0]?.id, project.checkpointArchiveId, 'A later Checkpoint must publish a new archive reference');
+    assert.equal(archived.remoteArchives?.[0]?.sourceSandboxId, project.sandbox.id);
     return { operationId: ready.sandboxOperation.id, sandboxId: ready.sandbox.id };
   });
   await env.step('Simultaneous entry into two paused projects completes both restores', async () => {

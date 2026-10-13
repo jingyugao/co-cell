@@ -59,6 +59,27 @@ test('failed synchronous create assertion keeps the created project in cleanup o
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
+test('checkpoint wait can include asynchronous disk archive completion', async ({}, testInfo) => {
+  let reads = 0;
+  const server = createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    reads++;
+    res.end(JSON.stringify({ id: 'project', sandbox: { id: 'box', status: 'paused' },
+      sandboxOperation: { id: 'checkpoint', kind: 'checkpoint', status: 'succeeded' },
+      sandboxBackup: { id: 'archive', sandboxId: 'box', status: reads === 1 ? 'running' : 'succeeded', phase: '上传中', updatedAt: new Date().toISOString() },
+      remoteArchives: reads === 1 ? [] : [{ id: 'archive' }] }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const env = new LiveEnvironment(liveConfig({ COCELL_E2E_BASE_URL: `http://127.0.0.1:${server.address().port}`, COCELL_E2E_ACCESS_TOKEN: 'test-only-token' }),
+    { journal: testInfo.outputPath('resources.json') });
+  try {
+    const project = await env.waitProject('project', { kind: 'checkpoint', status: 'paused', waitForBackup: true });
+    expect(reads).toBe(2);
+    expect(project.sandboxBackup.status).toBe('succeeded');
+    expect(project.remoteArchives[0].id).toBe('archive');
+  } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
+});
+
 test('cleanup failures fail the suite and redact the operator token in evidence', async ({}, testInfo) => {
   const token = 'secret-that-must-never-appear';
   let env;

@@ -10,7 +10,7 @@ export async function projectLifecycle(env) {
   const redact = env.redact.bind(env), persist = env.persist.bind(env);
   const delay = ms => sleep(ms, undefined, { signal: env.controller.signal });
   let projectId, sessionId, threadId, originalSandboxId, workingDirectory;
-  const waitProject = (kind, status) => env.waitProject(projectId, { kind, status });
+  const waitProject = (kind, status, waitForBackup = false) => env.waitProject(projectId, { kind, status, waitForBackup });
   const waitIdle = () => env.waitIdle(projectId);
   const port = 18080;
   const folder = 'lifecycle-http';
@@ -112,7 +112,7 @@ export async function projectLifecycle(env) {
       const checkpointed = await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
       assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
       assert.equal(checkpointed.sandbox.status, 'paused');
-      const paused = await waitProject('checkpoint', 'paused'); assert.equal(paused.sandbox.id, originalSandboxId);
+      const paused = await waitProject('checkpoint', 'paused', true); assert.equal(paused.sandbox.id, originalSandboxId);
       initialArchive = paused.remoteArchives?.[0];
       assert(initialArchive && initialArchive.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(initialArchive.sha256));
       assert.equal(initialArchive.sourceSandboxId, originalSandboxId); assert(initialArchive.threadIds.includes(threadId));
@@ -143,7 +143,7 @@ export async function projectLifecycle(env) {
       const checkpointed = await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
       assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
       assert.equal(checkpointed.sandbox.status, 'paused');
-      const paused = await waitProject('checkpoint', 'paused');
+      const paused = await waitProject('checkpoint', 'paused', true);
       checkpointArchive = paused.remoteArchives?.[0];
       assert(checkpointArchive && checkpointArchive.id !== initialArchive.id, 'Checkpoint did not create a new archive');
       assert(checkpointArchive.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(checkpointArchive.sha256));
@@ -167,7 +167,7 @@ export async function projectLifecycle(env) {
       const checkpointed = await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
       assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
       assert.equal(checkpointed.sandbox.status, 'paused');
-      const paused = await waitProject('checkpoint', 'paused'); backup = paused.remoteArchives?.[0];
+      const paused = await waitProject('checkpoint', 'paused', true); backup = paused.remoteArchives?.[0];
       assert(backup && backup.id !== checkpointArchive.id, 'Final Checkpoint did not create a fresh archive');
       assert(backup.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(backup.sha256));
       assert.equal(backup.sourceSandboxId, originalSandboxId); assert(backup.threadIds.includes(threadId));

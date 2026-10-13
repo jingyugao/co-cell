@@ -4,7 +4,7 @@ import { MySqlRoleRepository, type RoleRepository } from './role-repository.js';
 
 export interface StoredSecret {
   /** Old formats remain readable until the operator replaces their contents. */
-  id: string; name: string; format: SecretFormat | 'json' | 'binary'; mutable: boolean; enabled: boolean;
+  id: string; name: string; format: SecretFormat | 'json' | 'binary' | 'lark'; mutable: boolean; enabled: boolean;
   version: number; currentVersionId: string; ciphertext: string; createdAt: string; updatedAt: string;
   tool: ProxyTool | null; path: string | null; alias: string | null;
 }

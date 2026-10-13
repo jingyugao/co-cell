@@ -53,7 +53,8 @@ export class MountedToolHomes {
       if (format && format !== 'text') throw new Error('Mounted HOME supports text credential files only');
       return { tool, secretId, path: credentialPath(path), version };
     });
-    if (new Set(next.map(file => file.tool + ':' + file.secretId)).size !== next.length) throw new Error('Duplicate tool credential');
+    if (new Set(next.map(file => JSON.stringify([file.tool, file.secretId, file.path]))).size !== next.length)
+      throw new Error('Duplicate tool credential file');
     for (let i = 0; i < next.length; i++) for (let j = i + 1; j < next.length; j++) {
       const a = next[i].path, b = next[j].path;
       if (a === b || a.startsWith(b + '/') || b.startsWith(a + '/')) throw new Error('Credential HOME paths conflict');

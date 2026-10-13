@@ -9,6 +9,7 @@ const content = z.string().min(1).max(90000);
 const path = z.string().min(1).max(256);
 const fileFields = {
   format: z.enum(['text', 'files']), content: content.optional(),
+  supportFiles: z.array(z.object({ path, content, encoding: z.literal('base64') }).strict()).min(2).max(3).optional(),
   files: z.array(z.object({ path, content: z.string().max(1500000), encoding: z.literal('base64').optional() }).strict()).min(1).max(128).optional(),
   directory: path.optional(),
   adapter: z.literal('meegle').optional(),

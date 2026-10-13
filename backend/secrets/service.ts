@@ -1,3 +1,4 @@
+import { larkCredential, type LarkCredential } from './lark-credential.js';
 import { ToolRoles, connectionPath, selectConnection } from './roles.js';
 import { randomUUID } from 'node:crypto';
 import type { ProxyTool, SecretInput, SecretUpdate, SecretMetadata, SecretContent, SecretDeleteResult, ProvisionedToolFile } from '../../protocol/secret-types.js';
@@ -21,10 +22,11 @@ function fileBundle(input: unknown) {
   try { return validateFileBundle(input); }
   catch (error) { throw new HttpError(400, (error as Error).message); }
 }
-function inputBytes(input: SecretInput): Buffer {
+function inputBytes(input: SecretInput & { supportVersion?: number }): Buffer {
   if (input.format !== 'text') throw new HttpError(400, '只支持原生文本认证文件');
   if (input.files || input.directory || input.adapter || input.identity || input.content === undefined) throw new HttpError(400, '单文件请提供 content');
-  return secretBytes('text', input.content);
+  const bytes = secretBytes('text', input.content);
+  return input.supportFiles ? Buffer.from(JSON.stringify(larkCredential(input.tool, input.path, input.content, input.supportFiles, input.supportVersion))) : bytes;
 }
 export class SecretService {
   homes?: MountedToolHomes;
@@ -59,8 +61,14 @@ export class SecretService {
   private metadata(secret: StoredSecret, projectIds: string[] = []): SecretMetadata {
     const { ciphertext: _ciphertext, currentVersionId: _versionId, alias: _alias, format, ...metadata } = secret;
     const bundle = format === 'files' ? this.bundle(secret) : null;
-    return { ...metadata, format: format === 'files' ? 'files' : 'text', requiresTextImport: format !== 'text', projectIds,
+    const native = format === 'lark' ? this.lark(secret) : null;
+    return { ...metadata, ...(native ? { supportFilePaths: native.supportFiles.map(file => file.path) } : {}), format: format === 'files' ? 'files' : 'text', requiresTextImport: !['text', 'lark'].includes(format), projectIds,
       ...(bundle ? { filePaths: bundle.files.map(file => file.path), directory: bundle.directory, adapter: bundle.adapter, identity: bundle.identity } : {}) };
+  }
+  private lark(secret: StoredSecret): LarkCredential {
+    let payload;
+    try { payload = JSON.parse(this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('utf8')); } catch { throw new HttpError(400, 'Lark 凭证格式无效'); }
+    return larkCredential(secret.tool!, secret.path!, payload.content, payload.supportFiles, payload.supportVersion);
   }
   private bundle(secret: StoredSecret) { return fileBundle(JSON.parse(this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('utf8'))); }
   async list() {
@@ -68,22 +76,24 @@ export class SecretService {
     return secrets.map(secret => this.metadata(secret, [...new Set(grants.filter(g => g.files.some(f => f.secretId === secret.id)).map(g => g.projectId))]));
   }
   private validateConfig(secret: StoredSecret) {
-    if (secret.format !== 'text') throw new HttpError(400, '每份凭证只支持一个原生文本认证文件，请重新导入');
+    if (!['text', 'lark'].includes(secret.format)) throw new HttpError(400, '每份凭证只支持一个原生文本认证文件，请重新导入');
     if (!secret.tool || !secret.path) throw new HttpError(400, '请填写工具名和认证文件路径');
     toolName(secret.tool);
     credentialPath(secret.path);
+    if (secret.format === 'lark') this.lark(secret);
   }
 
   private async requireSecret(id: string) { const secret = await this.repository.get(id); if (!secret) throw new HttpError(404, 'Secret 不存在'); return secret; }
   async content(id: string): Promise<SecretContent> {
     const secret = await this.requireSecret(id), bytes = this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext);
+    if (secret.format === 'lark') { const value = this.lark(secret); return { format: 'text', content: value.content, supportFilePaths: value.supportFiles.map(file => file.path), requiresTextImport: false, version: secret.version }; }
     if (secret.format === 'files') return { format: 'files', content: '', ...this.bundle(secret), requiresTextImport: false, version: secret.version };
     return { format: 'text', content: secret.format === 'binary' ? '' : bytes.toString('utf8'), requiresTextImport: secret.format !== 'text', version: secret.version };
   }
   async create(input: SecretInput) {
     const id = randomUUID(), versionId = randomUUID(), now = new Date().toISOString();
     const bytes = inputBytes(input), ciphertext = this.crypto.seal(id, versionId, bytes);
-    const secret: StoredSecret = { id, name: input.name, format: input.format, mutable: input.mutable, enabled: true, version: 0, currentVersionId: versionId, ciphertext, createdAt: now, updatedAt: now,
+    const secret: StoredSecret = { id, name: input.name, format: input.supportFiles ? 'lark' : input.format, mutable: input.mutable, enabled: true, version: 0, currentVersionId: versionId, ciphertext, createdAt: now, updatedAt: now,
       tool: input.tool, path: input.path, alias: 'default' };
     this.validateConfig(secret);
     await this.repository.save(secret, { id: versionId, secretId: id, ciphertext, source: 'operator', baseVersion: null, createdAt: now, projectId: null, invocationId: null, changes: ['created'] });
@@ -91,16 +101,17 @@ export class SecretService {
   }
   async update(id: string, input: SecretUpdate) {
     const secret = await this.requireSecret(id), now = new Date().toISOString();
-    const contentChanged = input.content !== undefined || input.files !== undefined;
+    const contentChanged = input.content !== undefined || input.files !== undefined || input.supportFiles !== undefined;
+    const previousLark = secret.format === 'lark' ? this.lark(secret) : null;
     if (!contentChanged && (input.format !== undefined || input.directory !== undefined || input.identity !== undefined || input.adapter !== undefined)) throw new HttpError(400, '更改文件格式或加密身份时请提交完整内容');
     const next: StoredSecret = { ...secret, name: input.name ?? secret.name, mutable: input.mutable ?? secret.mutable,
       enabled: input.enabled ?? secret.enabled, tool: input.tool ?? secret.tool, path: input.path ?? secret.path,
-      alias: secret.alias ?? 'default', format: contentChanged ? input.format ?? (input.files ? 'files' : 'text') : secret.format, updatedAt: now };
+      alias: secret.alias ?? 'default', format: contentChanged ? input.format === 'files' ? 'files' : (input.supportFiles || previousLark) ? 'lark' : 'text' : secret.format, updatedAt: now };
     const changes = Object.keys(input).filter(key => key === 'content' || input[key as keyof typeof input] !== secret[key as keyof StoredSecret]);
     if (contentChanged && !changes.includes('content')) changes.push('content');
     if (!changes.length) return this.metadata(secret);
     const bytes = !contentChanged ? this.crypto.open(id, secret.currentVersionId, secret.ciphertext)
-      : inputBytes({ ...input, name: next.name, mutable: next.mutable, tool: next.tool!, path: next.path!, format: next.format as SecretInput['format'] });
+      : inputBytes({ ...input, name: next.name, mutable: next.mutable, tool: next.tool!, path: next.path!, content: input.content ?? previousLark?.content, supportFiles: input.supportFiles ?? previousLark?.supportFiles, supportVersion: input.supportFiles ? (previousLark?.supportVersion ?? 0) + 1 : previousLark?.supportVersion, format: next.format === 'lark' ? 'text' : next.format as SecretInput['format'] });
     const versionId = randomUUID(), ciphertext = this.crypto.seal(id, versionId, bytes);
     if (changes.some(key => ['tool', 'path', 'content'].includes(key))) this.validateConfig({ ...next, currentVersionId: versionId, ciphertext });
     if (changes.some(key => ['tool', 'path'].includes(key))) {
@@ -126,12 +137,14 @@ export class SecretService {
     for (const grant of grants) {
       if (grant.files.length !== 1) continue;
       const binding = grant.files[0], secret = await this.repository.get(binding.secretId);
-      if (!secret?.enabled || !['text', 'files'].includes(secret.format)) continue;
+      if (!secret?.enabled || !['text', 'lark'].includes(secret.format)) continue;
       if (secret.tool && (secret.tool !== grant.tool || secret.path !== binding.path)) continue;
       toolName(grant.tool); credentialPath(binding.path);
-      const content = this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('base64');
+      const native = secret.format === 'lark' ? this.lark(secret) : null;
+      const content = native ? Buffer.from(native.content).toString('base64') : this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('base64');
       files.push({ tool: grant.tool, secretId: secret.id, path: connectionPath(grant), content, mutable: secret.mutable, version: secret.version,
         alias: grant.alias });
+      for (const file of native?.supportFiles ?? []) files.push({ tool: grant.tool, secretId: secret.id, path: file.path, content: file.content, mutable: secret.mutable, version: native!.supportVersion, alias: grant.alias });
     }
     return files.sort((a, b) => a.tool.localeCompare(b.tool));
   }
@@ -151,7 +164,7 @@ export class SecretService {
     const selected = selectConnection(tool, args, grants), grant = selected.grant;
     if (grant.files.length !== 1) throw new HttpError(403, '项目未授权此工具的单文件凭证');
     const binding = grant.files[0], secret = await this.requireSecret(binding.secretId);
-    if (!secret.enabled || secret.format !== 'text' || (secret.tool && (secret.tool !== tool || secret.path !== binding.path)))
+    if (!secret.enabled || !['text', 'lark'].includes(secret.format) || (secret.tool && (secret.tool !== tool || secret.path !== binding.path)))
       throw new HttpError(403, '工具凭证已停用或需要重新配置');
     const path = credentialPath(connectionPath(grant)), checked = validateToolArgs(tool, selected.args);
     if (!this.homes || !await this.homes.ready(identity.projectId, { tool, secretId: secret.id, path, version: secret.version }))

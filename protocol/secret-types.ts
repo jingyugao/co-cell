@@ -1,4 +1,6 @@
 export type SecretFormat = 'text' | 'files';
+/** Native encrypted Linux Lark keychain files accompanying its primary config. */
+export interface SecretSupportFile { path: string; content: string; encoding: 'base64' }
 export interface SecretTextFile { path: string; content: string; encoding?: 'base64' }
 export interface SecretFileIdentity { hostname: string; username: string }
 export interface SecretFileBundle {
@@ -9,16 +11,20 @@ export interface SecretMetadata {
   id: string; name: string; format: SecretFormat; mutable: boolean; enabled: boolean;
   version: number; createdAt: string; updatedAt: string; projectIds: string[];
   tool: ProxyTool | null; path: string | null; requiresTextImport: boolean;
+  supportFilePaths?: string[];
   filePaths?: string[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity;
 }
 export interface SecretInput {
   name: string; format: SecretFormat; mutable: boolean; content?: string;
   tool: ProxyTool; path: string;
+  supportFiles?: SecretSupportFile[];
   files?: SecretTextFile[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity;
 }
 export interface SecretUpdate { name?: string; mutable?: boolean; enabled?: boolean; content?: string; tool?: ProxyTool; path?: string;
+  supportFiles?: SecretSupportFile[];
   format?: SecretFormat; files?: SecretTextFile[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity }
 export interface SecretContent extends Partial<SecretFileBundle> {
+  supportFilePaths?: string[];
   format: SecretFormat; content: string; requiresTextImport: boolean; version: number;
 }
 export interface SecretDeleteResult { ok: true }

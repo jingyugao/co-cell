@@ -36,7 +36,7 @@ test('deployed Git proxy preserves nested repository and Go module-cache directo
   const secret = secretId ? secrets.find(item => item.id === secretId) : secrets.length === 1 ? secrets[0] : undefined;
   assert(secret, 'Configure one enabled Git credential, or select it with COCELL_E2E_TOOL_GIT_SECRET_ID');
   const role = await env.json('/api/tool-roles', { method: 'POST', expectedStatus: 201, body: { name: env.name('git-cwd-role'),
-    connections: [{ tool: 'git', alias: 'repository', secretId: secret.id }] } });
+    connections: [{ tool: 'git', secretId: secret.id }] } });
   ownedRoleId = role.id;
   await env.json(`/api/projects/${project.id}/tool-role`, { method: 'PUT', body: { roleId: role.id } });
   const namespace = process.env.COCELL_E2E_CELLBOX_NAMESPACE ?? 'cell-box';

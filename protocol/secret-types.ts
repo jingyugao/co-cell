@@ -40,10 +40,11 @@ export interface ProjectToolGrant {
   id: string; projectId: string; tool: ProxyTool; alias: string; enabled: boolean;
   files: SecretFileBinding[]; updatedAt: string;
 }
-/** Named credentials granted together to a project. */
+/** Named credentials granted together to a project. alias is the current original credential name, never user-configurable. */
 export interface RoleConnection { tool: ProxyTool; alias: string; secretId: string }
 export interface ToolRole { id: string; name: string; connections: RoleConnection[]; createdAt: string; updatedAt: string }
-export interface ToolRoleInput { name: string; connections: RoleConnection[] }
+/** Connections are selected by credential ID; their names come from the credential. */
+export interface ToolRoleInput { name: string; connections: Array<Pick<RoleConnection, 'tool' | 'secretId'>> }
 export interface RoleCatalog { roles: ToolRole[]; defaultRoleId: string }
 export interface ProjectRoleAssignment { roleId: string | null }
 export interface ProjectRoleState extends ProjectRoleAssignment { connections: RoleConnection[] }

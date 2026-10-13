@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import type { RoleCatalog, RoleConnection, SecretMetadata, ToolRole } from '../../../protocol/secret-types';
 import { api, errorMessage } from '../../lib/api';
+import { toolConnectionCommand } from '../../../util/tool-connection-command';
 
-const ALIAS_PATTERN = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
 const STANDARD_TOOLS = ['mysql', 'kubectl', 'git', 'glab', 'meegle', 'lark-cli'];
 const repeatable = (tool: string) => tool === 'mysql' || tool === 'kubectl';
 
@@ -22,32 +22,26 @@ export default function RoleManager({ secrets }: { secrets: SecretMetadata[] }) 
   const usableSecrets = secrets.filter(item => item.enabled && item.format === 'text' && !item.requiresTextImport && item.tool);
   const tools = [...new Set([...STANDARD_TOOLS, ...secrets.flatMap(item => item.tool ? [item.tool] : []), ...connections.map(item => item.tool)])];
   function start(role?: ToolRole) {
-    setError(''); setName(role?.name ?? ''); setConnections(role ? role.connections.map(item => ({ ...item })) : []); setEditing(role ?? 'new');
+    setError(''); setName(role?.name ?? ''); setConnections(role ? role.connections.map(item => ({
+      ...item,
+      alias: secrets.find(secret => secret.id === item.secretId)?.name ?? item.alias,
+    })) : []); setEditing(role ?? 'new');
   }
   function selectCredential(tool: string, secretId: string, selected: boolean) {
     setConnections(current => {
       if (!selected) return current.filter(item => item.tool !== tool || item.secretId !== secretId);
       if (current.some(item => item.tool === tool && item.secretId === secretId)) return current;
-      const previous = !repeatable(tool) ? current.find(item => item.tool === tool) : undefined;
       const remaining = repeatable(tool) ? current : current.filter(item => item.tool !== tool);
       if (!secretId) return remaining;
       const secret = usableSecrets.find(item => item.id === secretId);
       if (!secret) return current;
-      const base = secret.name.replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^[^A-Za-z]+/, '').slice(0, 54) || tool;
-      let alias = previous?.alias ?? base, suffix = 2;
-      while (remaining.some(item => item.tool === tool && item.alias === alias)) alias = `${base}-${suffix++}`;
-      return [...remaining, { tool, secretId, alias }];
+      return [...remaining, { tool, secretId, alias: secret.name }];
     });
-  }
-  function changeAlias(tool: string, secretId: string, alias: string) {
-    setConnections(current => current.map(item => item.tool === tool && item.secretId === secretId ? { ...item, alias } : item));
   }
   async function save(event: React.FormEvent) {
     event.preventDefault(); setBusy(true); setError('');
     try {
-      if (connections.some(item => !ALIAS_PATTERN.test(item.alias))) throw new Error('连接别名须以字母开头，且只能包含字母、数字、点、下划线或连字符（最多 64 个字符）。');
-      if (connections.some((item, index) => connections.some((other, otherIndex) => otherIndex !== index && item.tool === other.tool && item.alias === other.alias))) throw new Error('同一工具下的连接别名不能重复。');
-      const body = JSON.stringify({ name: name.trim(), connections });
+      const body = JSON.stringify({ name: name.trim(), connections: connections.map(({ tool, secretId }) => ({ tool, secretId })) });
       const path = editing === 'new' ? '/api/tool-roles' : `/api/tool-roles/${editing?.id}`;
       await api(path, { method: editing === 'new' ? 'POST' : 'PUT', body });
       setEditing(null); await refresh();
@@ -77,17 +71,16 @@ export default function RoleManager({ secrets }: { secrets: SecretMetadata[] }) 
         const secretName = (secretId: string) => secrets.find(item => item.id === secretId)?.name ?? '已删除的凭证';
         return <fieldset className="role-tool-group" key={tool} disabled={busy}>
           <legend>{tool}</legend>
-          <p className="role-tool-hint">{repeatable(tool) ? '可选择多个凭证，并设置各连接的别名。' : '最多选择一个凭证。'}</p>
+          <p className="role-tool-hint">{repeatable(tool) ? '可选择多个凭证。' : '最多选择一个凭证。'}</p>
           {repeatable(tool) ? <div className="role-credential-options">
             {!available.length && !unavailable.length && <p>暂无可用凭证，请先添加或启用此工具的文本凭证。</p>}
             {available.map(secret => {
               const connection = selected.find(item => item.secretId === secret.id);
               return <div className={`role-credential-option${connection ? ' is-selected' : ''}`} key={secret.id}>
                 <label className="role-credential-check"><input type="checkbox" aria-label={`${tool} 凭证：${secret.name}`} checked={!!connection} onChange={event => selectCredential(tool, secret.id, event.target.checked)} /><span>{secret.name}</span></label>
-                {connection && <label className="role-credential-alias">连接别名<input aria-label={`${tool} ${secret.name} 别名`} required maxLength={64} pattern={ALIAS_PATTERN.source} value={connection.alias} onChange={event => changeAlias(tool, secret.id, event.target.value)} /><small>{tool} --connection={connection.alias}</small></label>}
               </div>;
             })}
-            {unavailable.map(connection => <label className="role-credential-check role-credential-unavailable" key={connection.secretId}><input type="checkbox" aria-label={`${tool} 凭证：${secretName(connection.secretId)}`} checked onChange={() => selectCredential(tool, connection.secretId, false)} /><span>{secretName(connection.secretId)} · 不可用（{connection.alias}），请取消选择或启用凭证</span></label>)}
+            {unavailable.map(connection => <label className="role-credential-check role-credential-unavailable" key={connection.secretId}><input type="checkbox" aria-label={`${tool} 凭证：${secretName(connection.secretId)}`} checked onChange={() => selectCredential(tool, connection.secretId, false)} /><span>{secretName(connection.secretId)} · 不可用，请取消选择或启用凭证</span></label>)}
           </div> : <label>认证凭证<select aria-label={`${tool} 凭证`} value={selected[0]?.secretId ?? ''} onChange={event => selectCredential(tool, event.target.value, true)}>
             <option value="">无权限</option>
             {available.map(secret => <option key={secret.id} value={secret.id}>{secret.name}</option>)}
@@ -99,7 +92,7 @@ export default function RoleManager({ secrets }: { secrets: SecretMetadata[] }) 
     </form>}
     {loading ? <p role="status">正在读取工具角色…</p> : !catalog?.roles.length ? <div className="connections-empty">暂无工具角色。角色可包含多个 MySQL 或 Kubernetes 连接。</div> : <div className="secret-list">{catalog.roles.map(role => <article className="connection-card role-card" key={role.id}>
       <div className="connection-profile-title"><strong>{role.name}</strong><span>{catalog.defaultRoleId === role.id ? '默认角色' : ''}</span></div>
-      {!role.connections.length ? <p>无工具连接</p> : <ul>{role.connections.map((connection, index) => <li key={`${connection.tool}-${connection.alias}-${index}`}><strong>{connection.tool}</strong> · {connection.alias}{['mysql', 'kubectl'].includes(connection.tool) && <code>{connection.tool} --connection={connection.alias}</code>}</li>)}</ul>}
+      {!role.connections.length ? <p>无工具连接</p> : <ul>{role.connections.map((connection, index) => <li key={`${connection.tool}-${connection.secretId}-${index}`}><strong>{connection.tool}</strong> · {secrets.find(secret => secret.id === connection.secretId)?.name ?? connection.alias}{['mysql', 'kubectl'].includes(connection.tool) && <code>{toolConnectionCommand(connection.tool, secrets.find(secret => secret.id === connection.secretId)?.name ?? connection.alias)}</code>}</li>)}</ul>}
       <div className="secret-actions"><button className="secondary-button" disabled={busy || catalog.defaultRoleId === role.id} onClick={() => void setDefault(role.id)}>{catalog.defaultRoleId === role.id ? '当前默认角色' : '设为默认'}</button><button className="secondary-button" aria-label={`编辑角色：${role.name}`} disabled={busy} onClick={() => start(role)}>编辑</button><button className="secondary-button" disabled={busy} onClick={() => void remove(role)}>删除</button></div>
     </article>)}</div>}
   </section>;

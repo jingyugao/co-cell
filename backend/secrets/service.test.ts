@@ -117,9 +117,15 @@ test('role API requires operator access and validates grants before changing rol
   assert.equal((await app.request(`https://app.example.test/api/projects/${projectId}/tool-role`, { method: 'PUT', headers, body: JSON.stringify({ roleId: role.id }) })).status, 200);
   assert.equal((await app.request(`https://app.example.test/api/tool-roles/${role.id}`, { method: 'DELETE', headers })).status, 409);
   const secret = await service.create({ name: 'glab', tool: 'glab', path: '.config/glab/config.yml', format: 'text', content: 'fixture', mutable: false });
-  await assert.rejects(service.roles.save({ name: 'Wrong tool', connections: [{ tool: 'mysql', alias: 'db', secretId: secret.id }] }), /已启用/);
-  await assert.rejects(service.roles.save({ name: 'Duplicate', connections: [{ tool: 'glab', alias: 'a', secretId: secret.id }, { tool: 'glab', alias: 'b', secretId: secret.id }] }), /重复/);
+  await assert.rejects(service.roles.save({ name: 'Wrong tool', connections: [{ tool: 'mysql', secretId: secret.id }] }), /已启用/);
+  await assert.rejects(service.roles.save({ name: 'Duplicate', connections: [{ tool: 'glab', secretId: secret.id }, { tool: 'glab', secretId: secret.id }] }), /重复/);
   assert.equal((await service.roles.catalog()).roles.length, 2);
+  const selection = { tool: 'glab', secretId: secret.id };
+  const selected = await app.request('https://app.example.test/api/tool-roles', { method: 'POST', headers, body: JSON.stringify({ name: 'GitLab access', connections: [selection] }) });
+  assert.equal(selected.status, 201);
+  assert.deepEqual((await selected.json()).connections, [{ ...selection, alias: secret.name }]);
+  const customAlias = await app.request('https://app.example.test/api/tool-roles', { method: 'POST', headers, body: JSON.stringify({ name: 'Custom alias', connections: [{ ...selection, alias: 'override' }] }) });
+  assert.equal(customAlias.status, 400);
 });
 
 
@@ -152,7 +158,7 @@ test('bootstrap binds every historical project to empty Default, removes mounted
     const authorized = await service.authorize('historical-box', 'mysql', ['-e', 'SELECT 1']);
     await writeFile(join(root, 'runtime/debug-homes', projectId, authorized.path), 'native-refresh');
     const restarted = new SecretService(repository, crypto); await restarted.mountHomes(root); await restarted.init();
-    assert.deepEqual((await restarted.roles.state(projectId)).connections, preexisting.connections);
+    assert.deepEqual((await restarted.roles.state(projectId)).connections, preexisting.connections.map(connection => ({ ...connection, alias: secret.name })));
     assert.equal(await readFile(join(root, 'runtime/debug-homes', projectId, authorized.path), 'utf8'), 'native-refresh');
     const newId = randomUUID(); repository.projectIds.add(newId);
     await repository.roles.assignDefault(newId);
@@ -191,4 +197,30 @@ test('native text secrets retain bytes and reject unsafe paths without granting 
   assert.equal((await service.content(secret.id)).version, 2);
   assert.ok(!(await service.versions(secret.id)).some(version => 'ciphertext' in version));
   await service.delete(secret.id); assert.equal((await service.list()).length, 0);
+});
+
+
+test('connection selectors use original credential names and follow renames without widening access', async () => {
+  const { service, projectId } = fixture(); await service.init();
+  const root = await mkdtemp(join(tmpdir(), 'cocell-credential-names-'));
+  await service.mountHomes(root);
+  try {
+    const name = "MySQL · 报表 team's database";
+    const secret = await service.create({ name, tool: 'mysql', path: '.my.cnf', format: 'text', mutable: false, content: '[client]\nuser=fixture' });
+    const role = await service.roles.save({ name: 'Reports', connections: [{ tool: 'mysql', secretId: secret.id }] });
+    assert.equal(role.connections[0].alias, name);
+    await service.roles.assign(projectId, role.id);
+    await service.publishHome(projectId);
+    await service.registerRuntime('name-box', projectId, 1);
+    const auth = await service.authorize('name-box', 'mysql', ['--connection', name, '-e', 'SELECT 1']);
+    assert(auth.path.includes(secret.id));
+    assert(!auth.args.includes(name));
+    await service.update(secret.id, { name: 'doris' });
+    assert.equal((await service.roles.state(projectId)).connections[0].alias, 'doris');
+    assert((await service.authorize('name-box', 'mysql', ['--connection=doris', '-e', 'SELECT 1'])).path.includes(secret.id));
+    await assert.rejects(service.authorize('name-box', 'mysql', [`--connection=${name}`, '-e', 'SELECT 1']), /未授权/);
+    const duplicate = await service.create({ name: 'doris', tool: 'mysql', path: '.my.cnf', format: 'text', mutable: false, content: '[client]\nuser=other' });
+    await assert.rejects(service.roles.save({ name: role.name, connections: [secret, duplicate].map(item => ({ tool: 'mysql', secretId: item.id })) }, role.id), /重复/);
+    assert.equal((await service.roles.state(projectId)).connections.length, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

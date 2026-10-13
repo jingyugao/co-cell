@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ProjectRoleState, RoleCatalog } from '../../../protocol/secret-types';
 import { api, errorMessage } from '../../lib/api';
+import { toolConnectionCommand } from '../../../util/tool-connection-command';
 import '../connections/SecretManager.css';
 
 type Selection = 'none' | string;
@@ -64,7 +65,7 @@ export default function ProjectToolGrants({ projectId, name, onClose }: { projec
         </fieldset>
         {!role && selection !== 'none' ? <p className="tool-secret-note" role="status">当前项目关联的角色已不存在。请明确选择一个角色或“无权限”后保存。</p> : role && <section className="project-role-preview" aria-label={`${role.name} 连接预览`}>
           <h3>{role.name} · 连接预览</h3>
-          {!role.connections.length ? <p className="tool-secret-note">此角色没有连接。</p> : <ul>{role.connections.map((connection, index) => <li key={`${connection.tool}-${connection.alias}-${index}`}><strong>{connection.tool}</strong> · {connection.alias}{['mysql', 'kubectl'].includes(connection.tool) && <code>{connection.tool} --connection={connection.alias}</code>}</li>)}</ul>}
+          {!role.connections.length ? <p className="tool-secret-note">此角色没有连接。</p> : <ul>{role.connections.map((connection, index) => <li key={`${connection.tool}-${connection.secretId}-${index}`}><strong>{connection.tool}</strong> · {connection.alias}{['mysql', 'kubectl'].includes(connection.tool) && <code>{toolConnectionCommand(connection.tool, connection.alias)}</code>}</li>)}</ul>}
         </section>}
       </>}
       <div className="tool-secret-actions"><button className="secondary-button" disabled={busy} onClick={onClose}>取消</button>

@@ -4,7 +4,6 @@ import type { SecretService } from './service.js';
 import { TOOL_NAME_PATTERN } from '../../util/tool-secrets.js';
 import { HttpError } from '../../util/errors.js';
 const id = z.string().uuid();
-const alias = z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/);
 const tool = z.string().trim().regex(TOOL_NAME_PATTERN);
 const content = z.string().min(1).max(90000);
 const path = z.string().min(1).max(256);
@@ -17,7 +16,7 @@ const fileFields = {
 };
 export function installSecretRoutes(app: Hono, secrets: SecretService, projectExists: (id: string) => boolean) {
   const project = (value: string) => { id.parse(value); if (!projectExists(value)) throw new HttpError(404, '项目不存在'); return value; };
-  const roleInput = z.object({ name: z.string().trim().min(1).max(100), connections: z.array(z.object({ tool, alias, secretId: id }).strict()).max(256) }).strict();
+  const roleInput = z.object({ name: z.string().trim().min(1).max(100), connections: z.array(z.object({ tool, secretId: id }).strict()).max(256) }).strict();
   const assignment = z.object({ roleId: id.nullable() }).strict();
   app.get('/api/tool-roles', async c => c.json(await secrets.roles.catalog()));
   app.post('/api/tool-roles', async c => c.json(await secrets.roles.save(roleInput.parse(await c.req.json())), 201));

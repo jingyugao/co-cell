@@ -11,6 +11,8 @@ test('real browser: immediate creation entry, draft retention and automatic resu
     const start = performance.now();
     const creationResponse = page.waitForResponse(response => response.request().method() === 'POST'
       && new URL(response.url()).pathname === '/api/projects');
+    const entryResponse = page.waitForResponse(response => response.request().method() === 'POST'
+      && new URL(response.url()).pathname.endsWith('/open'));
     await createThroughUI(page, env.name('browser'));
     const createdResponse = await creationResponse;
     assert.equal(createdResponse.status(), 201);
@@ -27,6 +29,12 @@ test('real browser: immediate creation entry, draft retention and automatic resu
     await expect(send).toBeEnabled({ timeout: env.config.operationTimeout });
     await expect(editor).toHaveValue('创建时输入的草稿');
     const ready = await env.json(`/api/projects/${id}`); box = ready.sandbox.id;
+    const opened = await entryResponse;
+    assert.equal(opened.status(), 200);
+    const openedProject = await opened.json();
+    assert.equal(openedProject.sandboxOperation.kind, 'resume');
+    assert.equal(openedProject.sandboxOperation.status, 'succeeded');
+    await env.waitProject(id, { kind: 'resume', status: 'ready', operationId: openedProject.sandboxOperation.id });
     return { projectId: id, inputReadyMs, readyMs: performance.now() - start };
   });
   await env.step('Checkpoint, enter its card, automatically resume and keep input', async () => {

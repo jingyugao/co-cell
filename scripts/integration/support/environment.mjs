@@ -174,7 +174,6 @@ export class LiveEnvironment {
       if (operationId) assert.equal(operation?.id, operationId, 'Operation was replaced while waiting');
       if (operation?.status === 'failed') throw new Error(this.redact(operation.error ?? 'Project operation failed'));
       if (operation?.status === 'succeeded') {
-        if (status) assert.equal(project.sandbox?.status, status);
         if (waitForBackup) {
           const backupStatus = project.sandboxBackup?.status;
           if (backupStatus === 'failed') throw new Error(this.redact(project.sandboxBackup.error ?? 'Project disk backup failed'));
@@ -183,6 +182,7 @@ export class LiveEnvironment {
             continue;
           }
         }
+        if (status) assert.equal(project.sandbox?.status, status);
         return project;
       }
       await delay(250, undefined, { signal: this.controller.signal });
@@ -212,18 +212,25 @@ export class LiveEnvironment {
       this.report.cleanup.push({ status: 'retained', projectIds: [...this.projects.keys()] });
     } else for (const [id, name] of [...this.projects].reverse()) {
       try {
+        const deadline = Date.now() + this.config.operationTimeout;
+        const stoppedSessions = new Set();
         for (;;) {
           const { data: project, response } = await this.request(`/api/projects/${id}`, { signal, expectedStatus: [200, 404] });
           if (response.status === 404) break;
           assert.equal(project.name, name, 'Project ownership changed; refusing cleanup');
           if (project.sandbox?.id) this.boxes.add(project.sandbox.id);
-          if (project.activeSessionId) {
+          if (project.activeSessionId && !stoppedSessions.has(project.activeSessionId)) {
             const sessions = await this.json('/api/sessions', { signal });
             assert(sessions.some(session => session.id === project.activeSessionId && session.projectId === id), 'Active session ownership is unknown');
             this.sessions.add(project.activeSessionId);
             await this.json(`/api/sessions/${project.activeSessionId}/stop`, { method: 'POST', signal });
+            stoppedSessions.add(project.activeSessionId);
           }
-          if (project.activeSessionId || project.sandboxOperation?.status === 'running') {
+          const waiting = Boolean(project.activeSessionId)
+            || project.sandboxOperation?.status === 'running'
+            || project.sandboxBackup?.status === 'running';
+          if (waiting) {
+            assert(Date.now() < deadline, `Timed out waiting for project ${id} operations and disk backup before cleanup`);
             await delay(250, undefined, { signal }); continue;
           }
           await this.json(`/api/projects/${id}`, { method: 'DELETE', timeoutMs: this.config.operationTimeout, signal });

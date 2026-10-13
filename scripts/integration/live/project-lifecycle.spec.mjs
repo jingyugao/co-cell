@@ -3,14 +3,17 @@ import { test } from '../support/fixtures.mjs';
 
 test('real projects: create, read-only pause, idempotent entry and two concurrent resumes', async ({ environment: env }) => {
   const projects = [];
-  await env.step('Create two isolated projects and join their preparation', async () => {
+  await env.step('Create two ready projects and enter their existing sandboxes', async () => {
     for (let i = 0; i < 2; i++) {
       const created = await env.createProject(`concurrency-${i}`);
       assert.equal(created.sandboxOperation.kind, 'create');
+      assert.equal(created.sandboxOperation.status, 'succeeded');
+      assert.equal(created.sandbox.status, 'ready');
       const opened = await env.json(`/api/projects/${created.id}/open`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
-      assert.equal(opened.sandboxOperation.id, created.sandboxOperation.id);
+      assert.equal(opened.sandboxOperation.kind, 'resume');
       assert.equal(opened.sandboxOperation.status, 'succeeded');
-      projects.push(await env.waitProject(created.id, { kind: 'create', status: 'ready', operationId: created.sandboxOperation.id }));
+      assert.equal(opened.sandbox.id, created.sandbox.id, 'Entry must keep the sandbox prepared by creation');
+      projects.push(await env.waitProject(created.id, { kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id }));
     }
     return projects.map(project => ({ projectId: project.id, sandboxId: project.sandbox.id }));
   });

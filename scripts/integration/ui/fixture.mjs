@@ -68,6 +68,11 @@ export const test = base.extend({
           const next = request.postDataJSON();
           if (next.status !== undefined) { data.status = next.status; data.completedAt = next.status === 'completed' ? now : null; }
         }
+        else if (method === 'POST' && path.endsWith('/archive')) {
+          data.status = 'archived'; data.archivedAt = now; delete data.sandbox;
+          delete data.archiveCleanupSourceId; delete data.pendingSandboxCleanup;
+          data.sandboxOperation = operation('archive', 'succeeded');
+        }
         else if (method === 'POST' && path.endsWith('/open')) {
           if (data.sandbox?.status === 'ready' && data.sandboxOperation?.status !== 'running') {
             data.sandboxOperation = operation('resume', 'succeeded');

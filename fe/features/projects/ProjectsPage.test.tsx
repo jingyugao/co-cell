@@ -19,7 +19,7 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
   return renderToStaticMarkup(<ProjectsPage
     projects={projects} config={config} loading={false} initialView={initialView}
     onRefresh={async () => projects} onCreate={async () => project()} onUpdate={async () => project()}
-    onRebuildSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()}
+    onRebuildSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()} onArchiveProject={async () => project()}
     onOpenProject={() => {}} onMenu={() => {}} onBack={() => {}}
   />);
 }
@@ -60,7 +60,7 @@ test('abnormal and missing sandboxes use the recovery-or-first-create paths', ()
   assert.match(missing, /进入项目/);
   assert.doesNotMatch(missing, /<button class="primary-button" disabled="">进入项目/);
   assert.match(missing, /重建 Sandbox/);
-  assert.doesNotMatch(missing, /恢复环境/);
+  assert.doesNotMatch(missing, /<button[^>]*>恢复环境<\/button>/);
 });
 
 test('paused sandbox shows its state and resumes the same environment', () => {

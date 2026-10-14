@@ -4,6 +4,7 @@ import { writeFile } from 'node:fs/promises';
 import { posix } from 'node:path';
 import { SandboxLifecycle, type SandboxExtension, type SandboxHandle, type SandboxLifecycleContext } from '@co-cell/sandbox';
 import { CellboxError, CellboxSandboxProvider, type CellboxArchive } from '../../packages/sandbox/src/providers/cellbox/index.js';
+import { HttpError } from '../../util/errors.js';
 import type { SandboxInfo } from '../../packages/sandbox/src/types.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import type { AppServerEndpoint } from '../execution/container-runtime.js';
@@ -49,10 +50,13 @@ export class CellboxRuntimeIntegration {
         }]);
         const ossArchiveEndpoint = process.env.OSS_ENDPOINT;
         this.remoteArchives = {
-        capture: async (target, key) => {
+        capture: async (target, key, captureOptions) => {
                 if (!target.sandbox)
                     throw new Error('Project has no Cellbox');
-                const capabilities = target.sandbox.status !== 'paused' && ossArchiveEndpoint && !target.imageSelection ? (await options.provider.client.getBox(target.sandbox.id)).capabilities : undefined;
+                if (captureOptions?.diskOnly && !(await options.provider.client.getBox(target.sandbox.id)).capabilities.diskArchives) {
+                    throw new HttpError(409, '当前环境不支持独立磁盘归档；请恢复环境后导出文件，或明确选择使用已有备份归档。');
+                }
+                const capabilities = !captureOptions?.diskOnly && target.sandbox.status !== 'paused' && ossArchiveEndpoint && !target.imageSelection ? (await options.provider.client.getBox(target.sandbox.id)).capabilities : undefined;
                 if (capabilities?.protectedTools) {
                     await runtimeConfig.ensureArchiveCredentials(target.sandbox.id);
                     const suffix = `${target.projectId ?? target.id}/${key.replace(/[^A-Za-z0-9._/-]/g, '_')}.tar.gz`;
@@ -70,7 +74,7 @@ export class CellboxRuntimeIntegration {
                     return { id: `oss:${value.objectKey}`, createdAt: value.createdAt, sizeBytes: value.sizeBytes, sha256: value.sha256,
                         imageId: image.id, sourceSandboxId: target.sandbox.id, storageType: 'oss', metadata: value };
                 }
-                const op = await options.provider.captureArchive(target.sandbox.id, key);
+                const op = await options.provider.captureArchive(target.sandbox.id, key, captureOptions);
                 const id = op.result?.archiveId;
                 if (!id)
                     throw new Error('Cellbox capture returned no archive ID');

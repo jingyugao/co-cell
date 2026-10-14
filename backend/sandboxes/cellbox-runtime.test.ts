@@ -426,3 +426,29 @@ test('paused default images capture through Cellbox disk archives without guest 
     if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;
   }
 });
+
+for (const status of ['ready', 'unavailable', 'unknown'] as const) test(`${status} disk archive uses the native node API without guest tools`, async () => {
+  const previous = process.env.OSS_ENDPOINT;
+  process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
+  const fake = fakeProvider();
+  fake.provider.client.getBox = async () => ({ capabilities: { diskArchives: true, protectedTools: true } }) as never;
+  fake.provider.client.runTool = async () => { assert.fail('disk archive must not use guest backup tools'); };
+  fake.provider.connectForSetup = async () => { assert.fail('disk archive must not start or prepare the guest'); };
+  fake.provider.captureArchive = async (id, key, options) => {
+    assert.equal(id, target.sandbox.id); assert.equal(key, 'disk-only');
+    assert.deepEqual(options, { diskOnly: true });
+    return { result: { archiveId: fake.archive.id } } as never;
+  };
+  const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {} });
+  try {
+    const archive = await runtime.remoteArchives.capture({ ...target, sandbox: { ...target.sandbox, status } }, 'disk-only', { diskOnly: true });
+    assert.equal(archive.id, fake.archive.id);
+    assert.equal(fake.credentialWrites.length, 0);
+    fake.provider.client.getBox = async () => ({ capabilities: {} }) as never;
+    fake.provider.captureArchive = async () => { assert.fail('old servers or storage layouts must not silently ignore diskOnly'); };
+    await assert.rejects(runtime.remoteArchives.capture(target, 'unsupported-disk', { diskOnly: true }), /不支持独立磁盘归档/);
+  } finally {
+    await runtime.close();
+    if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;
+  }
+});

@@ -10,6 +10,8 @@ export interface CellboxCapabilities {
   rootDebug?: boolean;
   credentialBatch?: boolean;
   internalServices?: boolean;
+  /** Stop execution and archive persistent files without a process checkpoint. */
+  diskArchives?: boolean;
 }
 /** Conceptual product matrix; Cellbox currently implements only two combinations. */
 export type CellboxRuntimeKind = 'docker-normal' | 'docker-resumable' | 'k8s-normal' | 'k8s-resumable';
@@ -327,8 +329,8 @@ export class CellboxClient {
     return this.request<CellboxLease>('PATCH', `/v1/leases/${this.id(id)}`, { body: { purpose, ttlSeconds } });
   }
   releaseLease(id: string) { return this.request<void>('DELETE', `/v1/leases/${this.id(id)}`, { response: 'empty' }); }
-  captureArchive(boxId: string, key: string) {
-    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(boxId)}/archives`, { key });
+  captureArchive(boxId: string, key: string, options?: { diskOnly: boolean }) {
+    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(boxId)}/archives`, { key, ...(options ? { body: options } : {}) });
   }
   listArchives() { return this.request<CellboxArchive[]>('GET', '/v1/archives'); }
   getArchive(id: string) { return this.request<CellboxArchive>('GET', `/v1/archives/${this.id(id)}`); }

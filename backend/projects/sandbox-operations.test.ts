@@ -143,6 +143,8 @@ for (const status of ['ready', 'paused'] as const) test(`cleanup uses an existin
   const f = await fixture(project(id, { sandbox: sandbox('sandbox-old', status), remoteArchives: [remoteReference] }));
   const operations = new ProjectSandboxOperations({ projects: f.projects,
     runtime: { ...runtime({ status }, []), async resume() { assert.fail('must not resume'); },
+      async checkpoint() { assert.fail('an accepted existing backup must not require a checkpoint'); },
+      async fenceSandbox() { assert.fail('environment deletion belongs to cleanup'); },
       remoteArchives: { async capture() { assert.fail('must not capture'); }, async inspect() { return remoteReference; },
         async restore() { throw new Error('unused'); }, async activate() {} } },
     threadIds: () => [], saveSandbox: async () => {}, detached: async () => {} });
@@ -205,15 +207,18 @@ test('a failed backup health check preserves the reference and a later retry use
   } finally { await operations.close(); await f.close(); }
 });
 
-test('Cellbox archive persists its verified reference before fencing the source', async () => {
+test('disk archive bypasses checkpoint and health checks and persists its verified reference before cleanup', async () => {
   const id = 'd1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1';
   const f = await fixture(project(id));
   const calls: string[] = [];
   let failCapture = true;
   const remoteRuntime: SandboxRuntime = {
-    ...runtime({}, calls),
+    ...runtime({ status: 'unavailable' }, calls),
+    async checkpoint() { assert.fail('disk archive must not checkpoint processes'); },
+    async verifySandbox() { assert.fail('disk archive must not check App Server health'); },
     remoteArchives: {
-      async capture(_target, key) {
+      async capture(_target, key, options) {
+        assert.deepEqual(options, { diskOnly: true });
         calls.push(`capture:${key}`);
         if (failCapture) throw new Error('Cellbox capture failed');
         return (({ threadIds: _threads, ...metadata }) => metadata)(remoteReference);
@@ -222,9 +227,11 @@ test('Cellbox archive persists its verified reference before fencing the source'
         return (({ threadIds: _threads, ...metadata }) => metadata)(remoteReference); },
       async restore() { throw new Error('unused'); }, async activate() { throw new Error('unused'); },
     },
-    async fenceSandbox(value) {
+    async fenceSandbox() { assert.fail('disk capture already stops execution without a checkpoint'); },
+    async deleteDanglingSandbox(value) {
+      assert.equal(f.projects.get(id).status, 'archived');
       assert.equal(f.projects.get(id).remoteArchives?.[0]?.id, remoteReference.id);
-      calls.push(`fence:${value.id}`);
+      calls.push(`delete:${value}`);
     },
   };
   const operations = new ProjectSandboxOperations({ projects: f.projects, runtime: remoteRuntime,
@@ -241,7 +248,7 @@ test('Cellbox archive persists its verified reference before fencing the source'
     assert.equal(f.projects.get(id).remoteArchives?.[0]?.id, remoteReference.id);
     assert.equal(f.projects.get(id).remoteArchives?.[0]?.threadIds[0], 'thread-1');
     assert.match(calls.find(call => call.startsWith('capture:'))!, /^capture:[0-9a-f-]+:capture$/);
-    assert.ok(calls.indexOf('inspect-archive') < calls.indexOf('fence:sandbox-old'));
+    assert.ok(calls.indexOf('inspect-archive') < calls.indexOf('delete:sandbox-old'));
   } finally { await operations.close(); await f.close(); }
 });
 
@@ -265,10 +272,13 @@ test('archive reports deletion failures and resumes its verified cleanup journal
     saveSandbox: async () => {}, detached: async () => { detached++; if (failLocalCleanup) throw new Error('cache deletion failed'); } });
   let operations = createOperations();
   try {
-    await assert.rejects(operations.run(id, 'archive'), /尚未清理完成/);
+    await operations.run(id, 'archive');
     let value = f.projects.get(id);
-    assert.equal(value.status, 'completed');
-    assert.equal(value.sandboxOperation?.status, 'failed');
+    assert.equal(value.status, 'archived');
+    assert.equal(value.sandboxOperation?.status, 'succeeded');
+    assert.match(value.sandboxOperation?.cleanupError ?? '', /清理未完成/);
+    assert.equal(value.sandbox, undefined);
+    assert.equal(value.sandboxArtifactsCleanedAt, undefined);
     assert.equal(value.archiveCleanupSourceId, 'sandbox-old');
     assert.deepEqual(value.pendingSandboxCleanup?.map(box => box.id), ['sandbox-old']);
     assert.equal(detached, 0);
@@ -276,8 +286,9 @@ test('archive reports deletion failures and resumes its verified cleanup journal
     // Reload persisted project state to exercise recovery after a service restart.
     await operations.close(); await f.projects.init(); operations = createOperations();
     failDelete = false; failLocalCleanup = true;
-    await assert.rejects(operations.run(id, 'archive'), /cache deletion failed/);
-    assert.equal(f.projects.get(id).status, 'completed');
+    await operations.run(id, 'archive');
+    assert.match(f.projects.get(id).sandboxOperation?.cleanupError ?? '', /清理未完成/);
+    assert.equal(f.projects.get(id).status, 'archived');
     assert.equal(f.projects.get(id).archiveCleanupSourceId, 'sandbox-old');
     failLocalCleanup = false;
     await operations.run(id, 'archive');
@@ -304,9 +315,10 @@ test('legacy archives reconcile all known retired boxes and preserve their archi
       async deleteDanglingSandbox(boxId) { deleted.push(boxId); if (failure && boxId === 'older-source') throw new Error('purge unavailable'); } },
     threadIds: () => [], saveSandbox: async () => { throw new Error('must not restore'); }, detached: async () => {} });
   try {
-    await assert.rejects(operations.run(id, 'archive'), /尚未清理完成/);
+    await operations.run(id, 'archive');
     assert.equal(f.projects.get(id).sandboxArtifactsCleanedAt, undefined);
-    assert.equal(f.projects.get(id).sandboxOperation?.status, 'failed');
+    assert.equal(f.projects.get(id).sandboxOperation?.status, 'succeeded');
+    assert.match(f.projects.get(id).sandboxOperation?.cleanupError ?? '', /清理未完成/);
     failure = false;
     await operations.run(id, 'archive');
     const value = f.projects.get(id);
@@ -541,7 +553,7 @@ test('checkpoint returns before disk capture and keeps pause success after backg
   } finally { failCapture(); await operations.close(); await f.close(); }
 });
 
-for (const kind of ['checkpoint', 'archive'] as const) test(`${kind} preserves the paused source on capture failure and retries from disk without resume`, async () => {
+for (const kind of ['checkpoint', 'archive'] as const) test(`${kind} preserves the source disk on capture failure and retries without resume`, async () => {
   const id = `disk-failure-${kind}`;
   const f = await fixture(project(id));
   const calls: string[] = [];
@@ -550,7 +562,9 @@ for (const kind of ['checkpoint', 'archive'] as const) test(`${kind} preserves t
   const operations = new ProjectSandboxOperations({ projects: f.projects,
     runtime: { ...runtime(control, calls), async resume() { assert.fail('disk capture must never resume'); },
       remoteArchives: {
-        async capture(value) { calls.push('capture'); assert.equal(value.sandbox?.status, 'paused');
+        async capture(value, _key, options) { calls.push('capture');
+          if (kind === 'archive') { assert.deepEqual(options, { diskOnly: true }); control.status = 'unavailable'; }
+          else assert.equal(value.sandbox?.status, 'paused');
           if (failCapture) throw new Error('storage unavailable'); return remoteReference; },
         async inspect() { calls.push('verify-archive'); return remoteReference; },
         async restore() { throw new Error('unused'); }, async activate() {},
@@ -564,7 +578,7 @@ for (const kind of ['checkpoint', 'archive'] as const) test(`${kind} preserves t
       assert.equal(f.projects.get(id).sandboxBackup?.status, 'failed');
       assert.match(f.projects.get(id).sandboxBackup?.error ?? '', /磁盘备份失败/);
     } else await assert.rejects(operations.run(id, kind), /storage unavailable/);
-    assert.equal(control.status, 'paused');
+    assert.equal(control.status, kind === 'checkpoint' ? 'paused' : 'unavailable');
     assert.equal(f.projects.get(id).sandbox?.id, 'sandbox-old');
     assert.equal(f.projects.get(id).sandboxOperation?.status, kind === 'checkpoint' ? 'succeeded' : 'failed');
     assert.equal(f.projects.get(id).archiveCleanupSourceId, undefined);
@@ -573,7 +587,7 @@ for (const kind of ['checkpoint', 'archive'] as const) test(`${kind} preserves t
     failCapture = false;
     await operations.run(id, kind);
     await operations.close();
-    assert.equal(calls.filter(call => call === 'checkpoint').length, 1, 'retry must keep the existing checkpoint');
+    assert.equal(calls.filter(call => call === 'checkpoint').length, kind === 'checkpoint' ? 1 : 0, 'disk archive must not create a process checkpoint');
     assert.equal(f.projects.get(id).remoteArchives?.[0].id, remoteReference.id);
     assert.equal(f.projects.get(id).sandboxOperation?.status, 'succeeded');
     if (kind === 'archive') {

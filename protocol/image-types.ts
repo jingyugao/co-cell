@@ -1,5 +1,7 @@
 /** Image names group immutable versions; projects retain a selected version. */
 export interface ImageVersion {
+  /** Global default for new projects and the warm pool. */
+  isDefault?: boolean;
   id: string;
   version: string;
   source: string;
@@ -20,6 +22,7 @@ export interface ImageVersion {
   deletedAt?: string;
   deprecatedAt?: string;
 }
+export interface DefaultImageSelection { imageId: string; versionId: string }
 export interface ManagedImage {
   id: string;
   name: string;

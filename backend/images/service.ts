@@ -15,6 +15,7 @@ const preparationKey = (request: ImageVersionRecord['request']) => createHash('s
 const usageLabels: Record<string, string> = {
   'boxes-reference-image': 'Cellbox 中仍有环境或 Checkpoint 引用此镜像',
   'profiles-reference-image': '系统运行配置仍引用此镜像',
+  'warm-default-reference-image': '预热默认镜像仍引用此版本，请先切换默认镜像',
   'archives-reference-image': 'Cellbox 中仍有依赖原镜像的备份',
   'image-operation-running': 'Cellbox 正在构建或清理镜像',
   'manifest-not-deletable': '此镜像不属于平台可清理的成品仓库',
@@ -28,7 +29,16 @@ export class ImageCatalog {
   constructor(private store: ImageCatalogStore, private client: CellboxClient, private profileId: string,
     private registry: ImageRegistry = new DockerRegistryClient(), private projects: () => Project[] | Promise<Project[]> = () => [],
     private coordinator?: SharedCoordinator) {}
-  async init() { await this.loadRecords(); }
+  async init() {
+    await this.exclusive(async () => {
+      await this.loadRecords();
+      await this.syncWarmDefault(await this.store.loadDefaultImage());
+    });
+  }
+  private async syncWarmDefault(selection?: { imageId: string; versionId: string }) {
+    const resolved = selection ? await this.resolveAvailable(selection.imageId, selection.versionId) : undefined;
+    await this.client.setWarmDefaultImage(this.profileId, resolved?.importedImageId);
+  }
   private async loadRecords() {
     const records = await this.store.listImages();
     this.records = new Map(records.map(image => [image.id, image]));
@@ -117,12 +127,14 @@ export class ImageCatalog {
     await this.refresh();
     const [images, profiles] = await Promise.all([this.client.listImages(), this.client.listProfiles()]);
     const profile = profiles.find(profile => profile.id === this.profileId);
-    const builtin: ManagedImage[] = profile ? [{ id: 'default', name: '系统默认镜像', category: '系统', origin: 'profile',
-      versions: [{ id: 'default', version: '当前配置', source: profile.image, image: profile.image, status: 'succeeded', createdAt: '' }] }] : [];
+    const builtin: ManagedImage[] = profile ? [{ id: 'default', name: '系统基础镜像', category: '系统', origin: 'profile',
+      versions: [{ id: 'default', version: '当前配置', source: profile.image, image: profile.image, status: 'succeeded', projectReady: true, createdAt: '' }] }] : [];
     const managed = [...this.records.values()].filter(image => image.origin === 'managed' && !image.deletedAt).map(publicImage);
     const repositories = new Set(managed.map(image => normalizeRepository(image.repository!).replace(/^https?:\/\//, '')));
-    const external = this.external(images).filter(image => includeExternalDuplicates || !repositories.has(normalizeRepository(image.repository!).replace(/^https?:\/\//, '')));
-    return [...builtin, ...managed, ...external];
+    const selected = await this.store.loadDefaultImage();
+    const external = this.external(images).filter(image => includeExternalDuplicates || selected?.imageId === image.id || !repositories.has(normalizeRepository(image.repository!).replace(/^https?:\/\//, '')));
+    return [...builtin, ...managed, ...external].map(image => ({ ...image, versions: image.versions.map(version => ({ ...version,
+      isDefault: selected ? selected.imageId === image.id && selected.versionId === version.id : image.origin === 'profile' })) }));
   }
   list(): Promise<ManagedImage[]> {
     return this.exclusive(() => this.readImages());
@@ -254,6 +266,12 @@ export class ImageCatalog {
   acquireSelection(imageId: string, versionId: string) {
     return this.exclusive(async () => this.reserve(await this.resolveAvailable(imageId, versionId)));
   }
+  acquireDefaultSelection() {
+    return this.exclusive(async () => {
+      const selected = await this.store.loadDefaultImage();
+      return this.reserve(selected ? await this.resolveAvailable(selected.imageId, selected.versionId) : undefined);
+    });
+  }
   private async reserve(selection?: ProjectImageSelection) {
     const key = selection?.image;
     let lease: SharedLease | undefined;
@@ -288,11 +306,20 @@ export class ImageCatalog {
   }
   setDefault(imageId: string, versionId: string) {
     return this.exclusive(async () => {
-      await this.resolveAvailable(imageId, versionId);
+      const selected = await this.resolveAvailable(imageId, versionId);
+      const previous = await this.store.loadDefaultImage();
       const stored = this.records.get(imageId);
-      if (!stored || stored.origin !== 'managed') throw new HttpError(400, '只有平台管理的仓库可以设置默认版本');
-      const record = structuredClone(stored); record.defaultVersionId = versionId;
-      await this.save(record); return publicImage(record);
+      const record = stored?.origin === 'managed' ? structuredClone(stored) : undefined;
+      if (record) record.defaultVersionId = versionId;
+      await this.client.setWarmDefaultImage(this.profileId, selected?.importedImageId);
+      try { await this.store.saveDefaultImage(selected ? { imageId, versionId } : undefined, record); }
+      catch (error) {
+        // Keep the published warm target aligned with durable selection on a failed write.
+        await this.syncWarmDefault(previous).catch(() => {});
+        throw error;
+      }
+      if (record) this.records.set(record.id, record);
+      return (await this.readImages(true)).find(image => image.id === imageId)!;
     });
   }
   setDeprecated(imageId: string, versionId: string, deprecated: boolean): Promise<ManagedImage> {
@@ -301,6 +328,7 @@ export class ImageCatalog {
       const version = image?.versions.find(value => value.id === versionId);
       if (!image || !version) throw new HttpError(404, '镜像或版本不存在');
       if (image.origin === 'profile') throw new HttpError(400, '系统默认镜像由平台配置管理');
+      if (deprecated && version.isDefault) throw new HttpError(409, '请先设置其他默认镜像，再弃用此版本');
       if (version.cleanup) throw new HttpError(409, '镜像版本正在清理或清理结果待确认');
       const deprecatedAt = deprecated ? version.deprecatedAt ?? new Date().toISOString() : undefined;
       if (image.origin === 'cellbox') {
@@ -345,6 +373,8 @@ export class ImageCatalog {
   }
   private async blockers(record: ImageRecord, version: ImageVersionRecord) {
     const blockers: string[] = [];
+    const global = await this.store.loadDefaultImage();
+    if (global?.imageId === record.id && global.versionId === version.id) blockers.push('当前默认镜像，请先指定其他默认镜像');
     if (record.defaultVersionId === version.id) blockers.push('仓库默认版本，请先指定其他默认版本');
     if (['submitting', 'queued', 'running', 'unknown'].includes(version.status)) blockers.push('版本仍在同步或导入结果待确认');
     if (version.image && (this.reservations.has(version.image) || await this.hasSharedReservation(version.image))) blockers.push('版本正在被创建或恢复操作使用');

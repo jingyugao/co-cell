@@ -1,4 +1,4 @@
-import type { ManagedImage, ImageVersion } from '../../protocol/image-types.js';
+import type { ManagedImage, ImageVersion, DefaultImageSelection } from '../../protocol/image-types.js';
 import type { CellboxImportImageInput } from '../../packages/sandbox/src/providers/cellbox/client.js';
 
 export interface ImageVersionRecord extends ImageVersion {
@@ -17,4 +17,6 @@ export interface ImageRecord extends Omit<ManagedImage, 'versions'> {
 export interface ImageCatalogStore {
   listImages(): Promise<ImageRecord[]>;
   saveImage(image: ImageRecord): Promise<void>;
+  loadDefaultImage(): Promise<DefaultImageSelection | undefined>;
+  saveDefaultImage(selection: DefaultImageSelection | undefined, image?: ImageRecord): Promise<void>;
 }

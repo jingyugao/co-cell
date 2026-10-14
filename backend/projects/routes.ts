@@ -105,7 +105,7 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
   app.post('/api/projects', async c => {
     const { imageId, imageVersionId, ...input } = createSchema.parse(await c.req.json());
     if (imageId && !images) throw new HttpError(503, '镜像管理尚未初始化');
-    const reservation = imageId ? await images!.acquireSelection(imageId, imageVersionId!) : undefined;
+    const reservation = imageId ? await images!.acquireSelection(imageId, imageVersionId!) : await images?.acquireDefaultSelection();
     try {
       return c.json(await manager.createProject({ ...input, ...(reservation?.selection ? { imageSelection: reservation.selection } : {}) }), 201);
     } finally { await reservation?.release(); }

@@ -223,6 +223,9 @@ export class CellboxClient {
   imageUsage(id: string) { return this.request<{ deletable: boolean; blockers: string[]; manifestShared: boolean }>('GET', `/v1/images/${this.id(id)}/usage`); }
   deleteImage(id: string, key: string) { return this.request<CellboxOperation>('DELETE', `/v1/images/${this.id(id)}`, { key }); }
   listProfiles(signal?: AbortSignal) { return this.request<CellboxProfile[]>('GET', '/v1/profiles', { signal }); }
+  setWarmDefaultImage(profileId: string, importedImageId?: string) {
+    return this.request<{ image: string }>('PUT', `/v1/profiles/${this.id(profileId)}/warm-default`, { body: importedImageId ? { importedImageId } : {} });
+  }
   listBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes', { signal }); }
   listResourceBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes?observation=resource', { signal }); }
   listCheckpoints(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/checkpoints', { signal }); }

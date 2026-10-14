@@ -72,7 +72,7 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry
   const visibleVersions = image.versions.filter(version => lifecycle === 'all' || (lifecycle === 'deprecated') === Boolean(version.deprecatedAt));
   const visibleTags = tags.filter(tag => tag.toLowerCase().includes(query.toLowerCase()));
   return <div className="repository-details">
-    <div className="projects-heading"><div><span className="projects-eyebrow">REPOSITORY VERSIONS</span><h1>{image.name}</h1><p>{image.repository ?? '系统默认开发环境'}</p></div><button className="secondary-button" disabled={busy} onClick={onBack}>返回仓库列表</button></div>
+    <div className="projects-heading"><div><span className="projects-eyebrow">REPOSITORY VERSIONS</span><h1>{image.name}</h1><p>{image.repository ?? '系统默认开发环境'}</p><p className="project-form-hint">新项目使用当前默认镜像；warm pool 只预热默认版本。仓库默认版本仅用于归档项目恢复。</p></div><button className="secondary-button" disabled={busy} onClick={onBack}>返回仓库列表</button></div>
     {managed && <>
       <section className="image-card image-import-form">
         <h2>仓库配置</h2><p className="project-form-hint">版本名与上游 Tag 一致。运行中和 Checkpoint 项目固定原版本；归档项目恢复时优先使用本仓库默认版本。首个同步成功的版本自动设为默认，后续可手动切换。</p>
@@ -98,7 +98,7 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry
       {!image.versions.length && <p className="project-form-hint">尚未同步版本。同步成功后可在创建项目时选择。</p>}
       {image.versions.length > 0 && !visibleVersions.length && <p className="project-form-hint">当前状态下没有版本。</p>}
       {visibleVersions.map(version => <section className="image-version" key={version.id}>
-        <div className="image-version-heading"><strong>{version.version}</strong>{version.deprecatedAt && <span className="project-type-badge">已弃用</span>}{image.defaultVersionId === version.id && <span className="project-type-badge">默认 · 归档恢复</span>}<span className={`image-status ${version.status}`}>{version.cleanup ? version.cleanup.status === 'failed' ? '清理失败' : version.cleanup.status === 'unknown' ? '清理结果待确认' : '清理中' : version.projectReady === false ? '需配置运行环境' : statusLabels[version.status]}</span>{version.createdAt && <time>{new Date(version.createdAt).toLocaleString('zh-CN', { hour12: false })}</time>}</div>
+        <div className="image-version-heading"><strong>{version.version}</strong>{version.isDefault && <span className="project-type-badge image-global-default">默认镜像</span>}{version.deprecatedAt && <span className="project-type-badge">已弃用</span>}{image.defaultVersionId === version.id && <span className="project-type-badge">仓库默认 · 归档恢复</span>}<span className={`image-status ${version.status}`}>{version.cleanup ? version.cleanup.status === 'failed' ? '清理失败' : version.cleanup.status === 'unknown' ? '清理结果待确认' : '清理中' : version.projectReady === false ? '需配置运行环境' : statusLabels[version.status]}</span>{version.createdAt && <time>{new Date(version.createdAt).toLocaleString('zh-CN', { hour12: false })}</time>}</div>
         <div className="image-reference"><span>源镜像</span><code>{version.source}</code></div>
         {version.upstreamDigest && <div className="image-reference"><span>上游 digest</span><code>{version.upstreamDigest}</code></div>}
         {version.image && <div className="image-reference"><span>固定镜像</span><code>{version.image}</code></div>}
@@ -108,13 +108,13 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onRetry
         {version.warnings?.length ? <details><summary>同步说明</summary><ul>{version.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></details> : null}
         {version.status === 'unknown' && managed && <button className="secondary-button" disabled={blocked} onClick={() => void action(async () => { await onRetry(version.id, version.registryAuthRequired ? credentials() : undefined); }, '已使用原请求确认同步结果。')}>确认同步结果</button>}
         {image.origin !== 'profile' && <div className="project-form-actions">
-          {!version.cleanup && <button className="secondary-button" disabled={blocked} onClick={() => void action(async () => {
-            if (!version.deprecatedAt && !window.confirm(`弃用 ${version.version}？已有项目继续使用，但新项目和归档恢复不能选择此版本。若它是默认版本，将切换到其他可用版本。`)) return;
+          {!version.cleanup && <button className="secondary-button" disabled={blocked || version.isDefault} title={version.isDefault ? '请先设置其他默认镜像' : undefined} onClick={() => void action(async () => {
+            if (!version.deprecatedAt && !window.confirm(`弃用 ${version.version}？已有项目继续使用，但新项目和归档恢复不能选择此版本。`)) return;
             await onDeprecated(version.id, !version.deprecatedAt);
           }, version.deprecatedAt ? '版本已恢复生效。' : '版本已弃用，已有项目不受影响。')}>{version.deprecatedAt ? '恢复生效' : '标记弃用'}</button>}
         </div>}
+        {version.status === 'succeeded' && !version.deprecatedAt && version.projectReady !== false && !version.cleanup && !version.isDefault && <div className="project-form-actions"><button className="secondary-button" disabled={blocked} onClick={() => void action(() => onDefault(version.id), '已设为默认镜像。新项目将使用该版本，只预热此版本。')}>设为默认镜像</button></div>}
         {managed && <div className="project-form-actions">
-          {version.status === 'succeeded' && !version.deprecatedAt && version.projectReady !== false && !version.cleanup && image.defaultVersionId !== version.id && <button className="secondary-button" disabled={blocked} onClick={() => void action(() => onDefault(version.id), '已设为默认版本，归档项目恢复时优先使用。')}>设为默认版本</button>}
           {(['succeeded', 'failed'].includes(version.status) || version.cleanup) && image.defaultVersionId !== version.id && <button className="secondary-button" disabled={blocked || version.cleanup?.status === 'pending'} onClick={() => void remove(version)}>{version.cleanup ? '重试 / 确认清理' : '清理版本'}</button>}
         </div>}
       </section>)}

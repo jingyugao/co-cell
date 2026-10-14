@@ -1,6 +1,8 @@
 import { test as base, expect } from '@playwright/test';
 
 const now = '2026-01-01T00:00:00Z';
+const defaultRoleId = '00000000-0000-4000-8000-000000000001';
+const defaultRole = { id: defaultRoleId, name: '默认角色', connections: [], createdAt: now, updatedAt: now };
 const workingDirectory = '/home/agent/workspace';
 const defaults = { executionMode: 'sandbox', workingDirectory, model: 'integration-model', modelReasoningEffort: 'medium', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
 const sandbox = (id, status = 'ready') => ({ id: `${id}-box`, status, template: 'default', workingDirectory });
@@ -12,6 +14,7 @@ export const test = base.extend({
     // Deterministic API boundaries make pending/error transitions reproducible.
     // These cases test the real React application, separately from the live suites.
     const projects = new Map([['paused', project('paused', '暂停项目')], ['other', project('other', '另一个项目', 'ready')]]);
+    const projectRoles = new Map([...projects.keys()].map(id => [id, defaultRoleId]));
     const calls = [], historyReads = [], submissions = [], errors = [];
     const pendingRoutes = new Map(), pendingByRequest = new Map();
     const rememberPending = (id, route, kind, call) => {
@@ -54,16 +57,21 @@ export const test = base.extend({
       calls.push(call);
       let data, status = 200;
       if (path === '/api/config') data = config;
+      else if (path === '/api/tool-roles' && method === 'GET') data = { roles: [defaultRole], defaultRoleId };
       else if (path === '/api/notifications') data = [];
       else if (path === '/api/images') data = [{ id: 'default', name: '系统默认镜像', category: '系统', origin: 'profile', versions: [{ id: 'default', version: '当前配置', status: 'succeeded', source: 'default', projectReady: true }] }];
       else if (path === '/api/projects' && method === 'GET') data = [...projects.values()];
       else if (path === '/api/projects' && method === 'POST') {
         data = project('new', request.postDataJSON().name); delete data.sandbox;
-        data.sandboxOperation = operation('create'); projects.set('new', data);
+        data.sandboxOperation = operation('create'); projects.set('new', data); projectRoles.set('new', defaultRoleId);
         rememberPending('new', route, 'create', call); return;
       } else if (path.startsWith('/api/projects/')) {
         const id = path.split('/')[3]; data = projects.get(id);
         if (!data) { data = { error: '不存在' }; status = 404; }
+        else if (path === `/api/projects/${id}/tool-role`) {
+          if (method === 'PUT') projectRoles.set(id, request.postDataJSON().roleId);
+          data = { roleId: projectRoles.get(id) ?? null, connections: [] };
+        }
         else if (method === 'PATCH' && path === `/api/projects/${id}`) {
           const next = request.postDataJSON();
           if (next.status !== undefined) { data.status = next.status; data.completedAt = next.status === 'completed' ? now : null; }

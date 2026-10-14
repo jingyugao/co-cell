@@ -24,7 +24,7 @@ export class ProjectService {
   private creatingWeeklyProjects = new Set<string>();
   private writer = new RecordWriteQueue();
   private saved = new Map<string, Project>();
-  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo, private now: () => Date = () => new Date(), private shared = false) {}
+  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo, private now: () => Date = () => new Date(), private shared = false, private onCreate?: (projectId: string) => Promise<void>) {}
 
   async init() {
     for (const project of await this.state.listProjects()) {
@@ -200,15 +200,18 @@ export class ProjectService {
     return () => { this.maintenance.delete(id); };
   }
 
-  async archiveAndDetachSandbox(id: string, sourceId?: string): Promise<void> {
+  async archiveAndDetachSandbox(id: string, sourceId?: string, cleanupPending = false): Promise<void> {
     await this.mutateSandboxMetadata(id, project => {
       if (sourceId && project.sandbox?.id !== sourceId) throw new HttpError(409, '项目 Sandbox 已变化');
       const at = new Date().toISOString();
       delete project.sandbox;
-      delete project.archiveCleanupSourceId;
-      delete project.pendingSandboxCleanup;
+      if (!cleanupPending) {
+        delete project.archiveCleanupSourceId;
+        delete project.pendingSandboxCleanup;
+      }
       project.sandboxReclaimedAt = at;
-      project.sandboxArtifactsCleanedAt = at;
+      if (cleanupPending) delete project.sandboxArtifactsCleanedAt;
+      else project.sandboxArtifactsCleanedAt = at;
       project.status = 'archived'; project.completedAt = null; project.archivedAt = at;
       project.lifecycleHistory = [...(project.lifecycleHistory ?? []), { id: randomUUID(), action: 'archived', at, ...(sourceId ? { sandboxId: sourceId } : {}) }];
     }, true);
@@ -428,6 +431,12 @@ export class ProjectService {
         executionMode: settings.executionMode ?? 'local', workingDirectory: settings.workingDirectory,
         status: 'active', completedAt: null, archivedAt: null, createdAt: now, updatedAt: now };
       await this.import(project);
+      try { await this.onCreate?.(project.id); }
+      catch (error) {
+        await this.state.deleteProject(project.id);
+        this.records.delete(project.id); this.saved.delete(project.id);
+        throw error;
+      }
       return this.get(project.id);
     } finally { if (weekOf) this.creatingWeeklyProjects.delete(weekOf); }
   }

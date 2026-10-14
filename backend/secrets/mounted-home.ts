@@ -5,7 +5,7 @@ import type { ProvisionedToolFile } from '../../protocol/secret-types.js';
 import { credentialPath } from './policy.js';
 import type { SharedCoordinator } from '../infra/storage/coordination.js';
 
-type Binding = Pick<ProvisionedToolFile, 'tool' | 'secretId' | 'path' | 'version'>;
+type Binding = Pick<ProvisionedToolFile, 'tool' | 'secretId' | 'path' | 'version' | 'revision'>;
 
 /** Native CLI files live here, rather than in the checkpoint or an API response. */
 export class MountedToolHomes {
@@ -49,11 +49,12 @@ export class MountedToolHomes {
   }
   private async write(projectId: string, files: ProvisionedToolFile[]) {
     const { home, manifest } = this.locations(projectId);
-    const next: Binding[] = files.map(({ tool, secretId, path, version, format }) => {
-      if (format && format !== 'text') throw new Error('Mounted HOME supports one text credential file per tool');
-      return { tool, secretId, path: credentialPath(path), version };
+    const next: Binding[] = files.map(({ tool, secretId, path, version, revision, format }) => {
+      if (format && format !== 'text') throw new Error('Mounted HOME supports text credential files only');
+      return { tool, secretId, path: credentialPath(path), version, ...(revision ? { revision } : {}) };
     });
-    if (new Set(next.map(file => file.tool)).size !== next.length) throw new Error('Only one credential file per tool is supported');
+    if (new Set(next.map(file => JSON.stringify([file.tool, file.secretId, file.path]))).size !== next.length)
+      throw new Error('Duplicate tool credential file');
     for (let i = 0; i < next.length; i++) for (let j = i + 1; j < next.length; j++) {
       const a = next[i].path, b = next[j].path;
       if (a === b || a.startsWith(b + '/') || b.startsWith(a + '/')) throw new Error('Credential HOME paths conflict');
@@ -74,7 +75,7 @@ export class MountedToolHomes {
         } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       }
       const bytes = Buffer.from(files[i].content, 'base64');
-      if (!bytes.length || bytes.length > 65536 || bytes.toString('base64') !== files[i].content) throw new Error('Invalid credential file');
+      if (!bytes.length || bytes.length > (file.revision ? 1024 * 1024 : 65536) || bytes.toString('base64') !== files[i].content) throw new Error('Invalid credential file');
       await this.atomicFile(join(home, file.path), bytes);
     }
     for (const file of old) if (!next.some(value => value.path === file.path)) {

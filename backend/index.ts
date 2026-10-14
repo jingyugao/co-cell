@@ -138,6 +138,7 @@ const lifecycleScanIntervalMs = process.env.SANDBOX_LIFECYCLE_SCAN_INTERVAL_MS =
 if (!Number.isFinite(archivedReclaimAfterMs) || archivedReclaimAfterMs < 0) throw new Error('SANDBOX_ARCHIVED_RECLAIM_AFTER_MS must be non-negative');
 manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtime, sandboxWorkingDirectory, runtimeLog,
   webImagesDirectory, {
+    onProjectCreate: projectId => secrets.repository.roles.assignDefault(projectId),
     archivedReclaimAfterMs,
     autoCheckpointAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),

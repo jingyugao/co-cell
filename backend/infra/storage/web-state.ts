@@ -1,6 +1,7 @@
 import { MySqlPreviewGrantStore } from '../../access/preview-grants.js';
 import { MySqlModelRepository } from '../../models/repository.js';
 import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
+import type { DefaultImageSelection } from '../../../protocol/image-types.js';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import type { Project, Session, Turn } from '../../../protocol/types.js';
 import type { SandboxState } from '../../../protocol/sandbox-types.js';
@@ -92,9 +93,25 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   async saveImage(image: ImageRecord) {
     await this.pool.query('INSERT INTO managed_images (id,document) VALUES (?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE document=VALUES(document)', [image.id, JSON.stringify(image)]);
   }
+  async loadDefaultImage(): Promise<DefaultImageSelection | undefined> {
+    const [rows] = await this.pool.query<Array<RowDataPacket & { document: DefaultImageSelection | string }>>("SELECT document FROM image_settings WHERE name='default'");
+    return rows[0] ? this.document<DefaultImageSelection>(rows[0].document) : undefined;
+  }
+  async saveDefaultImage(selection: DefaultImageSelection | undefined, image?: ImageRecord) {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      if (selection) await connection.query("INSERT INTO image_settings (name,document) VALUES ('default',CAST(? AS JSON)) ON DUPLICATE KEY UPDATE document=VALUES(document)", [JSON.stringify(selection)]);
+      else await connection.query("DELETE FROM image_settings WHERE name='default'");
+      if (image) await connection.query('INSERT INTO managed_images (id,document) VALUES (?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE document=VALUES(document)', [image.id, JSON.stringify(image)]);
+      await connection.commit();
+    } catch (error) { await connection.rollback().catch(() => undefined); throw error; }
+    finally { connection.release(); }
+  }
   async init() {
     await this.previewGrants.init();
     await this.pool.query(`CREATE TABLE IF NOT EXISTS managed_images (id CHAR(36) PRIMARY KEY, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS image_settings (name VARCHAR(100) PRIMARY KEY, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS projects (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL, requirement_url TEXT NULL, execution_mode ENUM('sandbox','local') NOT NULL, working_directory TEXT NOT NULL, archived_at DATETIME(3) NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sessions (id CHAR(36) PRIMARY KEY, project_id CHAR(36) NULL, thread_id VARCHAR(191) NULL, title VARCHAR(255) NOT NULL, status ENUM('idle','running','completed','failed','cancelled') NOT NULL, archived_at DATETIME(3) NULL, started_at DATETIME(3) NOT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, document JSON NOT NULL, INDEX sessions_project_updated (project_id, updated_at), CONSTRAINT sessions_project_fk FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.notificationRepository.init();

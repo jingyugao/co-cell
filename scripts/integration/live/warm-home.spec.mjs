@@ -23,15 +23,13 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
   const markerPath = '/home/agent/.cocell-warm-isolation-marker';
   const cases = [];
   const imageName = process.env.COCELL_E2E_WARM_HOME_IMAGE;
-  let selection;
-  if (imageName) {
-    const images = await env.json('/api/images');
-    const image = images.find(item => item.name === imageName);
-    const version = image?.versions.find(item => item.id === image.defaultVersionId);
-    assert(version?.status === 'succeeded' && version.projectReady,
-      `Image ${imageName} needs a ready default version`);
-    selection = { imageId: image.id, imageVersionId: version.id, image: version.image };
-  }
+  const images = await env.json('/api/images');
+  const defaults = images.flatMap(image => image.versions.filter(version => version.isDefault).map(version => ({ image, version })));
+  assert.equal(defaults.length, 1, 'Configure exactly one global default image');
+  const { image, version } = defaults[0];
+  assert(version.status === 'succeeded' && version.projectReady !== false && !version.deprecatedAt && !version.cleanup, 'Global default must be ready');
+  if (imageName) assert.equal(image.name, imageName, 'Warm HOME tests must use the global default image');
+  const selection = { imageId: image.id, imageVersionId: version.id, image: version.image ?? version.source };
 
   const inspectBox = async (project, { active = true } = {}) => {
     const box = await readJSON(['get', 'cellboxes.cellbox.local', `cellbox-${project.sandbox.id}`]);
@@ -47,7 +45,14 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
   };
 
   const eligibleCandidates = async box => {
+    const configured = await readJSON(['get', 'configmap', 'cellbox-warm-default']);
+    const targets = Object.values(configured.data ?? {}).map(value => JSON.parse(value));
+    assert(targets.some(target => target.nodeName === box.spec.nodeName && target.image === selection.image), 'Warm target differs from the global default');
     const pods = await readJSON(['get', 'pods', '-l', `${warmLabel}=true`]);
+    for (const pod of pods.items) {
+      if (pod.spec.nodeSelector?.['kubernetes.io/hostname'] !== box.spec.nodeName || pod.metadata.deletionTimestamp || pod.metadata.ownerReferences?.some(ref => ref.controller)) continue;
+      assert.equal(pod.spec.containers[0].image, selection.image, 'A nondefault image occupies the unclaimed warm pool');
+    }
     const now = Date.now();
     return pods.items.filter(pod => {
       const ageMs = now - Date.parse(pod.metadata.creationTimestamp);

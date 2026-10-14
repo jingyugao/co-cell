@@ -7,7 +7,9 @@ test('subagent read failures retry after readiness and clear the warning on succ
     reads++;
     await route.fulfill(reads === 1 ? { status: 503, json: { error: 'Sandbox 正忙，请稍后重试' } } : { json: [] });
   });
-  await page.goto('/sessions/old-session');
+  // Start observing the transient warning before the full-page load can outlast
+  // the retry interval (for example, on a cold Vite dependency cache).
+  await page.goto('/sessions/old-session', { waitUntil: 'domcontentloaded' });
   const warning = page.getByText('子代理对话暂时无法加载，正在自动重试。', { exact: true });
   await expect(warning).toBeVisible();
   await expect.poll(() => reads).toBe(2);

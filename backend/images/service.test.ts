@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { CellboxClient, type CellboxOperation, type CellboxImportedImage } from '../../packages/sandbox/src/providers/cellbox/client.js';
+import type { DefaultImageSelection } from '../../protocol/image-types.js';
 import type { ImageRecord } from './store.js';
 import { ImageCatalog } from './service.js';
 import { installImageRoutes } from './routes.js';
@@ -17,16 +19,35 @@ function fixture() {
   const operations = new Map<string, CellboxOperation>();
   const submissions: Array<{ key: string; body: Record<string, unknown> }> = [];
   const deletions: string[] = [];
+  const warmRequests: Array<Record<string, unknown>> = [];
+  const defaultSaves: Array<DefaultImageSelection | undefined> = [];
   const projects: Project[] = [];
   const upstream = new Map(['v1', 'v2', 'v3', 'latest'].map((tag, i) => [tag, `sha256:${String(i + 1).repeat(64)}`]));
   let loseResponse = false;
   let rejectDeletion = false;
+  let rejectWarmDefault = false;
+  let rejectDefaultSave = false;
+  let defaultImage: DefaultImageSelection | undefined;
   const store = { listImages: async () => structuredClone([...documents.values()]),
-    saveImage: async (image: ImageRecord) => { documents.set(image.id, structuredClone(image)); } };
+    saveImage: async (image: ImageRecord) => { documents.set(image.id, structuredClone(image)); },
+    loadDefaultImage: async () => structuredClone(defaultImage),
+    saveDefaultImage: async (selection: DefaultImageSelection | undefined, image?: ImageRecord) => {
+      if (rejectDefaultSave) throw new Error('default metadata unavailable');
+      if (image) documents.set(image.id, structuredClone(image));
+      defaultImage = structuredClone(selection);
+      defaultSaves.push(structuredClone(selection));
+    } };
   const client = new CellboxClient({ baseUrl: 'http://cellbox.test', fetch: async (input, init) => {
     const path = new URL(String(input)).pathname;
     const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200 });
     if (path === '/v1/profiles') return json([{ id: 'cocell', image: 'registry/default@sha256:default' }]);
+    if (path === '/v1/profiles/cocell/warm-default' && init?.method === 'PUT') {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      warmRequests.push(body);
+      if (rejectWarmDefault) return new Response(JSON.stringify({ error: { code: 'UNAVAILABLE', message: 'warm pool unavailable' } }), { status: 503 });
+      const importedImageId = body.importedImageId as string | undefined;
+      return json({ image: importedImageId ? images.get(importedImageId)?.image ?? 'registry/prepared@sha256:missing' : 'registry/default@sha256:default' });
+    }
     if (path === '/v1/images:import') {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       const key = new Headers(init?.headers).get('Idempotency-Key')!;
@@ -64,12 +85,35 @@ function fixture() {
   function finish(operationId: string, source: string) {
     const operation = operations.get(operationId)!;
     operation.status = 'succeeded'; operation.result = { importedImageId: operationId };
-    images.set(operationId, { id: operationId, source, resolvedSource: `${source}@sha256:source`, image: `registry/prepared@sha256:${operationId}`,
+    const imageDigest = createHash('sha256').update(operationId).digest('hex');
+    images.set(operationId, { id: operationId, source, resolvedSource: `${source}@sha256:source`, image: `registry/prepared@sha256:${imageDigest}`,
       platform: 'linux/amd64', command: ['/usr/local/bin/node', '/opt/product/cocell/launcher.mjs'], env: {}, workingDir: '/home/agent/workspace',
       ports: [], warnings: ['runs as agent'], key: operationId, createdAt: new Date().toISOString() });
   }
-  return { catalog, documents, submissions, deletions, projects, operations, images, upstream, finish,
-    rejectDeletion: (reject: boolean) => { rejectDeletion = reject; }, loseResponse: () => { loseResponse = true; } };
+  return { catalog, documents, submissions, deletions, warmRequests, defaultSaves, projects, operations, images, upstream, finish,
+    rejectDeletion: (reject: boolean) => { rejectDeletion = reject; }, loseResponse: () => { loseResponse = true; },
+    rejectWarmDefault: (reject: boolean) => { rejectWarmDefault = reject; },
+    rejectDefaultSave: (reject: boolean) => { rejectDefaultSave = reject; },
+    setDefaultImage: (selection: DefaultImageSelection | undefined) => { defaultImage = structuredClone(selection); } };
+}
+
+async function completeSync(f: ReturnType<typeof fixture>, catalog: ImageCatalog, imageId: string, tag: string, auth?: { username: string; password: string }) {
+  const result = await catalog.sync(imageId, { tag, ...(auth ? { registryAuth: auth } : {}) });
+  const version = result.versions[0];
+  f.finish(version.operationId!, version.source);
+  await catalog.list();
+  return version;
+}
+
+function emulatePreFingerprintVersion(f: ReturnType<typeof fixture>, imageId: string, versionId: string) {
+  const record = f.documents.get(imageId)!;
+  const version = record.versions.find(value => value.id === versionId)!;
+  // Older records retained the exact Cellbox request but had no desired-request fingerprint.
+  // A stale platform packaging script simulates the previous CoCell payload.
+  version.request.buildCommand = 'old platform payload without the current native tooling';
+  delete version.preparationKey;
+  f.documents.set(imageId, structuredClone(record));
+  return structuredClone(version);
 }
 
 test('image catalog refreshes durable records under a shared lock and shares live restore reservations', async () => {
@@ -199,6 +243,200 @@ test('an upstream tag update creates a new pinned revision without changing exis
   const restarted = f.catalog(); await restarted.init();
   assert.deepEqual(await restarted.resolve(repo.id, original.id), selection);
   assert.notEqual((await restarted.resolve(repo.id, updated.versions[0].id))?.image, selection?.image);
+});
+
+test('global default persists across restart, marks one version, and updates warm target', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const profile = (await catalog.list()).find(image => image.origin === 'profile')!;
+  assert.equal(profile.versions[0].isDefault, true, 'profile image is the fallback before a global choice exists');
+  const repo = await catalog.addRepository({ name: 'Doris', category: '数据库', repository: 'team/doris' });
+  const first = await completeSync(f, catalog, repo.id, 'v1');
+  const second = await completeSync(f, catalog, repo.id, 'v2');
+  const secondSelection = (await catalog.resolve(repo.id, second.id))!;
+
+  const selected = await catalog.setDefault(repo.id, second.id);
+  assert.equal(selected.versions.find(version => version.id === second.id)?.isDefault, true);
+  assert.equal(selected.versions.find(version => version.id === first.id)?.isDefault, false);
+  assert.deepEqual(f.defaultSaves.at(-1), { imageId: repo.id, versionId: second.id });
+  assert.equal(f.warmRequests.at(-1)?.importedImageId, secondSelection.importedImageId);
+  await assert.rejects(catalog.setDeprecated(repo.id, second.id, true), /先设置其他默认镜像/);
+  await assert.rejects(catalog.removeVersion(repo.id, second.id), /当前默认镜像/);
+
+  const restarted = f.catalog(); await restarted.init();
+  const listed = (await restarted.list()).flatMap(image => image.versions.filter(version => version.isDefault));
+  assert.deepEqual(listed.map(version => [version.id, version.importedImageId]), [[second.id, secondSelection.importedImageId]]);
+  assert.equal(f.warmRequests.at(-1)?.importedImageId, secondSelection.importedImageId, 'restart reconciles Cellbox to the persisted selection');
+  const reservation = await restarted.acquireDefaultSelection();
+  assert.deepEqual(reservation.selection, secondSelection);
+  await reservation.release();
+});
+
+test('changing the global default affects new projects while existing selections stay pinned', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repoA = await catalog.addRepository({ name: 'MySQL', category: '数据库', repository: 'team/mysql' });
+  const repoB = await catalog.addRepository({ name: 'K8s', category: '集群', repository: 'team/k8s' });
+  const mysql = await completeSync(f, catalog, repoA.id, 'v1');
+  const k8s = await completeSync(f, catalog, repoB.id, 'v1');
+  await catalog.setDefault(repoA.id, mysql.id);
+  const existingPin = await catalog.acquireDefaultSelection();
+  assert.equal(existingPin.selection?.imageId, repoA.id);
+  assert.equal(existingPin.selection?.versionId, mysql.id);
+
+  await catalog.setDefault(repoB.id, k8s.id);
+  const newPin = await catalog.acquireDefaultSelection();
+  assert.equal(existingPin.selection?.imageId, repoA.id, 'an acquired selection remains immutable after the default changes');
+  assert.equal(newPin.selection?.imageId, repoB.id);
+  const defaults = (await catalog.list()).flatMap(image => image.versions.filter(version => version.isDefault));
+  assert.deepEqual(defaults.map(version => version.id), [k8s.id], 'only one version across all repositories is default');
+  await existingPin.release(); await newPin.release();
+});
+
+test('invalid, failed, and deprecated versions cannot become the global default', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
+  const failed = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0];
+  const failedOperation = f.operations.get(failed.operationId!)!;
+  failedOperation.status = 'failed'; failedOperation.error = { code: 'BUILD_FAILED', message: 'synthetic failure' };
+  await catalog.list();
+  await assert.rejects(catalog.setDefault(repo.id, failed.id), /已导入成功/);
+  await assert.rejects(catalog.setDefault(repo.id, 'missing-version'), /不存在/);
+
+  const ready = await completeSync(f, catalog, repo.id, 'v2');
+  await catalog.setDeprecated(repo.id, ready.id, true);
+  await assert.rejects(catalog.setDefault(repo.id, ready.id), /已弃用/);
+  assert.equal(f.defaultSaves.length, 0, 'rejected candidates do not persist a default');
+  assert.equal(f.warmRequests.filter(body => body.importedImageId).length, 0);
+});
+
+test('warm-default failure leaves global selection and managed metadata unchanged', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'Doris', category: '数据库', repository: 'team/doris' });
+  const version = await completeSync(f, catalog, repo.id, 'v1');
+  const priorRepoDefault = f.documents.get(repo.id)?.defaultVersionId;
+  f.rejectWarmDefault(true);
+  await assert.rejects(catalog.setDefault(repo.id, version.id), /warm pool unavailable/);
+  assert.equal(f.defaultSaves.length, 0);
+  assert.equal(f.documents.get(repo.id)?.defaultVersionId, priorRepoDefault);
+  assert.equal((await catalog.list()).find(image => image.id === repo.id)?.versions.find(value => value.id === version.id)?.isDefault, false);
+});
+
+test('a failed durable default write restores the previous warm target', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
+  const first = await completeSync(f, catalog, repo.id, 'v1');
+  const second = await completeSync(f, catalog, repo.id, 'v2');
+  await catalog.setDefault(repo.id, first.id);
+  f.rejectDefaultSave(true);
+  await assert.rejects(catalog.setDefault(repo.id, second.id), /metadata unavailable/);
+  assert.equal(f.documents.get(repo.id)?.defaultVersionId, first.id);
+  assert.equal(f.warmRequests.at(-1)?.importedImageId, (await catalog.resolve(repo.id, first.id))?.importedImageId);
+  const listed = (await catalog.list()).flatMap(image => image.versions.filter(version => version.isDefault));
+  assert.deepEqual(listed.map(version => version.id), [first.id]);
+});
+
+test('an external default remains visible after adding its repository and can reset to the system image', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const remote: CellboxImportedImage = { id: 'external', source: 'docker.io/team/external:v1', resolvedSource: 'docker.io/team/external@sha256:' + 'a'.repeat(64),
+    image: 'registry/prepared@sha256:' + 'b'.repeat(64), platform: 'linux/amd64', command: ['/usr/local/bin/node', '/opt/product/cocell/launcher.mjs'],
+    workingDir: '/home/agent/workspace', env: {}, ports: [], warnings: [], key: 'external', createdAt: new Date().toISOString() };
+  f.images.set(remote.id, remote);
+  const external = (await catalog.list()).find(image => image.origin === 'cellbox')!;
+  await catalog.setDefault(external.id, remote.id);
+  await catalog.addRepository({ name: 'External', category: '开发', repository: 'team/external' });
+  assert.equal((await catalog.list()).find(image => image.id === external.id)?.versions[0].isDefault, true);
+  await catalog.setDefault('default', 'default');
+  assert.deepEqual(f.warmRequests.at(-1), {});
+  assert.deepEqual((await catalog.list()).flatMap(image => image.versions.filter(version => version.isDefault)).map(version => version.id), ['default']);
+  assert.equal((await catalog.acquireDefaultSelection()).selection, undefined);
+});
+
+test('init preserves an explicit default and requests profile fallback when none is saved', async () => {
+  const f = fixture(); const initial = f.catalog(); await initial.init();
+  assert.deepEqual(f.warmRequests[0], {}, 'no selection restores the profile-configured warm image');
+  const repo = await initial.addRepository({ name: 'MySQL', category: '数据库', repository: 'team/mysql' });
+  const version = await completeSync(f, initial, repo.id, 'v1');
+  const selection = (await initial.resolve(repo.id, version.id))!;
+  await initial.setDefault(repo.id, version.id);
+  f.warmRequests.length = 0;
+
+  const restarted = f.catalog(); await restarted.init();
+  assert.deepEqual(f.warmRequests, [{ importedImageId: selection.importedImageId }]);
+  assert.deepEqual(f.defaultSaves.at(-1), { imageId: repo.id, versionId: version.id }, 'init reconciles Cellbox without rewriting metadata');
+});
+
+test('native packaging refresh reuses an immutable prepared image and skips the operator build script', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const operatorCommand = 'cp /bundled/git /usr/local/bin/git';
+  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox',
+    buildCommand: operatorCommand, registryAuthRequired: true });
+  const auth = { username: 'synthetic-user', password: 'synthetic-password' };
+  const initial = await completeSync(f, catalog, repo.id, 'v1', auth);
+  assert.equal(f.submissions[0].body.registryAuth && (f.submissions[0].body.registryAuth as { password: string }).password, auth.password);
+  const prepared = emulatePreFingerprintVersion(f, repo.id, initial.id);
+
+  const refreshed = await catalog.sync(repo.id, { tag: 'v1', registryAuth: auth });
+  assert.equal(f.submissions.length, 2);
+  assert.equal(f.submissions[1].body.url, prepared.image);
+  assert.equal(f.submissions[1].body.registryAuth, undefined, 'upstream credentials must not reach the internal prepared-image import');
+  assert.doesNotMatch(String(f.submissions[1].body.buildCommand), /cp \/bundled\/git/);
+  assert.match(String(f.submissions[1].body.buildCommand), /launcher\.mjs/);
+  assert.doesNotMatch(JSON.stringify(refreshed), /preparationKey/);
+});
+
+test('retry after a failed repackaging sync reuses the earlier successful prepared image', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox',
+    buildCommand: 'cp /bundled/git /usr/local/bin/git' });
+  const initial = await completeSync(f, catalog, repo.id, 'v1');
+  const prepared = emulatePreFingerprintVersion(f, repo.id, initial.id);
+
+  const failed = await catalog.sync(repo.id, { tag: 'v1' });
+  const failedOperation = f.operations.get(failed.versions[0].operationId!)!;
+  failedOperation.status = 'failed'; failedOperation.error = { code: 'BUILD_FAILED', message: 'Cellbox unavailable' };
+  await catalog.list();
+  const retry = await catalog.sync(repo.id, { tag: 'v1' });
+  assert.equal(f.submissions.length, 3);
+  assert.equal(f.submissions[1].body.url, prepared.image);
+  assert.equal(f.submissions[2].body.url, prepared.image);
+  assert.equal(f.submissions[2].body.registryAuth, undefined);
+  assert.equal(retry.versions[0].status, 'running');
+});
+
+test('successful repackaging remains idempotent for the same source digest and operator command', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox',
+    buildCommand: 'cp /bundled/git /usr/local/bin/git' });
+  const initial = await completeSync(f, catalog, repo.id, 'v1');
+  emulatePreFingerprintVersion(f, repo.id, initial.id);
+
+  const repackaged = await completeSync(f, catalog, repo.id, 'v1');
+  assert.equal(f.submissions.length, 2);
+  const repeated = await catalog.sync(repo.id, { tag: 'v1' });
+  assert.equal(f.submissions.length, 2, 'an identical successful desired package must not start another import');
+  assert.equal(repeated.versions[0].id, repackaged.id);
+});
+
+test('changed upstream digest or operator build command forces a fresh upstream build', async () => {
+  const f = fixture(); const catalog = f.catalog(); await catalog.init();
+  const initialCommand = 'cp /bundled/git /usr/local/bin/git';
+  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox', buildCommand: initialCommand });
+  await completeSync(f, catalog, repo.id, 'v1');
+
+  const changedDigest = `sha256:${'b'.repeat(64)}`;
+  f.upstream.set('v1', changedDigest);
+  const sourceUpdate = await catalog.sync(repo.id, { tag: 'v1' });
+  assert.equal(f.submissions[1].body.url, `docker.io/team/mybox@${changedDigest}`);
+  assert.match(String(f.submissions[1].body.buildCommand), /cp \/bundled\/git/);
+  f.finish(sourceUpdate.versions[0].operationId!, sourceUpdate.versions[0].source);
+  await catalog.list();
+
+  const record = f.documents.get(repo.id)!;
+  record.buildCommand = 'echo changed-operator-command';
+  f.documents.set(repo.id, structuredClone(record));
+  const commandUpdate = await catalog.sync(repo.id, { tag: 'v1' });
+  assert.equal(f.submissions[2].body.url, `docker.io/team/mybox@${changedDigest}`);
+  assert.match(String(f.submissions[2].body.buildCommand), /echo changed-operator-command/);
+  assert.equal(commandUpdate.versions[0].status, 'running');
 });
 
 test('uncertain submission survives restart and retries the same request and key', async () => {
@@ -389,6 +627,7 @@ test('sync rebuilds unchanged upstream content when the platform tool installati
   await catalog.list();
   const saved = f.documents.get(repo.id)!;
   saved.versions[0].request.buildCommand = 'old launcher without proxies';
+  delete saved.versions[0].preparationKey;
   const restarted = f.catalog(); await restarted.init();
   const rebuilt = await restarted.sync(repo.id, { tag: 'v1' });
   assert.equal(rebuilt.versions.length, 2);

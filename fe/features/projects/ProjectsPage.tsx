@@ -93,6 +93,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
   const [showToolGrants, setShowToolGrants] = useState(false);
   const [error, setError] = useState('');
   const pending = useRef(false);
+  const [idCopyStatus, setIdCopyStatus] = useState('');
   const [chooseRestoreVersion, setChooseRestoreVersion] = useState(false);
   const [restoreVersionId, setRestoreVersionId] = useState('');
   const status = project.status ?? (project.archivedAt ? 'archived' : 'active');
@@ -113,16 +114,22 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
     && ['unavailable', 'ready'].includes(project.sandbox!.status) && !sandboxNormal;
   const sandboxMissing = project.executionMode === 'sandbox' && !project.sandbox;
   const latestImage = project.imageSelection ? { reference: project.imageSelection.image, id: project.imageSelection.image, repoDigests: [] } : config?.sandbox?.imageIdentity;
-  const canRestore = project.executionMode === 'sandbox' && ((archived && Boolean(backup)) || (!archived && sandboxBroken)) && !hasTask && !operating;
+  const canRestore = project.executionMode === 'sandbox' && ((archived && Boolean(backup)) || (!archived && sandboxBroken)) && !project.archiveCleanupSourceId && !hasTask && !operating;
   const archiveRetry = (operation?.kind === 'archive' && operation.status === 'failed')
-    || Boolean(project.archiveCleanupSourceId) || (archived && Boolean(project.pendingSandboxCleanup?.length));
-  const archiveNeedsExistingBackup = !archived && !project.archiveCleanupSourceId
-    && !['ready', 'paused'].includes(project.sandbox?.status ?? '');
-  const archiveDisabled = busy || operating || hasTask || sandboxBackup?.status === 'running'
-    || (project.sandbox?.status === 'starting' && !project.archiveCleanupSourceId)
-    || (archiveNeedsExistingBackup && !backup);
+    || Boolean(project.archiveCleanupSourceId) || (archived && (Boolean(project.pendingSandboxCleanup?.length) || Boolean(operation?.cleanupError)));
+  const archiveRetryCleanup = archived || Boolean(project.archiveCleanupSourceId);
+  const archiveHasDiskSource = Boolean(project.sandbox);
+  const archiveBaseDisabled = busy || operating || hasTask || sandboxBackup?.status === 'running'
+    || (project.sandbox?.status === 'starting' && !project.archiveCleanupSourceId);
+  const archiveDisabled = archiveBaseDisabled || (!archiveRetryCleanup && !archiveHasDiskSource);
+  const canUseExistingBackup = !archived && !project.archiveCleanupSourceId && Boolean(backup);
   const typeLabel = projectTypeLabel(project.type, project.weekOf);
   const displayName = projectDisplayName(project);
+
+  async function copyProjectId() {
+    try { await navigator.clipboard.writeText(project.id); setIdCopyStatus('已复制完整 ID'); }
+    catch { setIdCopyStatus(`复制失败，完整 ID：${project.id}`); }
+  }
 
   async function run(label: string, action: () => Promise<ProjectSummary>) {
     if (busy || operating) return;
@@ -147,16 +154,16 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
     if (!window.confirm(message)) return;
     void run(action, () => onRebuildSandbox(project.id, archived && restoreVersionId ? restoreVersionId : undefined));
   }
-  function archive() {
-    if (archiveDisabled || pending.current) return;
-    const message = project.archiveCleanupSourceId || archived
-      ? '将继续清理归档遗留的 Sandbox 和缓存，保留已成功备份的数据。确认重试归档？'
-      : archiveNeedsExistingBackup
-        ? `当前环境无法生成新备份。将使用 ${date(backup!.createdAt)} 的最新成功备份归档；该时间之后未备份的数据不会保存。归档会删除 Sandbox，其运行进程将结束。确认归档？`
-        : '将备份最新磁盘文件并归档项目，然后删除 Sandbox。暂停中的项目不会恢复运行；归档后再次使用会从备份创建新环境，运行进程需要重新启动。确认归档？';
+  function archive(useExistingBackup = false) {
+    if ((useExistingBackup ? archiveBaseDisabled : archiveDisabled) || pending.current) return;
+    const message = archiveRetryCleanup
+      ? '项目已归档。将继续清理 Sandbox 和缓存，不会重新备份磁盘。确认重试清理？'
+      : useExistingBackup
+        ? `将使用 ${date(backup!.createdAt)} 的已有备份归档；该时间之后未备份的数据不会保存。归档会删除 Sandbox，其运行进程将结束。确认归档？`
+        : '将停止 Sandbox 并备份最新持久化磁盘文件，然后归档项目并清理环境。运行中的进程不会保存，之后恢复项目时需要重新启动。确认归档？';
     if (!window.confirm(message)) return;
     pending.current = true;
-    void run('归档', () => onArchiveProject(project.id, archiveNeedsExistingBackup ? { useExistingBackup: true } : {}))
+    void run(archiveRetryCleanup ? '清理归档环境' : '归档', () => onArchiveProject(project.id, useExistingBackup ? { useExistingBackup: true } : {}))
       .finally(() => { pending.current = false; });
   }
   const openDisabled = !canEnterProject(project);
@@ -172,6 +179,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
   return <article className={`project-card ${archived ? 'archived' : ''}`} aria-label={displayName}>
     <div className="project-card-heading"><span className="project-folder" aria-hidden="true">▱</span><div className="project-card-statuses"><span className="project-type-badge">{typeLabel}</span>{archived && <span className="project-archived-badge">已归档</span>}<span className={`project-status ${project.activeSessionId ? 'active' : ''}`}>{project.activeSessionId ? '任务执行中' : project.executionMode === 'local' ? '本地项目' : operating ? operation.phase : project.sandbox ? states[project.sandbox.status] : '无 Sandbox'}</span></div></div>
     <h2>{openDisabled ? <span className="project-title-disabled">{displayName}</span> : <button className="project-title-button" onClick={() => onOpenProject(project.id)}>{displayName}</button>}</h2>
+    <div className="project-card-id"><span>项目 ID</span><button type="button" title={project.id} aria-label={`复制项目完整 ID ${project.id}`} onClick={() => void copyProjectId()}><code>{project.id.slice(0, 8)}</code></button>{idCopyStatus && <span role="status">{idCopyStatus}</span>}</div>
     {project.requirementUrl && /^https?:\/\//i.test(project.requirementUrl) ? <div className="project-requirement-wrap"><a className="project-requirement" href={project.requirementUrl} target="_blank" rel="noopener noreferrer" title={project.requirementUrl}>飞书需求 ↗<span>{project.requirementUrl}</span></a>{project.requirementStatus && <p className="project-requirement-status"><span>飞书项目状态</span><strong>{project.requirementStatus}</strong></p>}</div> : project.type === 2 ? <p className="project-unlinked">飞书需求待绑定</p> : <p className="project-unlinked">{typeLabel}</p>}
       <dl className="project-details"><div><dt>项目镜像</dt><dd>{project.imageSelection ? `${project.imageSelection.imageName} · ${project.imageSelection.version}` : '系统默认镜像'}</dd></div><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>最新备份</dt><dd>{backup ? onViewBackup && project.archiveVersions?.length ? <ArchiveVersionBadge project={project} onView={onViewBackup} /> : <time dateTime={backup.createdAt} title={date(backup.createdAt)}>{backupDate(backup.createdAt)}</time> : '暂无备份'}</dd></div><div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div></dl>
     <div className="project-action-groups">
@@ -179,8 +187,11 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
         <h3>项目操作</h3>
         <div className="project-card-actions">
           <button className="secondary-button" onClick={() => setShowToolGrants(true)}>工具权限</button>
-          {project.executionMode === 'sandbox' && (!archived || archiveRetry) && <button className="secondary-button" disabled={archiveDisabled} onClick={archive}>{archiveRetry ? '重试归档' : '手动归档'}</button>}
-          {archived && backup ? <button className="primary-button" disabled={busy || operating || hasTask} onClick={restore}>恢复项目</button>
+          {project.executionMode === 'sandbox' && (!archived || archiveRetry) && <>
+            <button className="secondary-button" disabled={archiveDisabled} onClick={() => archive()}>{archiveRetryCleanup ? '重试清理' : archiveRetry ? '重试归档' : '手动归档'}</button>
+            {canUseExistingBackup && <button className="secondary-button" disabled={archiveBaseDisabled} onClick={() => archive(true)}>使用已有备份归档</button>}
+          </>}
+          {archived && backup ? <button className="primary-button" disabled={busy || operating || hasTask || Boolean(project.archiveCleanupSourceId)} onClick={restore}>恢复项目</button>
             : archived ? <span className="project-action-note">暂无可恢复备份</span>
             : <button className="primary-button" disabled={openDisabled} onClick={() => onOpenProject(project.id)}>进入项目 <span aria-hidden="true">→</span></button>}
           {!archived && <button className="project-archive-button" disabled={busy || operating} title={completed ? '恢复为使用中，才能继续对话' : '完成满 1 天后自动归档'} onClick={() => void changeStatus()}>{busy ? '处理中…' : completed ? '恢复使用中' : '标记已完成'}</button>}
@@ -206,10 +217,12 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
       {project.imageSelection && <><button className="secondary-button" disabled={busy || operating} onClick={() => setChooseRestoreVersion(value => !value)}>选择恢复版本</button>
         {chooseRestoreVersion && <RestoreVersionPicker imageId={project.imageSelection.imageId} disabled={busy || operating} value={restoreVersionId} onChange={setRestoreVersionId} />}</>}
     </div>}
-    {cleanupPending && !operating && <p className="project-rebuild-hint" role="status">旧环境待清理，系统将自动重试。</p>}
+    {archived && operation?.kind === 'archive' && operation.cleanupError
+      ? <p className="project-operation" role="status"><strong>已归档，环境清理待重试</strong><span>{operation.cleanupError}</span></p>
+      : cleanupPending && !operating && <p className="project-rebuild-hint" role="status">旧环境待清理，系统将自动重试。</p>}
     {!operation && sandboxMissing && backup && <p className="project-rebuild-hint">当前没有 Sandbox 引用，无法沿用挂载目录重建。</p>}
     {error && <p className="project-error" role="alert">{error}</p>}
-    {archiveNeedsExistingBackup && !backup && !operating && project.executionMode === 'sandbox' && <p className="project-rebuild-hint">当前环境无法生成新备份，且没有成功备份；请先恢复环境并备份后再归档。</p>}
+    {!archiveHasDiskSource && !backup && !archived && !operating && project.executionMode === 'sandbox' && <p className="project-rebuild-hint">当前没有可读取的磁盘，也没有成功备份，暂时无法归档。</p>}
     {showToolGrants && <ProjectToolGrants projectId={project.id} name={displayName} onClose={() => setShowToolGrants(false)} />}
   </article>;
 }
@@ -230,7 +243,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
   const completedCount = projects.filter(project => projectStatus(project) === 'completed').length;
   const archivedCount = projects.filter(project => projectStatus(project) === 'archived').length;
   const inView = projects.filter(project => projectStatus(project) === view);
-  const visible = inView.filter(project => `${project.name} ${project.requirementUrl ?? ''} ${project.sandbox?.id ?? ''}`.toLowerCase().includes(query.trim().toLowerCase()));
+  const visible = inView.filter(project => `${project.id} ${project.name} ${project.requirementUrl ?? ''} ${project.sandbox?.id ?? ''}`.toLowerCase().includes(query.trim().toLowerCase()));
   const archivedGroups = view === 'archived' ? groupArchivedProjectsByWeek(visible) : [];
   const canCreate = config?.sandbox?.enabled === true;
   const stopCreating = () => { setCreating(false); setTimeout(() => createButton.current?.focus(), 0); };
@@ -248,7 +261,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
     activeTab.current?.focus();
   }} />;
 
-  const empty = <div className="projects-empty"><span aria-hidden="true">▱</span><h2>{query.trim() && inView.length ? '没有匹配的项目' : view === 'archived' ? '还没有归档项目' : view === 'completed' ? '还没有已完成项目' : projects.length ? '暂无使用中的项目' : '从一个项目开始'}</h2><p>{query.trim() && inView.length ? '试试其他项目名称、需求链接或 Sandbox ID。' : view === 'archived' ? '归档项目会按周显示；恢复时使用最新成功备份创建环境。' : view === 'completed' ? '已完成项目不能继续对话；恢复为使用中后才可继续。' : '先创建项目，再开启会话。飞书需求可以稍后关联。'}</p>{view === 'active' && !inView.length && canCreate && !creating && <button className="primary-button" onClick={() => setCreating(true)}>{projects.length ? '创建项目' : '创建第一个项目'}</button>}</div>;
+  const empty = <div className="projects-empty"><span aria-hidden="true">▱</span><h2>{query.trim() && inView.length ? '没有匹配的项目' : view === 'archived' ? '还没有归档项目' : view === 'completed' ? '还没有已完成项目' : projects.length ? '暂无使用中的项目' : '从一个项目开始'}</h2><p>{query.trim() && inView.length ? '试试其他项目名称、项目 ID、需求链接或 Sandbox ID。' : view === 'archived' ? '归档项目会按周显示；恢复时使用最新成功备份创建环境。' : view === 'completed' ? '已完成项目不能继续对话；恢复为使用中后才可继续。' : '先创建项目，再开启会话。飞书需求可以稍后关联。'}</p>{view === 'active' && !inView.length && canCreate && !creating && <button className="primary-button" onClick={() => setCreating(true)}>{projects.length ? '创建项目' : '创建第一个项目'}</button>}</div>;
 
   return <main className="main-pane projects-page">
     <header className="topbar"><button className="icon-button mobile-only" aria-label="打开导航" onClick={onMenu}>☰</button><div className="breadcrumbs"><span>工作空间</span><span className="slash">/</span><strong>项目</strong></div><button className="secondary-button" onClick={onBack}>返回对话</button></header>
@@ -261,7 +274,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
         try { const project = await onCreate(values); setCreating(false); onOpenProject(project.id); }
         finally { setBusy(false); }
       }} /></section>}
-      <div className="projects-toolbar"><div className="project-tabs" role="group" aria-label="项目状态"><button ref={activeTab} className={view === 'active' ? 'selected' : ''} aria-pressed={view === 'active'} onClick={() => setView('active')}>使用中 <span>{activeCount}</span></button><button className={view === 'completed' ? 'selected' : ''} aria-pressed={view === 'completed'} onClick={() => setView('completed')}>已完成 <span>{completedCount}</span></button><button ref={archivedTab} className={view === 'archived' ? 'selected' : ''} aria-pressed={view === 'archived'} onClick={() => setView('archived')}>归档 <span>{archivedCount}</span></button></div><div><input aria-label="搜索项目" placeholder="搜索项目、需求链接或 Sandbox" value={query} onChange={event => setQuery(event.target.value)} /><button className="secondary-button" disabled={loading} onClick={async () => { setError(''); try { await onRefresh(); } catch (err) { setError(err instanceof Error ? err.message : '刷新失败，请重试。'); } }}>{loading ? '刷新中…' : '刷新'}</button></div></div>
+      <div className="projects-toolbar"><div className="project-tabs" role="group" aria-label="项目状态"><button ref={activeTab} className={view === 'active' ? 'selected' : ''} aria-pressed={view === 'active'} onClick={() => setView('active')}>使用中 <span>{activeCount}</span></button><button className={view === 'completed' ? 'selected' : ''} aria-pressed={view === 'completed'} onClick={() => setView('completed')}>已完成 <span>{completedCount}</span></button><button ref={archivedTab} className={view === 'archived' ? 'selected' : ''} aria-pressed={view === 'archived'} onClick={() => setView('archived')}>归档 <span>{archivedCount}</span></button></div><div><input aria-label="搜索项目" placeholder="搜索名称、项目 ID 或 Sandbox" value={query} onChange={event => setQuery(event.target.value)} /><button className="secondary-button" disabled={loading} onClick={async () => { setError(''); try { await onRefresh(); } catch (err) { setError(err instanceof Error ? err.message : '刷新失败，请重试。'); } }}>{loading ? '刷新中…' : '刷新'}</button></div></div>
       <p className="projects-archive-hint">{view === 'archived' ? '按归档日期每周一组。恢复会创建新的 Sandbox。' : view === 'completed' ? '已完成项目必须恢复为使用中，才能继续对话。' : '可将项目标记为已完成；满 1 天后系统会归档并删除其 Sandbox。'}</p>
       {!projects.length && loading ? <section className="project-grid" aria-busy="true"><div className="projects-empty" role="status"><span className="spinner" /> 正在读取项目…</div></section>
         : !visible.length ? <section className="project-grid">{empty}</section>

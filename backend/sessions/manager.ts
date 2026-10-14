@@ -63,6 +63,7 @@ function normalizeExecutionSettings(settings: Settings): Settings {
 }
 
 export interface SandboxLifecycleOptions {
+  onProjectCreate?: (projectId: string) => Promise<void>;
   archivedReclaimAfterMs?: number;
   autoCheckpointAfterMs?: number;
   scanIntervalMs?: number;
@@ -115,7 +116,7 @@ export class SessionManager {
   ) {
     this.autoCheckpointAfterMs = lifecycleOptions.autoCheckpointAfterMs ?? 60 * 60 * 1000;
     this.notifications = notifications;
-    this.projects = new ProjectService(state, undefined, undefined, Boolean(coordinator));
+    this.projects = new ProjectService(state, undefined, undefined, Boolean(coordinator), lifecycleOptions.onProjectCreate);
     if (sandbox) {
       this.sandboxOperations = new ProjectSandboxOperations({
         projects: this.projects, runtime: sandbox,

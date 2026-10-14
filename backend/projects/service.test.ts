@@ -385,3 +385,18 @@ test('Feishu projects require a requirement link', async () => {
   await service.init();
   await assert.rejects(service.create({ name: 'missing requirement', type: 2 }, { workingDirectory: '/tmp' } as Settings), /必须绑定飞书需求/);
 });
+
+test('new project role initialization completes before creation returns and rolls back failed initialization', async () => {
+  const state = new MemoryState([]);
+  const initialized: string[] = [];
+  const projects = new ProjectService(state, undefined, undefined, false, async id => {
+    assert.ok(await state.getProject(id));
+    initialized.push(id);
+  });
+  const created = await projects.create({ name: 'Role project' }, { workingDirectory: '/tmp', executionMode: 'local' } as Settings);
+  assert.deepEqual(initialized, [created.id]);
+  const failed = new ProjectService(state, undefined, undefined, false, async () => { throw new Error('Role store unavailable'); });
+  await assert.rejects(failed.create({ name: 'Failed' }, { workingDirectory: '/tmp', executionMode: 'local' } as Settings), /Role store unavailable/);
+  assert.deepEqual(failed.list(), []);
+  assert.equal((await state.listProjects()).length, 1);
+});

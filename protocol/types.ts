@@ -114,6 +114,8 @@ export interface ProjectSandboxOperation {
   phase: string;
   status: 'running' | 'failed' | 'succeeded';
   error?: string;
+  /** Archive is durable; reclaiming the old runtime or cache can be retried independently. */
+  cleanupError?: string;
   durationMs?: number;
   scannedBytes?: number;
   addedBytes?: number;
@@ -154,7 +156,7 @@ export interface Project {
   completedAt?: string | null;
   imageSelection?: ProjectImageSelection;
   sandbox?: SandboxState;
-  /** Timestamp at which project archiving removed the previous sandbox. */
+  /** Timestamp at which archiving released the project's Sandbox binding. */
   sandboxReclaimedAt?: string;
   /** Confirmed runtime and Cellbox artifact cleanup; absent on legacy archives awaiting reconciliation. */
   sandboxArtifactsCleanedAt?: string;
@@ -167,7 +169,7 @@ export interface Project {
   sandboxBackup?: ProjectSandboxBackup;
   /** Uncommitted replacement containers and retired containers awaiting cleanup. */
   pendingSandboxCleanup?: SandboxState[];
-  /** Verified archive source awaiting deletion and archive finalization; survives retries/restarts. */
+  /** Verified archive source awaiting cleanup; survives retries/restarts after archiving. */
   archiveCleanupSourceId?: string;
   archivedAt?: string | null;
   lifecycleHistory?: ProjectLifecycleRecord[];

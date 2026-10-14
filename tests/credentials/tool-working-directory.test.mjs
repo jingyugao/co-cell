@@ -64,16 +64,7 @@ test('Git cache initialization and native Go VCS builds retain the caller direct
     const childDirectory = join(repo, 'nested'); await mkdir(childDirectory);
     const childInvocation = await decodeWorkingDirectory('git', encodeWorkingDirectory('git', ['status'], childDirectory), home);
     assert.equal(childInvocation.gitEnv.GIT_CONFIG_VALUE_0, repo);
-    for (const format of ['text', 'files']) {
-      output = '';
-      const path = '.gitconfig';
-      const content = format === 'text' ? '[user]\nname=Test\n' : JSON.stringify({ files: [{ path, content: '[user]\nname=Test\n' }] });
-      assert.equal(await runProtectedTool('git', encodeWorkingDirectory('git', ['rev-parse', '--show-toplevel'], childDirectory), {
-        ...options, tempRoot: join(root, 'legacy', format), config: { mode: 'files', generation: 1, url: config.url,
-          files: [{ tool: 'git', path, format, secretId: 'git', version: 1, mutable: false, content: Buffer.from(content).toString('base64') }] },
-      }), 0);
-      assert.equal(output.trim(), repo);
-    }
+    assert.equal(await git(childDirectory, ['rev-parse', '--show-toplevel']), repo);
     const proxy = `#!${process.execPath}\n` +
       `import {runProtectedTool} from ${JSON.stringify(new URL('../../deploy/box-wrap/protected-tool.mjs', import.meta.url).href)};\n` +
       `import {encodeWorkingDirectory} from ${JSON.stringify(new URL('../../util/tool-working-directory.mjs', import.meta.url).href)};\n` +

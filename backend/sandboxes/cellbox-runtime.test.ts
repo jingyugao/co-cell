@@ -10,7 +10,6 @@ import type { Socket } from 'node:net';
 import { SandboxLifecycle, type SandboxHandle } from '@co-cell/sandbox';
 import type { CellboxArchive, CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
-import type { ConnectionStore } from '../connections/store.js';
 import type { SecretService } from '../secrets/service.js';
 import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import { CELLBOX_PRODUCT_PATHS, CellboxRuntimeIntegration } from './cellbox-runtime.js';
@@ -116,45 +115,6 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
     counts: () => ({ leaseRenews, leaseReleases }) };
 }
 
-test('setup stays in the agent workspace, writes 0600 startup config, and installs mapped slots only', async () => {
-  const { handle, commands, files } = fakeHandle();
-  const { provider, credentialWrites } = fakeProvider();
-  const connections = { readRuntimeBundle: async () => ({ glabConfig: 'glab-secret', gitConfig: 'git-secret',
-    gitCredentials: 'git-credentials-secret', mysqlLogin: Buffer.from('mysql-secret').toString('base64'),
-    cliFiles: { 'cli/tool': Buffer.from('cli-secret').toString('base64') } }) } as unknown as ConnectionStore;
-  const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: ['--feature', 'x'],
-    env: { COCELL_TEST_MODE: 'yes' }, connections,
-    credentialSlots: { 'glab/config.yml': 'glab_slot', 'cli/tool': 'cli_slot', 'missing': 'unused_slot' } });
-  await runtime.reconcile(target);
-  await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
-  assert(commands.every(call => call.options.user === 'agent'));
-  assert(commands.every(call => !/\b(?:docker|kubectl|mount)\b/.test(call.command)));
-  assert(commands.some(call => call.command.includes('fs.mkdirSync') && call.command.includes(CELLBOX_PRODUCT_PATHS.codexHome)));
-  assert(commands.some(call => call.command.includes('chmod 600 -- ') && call.command.includes(' && mv -- ')));
-  assert(commands.some(call => call.command.includes('Startup config was not consumed')));
-  assert.equal(files.has(`${CELLBOX_PRODUCT_PATHS.startup}/config.json`), false);
-  assert.deepEqual(credentialWrites.map(write => [write.boxId, write.slot, write.bytes.toString()]), [
-    ['box-1', 'glab_slot', 'glab-secret'], ['box-1', 'cli_slot', 'cli-secret'], ['box-1', 'unused_slot', '\n'],
-  ]);
-  await runtime.close();
-});
-
-test('clearing a connection replaces its remote credential without submitting an empty payload', async () => {
-  const { handle } = fakeHandle();
-  const { provider, credentialWrites } = fakeProvider();
-  let glabConfig = 'previous-secret';
-  const connections = { readRuntimeBundle: async () => ({ glabConfig }) } as unknown as ConnectionStore;
-  const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {},
-    connections, credentialSlots: { 'glab/config.yml': 'glab_slot' } });
-  try {
-    await runtime.reconcile(target);
-    glabConfig = '';
-    await runtime.reconcile(target);
-    await runtime.reconcile(target);
-    assert.deepEqual(credentialWrites.map(write => write.bytes.toString()), ['previous-secret', '\n']);
-  } finally { await runtime.close(); }
-});
-
 test('imported images skip credentials, use native archives and restore with the pinned image', async () => {
   const previousEndpoint = process.env.OSS_ENDPOINT;
   process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
@@ -175,7 +135,6 @@ test('imported images skip credentials, use native archives and restore with the
     return { id: 'restore', targetId: 'box-1' } as never;
   };
   const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {},
-    connections: { readRuntimeBundle: async () => { assert.fail('must not read operator credentials for an imported image'); } } as unknown as ConnectionStore,
     credentialSlots: { __ossAccessKey: 'oss_access' } });
   try {
     await runtime.prepare(handle, { ...target, imageSelection }, AbortSignal.timeout(5000));
@@ -340,7 +299,6 @@ test('mounted OSS restore holds startup until extraction completes and provision
   };
   const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {},
     sharedDirectory: true,
-    connections: { readRuntimeBundle: async () => null } as unknown as ConnectionStore,
     credentialSlots: { __ossAccessKey: 'oss_access', __ossSecretKey: 'oss_secret' } });
   try {
     const ref: RemoteArchiveRef = { id: 'oss:archive', createdAt: new Date().toISOString(), sizeBytes: 1,
@@ -463,6 +421,32 @@ test('paused default images capture through Cellbox disk archives without guest 
     assert.equal(archive.id, fake.archive.id);
     assert.equal(captures, 1);
     assert.equal(fake.credentialWrites.length, 0);
+  } finally {
+    await runtime.close();
+    if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;
+  }
+});
+
+for (const status of ['ready', 'unavailable', 'unknown'] as const) test(`${status} disk archive uses the native node API without guest tools`, async () => {
+  const previous = process.env.OSS_ENDPOINT;
+  process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
+  const fake = fakeProvider();
+  fake.provider.client.getBox = async () => ({ capabilities: { diskArchives: true, protectedTools: true } }) as never;
+  fake.provider.client.runTool = async () => { assert.fail('disk archive must not use guest backup tools'); };
+  fake.provider.connectForSetup = async () => { assert.fail('disk archive must not start or prepare the guest'); };
+  fake.provider.captureArchive = async (id, key, options) => {
+    assert.equal(id, target.sandbox.id); assert.equal(key, 'disk-only');
+    assert.deepEqual(options, { diskOnly: true });
+    return { result: { archiveId: fake.archive.id } } as never;
+  };
+  const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {} });
+  try {
+    const archive = await runtime.remoteArchives.capture({ ...target, sandbox: { ...target.sandbox, status } }, 'disk-only', { diskOnly: true });
+    assert.equal(archive.id, fake.archive.id);
+    assert.equal(fake.credentialWrites.length, 0);
+    fake.provider.client.getBox = async () => ({ capabilities: {} }) as never;
+    fake.provider.captureArchive = async () => { assert.fail('old servers or storage layouts must not silently ignore diskOnly'); };
+    await assert.rejects(runtime.remoteArchives.capture(target, 'unsupported-disk', { diskOnly: true }), /不支持独立磁盘归档/);
   } finally {
     await runtime.close();
     if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;

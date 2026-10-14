@@ -6,11 +6,12 @@ export interface CellboxCapabilities {
   pty: boolean; reconnectExec: boolean; freeze: boolean;
   suspend: 'none' | 'same-node-checkpoint'; archives: string; protectedTools: boolean;
   sharedDirectory?: boolean;
-  mountedToolRuntime?: boolean;
   mountedDebugHome?: boolean;
   rootDebug?: boolean;
   credentialBatch?: boolean;
   internalServices?: boolean;
+  /** Stop execution and archive persistent files without a process checkpoint. */
+  diskArchives?: boolean;
 }
 /** Conceptual product matrix; Cellbox currently implements only two combinations. */
 export type CellboxRuntimeKind = 'docker-normal' | 'docker-resumable' | 'k8s-normal' | 'k8s-resumable';
@@ -224,6 +225,9 @@ export class CellboxClient {
   imageUsage(id: string) { return this.request<{ deletable: boolean; blockers: string[]; manifestShared: boolean }>('GET', `/v1/images/${this.id(id)}/usage`); }
   deleteImage(id: string, key: string) { return this.request<CellboxOperation>('DELETE', `/v1/images/${this.id(id)}`, { key }); }
   listProfiles(signal?: AbortSignal) { return this.request<CellboxProfile[]>('GET', '/v1/profiles', { signal }); }
+  setWarmDefaultImage(profileId: string, importedImageId?: string) {
+    return this.request<{ image: string }>('PUT', `/v1/profiles/${this.id(profileId)}/warm-default`, { body: importedImageId ? { importedImageId } : {} });
+  }
   listBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes', { signal }); }
   listResourceBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes?observation=resource', { signal }); }
   listCheckpoints(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/checkpoints', { signal }); }
@@ -325,8 +329,8 @@ export class CellboxClient {
     return this.request<CellboxLease>('PATCH', `/v1/leases/${this.id(id)}`, { body: { purpose, ttlSeconds } });
   }
   releaseLease(id: string) { return this.request<void>('DELETE', `/v1/leases/${this.id(id)}`, { response: 'empty' }); }
-  captureArchive(boxId: string, key: string) {
-    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(boxId)}/archives`, { key });
+  captureArchive(boxId: string, key: string, options?: { diskOnly: boolean }) {
+    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(boxId)}/archives`, { key, ...(options ? { body: options } : {}) });
   }
   listArchives() { return this.request<CellboxArchive[]>('GET', '/v1/archives'); }
   getArchive(id: string) { return this.request<CellboxArchive>('GET', `/v1/archives/${this.id(id)}`); }

@@ -1,5 +1,5 @@
 import { posix } from 'node:path';
-import type { ProjectToolGrant, ProxyTool } from '../../protocol/secret-types.js';
+import type { ProxyTool } from '../../protocol/secret-types.js';
 import { HttpError } from '../../util/errors.js';
 import { TOOL_NAME_PATTERN } from '../../util/tool-secrets.js';
 
@@ -13,17 +13,27 @@ export function credentialPath(path: string) {
     throw new HttpError(400, '认证文件路径必须相对于工具 HOME，不能包含路径跳转');
   return path;
 }
-export function validateToolArgs(tool: ProxyTool, args: string[], _grant: ProjectToolGrant): string[] {
+export function validateToolArgs(tool: ProxyTool, args: string[]): string[] {
   toolName(tool);
   if (args.length > 32 || args.some(arg => arg.includes('\0')) || args.reduce((n, arg) => n + Buffer.byteLength(arg), 0) > 8192)
     throw new HttpError(400, '工具参数超出限制');
   if (tool === 'mysql') {
     const checked = [...args];
+    let loginPath: string | undefined;
+    for (let i = 0; i < checked.length; i++) {
+      const arg = checked[i];
+      if (arg === '--login-path' || arg.startsWith('--login-path=')) {
+        const value = arg === '--login-path' ? checked[i + 1] : arg.slice('--login-path='.length);
+        if (loginPath !== undefined || !value || /[\u0000-\u001f\u007f\[\]]/.test(value)) throw new HttpError(400, 'MySQL 原生连接名称无效');
+        loginPath = value; checked.splice(i, arg === '--login-path' ? 2 : 1); i--;
+      }
+    }
+    if (checked.length === 1 && ['--version', '-V', '--help', '-?'].includes(checked[0])) return [...(loginPath ? [`--login-path=${loginPath}`] : []), ['--help', '-?'].includes(checked[0]) ? '--help' : '--version'];
     if (checked.length !== 2 || !['-e', '--execute'].includes(checked[0]))
-      throw new HttpError(400, '使用 mysql -e SQL 执行所选连接');
+      throw new HttpError(400, '使用 mysql --login-path=名称 -e SQL 执行原生连接');
     // SQL permissions belong to the selected account. Disable local client
     // commands and local-infile transport in the protected credential process.
-    return ['--binary-mode', '--local-infile=0', ...checked];
+    return [...(loginPath ? [`--login-path=${loginPath}`] : []), '--binary-mode', '--local-infile=0', ...checked];
   }
   if (tool === 'kubectl') {
     for (let i = 0; i < args.length; i++) {

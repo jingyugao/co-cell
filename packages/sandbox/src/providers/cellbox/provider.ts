@@ -392,7 +392,7 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     await this.ready();
     return this.wait(await this.client.restoreBox({ profileId: this.profileId, ...input }, key));
   }
-  async captureArchive(id: string, key: string) { return this.wait(await this.client.captureArchive(id, key)); }
+  async captureArchive(id: string, key: string, options?: { diskOnly: boolean }) { return this.wait(await this.client.captureArchive(id, key, options)); }
   async listInventory() {
     const [boxes, checkpoints] = await Promise.all([this.client.listBoxes(), this.client.listCheckpoints()]);
     return { boxes, checkpoints };

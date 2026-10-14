@@ -3,61 +3,38 @@ import { z } from 'zod';
 import type { SecretService } from './service.js';
 import { TOOL_NAME_PATTERN } from '../../util/tool-secrets.js';
 import { HttpError } from '../../util/errors.js';
-import { toolRuntimeBoxId } from '../../util/tool-runtime-identity.mjs';
 const id = z.string().uuid();
-const alias = z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/);
 const tool = z.string().trim().regex(TOOL_NAME_PATTERN);
 const content = z.string().min(1).max(90000);
-const policy = z.object({ namespaces: z.array(z.string().min(1).max(100)).max(100), resources: z.array(z.string().min(1).max(100)).max(100), commandPrefixes: z.array(z.array(z.string().min(1).max(200)).min(1).max(16)).max(100) }).strict();
 const path = z.string().min(1).max(256);
 const fileFields = {
   format: z.enum(['text', 'files']), content: content.optional(),
+  supportFiles: z.array(z.object({ path, content, encoding: z.literal('base64') }).strict()).min(2).max(3).optional(),
   files: z.array(z.object({ path, content: z.string().max(1500000), encoding: z.literal('base64').optional() }).strict()).min(1).max(128).optional(),
   directory: path.optional(),
   adapter: z.literal('meegle').optional(),
   identity: z.object({ hostname: z.string().min(1).max(253), username: z.string().min(1).max(253) }).strict().optional(),
 };
-const grant = z.object({ tool, alias: alias.default('default'), enabled: z.boolean(), files: z.array(z.object({ secretId: id, path }).strict()).length(1), policy: policy.optional() }).strict();
 export function installSecretRoutes(app: Hono, secrets: SecretService, projectExists: (id: string) => boolean) {
   const project = (value: string) => { id.parse(value); if (!projectExists(value)) throw new HttpError(404, '项目不存在'); return value; };
+  const roleInput = z.object({ name: z.string().trim().min(1).max(100), connections: z.array(z.object({ tool, secretId: id }).strict()).max(256) }).strict();
+  const assignment = z.object({ roleId: id.nullable() }).strict();
+  app.get('/api/tool-roles', async c => c.json(await secrets.roles.catalog()));
+  app.post('/api/tool-roles', async c => c.json(await secrets.roles.save(roleInput.parse(await c.req.json())), 201));
+  app.put('/api/tool-roles/default', async c => c.json(await secrets.roles.setDefault(z.object({ roleId: id }).strict().parse(await c.req.json()).roleId)));
+  app.put('/api/tool-roles/:id', async c => c.json(await secrets.roles.save(roleInput.parse(await c.req.json()), id.parse(c.req.param('id')))));
+  app.delete('/api/tool-roles/:id', async c => c.json(await secrets.roles.delete(id.parse(c.req.param('id')))));
+  app.get('/api/projects/:id/tool-role', async c => c.json(await secrets.roles.state(project(c.req.param('id')))));
+  app.put('/api/projects/:id/tool-role', async c => c.json(await secrets.roles.assign(project(c.req.param('id')), assignment.parse(await c.req.json()).roleId)));
   app.get('/api/secrets', async c => c.json(await secrets.list()));
   app.post('/api/secrets', async c => c.json(await secrets.create(z.object({ name: z.string().trim().min(1).max(100), ...fileFields, format: fileFields.format.default('text'), mutable: z.boolean().default(false), tool, path }).strict().parse(await c.req.json())), 201));
   app.get('/api/secrets/:id/content', async c => c.json(await secrets.content(id.parse(c.req.param('id')))));
   app.patch('/api/secrets/:id', async c => c.json(await secrets.update(id.parse(c.req.param('id')), z.object({ name: z.string().trim().min(1).max(100).optional(), mutable: z.boolean().optional(), enabled: z.boolean().optional(), ...fileFields, format: fileFields.format.optional(), tool: tool.optional(), path: path.optional() }).strict().parse(await c.req.json()))));
   app.delete('/api/secrets/:id', async c => c.json(await secrets.delete(id.parse(c.req.param('id')))));
   app.get('/api/secrets/:id/versions', async c => c.json(await secrets.versions(id.parse(c.req.param('id')))));
-  app.get('/api/projects/:id/tool-grants', async c => c.json(await secrets.grants(project(c.req.param('id')))));
-  app.get('/api/projects/:id/tool-permissions', async c => c.json(await secrets.permissions(project(c.req.param('id')))));
-  app.put('/api/projects/:id/tool-permissions', async c => {
-    const input = z.object({ permissions: z.array(z.object({ tool, enabled: z.boolean() }).strict()).max(256) }).strict().parse(await c.req.json());
-    return c.json(await secrets.savePermissions(project(c.req.param('id')), input.permissions));
-  });
-  app.post('/api/projects/:id/tool-grants', async c => c.json(await secrets.saveGrant(project(c.req.param('id')), grant.parse(await c.req.json()))));
-  app.put('/api/projects/:id/tool-grants', async c => {
-    const input = z.object({ selections: z.array(z.object({ tool, secretId: id.nullable() }).strict()).max(256) }).strict().parse(await c.req.json());
-    return c.json(await secrets.saveSelections(project(c.req.param('id')), input.selections));
-  });
-  app.delete('/api/projects/:id/tool-grants/:grantId', async c => { await secrets.deleteGrant(project(c.req.param('id')), id.parse(c.req.param('grantId'))); return c.json({ ok: true }); });
-  const runtimeBox = (boxId: string | undefined, header: string | undefined) => {
-    const value = toolRuntimeBoxId(boxId ?? (header?.startsWith('Bearer ') ? header.slice(7) : undefined));
-    if (!value) throw new HttpError(400, '请提供 Box ID');
-    return value;
-  };
-  const boxId = z.string().regex(/^[a-z0-9][a-z0-9-]{0,54}$/).optional();
+  const boxId = z.string().regex(/^[a-z0-9][a-z0-9-]{0,54}$/);
   app.post('/api/tool-runtime/authorize', async c => {
     const input = z.object({ boxId, tool, args: z.array(z.string().max(8192)).max(32) }).strict().parse(await c.req.json());
-    return c.json(await secrets.authorize(runtimeBox(input.boxId, c.req.header('authorization')), input.tool, input.args));
-  });
-  app.post('/api/tool-runtime/files', async c => {
-    const input = z.object({ boxId, tool, updates: z.array(z.object({ secretId: id, content: z.string().max(1500000), baseVersion: z.number().int().min(1), format: fileFields.format.optional() }).strict()).max(10), exitCode: z.number().int().min(-1).max(255) }).strict().parse(await c.req.json());
-    return c.json(await secrets.syncFiles(runtimeBox(input.boxId, c.req.header('authorization')), input.tool, input.updates, input.exitCode));
-  });
-  app.post('/api/tool-runtime/start', async c => {
-    const input = z.object({ boxId, tool, alias: alias.optional(), args: z.array(z.string().max(8192)).max(32) }).strict().parse(await c.req.json());
-    return c.json(await secrets.start(runtimeBox(input.boxId, c.req.header('authorization')), input.tool, input.alias, input.args));
-  });
-  app.post('/api/tool-runtime/:id/complete', async c => {
-    const input = z.object({ boxId, updates: z.array(z.object({ secretId: id, content: z.string().max(1500000) }).strict()).max(10), exitCode: z.number().int().min(-1).max(255) }).strict().parse(await c.req.json());
-    return c.json(await secrets.complete(runtimeBox(input.boxId, c.req.header('authorization')), id.parse(c.req.param('id')), input.updates, input.exitCode));
+    return c.json(await secrets.authorize(input.boxId, input.tool, input.args));
   });
 }

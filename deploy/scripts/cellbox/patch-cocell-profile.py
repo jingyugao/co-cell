@@ -4,6 +4,7 @@
 from copy import deepcopy
 import json
 import os
+from pathlib import Path
 import re
 import sys
 
@@ -49,19 +50,27 @@ if profile.get("sharedReadOnlyHostPath"):
     guest.setdefault("env", {})["COCELL_LAUNCHER_SHARED_DIRECTORY"] = "/var/lib/cellbox/shared"
 else:
     guest.setdefault("env", {}).pop("COCELL_LAUNCHER_SHARED_DIRECTORY", None)
-# Tool registration belongs to admit-tool-image.py; profile updates preserve it.
-guest.setdefault("tools", [])
+# Register the protected entries once; auto-trusted imports inherit them.
+tools = guest.setdefault("tools", [])
+names = json.loads(Path(sample_path).with_name("proxy-tools.json").read_text())
+for name in names:
+    tool_id = "cocell_" + name.replace("-", "_")
+    if not any(tool["id"] == tool_id for tool in tools):
+        tools.append({"id": tool_id, "executable": "/opt/cellbox/tools/cocell-proxy", "args": [name, "-"],
+                      "passThroughArgs": True, "credentialEnv": {"COCELL_TOOL_RUNTIME": "cocell_tool_runtime"}})
 profile["image"] = image
+# CoCell's internal profile inherits tools and managed HOME for each new import.
+profile["autoTrustImportedImages"] = True
 trusted = profile.setdefault("trustedToolImages", [])
 if image not in trusted:
     trusted.append(image)
-if os.environ.get("COCELL_TOOL_RUNTIME_MOUNT_VERSION") == "1":
-    mounted = profile.setdefault("mountedToolRuntimeImages", [])
-    if image not in mounted:
-        mounted.append(image)
 if os.environ.get("COCELL_DEBUG_HOME_VERSION") == "1":
     if not profile.get("sharedReadOnlyHostPath"):
         raise SystemExit("Mounted debug HOME requires the shared directory")
+    # Required by Cellbox for mountedDebugHome, even without files-mode delivery.
+    mounted = profile.setdefault("mountedToolRuntimeImages", [])
+    if image not in mounted:
+        mounted.append(image)
     profile["debugReadWriteHostPath"] = profile["sharedReadOnlyHostPath"] + "/runtime/debug-homes"
     homes = profile.setdefault("debugHomeImages", [])
     if image not in homes:

@@ -93,6 +93,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
   const [showToolGrants, setShowToolGrants] = useState(false);
   const [error, setError] = useState('');
   const pending = useRef(false);
+  const [idCopyStatus, setIdCopyStatus] = useState('');
   const [chooseRestoreVersion, setChooseRestoreVersion] = useState(false);
   const [restoreVersionId, setRestoreVersionId] = useState('');
   const status = project.status ?? (project.archivedAt ? 'archived' : 'active');
@@ -124,6 +125,11 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
   const canUseExistingBackup = !archived && !project.archiveCleanupSourceId && Boolean(backup);
   const typeLabel = projectTypeLabel(project.type, project.weekOf);
   const displayName = projectDisplayName(project);
+
+  async function copyProjectId() {
+    try { await navigator.clipboard.writeText(project.id); setIdCopyStatus('已复制完整 ID'); }
+    catch { setIdCopyStatus(`复制失败，完整 ID：${project.id}`); }
+  }
 
   async function run(label: string, action: () => Promise<ProjectSummary>) {
     if (busy || operating) return;
@@ -173,6 +179,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
   return <article className={`project-card ${archived ? 'archived' : ''}`} aria-label={displayName}>
     <div className="project-card-heading"><span className="project-folder" aria-hidden="true">▱</span><div className="project-card-statuses"><span className="project-type-badge">{typeLabel}</span>{archived && <span className="project-archived-badge">已归档</span>}<span className={`project-status ${project.activeSessionId ? 'active' : ''}`}>{project.activeSessionId ? '任务执行中' : project.executionMode === 'local' ? '本地项目' : operating ? operation.phase : project.sandbox ? states[project.sandbox.status] : '无 Sandbox'}</span></div></div>
     <h2>{openDisabled ? <span className="project-title-disabled">{displayName}</span> : <button className="project-title-button" onClick={() => onOpenProject(project.id)}>{displayName}</button>}</h2>
+    <div className="project-card-id"><span>项目 ID</span><button type="button" title={project.id} aria-label={`复制项目完整 ID ${project.id}`} onClick={() => void copyProjectId()}><code>{project.id.slice(0, 8)}</code></button>{idCopyStatus && <span role="status">{idCopyStatus}</span>}</div>
     {project.requirementUrl && /^https?:\/\//i.test(project.requirementUrl) ? <div className="project-requirement-wrap"><a className="project-requirement" href={project.requirementUrl} target="_blank" rel="noopener noreferrer" title={project.requirementUrl}>飞书需求 ↗<span>{project.requirementUrl}</span></a>{project.requirementStatus && <p className="project-requirement-status"><span>飞书项目状态</span><strong>{project.requirementStatus}</strong></p>}</div> : project.type === 2 ? <p className="project-unlinked">飞书需求待绑定</p> : <p className="project-unlinked">{typeLabel}</p>}
       <dl className="project-details"><div><dt>项目镜像</dt><dd>{project.imageSelection ? `${project.imageSelection.imageName} · ${project.imageSelection.version}` : '系统默认镜像'}</dd></div><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>最新备份</dt><dd>{backup ? onViewBackup && project.archiveVersions?.length ? <ArchiveVersionBadge project={project} onView={onViewBackup} /> : <time dateTime={backup.createdAt} title={date(backup.createdAt)}>{backupDate(backup.createdAt)}</time> : '暂无备份'}</dd></div><div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div></dl>
     <div className="project-action-groups">
@@ -236,7 +243,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
   const completedCount = projects.filter(project => projectStatus(project) === 'completed').length;
   const archivedCount = projects.filter(project => projectStatus(project) === 'archived').length;
   const inView = projects.filter(project => projectStatus(project) === view);
-  const visible = inView.filter(project => `${project.name} ${project.requirementUrl ?? ''} ${project.sandbox?.id ?? ''}`.toLowerCase().includes(query.trim().toLowerCase()));
+  const visible = inView.filter(project => `${project.id} ${project.name} ${project.requirementUrl ?? ''} ${project.sandbox?.id ?? ''}`.toLowerCase().includes(query.trim().toLowerCase()));
   const archivedGroups = view === 'archived' ? groupArchivedProjectsByWeek(visible) : [];
   const canCreate = config?.sandbox?.enabled === true;
   const stopCreating = () => { setCreating(false); setTimeout(() => createButton.current?.focus(), 0); };
@@ -254,7 +261,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
     activeTab.current?.focus();
   }} />;
 
-  const empty = <div className="projects-empty"><span aria-hidden="true">▱</span><h2>{query.trim() && inView.length ? '没有匹配的项目' : view === 'archived' ? '还没有归档项目' : view === 'completed' ? '还没有已完成项目' : projects.length ? '暂无使用中的项目' : '从一个项目开始'}</h2><p>{query.trim() && inView.length ? '试试其他项目名称、需求链接或 Sandbox ID。' : view === 'archived' ? '归档项目会按周显示；恢复时使用最新成功备份创建环境。' : view === 'completed' ? '已完成项目不能继续对话；恢复为使用中后才可继续。' : '先创建项目，再开启会话。飞书需求可以稍后关联。'}</p>{view === 'active' && !inView.length && canCreate && !creating && <button className="primary-button" onClick={() => setCreating(true)}>{projects.length ? '创建项目' : '创建第一个项目'}</button>}</div>;
+  const empty = <div className="projects-empty"><span aria-hidden="true">▱</span><h2>{query.trim() && inView.length ? '没有匹配的项目' : view === 'archived' ? '还没有归档项目' : view === 'completed' ? '还没有已完成项目' : projects.length ? '暂无使用中的项目' : '从一个项目开始'}</h2><p>{query.trim() && inView.length ? '试试其他项目名称、项目 ID、需求链接或 Sandbox ID。' : view === 'archived' ? '归档项目会按周显示；恢复时使用最新成功备份创建环境。' : view === 'completed' ? '已完成项目不能继续对话；恢复为使用中后才可继续。' : '先创建项目，再开启会话。飞书需求可以稍后关联。'}</p>{view === 'active' && !inView.length && canCreate && !creating && <button className="primary-button" onClick={() => setCreating(true)}>{projects.length ? '创建项目' : '创建第一个项目'}</button>}</div>;
 
   return <main className="main-pane projects-page">
     <header className="topbar"><button className="icon-button mobile-only" aria-label="打开导航" onClick={onMenu}>☰</button><div className="breadcrumbs"><span>工作空间</span><span className="slash">/</span><strong>项目</strong></div><button className="secondary-button" onClick={onBack}>返回对话</button></header>
@@ -267,7 +274,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
         try { const project = await onCreate(values); setCreating(false); onOpenProject(project.id); }
         finally { setBusy(false); }
       }} /></section>}
-      <div className="projects-toolbar"><div className="project-tabs" role="group" aria-label="项目状态"><button ref={activeTab} className={view === 'active' ? 'selected' : ''} aria-pressed={view === 'active'} onClick={() => setView('active')}>使用中 <span>{activeCount}</span></button><button className={view === 'completed' ? 'selected' : ''} aria-pressed={view === 'completed'} onClick={() => setView('completed')}>已完成 <span>{completedCount}</span></button><button ref={archivedTab} className={view === 'archived' ? 'selected' : ''} aria-pressed={view === 'archived'} onClick={() => setView('archived')}>归档 <span>{archivedCount}</span></button></div><div><input aria-label="搜索项目" placeholder="搜索项目、需求链接或 Sandbox" value={query} onChange={event => setQuery(event.target.value)} /><button className="secondary-button" disabled={loading} onClick={async () => { setError(''); try { await onRefresh(); } catch (err) { setError(err instanceof Error ? err.message : '刷新失败，请重试。'); } }}>{loading ? '刷新中…' : '刷新'}</button></div></div>
+      <div className="projects-toolbar"><div className="project-tabs" role="group" aria-label="项目状态"><button ref={activeTab} className={view === 'active' ? 'selected' : ''} aria-pressed={view === 'active'} onClick={() => setView('active')}>使用中 <span>{activeCount}</span></button><button className={view === 'completed' ? 'selected' : ''} aria-pressed={view === 'completed'} onClick={() => setView('completed')}>已完成 <span>{completedCount}</span></button><button ref={archivedTab} className={view === 'archived' ? 'selected' : ''} aria-pressed={view === 'archived'} onClick={() => setView('archived')}>归档 <span>{archivedCount}</span></button></div><div><input aria-label="搜索项目" placeholder="搜索名称、项目 ID 或 Sandbox" value={query} onChange={event => setQuery(event.target.value)} /><button className="secondary-button" disabled={loading} onClick={async () => { setError(''); try { await onRefresh(); } catch (err) { setError(err instanceof Error ? err.message : '刷新失败，请重试。'); } }}>{loading ? '刷新中…' : '刷新'}</button></div></div>
       <p className="projects-archive-hint">{view === 'archived' ? '按归档日期每周一组。恢复会创建新的 Sandbox。' : view === 'completed' ? '已完成项目必须恢复为使用中，才能继续对话。' : '可将项目标记为已完成；满 1 天后系统会归档并删除其 Sandbox。'}</p>
       {!projects.length && loading ? <section className="project-grid" aria-busy="true"><div className="projects-empty" role="status"><span className="spinner" /> 正在读取项目…</div></section>
         : !visible.length ? <section className="project-grid">{empty}</section>

@@ -8,6 +8,7 @@ import { HttpError } from '../../util/errors.js';
 import { SecretCrypto } from './crypto.js';
 import { credentialPath, toolName } from './policy.js';
 import { SecretService } from './service.js';
+import { MountedToolHomes } from './mounted-home.js';
 import type { SecretRepository, StoredSecret, StoredVersion } from './repository.js';
 import { MemoryRoleRepository } from './role-repository.js';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -50,6 +51,54 @@ export function fixture() {
   const service = new SecretService(repository, crypto);
   return { repository, service, projectId, crypto };
 }
+
+test('registered native HOME is shared by authorized callers without creating credential snapshots', async () => {
+  const { service, repository, projectId } = fixture();
+  const root = await mkdtemp(join(tmpdir(), 'cocell-native-authorization-'));
+  try {
+    await service.mountHomes(root); await service.init();
+    const secret = await service.create({ name: 'Native CLI', tool: 'custom-cli', path: '.tool/config', format: 'text', mutable: true, content: 'initial' });
+    const role = await service.roles.save({ name: 'Operators', connections: [{ tool: 'custom-cli', secretId: secret.id }] });
+    await service.roles.assign(projectId, role.id); await service.publishHome(projectId);
+    const native = repository.records.get(secret.id)!; native.nativeHome = secret.id;
+    const ownerHome = new MountedToolHomes(root);
+    await ownerHome.publish(secret.id, async () => [{ tool: native.tool!, secretId: native.id, path: native.path!, content: Buffer.from('live-native-state').toString('base64'), mutable: true, version: 1, alias: '' }]);
+    await service.publishHome(projectId);
+    await service.registerRuntime('native-box', projectId, 1);
+    const auth = await service.authorize('native-box', 'custom-cli', ['status']);
+    assert.equal(auth.home, `/home/debug/${secret.id}`);
+    assert.equal(auth.path, '.tool/config');
+    await assert.rejects(readFile(join(root, 'runtime/debug-homes', projectId, '.tool/config')), { code: 'ENOENT' });
+    assert.equal((await service.list())[0].homeDirectory, auth.home);
+    assert.equal((await service.list())[0].storage, 'native');
+    assert(!('nativeHome' in (await service.list())[0]));
+    await service.roles.assign(projectId, null);
+    await assert.rejects(service.authorize('native-box', 'custom-cli', ['status']), /未授权/);
+    assert.equal(await readFile(join(root, 'runtime/debug-homes', secret.id, '.tool/config'), 'utf8'), 'live-native-state');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('native MySQL file edits refresh only the selected project configuration without a metadata version bump', async () => {
+  const { service, repository, projectId, crypto } = fixture();
+  const root = await mkdtemp(join(tmpdir(), 'cocell-native-mysql-'));
+  try {
+    await service.mountHomes(root); await service.init();
+    const secret = await service.create({ name: 'Warehouse', tool: 'mysql', path: '.my.cnf', format: 'text', mutable: true, content: '[warehouse]\nhost=old.example.test\nuser=synthetic\n' });
+    repository.records.get(secret.id)!.nativeHome = secret.id;
+    const role = await service.roles.save({ name: 'Warehouse readers', connections: [{ tool: 'mysql', secretId: secret.id }] });
+    await service.roles.assign(projectId, role.id); await service.publishHome(projectId);
+    await service.registerRuntime('native-mysql-box', projectId, 1);
+    const file = join(root, 'runtime/debug-homes', projectId, '.mylogin.cnf');
+    const before = await readFile(file);
+    const current = repository.records.get(secret.id)!;
+    current.ciphertext = crypto.seal(current.id, current.currentVersionId, Buffer.from('[warehouse]\nhost=new.example.test\nuser=synthetic\n'));
+    const auth = await service.authorize('native-mysql-box', 'mysql', ['--login-path=warehouse', '-e', 'SELECT 1']);
+    assert.equal(auth.home, `/home/debug/${projectId}`);
+    assert.notDeepEqual(await readFile(file), before);
+    assert.equal(current.version, secret.version);
+    await assert.rejects(service.authorize('native-mysql-box', 'mysql', ['--login-path=ungranted', '-e', 'SELECT 1']), /未授权/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('project roles merge only granted native profiles, preserve unchanged HOME, and revoke live access', async () => {
   const { service, repository, projectId, crypto } = fixture(); await service.init();

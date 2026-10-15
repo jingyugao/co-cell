@@ -167,6 +167,9 @@ test('native binding revision is stable under source reordering and changes with
   assert.equal(mergedBinding('mysql', [...inputs].reverse()).revision, base.revision);
   assert.notEqual(mergedBinding('mysql', inputs.slice(0, 1)).revision, base.revision);
   assert.notEqual(mergedBinding('mysql', [{ ...inputs[0], version: 2 }, inputs[1]]).revision, base.revision);
+  const nativeInputs = inputs.map(item => ({ ...item, content: 'original native config' }));
+  assert.notEqual(mergedBinding('mysql', nativeInputs).revision,
+    mergedBinding('mysql', [{ ...nativeInputs[0], content: 'edited on disk' }, nativeInputs[1]]).revision);
 
   const kubeInputs = inputs.map(({ id, version }) => ({ id, name: 'display label', version }));
   assert.equal(mergedBinding('kubectl', kubeInputs).revision, mergedBinding('kubectl', kubeInputs.map(item => ({ ...item, name: 'renamed label' }))).revision);

@@ -25,6 +25,7 @@ test('configured metadata storage is MySQL without connecting until initializati
 
 test('database initialization failure propagates instead of falling back to local files', async () => {
   const store = Object.create(MySqlWebStateStore.prototype) as MySqlWebStateStore;
+  Object.assign(store, { previewGrants: { async init() {} } });
   const failure = new Error('Database unavailable');
   (store as unknown as { pool: { query: () => Promise<unknown> } }).pool = {
     async query() { throw failure; },

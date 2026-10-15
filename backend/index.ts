@@ -1,4 +1,6 @@
 import { createPreviewProxy } from './projects/preview-proxy.js';
+import { readSystemRequirementInfo } from './projects/requirements.js';
+import { SystemTools } from './execution/system-tools.js';
 import { ModelService } from './models/service.js';
 import { DirectModelProvider } from './models/direct-provider.js';
 import { initializeTracing } from './infra/diagnostics/tracing.js';
@@ -27,6 +29,7 @@ import { modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
 import { MySqlCoordinator } from './infra/storage/coordination.js';
 import { SecretCrypto } from './secrets/crypto.js';
+import { NativeSecretFiles } from './secrets/native-files.js';
 import { SecretService } from './secrets/service.js';
 import { SharedFiles } from './shared-files/service.js';
 import { publishSharedDirectory } from './shared-files/mount.js';
@@ -39,7 +42,6 @@ const multiApiFlag = process.env.COCELL_MULTI_API ?? '0';
 if (multiApiFlag !== '0' && multiApiFlag !== '1') throw new Error('COCELL_MULTI_API must be 0 or 1');
 const multiApi = multiApiFlag === '1';
 const coordinator = multiApi ? new MySqlCoordinator(mysqlUrl) : undefined;
-const webState = createWebStateStore(mysqlUrl);
 const port = Number(process.env.PORT || 3000);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be between 1 and 65535');
 const apiKey = process.env.CODEX_API_KEY || process.env.OPENAI_API_KEY;
@@ -73,7 +75,9 @@ const appServerArguments=appServerArgs(modelConfig, configOverrides).slice(1);
 const appServerEnv = {...(apiKey ? {CODEX_API_KEY:apiKey} : {}),
   ...(process.env.CODEX_MODEL_METADATA_JSON ? { CODEX_MODEL_METADATA_JSON: process.env.CODEX_MODEL_METADATA_JSON } : {})};
 const sharedDirectory = await loadSharedMountConfig();
+if (multiApi && !sharedDirectory) throw new Error('Multi-API native credentials require the shared persistent directory');
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
+const webState = createWebStateStore(mysqlUrl, new NativeSecretFiles(resolve(sharedDataRoot, 'runtime/debug-homes'), secretCrypto));
 if (sharedDirectory) {
   const publish = () => publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
   if (coordinator) await coordinator.run('cocell-shared-startup-config', publish);
@@ -84,7 +88,7 @@ if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOK
 const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,clientId:process.env.CELLBOX_CLIENT_ID,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',stateDirectory:resolve('data/cellbox-operations')});
 await cellboxProvider.initialize();
 let manager: SessionManager;
-const secrets = new SecretService(webState.secretRepository, secretCrypto);
+const secrets = new SecretService(webState.secretRepository, secretCrypto, async id => (await webState.getProject(id))?.status === 'active');
 if (sharedDirectory) await secrets.mountHomes(sharedDataRoot, coordinator);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
   error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); }, multiApi ? 0 : undefined);
@@ -122,6 +126,8 @@ const sandboxManager = new SandboxManager({ provider, logger: runtimeLog,
   // Project lifecycle owns idle checkpoints so every pause includes its disk backup.
   policy: { autoCheckpointAfterMs: Number.MAX_SAFE_INTEGER }, lifecycle: cellboxRuntime.lifecycle });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
+const systemTools = new SystemTools({ projects: () => webState.listProjects(), enter: id => manager.enterProject(id),
+  acquireUsage: id => cellboxRuntime.acquireUsage(id), execute: (id, tool, args) => cellboxProvider.client.runTool(id, tool, args, 40_000) });
 const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
   resolveModel: session => modelProvider.threadOptions(session),
@@ -139,6 +145,7 @@ if (!Number.isFinite(archivedReclaimAfterMs) || archivedReclaimAfterMs < 0) thro
 manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtime, sandboxWorkingDirectory, runtimeLog,
   webImagesDirectory, {
     onProjectCreate: projectId => secrets.repository.roles.assignDefault(projectId),
+    requirementInfo: url => readSystemRequirementInfo(url, systemTools),
     archivedReclaimAfterMs,
     autoCheckpointAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),

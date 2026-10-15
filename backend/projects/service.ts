@@ -7,7 +7,6 @@ import { HttpError } from '../../util/errors.js';
 import { RecordWriteQueue } from '../infra/storage/record-write-queue.js';
 import { mergeRecord } from '../infra/storage/record-merge.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
-import { readRequirementInfo } from './requirements.js';
 
 export type ProjectInput = { name?: string; requirementUrl?: string | null; type?: ProjectType; imageSelection?: ProjectImageSelection };
 export type ProjectUpdate = Partial<Omit<ProjectInput, 'imageSelection'>> & { status?: ProjectStatus; backupRetentionCount?: number };
@@ -24,7 +23,7 @@ export class ProjectService {
   private creatingWeeklyProjects = new Set<string>();
   private writer = new RecordWriteQueue();
   private saved = new Map<string, Project>();
-  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = readRequirementInfo, private now: () => Date = () => new Date(), private shared = false, private onCreate?: (projectId: string) => Promise<void>) {}
+  constructor(private state: WebStateStore, private requirementInfo: (url: string) => Promise<{ name: string; status: string | null }> = async () => { throw new HttpError(503, '尚未配置 system 项目的工具执行环境'); }, private now: () => Date = () => new Date(), private shared = false, private onCreate?: (projectId: string) => Promise<void>) {}
 
   async init() {
     for (const project of await this.state.listProjects()) {

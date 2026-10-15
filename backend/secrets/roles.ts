@@ -36,7 +36,7 @@ export class ToolRoles {
     for (const item of input.connections) {
       toolName(item.tool);
       const secret = await this.repository.get(item.secretId);
-      if (!secret?.enabled || !['text', 'lark'].includes(secret.format) || secret.tool !== item.tool || !secret.path) throw new HttpError(400, '请选择工具已启用的单文件凭证');
+      if (!secret?.enabled || !['text', 'lark', 'home'].includes(secret.format) || secret.tool !== item.tool || !secret.path) throw new HttpError(400, '请选择工具已启用的凭据');
       if (!validConnectionName(secret.name)) throw new HttpError(400, '凭证名称不能为空、超过 100 个字符或包含控制字符');
       const key = `${item.tool}:${nativeContextTool(item.tool) ? secret.id : ''}`;
       if (keys.has(key) || secrets.has(item.secretId)) throw new HttpError(400, '凭证名称或凭证重复；仅 MySQL 和 Kubernetes 支持多个连接');
@@ -75,7 +75,7 @@ export class ToolRoles {
     for (const connection of state.connections) {
       const secret = await this.repository.get(connection.secretId);
       // Deletion, disablement, or changing a secret's tool revokes access immediately.
-      if (!secret?.enabled || secret.tool !== connection.tool || !['text', 'lark'].includes(secret.format) || !secret.path) continue;
+      if (!secret?.enabled || secret.tool !== connection.tool || !['text', 'lark', 'home'].includes(secret.format) || !secret.path) continue;
       grants.push({ id: connection.secretId, projectId, tool: connection.tool, alias: secret.name,
         files: [{ secretId: secret.id, path: secret.path }], enabled: true, updatedAt: secret.updatedAt, nativeNames: connection.nativeNames });
     }

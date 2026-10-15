@@ -1,14 +1,8 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { z } from 'zod';
 import { HttpError } from '../../util/errors.js';
+import type { SystemTools } from '../execution/system-tools.js';
 
-const exec = promisify(execFile);
 type Command = (args: string[]) => Promise<string>;
-const command: Command = async args => {
-  const result = await exec('meegle', args, { timeout: 15_000, maxBuffer: 2 * 1024 * 1024 });
-  return result.stdout;
-};
 const decodedSchema = z.object({
   url_kind: z.string(), host: z.string(), simple_name: z.string().optional(), work_item_id: z.string().optional(),
 });
@@ -24,23 +18,36 @@ const detailSchema = z.object({ work_item_attribute: z.object({
 }) });
 export type RequirementInfo = { name: string; status: string | null };
 
-/** Read requirement metadata using the host's logged-in Meegle CLI, never a URL fetch or shell. */
-export async function readRequirementName(url: string, run: Command = command): Promise<string> {
+export async function readSystemRequirementInfo(url: string, tools: Pick<SystemTools, 'withTools'>): Promise<RequirementInfo> {
+  return tools.withTools(run => readRequirementInfo(url, async args => {
+    const result = await run('meegle', args);
+    if (result.truncated) throw new Error('System tool output exceeded limit');
+    if (result.exitCode !== 0) {
+      const status = args[0] === 'auth' && args[1] === 'status' && result.exitCode === 1
+        ? statusSchema.safeParse(JSON.parse(result.stdout)) : null;
+      if (!status?.success || status.data.authenticated) throw new Error('System tool failed');
+    }
+    return result.stdout;
+  }));
+}
+
+/** Read requirement metadata through Meegle CLI, never a URL fetch or shell. */
+export async function readRequirementName(url: string, run: Command): Promise<string> {
   return (await readRequirementInfo(url, run)).name;
 }
 
-export async function readRequirementInfo(url: string, run: Command = command): Promise<RequirementInfo> {
+export async function readRequirementInfo(url: string, run: Command): Promise<RequirementInfo> {
   async function read<T>(args: string[], schema: z.ZodType<T>, failure: string): Promise<T> {
     try { return schema.parse(JSON.parse(await run([...args, '--format', 'json']))); }
     // CLI errors may contain credentials or remote content; only expose our stage-specific message.
     catch { throw new HttpError(502, failure); }
   }
-  const decoded = await read(['url', 'decode', '--url', url], decodedSchema, '无法解析飞书需求链接，请确认链接格式及本机 Meegle CLI 是否可用');
+  const decoded = await read(['url', 'decode', '--url', url], decodedSchema, '无法解析飞书需求链接，请确认链接格式及 system 项目的 Meegle CLI 是否可用');
   if (decoded.url_kind !== 'workitem_detail' || !decoded.simple_name || !decoded.work_item_id) {
     throw new HttpError(400, '请填写飞书项目的具体需求详情链接，不能使用空间首页、列表或文档链接');
   }
-  const authStatus = await read(['auth', 'status'], statusSchema, '无法检查飞书项目登录状态，请检查本机 Meegle 登录及网络后重试');
-  if (!authStatus.authenticated) throw new HttpError(409, '飞书项目尚未登录或登录已失效，请先在本机完成 Meegle 登录');
+  const authStatus = await read(['auth', 'status'], statusSchema, '无法检查飞书项目登录状态，请检查 Meegle 凭据及服务网络后重试');
+  if (!authStatus.authenticated) throw new HttpError(409, '飞书项目尚未登录或登录已失效，请在 system 项目的 debug HOME 中完成 Meegle 登录');
   const hostname = (value: string) => {
     try { return new URL(value.includes('://') ? value : `https://${value}`).host.toLowerCase(); }
     catch { return ''; }

@@ -1,4 +1,4 @@
-export type SecretFormat = 'text' | 'files';
+export type SecretFormat = 'text' | 'files' | 'home';
 /** Native encrypted Linux Lark keychain files accompanying its primary config. */
 export interface SecretSupportFile { path: string; content: string; encoding: 'base64' }
 export interface SecretTextFile { path: string; content: string; encoding?: 'base64' }
@@ -11,6 +11,10 @@ export interface SecretMetadata {
   id: string; name: string; format: SecretFormat; mutable: boolean; enabled: boolean;
   version: number; createdAt: string; updatedAt: string; projectIds: string[];
   tool: ProxyTool | null; path: string | null; requiresTextImport: boolean;
+  homeProjectId?: string;
+  /** Credential body storage; database is a pre-migration record. */
+  storage?: 'native' | 'database';
+  homeDirectory?: string;
   supportFilePaths?: string[];
   /** Native MySQL login-path names or Kubernetes context names; no credential values. */
   nativeNames?: string[];
@@ -18,21 +22,26 @@ export interface SecretMetadata {
 }
 export interface SecretInput {
   name: string; format: SecretFormat; mutable: boolean; content?: string;
+  homeProjectId?: string;
   tool: ProxyTool; path: string;
   supportFiles?: SecretSupportFile[];
   files?: SecretTextFile[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity;
 }
 export interface SecretUpdate { name?: string; mutable?: boolean; enabled?: boolean; content?: string; tool?: ProxyTool; path?: string;
+  homeProjectId?: string;
   supportFiles?: SecretSupportFile[];
   format?: SecretFormat; files?: SecretTextFile[]; directory?: string; adapter?: 'meegle'; identity?: SecretFileIdentity }
 export interface SecretContent extends Partial<SecretFileBundle> {
   supportFilePaths?: string[];
   format: SecretFormat; content: string; requiresTextImport: boolean; version: number;
+  homeProjectId?: string;
 }
 export interface SecretDeleteResult { ok: true }
 export interface ProvisionedToolFile {
   tool: ProxyTool; secretId: string; path: string; content: string; mutable: boolean; version: number;
   alias: string;
+  /** Preserve a native HOME-owned file in place rather than seeding it from a Secret snapshot. */
+  externallyManaged?: boolean;
   /** Revision of all credentials contributing to a merged native config. */
   revision?: string;
   format?: SecretFormat;

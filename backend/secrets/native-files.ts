@@ -8,6 +8,7 @@ import type { StoredSecret } from './repository.js';
 import { fileBytes, validateFileBundle } from '../../util/credential-files.mjs';
 
 const prefix = 'native:v1:';
+const legacyPath = (secret: StoredSecret) => secret.format === 'json' ? 'config.json' : secret.format === 'binary' ? 'credentials.bin' : undefined;
 type Descriptor = { kind: StoredSecret['format']; files: Array<{ path: string; encoding?: 'base64' }>;
   supportVersion?: number; homeProjectId?: string; directory?: string; adapter?: 'meegle'; identity?: { hostname: string; username: string } };
 
@@ -73,7 +74,7 @@ export class NativeSecretFiles {
     for (const file of value.files) this.path(secret.id, file.path);
     if (secret.format === 'home') {
       if (value.files.length || !/^[a-f0-9-]{36}$/.test(value.homeProjectId ?? '')) throw new Error('Invalid HOME registration');
-    } else if (!secret.path || value.files[0]?.path !== secret.path || new Set(value.files.map(file => file.path)).size !== value.files.length) {
+    } else if (value.files[0]?.path !== (secret.path ?? legacyPath(secret)) || !value.files.length || new Set(value.files.map(file => file.path)).size !== value.files.length) {
       throw new Error('Native credential path does not match registration');
     }
     return value;
@@ -82,21 +83,26 @@ export class NativeSecretFiles {
     if (!this.isNative(secret.ciphertext)) return secret.ciphertext;
     const descriptor = this.descriptor(secret);
     const files = await Promise.all(descriptor.files.map(async file => ({ ...file, bytes: await this.bytes(this.path(secret.id, file.path)) })));
-    let payload: string;
+    let payload: string | Buffer;
     if (secret.format === 'home') payload = JSON.stringify({ homeProjectId: descriptor.homeProjectId });
     else if (secret.format === 'lark') payload = JSON.stringify({ content: files[0].bytes.toString('utf8'),
       supportFiles: files.slice(1).map(file => ({ path: file.path, content: file.bytes.toString('base64'), encoding: 'base64' })), supportVersion: descriptor.supportVersion });
     else if (secret.format === 'files') payload = JSON.stringify({ ...descriptor, kind: undefined,
       files: files.map(({ path, encoding, bytes }) => ({ path, content: bytes.toString(encoding ?? 'utf8'), ...(encoding ? { encoding } : {}) })) });
-    else payload = files[0].bytes.toString('utf8');
+    else payload = secret.format === 'binary' ? files[0].bytes : files[0].bytes.toString('utf8');
     return this.crypto.seal(secret.id, secret.currentVersionId, Buffer.from(payload));
   }
   async prepare(secret: StoredSecret, versionId: string, ciphertext: string, registered?: StoredSecret) {
-    const payload = this.crypto.open(secret.id, versionId, ciphertext).toString('utf8');
+    const original = this.crypto.open(secret.id, versionId, ciphertext);
+    const payload = original.toString('utf8');
     const descriptor: Descriptor = { kind: secret.format, files: [] };
     let files: Array<{ path: string; bytes: Buffer; encoding?: 'base64' }> = [];
     if (secret.format === 'home') descriptor.homeProjectId = JSON.parse(payload).homeProjectId;
-    else {
+    else if (legacyPath(secret)) {
+      // Historical unbound entries have no tool/path registration. Preserve
+      // their exact bytes without guessing a tool or enabling tool access.
+      files = [{ path: secret.path ?? legacyPath(secret)!, bytes: original }];
+    } else {
       if (!secret.path || !secret.tool) throw new Error('Legacy credentials need a native tool and path before migration');
       if (secret.format === 'text') files = [{ path: secret.path, bytes: Buffer.from(payload) }];
       else if (secret.format === 'lark') {

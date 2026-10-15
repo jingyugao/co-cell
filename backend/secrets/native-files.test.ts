@@ -103,6 +103,25 @@ test('keeps HOME references as metadata and writes no credential body files', as
   });
 });
 
+test('preserves unbound legacy JSON and arbitrary binary bytes without inventing tool registrations', async () => {
+  await withRoot(async (root, crypto) => {
+    const files = new NativeSecretFiles(root, crypto); await files.init();
+    for (const [format, id, filename, bytes] of [
+      ['json', secretId, 'config.json', Buffer.from('{"legacy":"native-config"}')],
+      ['binary', '723e4567-e89b-42d3-a456-426614174000', 'credentials.bin', Buffer.from([0, 255, 128, 3, 0])],
+    ] as const) {
+      const old: StoredSecret = { ...secret(crypto, 'text', 'unused', '', id), format, tool: null, path: null,
+        ciphertext: crypto.seal(id, versionId, bytes) };
+      const prepared = await files.prepare(old, versionId, old.ciphertext);
+      assert.deepEqual(await readFile(fileAt(root, id, filename)), bytes);
+      const loaded = await files.read({ ...old, ciphertext: prepared.reference });
+      assert.deepEqual(crypto.open(id, versionId, loaded), bytes);
+      assert.equal(old.tool, null); assert.equal(old.path, null);
+      assert(!prepared.reference.includes(bytes.toString('base64')));
+    }
+  });
+});
+
 test('rollback restores prior native bytes after a prepared content change', async () => {
   await withRoot(async (root, crypto) => {
     const files = new NativeSecretFiles(root, crypto); await files.init();

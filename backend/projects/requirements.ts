@@ -1,14 +1,30 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { z } from 'zod';
 import { HttpError } from '../../util/errors.js';
+import type { SecretService } from '../secrets/service.js';
 
 const exec = promisify(execFile);
 type Command = (args: string[]) => Promise<string>;
-const command: Command = async args => {
-  const result = await exec('meegle', args, { timeout: 15_000, maxBuffer: 2 * 1024 * 1024 });
-  return result.stdout;
-};
+function cliCommand(env = process.env): Command {
+  return async args => {
+    try {
+      return (await exec('meegle', args, { env, timeout: 15_000, maxBuffer: 2 * 1024 * 1024 })).stdout;
+    } catch (error) {
+      const result = error as { code?: number; killed?: boolean; stdout?: string };
+      // Meegle exits 1 for a missing/rejected token while still returning status JSON.
+      if (args[0] === 'auth' && args[1] === 'status' && result.code === 1 && !result.killed && result.stdout) {
+        const status = statusSchema.safeParse(JSON.parse(result.stdout));
+        if (status.success && !status.data.authenticated) return result.stdout;
+      }
+      throw error;
+    }
+  };
+}
+const command = cliCommand();
 const decodedSchema = z.object({
   url_kind: z.string(), host: z.string(), simple_name: z.string().optional(), work_item_id: z.string().optional(),
 });
@@ -24,7 +40,24 @@ const detailSchema = z.object({ work_item_attribute: z.object({
 }) });
 export type RequirementInfo = { name: string; status: string | null };
 
-/** Read requirement metadata using the host's logged-in Meegle CLI, never a URL fetch or shell. */
+/** New projects inherit the default role, so use only that role's Meegle credential. */
+export async function readManagedRequirementInfo(url: string, secrets: Pick<SecretService, 'defaultToolCredential'>): Promise<RequirementInfo> {
+  const credential = await secrets.defaultToolCredential('meegle');
+  if (!credential || credential.path !== '.meegle/config.json') {
+    throw new HttpError(409, '请在工具权限中导入 Meegle 原生配置，并将凭据加入默认角色后重试');
+  }
+  const home = await mkdtemp(join(tmpdir(), 'cocell-meegle-'));
+  try {
+    await mkdir(join(home, '.meegle'), { mode: 0o700 });
+    await writeFile(join(home, '.meegle/config.json'), credential.content, { mode: 0o600, flag: 'wx' });
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(home, '.cache') };
+    // Ambient operator settings must not override the selected role's account.
+    for (const key of Object.keys(env)) if (key.startsWith('MEEGLE_')) delete env[key];
+    return await readRequirementInfo(url, cliCommand(env));
+  } finally { await rm(home, { recursive: true, force: true }); }
+}
+
+/** Read requirement metadata through Meegle CLI, never a URL fetch or shell. */
 export async function readRequirementName(url: string, run: Command = command): Promise<string> {
   return (await readRequirementInfo(url, run)).name;
 }
@@ -39,8 +72,8 @@ export async function readRequirementInfo(url: string, run: Command = command): 
   if (decoded.url_kind !== 'workitem_detail' || !decoded.simple_name || !decoded.work_item_id) {
     throw new HttpError(400, '请填写飞书项目的具体需求详情链接，不能使用空间首页、列表或文档链接');
   }
-  const authStatus = await read(['auth', 'status'], statusSchema, '无法检查飞书项目登录状态，请检查本机 Meegle 登录及网络后重试');
-  if (!authStatus.authenticated) throw new HttpError(409, '飞书项目尚未登录或登录已失效，请先在本机完成 Meegle 登录');
+  const authStatus = await read(['auth', 'status'], statusSchema, '无法检查飞书项目登录状态，请检查 Meegle 凭据及服务网络后重试');
+  if (!authStatus.authenticated) throw new HttpError(409, '飞书项目尚未登录或凭据已失效，请重新登录 Meegle 并更新默认角色的凭据');
   const hostname = (value: string) => {
     try { return new URL(value.includes('://') ? value : `https://${value}`).host.toLowerCase(); }
     catch { return ''; }

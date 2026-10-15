@@ -51,6 +51,25 @@ export function fixture() {
   return { repository, service, projectId, crypto };
 }
 
+test('pre-project credentials follow the current default role and honor revocation', async () => {
+  const { service } = fixture(); await service.init();
+  const create = (name: string) => service.create({ name, tool: 'meegle', path: '.meegle/config.json', format: 'text', mutable: false, content: name });
+  const selected = await create('selected'), other = await create('unselected');
+  assert.equal(await service.defaultToolCredential('meegle'), null, 'unassigned secrets must not be used');
+  const role = await service.roles.save({ name: 'Selected', connections: [{ tool: 'meegle', secretId: selected.id }] });
+  await service.roles.setDefault(role.id);
+  assert.deepEqual(await service.defaultToolCredential('meegle'), { path: '.meegle/config.json', content: 'selected' });
+  await service.update(selected.id, { content: 'rotated' });
+  assert.equal((await service.defaultToolCredential('meegle'))?.content, 'rotated');
+  await service.update(selected.id, { enabled: false });
+  assert.equal(await service.defaultToolCredential('meegle'), null);
+  const replacement = await service.roles.save({ name: 'Replacement', connections: [{ tool: 'meegle', secretId: other.id }] });
+  await service.roles.setDefault(replacement.id);
+  assert.equal((await service.defaultToolCredential('meegle'))?.content, 'unselected');
+  await service.delete(other.id);
+  assert.equal(await service.defaultToolCredential('meegle'), null);
+});
+
 test('project roles merge only granted native profiles, preserve unchanged HOME, and revoke live access', async () => {
   const { service, repository, projectId, crypto } = fixture(); await service.init();
   const root = await mkdtemp(join(tmpdir(), 'cocell-roles-')); await service.mountHomes(root);

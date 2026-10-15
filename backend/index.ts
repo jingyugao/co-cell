@@ -1,4 +1,5 @@
 import { createPreviewProxy } from './projects/preview-proxy.js';
+import { readManagedRequirementInfo } from './projects/requirements.js';
 import { ModelService } from './models/service.js';
 import { DirectModelProvider } from './models/direct-provider.js';
 import { initializeTracing } from './infra/diagnostics/tracing.js';
@@ -139,6 +140,7 @@ if (!Number.isFinite(archivedReclaimAfterMs) || archivedReclaimAfterMs < 0) thro
 manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtime, sandboxWorkingDirectory, runtimeLog,
   webImagesDirectory, {
     onProjectCreate: projectId => secrets.repository.roles.assignDefault(projectId),
+    requirementInfo: url => readManagedRequirementInfo(url, secrets),
     archivedReclaimAfterMs,
     autoCheckpointAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),

@@ -105,6 +105,15 @@ export class SecretService {
     if (secret.format === 'files') return { format: 'files', content: '', ...this.bundle(secret), requiresTextImport: false, version: secret.version };
     return { format: 'text', content: secret.format === 'binary' ? '' : bytes.toString('utf8'), requiresTextImport: secret.format !== 'text', version: secret.version };
   }
+  /** Internal pre-project reads use only the role a newly created project inherits. */
+  async defaultToolCredential(tool: string): Promise<{ path: string; content: string } | null> {
+    const catalog = await this.repository.roles.catalog();
+    const connections = catalog.roles.find(role => role.id === catalog.defaultRoleId)?.connections.filter(item => item.tool === tool) ?? [];
+    if (connections.length !== 1) return null;
+    const secret = await this.repository.get(connections[0].secretId);
+    if (!secret?.enabled || secret.tool !== tool || secret.format !== 'text' || !secret.path) return null;
+    return { path: secret.path, content: this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('utf8') };
+  }
   async create(input: SecretInput) {
     const id = randomUUID(), versionId = randomUUID(), now = new Date().toISOString();
     const bytes = inputBytes(input), ciphertext = this.crypto.seal(id, versionId, bytes);

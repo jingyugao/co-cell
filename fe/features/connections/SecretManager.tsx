@@ -72,8 +72,11 @@ export default function SecretManager() {
         <label>上传文件<input type="file" onChange={e => void upload(e.target.files?.[0])} /></label>
         <label>认证内容<textarea required spellCheck={false} autoComplete="off" rows={12} value={content} onChange={e => setContent(e.target.value)} placeholder="粘贴工具原生认证文件的完整文本内容" /></label>
       </>}
-      {editing !== 'new' && editing.supportFilePaths?.length ? <p>此凭证包含 {editing.supportFilePaths.length} 个原生密钥和令牌文件，编辑配置时会保留；取消角色授权时一并移除。</p> : null}
-      {!homeManaged && <p>管理员保存的内容及历史加密存储。工具自行刷新的凭证保留在挂载目录，管理员更新内容时覆盖对应文件。</p>}
+      {editing !== 'new' && editing.supportFilePaths?.length ? <p>此凭证包含 {editing.supportFilePaths.length} 个原生密钥和令牌文件，编辑配置时会保留；取消角色授权后工具立即失去访问权限。</p> : null}
+      {editing !== 'new' && editing.homeDirectory && <p>原生凭据目录：<code>{editing.homeDirectory}</code></p>}
+      {!homeManaged && <p>配置直接写入持久化目录中的原生文件，工具刷新后继续使用同一份文件。数据库和历史记录仅登记元信息。</p>}
+      {editing !== 'new' && editing.storage === 'native' && <p>取消登记会撤销工具访问权限，原生配置文件保留在上述目录。</p>}
+      {editing !== 'new' && editing.storage === 'database' && <p>此凭据仍在旧存储中，需运行原生凭据迁移。</p>}
       <div className="secret-actions"><button className="primary-button" disabled={busy}>{busy ? '保存中…' : '保存'}</button><button type="button" className="secondary-button" disabled={busy} onClick={close}>取消</button></div>
     </form>}
     {loading ? <p role="status">正在读取 Secret…</p> : !items.length ? <div className="connections-empty">尚未创建 Secret。新建后，在项目的“工具权限”中绑定。</div> : <div className="secret-list">{items.map(item => <article className="connection-card" key={item.id}>

@@ -5,6 +5,7 @@ import type { DefaultImageSelection } from '../../../protocol/image-types.js';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import type { Project, Session, Turn } from '../../../protocol/types.js';
 import type { SandboxState } from '../../../protocol/sandbox-types.js';
+import type { NativeSecretFiles } from '../../secrets/native-files.js';
 import { MySqlSecretRepository } from '../../secrets/repository.js';
 import { MySqlNotificationRepository } from '../../notifications/repository.js';
 import { HttpError } from '../../../util/errors.js';
@@ -79,11 +80,11 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   readonly modelRepository: MySqlModelRepository;
   readonly secretRepository: MySqlSecretRepository;
   readonly notificationRepository: MySqlNotificationRepository;
-  constructor(url: string) {
+  constructor(url: string, secretFiles?: NativeSecretFiles) {
     this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' });
     this.previewGrants = new MySqlPreviewGrantStore(this.pool);
     this.modelRepository = new MySqlModelRepository(this.pool);
-    this.secretRepository = new MySqlSecretRepository(this.pool);
+    this.secretRepository = new MySqlSecretRepository(this.pool, secretFiles);
     this.notificationRepository = new MySqlNotificationRepository(this.pool);
   }
   async listImages(): Promise<ImageRecord[]> {
@@ -283,6 +284,6 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   }
 }
 
-export function createWebStateStore(mysqlUrl?: string) {
-  return new MySqlWebStateStore(requireMySqlUrl(mysqlUrl));
+export function createWebStateStore(mysqlUrl?: string, secretFiles?: NativeSecretFiles) {
+  return new MySqlWebStateStore(requireMySqlUrl(mysqlUrl), secretFiles);
 }

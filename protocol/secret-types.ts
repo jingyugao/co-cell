@@ -12,6 +12,9 @@ export interface SecretMetadata {
   version: number; createdAt: string; updatedAt: string; projectIds: string[];
   tool: ProxyTool | null; path: string | null; requiresTextImport: boolean;
   homeProjectId?: string;
+  /** Credential body storage; database is a pre-migration record. */
+  storage?: 'native' | 'database';
+  homeDirectory?: string;
   supportFilePaths?: string[];
   /** Native MySQL login-path names or Kubernetes context names; no credential values. */
   nativeNames?: string[];

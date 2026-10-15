@@ -64,8 +64,9 @@ export function nativeNames(tool: string, source: NativeSource): string[] {
   return tool === 'mysql' ? [...mysqlProfiles(source.content, source.name).keys()] : kubeConfig(source.content).contexts.map(item => item.name);
 }
 
-export function mergedBinding(tool: string, sources: Array<Pick<NativeSource, 'id' | 'name' | 'version'>>) {
-  const revision = createHash('sha256').update(JSON.stringify(sources.map(source => [source.id, source.version, tool === 'mysql' ? source.name : '']).sort((a, b) => String(a[0]).localeCompare(String(b[0]))))).digest('hex');
+export function mergedBinding(tool: string, sources: Array<Pick<NativeSource, 'id' | 'name' | 'version'> & { content?: string }>) {
+  const revision = createHash('sha256').update(JSON.stringify(sources.map(source => [source.id, source.version, tool === 'mysql' ? source.name : '',
+    ...(source.content === undefined ? [] : [createHash('sha256').update(source.content).digest('hex')])]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))))).digest('hex');
   return { tool, secretId: `native-${tool}`, path: nativeConfigPath(tool), version: 0, revision };
 }
 

@@ -29,6 +29,7 @@ import { modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
 import { MySqlCoordinator } from './infra/storage/coordination.js';
 import { SecretCrypto } from './secrets/crypto.js';
+import { NativeSecretFiles } from './secrets/native-files.js';
 import { SecretService } from './secrets/service.js';
 import { SharedFiles } from './shared-files/service.js';
 import { publishSharedDirectory } from './shared-files/mount.js';
@@ -41,7 +42,6 @@ const multiApiFlag = process.env.COCELL_MULTI_API ?? '0';
 if (multiApiFlag !== '0' && multiApiFlag !== '1') throw new Error('COCELL_MULTI_API must be 0 or 1');
 const multiApi = multiApiFlag === '1';
 const coordinator = multiApi ? new MySqlCoordinator(mysqlUrl) : undefined;
-const webState = createWebStateStore(mysqlUrl);
 const port = Number(process.env.PORT || 3000);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be between 1 and 65535');
 const apiKey = process.env.CODEX_API_KEY || process.env.OPENAI_API_KEY;
@@ -75,7 +75,9 @@ const appServerArguments=appServerArgs(modelConfig, configOverrides).slice(1);
 const appServerEnv = {...(apiKey ? {CODEX_API_KEY:apiKey} : {}),
   ...(process.env.CODEX_MODEL_METADATA_JSON ? { CODEX_MODEL_METADATA_JSON: process.env.CODEX_MODEL_METADATA_JSON } : {})};
 const sharedDirectory = await loadSharedMountConfig();
+if (multiApi && !sharedDirectory) throw new Error('Multi-API native credentials require the shared persistent directory');
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
+const webState = createWebStateStore(mysqlUrl, new NativeSecretFiles(resolve(sharedDataRoot, 'runtime/debug-homes'), secretCrypto));
 if (sharedDirectory) {
   const publish = () => publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
   if (coordinator) await coordinator.run('cocell-shared-startup-config', publish);

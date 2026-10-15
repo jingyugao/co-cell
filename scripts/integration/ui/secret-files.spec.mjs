@@ -8,7 +8,7 @@ test('one native credential file preserves uploaded text while projects use the 
     if (path.endsWith('/content')) return route.fulfill({ json: { format: 'text', content: payload.content, requiresTextImport: false, version: 1 } });
     if (request.method() === 'POST') {
       payload = request.postDataJSON();
-      saved = { id: 'native-file', ...payload, enabled: true, version: 1, projectIds: [], requiresTextImport: false, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' };
+      saved = { id: 'native-file', ...payload, storage: 'native', homeDirectory: '/home/debug/credential-fixture', enabled: true, version: 1, projectIds: [], requiresTextImport: false, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' };
       return route.fulfill({ status: 201, json: saved });
     }
     if (request.method() === 'PATCH') { const edit = request.postDataJSON(); edits.push(edit); saved = { ...saved, ...edit }; return route.fulfill({ json: saved }); }
@@ -27,6 +27,8 @@ test('one native credential file preserves uploaded text while projects use the 
   expect(payload.format).toBe('text'); expect(payload.content).toBe(original); expect(payload.files).toBeUndefined();
   expect(payload.path).toBe('.kube/config');
   await page.getByRole('button', { name: '编辑', exact: true }).click();
+  await expect(page.getByText('原生凭据目录：')).toContainText('/home/debug/credential-fixture');
+  await expect(page.getByText('取消登记会撤销工具访问权限，原生配置文件保留在上述目录。', { exact: true })).toBeVisible();
   await page.getByLabel('名称', { exact: true }).fill(name + ' 改名');
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await expect(page.getByText(name + ' 改名', { exact: true })).toBeVisible();

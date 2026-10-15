@@ -78,11 +78,13 @@ export class SecretService {
   }
 
   private metadata(secret: StoredSecret, projectIds: string[] = []): SecretMetadata {
-    const { ciphertext: _ciphertext, currentVersionId: _versionId, alias: _alias, format, ...metadata } = secret;
+    const { ciphertext: _ciphertext, currentVersionId: _versionId, alias: _alias, nativeHome: _nativeHome, format, ...metadata } = secret;
     const bundle = format === 'files' ? this.bundle(secret) : null;
     const native = format === 'lark' ? this.lark(secret) : null;
     const nativeNames = this.profiles(secret);
-    return { ...metadata, ...(format === 'home' ? { homeProjectId: this.homeProject(secret) } : {}), ...(nativeNames ? { nativeNames } : {}), ...(native ? { supportFilePaths: native.supportFiles.map(file => file.path) } : {}), format: format === 'files' ? 'files' : format === 'home' ? 'home' : 'text', requiresTextImport: !['text', 'lark', 'home'].includes(format), projectIds,
+    return { ...metadata, storage: secret.nativeHome ? 'native' : 'database',
+      ...(secret.nativeHome || format === 'home' ? { homeDirectory: `/home/debug/${format === 'home' ? this.homeProject(secret) : secret.nativeHome}` } : {}),
+      ...(format === 'home' ? { homeProjectId: this.homeProject(secret) } : {}), ...(nativeNames ? { nativeNames } : {}), ...(native ? { supportFilePaths: native.supportFiles.map(file => file.path) } : {}), format: format === 'files' ? 'files' : format === 'home' ? 'home' : 'text', requiresTextImport: !['text', 'lark', 'home'].includes(format), projectIds,
       ...(bundle ? { filePaths: bundle.files.map(file => file.path), directory: bundle.directory, adapter: bundle.adapter, identity: bundle.identity } : {}) };
   }
   private lark(secret: StoredSecret): LarkCredential {
@@ -187,6 +189,9 @@ export class SecretService {
       if (nativeContextTool(grant.tool)) {
         const sources = nativeSources.get(grant.tool) ?? []; sources.push(this.nativeSource(secret)); nativeSources.set(grant.tool, sources); continue;
       }
+      // Registered native files are the CLI's writable source of truth.
+      // Consumers share that credential HOME instead of receiving snapshots.
+      if (secret.nativeHome) continue;
       const native = secret.format === 'lark' ? this.lark(secret) : null;
       const content = native ? Buffer.from(native.content).toString('base64') : this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('base64');
       files.push({ tool: grant.tool, secretId: secret.id, path: binding.path, content, mutable: secret.mutable, version: secret.version,
@@ -219,7 +224,10 @@ export class SecretService {
         if (loginPath && !names.includes(loginPath)) throw new HttpError(403, `项目未授权此 MySQL 原生连接；可用连接：${names.join(', ')}`);
         if (!loginPath && names.length > 1 && !checked.includes('--version') && !checked.includes('--help')) throw new HttpError(400, `请用 MySQL 原生 --login-path=名称 选择连接：${names.join(', ')}`);
       }
-      const binding = mergedBinding(tool, secrets);
+      const binding = mergedBinding(tool, secrets.map(secret => this.nativeSource(secret)));
+      // Rebuild only role-selected native connections when their source files
+      // change on disk; neither database writes nor re-import are required.
+      if (secrets.some(secret => secret.nativeHome)) await this.publishHome(identity.projectId);
       if (!this.homes || !await this.homes.ready(identity.projectId, binding)) throw new HttpError(409, '凭证尚未更新到 debug HOME，请重新保存工具选择');
       return { tool, args: checked, home: `/home/debug/${identity.projectId}`, path: binding.path };
     }
@@ -236,6 +244,10 @@ export class SecretService {
     if (!secret.enabled || !['text', 'lark'].includes(secret.format) || (secret.tool && (secret.tool !== tool || secret.path !== binding.path)))
       throw new HttpError(403, '工具凭证已停用或需要重新配置');
     const path = credentialPath(binding.path);
+    if (secret.nativeHome) {
+      if (!this.homes || !await this.homes.hasFile(secret.nativeHome, path)) throw new HttpError(409, '原生凭据目录中缺少认证文件');
+      return { tool, args: checked, home: `/home/debug/${secret.nativeHome}`, path };
+    }
     if (!this.homes || !await this.homes.ready(identity.projectId, { tool, secretId: secret.id, path, version: secret.version }))
       throw new HttpError(409, '凭证尚未更新到 debug HOME，请重新保存工具选择');
     return { tool, args: checked, home: `/home/debug/${identity.projectId}`, path };

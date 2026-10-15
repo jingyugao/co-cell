@@ -43,14 +43,17 @@ export default function SecretManager() {
       setContent(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(await file.arrayBuffer())); setError('');
     } catch { setError('请上传 UTF-8 编码的原始文本文件'); }
   }
+  const homeManaged = editing !== null && editing !== 'new' && editing.format === 'home';
+  const homeProjectId = editing !== null && editing !== 'new' ? editing.homeProjectId : undefined;
   return <>
     <div className="connections-heading"><div><h1>Secret 管理</h1><p>每份 Secret 保存一个原生认证文件；MySQL 和 Kubernetes 可分别配置多个连接。</p></div><button className="primary-button" disabled={busy} onClick={() => void edit()}>新建 Secret</button></div>
     {error && <p className="connections-error" role="alert">{error}</p>}
     {editing && <form className="secret-form" onSubmit={async event => {
       event.preventDefault(); setBusy(true); setError('');
       try {
-        const changed = editing === 'new' || editing.format !== 'text' || editing.requiresTextImport || content !== original;
-        const body = { name, tool: tool.trim(), path, ...(editing === 'new' ? { mutable: true } : {}), ...(changed ? { format: 'text', content } : {}) };
+        const managedHome = editing !== 'new' && editing.format === 'home';
+        const changed = !managedHome && (editing === 'new' || editing.format !== 'text' || editing.requiresTextImport || content !== original);
+        const body = managedHome ? { name } : { name, tool: tool.trim(), path, ...(editing === 'new' ? { mutable: true } : {}), ...(changed ? { format: 'text', content } : {}) };
         if (editing === 'new') await api('/api/secrets', { method: 'POST', body: JSON.stringify(body) });
         else await api(`/api/secrets/${editing.id}`, { method: 'PATCH', body: JSON.stringify(body) });
         close(); await refresh();
@@ -58,21 +61,24 @@ export default function SecretManager() {
     }}>
       <h2>{editing === 'new' ? '新建 Secret' : `编辑 ${editing.name}`}</h2>
       <label>名称<input required maxLength={100} value={name} onChange={e => setName(e.target.value)} /></label>
-      <label>工具名<input required maxLength={64} pattern={TOOL_NAME_PATTERN.source} value={tool} onChange={e => setTool(e.target.value)} placeholder="例如 mysql、kubectl 或自定义 CLI 名称" /></label>
-      <label>认证文件路径<input required maxLength={256} value={path} onChange={e => setPath(e.target.value)} placeholder="例如 .my.cnf、.kube/config" /></label>
-      {tool.trim() === 'mysql' ? <p>使用原生 login-path 选项组，例如 [doris]。角色授权的连接会合并为 .mylogin.cnf，通过 mysql --login-path=doris 使用；仅含 [client] 的文件使用凭证名称作为连接名。</p>
+      <label>工具名<input required maxLength={64} pattern={TOOL_NAME_PATTERN.source} value={tool} readOnly={homeManaged} onChange={e => setTool(e.target.value)} placeholder="例如 mysql、kubectl 或自定义 CLI 名称" /></label>
+      <label>认证文件路径<input required maxLength={256} value={path} readOnly={homeManaged} onChange={e => setPath(e.target.value)} placeholder="例如 .my.cnf、.kube/config" /></label>
+      {homeManaged ? <p>由项目 HOME 管理 · 来源项目 {homeProjectId ?? '未知'}</p>
+        : tool.trim() === 'mysql' ? <p>使用原生 login-path 选项组，例如 [doris]。角色授权的连接会合并为 .mylogin.cnf，通过 mysql --login-path=doris 使用；仅含 [client] 的文件使用凭证名称作为连接名。</p>
         : tool.trim() === 'kubectl' ? <p>上传原生 kubeconfig。角色授权的账户会合并到 .kube/config，保留 context 原名，通过 kubectl --context=名称 使用。</p>
           : <p>路径相对于 debug HOME。内容按 UTF-8 文本原样使用。</p>}
-      {editing !== 'new' && (editing.requiresTextImport || editing.format !== 'text') && <p className="connections-error">旧格式需要重新导入一个原生文本认证文件。</p>}
-      <label>上传文件<input type="file" onChange={e => void upload(e.target.files?.[0])} /></label>
-      <label>认证内容<textarea required spellCheck={false} autoComplete="off" rows={12} value={content} onChange={e => setContent(e.target.value)} placeholder="粘贴工具原生认证文件的完整文本内容" /></label>
+      {editing !== 'new' && !homeManaged && (editing.requiresTextImport || editing.format !== 'text') && <p className="connections-error">旧格式需要重新导入一个原生文本认证文件。</p>}
+      {!homeManaged && <>
+        <label>上传文件<input type="file" onChange={e => void upload(e.target.files?.[0])} /></label>
+        <label>认证内容<textarea required spellCheck={false} autoComplete="off" rows={12} value={content} onChange={e => setContent(e.target.value)} placeholder="粘贴工具原生认证文件的完整文本内容" /></label>
+      </>}
       {editing !== 'new' && editing.supportFilePaths?.length ? <p>此凭证包含 {editing.supportFilePaths.length} 个原生密钥和令牌文件，编辑配置时会保留；取消角色授权时一并移除。</p> : null}
-      <p>管理员保存的内容及历史加密存储。工具自行刷新的凭证保留在挂载目录，管理员更新内容时覆盖对应文件。</p>
+      {!homeManaged && <p>管理员保存的内容及历史加密存储。工具自行刷新的凭证保留在挂载目录，管理员更新内容时覆盖对应文件。</p>}
       <div className="secret-actions"><button className="primary-button" disabled={busy}>{busy ? '保存中…' : '保存'}</button><button type="button" className="secondary-button" disabled={busy} onClick={close}>取消</button></div>
     </form>}
     {loading ? <p role="status">正在读取 Secret…</p> : !items.length ? <div className="connections-empty">尚未创建 Secret。新建后，在项目的“工具权限”中绑定。</div> : <div className="secret-list">{items.map(item => <article className="connection-card" key={item.id}>
       <div className="connection-profile-title"><strong>{item.name}</strong><span>{item.enabled ? '启用' : '停用'}</span></div>
-      <p>{item.tool ?? '待填写工具'} · {item.path ?? '待填写路径'}{item.supportFilePaths?.length ? ` · ${item.supportFilePaths.length} 个令牌辅助文件` : ''} · v{item.version} · {item.projectIds.length} 个项目{(item.requiresTextImport || item.format !== 'text') && ' · 需重新导入单文件'}</p>
+      <p>{item.format === 'home' ? `由项目 HOME 管理 · 来源项目 ${item.homeProjectId ?? '未知'}` : `${item.tool ?? '待填写工具'} · ${item.path ?? '待填写路径'}${item.supportFilePaths?.length ? ` · ${item.supportFilePaths.length} 个令牌辅助文件` : ''}`} · v{item.version} · {item.projectIds.length} 个项目{item.format !== 'home' && (item.requiresTextImport || item.format !== 'text') && ' · 需重新导入单文件'}</p>
       <p>最近更新 {new Date(item.updatedAt).toLocaleString()}</p>
       <div className="secret-actions"><button className="secondary-button" disabled={busy} onClick={() => void edit(item)}>编辑</button><button className="secondary-button" disabled={busy} onClick={async () => {
         setBusy(true); setError(''); try { await api(`/api/secrets/${item.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !item.enabled }) }); await refresh(); } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }

@@ -1,5 +1,6 @@
 import { createPreviewProxy } from './projects/preview-proxy.js';
-import { readManagedRequirementInfo } from './projects/requirements.js';
+import { readSystemRequirementInfo } from './projects/requirements.js';
+import { SystemTools } from './execution/system-tools.js';
 import { ModelService } from './models/service.js';
 import { DirectModelProvider } from './models/direct-provider.js';
 import { initializeTracing } from './infra/diagnostics/tracing.js';
@@ -85,7 +86,7 @@ if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOK
 const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,clientId:process.env.CELLBOX_CLIENT_ID,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',stateDirectory:resolve('data/cellbox-operations')});
 await cellboxProvider.initialize();
 let manager: SessionManager;
-const secrets = new SecretService(webState.secretRepository, secretCrypto);
+const secrets = new SecretService(webState.secretRepository, secretCrypto, async id => (await webState.getProject(id))?.status === 'active');
 if (sharedDirectory) await secrets.mountHomes(sharedDataRoot, coordinator);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
   error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); }, multiApi ? 0 : undefined);
@@ -123,6 +124,8 @@ const sandboxManager = new SandboxManager({ provider, logger: runtimeLog,
   // Project lifecycle owns idle checkpoints so every pause includes its disk backup.
   policy: { autoCheckpointAfterMs: Number.MAX_SAFE_INTEGER }, lifecycle: cellboxRuntime.lifecycle });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
+const systemTools = new SystemTools({ projects: () => webState.listProjects(), enter: id => manager.enterProject(id),
+  acquireUsage: id => cellboxRuntime.acquireUsage(id), execute: (id, tool, args) => cellboxProvider.client.runTool(id, tool, args, 40_000) });
 const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
   resolveModel: session => modelProvider.threadOptions(session),
@@ -140,7 +143,7 @@ if (!Number.isFinite(archivedReclaimAfterMs) || archivedReclaimAfterMs < 0) thro
 manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtime, sandboxWorkingDirectory, runtimeLog,
   webImagesDirectory, {
     onProjectCreate: projectId => secrets.repository.roles.assignDefault(projectId),
-    requirementInfo: url => readManagedRequirementInfo(url, secrets),
+    requirementInfo: url => readSystemRequirementInfo(url, systemTools),
     archivedReclaimAfterMs,
     autoCheckpointAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),

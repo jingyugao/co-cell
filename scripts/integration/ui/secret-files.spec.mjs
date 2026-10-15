@@ -61,3 +61,40 @@ test('legacy file groups require explicit single-file import and binary uploads 
   await expect(page.getByRole('textbox', { name: '认证内容', exact: true })).toHaveCount(0);
   expect(updated.format).toBe('text'); expect(updated.content).toBe('native-fixture'); expect(updated.files).toBeUndefined();
 });
+
+test('project HOME references are read-only except for rename and never show legacy import warnings', async ({ page, ui }) => {
+  const sourceProjectId = '00000000-0000-4000-8000-000000000123';
+  let saved = { id: 'home-reference', name: '项目登录', tool: 'meegle', path: '.meegle/config.json', format: 'home', mutable: true, enabled: true,
+    version: 4, projectIds: [], requiresTextImport: false, homeProjectId: sourceProjectId,
+    createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' };
+  let patchBody;
+  const nativeHomeFile = { path: '.meegle/credentials.enc', content: 'refreshed-by-project-cli' };
+  await page.route('**/api/secrets**', async route => {
+    const request = route.request(), path = new URL(request.url()).pathname;
+    if (path.endsWith('/content')) return route.fulfill({ json: { format: 'home', content: '', requiresTextImport: false, version: saved.version, homeProjectId: sourceProjectId } });
+    if (request.method() === 'PATCH') {
+      patchBody = request.postDataJSON();
+      if (patchBody.content !== undefined) nativeHomeFile.content = patchBody.content;
+      saved = { ...saved, ...patchBody };
+      return route.fulfill({ json: saved });
+    }
+    await route.fulfill({ json: [saved] });
+  });
+  await page.goto('/#connections');
+  await expect(page.getByText('由项目 HOME 管理 · 来源项目 ' + sourceProjectId).first()).toBeVisible();
+  await expect(page.getByText('需重新导入单文件', { exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: '编辑', exact: true }).click();
+  await expect(page.getByText('由项目 HOME 管理 · 来源项目 ' + sourceProjectId).first()).toBeVisible();
+  await expect(page.getByText('旧格式需要重新导入一个原生文本认证文件。', { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('工具名', { exact: true })).toHaveJSProperty('readOnly', true);
+  await expect(page.getByLabel('认证文件路径', { exact: true })).toHaveJSProperty('readOnly', true);
+  await expect(page.getByRole('textbox', { name: '认证内容', exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('上传文件', { exact: true })).toHaveCount(0);
+  await page.getByLabel('名称', { exact: true }).fill('项目登录改名');
+  await page.getByRole('button', { name: '保存', exact: true }).click();
+  await expect(page.getByText('项目登录改名', { exact: true })).toBeVisible();
+  expect(patchBody).toEqual({ name: '项目登录改名' });
+  expect(nativeHomeFile).toEqual({ path: '.meegle/credentials.enc', content: 'refreshed-by-project-cli' });
+  await expect(page.getByText('需重新导入单文件', { exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});

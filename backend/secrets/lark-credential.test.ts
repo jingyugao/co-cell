@@ -14,6 +14,22 @@ const supports = (): SecretSupportFile[] => [
 ];
 const input = (): SecretInput => ({ name: 'Lark user fixture', tool: 'lark-cli', path: '.lark-cli/config.json', format: 'text', mutable: true, content: config, supportFiles: supports() });
 
+test('moving a native Lark credential to its owner HOME preserves all keychain companion files', async () => {
+  const { service, projectId } = fixture(); await service.init();
+  const root = await mkdtemp(join(tmpdir(), 'cocell-lark-home-ref-')); await service.mountHomes(root);
+  try {
+    const secret = await service.create(input());
+    const role = await service.roles.save({ name: 'Lark owner', connections: [{ tool: 'lark-cli', secretId: secret.id }] });
+    await service.roles.assign(projectId, role.id); await service.publishHome(projectId);
+    const home = join(root, 'runtime/debug-homes', projectId), token = join(home, supports()[2].path);
+    await writeFile(token, 'refreshed-lark-token');
+    await service.update(secret.id, { format: 'home', homeProjectId: projectId });
+    assert.equal(await readFile(token, 'utf8'), 'refreshed-lark-token');
+    for (const file of supports().slice(0, 2)) assert.deepEqual(await readFile(join(home, file.path)), Buffer.from(file.content, 'base64'));
+    await service.publishHome(projectId); assert.equal(await readFile(token, 'utf8'), 'refreshed-lark-token');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('Lark user import provisions and revokes all native files while preserving token refresh and editable config', async () => {
   const { service, repository, projectId } = fixture(); await service.init();
   const root = await mkdtemp(join(tmpdir(), 'cocell-lark-'));

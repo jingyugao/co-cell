@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -79,6 +80,76 @@ test('native threads use channels directly and preserve history across endpoint 
     for (const message of ['Remember the first message', 'Second message', 'Third message', 'Fourth message', 'Fifth message', 'After restart']) {
       assert.match(requests[5].input, new RegExp(message));
     }
+  } finally {
+    await codex?.close(); await client?.close();
+    await new Promise<void>(done => { upstream.closeAllConnections(); upstream.close(() => done()); });
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('native streaming failures retain the upstream cause after adopting the Codex transport identity', { timeout: 30_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cocell-stream-error-'));
+  const overload = { type: 'service_unavailable_error', code: 'server_is_overloaded',
+    message: 'Our servers are currently overloaded. Please try again later.' };
+  let upstreamError: typeof overload | undefined = overload;
+  const requests: Array<{ originator?: string; input: string }> = [];
+  const upstream = createServer(async (req, res) => {
+    let input = ''; for await (const chunk of req) input += chunk;
+    const originator = String(req.headers.originator ?? '');
+    requests.push({ originator, input });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: response.created\ndata: {"type":"response.created","response":{"id":"resp_test","status":"in_progress","output":[]}}\n\n');
+    if (upstreamError) {
+      // CLIProxyAPI v7.2.154 selects this wire format by the request's Codex
+      // identity. Its generic error event is ignored by the real Codex parser.
+      const event = originator === 'codex_cli_rs'
+        ? { type: 'response.failed', sequence_number: 0, response: { status: 'failed', error: upstreamError } }
+        : { type: 'error', sequence_number: 0, code: upstreamError.code, message: upstreamError.message };
+      res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+    res.end();
+  });
+  await new Promise<void>(done => upstream.listen(0, '127.0.0.1', done));
+  const endpoint = `http://127.0.0.1:${(upstream.address() as { port: number }).port}/v1`;
+  const selected = { model: 'gpt-6-sol', modelEntryId: 'entry', channelId: 'legacy-default', endpoint, apiKey: '' };
+  const provider = new DirectModelProvider({ selection: async () => selected } as unknown as ModelService, true);
+  const options = await provider.threadOptions({ settings: { model: selected.model } } as Session);
+  const oldProvider = `cocell_direct_${createHash('sha256').update(JSON.stringify([selected.channelId, endpoint, ''])).digest('hex')}`;
+  const { http_headers: _, ...oldConfig } = Object.values(options.providerConfig!)[0] as Record<string, unknown>;
+  let client: CodexAppServerClient | undefined;
+  let codex: Codex | undefined;
+  try {
+    client = await CodexAppServerClient.spawn({ command: resolve('node_modules/.bin/codex'), args: ['app-server'], cwd: home,
+      env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, NO_PROXY: '127.0.0.1,localhost' } });
+    codex = new Codex({ appServerClient: client });
+    const common = { workingDirectory: home, sandboxMode: 'read-only' as const, approvalPolicy: 'never' as const, webSearchMode: 'disabled' as const };
+    const failure = async (thread: Thread, prompt: string) => {
+      const events = [];
+      for await (const event of (await thread.runStreamed(prompt)).events) events.push(event);
+      const last = events.at(-1);
+      assert.equal(last?.type, 'turn.failed');
+      if (last?.type !== 'turn.failed') throw new Error('Expected failed turn');
+      const stored = await client!.request('thread/read', { threadId: thread.id, includeTurns: true });
+      assert.equal(stored.thread.turns.at(-1).error.message, last.error.message, 'history must retain the live failure');
+      return last.error.message;
+    };
+    const legacy = codex.startThread({ ...common, model: selected.model, modelProvider: oldProvider,
+      providerConfig: { [`model_providers.${oldProvider}`]: { ...oldConfig, name: oldProvider } } });
+    assert.match(await failure(legacy, 'Original request.'), /stream closed before response.completed/);
+    assert.equal(requests[0].originator, 'co_cell_app_server_client');
+
+    const migrated = codex.resumeThread(legacy.id!, { ...common, ...options });
+    assert.equal(await failure(migrated, 'Continue the original request.'), 'Selected model is at capacity. Please try a different model.');
+    assert.notEqual(migrated.id, legacy.id, 'already loaded providers must adopt the new header through a history fork');
+    assert.equal(requests[1].originator, 'codex_cli_rs');
+    assert.match(requests[1].input, /Original request/);
+
+    upstreamError = { type: 'server_error', code: 'upstream_failure', message: 'The upstream inference worker is unavailable.' };
+    assert.match(await failure(migrated, 'Retry with an upstream error.'), /The upstream inference worker is unavailable\./);
+    upstreamError = undefined;
+    assert.match(await failure(migrated, 'Retry with a disconnected stream.'), /stream closed before response.completed/,
+      'a later disconnect must not reuse an earlier upstream error');
+    assert.equal(requests.length, 4);
   } finally {
     await codex?.close(); await client?.close();
     await new Promise<void>(done => { upstream.closeAllConnections(); upstream.close(() => done()); });

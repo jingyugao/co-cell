@@ -25,7 +25,7 @@ import { AppServerReader } from './execution/app-server-reader.js';
 import { ProjectSandboxes } from './sandboxes/project-sandboxes.js';
 import { RuntimeLog } from './infra/diagnostics/runtime-log.js';
 import { installProductionStatic } from './infra/http/static-files.js';
-import { modelProxyKind } from './execution/model-proxy.js';
+import { CODEX_MODEL_HTTP_HEADERS, modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
 import { MySqlCoordinator } from './infra/storage/coordination.js';
 import { SecretCrypto } from './secrets/crypto.js';
@@ -49,6 +49,7 @@ const proxyKind = modelProxyKind();
 const sdkConfig = process.env.CODEX_CONFIG_JSON ? JSON.parse(process.env.CODEX_CONFIG_JSON) : {};
 const proxyConfig = process.env.OPENAI_BASE_URL ? { model_provider: 'codex_web_proxy', model_providers: { codex_web_proxy: {
   name: 'Codex Web proxy', base_url: process.env.OPENAI_BASE_URL, wire_api: 'responses', supports_websockets: false,
+  http_headers: CODEX_MODEL_HTTP_HEADERS,
   ...(apiKey ? { env_key: 'CODEX_API_KEY' } : { requires_openai_auth: true }),
   ...(proxyKind === 'cliproxyapi' || proxyKind === 'litellm' ? { request_max_retries: 0, stream_max_retries: 0 } : {}),
 } } } : {};

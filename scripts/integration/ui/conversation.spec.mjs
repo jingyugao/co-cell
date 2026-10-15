@@ -1,5 +1,30 @@
 import { test, expect } from './fixture.mjs';
 
+test('upstream model errors appear in the failed turn and survive a page reload', async ({ page, ui }) => {
+  ui.complete('paused');
+  const session = ui.sessions.get('old-session');
+  const error = 'Selected model is at capacity. Please try a different model.';
+  const turn = { id: 'overloaded-turn', nativeTurnId: 'overloaded-turn', prompt: 'Continue my task',
+    images: [], items: [], status: 'running', codexAccepted: true, startedAt: session.createdAt };
+  session.status = 'failed';
+  session.turns = [{ ...turn, status: 'failed', error, completedAt: session.createdAt }];
+  let opened = false;
+  await page.route('**/api/sessions/old-session/events', async route => {
+    const messages = opened ? [{ type: 'snapshot', session }] : [
+      { type: 'snapshot', session: { ...session, status: 'running', turns: [turn] } },
+      { type: 'sdk', turnId: turn.id, event: { type: 'turn.failed', error: { message: error } } },
+    ];
+    opened = true;
+    await route.fulfill({ contentType: 'text/event-stream', body: messages.map(message => `data: ${JSON.stringify(message)}\n\n`).join('') });
+  });
+  await page.goto('/sessions/old-session');
+  await expect(page.locator('.turn .inline-error')).toHaveText(error);
+  await expect(page.locator('.assistant-header')).toContainText('失败');
+  await page.reload();
+  await expect(page.locator('.turn .inline-error')).toHaveText(error);
+  await expect(page.getByText('stream closed before response.completed', { exact: false })).toHaveCount(0);
+});
+
 test('subagent read failures retry after readiness and clear the warning on success', async ({ page, ui }) => {
   ui.complete('paused');
   let reads = 0;

@@ -59,11 +59,19 @@ test('release a Box and recreate it with the same independent workspace volume',
       assert.deepEqual(created.sandboxMounts, project.sandboxMounts,
         'Create must retain the same project volume attachment');
       assert(workspaceHasPersistentVolume(created.sandbox), 'Replacement Box must report a persistent workspace volume');
+      assert.equal(created.sandbox.image?.templateId, project.imageSelection.templateId,
+        'Create must stay within the project template');
+      assert(created.sandbox.image?.revisionId, 'Cellbox must report the actual revision admitted for the new Box');
+      assert.equal(created.imageSelection.revisionId, created.sandbox.image.revisionId,
+        'The project must retain the actual admitted revision rather than its previous selection');
+      assert.equal(created.imageSelection.image, created.sandbox.image.reference,
+        'The project image snapshot must describe the new Box');
 
       const file = await env.request(`/api/projects/${project.id}/files/content?path=${encodeURIComponent(`/home/agent/workspace/${filename}`)}`);
       assert.equal(file.buffer.toString(), marker, 'Workspace file must survive Box release and recreation');
       return { projectId: project.id, oldBoxId: originalBox.id, newBoxId: created.sandbox.id,
-        homeVolumeId: created.sandbox.homeVolumeId, mounts: created.sandbox.mounts };
+        homeVolumeId: created.sandbox.homeVolumeId, mounts: created.sandbox.mounts,
+        templateId: created.sandbox.image.templateId, revisionId: created.sandbox.image.revisionId };
     });
   } finally {
     await releaseActiveBoxOnce();

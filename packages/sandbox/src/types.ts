@@ -44,6 +44,8 @@ export interface SandboxInfo {
   /** Provider capabilities observed with this state snapshot. */
   capabilities?: Record<string, boolean | string>;
   templateIdentity?: {
+    templateId?: string;
+    revisionId?: string;
     reference: string;
     id: string;
     repoDigests: string[];

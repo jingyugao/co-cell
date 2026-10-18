@@ -269,7 +269,10 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
         ...(box.operationId ? { operationId: box.operationId } : {}),
         ...(box.executionId ? { executionId: box.executionId } : {}) },
       capabilities: { ...box.capabilities },
-      templateIdentity: { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] } };
+      templateIdentity: { reference: box.image, id: box.imageId ?? box.image, repoDigests: [],
+        ...(box.templateId ? { templateId: box.templateId } : {}),
+        ...(box.revisionId ? { revisionId: box.revisionId } : {}),
+        ...(box.templateVersion ? { version: box.templateVersion } : {}) } };
   }
   async pause(id: string) {
     await this.act(id, 'suspend');
@@ -339,17 +342,18 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     for (const box of checkpoints) if (!byId.has(box.id)) byId.set(box.id, box);
     return [...byId.values()];
   }
-  async currentImageIdentity(id?: string) {
+  async currentImageIdentity(id?: string): Promise<NonNullable<SandboxInfo['templateIdentity']>> {
     if (id) { const box = await this.box(id); return { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] as string[] }; }
     await this.ready();
-    if (this.revisionId) {
-      const revision = await this.client.getTemplateRevision(this.revisionId);
-      return { reference: revision.image, id: revision.image, repoDigests: [revision.image] };
+    let revisionId = this.revisionId;
+    if (!revisionId) {
+      const template = await this.client.getTemplate(this.templateId!);
+      if (!template.stableRevisionId) throw new CellboxError('NOT_FOUND', `Template ${template.id} has no stable revision`);
+      revisionId = template.stableRevisionId;
     }
-    const template = await this.client.getTemplate(this.templateId!);
-    if (!template.stableRevisionId) throw new CellboxError('NOT_FOUND', `Template ${template.id} has no stable revision`);
-    const revision = await this.client.getTemplateRevision(template.stableRevisionId);
-    return { reference: revision.image, id: revision.image, repoDigests: [revision.image] };
+    const revision = await this.client.getTemplateRevision(revisionId);
+    return { reference: revision.image, id: revision.image, repoDigests: [revision.image],
+      templateId: revision.templateId, revisionId: revision.id, version: revision.version };
   }
   /** Backend and preview connections both use the direct internal endpoint. */
   async getServiceAccess(id: string, port: number): Promise<CellboxServiceAccess> {

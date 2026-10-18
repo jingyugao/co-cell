@@ -339,19 +339,43 @@ test('sibling sessions share one sandbox and a stable project persistence callba
   } finally { await manager.close(); }
 });
 
-test('project revision selection reaches sandbox creation and overrides the default image identity', async () => {
+test('creation selects the project template stable revision and reuses retained mounts and owner', async () => {
   const { provider, manager, projects, target, sandbox } = fixture();
   const selection = { imageId: 'python', imageName: 'Python', category: '开发', versionId: 'v1', version: 'v1',
-    revisionId: 'python-r1', image: 'registry/python@sha256:pinned' };
+    templateId: 'python-template', revisionId: 'python-r1', image: 'registry/python@sha256:pinned' };
   target.imageSelection = selection;
+  target.sandboxOwnerKey = 'project:restored-owner';
+  target.sandboxMounts = [{ volumeId: 'retained-volume', mountPath: '/home/agent' }];
   provider.create = async (_template, options) => {
-    assert.equal(options.metadata?.cellboxRevisionId, selection.revisionId);
+    assert.equal(options.metadata?.cellboxTemplateId, selection.templateId);
+    assert.equal(options.metadata?.cellboxRevisionId, undefined, 'an old project revision must not pin a new Box');
+    assert.equal(options.metadata?.cellboxOwnerKey, target.sandboxOwnerKey);
+    assert.deepEqual(JSON.parse(options.metadata!.cellboxMounts), target.sandboxMounts);
     return sandbox;
   };
-  const runtime = new ContainerCodexRuntime({ paths: runtimePaths, prepareRemote: async () => false, provider, apiKey: '', sandboxes: projects });
+  const actualImage = { templateId: selection.templateId, revisionId: 'python-r2', version: 'v2',
+    reference: 'registry/python@sha256:stable', id: 'registry/python@sha256:stable', repoDigests: [] };
+  provider.getInfo = async () => ({ sandboxId: sandbox.sandboxId, state: 'running', startedAt: new Date(),
+    metadata: { ownerKey: target.sandboxOwnerKey! }, mounts: target.sandboxMounts, templateIdentity: actualImage });
   try {
     const lease = await projects.acquire(target, { create: true, save: async () => {} });
-    assert.equal((await runtime.currentImageIdentity(target)).id, selection.image);
+    assert.deepEqual(target.sandbox?.image, actualImage, 'record the actual stable revision returned by Cellbox');
+    assert.deepEqual(target.sandbox?.mounts, target.sandboxMounts);
+    assert.equal(target.sandbox?.ownerKey, target.sandboxOwnerKey);
+    await lease.release();
+  } finally { await manager.close(); }
+});
+
+test('creation without a saved image selection uses the configured template rather than its pinned bootstrap revision', async () => {
+  const { provider, manager, target, sandbox } = fixture();
+  const projects = new ProjectSandboxes(manager, 'base', 'tpl-bootstrap');
+  provider.create = async (_template, options) => {
+    assert.equal(options.metadata?.cellboxTemplateId, 'tpl-bootstrap');
+    assert.equal(options.metadata?.cellboxRevisionId, undefined);
+    return sandbox;
+  };
+  try {
+    const lease = await projects.acquire(target, { create: true, save: async () => {} });
     await lease.release();
   } finally { await manager.close(); }
 });

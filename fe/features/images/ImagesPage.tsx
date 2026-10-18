@@ -62,7 +62,7 @@ export default function ImagesPage({ onMenu, onBack }: { onMenu: () => void; onB
         onDefault={async versionId => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/${encodeURIComponent(versionId)}/default`, {}); await reload(); }}
         onSync={async (input: SyncImageVersionInput) => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/sync`, input); }}
         /> : <>
-        <div className="projects-heading"><div><span className="projects-eyebrow">IMAGE REPOSITORIES</span><h1>镜像管理</h1><p>新项目使用 CoCell 选择的默认 revision；Cellbox stable revision 与 warmSlots 独立管理。</p></div><button className="primary-button" disabled={busy || adding} onClick={() => setAdding(true)}>＋ 添加仓库</button></div>
+        <div className="projects-heading"><div><span className="projects-eyebrow">IMAGE REPOSITORIES</span><h1>镜像管理</h1><p>CoCell 默认选择决定新项目使用的 template；新建 Sandbox 使用该 template 的 stable revision，已有 Sandbox 不受影响。</p></div><button className="primary-button" disabled={busy || adding} onClick={() => setAdding(true)}>＋ 添加仓库</button></div>
         {adding && <div className="project-create-panel"><RepositoryForm categories={categories} busy={busy} onCancel={() => setAdding(false)} onSubmit={async (input: AddImageRepositoryInput) => {
           const next = await mutate('/api/images/repositories', input);
           if (next) { setAdding(false); setSelectedId(next.id); }

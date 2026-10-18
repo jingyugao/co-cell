@@ -36,7 +36,7 @@ async function imageRoutes(page, initial = initialImages()) {
 test('CoCell default revision can move within a repository without changing Cellbox defaults', async ({ page, ui }) => {
   const { reads, writes } = await imageRoutes(page);
   await page.goto('/#images');
-  await expect(page.getByText('新项目使用 CoCell 选择的默认 revision；Cellbox stable revision 与 warmSlots 独立管理。')).toBeVisible();
+  await expect(page.getByText('CoCell 默认选择决定新项目使用的 template；新建 Sandbox 使用该 template 的 stable revision，已有 Sandbox 不受影响。')).toBeVisible();
 
   await page.getByRole('article').filter({ hasText: 'Managed Runtime' }).getByRole('button', { name: '进入仓库' }).click();
   const managedVersion = page.locator('.image-version').filter({ hasText: '2.0' });
@@ -75,9 +75,9 @@ test('new-project picker names the configured default without sending an explici
   await page.getByRole('button', { name: '＋ 创建项目' }).click();
   const form = page.getByRole('form', { name: '创建项目' });
   const imageType = form.getByLabel('镜像类型');
-  await expect(imageType.locator('option').first()).toHaveText('系统默认镜像 · 系统基础镜像 node-22');
+  await expect(imageType.locator('option').first()).toHaveText('系统默认镜像 · 系统基础镜像');
   await expect(imageType).toHaveValue('');
-  await expect(form.getByText('未指定镜像时，新项目使用配置的默认 revision：系统基础镜像 · node-22。CoCell 默认选择不修改 Cellbox stable 或 warmSlots。')).toBeVisible();
+  await expect(form.getByText('未指定镜像时，新项目使用 CoCell 默认 template：系统基础镜像；新建 Sandbox 时使用该 template 当前的 stable revision。CoCell 默认选择只决定 template，不修改 Cellbox stable 或 warmSlots。')).toBeVisible();
   await form.getByLabel('项目名称').fill('默认镜像测试');
   await form.getByRole('button', { name: '创建项目', exact: true }).click();
   await expect.poll(() => createBody).toBeDefined();
@@ -85,12 +85,12 @@ test('new-project picker names the configured default without sending an explici
   await expect(form.getByRole('alert')).toHaveText('capture only');
 });
 
-test('a default revision remains selectable when a newer revision reuses its tag', async ({ page, ui }) => {
+test('new-project image selection chooses a template, not a revision that create will not use', async ({ page, ui }) => {
   const images = initialImages();
   images[0].defaultVersionId = 'new-revision';
   images[0].versions = [
-    version('new-revision', '1.0', { image: 'registry.example/runtime@sha256:' + 'b'.repeat(64) }),
-    version('old-revision', '1.0', { image: 'registry.example/runtime@sha256:' + 'a'.repeat(64), isDefault: true }),
+    version('new-revision', '1.0', { image: 'registry.example/runtime@sha256:' + 'b'.repeat(64), isDefault: true }),
+    version('old-revision', '1.0', { image: 'registry.example/runtime@sha256:' + 'a'.repeat(64) }),
   ];
   images[2].versions[0].isDefault = false;
   await imageRoutes(page, images);
@@ -105,10 +105,9 @@ test('a default revision remains selectable when a newer revision reuses its tag
   const form = page.getByRole('form', { name: '创建项目' });
   await form.getByLabel('镜像类型').selectOption('Node');
   await form.getByLabel('镜像', { exact: true }).selectOption('managed');
-  const versions = form.getByLabel('版本', { exact: true });
-  await expect(versions).toHaveValue('old-revision');
-  await expect(versions.locator('option')).toHaveText(['请选择版本', '1.0 · bbbbbbbbbbbb', '1.0 · 默认镜像 · aaaaaaaaaaaa']);
+  await expect(form.getByLabel('版本', { exact: true })).toHaveCount(0);
+  await expect(form.getByText('这里选择 Cellbox template，不固定镜像版本；新建 Sandbox 时使用该 template 当前的 stable revision。已有 Sandbox 不受影响。')).toBeVisible();
   await form.getByLabel('项目名称').fill('旧版默认镜像');
   await form.getByRole('button', { name: '创建项目', exact: true }).click();
-  await expect.poll(() => createBody?.imageVersionId).toBe('old-revision');
+  await expect.poll(() => createBody?.imageVersionId).toBe('new-revision');
 });

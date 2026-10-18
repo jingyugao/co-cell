@@ -149,6 +149,33 @@ test('resume metadata status-only callbacks are no-ops, while pausedAt and activ
   assert.equal(service.get('project-1').sandbox?.lastActiveAt, '2026-09-03T00:00:00.000Z');
 });
 
+test('release then create preserves volumes and persists the actual stable revision across restart', async () => {
+  const value = project();
+  value.imageSelection = { imageId: 'python', imageName: 'Python', category: '开发', templateId: 'tpl-python',
+    revisionId: 'rev-old', versionId: 'rev-old', version: '1.0-r1', image: 'python@sha256:old' };
+  const mounts = [{ volumeId: 'retained-home', mountPath: '/home/agent' }];
+  value.sandbox = { ...value.sandbox!, mounts, ownerKey: 'project:actual-owner' };
+  const state = new MemoryState([value]);
+  const service = new ProjectService(state);
+  await service.init();
+  await service.releaseSandbox(value.id, value.sandbox);
+  assert.equal(service.get(value.id).imageSelection?.revisionId, 'rev-old');
+
+  const image = { templateId: 'tpl-python', revisionId: 'rev-stable', version: '2.0-r1',
+    reference: 'python@sha256:stable', id: 'sha256:stable', repoDigests: [] };
+  await service.updateSandbox(value.id, { ...value.sandbox, id: 'new-box', image }, false, undefined, null);
+  assert.deepEqual(service.get(value.id).imageSelection, { ...value.imageSelection,
+    revisionId: 'rev-stable', versionId: 'rev-stable', version: '2.0-r1', image: image.reference });
+  assert.deepEqual(service.get(value.id).sandboxMounts, mounts);
+  assert.equal(service.get(value.id).sandboxOwnerKey, 'project:actual-owner');
+
+  const restarted = new ProjectService(state);
+  await restarted.init();
+  assert.equal(restarted.get(value.id).imageSelection?.revisionId, 'rev-stable');
+  assert.deepEqual(restarted.get(value.id).sandbox?.image, image);
+  await service.close(); await restarted.close();
+});
+
 test('project can be viewed and edited while a Sandbox operation is running', async () => {
   const value = project();
   value.sandboxOperation = { id: 'resume-1', kind: 'resume', phase: '恢复中', status: 'running', updatedAt: value.updatedAt };

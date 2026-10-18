@@ -65,12 +65,27 @@ test('abnormal and missing sandboxes use the recovery-or-first-create paths', ()
 
 test('a released project offers new Sandbox and explicit backup restore independently', () => {
   const html = page([project({
+    imageSelection: { imageId: 'node', imageName: 'Node Runtime', category: 'Node', versionId: 'old-entry', version: '1.0', templateId: 'node-template', revisionId: 'old-entry', image: 'registry.example/node:1.0' },
     latestBackup: backup,
     sandboxMounts: [{ volumeId: 'project-volume', mountPath: '/workspace' }],
   })]);
   assert.match(html, /新建 Sandbox/);
   assert.match(html, /从备份恢复/);
+  assert.match(html, /Node Runtime · Cellbox stable/);
+  assert.doesNotMatch(html, /Node Runtime · 1\.0/);
   assert.match(html, /保留的挂载盘[\s\S]*\/workspace[\s\S]*project-volume/);
+});
+
+test('a running sandbox card shows the observed image version and revision instead of the saved template entry', () => {
+  const html = page([project({
+    imageSelection: { imageId: 'node', imageName: 'Node Runtime', category: 'Node', versionId: 'old-entry', version: '1.0', templateId: 'node-template', revisionId: 'old-entry', image: 'registry.example/node:1.0' },
+    sandbox: { id: 'current', status: 'ready', template: 'default', workingDirectory: '/workspace', image: {
+      reference: 'registry.example/node@sha256:current', id: 'sha256:current', repoDigests: [],
+      templateId: 'node-template', revisionId: 'stable-current', version: '2.0',
+    } },
+  })]);
+  assert.match(html, /项目镜像[\s\S]*2\.0 · revision stable-current/);
+  assert.doesNotMatch(html, /Node Runtime · 1\.0/);
 });
 
 test('paused sandbox shows its state and resumes the same environment', () => {

@@ -16,7 +16,7 @@ const resourceKey = (target: WorkspaceTarget) => target.projectId ? `project:${t
 export class ProjectSandboxes {
   private bindings = new Map<string, Binding>();
 
-  constructor(readonly manager: SandboxManager, private template: string) {}
+  constructor(readonly manager: SandboxManager, private template: string, private defaultTemplateId?: string) {}
 
   get templateReference() { return this.template; }
 
@@ -109,9 +109,10 @@ export class ProjectSandboxes {
     operationKey?: string;
   } = {}): Promise<SandboxLease> {
     const binding = this.track(target, options.save);
-    if (options.create && target.imageSelection && !target.imageSelection.revisionId) throw new Error('项目仍引用旧导入镜像，请先迁移为 Cellbox revision。');
+    if (options.create && target.imageSelection && !target.imageSelection.templateId) throw new Error('项目仍引用旧导入镜像，请先迁移为 Cellbox template。');
     if (options.create && !binding.save) throw new Error('项目沙箱的持久化入口尚未配置');
     const key = resourceKey(target);
+    const templateId = target.imageSelection?.templateId ?? this.defaultTemplateId;
     const lease = await this.manager.acquire(key, {
       usageId: options.usageId ?? randomUUID(),
       purpose: options.usageId ? 'execution' : 'workspace',
@@ -123,7 +124,7 @@ export class ProjectSandboxes {
         metadata: {
           ...(target.sandboxOwnerKey ? { cellboxOwnerKey: target.sandboxOwnerKey } : {}),
           ...(target.sandboxMounts?.length ? { cellboxMounts: JSON.stringify(target.sandboxMounts) } : {}),
-          ...(target.imageSelection?.revisionId ? { cellboxRevisionId: target.imageSelection.revisionId } : {}),
+          ...(templateId ? { cellboxTemplateId: templateId } : {}),
           app: 'codex-web', sessionId: target.id, workingDirectory: target.settings.workingDirectory,
           ...(target.projectId ? { projectId: target.projectId } : {}),
         },

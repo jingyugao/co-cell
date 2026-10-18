@@ -2,7 +2,6 @@ import ImagePicker from '../images/ImagePicker';
 import RestoreVersionPicker from '../images/RestoreVersionPicker';
 import { useEffect, useRef, useState } from 'react';
 import type { AppConfig, ProjectSummary, ProjectType } from '../../../protocol/types';
-import { SandboxVersion } from '../../components/SandboxVersion';
 import { projectDisplayName, projectTypeLabel } from '../../../util/project-types';
 import { canEnterProject } from '../../../util/project-sandbox';
 import type { ProjectValues, ProjectUpdate } from './useProjects';
@@ -47,6 +46,15 @@ const duration = (value: number | undefined, fallback: string) => value == null 
 
 function latestBackup(project: ProjectSummary) {
   return project.latestBackup ?? null;
+}
+
+function projectImageLabel(project: ProjectSummary) {
+  if (project.executionMode === 'local') return '本地运行';
+  const actual = project.sandbox?.image;
+  if (actual) return [actual.version ?? actual.reference, actual.revisionId ? `revision ${actual.revisionId}` : undefined].filter(Boolean).join(' · ');
+  if (project.imageSelection?.migrationRequired) return `${project.imageSelection.imageName} · 需要迁移`;
+  if (project.sandbox) return project.imageSelection ? `${project.imageSelection.imageName} · template` : '系统默认 template';
+  return project.imageSelection ? `${project.imageSelection.imageName} · Cellbox stable` : '系统默认 template · Cellbox stable';
 }
 
 function ProjectForm({ busy, onSubmit, onCancel }: {
@@ -115,7 +123,6 @@ function ProjectCard({ project, config, onUpdate, onCreateSandbox, onRestoreSand
   const sandboxBroken = project.executionMode === 'sandbox' && Boolean(project.sandbox)
     && ['unavailable', 'ready'].includes(project.sandbox!.status) && !sandboxNormal;
   const sandboxMissing = project.executionMode === 'sandbox' && !project.sandbox;
-  const latestImage = project.imageSelection ? { reference: project.imageSelection.image, id: project.imageSelection.image, repoDigests: [] } : config?.sandbox?.imageIdentity;
   const canRestore = project.executionMode === 'sandbox' && Boolean(backup) && (archived || sandboxBroken || sandboxMissing) && !project.archiveCleanupSourceId && !hasTask;
   const archiveRetry = (operation?.kind === 'archive' && operation.status === 'failed')
     || Boolean(project.archiveCleanupSourceId) || (archived && (Boolean(project.pendingSandboxCleanup?.length) || Boolean(operation?.cleanupError)));
@@ -173,8 +180,8 @@ function ProjectCard({ project, config, onUpdate, onCreateSandbox, onRestoreSand
   }
   const openDisabled = !canEnterProject(project);
   const sandboxDescription = project.executionMode === 'local' ? '本地运行'
-    : sandboxNormal ? <span className="project-sandbox-detail"><span>就绪</span><code title={project.sandbox!.id} aria-label={`Sandbox ID ${project.sandbox!.id}`}>{project.sandbox!.id.slice(0, 6)}</code><SandboxVersion image={project.sandbox!.image} latestImage={latestImage} /></span>
-    : sandboxPaused ? <span className="project-sandbox-detail"><span>已暂停（Checkpoint）</span><code title={project.sandbox!.id} aria-label={`Sandbox ID ${project.sandbox!.id}`}>{project.sandbox!.id.slice(0, 6)}</code><SandboxVersion image={project.sandbox!.image} latestImage={latestImage} /></span>
+    : sandboxNormal ? <span className="project-sandbox-detail"><span>就绪</span><code title={project.sandbox!.id} aria-label={`Sandbox ID ${project.sandbox!.id}`}>{project.sandbox!.id.slice(0, 6)}</code></span>
+    : sandboxPaused ? <span className="project-sandbox-detail"><span>已暂停（Checkpoint）</span><code title={project.sandbox!.id} aria-label={`Sandbox ID ${project.sandbox!.id}`}>{project.sandbox!.id.slice(0, 6)}</code></span>
     : project.sandbox?.status === 'starting' ? '准备中'
     : project.sandbox?.status === 'unknown' ? '状态查询失败，请稍后刷新'
     : sandboxBroken ? '异常'
@@ -185,7 +192,7 @@ function ProjectCard({ project, config, onUpdate, onCreateSandbox, onRestoreSand
     <h2>{openDisabled ? <span className="project-title-disabled">{displayName}</span> : <button className="project-title-button" onClick={() => onOpenProject(project.id)}>{displayName}</button>}</h2>
     <div className="project-card-id"><span>项目 ID</span><button type="button" title={project.id} aria-label={`复制项目完整 ID ${project.id}`} onClick={() => void copyProjectId()}><code>{project.id.slice(0, 8)}</code></button>{idCopyStatus && <span role="status">{idCopyStatus}</span>}</div>
     {project.requirementUrl && /^https?:\/\//i.test(project.requirementUrl) ? <div className="project-requirement-wrap"><a className="project-requirement" href={project.requirementUrl} target="_blank" rel="noopener noreferrer" title={project.requirementUrl}>飞书需求 ↗<span>{project.requirementUrl}</span></a>{project.requirementStatus && <p className="project-requirement-status"><span>飞书项目状态</span><strong>{project.requirementStatus}</strong></p>}</div> : project.type === 2 ? <p className="project-unlinked">飞书需求待绑定</p> : <p className="project-unlinked">{typeLabel}</p>}
-    <dl className="project-details"><div><dt>项目镜像</dt><dd>{project.imageSelection ? `${project.imageSelection.imageName} · ${project.imageSelection.version}` : '系统默认镜像'}</dd></div><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>最新备份</dt><dd>{backup ? onViewBackup && project.archiveVersions?.length ? <ArchiveVersionBadge project={project} onView={onViewBackup} /> : <time dateTime={backup.createdAt} title={date(backup.createdAt)}>{backupDate(backup.createdAt)}</time> : '暂无备份'}</dd></div><div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div></dl>
+    <dl className="project-details"><div><dt>项目镜像</dt><dd>{projectImageLabel(project)}</dd></div><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>最新备份</dt><dd>{backup ? onViewBackup && project.archiveVersions?.length ? <ArchiveVersionBadge project={project} onView={onViewBackup} /> : <time dateTime={backup.createdAt} title={date(backup.createdAt)}>{backupDate(backup.createdAt)}</time> : '暂无备份'}</dd></div><div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div></dl>
     {(() => { const mounts = project.sandbox?.mounts ?? project.sandboxMounts ?? []; return mounts.length > 0 && <div className="project-mounts"><strong>保留的挂载盘</strong><ul>{mounts.map(mount => <li key={`${mount.volumeId}:${mount.mountPath}`}><code>{mount.mountPath}</code><span>{mount.volumeId}</span>{mount.readOnly && <span>只读</span>}</li>)}</ul></div>; })()}
     <div className="project-action-groups">
       <section className="project-action-group" aria-label="项目操作">

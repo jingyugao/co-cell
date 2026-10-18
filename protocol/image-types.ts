@@ -50,6 +50,8 @@ export interface ManagedImage {
   error?: string;
 }
 export interface ImageVersionUsage { deletable: boolean; blockers: string[]; manifestShared: boolean }
+/** Ordinary creation uses the template's current stable revision. Version fields
+ * retain the selection snapshot and are refreshed from the actual Box. */
 export interface ProjectImageSelection {
   imageId: string;
   imageName: string;

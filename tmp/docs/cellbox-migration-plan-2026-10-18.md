@@ -75,18 +75,19 @@ CoCell 接入新版 Cellbox 的 template/revision、显式生命周期和单节�
 | profile | Cellbox 运行配置 | provider、节点、工作目录、身份、资源规格和工具能力；用于构建 revision 与运行能力检查 |
 | template | Cellbox catalog | 模板族、描述、默认预热数量和 stable 指针 |
 | revision | Cellbox catalog | 成功构建的版本，固定镜像 digest、构建输入和运行配置 |
-| 项目与会话 | CoCell | 分类、权限、业务配置、会话关联、选定的 revision 和实际 Sandbox 绑定 |
-| 全局默认选择 | CoCell | 新项目默认使用的明确版本；与 template 的 stable、revision 的预热配置分别表达 |
+| 项目与会话 | CoCell | 分类、权限、业务配置、会话关联、选定的 template、实际 revision 和 Sandbox 绑定 |
+| 全局默认选择 | CoCell | 确定新项目的 template；普通创建由该 template 的 stable 决定版本，预热配置独立 |
 | Sandbox、operation、archive | Cellbox | 实际实例与底层任务、归档内容和归档元数据 |
 
-现有“镜像仓库 → 镜像版本 → 项目选择”的产品入口可以保留，但后端分别映射为 template、revision、项目固定版本。构建状态和镜像身份从 Cellbox 读取，CoCell 不再维护一套独立的导入镜像真相。
+镜像仓库和构建版本分别映射为 template、revision。创建项目时选择 template；普通新建 Sandbox 使用其当前 stable，从备份恢复保留明确选择 revision 的入口。构建状态和镜像身份从 Cellbox 读取，CoCell 不再维护一套独立的导入镜像真相。
 
 建议项目版本引用保留现有业务显示信息，增加 `templateId/revisionId`，逐步淘汰 `importedImageId`。Sandbox 和归档引用也保留实际返回的 template/revision、镜像身份，不从当前 stable 反推历史版本。
 
 ### 3.2 默认值和预热分开
 
-- CoCell 的全局默认选择指向明确 revision；创建项目后固定该 revision，不随 stable 漂移。
-- 如果产品允许“使用模板当前 stable”，应先解析并展示版本，最终保存实际创建返回的 revision；不能承诺解析到创建之间 stable 不会改变。
+- CoCell 的全局默认记录保留现有 template/revision 结构，用来确定新项目的 template。普通创建向 Cellbox 传 `templateId`，不把项目保存的历史 revision 用作新实例的固定版本。
+- stable 即 template 的默认版本，通过 Cellbox template 的 `stableRevisionId` 配置。Cellbox 在创建接入时解析 stable，CoCell 保存实际 Box 返回的 template/revision 和镜像；不先解析再固定、不排序“最新构建”。未设置 stable 时直接呈现底层冲突，不自动回退到旧 revision 或重提。
+- stable 改变不修改已有 Sandbox；释放后新建使用当时的 stable，继续传入保留的 mounts 和实际 ownerKey。从备份恢复仍可显式指定 revision。
 - 系统基础镜像也需要建立 template/revision，删除“只凭 profile 创建”的特殊路径。
 - 构建成功不自动切换 stable。修改 CoCell 默认选择，不隐式修改 stable 或 warmSlots，不做跨系统回滚补偿。
 - revision 的预热配置独立提交和展示。切 stable 不自动清空旧 revision 的 warmSlots。
@@ -374,7 +375,7 @@ CoCell 与 Cellbox 版本需要成对切换。新版本产生写入后，不能�
 ### 11.2 产品与真实链路
 
 - 系统模板、仓库模板和 revision 构建、查询、选择、默认值与预热信息可用；未知数量和过期观察正确显示。
-- 新项目固定 revision；stable 改变不替换已有实例；再次同步同一 tag 可以形成新 revision，不假定它与旧结果相同。
+- 普通新建按 template 当前 stable 创建并保存实际 revision，释放后再次创建复用原挂载盘；stable 改变不替换已有实例。再次同步同一 tag 可以形成新 revision，不假定它与旧结果相同。
 - GET 和历史读取不唤醒实例；显式 pause/resume 各发出一次 provider 生命周期调用，记录真实 operation 结果；不做状态预查、App Server readiness、环境准备或项目 Sandbox 绑定重写，底层冲突不重试。
 - HTTP/WebSocket、文件、工具凭据和会话历史通过新实例验证；冲突直接呈现，测试不得靠无条件重试通过。
 - 归档前置条件、portable/image/agent 校验、staged 恢复与显式激活可用；不支持的入口明确显示不支持。

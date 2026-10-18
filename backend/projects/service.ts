@@ -352,6 +352,11 @@ export class ProjectService {
       if (sandbox.ownerKey) next.sandboxOwnerKey = sandbox.ownerKey;
       next.workingDirectory = sandbox.workingDirectory;
       if (restoreProject) next.imageSelection = restoreImage ? structuredClone(restoreImage) : undefined;
+      const image = sandbox.image;
+      if (next.imageSelection && image?.revisionId && image.templateId === next.imageSelection.templateId) {
+        next.imageSelection = { ...next.imageSelection, revisionId: image.revisionId, versionId: image.revisionId,
+          version: image.version ?? image.revisionId, image: image.reference };
+      }
       if (restoreProject && next.status === 'archived') {
         const at = new Date().toISOString();
         next.status = 'active';

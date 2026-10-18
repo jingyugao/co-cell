@@ -80,12 +80,14 @@ test('current image identity resolves the configured template stable revision', 
     requests.push(path);
     if (path === '/v1/profiles') return Response.json([profile]);
     if (path === '/v1/templates/tpl-a') return Response.json({ id: 'tpl-a', stableRevisionId: 'rev-stable' });
-    if (path === '/v1/template-revisions/rev-stable') return Response.json({ id: 'rev-stable', image: 'sha256:image-a' });
+    if (path === '/v1/template-revisions/rev-stable') return Response.json({ id: 'rev-stable', templateId: 'tpl-a',
+      version: '1.0-r1', image: 'sha256:image-a' });
     throw new Error(`unexpected request ${path}`);
   };
   const instance = provider(fetch, { templateId: 'tpl-a' });
   assert.deepEqual(await instance.currentImageIdentity(), {
     reference: 'sha256:image-a', id: 'sha256:image-a', repoDigests: ['sha256:image-a'],
+    templateId: 'tpl-a', revisionId: 'rev-stable', version: '1.0-r1',
   });
   assert.deepEqual(requests, ['/v1/profiles', '/v1/templates/tpl-a', '/v1/template-revisions/rev-stable']);
 });
@@ -237,7 +239,7 @@ test('release refuses an old Cellbox server before a destructive request', async
   assert.deepEqual(calls, ['GET /v1/volumes']);
 });
 
-test('create forwards retained mounts in order with their actual owner, without reserving shared volumes', async () => {
+test('template creation forwards retained mounts and records the admitted stable revision', async () => {
   const mounts = [{ volumeId: 'shared-volume', mountPath: '/home/agent' },
     { volumeId: 'shared-volume', mountPath: '/data', readOnly: true }];
   const bodies: unknown[] = [];
@@ -245,11 +247,33 @@ test('create forwards retained mounts in order with their actual owner, without 
     const path = new URL(String(input)).pathname;
     if (path === '/v1/profiles') return Response.json([profile]);
     if (path === '/v1/boxes') { bodies.push(JSON.parse(String(init?.body))); return Response.json(op('create')); }
-    if (path === '/v1/boxes/box-a') return Response.json(box('running', { mounts }));
+    if (path === '/v1/boxes/box-a') return Response.json(box('running', { mounts,
+      templateId: 'tpl-current', revisionId: 'rev-stable', templateVersion: '2.0-r1' }));
     assert.fail(`unexpected ${path}`);
   }, { revisionId: 'rev-a' });
   await instance.create('profile-a', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
-    metadata: { projectId: 'p1', cellboxOwnerKey: 'project:p1:restore:previous', cellboxMounts: JSON.stringify(mounts) } });
-  assert.deepEqual(bodies, [{ ownerKey: 'project:p1:restore:previous', revisionId: 'rev-a', mounts }]);
-  assert.deepEqual((await instance.getInfo('box-a')).mounts, mounts);
+    metadata: { projectId: 'p1', cellboxTemplateId: 'tpl-current',
+      cellboxOwnerKey: 'project:p1:restore:previous', cellboxMounts: JSON.stringify(mounts) } });
+  assert.deepEqual(bodies, [{ ownerKey: 'project:p1:restore:previous', templateId: 'tpl-current', mounts }]);
+  const info = await instance.getInfo('box-a');
+  assert.deepEqual(info.mounts, mounts);
+  assert.equal(info.templateIdentity?.templateId, 'tpl-current');
+  assert.equal(info.templateIdentity?.revisionId, 'rev-stable');
+  assert.equal(info.templateIdentity?.version, '2.0-r1');
+});
+
+test('template without a stable revision surfaces the conflict without a pinned revision fallback or resubmission', async () => {
+  const posts: unknown[] = [];
+  const instance = provider(async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === '/v1/profiles') return Response.json([profile]);
+    assert.equal(path, '/v1/boxes');
+    assert.equal(init?.method, 'POST');
+    posts.push(JSON.parse(String(init?.body)));
+    return Response.json({ error: { code: 'CONFLICT', message: 'Template has no stable revision' } }, { status: 409 });
+  }, { revisionId: 'rev-old-default' });
+  await assert.rejects(instance.create('profile-a', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+    metadata: { projectId: 'p1', cellboxTemplateId: 'tpl-current' } }),
+  error => error instanceof CellboxError && error.code === 'CONFLICT' && /no stable revision/.test(error.message));
+  assert.deepEqual(posts, [{ ownerKey: 'project:p1', templateId: 'tpl-current' }]);
 });

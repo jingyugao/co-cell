@@ -1,5 +1,8 @@
 /** Immutable OCI image identity captured by the selected sandbox backend. */
 export interface SandboxImageIdentity {
+  /** Actual Cellbox identities resolved when this Sandbox was created. */
+  templateId?: string;
+  revisionId?: string;
   /** Mutable reference requested by the service, for example `cellbox:latest`. */
   reference: string;
   /** Docker content ID or an immutable registry reference (`repository@sha256:...`). */

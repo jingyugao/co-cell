@@ -125,7 +125,7 @@ if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw
 const sandboxManager = new SandboxManager({ provider, logger: runtimeLog,
   // Project lifecycle owns idle checkpoints; disk backup is a separate operation.
   policy: { autoCheckpointAfterMs: Number.MAX_SAFE_INTEGER }, lifecycle: cellboxRuntime.lifecycle });
-const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
+const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage, sandboxImageIdentity.templateId);
 const systemTools = new SystemTools({ projects: () => webState.listProjects(), enter: id => manager.enterProject(id),
   execute: (id, tool, args) => cellboxProvider.client.runTool(id, tool, args, 40_000) });
 const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);

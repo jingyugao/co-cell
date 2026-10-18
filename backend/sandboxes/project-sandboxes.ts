@@ -99,6 +99,7 @@ export class ProjectSandboxes {
     operationKey?: string;
   } = {}): Promise<SandboxLease> {
     const binding = this.track(target, options.save);
+    if (options.create && target.imageSelection && !target.imageSelection.revisionId) throw new Error('项目仍引用旧导入镜像，请先迁移为 Cellbox revision。');
     if (options.create && !binding.save) throw new Error('项目沙箱的持久化入口尚未配置');
     const key = resourceKey(target);
     const lease = await this.manager.acquire(key, {
@@ -110,7 +111,7 @@ export class ProjectSandboxes {
       ...(options.create ? { create: {
         template: this.template,
         metadata: {
-          ...(target.imageSelection ? { cellboxImportedImageId: target.imageSelection.importedImageId } : {}),
+          ...(target.imageSelection?.revisionId ? { cellboxRevisionId: target.imageSelection.revisionId } : {}),
           app: 'codex-web', sessionId: target.id, workingDirectory: target.settings.workingDirectory,
           ...(target.projectId ? { projectId: target.projectId } : {}),
         },

@@ -12,7 +12,7 @@ import { SessionManager, type CodexClient } from './manager.js';
 const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
   modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
 
-test('preview access retains runtime/project ownership and releases it once even after runtime failure', async () => {
+test('preview access releases the runtime stream once after success or failure', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-preview-lease-'));
   const state = new MemoryWebStateStore();
   const box: SandboxState = { id: 'preview-box', status: 'ready', template: 'default', workingDirectory: '/home/agent/workspace' };
@@ -38,15 +38,10 @@ test('preview access retains runtime/project ownership and releases it once even
     const ready = await manager.enterProject(project.id);
     assert.equal(ready.sandbox?.status, 'ready');
     const access = await manager.projectServiceAccess(project.id, 8080, 'POST', new AbortController().signal);
-    const projects = (manager as any).projects;
-    assert.equal(projects.operations.get(project.id), 1);
     await assert.rejects(access.release(), /release failed/);
     await access.release();
     assert.equal(releases, 1);
-    assert.equal(projects.operations.has(project.id), false);
     refuseAccess = true;
     await assert.rejects(manager.projectServiceAccess(project.id, 8080, 'POST', new AbortController().signal), /service unavailable/);
-    assert.equal(projects.operations.has(project.id), false);
-    assert.equal(projects.reads.has(project.id), false);
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

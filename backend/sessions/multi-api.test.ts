@@ -156,55 +156,7 @@ async function fixture(makeRuntime: (control: Control) => SandboxRuntime = runti
   } };
 }
 
-test('checkpoint responds before backup and another API resumes even when capture fails', async () => {
-  const captured = deferred<void>();
-  const started = deferred<void>();
-  let paused = false, resumes = 0;
-  const f = await fixture(control => ({ ...runtimeFor(control),
-    async querySandbox(value) { return { ...value, status: paused ? 'paused' : 'ready' }; },
-    async verifySandbox() {},
-    async checkpoint(target) { paused = true; return { ...target.sandbox!, status: 'paused' }; },
-    async resume(target) { resumes++; paused = false; return { ...target.sandbox!, status: 'ready' }; },
-    remoteArchives: {
-      async capture() { started.resolve(); await captured.promise; throw new Error('object storage unavailable'); },
-      async inspect() { throw new Error('unused'); }, async restore() { throw new Error('unused'); }, async activate() {},
-    },
-  }));
-  try {
-    const apiA = await f.start(), apiB = await f.start();
-    const response = await apiA.checkpointProjectSandbox(f.projectId);
-    await started.promise;
-    assert.equal(response.sandboxOperation?.status, 'succeeded');
-    assert.equal(response.sandbox?.status, 'paused');
-    assert.equal(response.sandboxBackup?.status, 'running');
-    let completed = false;
-    const open = apiB.enterProject(f.projectId).then(value => { completed = true; return value; });
-    await new Promise(resolve => setTimeout(resolve, 150));
-    assert.equal(completed, false, 'resume waits until the disk reader releases the source');
-    assert.equal(resumes, 0);
-    assert.equal((await f.state.getProject(f.projectId))?.sandboxBackup?.status, 'running', 'other API must not fail the live owner');
-    captured.resolve();
-    const resumed = await open;
-    assert.equal(resumed.sandbox?.status, 'ready');
-    assert.equal(resumed.sandboxOperation?.status, 'succeeded');
-    assert.equal(resumed.sandboxBackup?.status, 'failed');
-    assert.equal(resumes, 1);
-    // Projects carrying the original combined checkpoint/backup error must
-    // also enter normally after upgrading, without requiring a successful retry.
-    await f.state.mutateProject(f.projectId, current => {
-      current.sandboxOperation = { id: 'legacy-pause', kind: 'checkpoint', status: 'failed', phase: '从暂停磁盘备份数据',
-        error: '沙箱已暂停，磁盘备份失败', updatedAt: new Date().toISOString() };
-      delete current.sandboxBackup;
-    });
-    paused = true;
-    const legacyEntry = await apiB.enterProject(f.projectId);
-    assert.equal(legacyEntry.sandbox?.status, 'ready');
-    assert.equal(legacyEntry.sandboxOperation?.kind, 'resume');
-    assert.equal(resumes, 2);
-  } finally { captured.resolve(); await f.close(); }
-});
-
-test('shared recovery releases an orphaned backup without failing the completed checkpoint', async () => {
+test('a new shared API leaves an unfinished backup visible without recovering it', async () => {
   const f = await fixture();
   try {
     const value = (await f.state.getProject(f.projectId))!;
@@ -213,11 +165,9 @@ test('shared recovery releases an orphaned backup without failing the completed 
     await f.state.saveProject(value);
     await f.start();
     const recovered = (await f.state.getProject(f.projectId))!;
-    assert.equal(recovered.sandboxBackup?.status, 'failed');
+    assert.equal(recovered.sandboxBackup?.status, 'running');
     assert.equal(recovered.sandboxOperation?.status, 'succeeded');
-    const lease = await f.coordinator.tryAcquire(`project-maintenance:${f.projectId}`);
-    assert.ok(lease);
-    await lease.release();
+    assert.equal(recovered.sandboxBackup?.id, 'pause-1');
   } finally { await f.close(); }
 });
 
@@ -255,7 +205,7 @@ test('a second API appends messages to the accepted native turn and steers its a
   } finally { f.control.terminal.resolve('completed'); await f.close(); }
 });
 
-test('a second API waits for native turn acceptance before steering without holding the project lock', async () => {
+test('a second API waits for native turn acceptance before steering', async () => {
   const f = await fixture();
   try {
     const apiA = await f.start();
@@ -303,24 +253,6 @@ test('simultaneous submissions converge on one accepted turn and steer the secon
     assert.deepEqual(source.additionalUserInputs, [added]);
     assert.equal(f.control.steers[0], added);
   } finally { f.control.acceptanceReady.resolve(); f.control.terminal.resolve('completed'); await f.close(); }
-});
-
-test('a second API blocks maintenance and remotely stops the native turn as cancelled', async () => {
-  const f = await fixture();
-  try {
-    const apiA = await f.start();
-    const apiB = await f.start();
-    const turnId = await apiA.startTurn(f.sessionId, 'Run until stopped');
-    await f.control.questionReady.promise;
-    await assert.rejects(apiB.checkpointProjectSandbox(f.projectId));
-    assert.equal(f.control.maintenanceCalls, 0);
-    await apiB.stop(f.sessionId);
-    await apiA.waitForIdle(f.sessionId);
-    const persisted = await f.state.getSession(f.sessionId);
-    assert.equal(f.control.interrupts, 1);
-    assert.equal(f.control.runCalls, 1);
-    assert.equal(persisted?.turns.find(turn => turn.id === turnId)?.status, 'cancelled');
-  } finally { await f.close(); }
 });
 
 test('a new API does not fail another API turn and takes over observation after it closes', async () => {
@@ -382,115 +314,6 @@ test('scheduler never periodically backs up a running project, even after the fo
     assert.equal(f.control.archiveCaptures, 0);
     assert.equal((await f.state.getProject(f.projectId))?.sandboxOperation, undefined);
   } finally { await f.close(); }
-});
-
-test('idle scheduler rechecks activity after another API resumes the project', async () => {
-  const f = await fixture();
-  try {
-    const api = await f.start();
-    const project = (await f.state.getProject(f.projectId))!;
-    project.sandbox!.lastActiveAt = new Date(0).toISOString();
-    await f.state.saveProject(project);
-    const session = (await f.state.getSession(f.sessionId))!;
-    session.updatedAt = new Date(0).toISOString();
-    await f.state.saveSession(session);
-    const originalRun = f.coordinator.run.bind(f.coordinator);
-    let refreshed = false;
-    f.coordinator.run = async (key, action) => {
-      if (key === `project-control:${f.projectId}` && !refreshed) {
-        refreshed = true;
-        project.sandbox!.lastActiveAt = new Date().toISOString();
-        await f.state.saveProject(project);
-      }
-      return originalRun(key, action);
-    };
-    await api.scheduledArchive();
-    assert.equal(refreshed, true);
-    assert.equal((await f.state.getProject(f.projectId))?.sandboxOperation, undefined,
-      'A resume after the idle scan must prevent an immediate automatic checkpoint');
-    assert.equal(f.control.maintenanceCalls, 0);
-  } finally { await f.close(); }
-});
-
-for (const pending of ['archive', 'source', 'cleanup'] as const) test(`scheduler discards stale ${pending} cleanup after another API finishes`, async () => {
-  const f = await fixture();
-  try {
-    const api = await f.start();
-    const project = (await f.state.getProject(f.projectId))!;
-    project.status = pending === 'archive' ? 'archived' : 'completed';
-    if (pending === 'source') project.archiveCleanupSourceId = project.sandbox!.id;
-    if (pending === 'cleanup') project.pendingSandboxCleanup = [project.sandbox!];
-    await f.state.saveProject(project);
-    const originalRun = f.coordinator.run.bind(f.coordinator);
-    const originalAcquire = f.coordinator.tryAcquire.bind(f.coordinator);
-    let maintenanceAcquisitions = 0;
-    f.coordinator.tryAcquire = async key => {
-      if (key === `project-maintenance:${f.projectId}`) maintenanceAcquisitions++;
-      return originalAcquire(key);
-    };
-    let refreshed = false;
-    f.coordinator.run = async (key, action) => {
-      if (key === `project-control:${f.projectId}` && !refreshed) {
-        refreshed = true;
-        // The other API finishes after the scan, before this API gets control.
-        project.status = 'archived';
-        project.sandboxArtifactsCleanedAt = new Date().toISOString();
-        delete project.sandbox;
-        delete project.archiveCleanupSourceId;
-        delete project.pendingSandboxCleanup;
-        await f.state.saveProject(project);
-      }
-      return originalRun(key, action);
-    };
-    await api.scheduledArchive();
-    assert.equal(refreshed, true);
-    assert.equal((await f.state.getProject(f.projectId))?.sandboxOperation, undefined,
-      'An obsolete scan must not start another archive operation');
-    assert.equal(maintenanceAcquisitions, 0, 'An obsolete scan must not acquire maintenance');
-    const lease = await originalAcquire(`project-maintenance:${f.projectId}`);
-    assert.ok(lease, 'Completed cleanup must leave maintenance available');
-    await lease.release();
-  } finally { await f.close(); }
-});
-
-test('shared recovery rechecks the persisted operation after acquiring maintenance ownership', async () => {
-  const f = await fixture();
-  let held: Awaited<ReturnType<typeof f.coordinator.tryAcquire>> = null;
-  try {
-    const project = await f.state.getProject(f.projectId);
-    assert.ok(project);
-    project.sandboxOperation = { id: 'old-operation', kind: 'resume', phase: '恢复中', status: 'running', updatedAt: new Date().toISOString() };
-    await f.state.saveProject(project);
-    held = await f.coordinator.tryAcquire(`project-maintenance:${f.projectId}`);
-    assert.ok(held);
-
-    const originalTryAcquire = f.coordinator.tryAcquire.bind(f.coordinator);
-    const acquisitionStarted = deferred<void>();
-    const continueAcquisition = deferred<void>();
-    f.coordinator.tryAcquire = async key => {
-      if (key === `project-maintenance:${f.projectId}`) {
-        acquisitionStarted.resolve();
-        await continueAcquisition.promise;
-      }
-      return originalTryAcquire(key);
-    };
-    const starting = f.start();
-    await acquisitionStarted.promise;
-
-    project.sandboxOperation.status = 'succeeded';
-    project.sandboxOperation.phase = '完成';
-    await f.state.saveProject(project);
-    await held.release();
-    held = null;
-    continueAcquisition.resolve();
-
-    const api = await starting;
-    assert.equal((await f.state.getProject(f.projectId))?.sandboxOperation?.status, 'succeeded');
-    await f.closeManager(api);
-  } finally {
-    await held?.release();
-    await f.close();
-  }
 });
 
 test('pre-acceptance recovery does not attach a recent completed duplicate prompt', async () => {

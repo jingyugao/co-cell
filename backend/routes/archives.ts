@@ -80,9 +80,7 @@ export function installArchiveRoutes(app: Hono, manager: SessionManager) {
   });
 
   app.post('/api/archives/prune', async c => {
-    try {
-      const deleted = await manager.pruneArchivedProjectArchives();
-      return c.json({ deleted, message: `已清理 ${deleted} 个旧归档` });
-    } catch (error) { return c.json({ error: (error as Error).message }, 500); }
+    const deleted = await manager.pruneArchivedProjectArchives();
+    return c.json({ deleted, message: `已清理 ${deleted} 个旧归档` });
   });
 }

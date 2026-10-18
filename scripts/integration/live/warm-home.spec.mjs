@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -8,6 +8,31 @@ import { test } from '../support/fixtures.mjs';
 const exec = promisify(execFile);
 const warmLabel = 'cellbox.local/warm-pool';
 const warmSpec = 'cellbox.local/warm-spec';
+
+async function forwardService(context, namespace, service, port) {
+  const child = spawn('kubectl', ['--context', context, '-n', namespace, 'port-forward', `service/${service}`, `:${port}`, '--address=127.0.0.1'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  child.stderr.resume();
+  const close = async () => {
+    if (child.exitCode !== null) return;
+    child.kill('SIGTERM');
+    await new Promise(resolve => {
+      const timer = setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 3000);
+      child.once('exit', () => { clearTimeout(timer); resolve(); });
+    });
+  };
+  try {
+    const localPort = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Cellbox API port-forward did not become ready')), 15_000);
+      child.once('error', () => { clearTimeout(timer); reject(new Error('Cannot start Cellbox API port-forward')); });
+      child.once('exit', () => { clearTimeout(timer); reject(new Error('Cellbox API port-forward exited')); });
+      child.stdout.on('data', data => {
+        const match = /Forwarding from 127\.0\.0\.1:(\d+)/.exec(String(data));
+        if (match) { clearTimeout(timer); resolve(match[1]); }
+      });
+    });
+    return { base: `http://127.0.0.1:${localPort}`, close };
+  } catch (error) { await close(); throw error; }
+}
 
 test('persistent HOME restores from a shared warm pool with per-Box isolation', async ({ environment: env }) => {
   test.skip(process.env.COCELL_E2E_WARM_HOME_TEST !== '1', 'Requires a Cellbox installation with persistent HOME warm-pool support');
@@ -18,19 +43,37 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
     timeout: 40_000, maxBuffer: 2 * 1024 * 1024,
   })).stdout;
   const readJSON = async args => JSON.parse(await kubectl([...args, '-o', 'json']));
+  const appNamespace = process.env.COCELL_E2E_NAMESPACE ?? process.env.COCELL_NAMESPACE ?? 'co-cell';
+  const release = process.env.COCELL_E2E_HELM_RELEASE ?? process.env.COCELL_HELM_RELEASE ?? 'co-cell';
+  const values = JSON.parse((await exec('helm', ['--kube-context', context, '-n', appNamespace, 'get', 'values', release, '-o', 'json'], { timeout: 30_000 })).stdout);
+  assert(values.cellbox?.clientId, 'CoCell Helm values must include cellbox.clientId for the read-only warm-pool query');
+  const templateId = values.cellbox.templateId;
+  const configuredRevisionId = values.cellbox.revisionId;
+  assert(Boolean(templateId) !== Boolean(configuredRevisionId), 'Configure exactly one Cellbox cellbox.templateId or cellbox.revisionId selector');
+  const transport = await forwardService(context, namespace, 'cellbox-api', 8090);
+  env.transports.push(transport);
+  const cellboxJSON = async path => {
+    const response = await fetch(`${transport.base}${path}`, {
+      headers: { 'X-Cellbox-Client-ID': values.cellbox.clientId },
+      signal: AbortSignal.any([env.controller.signal, AbortSignal.timeout(15_000)]), redirect: 'error',
+    });
+    const body = await response.text();
+    assert(response.ok, `Cellbox GET ${path} failed: HTTP ${response.status}; ${body.slice(0, 500)}`);
+    return JSON.parse(body);
+  };
+  let revisionId = configuredRevisionId;
+  if (templateId) {
+    const template = await cellboxJSON(`/v1/templates/${encodeURIComponent(templateId)}`);
+    revisionId = template.stableRevisionId;
+    assert(revisionId, `Configured Cellbox template ${templateId} has no stable revision; pin CELLBOX_REVISION_ID for this test`);
+  }
+  const revision = await cellboxJSON(`/v1/template-revisions/${encodeURIComponent(revisionId)}`);
+  assert(revision.warmSlots > 0, `Configured Cellbox revision ${revisionId} has warmSlots=0; set warmSlots > 0 to run this test`);
+  const selection = { templateId: revision.templateId, revisionId: revision.id, image: revision.image };
   const runId = randomUUID();
   const statePath = `/home/agent/.cocell-warm-${runId}.json`;
   const markerPath = '/home/agent/.cocell-warm-isolation-marker';
   const cases = [];
-  const imageName = process.env.COCELL_E2E_WARM_HOME_IMAGE;
-  const images = await env.json('/api/images');
-  const defaults = images.flatMap(image => image.versions.filter(version => version.isDefault).map(version => ({ image, version })));
-  assert.equal(defaults.length, 1, 'Configure exactly one global default image');
-  const { image, version } = defaults[0];
-  assert(version.status === 'succeeded' && version.projectReady !== false && !version.deprecatedAt && !version.cleanup, 'Global default must be ready');
-  if (imageName) assert.equal(image.name, imageName, 'Warm HOME tests must use the global default image');
-  const selection = { imageId: image.id, imageVersionId: version.id, image: version.image ?? version.source };
-
   const inspectBox = async (project, { active = true } = {}) => {
     const box = await readJSON(['get', 'cellboxes.cellbox.local', `cellbox-${project.sandbox.id}`]);
     assert(box.spec.persistentHome, `Box ${project.sandbox.id} must use persistent HOME`);
@@ -45,9 +88,12 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
   };
 
   const eligibleCandidates = async box => {
-    const configured = await readJSON(['get', 'configmap', 'cellbox-warm-default']);
-    const targets = Object.values(configured.data ?? {}).map(value => JSON.parse(value));
-    assert(targets.some(target => target.nodeName === box.spec.nodeName && target.image === selection.image), 'Warm target differs from the global default');
+    const warm = await cellboxJSON(`/v1/template-revisions/${encodeURIComponent(selection.revisionId)}/warm-pool`);
+    assert.equal(warm.revisionId, selection.revisionId);
+    assert.equal(warm.desiredSlots, revision.warmSlots, 'Warm-pool desired slots differ from the configured revision');
+    if (!warm.stale) assert.equal(warm.syncStatus, 'applied', warm.error ?? 'Warm-pool target has not been applied');
+    if (warm.pool && !warm.pool.stale) assert(warm.pool.readySlots > 0 || warm.pool.preparingSlots > 0,
+      `Warm-pool revision ${selection.revisionId} has no ready or preparing slots`);
     const pods = await readJSON(['get', 'pods', '-l', `${warmLabel}=true`]);
     for (const pod of pods.items) {
       if (pod.spec.nodeSelector?.['kubernetes.io/hostname'] !== box.spec.nodeName || pod.metadata.deletionTimestamp || pod.metadata.ownerReferences?.some(ref => ref.controller)) continue;
@@ -125,11 +171,11 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
 
   await env.step('Create two same-template projects with independent persistent HOME directories', async () => {
     for (const index of [0, 1]) {
-      const created = selection
-        ? await env.json('/api/projects', { method: 'POST', expectedStatus: 201,
-          body: { name: env.name(`warm-home-${index}`), type: 1,
-            imageId: selection.imageId, imageVersionId: selection.imageVersionId } })
-        : await env.createProject(`warm-home-${index}`);
+      const created = await env.createProject(`warm-home-${index}`);
+      assert.equal(created.imageSelection?.templateId, selection.templateId,
+        'Project system default template differs from the configured warm-pool revision');
+      assert.equal(created.imageSelection?.revisionId, selection.revisionId,
+        'Project system default revision differs from the configured warm-pool revision');
       const ready = await env.waitProject(created.id, { kind: 'create', status: 'ready', operationId: created.sandboxOperation.id });
       cases.push({ project: ready, marker: `home-${index}-${runId}` });
     }
@@ -173,7 +219,7 @@ test('persistent HOME restores from a shared warm pool with per-Box isolation', 
       assert.equal(before.box.status.phase, 'Suspended');
       const candidates = await waitForCandidates(before.box, 1);
       const candidateIdentities = candidates.map(pod => ({ name: pod.metadata.name, uid: pod.metadata.uid }));
-      const opened = await env.json(`/api/projects/${testCase.project.id}/open`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+      const opened = await env.json(`/api/projects/${testCase.project.id}/sandbox/resume`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
       assert.equal(opened.sandboxOperation.kind, 'resume');
       assert.equal(opened.sandboxOperation.status, 'succeeded');
       assert.equal(opened.sandbox.status, 'ready');

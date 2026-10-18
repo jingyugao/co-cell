@@ -10,7 +10,7 @@ export class SystemTools {
   constructor(private options: {
     projects: () => Promise<Project[]>;
     enter: (id: string) => Promise<ProjectSummary>;
-    acquireUsage: (boxId: string) => Promise<() => Promise<void>>;
+    acquireUsage?: (boxId: string) => Promise<() => Promise<void>>;
     execute: (boxId: string, tool: string, args: string[]) => Promise<ToolResult>;
   }) {}
   async withTools<T>(action: (run: SystemToolCommand) => Promise<T>): Promise<T> {
@@ -19,12 +19,9 @@ export class SystemTools {
     const project = await this.options.enter(matches[0].id);
     if (!project.sandbox || project.sandbox.status !== 'ready') throw new HttpError(503, 'system 项目的 Sandbox 尚未就绪');
     const boxId = project.sandbox.id;
-    const release = await this.options.acquireUsage(boxId);
-    try {
-      return await action((tool, args) => {
+    return await action((tool, args) => {
         toolName(tool);
         return this.options.execute(boxId, `cocell_${tool.replaceAll('-', '_')}`, args);
-      });
-    } finally { await release(); }
+    });
   }
 }

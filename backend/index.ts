@@ -85,7 +85,7 @@ if (sharedDirectory) {
 }
 for(const name of ['CELLBOX_API_URL','CELLBOX_PROFILE','COCELL_ACCESS_TOKEN'])if(!process.env[name])throw new Error(name+' is required for Cellbox Kubernetes mode');
 if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOKEN must contain at least 32 bytes');
-const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,clientId:process.env.CELLBOX_CLIENT_ID,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',stateDirectory:resolve('data/cellbox-operations')});
+const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,clientId:process.env.CELLBOX_CLIENT_ID,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',templateId:process.env.CELLBOX_TEMPLATE_ID,revisionId:process.env.CELLBOX_REVISION_ID});
 await cellboxProvider.initialize();
 let manager: SessionManager;
 const secrets = new SecretService(webState.secretRepository, secretCrypto, async id => (await webState.getProject(id))?.status === 'active');
@@ -96,7 +96,7 @@ const cellboxRuntime=new CellboxRuntimeIntegration({provider:cellboxProvider,pro
   extensions: [appServerReader.extension],
   env:appServerEnv, sharedDirectory, ...(sharedDirectory ? { sharedDataRoot } : {}),
   secrets, toolBrokerUrl, logger: runtimeLog,
-  onRenewalFailure:error=>{void runtimeLog.write({event:'sandbox.cellbox_renewal_failed',error});}});
+});
 const provider = cellboxProvider;
 const inventory = new CellboxSandboxInventory(cellboxProvider);
 const sandboxImage = process.env.CELLBOX_PROFILE!;
@@ -127,7 +127,7 @@ const sandboxManager = new SandboxManager({ provider, logger: runtimeLog,
   policy: { autoCheckpointAfterMs: Number.MAX_SAFE_INTEGER }, lifecycle: cellboxRuntime.lifecycle });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
 const systemTools = new SystemTools({ projects: () => webState.listProjects(), enter: id => manager.enterProject(id),
-  acquireUsage: id => cellboxRuntime.acquireUsage(id), execute: (id, tool, args) => cellboxProvider.client.runTool(id, tool, args, 40_000) });
+  execute: (id, tool, args) => cellboxProvider.client.runTool(id, tool, args, 40_000) });
 const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
   resolveModel: session => modelProvider.threadOptions(session),
@@ -135,7 +135,7 @@ const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provide
   sharedDataDirectory: pathToFileURL(`${sharedDataRoot}/`),
   ...(sharedDirectory ? { sharedFilesMounted: (id: string) => cellboxRuntime.usesSharedDirectory(id) } : {}),
   appServer, appServerReader, paths:CELLBOX_PRODUCT_PATHS, prepareRemote:(handle,target,signal,info)=>cellboxRuntime.prepare(handle,target,signal,info),
-  acquireRemoteUsage:(id, initializationDirectory,info)=>cellboxRuntime.acquireUsage(id, initializationDirectory,info), remoteArchives:cellboxRuntime.remoteArchives,
+  remoteArchives:cellboxRuntime.remoteArchives,
   serviceAccess:(id:string,port:number)=>cellboxProvider.getServiceAccess(id,port) });
 const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || 'data/web-state');
 const webImagesDirectory = resolve(process.env.CODEX_WEB_IMAGES_DIR || 'data/images');
@@ -169,8 +169,7 @@ const reconcileProjects = async () => {
         settings: { workingDirectory: project.sandbox!.workingDirectory }, sandbox: project.sandbox });
     };
     try {
-      if (coordinator) await coordinator.run(`project-control:${project.id}`, reconcile);
-      else await reconcile();
+      await reconcile();
     } catch (error) { runtimeLog.write({ event: 'sandbox.runtime_config_reconcile_failed', projectId: project.id, error }); }
   }
 };
@@ -179,7 +178,7 @@ if (coordinator) {
   if (lease) try { await reconcileProjects(); } finally { await lease.release(); }
 } else await reconcileProjects();
 const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.env.CELLBOX_PROFILE!, undefined,
-  () => webState.listProjects(), coordinator);
+  () => webState.listProjects(), {defaultTemplateId:process.env.CELLBOX_TEMPLATE_ID,defaultRevisionId:process.env.CELLBOX_REVISION_ID});
 await imageCatalog.init();
 manager.setImageCatalog(imageCatalog);
 const config: AppConfig = { models: availableModels, sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,

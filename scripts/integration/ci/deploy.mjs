@@ -12,6 +12,8 @@ const kube = args => ['--context', context, '-n', namespace, ...args];
 const nodes = JSON.parse(exec('kubectl', kube(['get', 'nodes', '-o', 'json']))).items;
 assert(nodes.length === 1 && nodes[0].metadata.labels['cocell-ci-run'] === process.env.GITHUB_RUN_ID, 'Refusing to deploy to an unrelated cluster');
 const nodeName = nodes[0].metadata.name;
+const nodeIP = nodes[0].status.addresses.find(address => address.type === 'InternalIP')?.address;
+assert(nodeIP && nodeIP === process.env.COCELL_CI_NODE_IP, 'K3s node address does not match the configured disposable registry address');
 const cellbox = process.env.CELLBOX_SOURCE_DIR;
 assert(cellbox && process.env.RUNNER_TEMP);
 const work = join(process.env.RUNNER_TEMP, 'cocell-ci');
@@ -21,18 +23,36 @@ const credentials = { token: randomBytes(32).toString('hex'), masterKey: randomB
 for (const value of Object.values(credentials)) console.log('::add-mask::' + value);
 await writeFile(join(work, 'credentials.json'), JSON.stringify(credentials), { mode: 0o600 });
 
+// The disposable node and BuildKit use a per-run HTTP registry. Docker pushes
+// through localhost; the server and containerd reach the same host registry by node IP.
+const registryName = `cocell-ci-registry-${process.env.GITHUB_RUN_ID}`;
+exec('docker', ['run', '-d', '--name', registryName, '--network', 'host', '--restart', 'no', 'registry:2']);
+for (let attempt = 0; attempt < 60; attempt++) {
+  try { if ((await fetch(`http://${nodeIP}:5000/v2/`)).ok) break; } catch {}
+  if (attempt === 59) throw new Error('Disposable CI registry did not become ready');
+  await new Promise(resolve => setTimeout(resolve, 500));
+}
+
 // Import images directly into this node; no registry credentials or image pushes.
 const suffix = exec('git', ['rev-parse', '--short=12', 'HEAD']).trim();
-const images = Object.fromEntries(['web', 'api', 'controller', 'sandbox', 'minio'].map(name => [name, `docker.io/cocell-ci/${name}:${suffix}`]));
+const images = Object.fromEntries(['web', 'server', 'sandbox', 'minio'].map(name => [name, `docker.io/cocell-ci/${name}:${suffix}`]));
 const build = args => exec('docker', ['build', ...args], { stdio: 'inherit' });
 build(['-f', 'deploy/web/Dockerfile', '-t', images.web, '.']);
-build(['-f', join(cellbox, 'images/cellbox-api.Dockerfile'), '-t', images.api, join(cellbox, 'dist/release')]);
-build(['-f', join(cellbox, 'images/controller.Dockerfile'), '-t', images.controller, join(cellbox, 'dist/release')]);
+build(['-f', join(cellbox, 'images/cellbox-server.Dockerfile'), '-t', images.server, join(cellbox, 'dist/release')]);
 const sandboxContext = join(work, 'sandbox'); await mkdir(sandboxContext);
 await copyFile(join(cellbox, 'dist/release/cellbox-container-agent'), join(sandboxContext, 'cellbox-container-agent'));
 await copyFile('deploy/box-wrap/launcher.mjs', join(sandboxContext, 'launcher.mjs'));
 const codexVersion = JSON.parse(await readFile('package.json', 'utf8')).dependencies['@openai/codex'];
 build(['-f', join(process.cwd(), 'deploy/ci/Sandbox.Dockerfile'), '--build-arg', `CODEX_VERSION=${codexVersion}`, '-t', images.sandbox, sandboxContext]);
+const localSandboxImage = `localhost:5000/cocell-ci/sandbox:${suffix}`;
+exec('docker', ['tag', images.sandbox, localSandboxImage]);
+exec('docker', ['push', localSandboxImage], { stdio: 'inherit' });
+const sandboxManifest = await fetch(`http://${nodeIP}:5000/v2/cocell-ci/sandbox/manifests/${suffix}`, { method: 'HEAD',
+  headers: { Accept: 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' } });
+assert(sandboxManifest.ok, 'Cannot read the pushed Sandbox image manifest');
+const sandboxDigest = sandboxManifest.headers.get('docker-content-digest');
+assert(/^sha256:[a-f0-9]{64}$/.test(sandboxDigest ?? ''), 'Cannot resolve the pushed Sandbox image digest');
+const sandboxImage = `${nodeIP}:5000/cocell-ci/sandbox@${sandboxDigest}`;
 // The old public MinIO image is no longer pullable. Build its pinned official
 // source instead of depending on an unverified image mirror.
 const minioCommit = '0d7408fc9969caf07de6a8c3a84f9fbb10a6739e';
@@ -44,12 +64,6 @@ build(['-f', join(process.cwd(), 'deploy/ci/Minio.Dockerfile'), '-t', images.min
 for (const image of Object.values(images)) {
   exec('bash', ['-o', 'pipefail', '-c', 'docker save "$1" | sudo k3s ctr images import -', 'image-import', image], { stdio: 'inherit' });
 }
-const imported = exec('sudo', ['k3s', 'ctr', 'images', 'ls']);
-const row = imported.split('\n').find(line => line.split(/\s+/)[0] === images.sandbox);
-const digest = row?.split(/\s+/)[2]; assert(/^sha256:[a-f0-9]{64}$/.test(digest ?? ''), 'Cannot resolve imported Sandbox manifest');
-const sandboxImage = `docker.io/cocell-ci/sandbox@${digest}`;
-exec('sudo', ['k3s', 'ctr', 'images', 'tag', images.sandbox, sandboxImage]);
-
 exec('kubectl', ['--context', context, 'create', 'namespace', namespace]);
 function apply(items) {
   exec('kubectl', kube(['apply', '-f', '-']), { input: JSON.stringify({ apiVersion: 'v1', kind: 'List', items }), stdio: ['pipe', 'inherit', 'inherit'] });
@@ -90,11 +104,14 @@ try {
   });
 } finally { forward.kill('SIGTERM'); }
 
-const cellboxValues = { api: { image: images.api, imagePullPolicy: 'Never', config: { clientId: 'cocell-ci', startupTimeoutSeconds: 180,
+const cellboxValues = { server: { image: images.server, imagePullPolicy: 'Never', nodeName },
+  storage: { hostPath: `/var/lib/cellbox-data-${process.env.GITHUB_RUN_ID}` },
+  api: { replicas: 1, namespace, config: { clientId: 'cocell-ci', startupTimeoutSeconds: 180, dataDir: '/var/lib/cellbox-data',
   profiles: [{ id: 'cocell-ci', provider: 'resumable-k8s-pod', image: sandboxImage, namespace, nodeName, cpu: 1, memoryMiB: 1024,
     guest: { workspace: '/home/agent/workspace', agent: { uid: 11000, gid: 11000 }, debug: { uid: 11001, gid: 11001 },
       command: ['/usr/local/bin/node', '/opt/product/cocell/launcher.mjs'], env: {}, tools: [] } }] } },
-  controller: { image: images.controller, imagePullPolicy: 'Never', warmPoolSize: 0, criDirectory: '/run/k3s/containerd', criSocket: '/run/k3s/containerd/containerd.sock' },
+  controller: { warmPoolSize: 0, criDirectory: '/run/k3s/containerd', criSocket: '/run/k3s/containerd/containerd.sock' },
+  buildkit: { enabled: true, repository: `${nodeIP}:5000/cocell-ci/template`, registryHost: `${nodeIP}:5000`, registryHTTP: true },
   objectStorage: { endpoint: `http://minio.${namespace}.svc.cluster.local:9000`, bucket: 'cocell-ci', credentialsSecret: 'ci-storage' },
 };
 const webValues = { image: { repository: 'docker.io/cocell-ci/web', tag: suffix, pullPolicy: 'Never' }, existingSecret: 'co-cell-runtime',
@@ -109,11 +126,24 @@ try {
   await copyFile('scripts/integration/ci/check-cellbox-config.go', check);
   exec('go', ['run', '-buildvcs=false', check], { cwd: cellbox, input: JSON.stringify(cellboxValues.api.config), stdio: ['pipe', 'inherit', 'inherit'] });
 } finally { await rm(checkDirectory, { recursive: true, force: true }); }
-for (const [name, chart, values] of [['cellbox', join(cellbox, 'charts/cellbox'), cellboxValues], ['co-cell', 'deploy/helm/co-cell', webValues]]) {
-  const file = join(work, `${name}-values.json`); await writeFile(file, JSON.stringify(values), { mode: 0o600 });
-  exec('helm', ['upgrade', '--install', name, chart, '--kube-context', context, '-n', namespace, '-f', file, '--wait', '--timeout', '5m'], { stdio: 'inherit' });
-}
+const cellboxValuesFile = join(work, 'cellbox-values.json'); await writeFile(cellboxValuesFile, JSON.stringify(cellboxValues), { mode: 0o600 });
+exec('helm', ['upgrade', '--install', 'cellbox', join(cellbox, 'charts/cellbox'), '--kube-context', context,
+  '-n', namespace, '-f', cellboxValuesFile, '--wait', '--timeout', '5m'], { stdio: 'inherit' });
+const bootstrapOutput = exec('python3', ['deploy/scripts/cellbox/bootstrap-template.py', sandboxImage], { env: {
+  ...process.env, COCELL_KUBE_CONTEXT: context, COCELL_CELLBOX_NAMESPACE: namespace, CELLBOX_PROFILE: 'cocell-ci',
+  CELLBOX_CLIENT_ID: 'cocell-ci', COCELL_CELLBOX_CREATE_TEMPLATE: '1', COCELL_CELLBOX_TEMPLATE_NAME: `cocell-ci-${suffix}`,
+  COCELL_SANDBOX_IMAGE_TAG: `ci-${suffix}`,
+} });
+const revisionId = /^CELLBOX_REVISION_ID=(.+)$/m.exec(bootstrapOutput)?.[1];
+assert(revisionId, 'Template build did not produce a revision selector');
+const templateId = /^Created template family ([A-Za-z0-9_-]+)$/m.exec(bootstrapOutput)?.[1];
+webValues.cellbox.revisionId = revisionId;
+const webValuesFile = join(work, 'co-cell-values.json');
+await writeFile(webValuesFile, JSON.stringify(webValues), { mode: 0o600 });
+exec('helm', ['upgrade', '--install', 'co-cell', 'deploy/helm/co-cell', '--kube-context', context, '-n', namespace,
+  '-f', webValuesFile, '--wait', '--timeout', '5m'], { stdio: 'inherit' });
 // Keep the provenance, not configuration or credentials, in the uploaded report.
 await mkdir('tmp/integration/ci', { recursive: true });
 await writeFile('tmp/integration/ci/deployment.json', JSON.stringify({ commit: exec('git', ['rev-parse', 'HEAD']).trim(),
-  cellboxCommit: exec('git', ['-C', cellbox, 'rev-parse', 'HEAD']).trim(), minioCommit, nodeName, images, sandboxImage }, null, 2));
+  cellboxCommit: exec('git', ['-C', cellbox, 'rev-parse', 'HEAD']).trim(), minioCommit, nodeName, images, sandboxImage,
+  ...(templateId ? { templateId } : {}), revisionId }, null, 2));

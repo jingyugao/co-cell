@@ -14,6 +14,11 @@ export interface SandboxImageIdentity {
 
 /** Sandbox reference and live observation; status is never persisted by CoCell. */
 export interface SandboxState {
+  /** Request-local observations from Cellbox; never used as a resource lock. */
+  phase?: string;
+  generation?: number;
+  operationId?: string;
+  observedAt?: string;
   lastActiveAt?: string;
   pausedAt?: string;
   id: string;

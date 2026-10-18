@@ -1,18 +1,17 @@
 import type { ManagedImage, ImageVersion, DefaultImageSelection } from '../../protocol/image-types.js';
-import type { CellboxImportImageInput } from '../../packages/sandbox/src/providers/cellbox/client.js';
 
 export interface ImageVersionRecord extends ImageVersion {
-  /** Exact request retained for idempotent retry; registry credentials are never stored. */
-  request: Omit<CellboxImportImageInput, 'registryAuth'>;
-  /** Fingerprint of source + operator script + current CoCell packaging. */
+  userVersion?: string;
+  /** Legacy imported-image metadata retained only so old JSON can be loaded safely. */
+  request?: unknown;
   preparationKey?: string;
-  requiresRegistryAuth: boolean;
+  requiresRegistryAuth?: boolean;
 }
 export interface ImageRecord extends Omit<ManagedImage, 'versions'> {
   versions: ImageVersionRecord[];
   deletedAt?: string;
-  /** Local lifecycle flags for versions discovered through Cellbox. */
-  versionLifecycle?: Record<string, { deprecatedAt?: string }>;
+  /** Old imported-image records stay visible until an operator migrates them. */
+  legacyImport?: boolean;
 }
 export interface ImageCatalogStore {
   listImages(): Promise<ImageRecord[]>;

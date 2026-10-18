@@ -58,23 +58,23 @@ is excluded from Git and Docker build contexts. Integration tests can read the
 existing Kubernetes Secret in memory using `COCELL_E2E_KUBE_CONTEXT`, so operator
 tokens need not be copied into the file.
 
-```sh
-make deploy-cellbox-api CELLBOX_SOURCE_DIR=../cell-box COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT
-make deploy-cellbox-controller CELLBOX_SOURCE_DIR=../cell-box COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT
-make deploy-co-cell COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT
-make deploy-all CELLBOX_SOURCE_DIR=../cell-box COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT
-make deploy-debug-mount CELLBOX_SOURCE_DIR=../cell-box COCELL_REGISTRY_ENDPOINT=http://REGISTRY_HOST:PORT COCELL_DEBUG_READ_ONLY_HOST_PATH=/ABSOLUTE/NODE/DIRECTORY COCELL_SANDBOX_IMAGE_TAG=v0.0.2
-```
+The server uses exactly one of `CELLBOX_TEMPLATE_ID` or `CELLBOX_REVISION_ID`;
+`CELLBOX_PROFILE` selects the runtime specification. Configure the dedicated
+server node and persistent storage before deployment. A legacy installation
+requires a new data directory and object-storage prefix; existing v2 upgrades
+preserve their storage. Legacy metadata and archive indexes are not imported.
 
-`deploy-cellbox-controller` updates the ResumablePod CRD and controller image.
-`deploy-cellbox-api` builds and publishes the Cellbox API image, checks for
-active operations, updates its `Recreate` deployment, and verifies the running
-Pod uses the published digest. `deploy-co-cell` deploys only the CoCell web
-service. `deploy-debug-mount` builds Cellbox once and runs the controller, API,
-and Sandbox deployments in sequence. `deploy-all` also deploys the CoCell web
-service. With the debug host mount, remove `__mysqlLogin` and
-`__kubernetes_config.json` from CoCell's credential-slot mapping; their CLI
-wrappers read those files from the mount. Keep registry addresses and
-credentials in local configuration, not
-in this file. Do not apply Cellbox's example `deploy/cellbox-api.yaml` to the
-CoCell installation.
+`make deploy-cellbox-server` builds and publishes one server image, checks
+active Box operations, deploys the single-node `cellbox-server`, and verifies
+its image digest. `make deploy-cocell-sandbox` submits one explicit template
+revision build and prints its selector. Save that revision for standalone
+`make deploy-co-cell`. `make deploy-all` passes the newly built revision to
+CoCell automatically; any unconfirmed build result stops the sequence.
+`make deploy-debug-mount` updates the server and Sandbox only.
+
+The old `deploy-cellbox-api`, `deploy-cellbox-controller`, and
+`deploy-cellbox-local-metadata` targets reject execution. Use the sibling
+Cellbox single-server chart; do not apply an old example API Deployment.
+Keep installation addresses, credentials, storage paths, and selectors in
+local configuration. See the [migration plan](tmp/docs/cellbox-migration-plan-2026-10-18.md)
+for data boundaries and validation before any operator-authorized rollout.

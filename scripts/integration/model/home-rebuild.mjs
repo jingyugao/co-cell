@@ -42,7 +42,7 @@ export async function homeRebuild(env) {
     assert.equal(archived.status, 'archived');
     assert.equal(archived.sandboxOperation.status, 'succeeded');
     assert.equal(archived.sandbox, undefined);
-    const restoredNow = await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    const restoredNow = await env.json(`/api/projects/${project.id}/sandbox/restore`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(restoredNow.sandboxOperation.status, 'succeeded');
     assert.equal(restoredNow.sandboxOperation.kind, 'restore');
     assert.equal(restoredNow.sandbox.status, 'ready');
@@ -67,24 +67,20 @@ export async function homeRebuild(env) {
     await env.persist();
     return { nativeTurnId: newer.turn.nativeTurnId };
   });
-  await env.step('Lose the test execution and rebuild the same HOME without archive rollback', async () => {
+  await env.step('Report same-ID rebuild as unsupported while preserving the original binding and backup', async () => {
     const failure = await failTestSandbox(env, project.id);
     await env.waitProject(project.id, { status: 'unavailable' });
-    const rebuild = await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
-    assert.equal(rebuild.sandboxOperation.status, 'succeeded');
-    assert.equal(rebuild.sandbox.status, 'ready');
-    const rebuilt = await env.waitProject(project.id, { kind: 'rebuild', status: 'ready' });
-    assert.equal(rebuilt.sandbox.id, ready.sandbox.id, 'Rebuild replaced the HOME owner');
-    assert.equal(rebuilt.remoteArchives[0].id, archive.id);
-    assert.equal(await read(), latest, 'Rebuild lost the file written after backup');
-    const current = await env.json(`/api/sessions/${session.id}`);
-    assert.equal(current.threadId, initial.session.threadId);
-    assert.deepEqual(history(current), savedHistory, 'Rebuild lost or changed native conversation history');
-    const continued = await record();
-    assert.equal(continued.session.threadId, initial.session.threadId);
-    assert.deepEqual(history(continued.session).slice(0, savedHistory.length), savedHistory);
-    assert.equal(history(continued.session).length, savedHistory.length + 1);
-    assert.equal(await read(), latest);
-    return { ...failure, sandboxId: rebuilt.sandbox.id, threadId: current.threadId, turns: continued.session.turns.length };
+    const rejected = await env.json(`/api/projects/${project.id}/sandbox/rebuild`, {
+      method: 'POST', body: {}, expectedStatus: 422, timeoutMs: env.config.operationTimeout,
+    });
+    assert.match(rejected.error, /不支持同 ID 重建/);
+    const current = await env.json(`/api/projects/${project.id}`);
+    assert.equal(current.sandbox.id, ready.sandbox.id);
+    assert.equal(current.remoteArchives[0].id, archive.id);
+    assert.equal(current.sandboxOperation.status, 'failed');
+    env.report.homeRebuildEvidence.sameIdRebuildUnsupported = true;
+    await env.persist();
+    return { ...failure, sandboxId: current.sandbox.id, archiveId: archive.id };
+
   });
 }

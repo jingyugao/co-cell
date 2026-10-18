@@ -19,6 +19,9 @@ cellbox:
   # Optional data namespace. Empty uses the Cellbox API's configured default.
   clientId: ""
   profile: ""
+  # Choose exactly one selector. A revision ID pins the configured system runtime.
+  templateId: ""
+  revisionId: ""
 
 # HTTPS origin (or loopback HTTP origin). It must have no path, query, or hash.
 publicUrl: ""

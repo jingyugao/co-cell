@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type ProjectSandboxOperation, type ProjectStatus, type ProjectSummary, type ProjectType } from '../../../protocol/types';
-import { api } from '../../lib/api';
+import { api, ApiError } from '../../lib/api';
 
 export type ProjectValues = { name: string; requirementUrl: string | null; type: ProjectType; imageId?: string; imageVersionId?: string };
 export type ProjectUpdate = Partial<Omit<ProjectValues, 'imageId' | 'imageVersionId'>> & { status?: ProjectStatus; backupRetentionCount?: number };
@@ -29,7 +29,7 @@ export function useProjects() {
     await api<ProjectSummary>('/api/projects', { method: 'POST', body: JSON.stringify(values) }),
   ), [storeProject]);
   const enterProject = useCallback(async (id: string, signal?: AbortSignal) => {
-    const project = await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/open`, { method: 'POST', signal });
+    const project = await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { signal });
     signal?.throwIfAborted();
     return storeProject(project);
   }, [storeProject]);
@@ -51,14 +51,14 @@ export function useProjects() {
     try { return storeProject(await request()); }
     catch (error) {
       setProjects(current => current.map(project => project.id === id ? { ...project, sandboxOperation: {
-        ...operation, status: 'failed', error: error instanceof Error ? error.message : '请求失败，请刷新状态后重试。',
+        ...operation, status: !(error instanceof ApiError) || ['UNKNOWN_OUTCOME', 'TRANSPORT'].includes(error.code ?? '') ? 'unknown' : 'failed', errorCode: error instanceof ApiError ? error.code : undefined, error: error instanceof Error ? error.message : '请求结果未知，请查询状态后决定下一步。',
       } } : project));
       throw error;
     }
     finally { await refreshProjects().catch(() => undefined); }
   }, [refreshProjects, storeProject]);
   const rebuildSandbox = useCallback((id: string, imageVersionId?: string) => runSandboxOperation(id, projects.find(project => project.id === id)?.remoteArchives?.length ? 'restore' : 'create', () =>
-    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/rebuild`, { method: 'POST', body: JSON.stringify(imageVersionId ? { imageVersionId } : {}) }),
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/${projects.find(project => project.id === id)?.remoteArchives?.length ? 'restore' : 'create'}`, { method: 'POST', body: JSON.stringify(imageVersionId ? { imageVersionId } : {}) }),
   ), [projects, runSandboxOperation]);
   const resumeSandbox = useCallback((id: string) => runSandboxOperation(id, 'resume', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/resume`, { method: 'POST' }),

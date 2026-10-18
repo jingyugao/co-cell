@@ -93,18 +93,20 @@ test('project list and detail query live sandbox state without mutating lifecycl
   const saveProject = state.saveProject.bind(state);
   let writes = 0;
   state.saveProject = async value => { writes++; await saveProject(value); };
-  let releaseMaintenance: (() => void) | undefined;
   try {
     await manager.init();
     writes = 0;
     const queriesBeforePoll = queries;
     const lifecycleCallsBeforePoll = { inspections, rebuilds, resumes, verifications, preparations };
     const projects = (manager as unknown as { projects: ProjectService }).projects;
-    releaseMaintenance = projects.beginMaintenance(id);
+    const pendingOperation = { id: 'archive-op-1', kind: 'archive' as const, phase: '校验归档', status: 'running' as const,
+      updatedAt: new Date().toISOString() };
+    await projects.updateSandboxOperation(id, pendingOperation);
     const list = await manager.listProjectsWithArchives();
     assert.equal(list.length, 1);
     assert.equal(list[0].sandbox?.status, 'paused', 'provider state replaces stale saved status in list response');
     assert.equal(projects.get(id).sandbox?.status, 'unknown', 'internal metadata keeps status transient');
+    assert.deepEqual(projects.get(id).sandboxOperation, pendingOperation, 'reads preserve real pending operation metadata');
     assert.equal(writes, 0);
     assert.deepEqual({ inspections, rebuilds, resumes, verifications, preparations }, lifecycleCallsBeforePoll);
 
@@ -120,7 +122,6 @@ test('project list and detail query live sandbox state without mutating lifecycl
 
     queryFailure = false;
     providerStatus = 'ready';
-    releaseMaintenance(); releaseMaintenance = undefined;
     const releaseTask = projects.startSession(id, 'active-task');
     try {
       const activeList = await manager.listProjectsWithArchives();
@@ -132,7 +133,6 @@ test('project list and detail query live sandbox state without mutating lifecycl
     assert.deepEqual({ inspections, rebuilds, resumes, verifications, preparations }, lifecycleCallsBeforePoll);
     assert.equal(queries - queriesBeforePoll, 5);
   } finally {
-    releaseMaintenance?.();
     await manager.close();
     await rm(directory, { recursive: true, force: true });
   }

@@ -39,8 +39,8 @@ test('turns reuse the read transport and keep native success when activity persi
   } finally { await runtime.close(); }
 });
 
-test('history maintenance keeps BUSY classification through runtime error sanitization', async () => {
-  const reader = new AppServerReader(async () => { throw new Error('must not connect during maintenance'); }, () => {});
+test('history surfaces Cellbox BUSY and redacts secrets without a local maintenance fence', async () => {
+  const reader = new AppServerReader(async () => { throw Object.assign(new Error('Cellbox BUSY test-secret'), { code: 'BUSY' }); }, () => {});
   const runtime = new ContainerCodexRuntime({ provider: {} as SandboxProvider,
     sandboxes: { close: async () => {} } as unknown as ProjectSandboxes, apiKey: 'test-secret', appServerReader: reader,
     paths: { root: '/workspace', runtime: '/runtime', codexHome: '/codex', node: '/node' }, prepareRemote: async () => false });
@@ -48,7 +48,7 @@ test('history maintenance keeps BUSY classification through runtime error saniti
   const session = { threadId: 'thread-one', sandbox: { id: 'box-one' } } as Session;
   try {
     for (const request of [() => runtime.history(session), () => runtime.subagents(session)]) {
-      await assert.rejects(request(), error => error instanceof Error && 'code' in error && error.code === 'BUSY');
+      await assert.rejects(request(), error => error instanceof Error && 'code' in error && error.code === 'BUSY' && !error.message.includes('test-secret'));
     }
   } finally { release?.(); await runtime.close(); }
 });

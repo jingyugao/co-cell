@@ -60,6 +60,20 @@
         "apiUrl",
         "profile"
       ],
+      "oneOf": [
+        {
+          "properties": {
+            "templateId": { "type": "string", "minLength": 1 },
+            "revisionId": { "type": "string", "maxLength": 0 }
+          }
+        },
+        {
+          "properties": {
+            "templateId": { "type": "string", "maxLength": 0 },
+            "revisionId": { "type": "string", "minLength": 1 }
+          }
+        }
+      ],
       "properties": {
         "apiUrl": {
           "type": "string",
@@ -73,6 +87,14 @@
         "profile": {
           "type": "string",
           "minLength": 1
+        },
+        "templateId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "revisionId": {
+          "type": "string",
+          "maxLength": 128
         }
       }
     },

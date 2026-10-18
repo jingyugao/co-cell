@@ -9,7 +9,7 @@
 | `scripts/integration/conversation-reads.mjs` | 真实模型、原生历史、子/孙代理、会话隔离、读取耗时 | `model/conversation-reads.mjs`，保留实际对话断言 |
 | `scripts/integration/project-lifecycle.mjs` | 真实模型生成文件/Go 服务、异步提问、Checkpoint、进程连续性、备份恢复 | `model/project-lifecycle.mjs`，复用统一配置和清理，服务样例改用平台已有 Node 标准库 |
 | `backend/access/app-integration.test.ts` | Hono 路由、登录、预览 Cookie；后端依赖替身 | 保留原位置，属于进程内集成测试 |
-| `backend/sessions/project-sandbox-lifecycle.test.ts`、`backend/projects/*.test.ts` | Manager、维护锁、状态提交、生命周期错误；运行时替身 | 保留原位置，定位业务状态问题 |
+| `backend/sessions/project-sandbox-lifecycle.test.ts`、`backend/projects/*.test.ts` | Manager、元数据短事务、状态提交、生命周期错误；运行时替身 | 保留原位置，定位业务状态问题 |
 | `packages/sandbox/src/providers/cellbox/provider.test.ts` | Provider 协议、超时、轮询等替身边界 | 保留原位置，定位适配器问题 |
 | `fe/**/*.test.ts(x)` | 导航、历史合并、组件静态渲染 | 保留原位置，补充浏览器测试 |
 | 临时 Python/Playwright 验证脚本 | 立即进入项目、自动恢复、可编辑草稿、真实 k3s 冒烟 | 迁入 `ui/` 与 `live/`，不再依赖临时目录中的程序 |
@@ -21,13 +21,13 @@
 | 分组 | 用例 | 外部依赖 |
 | --- | --- | --- |
 | harness | 创建响应丢失后的资源回收；拒绝删除非本次项目；清理失败导致测试失败；报告凭证脱敏 | 无 |
-| ui-desktop / ui-mobile | 暂停项目可进入；等待期间可输入且禁止发送；创建立即进入；创建/恢复失败与重试；刷新保留草稿；旧会话先 SSE 后历史；Checkpoint 进行中进入；切换项目停止轮询、草稿隔离 | 本地 Vite、Chromium；API 为可控替身 |
-| live | 真实 UI 创建/自动恢复；单项目并发进入去重；两个项目同时恢复；GET 不隐式唤醒；暂停时允许空会话元数据、拒绝任务执行；恢复保持 box ID；再次 Checkpoint 验证 App Server | 已部署 CoCell、Cellbox、Kubernetes 运行时和存储 |
+| ui-desktop / ui-mobile | 暂停项目只读进入且可编辑草稿；明确恢复；unknown 不自动重放；创建立即进入；查询失败可刷新；旧会话先 SSE 后历史；Checkpoint 不挡查看；草稿隔离 | 本地 Vite、Chromium；API 为可控替身 |
+| live | 真实 UI 创建/明确恢复；并发只读进入不提交恢复；明确恢复请求独立并透传底层冲突；两个项目同时恢复；GET 不隐式唤醒；暂停时允许空会话元数据、拒绝任务执行；再次 Checkpoint 验证 App Server | 已部署 CoCell、Cellbox、Kubernetes 运行时和存储 |
 | model lifecycle | 真实模型调用工具；Node 服务与文件下载；Checkpoint/Resume 保持 PID、实例标记和内存计数；备份/归档/恢复；恢复后的文件、会话上下文和重新启动服务 | live 依赖、可用模型、Sandbox 内预装 Node |
 | model user-input | 独立新会话及原会话续聊连续两次真实调用异步提问工具，API 回复、原生 call ID、答复状态持久化 | live 依赖、支持原生异步提问工具的模型 |
 | model reads | 真实子/孙代理、会话隔离、后续轮次上下文、原生历史新鲜度、历史与子代理接口耗时 | live 依赖、支持子代理的模型 |
 
-`pnpm test:integration:full --list` 是用例清单的权威入口。目前包括 2 个基础设施用例、6 个桌面和 6 个手机用例、2 条真实服务旅程、3 条真实模型旅程。模型旅程内部通过步骤报告区分多个断言阶段。
+`pnpm test:integration:full --list` 是当前用例清单的权威入口。模型旅程内部通过步骤报告区分多个断言阶段。
 
 ## 运行
 
@@ -83,14 +83,24 @@ UI 交互耗时与实际恢复耗时分别记录；普通集成测试不把单�
 ## 重点维护规则
 
 - 改项目入口、草稿、导航或异步就绪：补充/更新 `ui/`，跑桌面和手机回归。
-- 改创建、Checkpoint、Resume、幂等或状态读取：更新 `live/`，对测试安装执行真实旅程。
+- 改创建、Checkpoint、Resume、错误分类或状态读取：更新 `live/`，对测试安装执行真实旅程。
 - 改原生历史、子代理、异步提问、备份恢复：更新 `model/` 对应旅程，不能用伪造对话替代。
 - 缺陷修复与回归断言放在同一 MR；失败先区分产品缺陷、环境故障、测试缺陷，禁止用无条件重试或跳过隐藏问题。
 - GitHub Actions 在 PR 和 master 上执行类型检查、构建及默认浏览器回归，保留 7 天报告。真实集群/模型测试通过本机或有对应配置的运行环境执行。
 
 此模块覆盖 CoCell 产品关键闭环，不包含 Cellbox API 重启、节点丢失、OSS 故障注入、冷缓存容量压测、镜像构建或外部飞书服务完整测试。故障注入应在隔离环境维护独立套件，不能混入每次运行的默认回归。
 
-## 修复与实测：2026-10-04
+## 新版 Cellbox 适配：2026-10-18
+
+项目不再有通用控制锁、维护长租约或恢复重放。只读进入和真实状态查询独立，unknown 结果由用户决定下一步。SDK 与 App Server 连接缓存仅保护本地数据；生命周期请求不排队等待普通读取，冲突由 Cellbox 返回。自动政策不重复提交已失败或未知的动作。
+
+运行中纯磁盘归档和同 ID rebuild 已明确不支持。真实模型测试中的同 ID 重建改为验证 unsupported 且不改变原绑定/备份；归档恢复使用明确的 restore API。自动备份不自动删除旧归档，清理需明确调用 prune。真实环境与模型测试须针对已迁移的独立测试安装执行；本次本地代码验证不能代替部署验收。
+
+本轮本地结果：379 项单测通过；桌面 28/28、手机 28/28 通过。完整集成运行 66/67，唯一 harness 失败来自测试文件编辑期间缺失导入，补齐后同一 harness 定向复验 1/1 通过。没有跳过或 flaky；新版安装的 live/full 尚未执行。
+
+## 历史修复与实测：2026-10-04
+
+以下为旧版历史结果，其中的维护栅栏与隐式恢复行为已在 2026-10-18 改造中移除，不代表当前版本已完成真实安装验证。
 
 首次真实模型测试发现，历史读取连接会保留 60 秒，导致紧接着的 Checkpoint/删除被 Cellbox 拒绝；子代理测试还因授权上下文未完整传递而没有生成孙代理。修复后验证如下：
 

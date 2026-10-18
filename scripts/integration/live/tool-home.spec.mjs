@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { test, expect } from '../support/fixtures.mjs';
-import { failTestSandbox } from '../support/kubernetes.mjs';
 
 const exec = promisify(execFile);
 let ownedProjectId;
@@ -20,7 +19,7 @@ test.afterEach(async ({ environment: env }) => {
   }
 });
 
-test('native tool HOME: deployed permission UI, revocation, checkpoint continuity and cold rebuild', async ({ livePage: page, environment: env }) => {
+test('native tool HOME: deployed permission UI, revocation, checkpoint continuity and archive restore', async ({ livePage: page, environment: env }) => {
   test.skip(process.env.COCELL_E2E_TOOL_HOME_TEST !== '1', 'Requires an installation with a mounted HOME image and a configured kubectl credential');
   const context = process.env.COCELL_E2E_KUBE_CONTEXT;
   assert(context, 'This installation test requires its explicit Kubernetes context');
@@ -112,7 +111,7 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     assert.equal((await fileState()).exists, false);
     return { podUnchanged: true, denied: true, credentialRemoved: true };
   });
-  await env.step('Native CLI updates survive pause and resume without copying the original credential back', async () => {
+  await env.step('Native CLI updates survive pause and an explicit resume without replacing the file', async () => {
     await savePermission(true);
     const before = await fileState();
     assert.equal((await cli([`--context=${kubeContext}`, 'config', 'set-context', '--current', '--namespace=cocell-home-integration'])).status, 0);
@@ -123,27 +122,34 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     assert.equal(checkpointed.sandbox.status, 'paused');
     await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
     const start = performance.now();
-    const opened = await env.json(`/api/projects/${project.id}/open`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
-    assert.equal(opened.sandboxOperation.status, 'succeeded');
-    assert.equal(opened.sandbox.status, 'ready');
-    const resumed = await env.waitProject(project.id, { kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id });
+    const resumed = await env.json(`/api/projects/${project.id}/sandbox/resume`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    assert.equal(resumed.sandboxOperation.status, 'succeeded');
+    assert.equal(resumed.sandbox.status, 'ready');
+    const ready = await env.waitProject(project.id, { kind: 'resume', status: 'ready', operationId: resumed.sandboxOperation.id });
     const observedReadyMs = performance.now() - start;
-    assert.equal(resumed.sandbox.id, project.sandbox.id);
+    assert.equal(ready.sandbox.id, project.sandbox.id);
     const previousPod = pod; pod = await findPod();
     assert.notEqual(pod, previousPod);
     assert.equal((await fileState()).sha256, refreshed.sha256);
     assert.equal((await cli([`--context=${kubeContext}`, 'config', 'current-context'])).status, 0);
-    return { observedReadyMs, pod, nativeCredentialPreserved: true };
+    return { observedReadyMs, pod, nativeCredentialPreserved: true, operationId: ready.sandboxOperation.id };
   });
-  await env.step('Cold rebuild restores protected kubectl and MySQL while retaining native credential updates', async () => {
+  await env.step('Archive and explicit restore create a new Sandbox with the updated native credentials', async () => {
     const before = await fileState();
     const previousPod = pod;
-    const lost = await failTestSandbox(env, project.id);
-    const rebuild = await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
-    assert.equal(rebuild.sandboxOperation.status, 'succeeded');
-    assert.equal(rebuild.sandbox.status, 'ready');
-    const rebuilt = await env.waitProject(project.id, { kind: 'rebuild', status: 'ready' });
-    assert.equal(rebuilt.sandbox.id, lost.sandboxId);
+    const checkpointed = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    assert.equal(checkpointed.sandbox.status, 'paused');
+    const backedUp = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
+    assert(backedUp.remoteArchives?.length, 'Checkpoint must publish a durable archive before project archival');
+    const archived = await env.json(`/api/projects/${project.id}/archive`, { method: 'POST', expectedStatus: 200,
+      timeoutMs: env.config.operationTimeout, body: { useExistingBackup: true } });
+    assert.equal(archived.status, 'archived');
+    assert.equal(archived.sandbox, undefined);
+    const restored = await env.json(`/api/projects/${project.id}/sandbox/restore`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    assert.equal(restored.sandboxOperation.status, 'succeeded');
+    assert.equal(restored.sandbox.status, 'ready');
+    const ready = await env.waitProject(project.id, { kind: 'restore', status: 'ready' });
+    assert.notEqual(ready.sandbox.id, project.sandbox.id, 'Archive restore must create a new runtime resource');
     pod = await findPod();
     assert.notEqual(pod, previousPod);
     assert.equal((await fileState()).sha256, before.sha256);
@@ -155,6 +161,6 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     const mysql = await guest(`const {spawnSync}=require('node:child_process');const r=spawnSync('/usr/local/bin/mysql',${JSON.stringify(args)},{uid:11000,gid:11000,cwd:'/home/agent/workspace',env:{HOME:'/home/agent',PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:20000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.code}));`);
     assert.equal(mysql.status, 0, mysql.stderr || mysql.error);
     assert.equal(mysql.stdout.trim().split('\n').at(-1), '1');
-    return { sandboxId: rebuilt.sandbox.id, pod, credentialPreserved: true, kubectl: 'passed', mysql: 'passed' };
+    return { sandboxId: ready.sandbox.id, pod, credentialPreserved: true, kubectl: 'passed', mysql: 'passed' };
   });
 });

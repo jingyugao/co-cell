@@ -4,12 +4,12 @@ import type { WorkspaceTarget } from '../sandboxes/types.js';
 
 /** Optional runtime capability for Cellbox-owned archives. */
 export interface RemoteArchives {
-  /** Capture and verify the current box. The idempotency key was persisted before this call. */
-  capture(target: WorkspaceTarget, idempotencyKey: string, options?: { diskOnly: boolean }): Promise<RemoteArchiveMetadata>;
+  /** Submit capture once and verify the result; request ID is only for correlation. */
+  capture(target: WorkspaceTarget, requestId: string, options?: { diskOnly: boolean }): Promise<RemoteArchiveMetadata>;
   /** Verify that the specific owned archive still exists and matches its saved metadata. */
   inspect(reference: RemoteArchiveRef): Promise<RemoteArchiveMetadata>;
   /** Restore into a staged box. Notify about its ID before subsequent setup can fail. */
-  restore(target: WorkspaceTarget, reference: RemoteArchiveRef, idempotencyKey: string,
+  restore(target: WorkspaceTarget, reference: RemoteArchiveRef, requestId: string,
     onCandidate: (sandbox: SandboxState) => Promise<void>): Promise<SandboxState>;
   /** Configure the restored box, activate it, and verify it is ready for the app server. */
   activate(candidate: SandboxState): Promise<void>;

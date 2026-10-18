@@ -5,7 +5,7 @@ import { errorMessage } from '../../lib/api';
 
 type EnterProject = (id: string, signal?: AbortSignal) => Promise<ProjectSummary>;
 
-/** Prepare once per workspace entry, independently of the editable prompt draft. */
+/** Read once per workspace entry; never resume or prepare a remote environment. */
 export function useProjectEntry(projectId: string | null, entryKey: string, enter: EnterProject) {
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState({ key: '', pending: false, error: '' });
@@ -18,9 +18,9 @@ export function useProjectEntry(projectId: string | null, entryKey: string, ente
       const project = await enter(projectId, signal);
       signal.throwIfAborted();
       const operation = project.sandboxOperation;
-      if (operation?.status === 'failed') throw new Error(operation.error || '环境准备失败，请重试。');
+      if (!isProjectSandboxReady(project) && (operation?.status === 'failed' || operation?.status === 'unknown')) throw new Error(operation.error || '操作尚未确认，请查询状态后决定下一步。');
       if (!isProjectSandboxReady(project))
-        throw new Error(project.sandbox ? '环境暂不可用，请重试或在项目管理中恢复。' : '环境尚未创建，请在项目管理中重试准备。');
+        throw new Error(project.sandbox?.status === 'paused' ? '环境已暂停，请在项目管理中点击恢复运行。' : project.sandbox ? '环境暂不可用，请在项目管理中查看状态。' : '环境尚未创建，请在项目管理中创建。');
       setState({ key: entryKey, pending: false, error: '' });
     })().catch(error => {
       if (!signal.aborted) setState({ key: entryKey, pending: false, error: errorMessage(error) });

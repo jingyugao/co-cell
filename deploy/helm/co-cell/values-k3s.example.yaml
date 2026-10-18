@@ -15,6 +15,8 @@ existingSecret: co-cell-secrets
 cellbox:
   apiUrl: https://cellbox-api.example.invalid
   profile: replace-with-resumable-profile
+  # Pin a built Cellbox system revision. Set templateId instead only if following its stable pointer is intended.
+  revisionId: replace-with-cellbox-revision-id
 
 publicUrl: https://co-cell.example.invalid
 

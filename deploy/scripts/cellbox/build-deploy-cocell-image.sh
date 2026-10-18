@@ -37,7 +37,7 @@ kube_context="${COCELL_KUBE_CONTEXT:-k3s}"
 namespace="${COCELL_CELLBOX_NAMESPACE:-cell-box}"
 release="${COCELL_CELLBOX_RELEASE:-cellbox}"
 cellbox_source="${CELLBOX_SOURCE_DIR:?Set CELLBOX_SOURCE_DIR to the Cellbox source directory}"
-profile_id="${COCELL_CELLBOX_PROFILE:-cocell-k8s-resumable}"
+profile_id="${CELLBOX_PROFILE:-${COCELL_CELLBOX_PROFILE:-cocell-k8s-resumable}}"
 shared_enabled="$(uv run --no-project python "$repo_root/deploy/scripts/cellbox/mount_config.py")"
 
 for command in curl jq kubectl uv helm docker; do
@@ -103,16 +103,17 @@ profile_patch="$(helm get values "$release" --kube-context "$kube_context" --nam
   uv run --no-project python "$repo_root/deploy/scripts/cellbox/patch-cocell-profile.py" "$profile_id" "$immutable_image" "$repo_root/deploy/box-wrap/profile.sample.json")"
 if [[ "$profile_patch" == "{}" ]]; then
   echo "Cellbox profile ${profile_id} already uses ${immutable_image} and the admitted tools"
-  exit 0
+else
+  echo "Updating Cellbox profile ${profile_id} to ${immutable_image} with admitted tools"
+  work="$(mktemp -d)"
+  trap 'rm -rf -- "$work"' EXIT
+  chmod 700 "$work"
+  printf '%s' "$profile_patch" > "$work/profile.json"
+  chmod 600 "$work/profile.json"
+  helm upgrade "$release" "$cellbox_source/charts/cellbox" \
+    --kube-context "$kube_context" --namespace "$namespace" --reuse-values \
+    --values "$work/profile.json" --wait --timeout 10m
 fi
 
-echo "Updating Cellbox profile ${profile_id} to ${immutable_image} with admitted tools"
-work="$(mktemp -d)"
-trap 'rm -rf -- "$work"' EXIT
-chmod 700 "$work"
-printf '%s' "$profile_patch" > "$work/profile.json"
-chmod 600 "$work/profile.json"
-helm upgrade "$release" "$cellbox_source/charts/cellbox" \
-  --kube-context "$kube_context" --namespace "$namespace" --reuse-values \
-  --values "$work/profile.json" --wait --timeout 10m
-echo "Deployed ${immutable_image} for new Cellbox Sandboxes"
+echo "Submitting one explicit template revision build for ${immutable_image}"
+uv run --no-project python "$repo_root/deploy/scripts/cellbox/bootstrap-template.py" "$immutable_image"

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { AddImageRepositoryInput, ManagedImage, RegistryAuth, SyncImageVersionInput } from '../../../protocol/image-types';
+import type { AddImageRepositoryInput, ManagedImage, SyncImageVersionInput } from '../../../protocol/image-types';
 import { api } from '../../lib/api';
 import RepositoryForm from './RepositoryForm';
 import RepositoryDetails from './RepositoryDetails';
@@ -28,7 +28,7 @@ export default function ImagesPage({ onMenu, onBack }: { onMenu: () => void; onB
     finally { if (alive.current && request === sequence.current) { setLoading(false); setRefreshTick(tick => tick + 1); } }
   }, []);
   useEffect(() => { alive.current = true; void reload(); return () => { alive.current = false; sequence.current++; }; }, [reload]);
-  const importing = images.some(image => image.versions.some(version => ['queued', 'running', 'submitting'].includes(version.status) || version.status === 'unknown' && version.operationId || version.cleanup && version.cleanup.status !== 'failed' && version.cleanup.operationId));
+  const importing = images.some(image => image.versions.some(version => ['queued', 'running', 'submitting'].includes(version.status) || version.status === 'unknown' && version.operationId));
   useEffect(() => {
     if (!importing || busy) return;
     const timer = setTimeout(() => void reload(), 3000);
@@ -60,10 +60,9 @@ export default function ImagesPage({ onMenu, onBack }: { onMenu: () => void; onB
       {selected ? <RepositoryDetails key={selected.id} image={selected} busy={busy} initialLifecycle={lifecycle} onBack={() => setSelectedId(null)}
         onDeprecated={async (versionId, deprecated) => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/${encodeURIComponent(versionId)}`, { deprecated }, 'PATCH'); }}
         onDefault={async versionId => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/${encodeURIComponent(versionId)}/default`, {}); await reload(); }}
-        onDelete={async versionId => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/${encodeURIComponent(versionId)}`, undefined, 'DELETE'); }}
         onSync={async (input: SyncImageVersionInput) => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/sync`, input); }}
-        onRetry={async (versionId: string, registryAuth?: RegistryAuth) => { await mutate(`/api/images/${encodeURIComponent(selected.id)}/versions/${encodeURIComponent(versionId)}/retry`, registryAuth ? { registryAuth } : {}); }} /> : <>
-        <div className="projects-heading"><div><span className="projects-eyebrow">IMAGE REPOSITORIES</span><h1>镜像管理</h1><p>新项目使用标记为默认镜像的版本；只预热此版本。已有项目继续使用原版本。</p></div><button className="primary-button" disabled={busy || adding} onClick={() => setAdding(true)}>＋ 添加仓库</button></div>
+        /> : <>
+        <div className="projects-heading"><div><span className="projects-eyebrow">IMAGE REPOSITORIES</span><h1>镜像管理</h1><p>新项目使用 CoCell 选择的默认 revision；Cellbox stable revision 与 warmSlots 独立管理。</p></div><button className="primary-button" disabled={busy || adding} onClick={() => setAdding(true)}>＋ 添加仓库</button></div>
         {adding && <div className="project-create-panel"><RepositoryForm categories={categories} busy={busy} onCancel={() => setAdding(false)} onSubmit={async (input: AddImageRepositoryInput) => {
           const next = await mutate('/api/images/repositories', input);
           if (next) { setAdding(false); setSelectedId(next.id); }
@@ -71,7 +70,7 @@ export default function ImagesPage({ onMenu, onBack }: { onMenu: () => void; onB
         <div className="projects-toolbar"><div className="image-filters"><input aria-label="搜索镜像仓库" placeholder="搜索仓库、类型或版本…" value={query} onChange={event => setQuery(event.target.value)} /><select aria-label="筛选镜像类型" value={category} onChange={event => setCategory(event.target.value)}><option value="">全部类型</option>{categories.map(value => <option key={value}>{value}</option>)}</select><select aria-label="筛选镜像生效状态" value={lifecycle} onChange={event => setLifecycle(event.target.value)}><option value="active">生效中</option><option value="deprecated">已弃用</option><option value="all">全部</option></select></div><button className="secondary-button" disabled={busy} onClick={() => void reload()}>刷新</button></div>
         {loading ? <p className="projects-empty">正在读取仓库…</p> : !visible.length ? <p className="projects-empty">{query || category || images.length ? '当前筛选下没有匹配的仓库。' : '尚无镜像仓库，添加第一个开发环境。'}</p> : <div className="image-library">{visible.map(image => <article className="image-card" key={image.id}>
           <header><div><span className="project-type-badge">{image.category}</span><h2>{image.name}</h2><span className="image-count">{new Set(image.versions.filter(version => version.status === 'succeeded').map(version => version.version)).size} 个已同步版本{image.origin === 'profile' ? ' · 系统配置' : image.origin === 'cellbox' ? ' · Cellbox 已有镜像' : ''}</span></div><button className="secondary-button" disabled={busy || adding} onClick={() => setSelectedId(image.id)}>{image.origin === 'managed' ? '进入仓库' : '查看版本'}</button></header>
-          {image.versions.find(version => version.isDefault) && <p className="image-default-summary">默认镜像 · {image.versions.find(version => version.isDefault)?.version}</p>}
+          {image.versions.find(version => version.isDefault) && <p className="image-default-summary">CoCell 默认 revision · {image.versions.find(version => version.isDefault)?.version}</p>}
           {image.repository && <div className="image-reference"><span>仓库</span><code>{image.repository}</code></div>}
           {image.versions.some(version => ['queued', 'running', 'submitting'].includes(version.status)) && <p className="project-form-hint">版本同步中…</p>}
         </article>)}</div>}

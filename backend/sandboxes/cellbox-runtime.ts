@@ -26,7 +26,6 @@ export interface CellboxRuntimeIntegrationOptions extends SandboxRuntimeConfigOp
     env: Record<string, string>;
     lifecycle?: SandboxLifecycle;
     extensions?: readonly SandboxExtension[];
-    onRenewalFailure?: (error: unknown) => void;
     logger?: RuntimeLog;
     sharedDirectory?: boolean;
 }
@@ -34,17 +33,14 @@ export interface CellboxRuntimeIntegrationOptions extends SandboxRuntimeConfigOp
 export class CellboxRuntimeIntegration {
     readonly lifecycle: SandboxLifecycle;
     readonly remoteArchives: RemoteArchives;
-    private readonly preparations = new Map<string, Promise<void>>();
     private readonly prepared = new Map<string, { generation: number; workspace: string }>();
     private readonly sharedMounts = new Set<string>();
-    private readonly releases = new Set<() => Promise<void>>();
     constructor(private readonly options: CellboxRuntimeIntegrationOptions) {
         const runtimeConfig = new SandboxRuntimeConfig(options);
         this.lifecycle = options.lifecycle ?? new SandboxLifecycle([...(options.extensions ?? []), runtimeConfig.extension, {
             name: 'product-resource-cache', post: async context => {
                 if (context.action !== 'destroy' || !context.sandboxId) return;
                 this.prepared.delete(context.sandboxId);
-                this.preparations.delete(context.sandboxId);
                 this.sharedMounts.delete(context.sandboxId);
             },
         }]);
@@ -53,7 +49,7 @@ export class CellboxRuntimeIntegration {
         capture: async (target, key, captureOptions) => {
                 if (!target.sandbox)
                     throw new Error('Project has no Cellbox');
-                if (captureOptions?.diskOnly && !(await options.provider.client.getBox(target.sandbox.id)).capabilities.diskArchives) {
+                if (captureOptions?.diskOnly) {
                     throw new HttpError(409, '当前环境不支持独立磁盘归档；请恢复环境后导出文件，或明确选择使用已有备份归档。');
                 }
                 const capabilities = !captureOptions?.diskOnly && target.sandbox.status !== 'paused' && ossArchiveEndpoint && !target.imageSelection ? (await options.provider.client.getBox(target.sandbox.id)).capabilities : undefined;
@@ -85,6 +81,7 @@ export class CellboxRuntimeIntegration {
                 return metadata(await options.provider.client.getArchive(ref.id));
             },
             restore: async (target, ref, key, onCandidate) => {
+                if (target.imageSelection && !target.imageSelection.revisionId) throw new HttpError(409, '旧导入镜像尚未迁移为 Cellbox revision。');
                 const context: SandboxLifecycleContext = { action: 'restore', resourceKey: `project:${target.projectId ?? target.id}` };
                 return this.lifecycle.run(context, async () => {
                     if (ref.storageType === 'oss') {
@@ -93,7 +90,7 @@ export class CellboxRuntimeIntegration {
                         const createContext: SandboxLifecycleContext = { action: 'create', resourceKey: context.resourceKey };
                         let candidate!: SandboxState;
                         await this.lifecycle.run(createContext, async () => {
-                            const handle = await options.provider.create(options.profileId, { timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false }, metadata: { projectId: target.projectId ?? target.id, cellboxOwnerKey: `project:${target.projectId ?? target.id}:oss-restore:${key}`, cellboxIdempotencyKey: key, ...(options.sharedDirectory ? { cellboxStaged: 'true' } : {}) } });
+                            const handle = await options.provider.create(options.profileId, { timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false }, metadata: { projectId: target.projectId ?? target.id, cellboxOwnerKey: `project:${target.projectId ?? target.id}:oss-restore:${key}`, ...(options.sharedDirectory ? { cellboxStaged: 'true' } : {}) } });
                             candidate = { id: handle.sandboxId, template: options.profileId, status: 'starting', workingDirectory: workspace };
                             await onCandidate(candidate);
                             createContext.sandboxId = context.sandboxId = candidate.id;
@@ -107,7 +104,7 @@ export class CellboxRuntimeIntegration {
                         candidate.image = await options.provider.currentImageIdentity(candidate.id);
                         return candidate;
                     }
-                    const op = await options.provider.client.restoreBox({ profileId: options.profileId, ownerKey: `project:${target.projectId ?? target.id}:restore:${key}`, archiveId: ref.id, ...(target.imageSelection ? { importedImageId: target.imageSelection.importedImageId } : {}), ...(ref.portable ? { acceptImageChange: true } : {}) }, key);
+                    const op = await options.provider.client.restoreBox({ ...options.provider.defaultSelector, ownerKey: `project:${target.projectId ?? target.id}:restore:${key}`, archiveId: ref.id, ...(target.imageSelection?.revisionId ? { revisionId: target.imageSelection.revisionId, templateId: undefined } : {}), ...(ref.portable ? { acceptImageChange: true } : {}) });
                     const candidate: SandboxState = { id: op.targetId, template: options.profileId, status: 'starting', workingDirectory: target.settings.workingDirectory };
                     await onCandidate(candidate);
                     context.sandboxId = candidate.id;
@@ -140,7 +137,7 @@ export class CellboxRuntimeIntegration {
                 await writeFile(destination, bytes, { mode: 0o600, flag: 'wx' });
             },
             remove: async (ref) => {
-                if (ref.storageType === 'oss') return;
+                if (ref.storageType === 'oss') throw new HttpError(422, '旧 OSS 归档不支持通过 Cellbox 删除，请检查对象存储后手动处理。');
                 try {
                 await options.provider.client.deleteArchive(ref.id);
             }
@@ -152,13 +149,10 @@ export class CellboxRuntimeIntegration {
         };
     }
     async prepare(handle: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal, observation?: SandboxInfo, wait = true): Promise<boolean> {
-        const previous = this.preparations.get(handle.sandboxId) ?? Promise.resolve();
-        let fresh = false;
-        const current = previous.catch(() => { }).then(async () => {
+        return this.timed('product.prepare', handle.sandboxId, async () => {
             const box = observation ? undefined : await this.options.provider.client.getBox(handle.sandboxId);
             const phase = observation?.metadata?.phase ?? box?.phase;
-            const generationString = observation?.metadata?.generation;
-            const generation = observation ? Number(generationString) : box?.generation;
+            const generation = observation ? Number(observation.metadata?.generation) : box?.generation;
             if ((observation && observation.sandboxId !== handle.sandboxId) || (phase !== 'running' && phase !== 'staged')
                 || !Number.isSafeInteger(generation) || generation! < 1)
                 throw new Error(`Cellbox snapshot does not describe a prepared running Box ${handle.sandboxId}`);
@@ -166,21 +160,11 @@ export class CellboxRuntimeIntegration {
             if (this.options.sharedDirectory && sharedDirectory) this.sharedMounts.add(handle.sandboxId);
             else this.sharedMounts.delete(handle.sandboxId);
             const cached = this.prepared.get(handle.sandboxId);
-            fresh = !cached || cached.generation !== generation || cached.workspace !== target.settings.workingDirectory;
+            const fresh = !cached || cached.generation !== generation || cached.workspace !== target.settings.workingDirectory;
             if (fresh) await this.prepareOnce(handle, target, signal, wait);
             if (wait) this.prepared.set(handle.sandboxId, { generation: generation!, workspace: target.settings.workingDirectory });
-        });
-        this.preparations.set(handle.sandboxId, current);
-        try {
-            // The caller owns sandbox.prepare_environment; keep the stage log
-            // without a duplicate span around the same work.
-            await this.timed('product.prepare', handle.sandboxId, () => current, false);
-        }
-        finally {
-            if (this.preparations.get(handle.sandboxId) === current)
-                this.preparations.delete(handle.sandboxId);
-        }
-        return fresh;
+            return fresh;
+        }, false);
     }
     private async prepareOnce(handle: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal, wait: boolean) {
         if (posix.normalize(target.settings.workingDirectory) !== target.settings.workingDirectory || (target.settings.workingDirectory !== workspace && !target.settings.workingDirectory.startsWith(workspace + '/')))
@@ -243,27 +227,6 @@ export class CellboxRuntimeIntegration {
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         return { url: url.href, headers: access.headers };
     }
-    async acquireUsage(boxId: string, initializationDirectory?: string, observation?: SandboxInfo): Promise<() => Promise<void>> {
-        // Mounted default-workspace initialization does no remote I/O. The
-        // project usage remains held locally; the subsequent RPC holds an API
-        // stream fence. Custom directories, legacy setup and execution keep leases.
-        if (initializationDirectory === workspace && this.options.sharedDirectory &&
-            (observation ? observation.sandboxId === boxId && observation.capabilities?.sharedDirectory === true
-                : (await this.options.provider.client.getBox(boxId)).capabilities.sharedDirectory)) return async () => {};
-        const lease = await this.options.provider.createLease(boxId, 'cocell-product', 180);
-        return this.keepAlive(() => this.options.provider.renewLease(lease.id, 'cocell-product', 180).then(() => { }), () => this.options.provider.releaseLease(lease.id));
-    }
-    private keepAlive(renew: () => Promise<void>, close: () => Promise<void>) {
-        let closed = false;
-        let active: Promise<void> | undefined;
-        const timer = setInterval(() => { if (!closed && !active)
-            active = renew().catch(error => { this.options.onRenewalFailure?.(error); }).finally(() => { active = undefined; }); }, 60000);
-        timer.unref();
-        const release = async () => { if (closed)
-            return; closed = true; clearInterval(timer); this.releases.delete(release); await active; await close(); };
-        this.releases.add(release);
-        return release;
-    }
     private async timed<T>(phase: string, sandboxId: string, action: () => Promise<T>, recordSpan = true): Promise<T> {
         const startedAt = new Date().toISOString();
         const started = performance.now();
@@ -283,7 +246,6 @@ export class CellboxRuntimeIntegration {
         await client?.close();
     } }); }
     async close() {
-        await Promise.allSettled([...this.releases].map(release => release()));
         this.prepared.clear();
     }
 }

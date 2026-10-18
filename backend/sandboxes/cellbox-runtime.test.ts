@@ -85,10 +85,10 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
   const archiveBytes = Buffer.from('cellbox archive bytes');
   const archive: CellboxArchive = {
     id: 'archive-1', sourceBoxId: 'box-1', profileId: 'k8s', imageId: 'image@sha256:abc',
+    templateId: 'tpl-a', revisionId: 'rev-a', templateName: 'agent', templateVersion: '1.0-r1',
     agent: { uid: 11000, gid: 11000 }, sha256: createHash('sha256').update(archiveBytes).digest('hex'),
     size: archiveBytes.length, consistency: 'workspace-best-effort', createdAt: new Date().toISOString(),
   };
-  let leaseRenews = 0, leaseReleases = 0;
   const access = { url: 'http://cellbox.test/v1/boxes/box-1/services/4500/', headers: {} };
   const provider = {
     client: {
@@ -106,16 +106,13 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
     activateBox: async () => { events.push('activate'); },
     captureArchive: async () => ({ result: { archiveId: archive.id } }),
     getServiceAccess: async () => access,
-    createLease: async () => ({ id: 'lease-1' }),
-    renewLease: async () => { leaseRenews++; },
-    releaseLease: async () => { leaseReleases++; },
+    defaultSelector: { revisionId: 'rev-a' },
     ...overrides,
   } as unknown as CellboxSandboxProvider;
-  return { provider, events, credentialWrites, archive, archiveBytes,
-    counts: () => ({ leaseRenews, leaseReleases }) };
+  return { provider, events, credentialWrites, archive, archiveBytes };
 }
 
-test('imported images skip credentials, use native archives and restore with the pinned image', async () => {
+test('revision selected images skip credentials, use native archives and restore with the pinned revision', async () => {
   const previousEndpoint = process.env.OSS_ENDPOINT;
   process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
   const { handle } = fakeHandle();
@@ -126,11 +123,12 @@ test('imported images skip credentials, use native archives and restore with the
     assert.equal(key, 'capture-imported');
     return { result: { archiveId: fake.archive.id } } as never;
   };
-  const imageSelection = { imageId: 'python', imageName: 'Python', category: '开发', versionId: 'v1', version: 'v1',
-    importedImageId: 'imported-python-v1', image: 'image@sha256:abc' };
+  const imageSelection = { templateId: 'tpl-python', revisionId: 'rev-python', imageId: 'python', imageName: 'Python',
+    category: '开发', versionId: 'v1', version: 'v1', image: 'image@sha256:abc' };
   fake.archive.portable = true;
   fake.provider.client.restoreBox = async input => {
-    assert.equal(input.importedImageId, imageSelection.importedImageId);
+    assert.equal(input.revisionId, imageSelection.revisionId);
+    assert.equal(input.templateId, undefined);
     assert.equal(input.acceptImageChange, true);
     return { id: 'restore', targetId: 'box-1' } as never;
   };
@@ -178,40 +176,13 @@ test('startup reconciliation leaves paused sandboxes asleep and archive workflow
   } finally { await runtime.close(); }
 });
 
-test('only usage leases renew; anonymous App Server access needs no timer', async t => {
-  const callbacks: Array<() => void> = [];
-  t.mock.method(globalThis, 'setInterval', ((callback: () => void) => {
-    callbacks.push(callback);
-    return { unref() {} } as NodeJS.Timeout;
-  }) as typeof setInterval);
-  t.mock.method(globalThis, 'clearInterval', (() => {}) as typeof clearInterval);
-  const { provider, counts } = fakeProvider();
+test('App Server access uses the direct service URL without registering a lease or route', async () => {
+  const { provider } = fakeProvider();
   const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {} });
   const endpoint = await runtime.appServer('box-1');
   assert.equal(endpoint.url, 'ws://cellbox.test/v1/boxes/box-1/services/4500/');
   assert.deepEqual(endpoint.headers, {});
-  const releaseLease = await runtime.acquireUsage('box-1');
-  assert.equal(callbacks.length, 1);
-  callbacks.forEach(callback => callback());
-  await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(counts(), { leaseRenews: 1, leaseReleases: 0 });
-  await releaseLease();
-  await runtime.close();
-  assert.deepEqual(counts(), { leaseRenews: 1, leaseReleases: 1 });
-});
-
-test('mounted default-workspace initialization skips an empty remote lease; execution and custom setup retain it', async () => {
-  let leases = 0;
-  const { provider } = fakeProvider({
-    client: { getBox: async () => ({ capabilities: { sharedDirectory: true } }) },
-    createLease: async () => { leases++; return { id: 'lease-1' }; },
-  });
-  const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {}, sharedDirectory: true });
-  await (await runtime.acquireUsage('box-1', '/home/agent/workspace'))();
-  assert.equal(leases, 0);
-  await (await runtime.acquireUsage('box-1', '/home/agent/workspace/project'))();
-  await (await runtime.acquireUsage('box-1'))();
-  assert.equal(leases, 2);
+  assert.equal('acquireUsage' in runtime, false);
   await runtime.close();
 });
 
@@ -403,50 +374,18 @@ test('environment preparation and readiness retries never distribute credentials
   } finally { await runtime.close(); }
 });
 
-test('paused default images capture through Cellbox disk archives without guest commands or credentials', async () => {
+test('diskOnly archive requests are explicitly rejected before remote access', async () => {
   const previous = process.env.OSS_ENDPOINT;
   process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
   const fake = fakeProvider();
-  fake.provider.client.runTool = async () => { assert.fail('paused capture must not execute in the guest'); };
-  fake.provider.connectForSetup = async () => { assert.fail('paused capture must not connect or resume'); };
-  let captures = 0;
-  fake.provider.captureArchive = async (id, key) => {
-    assert.equal(id, target.sandbox.id); assert.equal(key, 'paused-disk'); captures++;
-    return { id: 'capture-paused', kind: 'archive', targetId: id, status: 'succeeded', version: 1,
-      createdAt: new Date().toISOString(), result: { archiveId: fake.archive.id } };
-  };
+  fake.provider.client.getBox = async () => { assert.fail('unsupported diskOnly must not query or mutate Cellbox'); };
+  fake.provider.captureArchive = async () => { assert.fail('unsupported diskOnly must not submit an archive mutation'); };
   const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {} });
   try {
-    const archive = await runtime.remoteArchives.capture({ ...target, sandbox: { ...target.sandbox, status: 'paused' } }, 'paused-disk');
-    assert.equal(archive.id, fake.archive.id);
-    assert.equal(captures, 1);
-    assert.equal(fake.credentialWrites.length, 0);
-  } finally {
-    await runtime.close();
-    if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;
-  }
-});
-
-for (const status of ['ready', 'unavailable', 'unknown'] as const) test(`${status} disk archive uses the native node API without guest tools`, async () => {
-  const previous = process.env.OSS_ENDPOINT;
-  process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
-  const fake = fakeProvider();
-  fake.provider.client.getBox = async () => ({ capabilities: { diskArchives: true, protectedTools: true } }) as never;
-  fake.provider.client.runTool = async () => { assert.fail('disk archive must not use guest backup tools'); };
-  fake.provider.connectForSetup = async () => { assert.fail('disk archive must not start or prepare the guest'); };
-  fake.provider.captureArchive = async (id, key, options) => {
-    assert.equal(id, target.sandbox.id); assert.equal(key, 'disk-only');
-    assert.deepEqual(options, { diskOnly: true });
-    return { result: { archiveId: fake.archive.id } } as never;
-  };
-  const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {} });
-  try {
-    const archive = await runtime.remoteArchives.capture({ ...target, sandbox: { ...target.sandbox, status } }, 'disk-only', { diskOnly: true });
-    assert.equal(archive.id, fake.archive.id);
-    assert.equal(fake.credentialWrites.length, 0);
-    fake.provider.client.getBox = async () => ({ capabilities: {} }) as never;
-    fake.provider.captureArchive = async () => { assert.fail('old servers or storage layouts must not silently ignore diskOnly'); };
-    await assert.rejects(runtime.remoteArchives.capture(target, 'unsupported-disk', { diskOnly: true }), /不支持独立磁盘归档/);
+    await assert.rejects(runtime.remoteArchives.capture({ ...target, sandbox: { ...target.sandbox, status: 'paused' } }, 'disk-only', { diskOnly: true }),
+      /不支持独立磁盘归档/);
+    await assert.rejects(runtime.remoteArchives.capture(target, 'disk-only', { diskOnly: true }),
+      /不支持独立磁盘归档/);
   } finally {
     await runtime.close();
     if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;

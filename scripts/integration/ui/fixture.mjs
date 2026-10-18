@@ -90,6 +90,9 @@ export const test = base.extend({
               data.sandboxOperation = operation('resume');
             rememberPending(id, route, 'open', call); return;
           }
+        } else if (method === 'POST' && path.endsWith('/resume')) {
+          data.sandboxOperation = operation('resume');
+          rememberPending(id, route, 'resume', call); return;
         } else if (method === 'POST' && path.endsWith('/sandbox/checkpoint')) {
           if (data.sandbox?.status === 'paused') {
             data.sandboxOperation = operation('checkpoint', 'succeeded');
@@ -99,9 +102,10 @@ export const test = base.extend({
             data.sandboxOperation = operation('checkpoint');
             rememberPending(id, route, 'checkpoint', call); return;
           }
-        } else if (method === 'POST' && path.endsWith('/rebuild')) {
-          data.sandboxOperation = operation(data.sandbox ? 'rebuild' : 'create');
-          rememberPending(id, route, 'rebuild', call); return;
+        } else if (method === 'POST' && (path.endsWith('/sandbox/create') || path.endsWith('/sandbox/restore') || path.endsWith('/rebuild'))) {
+          const kind = path.endsWith('/sandbox/restore') ? 'restore' : path.endsWith('/sandbox/create') ? 'create' : data.sandbox ? 'rebuild' : 'create';
+          data.sandboxOperation = operation(kind);
+          rememberPending(id, route, kind, call); return;
         }
       } else if (path === '/api/sessions' && method === 'GET') data = [...sessions.values()];
       else if (path.startsWith('/api/sessions/') && path.endsWith('/events')) {
@@ -128,7 +132,10 @@ export const test = base.extend({
       setRunning() { session.status = 'running'; session.turns = [{ id: 'native-turn', nativeTurnId: 'native-turn', prompt: '原始任务', additionalUserInputs: ['相同补充', '相同补充'], images: [], items: [], status: 'running', codexAccepted: true, startedAt: now }]; },
       count: (method, path) => calls.filter(call => call.path === path && call.method === method).length,
       async complete(id) {
-        const value = projects.get(id); value.sandbox = sandbox(id);
+        const value = projects.get(id);
+        const restoring = value.sandbox?.status === 'unavailable' && Boolean(value.remoteArchives?.length || value.latestBackup);
+        value.sandbox = sandbox(id, 'ready');
+        if (restoring) value.sandbox.id = `${id}-restored-box`;
         value.sandboxOperation = operation(value.sandboxOperation?.kind ?? 'create', 'succeeded');
         await fulfillPending(id);
       },

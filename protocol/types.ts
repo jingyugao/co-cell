@@ -100,20 +100,20 @@ export interface Turn {
 }
 export type ProjectStatus = 'active' | 'completed' | 'archived';
 export interface ProjectSandboxOperation {
-  /** Resume completion confirms runtime restoration; health diagnostics do not gate it. */
-	/** Persisted intention ID used for remote operation idempotency. */
-	id?: string;
-  /** Resume intent and API ownership; recovery preserves the operation identity. */
+  /** Local request identifier for observation; never used for remote replay. */
+  id?: string;
+  /** Legacy ownership metadata retained for reading old records only. */
   resume?: { sandboxId: string; ownerId: string };
   /** Runtime snapshot durably published by a completed resume operation. */
   result?: { sandbox: SandboxState };
-  /** Image reserved by an in-flight or uncertain archived restore. */
+  /** Image selected by this restore request; no resource reservation. */
   imageSelection?: ProjectImageSelection;
   /** Checkpoint completes when paused; its workspace backup has independent status. */
   kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild';
   phase: string;
-  status: 'running' | 'failed' | 'succeeded';
+  status: 'running' | 'failed' | 'succeeded' | 'unknown';
   error?: string;
+  errorCode?: string;
   /** Archive is durable; reclaiming the old runtime or cache can be retried independently. */
   cleanupError?: string;
   durationMs?: number;
@@ -130,7 +130,7 @@ export type ProjectType = 1 | 2 | 3;
 export interface ProjectSandboxBackup {
   id: string;
   sandboxId: string;
-  status: 'running' | 'failed' | 'succeeded';
+  status: 'running' | 'failed' | 'succeeded' | 'unknown';
   phase: string;
   error?: string;
   durationMs?: number;
@@ -313,3 +313,12 @@ export type StreamMessage =
   | { type: 'snapshot'; session: Session }
   | { type: 'sdk'; turnId: string; event: AgentEvent }
   | { type: 'state'; session: Session };
+
+
+/** Provider failures keep their classification; an unreadable accepted mutation is still an API error. */
+export interface ApiErrorResponse {
+  error: string | { message?: string; code?: string };
+  code?: string;
+  /** Original upstream success status when CoCell cannot confirm the mutation result. */
+  upstreamStatus?: number;
+}

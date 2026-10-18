@@ -2,6 +2,12 @@
 {{- if and (not .Values.image.tag) (not .Values.image.digest) -}}
 {{- fail "Set image.tag or image.digest" -}}
 {{- end -}}
+{{- $_ := required "Set cellbox.profile" .Values.cellbox.profile -}}
+{{- $templateId := .Values.cellbox.templateId | default "" -}}
+{{- $revisionId := .Values.cellbox.revisionId | default "" -}}
+{{- if eq (ne $templateId "") (ne $revisionId "") -}}
+{{- fail "Set exactly one of cellbox.templateId or cellbox.revisionId" -}}
+{{- end -}}
 {{- if $shared.enabled -}}
 {{- $_ := required "Set sharedDirectory.hostPath" $shared.hostPath -}}
 {{- $_ := required "Set sharedDirectory.nodeName to the Cellbox profile node" $shared.nodeName -}}
@@ -100,6 +106,13 @@ spec:
             {{- end }}
             - name: CELLBOX_PROFILE
               value: {{ .Values.cellbox.profile | quote }}
+            {{- if $templateId }}
+            - name: CELLBOX_TEMPLATE_ID
+              value: {{ $templateId | quote }}
+            {{- else }}
+            - name: CELLBOX_REVISION_ID
+              value: {{ $revisionId | quote }}
+            {{- end }}
             - name: COCELL_PUBLIC_URL
               value: {{ .Values.publicUrl | quote }}
             - name: COCELL_PREVIEW_SUBDOMAINS

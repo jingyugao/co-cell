@@ -26,7 +26,7 @@ test('accepted background work retains incoming trace after response and caller 
     return Response.json({ id: 'box', phase: 'running' });
   };
   const client = new CellboxClient({ baseUrl: 'http://cellbox.test', fetch });
-  const providerAdapter = new CellboxSandboxProvider({ baseUrl: 'http://cellbox.test', profileId: 'profile', fetch });
+  const providerAdapter = new CellboxSandboxProvider({ baseUrl: 'http://cellbox.test', profileId: 'profile', revisionId: 'revision', fetch });
   const app = new Hono();
   app.use('*', traceHttpRequest);
   app.post('/resume', c => {

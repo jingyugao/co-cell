@@ -179,8 +179,13 @@ export async function projectLifecycle(env) {
       assert.equal(completed.sandbox.id, originalSandboxId);
       return { sandboxId: originalSandboxId, completedAt: completed.completedAt };
     });
-    await step('Clean up the completed project with a fresh disk archive and no resume', async () => {
+    await step('Explicitly pause, then archive the completed workspace without implicit resume', async () => {
       const previousArchiveId = backup.id;
+      const state = await json(`/api/projects/${projectId}`);
+      if (state.sandbox?.status === 'ready') {
+        await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: operationTimeout });
+        await env.waitProject(projectId, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
+      }
       const archived = await json(`/api/projects/${projectId}/archive`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
       assert.equal(archived.status, 'archived'); assert.equal(archived.sandbox, undefined);
       assert.equal(archived.sandboxOperation.status, 'succeeded'); assert(!archived.pendingSandboxCleanup?.length, 'Sandbox deletion is still pending');
@@ -192,7 +197,7 @@ export async function projectLifecycle(env) {
       return { deletedSandboxId: originalSandboxId, archiveId: backup.id };
     });
     await step('Rebuild from backup and verify restored files and original conversation history', async () => {
-      const rebuilt = await json(`/api/projects/${projectId}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
+      const rebuilt = await json(`/api/projects/${projectId}/sandbox/restore`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
       assert.equal(rebuilt.sandboxOperation.status, 'succeeded');
       assert.equal(rebuilt.sandboxOperation.kind, 'restore');
       assert.equal(rebuilt.sandbox.status, 'ready');

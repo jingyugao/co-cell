@@ -167,15 +167,17 @@ function fixture() {
   return { counts, sandbox, provider, manager, projects, target, record };
 }
 
-test('default mounted-home resume waits for Codex with one ensure command and no metadata GET, prepare, renew, or save', async t => {
+test('default mounted-home resume selects the configured template, GETs state, and submits one resume', async t => {
   const calls: Array<{ method: string; path: string; body?: unknown; key?: string }> = [];
   const capabilities = { exec: true, files: true, http: true, websocket: true, pty: false, reconnectExec: false,
     freeze: false, suspend: 'same-node-checkpoint' as const, archives: 'workspace-best-effort', protectedTools: false,
     sharedDirectory: true };
-  const box: CellboxBox = { id: 'test-sandbox', ownerKey: 'project:project-resume', profileId: 'k8s', phase: 'running',
-    generation: 9, resourceVersion: 12, image: 'mybox:latest', workspace: '/home/agent/workspace', capabilities,
-    createdAt: new Date(0).toISOString() };
-  const provider = new CellboxSandboxProvider({ baseUrl: 'http://cellbox.test', profileId: 'k8s', fetch: async (input, init) => {
+  const box = (phase: CellboxBox['phase']): CellboxBox => ({ id: 'test-sandbox', ownerKey: 'project:project-resume',
+    profileId: 'k8s', templateId: 'codex', revisionId: 'codex-r1', templateName: 'Codex', templateVersion: '1', phase,
+    generation: phase === 'suspended' ? 9 : 10, resourceVersion: 12, image: 'mybox:latest', workspace: '/home/agent/workspace',
+    capabilities, createdAt: new Date(0).toISOString() });
+  let currentBox: CellboxBox = box('suspended');
+  const provider = new CellboxSandboxProvider({ baseUrl: 'http://cellbox.test', profileId: 'k8s', templateId: 'codex', fetch: async (input, init) => {
     const url = new URL(String(input));
     const method = init?.method ?? 'GET';
     const headers = new Headers(init?.headers);
@@ -185,9 +187,12 @@ test('default mounted-home resume waits for Codex with one ensure command and no
     if (url.pathname === '/v1/profiles') return Response.json([{ id: 'k8s', provider: 'resumable-k8s-pod',
       capabilities, runtime: 'k8s', behavior: 'resumable', kind: 'k8s-resumable', image: 'mybox:latest',
       workspace: '/home/agent/workspace', agent: { uid: 1000, gid: 1000 }, cpu: 2, memoryMiB: 4096 }]);
-    if (url.pathname === `/v1/boxes/${box.id}:ensure-running` && method === 'POST') {
-      const operation: CellboxOperation = { id: 'resume-operation', kind: 'ensure-running', targetId: box.id,
-        status: 'succeeded', version: 1, createdAt: new Date().toISOString(), box };
+    if (url.pathname === `/v1/boxes/${currentBox.id}` && method === 'GET') return Response.json(currentBox);
+    if (url.pathname === `/v1/boxes/${currentBox.id}:resume` && method === 'POST') {
+      assert.deepEqual(JSON.parse(String(raw)), { expectedGeneration: 9 });
+      currentBox = box('running');
+      const operation: CellboxOperation = { id: 'resume-operation', kind: 'resume', targetId: currentBox.id,
+        status: 'succeeded', version: 1, createdAt: new Date().toISOString() };
       return Response.json(operation);
     }
     assert.fail(`unexpected Cellbox request: ${method} ${url.pathname}`);
@@ -197,10 +202,11 @@ test('default mounted-home resume waits for Codex with one ensure command and no
   let saves = 0, preparations = 0, remoteUsage = 0;
   const target: WorkspaceTarget = { id: 'session-resume', projectId: 'project-resume',
     settings: { workingDirectory: runtimePaths.root }, updatedAt: new Date().toISOString(),
-    sandbox: { id: box.id, template: 'k8s', status: 'unknown', workingDirectory: runtimePaths.root } };
+    sandbox: { id: 'test-sandbox', template: 'k8s', status: 'unknown', workingDirectory: runtimePaths.root,
+      image: { reference: 'mybox:latest', id: 'sha256:box', repoDigests: [] } } };
   // Simulate a process recovered from durable state with a checkpoint marker
-  // and stale unknown status; Cellbox ensure-running owns the recovery.
-  manager.track(`project:${target.projectId}`, { id: box.id, template: 'k8s', status: 'unavailable',
+  // and stale unknown status; the provider reads Cellbox state and resumes once.
+  manager.track(`project:${target.projectId}`, { id: 'test-sandbox', template: 'k8s', status: 'unavailable',
     checkpoint: { id: 'cellbox-checkpoint', createdAt: new Date(0).toISOString() } }, async () => { saves++; });
   projects.track(target, async () => { saves++; });
   let finishHealth!: () => void;
@@ -230,11 +236,13 @@ test('default mounted-home resume waits for Codex with one ensure command and no
     finishHealth();
     const result = await pending;
     assert.equal(result.status, 'ready');
-    assert.deepEqual(calls.map(call => [call.method, call.path]), [
-      ['GET', '/v1/profiles'], ['POST', `/v1/boxes/${box.id}:ensure-running`],
+    assert.deepEqual(provider.defaultSelector, { templateId: 'codex' });
+    assert.deepEqual(calls.filter(call => call.path.startsWith('/v1/boxes/')).map(call => [call.method, call.path]), [
+      ['GET', `/v1/boxes/${box('running').id}`], ['POST', `/v1/boxes/${box('running').id}:resume`],
+      ['GET', `/v1/boxes/${box('running').id}`],
     ]);
-    assert.equal(calls[1].key, 'project-resume-op');
-    assert.equal(calls.filter(call => call.method === 'GET' && call.path.startsWith('/v1/boxes/')).length, 0);
+    assert.equal(calls.some(call => call.key), false, 'resume must not send an idempotency key');
+    assert.equal(calls.filter(call => call.method === 'POST').length, 1);
     assert.equal(saves, 0);
     assert.equal(preparations, 0);
     assert.equal(remoteUsage, 0);
@@ -245,8 +253,8 @@ test('default mounted-home resume waits for Codex with one ensure command and no
     await cancelledCheck;
     controller.abort(new Error('entry cancelled'));
     await cancelled;
-    assert.equal(calls.filter(call => call.method === 'POST').length, 2, 'cancelling readiness must not submit another restore');
-    assert.equal(target.sandbox?.id, box.id, 'readiness cancellation preserves the restored Box');
+    assert.equal(calls.filter(call => call.method === 'POST').length, 1, 'cancelling readiness must not replay the resume mutation');
+    assert.equal(target.sandbox?.id, 'test-sandbox', 'readiness cancellation preserves the restored Box');
     assert.equal(manager.peek(`project:${target.projectId}`)?.checkpoint, undefined, 'a consumed checkpoint must not be replayed');
   } finally { finishHealth(); await runtime.close(); await manager.close(); }
 });
@@ -333,7 +341,7 @@ test('rebuild replaces a missing box but preserves the binding on a transport fa
   } finally { await runtime.close(); }
 });
 
-test('sibling sessions share one sandbox and a stable project persistence callback', async () => {
+test('sibling sessions share one sandbox and a stable project persistence callback after creation', async () => {
   const { counts, manager, projects, target } = fixture();
   const sibling = { ...target, id: randomUUID() };
   const saved: SandboxState[] = [];
@@ -341,10 +349,9 @@ test('sibling sessions share one sandbox and a stable project persistence callba
   projects.track(target, async state => { saved.push(state); });
   projects.track(sibling, async () => { siblingWrites++; });
   try {
-    const [first, second] = await Promise.all([
-      projects.acquire(target, { create: true, usageId: 'first' }),
-      projects.acquire(sibling, { create: true, usageId: 'second' }),
-    ]);
+    const first = await projects.acquire(target, { create: true, usageId: 'first' });
+    sibling.sandbox = target.sandbox;
+    const second = await projects.acquire(sibling, { create: true, usageId: 'second' });
     assert.equal(counts.create, 1);
     assert.equal(first.sandbox, second.sandbox);
     assert.equal(sibling.sandbox?.id, target.sandbox?.id);
@@ -361,13 +368,13 @@ test('sibling sessions share one sandbox and a stable project persistence callba
   } finally { await manager.close(); }
 });
 
-test('project image selection reaches sandbox creation and overrides the default image identity', async () => {
+test('project revision selection reaches sandbox creation and overrides the default image identity', async () => {
   const { provider, manager, projects, target, sandbox } = fixture();
   const selection = { imageId: 'python', imageName: 'Python', category: '开发', versionId: 'v1', version: 'v1',
-    importedImageId: 'imported-python-v1', image: 'registry/python@sha256:pinned' };
+    revisionId: 'python-r1', image: 'registry/python@sha256:pinned' };
   target.imageSelection = selection;
   provider.create = async (_template, options) => {
-    assert.equal(options.metadata?.cellboxImportedImageId, selection.importedImageId);
+    assert.equal(options.metadata?.cellboxRevisionId, selection.revisionId);
     return sandbox;
   };
   const runtime = new ContainerCodexRuntime({ paths: runtimePaths, prepareRemote: async () => false, provider, apiKey: '', sandboxes: projects });

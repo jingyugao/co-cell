@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: jingyugao/cell-box
-          ref: 419a2492f7398c37f61c361c6539e2a6d1e07d0b
+          ref: 6465c3e4b1205cde619f2681ede48d7ce1173b6b
           path: cellbox-source
       - uses: actions/setup-node@v4
         with:
@@ -79,6 +79,9 @@ jobs:
       - name: Collect diagnostics
         if: always()
         run: node scripts/integration/ci/collect.mjs
+      - name: Remove disposable image registry
+        if: always()
+        run: docker rm -f "cocell-ci-registry-${GITHUB_RUN_ID}" || true
       - uses: actions/cache/save@v4
         if: always() && steps.native-go-cache.outputs.cache-hit != 'true'
         continue-on-error: true

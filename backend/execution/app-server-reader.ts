@@ -24,14 +24,13 @@ type Connection = {
 export class AppServerReader {
   private connections = new Map<string, Connection>();
   private live = new Set<Connection>();
-  private blocked = new Map<string, number>();
   private closed = false;
 
   readonly extension: SandboxExtension = {
     name: 'app-server-read-connections',
     pre: async context => {
       if (!context.sandboxId || !['pause', 'checkpoint', 'destroy'].includes(context.action)) return;
-      return this.suspend(context.sandboxId);
+      await this.closeIdle(context.sandboxId);
     },
   };
 
@@ -78,7 +77,6 @@ export class AppServerReader {
   async acquire(id: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
     if (this.closed) throw new Error('App Server reader is closed');
-    if (this.blocked.has(id)) throw Object.assign(new Error('Sandbox is entering maintenance'), { code: 'BUSY' });
     let connection = this.connections.get(id);
     if (!connection) {
       let finish!: Connection['finish'];
@@ -114,19 +112,13 @@ export class AppServerReader {
     }
   }
 
-  /** Fence new reads until the lifecycle operation completes; drain active RPCs first. */
-  private async suspend(id: string): Promise<() => void> {
-    this.blocked.set(id, (this.blocked.get(id) ?? 0) + 1);
-    const release = () => {
-      const count = this.blocked.get(id)! - 1;
-      if (count) this.blocked.set(id, count); else this.blocked.delete(id);
-    };
-    const connections = [...this.live].filter(connection => connection.id === id);
-    for (const connection of connections) this.retire(id, connection);
-    const errors = await Promise.all(connections.map(connection => connection.drained));
+  /** Release our unused cached sockets; active requests and races go to Cellbox admission. */
+  private async closeIdle(id: string): Promise<void> {
+    const idle = [...this.live].filter(connection => connection.id === id && !connection.users);
+    for (const connection of idle) this.retire(id, connection);
+    const errors = await Promise.all(idle.map(connection => connection.drained));
     const error = errors.find(error => error !== undefined);
-    if (error !== undefined) { release(); throw error; }
-    return release;
+    if (error !== undefined) throw error;
   }
 
   private async open(id: string, connection: Connection) {

@@ -159,7 +159,7 @@ export interface AcquireSandboxOptions {
   usageId: string;
   purpose?: string;
   signal?: AbortSignal;
-  /** Stable idempotency key for an explicit ensure-running request. */
+  /** Local request identifier for an explicit resume; provides no deduplication. */
   operationKey?: string;
   /** Registers an existing record when track() was not called first. */
   record?: SandboxRecord;

@@ -155,8 +155,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private safeError(error: unknown): Error {
     let message = error instanceof Error ? error.message : String(error);
     if (this.options.apiKey) message = message.replaceAll(this.options.apiKey, '[REDACTED]');
-    const safe = new Error(message);
-    if (error && typeof error === 'object' && 'code' in error && error.code === 'BUSY') Object.assign(safe, { code: 'BUSY' });
+    const safe = new Error(message, { cause: error });
+    if (error && typeof error === 'object' && 'code' in error) Object.assign(safe, { code: error.code });
     return safe;
   }
 
@@ -581,7 +581,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (this.closing) throw new HttpError(503, 'Sandbox 运行时正在关闭');
     let entry: Entry;
     try { entry = await this.acquire(session, false, undefined, undefined, request.signal); }
-    catch (error) { throw new HttpError(502, this.safeError(error).message); }
+    catch (error) { throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) }); }
     try {
       const response = await cellboxWorkspaceFileResponse(entry.sandbox, session.settings.workingDirectory, path, request);
       if (!response.body) { await this.release(entry, false); return response; }
@@ -589,7 +589,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     } catch (error) {
       await this.release(entry, true);
       if (error instanceof HttpError) throw error;
-      throw new HttpError(502, this.safeError(error).message);
+      throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) });
     }
   }
 
@@ -597,7 +597,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (this.closing) throw new HttpError(503, 'Sandbox 运行时正在关闭');
     let entry: Entry;
     try { entry = await this.acquire(session, false, undefined, undefined, signal); }
-    catch (error) { throw new HttpError(502, this.safeError(error).message); }
+    catch (error) { throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) }); }
     let failed = false;
     try {
       return await readCellboxWorkspaceFile(entry.sandbox,
@@ -606,7 +606,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       failed = true;
       if (error instanceof HttpError) throw error;
       if (/not found|404/i.test(String(error))) await this.sandboxes.inspect(session).catch(() => { });
-      throw new HttpError(502, this.safeError(error).message);
+      throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) });
     } finally { await this.release(entry, failed); }
   }
 
@@ -722,7 +722,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     // prevents execution but does not change its paused runtime state.
     const status = info.state === 'running' ? 'ready' : info.state === 'paused' || phase === 'suspended' ? 'paused'
       : ['creating', 'resuming', 'restoring', 'checkpointing', 'suspending', 'staged'].includes(phase ?? '') ? 'starting' : 'unavailable';
-    return { ...sandbox, status, ...(info.templateIdentity ? { image: info.templateIdentity } : {}) };
+    return { ...sandbox, status, phase, generation: info.metadata?.generation ? Number(info.metadata.generation) : undefined,
+      operationId: info.metadata?.operationId, observedAt: new Date().toISOString(), ...(info.templateIdentity ? { image: info.templateIdentity } : {}) };
   }
 
   async rebuild(target: WorkspaceTarget, onSandbox: SaveSandbox) {
@@ -741,16 +742,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const entry = await this.acquire(target, true, onSandbox, undefined, undefined, true);
     try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
   }
-  async rebuildPersistent(target: WorkspaceTarget, key: string, onSandbox: SaveSandbox) {
-    if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在，无法沿用挂载目录');
-    this.sandboxes.track(target, onSandbox);
-    const provider = this.options.provider as SandboxProvider & { rebuildPersistent?: (id: string, key: string) => Promise<void> };
-    if (!provider.rebuildPersistent) throw new HttpError(503, 'Sandbox 不支持保留挂载目录重建');
-    this.runtimePreparations.delete(target.sandbox.id);
-    await this.sandboxes.manager.lifecycle.run({ action: 'reconcile', resourceKey: `project:${target.projectId ?? target.id}`, sandboxId: target.sandbox.id, metadata: { restoreRuntimeConfig: 'true' } },
-      () => provider.rebuildPersistent!(target.sandbox!.id, key));
-    await this.sandboxes.inspect(target);
-    await onSandbox(await this.resume(target, undefined, `cocell-rebuild-resume-${key}`));
+  async rebuildPersistent(_target: WorkspaceTarget, _requestId: string, _onSandbox: SaveSandbox): Promise<void> {
+    throw new HttpError(422, '当前 Cellbox 不支持同 ID 重建；请明确选择从备份创建新环境。');
   }
 
   async resume(target: WorkspaceTarget, signal?: AbortSignal, operationKey = `cocell-resume-${randomUUID()}`): Promise<SandboxState> {

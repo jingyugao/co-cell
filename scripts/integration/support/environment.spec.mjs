@@ -6,7 +6,7 @@ import { LiveEnvironment, liveConfig } from './environment.mjs';
 test('cleanup recovers a lost create response and never deletes an existing project', async ({}, testInfo) => {
   const projects = new Map([['existing', { id: 'existing', name: 'Existing user project' }]]);
   const deleted = [];
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     if (req.url === '/api/projects') { res.end(JSON.stringify([...projects.values()])); return; }
     const id = req.url.split('/').at(-1);
@@ -24,7 +24,7 @@ test('cleanup recovers a lost create response and never deletes an existing proj
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
-test('failed synchronous create assertion keeps the created project in cleanup ownership', async ({}, testInfo) => {
+test('cleanup preserves a preparing sandbox after a synchronous create failure', async ({}, testInfo) => {
   const projects = new Map();
   const deleted = [];
   let env;
@@ -40,7 +40,7 @@ test('failed synchronous create assertion keeps the created project in cleanup o
       res.statusCode = 201; res.end(JSON.stringify(project)); return;
     }
     if (req.url === '/api/projects') { res.end(JSON.stringify([...projects.values()])); return; }
-    if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[]}'); return; }
+    if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[{"id":"box-created"}]}'); return; }
     const id = req.url.split('/').at(-1);
     if (req.method === 'DELETE') { deleted.push(id); projects.delete(id); res.end('{"ok":true}'); return; }
     if (req.method === 'GET' && projects.has(id)) projects.get(id).sandboxOperation.status = 'succeeded';
@@ -53,15 +53,15 @@ test('failed synchronous create assertion keeps the created project in cleanup o
     await expect(env.createProject('synchronous-create')).rejects.toThrow('completed sandbox operation');
     expect(env.projects.get('created')).toBe(env.name('synchronous-create'));
     expect(env.boxes.has('box-created')).toBe(true);
-    await env.cleanup();
-    expect(deleted).toEqual(['created']);
-    expect(projects.has('created')).toBe(false);
+    await expect(env.cleanup()).rejects.toThrow('Integration cleanup failed');
+    expect(deleted).toEqual([]);
+    expect(projects.has('created')).toBe(true);
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
 test('checkpoint wait can include asynchronous disk archive completion', async ({}, testInfo) => {
   let reads = 0;
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     reads++;
     res.end(JSON.stringify({ id: 'project', sandbox: { id: 'box', status: reads === 1 ? 'unavailable' : 'paused' },
@@ -80,15 +80,22 @@ test('checkpoint wait can include asynchronous disk archive completion', async (
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
-test('cleanup waits for running project operations and disk backup before deleting once', async ({}, testInfo) => {
+test('cleanup submits one checkpoint, waits for its archive, archives, then deletes once', async ({}, testInfo) => {
   let reads = 0;
+  let checkpointCalls = 0;
+  let archiveCalls = 0;
   let deleted = 0;
   let removed = false;
+  let archived = false;
+  let backupReads = 0;
   let env;
-  const project = () => ({ id: 'owned', name: env.name('async-checkpoint'), sandbox: { id: 'box', status: reads < 3 ? 'unavailable' : 'paused' },
-    sandboxOperation: { id: 'checkpoint', kind: 'checkpoint', status: reads === 1 ? 'running' : 'succeeded' },
-    sandboxBackup: { id: 'archive', sandboxId: 'box', status: reads < 3 ? 'running' : 'succeeded' } });
-  const server = createServer((req, res) => {
+  const project = () => ({ id: 'owned', name: env.name('async-checkpoint'), status: archived ? 'archived' : 'active',
+    ...(archived ? {} : { sandbox: { id: 'box', status: checkpointCalls ? 'paused' : 'ready' } }),
+    sandboxOperation: checkpointCalls
+      ? { id: 'checkpoint', kind: archived ? 'archive' : 'checkpoint', status: 'succeeded' }
+      : { id: 'create', kind: 'create', status: 'succeeded' },
+    ...(checkpointCalls ? { sandboxBackup: { id: 'checkpoint', sandboxId: 'box', status: backupReads++ < 2 ? 'running' : 'succeeded' } } : {}) });
+  const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify(removed ? [] : [project()])); return; }
     if (req.url === '/api/sessions') { res.end('[]'); return; }
@@ -98,8 +105,24 @@ test('cleanup waits for running project operations and disk backup before deleti
       reads++;
       res.end(JSON.stringify(project())); return;
     }
+    if (req.url === '/api/projects/owned/sandbox/checkpoint' && req.method === 'POST') {
+      checkpointCalls++;
+      expect(checkpointCalls).toBe(1);
+      res.end(JSON.stringify({ ...project(), sandboxOperation: { id: 'checkpoint', kind: 'checkpoint', status: 'succeeded' } })); return;
+    }
+    if (req.url === '/api/projects/owned/archive' && req.method === 'POST') {
+      archiveCalls++;
+      expect(archiveCalls).toBe(1);
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const reqBody = Buffer.concat(chunks).toString();
+      expect(JSON.parse(reqBody)).toEqual({ useExistingBackup: true });
+      archived = true;
+      res.end(JSON.stringify(project())); return;
+    }
     if (req.url === '/api/projects/owned' && req.method === 'DELETE') {
-      expect(reads).toBeGreaterThanOrEqual(3);
+      expect(checkpointCalls).toBe(1);
+      expect(archiveCalls).toBe(1);
       deleted++;
       removed = true;
       res.end('{"ok":true}'); return;
@@ -115,7 +138,42 @@ test('cleanup waits for running project operations and disk backup before deleti
   try {
     await env.cleanup();
     expect(reads).toBeGreaterThanOrEqual(3);
+    expect(checkpointCalls).toBe(1);
+    expect(archiveCalls).toBe(1);
     expect(deleted).toBe(1);
+  } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
+});
+
+test('cleanup does not replay an unknown checkpoint or delete its sandbox', async ({}, testInfo) => {
+  let checkpointCalls = 0;
+  let deleted = 0;
+  let env;
+  const project = { id: 'owned', name: '', status: 'active', sandbox: { id: 'box', status: 'ready' },
+    sandboxOperation: { id: 'create', kind: 'create', status: 'succeeded' } };
+  const server = createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify([project])); return; }
+    if (req.url === '/api/sessions') { res.end('[]'); return; }
+    if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[{"id":"box"}]}'); return; }
+    if (req.url === '/api/projects/owned' && req.method === 'GET') { res.end(JSON.stringify(project)); return; }
+    if (req.url === '/api/projects/owned/sandbox/checkpoint' && req.method === 'POST') {
+      checkpointCalls++;
+      project.sandboxOperation = { id: 'checkpoint-unknown', kind: 'checkpoint', status: 'unknown', error: 'response lost' };
+      res.end(JSON.stringify(project)); return;
+    }
+    if (req.url === '/api/projects/owned/archive' && req.method === 'POST') assert.fail('Unknown checkpoint must not be followed by archive');
+    if (req.url === '/api/projects/owned' && req.method === 'DELETE') { deleted++; res.end('{"ok":true}'); return; }
+    res.statusCode = 404; res.end('{"error":"missing"}');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  env = new LiveEnvironment(liveConfig({ COCELL_E2E_BASE_URL: `http://127.0.0.1:${server.address().port}`, COCELL_E2E_ACCESS_TOKEN: 'test-only-token' }),
+    { journal: testInfo.outputPath('resources.json') });
+  project.name = env.name('unknown-checkpoint');
+  env.projects.set('owned', project.name);
+  try {
+    await expect(env.cleanup()).rejects.toThrow('Integration cleanup failed');
+    expect(checkpointCalls).toBe(1);
+    expect(deleted).toBe(0);
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 

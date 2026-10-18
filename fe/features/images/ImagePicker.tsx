@@ -17,7 +17,7 @@ export default function ImagePicker({ disabled, onChange }: {
       .catch(err => { if (alive) setError(err instanceof Error ? err.message : '镜像读取失败'); });
     return () => { alive = false; };
   }, []);
-  const ready = (version: ManagedImage['versions'][number]) => version.status === 'succeeded' && !version.deprecatedAt && !version.cleanup && version.projectReady !== false;
+  const ready = (version: ManagedImage['versions'][number]) => version.status === 'succeeded' && !version.deprecatedAt && !version.cleanup && !version.migrationRequired && version.projectReady !== false;
   const usable = images.filter(image => image.origin !== 'profile' && image.versions.some(ready));
   const globalDefault = images.flatMap(image => image.versions.map(version => ({ image, version }))).find(entry => entry.version.isDefault && ready(entry.version));
   const categories = [...new Set(usable.map(image => image.category))];
@@ -36,7 +36,7 @@ export default function ImagePicker({ disabled, onChange }: {
       const digest = version.image?.match(/@sha256:([a-f0-9]{64})$/)?.[1]?.slice(0, 12);
       return <option key={version.id} value={version.id}>{version.version}{version.isDefault ? ' · 默认镜像' : ''}{repeated ? ` · ${digest ?? version.id.slice(0, 12)}` : ''}</option>;
     })}</select></label></>}
-    <p className="project-form-hint">{category ? '项目固定使用选中的版本；新增镜像版本不会改变已有项目。' : `未指定镜像时，新项目使用当前默认版本${globalDefault ? `：${globalDefault.image.name} · ${globalDefault.version.version}` : ''}；只预热该版本。`}</p>
+    <p className="project-form-hint">{category ? '项目固定使用选中的 Cellbox revision；新增 revision 不会改变已有项目。' : `未指定镜像时，新项目使用配置的默认 revision${globalDefault ? `：${globalDefault.image.name} · ${globalDefault.version.version}` : '（尚未配置）'}。CoCell 默认选择不修改 Cellbox stable 或 warmSlots。`}</p>
     {error && <p className="project-error" role="alert">{error}，仍可使用系统默认镜像。</p>}
   </fieldset>;
 }

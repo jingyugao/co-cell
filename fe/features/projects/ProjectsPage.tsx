@@ -20,6 +20,7 @@ type Props = {
   onUpdate: (id: string, values: ProjectUpdate) => Promise<ProjectSummary>;
   onRebuildSandbox: (id: string, imageVersionId?: string) => Promise<ProjectSummary>;
   onResumeSandbox: (id: string) => Promise<ProjectSummary>;
+  onBackupSandbox: (id: string) => Promise<ProjectSummary>;
   onCheckpointSandbox: (id: string) => Promise<ProjectSummary>;
   onArchiveProject: (id: string, options?: { useExistingBackup?: boolean }) => Promise<ProjectSummary>;
   onOpenProject: (id: string) => void;
@@ -85,7 +86,7 @@ function ProjectForm({ busy, onSubmit, onCancel }: {
   </form>;
 }
 
-function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSandbox, onCheckpointSandbox, onArchiveProject, onOpenProject, onViewBackup, onStatus }: Pick<Props, 'config' | 'onUpdate' | 'onRebuildSandbox' | 'onResumeSandbox' | 'onCheckpointSandbox' | 'onArchiveProject' | 'onOpenProject' | 'onViewBackup'> & {
+function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSandbox, onCheckpointSandbox, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onStatus }: Pick<Props, 'config' | 'onUpdate' | 'onRebuildSandbox' | 'onResumeSandbox' | 'onCheckpointSandbox' | 'onBackupSandbox' | 'onArchiveProject' | 'onOpenProject' | 'onViewBackup'> & {
   project: ProjectSummary;
   onStatus: (name: string, status: 'active' | 'completed') => void;
 }) {
@@ -196,12 +197,13 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
       {project.executionMode === 'sandbox' && !archived && <section className="project-action-group" aria-label="Sandbox 操作">
         <h3>Sandbox 操作</h3>
         <div className="project-card-actions">
-          {sandboxPaused ? <><button className="secondary-button" disabled={busy || hasTask} onClick={() => void run('恢复运行', () => onResumeSandbox(project.id))}>恢复运行</button>{backupFailed && <button className="secondary-button" disabled={busy || hasTask} onClick={() => void run('磁盘备份', () => onCheckpointSandbox(project.id))}>重试磁盘备份</button>}</>
+          {sandboxPaused ? <button className="secondary-button" disabled={busy || hasTask} onClick={() => void run('恢复运行', () => onResumeSandbox(project.id))}>恢复运行</button>
             : sandboxNormal ? <button className="secondary-button" disabled={busy || hasTask} onClick={() => void run('Checkpoint', () => onCheckpointSandbox(project.id))}>Checkpoint · 暂停</button>
             : !sandboxBroken && !sandboxMissing ? <span className="project-action-note">等待状态就绪后操作</span>
             : canRestore ? <button className="secondary-button" disabled={busy || hasTask} onClick={restore}>从备份恢复</button>
             : project.sandbox ? <span className="project-action-note">当前 Cellbox 不支持同 ID 重建，暂无可恢复备份</span>
             : <button className="secondary-button" disabled={busy || hasTask} onClick={() => void run('创建 Sandbox', () => onRebuildSandbox(project.id))}>创建 Sandbox</button>}
+          {(sandboxPaused || project.sandbox?.phase === 'failed') && <button className="secondary-button" disabled={busy || hasTask} onClick={() => void run('磁盘备份', () => onBackupSandbox(project.id))}>{backupFailed ? '重试磁盘备份' : '磁盘备份'}</button>}
         </div>
       </section>}
     </div>
@@ -209,7 +211,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
     {sandboxBackup?.status === 'running' && <p className="project-operation" role="status"><strong>磁盘备份：{sandboxBackup.phase || '进行中'}</strong></p>}
     {sandboxBackup?.status === 'unknown' && <p className="project-operation" role="status"><strong>磁盘备份结果未知</strong>{sandboxBackup.error}</p>}
     {backupFailed && <p className="project-operation failed" role="alert"><strong>磁盘备份失败</strong>{sandboxBackup?.error || operation?.error}</p>}
-    {sandboxPaused && <p className="project-rebuild-hint">{completed ? `完成满 ${duration(config?.sandbox?.archivedReclaimAfterMs, '1 天')}后会从磁盘备份最新数据并清理暂停环境，不恢复运行。` : 'Checkpoint 已完成，磁盘备份在后台进行。备份和恢复的冲突由 Cellbox 返回；结果未知时请先查询状态，不会自动重提。'}</p>}
+    {sandboxPaused && <p className="project-rebuild-hint">{completed ? `完成满 ${duration(config?.sandbox?.archivedReclaimAfterMs, '1 天')}后会从磁盘备份最新数据并清理暂停环境，不恢复运行。` : 'Checkpoint 只暂停环境；磁盘备份需单独操作。恢复运行会继续当前环境。'}</p>}
     {archived && project.executionMode === 'sandbox' && <div className="project-rebuild-hint">
       <p>恢复时选择{project.imageSelection ? '原仓库默认版本' : '当前系统默认镜像'}；文件和对话历史从备份恢复，服务需要重新启动。</p>
       {project.imageSelection && <><button className="secondary-button" disabled={busy} onClick={() => setChooseRestoreVersion(value => !value)}>选择恢复版本</button>
@@ -225,7 +227,7 @@ function ProjectCard({ project, config, onUpdate, onRebuildSandbox, onResumeSand
   </article>;
 }
 
-export default function ProjectsPage({ projects, config, loading, onRefresh, onCreate, onUpdate, onRebuildSandbox, onResumeSandbox, onCheckpointSandbox, onArchiveProject, onOpenProject, onViewBackup, onMenu, onBack, initialView = 'active' }: Props) {
+export default function ProjectsPage({ projects, config, loading, onRefresh, onCreate, onUpdate, onRebuildSandbox, onResumeSandbox, onCheckpointSandbox, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onMenu, onBack, initialView = 'active' }: Props) {
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState('');
@@ -250,7 +252,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
     const timer = window.setInterval(() => { void onRefresh().catch(err => setError(err instanceof Error ? err.message : '状态读取失败，请刷新重试。')); }, 3_000);
     return () => window.clearInterval(timer);
   }, [projects, onRefresh]);
-  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} config={config} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onResumeSandbox={onResumeSandbox} onCheckpointSandbox={onCheckpointSandbox} onArchiveProject={async (id, options) => {
+  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} config={config} onUpdate={onUpdate} onRebuildSandbox={onRebuildSandbox} onResumeSandbox={onResumeSandbox} onCheckpointSandbox={onCheckpointSandbox} onBackupSandbox={onBackupSandbox} onArchiveProject={async (id, options) => {
     const result = await onArchiveProject(id, options);
     setMessage(`「${project.name}」已归档，可在“归档”页查看。`);
     return result;

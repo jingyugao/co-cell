@@ -10,7 +10,17 @@ export async function projectLifecycle(env) {
   const redact = env.redact.bind(env), persist = env.persist.bind(env);
   const delay = ms => sleep(ms, undefined, { signal: env.controller.signal });
   let projectId, sessionId, threadId, originalSandboxId, workingDirectory;
-  const waitProject = (kind, status, waitForBackup = false) => env.waitProject(projectId, { kind, status, waitForBackup });
+  const waitProject = (kind, status) => env.waitProject(projectId, { kind, status });
+  const backupPausedSandbox = async () => {
+    const response = await json(`/api/projects/${projectId}/backup`, { method: 'POST', expectedStatus: 200,
+      timeoutMs: operationTimeout });
+    assert.equal(response.sandboxOperation.kind, 'backup');
+    assert.equal(response.sandboxOperation.status, 'succeeded');
+    assert.equal(response.sandbox?.status, 'paused');
+    const backedUp = await waitProject('backup', 'paused');
+    assert.equal(backedUp.sandboxBackup?.status, 'succeeded');
+    return backedUp;
+  };
   const waitIdle = () => env.waitIdle(projectId);
   const port = 18080;
   const folder = 'lifecycle-http';
@@ -108,20 +118,24 @@ export async function projectLifecycle(env) {
       return { sourceSha256: source.sha256, fileSha256: file.sha256, http: firstHealth };
     });
     let initialArchive;
-    await step('Checkpoint the sandbox, verify its workspace archive, and reject standalone backup', async () => {
+    await step('Reject backup while running, then Checkpoint and pause the sandbox', async () => {
+      await request(`/api/projects/${projectId}/backup`, { method: 'POST', expectedStatus: 409 });
       const checkpointed = await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
       assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
       assert.equal(checkpointed.sandbox.status, 'paused');
-      const paused = await waitProject('checkpoint', 'paused', true); assert.equal(paused.sandbox.id, originalSandboxId);
-      initialArchive = paused.remoteArchives?.[0];
-      assert(initialArchive && initialArchive.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(initialArchive.sha256));
-      assert.equal(initialArchive.sourceSandboxId, originalSandboxId); assert(initialArchive.threadIds.includes(threadId));
-      await request(`/api/projects/${projectId}/backup`, { method: 'POST', expectedStatus: 409 });
+      const paused = await waitProject('checkpoint', 'paused'); assert.equal(paused.sandbox.id, originalSandboxId);
+      assert.equal(paused.remoteArchives?.length ?? 0, 0, 'Checkpoint must not create a disk backup');
       const inventory = await json('/api/sandboxes'); assert.equal(inventory.sandboxes.find(s => s.id === originalSandboxId)?.state, 'paused');
       const { response: blocked } = await request(`/api/projects/${projectId}/service/${port}/healthz`, { expectedStatus: 409 }); assert.equal(blocked.status, 409, 'Paused sandbox allowed HTTP access');
       assert.equal((await json(`/api/projects/${projectId}`)).sandbox.status, 'paused');
-      return { sandboxId: originalSandboxId, status: paused.sandbox.status, blockedHttpStatus: blocked.status,
-        archiveId: initialArchive.id, archiveSizeBytes: initialArchive.sizeBytes, archiveSha256: initialArchive.sha256 };
+      return { sandboxId: originalSandboxId, status: paused.sandbox.status, blockedHttpStatus: blocked.status };
+    });
+    await step('Create and verify the first explicit disk backup', async () => {
+      const paused = await backupPausedSandbox(); assert.equal(paused.sandbox.id, originalSandboxId);
+      initialArchive = paused.remoteArchives?.[0];
+      assert(initialArchive && initialArchive.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(initialArchive.sha256));
+      assert.equal(initialArchive.sourceSandboxId, originalSandboxId); assert(initialArchive.threadIds.includes(threadId));
+      return { archiveId: initialArchive.id, archiveSizeBytes: initialArchive.sizeBytes, archiveSha256: initialArchive.sha256 };
     });
     await step('Resume and verify the same Node process, files, and in-memory counter survived', async () => {
       const resumeResponse = await json(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
@@ -143,9 +157,15 @@ export async function projectLifecycle(env) {
       const checkpointed = await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
       assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
       assert.equal(checkpointed.sandbox.status, 'paused');
-      const paused = await waitProject('checkpoint', 'paused', true);
-      checkpointArchive = paused.remoteArchives?.[0];
-      assert(checkpointArchive && checkpointArchive.id !== initialArchive.id, 'Checkpoint did not create a new archive');
+      const paused = await waitProject('checkpoint', 'paused');
+      assert.equal(paused.remoteArchives?.[0]?.id, initialArchive.id, 'Checkpoint must leave existing backups unchanged');
+      return { sandboxId: paused.sandbox.id, status: paused.sandbox.status };
+    });
+    await step('Back up the paused workspace after its first file change', async () => {
+      const backedUp = await backupPausedSandbox();
+      assert.equal(backedUp.sandbox.id, originalSandboxId);
+      checkpointArchive = backedUp.remoteArchives?.[0];
+      assert(checkpointArchive && checkpointArchive.id !== initialArchive.id, 'Explicit backup did not create a new archive');
       assert(checkpointArchive.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(checkpointArchive.sha256));
       assert.equal(checkpointArchive.sourceSandboxId, originalSandboxId); assert(checkpointArchive.threadIds.includes(threadId));
       return { archiveId: checkpointArchive.id, sizeBytes: checkpointArchive.sizeBytes,
@@ -163,12 +183,17 @@ export async function projectLifecycle(env) {
       return { ...result, http: current };
     });
     let backup;
-    await step('Final Checkpoint captures and verifies the latest workspace and conversation', async () => {
+    await step('Final Checkpoint pauses the sandbox without changing its backup', async () => {
       const checkpointed = await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
       assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
       assert.equal(checkpointed.sandbox.status, 'paused');
-      const paused = await waitProject('checkpoint', 'paused', true); backup = paused.remoteArchives?.[0];
-      assert(backup && backup.id !== checkpointArchive.id, 'Final Checkpoint did not create a fresh archive');
+      const paused = await waitProject('checkpoint', 'paused');
+      assert.equal(paused.remoteArchives?.[0]?.id, checkpointArchive.id, 'Checkpoint must leave existing backups unchanged');
+      return { sandboxId: paused.sandbox.id };
+    });
+    await step('Create a separate final disk backup of the latest workspace and conversation', async () => {
+      const backedUp = await backupPausedSandbox(); backup = backedUp.remoteArchives?.[0];
+      assert(backup && backup.id !== checkpointArchive.id, 'Explicit backup did not create a fresh archive');
       assert(backup.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(backup.sha256));
       assert.equal(backup.sourceSandboxId, originalSandboxId); assert(backup.threadIds.includes(threadId));
       return { archiveId: backup.id, sizeBytes: backup.sizeBytes, sha256: backup.sha256, threadIds: backup.threadIds };
@@ -180,17 +205,19 @@ export async function projectLifecycle(env) {
       return { sandboxId: originalSandboxId, completedAt: completed.completedAt };
     });
     await step('Explicitly pause, then archive the completed workspace without implicit resume', async () => {
-      const previousArchiveId = backup.id;
       const state = await json(`/api/projects/${projectId}`);
       if (state.sandbox?.status === 'ready') {
         await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: operationTimeout });
-        await env.waitProject(projectId, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
+        await env.waitProject(projectId, { kind: 'checkpoint', status: 'paused' });
+        const backedUp = await backupPausedSandbox();
+        backup = backedUp.remoteArchives?.[0];
       }
-      const archived = await json(`/api/projects/${projectId}/archive`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: operationTimeout });
+      const previousArchiveId = backup.id;
+      const archived = await json(`/api/projects/${projectId}/archive`, { method: 'POST', body: { useExistingBackup: true }, expectedStatus: 200, timeoutMs: operationTimeout });
       assert.equal(archived.status, 'archived'); assert.equal(archived.sandbox, undefined);
       assert.equal(archived.sandboxOperation.status, 'succeeded'); assert(!archived.pendingSandboxCleanup?.length, 'Sandbox deletion is still pending');
       backup = archived.remoteArchives[0]; assert(backup.threadIds.includes(threadId));
-      assert.notEqual(backup.id, previousArchiveId, 'Default cleanup must capture a fresh disk archive');
+      assert.equal(backup.id, previousArchiveId, 'Archive must use the explicitly created latest backup');
       assert(backup.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(backup.sha256));
       assert.equal(backup.sourceSandboxId, originalSandboxId); assert(backup.threadIds.includes(threadId));
       const inventory = await json('/api/sandboxes'); assert(!inventory.sandboxes.some(s => s.id === originalSandboxId), 'Original sandbox still exists');

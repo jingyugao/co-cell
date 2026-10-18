@@ -12,9 +12,9 @@
 - 新增明确的 `POST /api/projects/:id/sandbox/create` 和 `sandbox/restore`；前端进入项目只 GET。旧 `open` 也只读，旧 `rebuild` 保留兼容但同 ID 重建明确拒绝。
 - 删除项目控制锁、维护长租约、创建总锁、按周占用、恢复接管与重放、镜像全局队列/预占、Cellbox lease/route 管理。元数据保留短事务；旧回调不能覆盖已切换的本地 Sandbox 绑定。
 - SDK pause/destroy/resume 不跨远程请求持本地资源锁；普通 acquire 不隐式恢复。App Server 仅关闭自己的闲置缓存连接，活跃 RPC 和新读取不被本地维护栅栏阻挡。
-- 返回 Cellbox 的错误 status/code 和脱敏 message；未确认写请求保存 unknown。远端成功响应无法读取或解析时，CoCell 返回错误 HTTP 状态并保留 upstreamStatus，避免把 unknown 当作成功。checkpoint 成功和后台备份分别展示；定时政策跳过 running/failed/unknown 结果，不接管重做。
+- 返回 Cellbox 的错误 status/code 和脱敏 message；未确认写请求保存 unknown。远端成功响应无法读取或解析时，CoCell 返回错误 HTTP 状态并保留 upstreamStatus，避免把 unknown 当作成功。Checkpoint 只暂停 Sandbox；备份由用户通过独立入口明确提交，结果分别展示。定时政策不接管或重做 running/failed/unknown 的操作。
 - 归档只针对已暂停或底层允许的 failed 实例；运行中的纯磁盘归档、同 ID rebuild、revision 物理删除、请求级私仓凭据明确不支持。旧 OSS 归档也不伪称通过 Cellbox 删除。
-- 自动备份不附带远程删除旧归档，避免下一次备份盲目重试未知删除。`POST /api/archives/prune` 是用户明确发起的独立清理，按项目保留数执行。
+- 显式备份不附带远程删除旧归档，避免后续操作盲目重试未知删除。`POST /api/archives/prune` 是用户明确发起的独立清理，按项目保留数执行。
 - 新增 `make deploy-cellbox-server`，deploy-all 将成功构建的实际 revision 传给 CoCell。首次 legacy 切换要求隔离数据目录/归档前缀；后续 v2 升级保留原存储。旧部署 target 明确拒绝。
 - 只读盘点工具：`kubectl --context CONTEXT -n NAMESPACE get cellboxes.cellbox.local -o json | uv run --no-project python scripts/migration/inventory-cellbox-crs.py`。它只盘 CR，输出 ID、digest、计数和未知项，不读取凭据，也不导入 SQLite、归档索引、HOME、workspace 或 checkpoint。
 
@@ -99,12 +99,12 @@ CoCell 接入新版 Cellbox 的 template/revision、显式生命周期和单节�
 | 标记完成、恢复使用中 | 同一 PATCH 入口的 status 字段 | 校验业务状态并更新本地记录；不持有远端资源锁 |
 | 查看、修改工具角色 | `GET/PUT /api/projects/:id/tool-role` | 读取或更新角色关联；权限校验与数据写入独立处理，不套项目大锁 |
 | 进入项目 | `POST /api/projects/:id/open` | 当前会等待备份和已有操作，再尝试恢复；目标是查看先返回，恢复行为独立表达，单次提交，不因进入页面建立排他保证 |
-| 恢复运行、暂停 | `POST /api/projects/:id/sandbox/resume`、`checkpoint` | Cellbox 管理资源一致性；CoCell 展示实际状态、冲突和未知结果，不额外加资源锁 |
+| 恢复运行、暂停 | `POST /api/projects/:id/sandbox/resume`、`checkpoint` | Checkpoint 只暂停，不自动备份；Cellbox 管理资源一致性，CoCell 展示实际状态、冲突和未知结果，不额外加资源锁 |
 | 创建、重建或从备份恢复环境 | `POST /api/projects/:id/sandbox/rebuild` | 按实际支持的动作拆分；远端提交交 Cellbox，项目绑定只在本地短事务中更新 |
-| 归档项目 | `POST /api/projects/:id/archive` | 备份、项目状态更新和清理分别记录结果；不把多步流程包进长锁，不承诺整体原子 |
+| 归档项目 | `POST /api/projects/:id/archive` | 可从已暂停/failed 的资源生成备份，或明确复用已有备份；项目状态更新和清理分别记录结果，不把多步流程包进长锁、不承诺整体原子 |
 | 文件读取、下载和服务预览 | files、preview、service 路径 | 不加项目级锁；本地只管理自身连接，实际访问与生命周期冲突交给 Cellbox |
 | 删除项目 | `DELETE /api/projects/:id` | 清理环境、会话和项目记录分步处理；本地数据删除用数据库事务，不跨远端清理持锁 |
-| 保留的旧操作入口 | `POST /api/projects/:id/backup`、`sandbox/refresh-runtime` | 当前独立 backup 直接拒绝；按实际能力迁移或删除旧入口，不能只因路由存在就宣传可用 |
+| 独立备份、保留的旧操作入口 | `POST /api/projects/:id/backup`、`sandbox/refresh-runtime` | backup 是用户明确提交的独立操作，仅接受 paused/failed Sandbox；running 返回 409。Cellbox 仍可能返回 BUSY；CoCell 不加资源锁、不自动重试，也不承诺幂等。`refresh-runtime` 按实际能力拒绝 |
 
 当前普通 GET 列表/详情不通过 `projectMutation` 的项目级分布式锁，但详情刷新仍经过本地缓存队列。实现时保持查询与操作分离，普通查看返回当前可用信息，不用维护、删除中等进程内标记替代真实数据查询；数据库已不存在时正常返回不存在。
 
@@ -222,13 +222,17 @@ MySQL named lock 在 `COCELL_MULTI_API=1` 时启用；本地 Promise 队列和 M
 
 Cellbox runtime running 与 Codex App Server 可用分开呈现。Codex 未就绪时可以报告“Sandbox 已运行，App Server 尚不可用”，不能把 resume 请求自动再执行一次。
 
+`POST /api/projects/:id/sandbox/checkpoint` 只负责暂停并返回暂停结果，不启动后台备份。用户需要工作区备份时，单独调用 `POST /api/projects/:id/backup`；仅 paused/failed Sandbox 可备份，running 返回 409。备份期间底层仍可能返回 BUSY；CoCell 不叠加资源锁、不自动重试写请求，也不向上承诺幂等。Resume 同样呈现底层真实结果。
+
+现场已确认一次 BUSY 的原因：原 Checkpoint 在暂停成功后返回，同时继续提交 archive 操作；用户此时 resume，底层仍在备份，因此第一次收到 BUSY，备份结束后第二次成功。此次移除 Checkpoint 的自动备份，而不是修改 Cellbox 的资源互斥或重试 resume。独立备份保留进度、耗时、成功/失败/未知结果；只有用户明确发起备份或归档时才生成磁盘归档。
+
 ### 7.2 纯磁盘归档
 
-新版 capture 不自动暂停，且不支持 diskOnly。普通 capture 要求 suspended 或 failed、持久 HOME 布局、节点支持和 S3 配置；failed 仍由 provider 验证可安全读取，不代表任意失败实例都能归档。
+新版 capture 不自动暂停，且不支持 diskOnly。普通 capture 要求 suspended 或 failed、持久 HOME 布局、节点支持和 S3 配置；failed 仍由 provider 验证可安全读取，不代表任意失败实例都能归档。归档可以从已暂停/failed 的资源生成备份，也可以由用户明确选择复用已有备份。
 
-当前 CoCell 的“无需进程 checkpoint，停止写入后只归档磁盘”无法等价迁移。第一版必须明确显示该能力不可用，不能偷偷改成先 checkpoint，也不能仅删除 diskOnly 参数。
+running Sandbox 的“停止写入后只归档磁盘”仍不可用；归档不能隐式执行 Checkpoint。需要备份时先明确暂停，再单独备份或归档。
 
-已经暂停的实例可以使用新版归档；归档是 workspace 文件内容，不等于完整 HOME、rootfs 或进程内存。现有 CoCell 受保护工具 OSS 备份分支是另一条路径，需要独立核对其范围与凭据能力，不能与 Cellbox capture 混为一种保证。
+已暂停的实例可以由归档操作生成新的 Cellbox 备份，也可以明确复用已有备份；归档是 workspace 文件内容，不等于完整 HOME、rootfs 或进程内存。现有 CoCell 受保护工具 OSS 备份分支是另一条路径，需要独立核对其范围与凭据能力，不能与 Cellbox capture 混为一种保证。
 
 ### 7.3 同 ID 重建与新实例替换
 

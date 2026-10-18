@@ -139,8 +139,13 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     const previousPod = pod;
     const checkpointed = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(checkpointed.sandbox.status, 'paused');
-    const backedUp = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
-    assert(backedUp.remoteArchives?.length, 'Checkpoint must publish a durable archive before project archival');
+    await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+    const backedUp = await env.json(`/api/projects/${project.id}/backup`, { method: 'POST', expectedStatus: 200,
+      timeoutMs: env.config.operationTimeout });
+    assert.equal(backedUp.sandboxOperation.kind, 'backup');
+    assert.equal(backedUp.sandboxOperation.status, 'succeeded');
+    assert.equal(backedUp.sandboxBackup?.status, 'succeeded');
+    assert(backedUp.remoteArchives?.length, 'Explicit backup must publish a durable archive before project archival');
     const archived = await env.json(`/api/projects/${project.id}/archive`, { method: 'POST', expectedStatus: 200,
       timeoutMs: env.config.operationTimeout, body: { useExistingBackup: true } });
     assert.equal(archived.status, 'archived');

@@ -123,7 +123,7 @@ const modelProvider = new DirectModelProvider(models, proxyKind !== 'new-api');
 const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_MS ?? 60 * 60 * 1000);
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
 const sandboxManager = new SandboxManager({ provider, logger: runtimeLog,
-  // Project lifecycle owns idle checkpoints so every pause includes its disk backup.
+  // Project lifecycle owns idle checkpoints; disk backup is a separate operation.
   policy: { autoCheckpointAfterMs: Number.MAX_SAFE_INTEGER }, lifecycle: cellboxRuntime.lifecycle });
 const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage);
 const systemTools = new SystemTools({ projects: () => webState.listProjects(), enter: id => manager.enterProject(id),

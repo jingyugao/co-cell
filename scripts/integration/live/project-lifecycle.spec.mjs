@@ -22,13 +22,9 @@ test('real projects: read-only entry, explicit resume, checkpoint and independen
       const checkpointResponse = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
       assert.equal(checkpointResponse.sandboxOperation.status, 'succeeded');
       assert.equal(checkpointResponse.sandbox.status, 'paused');
-      const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
-      const archive = checkpointed.remoteArchives?.[0];
-      assert(archive && archive.sizeBytes > 0 && /^[a-f0-9]{64}$/.test(archive.sha256), 'Checkpoint did not publish a verified archive reference');
-      assert.equal(archive.sourceSandboxId, project.sandbox.id);
-      assert(Array.isArray(archive.threadIds));
-      project.checkpointArchiveId = archive.id;
-      projects[index] = checkpointed;
+      assert.equal(checkpointResponse.sandboxBackup, undefined, 'Checkpoint must not launch a disk backup');
+      assert.deepEqual(checkpointResponse.remoteArchives ?? [], project.remoteArchives ?? []);
+      projects[index] = checkpointResponse;
       // An empty conversation is metadata and may be created while paused.
       // Executing a turn is the readiness boundary.
       const session = await env.json('/api/sessions', { method: 'POST', expectedStatus: 201, body: { projectId: project.id } });
@@ -62,9 +58,8 @@ test('real projects: read-only entry, explicit resume, checkpoint and independen
     const checkpointed = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
     assert.equal(checkpointed.sandbox.status, 'paused');
-    const archived = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
-    assert.notEqual(archived.remoteArchives?.[0]?.id, project.checkpointArchiveId, 'A later Checkpoint must publish a new archive reference');
-    assert.equal(archived.remoteArchives?.[0]?.sourceSandboxId, project.sandbox.id);
+    assert.equal(checkpointed.sandboxBackup, undefined, 'A later Checkpoint must not create a backup either');
+    assert.deepEqual(checkpointed.remoteArchives ?? [], project.remoteArchives ?? []);
     return { operationId: ready.sandboxOperation.id, sandboxId: ready.sandbox.id };
   });
   await env.step('Explicit resume of two paused projects completes both independent restores', async () => {
@@ -78,6 +73,14 @@ test('real projects: read-only entry, explicit resume, checkpoint and independen
       assert.equal(ready.sandbox.id, project.sandbox.id);
       return { projectId: project.id, durationMs: performance.now() - start, operationId: ready.sandboxOperation.id };
     }));
+  });
+  await env.step('Checkpoint permits an immediate first resume without backup or retry', async () => {
+    const project = projects[0];
+    await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', timeoutMs: env.config.operationTimeout });
+    const resumed = await env.json(`/api/projects/${project.id}/sandbox/resume`, { method: 'POST', timeoutMs: env.config.operationTimeout });
+    assert.equal(resumed.sandboxOperation.status, 'succeeded');
+    assert.equal(resumed.sandbox.status, 'ready');
+    assert.equal(resumed.sandboxBackup, undefined);
   });
   await env.step('Restored App Servers can complete another checkpoint', async () => {
     for (const project of projects) {

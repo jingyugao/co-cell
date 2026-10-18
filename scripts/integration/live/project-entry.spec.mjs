@@ -47,7 +47,7 @@ test('real browser: read-only project entry, explicit resume, and draft retentio
     const checkpointed = await env.json(`/api/projects/${id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
     assert.equal(checkpointed.sandbox.status, 'paused');
-    await env.waitProject(id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
+    assert.equal(checkpointed.sandboxBackup, undefined, 'Checkpoint must not launch disk backup');
 
     await page.reload();
     const card = page.getByRole('article', { name: env.name('browser'), exact: true });

@@ -108,7 +108,7 @@ export interface ProjectSandboxOperation {
   result?: { sandbox: SandboxState };
   /** Image selected by this restore request; no resource reservation. */
   imageSelection?: ProjectImageSelection;
-  /** Checkpoint completes when paused; its workspace backup has independent status. */
+  /** Checkpoint only pauses the Sandbox; workspace backup is a separate explicit operation. */
   kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild';
   phase: string;
   status: 'running' | 'failed' | 'succeeded' | 'unknown';
@@ -165,7 +165,7 @@ export interface Project {
   backupRetentionCount?: number;
   latestBackup?: LatestBackupSummary;
   sandboxOperation?: ProjectSandboxOperation;
-  /** Background workspace capture; failure never changes the checkpoint outcome. */
+  /** Result of an explicit workspace backup, independent of checkpoint outcome. */
   sandboxBackup?: ProjectSandboxBackup;
   /** Uncommitted replacement containers and retired containers awaiting cleanup. */
   pendingSandboxCleanup?: SandboxState[];

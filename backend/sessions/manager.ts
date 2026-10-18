@@ -1004,7 +1004,8 @@ export class SessionManager {
   }
 
   async backupProjectNow(id: string): Promise<ProjectSummary> {
-    throw new HttpError(409, '请使用 Checkpoint 暂停并备份；运行中的项目不再单独备份');
+    await this.submitProjectSandboxOperation(id, 'backup');
+    return this.readProject(id);
   }
 
   async resumeProjectSandbox(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
@@ -1053,7 +1054,7 @@ export class SessionManager {
     await done;
   }
 
-  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void>; settled?: Promise<void> }>, eligible?: (project: Project) => boolean) {
+  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>, eligible?: (project: Project) => boolean) {
     await this.projects.refreshOne(id);
     if (eligible) {
       const current = this.projects.find(id);

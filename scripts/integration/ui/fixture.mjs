@@ -93,10 +93,13 @@ export const test = base.extend({
         } else if (method === 'POST' && path.endsWith('/resume')) {
           data.sandboxOperation = operation('resume');
           rememberPending(id, route, 'resume', call); return;
+        } else if (method === 'POST' && path.endsWith('/backup')) {
+          data.sandboxOperation = operation('backup', 'succeeded');
+          data.sandboxBackup = { id: data.sandboxOperation.id, sandboxId: data.sandbox.id, status: 'succeeded', phase: '完成', updatedAt: now };
+          status = 200;
         } else if (method === 'POST' && path.endsWith('/sandbox/checkpoint')) {
           if (data.sandbox?.status === 'paused') {
             data.sandboxOperation = operation('checkpoint', 'succeeded');
-            data.sandboxBackup = { id: 'disk-backup', sandboxId: data.sandbox.id, status: 'running', phase: '排队中', updatedAt: now };
             status = 200;
           } else {
             data.sandboxOperation = operation('checkpoint');
@@ -148,7 +151,6 @@ export const test = base.extend({
         const value = projects.get(id);
         value.sandbox = sandbox(id, running ? 'ready' : 'paused');
         value.sandboxOperation = operation('checkpoint', running ? 'running' : 'succeeded');
-        if (!running) value.sandboxBackup = { id: 'disk-backup', sandboxId: value.sandbox.id, status: 'running', phase: '扫描文件', updatedAt: now };
         if (!running) {
           const pending = [...(pendingRoutes.get(id) ?? [])];
           const entries = pending.filter(record => record.kind === 'open');

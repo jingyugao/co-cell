@@ -215,6 +215,7 @@ export class LiveEnvironment {
         const deadline = Date.now() + this.config.operationTimeout;
         const stoppedSessions = new Set();
         let checkpointSubmitted = false;
+        let backupId;
         for (;;) {
           const { data: project, response } = await this.request(`/api/projects/${id}`, { signal, expectedStatus: [200, 404] });
           if (response.status === 404) break;
@@ -236,12 +237,12 @@ export class LiveEnvironment {
           }
           assert(!['unknown', 'failed'].includes(project.sandboxOperation?.status),
             `Project ${id} has a ${project.sandboxOperation?.status ?? 'unknown'} sandbox operation; cleanup will not replay it`);
-          assert(project.sandboxBackup?.status !== 'failed',
+          assert(!['failed', 'unknown'].includes(project.sandboxBackup?.status),
             `Project ${id} disk backup failed: ${project.sandboxBackup?.error ?? 'unknown error'}`);
           if (project.sandbox && project.status !== 'archived') {
             assert(['ready', 'paused'].includes(project.sandbox.status),
               `Project ${id} sandbox is ${project.sandbox.status}; cleanup will leave it for an operator`);
-            if (!checkpointSubmitted) {
+            if (project.sandbox.status === 'ready' && !checkpointSubmitted) {
               const checkpoint = await this.json(`/api/projects/${id}/sandbox/checkpoint`, {
                 method: 'POST', timeoutMs: this.config.operationTimeout, signal,
               });
@@ -252,16 +253,25 @@ export class LiveEnvironment {
               checkpointSubmitted = true;
               continue;
             }
-            const checkpointId = project.sandboxOperation?.kind === 'checkpoint'
-              ? project.sandboxOperation.id : undefined;
-            if (project.sandboxBackup?.status !== 'succeeded' || project.sandboxBackup.id !== checkpointId) {
-              assert(Date.now() < deadline, `Timed out waiting for cleanup checkpoint archive for project ${id}`);
-              await delay(250, undefined, { signal }); continue;
+            if (!backupId) {
+              const backedUp = await this.json(`/api/projects/${id}/backup`, {
+                method: 'POST', timeoutMs: this.config.operationTimeout, signal,
+              });
+              assert.equal(backedUp.sandboxOperation?.kind, 'backup');
+              assert.equal(backedUp.sandboxOperation?.status, 'succeeded', `Cleanup backup for project ${id} did not succeed`);
+              backupId = backedUp.sandboxOperation.id;
+              assert(backupId, 'Cleanup backup has no operation ID');
+              assert.equal(backedUp.sandboxBackup?.id, backupId);
+              assert.equal(backedUp.sandboxBackup?.sandboxId, project.sandbox.id);
+              assert.equal(backedUp.sandboxBackup?.status, 'succeeded');
+              continue;
             }
+            assert.equal(project.sandboxBackup?.id, backupId, 'Cleanup backup observation was replaced');
+            assert.equal(project.sandboxBackup?.status, 'succeeded');
             const archived = await this.json(`/api/projects/${id}/archive`, {
               method: 'POST', timeoutMs: this.config.operationTimeout, signal, body: { useExistingBackup: true },
             });
-            assert.equal(archived.status, 'archived', `Project ${id} was not archived after its cleanup checkpoint`);
+            assert.equal(archived.status, 'archived', `Project ${id} was not archived after its explicit cleanup backup`);
             continue;
           }
           assert(!project.sandbox, `Archived project ${id} still has a sandbox; cleanup will leave it for an operator`);

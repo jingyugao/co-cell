@@ -22,8 +22,8 @@
 | --- | --- | --- |
 | harness | 创建响应丢失后的资源回收；拒绝删除非本次项目；清理失败导致测试失败；报告凭证脱敏 | 无 |
 | ui-desktop / ui-mobile | 暂停项目只读进入且可编辑草稿；明确恢复；unknown 不自动重放；创建立即进入；查询失败可刷新；旧会话先 SSE 后历史；Checkpoint 不挡查看；草稿隔离 | 本地 Vite、Chromium；API 为可控替身 |
-| live | 真实 UI 创建/明确恢复；并发只读进入不提交恢复；明确恢复请求独立并透传底层冲突；两个项目同时恢复；GET 不隐式唤醒；暂停时允许空会话元数据、拒绝任务执行；再次 Checkpoint 验证 App Server；文件归档恢复到新 Sandbox 后再次归档、删除 | 已部署 CoCell、Cellbox、Kubernetes 运行时和存储 |
-| model lifecycle | 真实模型调用工具；Node 服务与文件下载；Checkpoint/Resume 保持 PID、实例标记和内存计数；备份/归档/恢复；恢复后的文件、会话上下文和重新启动服务 | live 依赖、可用模型、Sandbox 内预装 Node |
+| live | 真实 UI 创建/明确恢复；并发只读进入不提交恢复；明确恢复请求独立并透传底层冲突；两个项目同时恢复；GET 不隐式唤醒；暂停时允许空会话元数据、拒绝任务执行；Checkpoint 只暂停、备份单独提交；文件归档恢复到新 Sandbox 后再次归档、删除 | 已部署 CoCell、Cellbox、Kubernetes 运行时和存储 |
+| model lifecycle | 真实模型调用工具；Node 服务与文件下载；Checkpoint/Resume 保持 PID、实例标记和内存计数；显式备份、归档/恢复；恢复后的文件、会话上下文和重新启动服务 | live 依赖、可用模型、Sandbox 内预装 Node |
 | model user-input | 独立新会话及原会话续聊连续两次真实调用异步提问工具，API 回复、原生 call ID、答复状态持久化 | live 依赖、支持原生异步提问工具的模型 |
 | model reads | 真实子/孙代理、会话隔离、后续轮次上下文、原生历史新鲜度、历史与子代理接口耗时 | live 依赖、支持子代理的模型 |
 
@@ -94,7 +94,9 @@ UI 交互耗时与实际恢复耗时分别记录；普通集成测试不把单�
 
 项目不再有通用控制锁、维护长租约或恢复重放。只读进入和真实状态查询独立，unknown 结果由用户决定下一步。SDK 与 App Server 连接缓存仅保护本地数据；生命周期请求不排队等待普通读取，冲突由 Cellbox 返回。自动政策不重复提交已失败或未知的动作。
 
-运行中纯磁盘归档和同 ID rebuild 已明确不支持。真实模型测试中的同 ID 重建改为验证 unsupported 且不改变原绑定/备份；归档恢复使用明确的 restore API。自动备份不自动删除旧归档，清理需明确调用 prune。真实环境与模型测试须针对已迁移的独立测试安装执行；本次本地代码验证不能代替部署验收。
+运行中纯磁盘归档和同 ID rebuild 已明确不支持。真实模型测试中的同 ID 重建改为验证 unsupported 且不改变原绑定/备份；归档恢复使用明确的 restore API。备份不自动删除旧归档，清理需明确调用 prune。真实环境与模型测试须针对已迁移的独立测试安装执行；本次本地代码验证不能代替部署验收。
+
+Checkpoint 只负责暂停 Sandbox，不自动触发备份。工作区备份通过 `POST /api/projects/:id/backup` 单独明确提交，仅支持 paused/failed Sandbox；running 返回 409。Cellbox 仍可能返回 BUSY，CoCell 不添加资源锁、隐藏重试或幂等承诺；Resume 与备份均呈现实际结果。归档可以从已暂停/failed 的资源生成备份，或明确复用已有备份。
 
 本轮本地结果：379 项单测通过；桌面 28/28、手机 28/28 通过。完整集成运行 66/67，唯一 harness 失败来自测试文件编辑期间缺失导入，补齐后同一 harness 定向复验 1/1 通过。本地套件没有跳过或 flaky。
 

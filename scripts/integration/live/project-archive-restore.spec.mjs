@@ -10,7 +10,10 @@ test('real archive restores files into a new sandbox and can be archived again',
   const write = await testWorkspaceWriter(env, project.id);
   await write(filename, marker);
   await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', timeoutMs: env.config.operationTimeout });
-  await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
+  const backedUp = await env.json(`/api/projects/${project.id}/backup`, { method: 'POST', timeoutMs: env.config.operationTimeout });
+  assert.equal(backedUp.sandboxOperation.kind, 'backup');
+  assert.equal(backedUp.sandboxOperation.status, 'succeeded');
+  assert.equal(backedUp.sandboxBackup.status, 'succeeded');
   const archived = await env.json(`/api/projects/${project.id}/archive`, {
     method: 'POST', body: { useExistingBackup: true }, timeoutMs: env.config.operationTimeout,
   });
@@ -24,6 +27,6 @@ test('real archive restores files into a new sandbox and can be archived again',
   assert.notEqual(restored.sandbox.id, sourceId);
   const file = await env.request(`/api/projects/${project.id}/files/content?path=${encodeURIComponent(`/home/agent/workspace/${filename}`)}`);
   assert.equal(file.buffer.toString(), marker);
-  // Fixture cleanup checkpoints, archives, and deletes the restored project.
+  // Fixture cleanup checkpoints, explicitly backs up, archives, and deletes the restored project.
   // Its older archive source has already been purged and must not be deleted again.
 });

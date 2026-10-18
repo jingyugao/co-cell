@@ -102,7 +102,7 @@ export class ProjectSandboxOperations {
   }
 
   /** One user request submits each remote step once; no task takeover or replay. */
-  async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void>; settled?: Promise<void> }> {
+  async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
     const project = this.deps.projects.get(id);
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
     if (kind === 'checkpoint' && project.status === 'archived') throw new HttpError(409, '已归档项目不能暂停');
@@ -114,35 +114,23 @@ export class ProjectSandboxOperations {
     const pending = { operationId: operation.id!, waiters: new Set<() => void>(), done: undefined as Promise<void> | undefined };
     this.pending.set(id, pending);
     this.timings.set(id, { operationId: operation.id!, kind, started: Date.now(), phaseStarted: Date.now(), phase: operation.phase });
-    let pauseDone!: () => void, pauseFailed!: (error: unknown) => void;
-    const checkpointDone = kind === 'checkpoint' ? new Promise<void>((resolve, reject) => { pauseDone = resolve; pauseFailed = reject; }) : undefined;
-    let pausePublished = false;
     const execute = async () => {
       try {
         if (kind === 'create') await this.create(id);
         else if (kind === 'resume') await this.resume(id);
         else if (kind === 'rebuild') throw new HttpError(422, '当前 Cellbox 不支持同 ID 重建；可从备份创建新环境。');
-        else if (kind === 'checkpoint') await this.checkpoint(id, false);
+        else if (kind === 'checkpoint') await this.checkpoint(id);
         else if (kind === 'restore') await this.restore(id, false, selection);
         else if (kind === 'backup') await this.backup(id);
         else if (kind === 'refresh') throw new HttpError(422, '当前 Cellbox 不支持原地刷新；请选择明确版本创建新环境。');
         else await this.archive(id, options.useExistingBackup === true);
         operation.status = 'succeeded'; operation.phase = operation.cleanupError ? '操作完成，资源清理未完成' : '完成'; operation.updatedAt = new Date().toISOString();
         await this.deps.projects.updateSandboxOperation(id, { ...operation });
-        if (kind === 'checkpoint') {
-          pausePublished = true; pauseDone();
-          const sandbox = this.deps.projects.get(id).sandbox!;
-          await this.deps.projects.updateSandboxBackup(id, { id: operation.id!, sandboxId: sandbox.id, status: 'running', phase: '备份暂停工作区', updatedAt: new Date().toISOString() });
-          await this.backgroundBackup(id);
-        }
       } catch (error) {
         const detail = operationError(error);
-        if (!pausePublished) {
-          Object.assign(operation, { status: detail.unknown ? 'unknown' : 'failed', error: detail.message, errorCode: detail.code,
-            phase: detail.unknown ? '请求结果未知' : operation.phase, updatedAt: new Date().toISOString() });
-          await this.deps.projects.updateSandboxOperation(id, { ...operation });
-          pauseFailed?.(error);
-        }
+        Object.assign(operation, { status: detail.unknown ? 'unknown' : 'failed', error: detail.message, errorCode: detail.code,
+          phase: detail.unknown ? '请求结果未知' : operation.phase, updatedAt: new Date().toISOString() });
+        await this.deps.projects.updateSandboxOperation(id, { ...operation });
         void this.deps.logger?.write({ event: 'sandbox.operation_failed', projectId: id, operationId: operation.id, kind, error });
         throw error;
       } finally {
@@ -157,8 +145,7 @@ export class ProjectSandboxOperations {
     pending.done = task;
     this.tasks.add(task);
     void task.finally(() => this.tasks.delete(task)).catch(() => {});
-    if (checkpointDone) void task.catch(error => pauseFailed(error));
-    return checkpointDone ? { done: checkpointDone, settled: task } : { done: task };
+    return { done: task };
   }
 
   hasResume(id: string, operationId: string): boolean { return this.pending.get(id)?.operationId === operationId; }
@@ -188,7 +175,7 @@ export class ProjectSandboxOperations {
     await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, false);
   }
 
-  private async checkpoint(id: string, capture = true) {
+  private async checkpoint(id: string) {
     const { projects, runtime } = this.deps;
     const project = await this.inspect(id);
     if (!project.sandbox || !['ready', 'paused'].includes(project.sandbox.status)) throw new HttpError(409, '仅运行中或已暂停的 Sandbox 可以创建 Checkpoint');
@@ -200,21 +187,6 @@ export class ProjectSandboxOperations {
       if (paused.status !== 'paused') throw new Error('Checkpoint 完成后 Sandbox 未暂停');
       await this.deps.saveSandbox(id, paused, false);
     }
-    if (capture) await this.backup(id);
-  }
-
-  private async backgroundBackup(id: string) {
-    try {
-      await this.backup(id, true);
-    } catch (error) {
-      const backup = this.deps.projects.get(id).sandboxBackup;
-      if (!backup || backup.id !== this.context.getStore()!.operation.id) return;
-      void this.deps.logger?.write({ event: 'sandbox.backup_failed', projectId: id,
-        sandboxId: backup.sandboxId, operationId: backup.id, phase: backup.phase, error });
-      const detail = operationError(error);
-      await this.deps.projects.updateSandboxBackup(id, { ...backup, status: detail.unknown ? 'unknown' : 'failed',
-        error: detail.message, updatedAt: new Date().toISOString() }, backup.id);
-    }
   }
 
   private async inspect(id: string) {
@@ -223,43 +195,50 @@ export class ProjectSandboxOperations {
     return project;
   }
 
-  private async backup(id: string, background = false) {
+  private async backup(id: string) {
     const project = await this.inspect(id);
     const runtime = this.deps.runtime;
     if (!project.sandbox) throw new HttpError(409, '项目没有可备份的持久化目录');
     if (project.sandbox.status !== 'paused' && project.sandbox.phase !== 'failed') throw new HttpError(409, '请先暂停 Sandbox，再从磁盘生成备份');
     if (!runtime.remoteArchives) throw new HttpError(503, 'Cellbox 归档不可用');
+    const operation = this.context.getStore()!.operation;
+    let backup: NonNullable<Project['sandboxBackup']> = { id: operation.id!, sandboxId: project.sandbox.id, status: 'running',
+      phase: '从已停止的磁盘备份数据', updatedAt: new Date().toISOString() };
+    await this.deps.projects.updateSandboxBackup(id, backup);
     const phase = async (value: string) => {
-      if (!background) return this.phase(id, value);
-      const backup = this.deps.projects.get(id).sandboxBackup;
-      if (!backup || backup.id !== this.context.getStore()!.operation.id) return;
-      await this.deps.projects.updateSandboxBackup(id, { ...backup,
-        phase: value, updatedAt: new Date().toISOString() }, backup.id);
+      await this.phase(id, value);
+      backup = { ...backup, phase: value, updatedAt: new Date().toISOString() };
+      await this.deps.projects.updateSandboxBackup(id, backup, operation.id);
     };
-    await phase('从已停止的磁盘备份数据');
     const started = Date.now();
-    const captured = await runtime.remoteArchives.capture(target(project), this.operationKey(id, 'capture'));
-    const reference: RemoteArchiveRef = { ...captured, threadIds: this.deps.threadIds(id) };
-    if (reference.sourceSandboxId !== project.sandbox.id
-      || (project.sandbox.image?.id && reference.imageId !== project.sandbox.image.id)) {
-      throw new HttpError(409, 'Cellbox 归档来源与当前 Sandbox 不符，操作已停止');
-    }
-    await phase('校验备份');
-    const inspected = await runtime.remoteArchives.inspect(reference);
-    if (!matchesRemoteArchive(reference, inspected)) {
-      throw new HttpError(409, 'Cellbox 归档校验失败，操作已停止');
-    }
-    // Persist the reference before any archive operation may release the source box.
-    await this.deps.projects.saveRemoteArchive(id, reference);
-    const outcome = { durationMs: Date.now() - started, scannedBytes: reference.sizeBytes, verified: true,
-      updatedAt: new Date().toISOString() };
-    // Remote deletion is an explicit cleanup action. A later backup must not
-    // silently repeat an earlier failed or unknown archive deletion.
-    if (background) await this.deps.projects.updateSandboxBackup(id, { ...this.deps.projects.get(id).sandboxBackup!,
-      ...outcome, phase: '完成', status: 'succeeded' }, this.context.getStore()!.operation.id);
-    else {
-      Object.assign(this.context.getStore()!.operation, outcome);
-      await this.deps.projects.updateSandboxOperation(id, { ...this.context.getStore()!.operation });
+    try {
+      await phase(backup.phase);
+      const captured = await runtime.remoteArchives.capture(target(project), this.operationKey(id, 'capture'));
+      const reference: RemoteArchiveRef = { ...captured, threadIds: this.deps.threadIds(id) };
+      if (reference.sourceSandboxId !== project.sandbox.id
+        || (project.sandbox.image?.id && reference.imageId !== project.sandbox.image.id)) {
+        throw new HttpError(409, 'Cellbox 归档来源与当前 Sandbox 不符，操作已停止');
+      }
+      await phase('校验备份');
+      const inspected = await runtime.remoteArchives.inspect(reference);
+      if (!matchesRemoteArchive(reference, inspected)) {
+        throw new HttpError(409, 'Cellbox 归档校验失败，操作已停止');
+      }
+      // Persist the reference before any archive operation may release the source box.
+      await this.deps.projects.saveRemoteArchive(id, reference);
+      const outcome = { durationMs: Date.now() - started, scannedBytes: reference.sizeBytes, verified: true,
+        updatedAt: new Date().toISOString() };
+      // Remote deletion remains an explicit cleanup action, never a backup retry.
+      await this.deps.projects.updateSandboxBackup(id, { ...backup, ...outcome, phase: '完成', status: 'succeeded' }, operation.id);
+      Object.assign(operation, outcome);
+      await this.deps.projects.updateSandboxOperation(id, { ...operation });
+    } catch (error) {
+      const detail = operationError(error);
+      await this.deps.projects.updateSandboxBackup(id, { ...backup, status: detail.unknown ? 'unknown' : 'failed',
+        error: detail.message, updatedAt: new Date().toISOString() }, operation.id);
+      void this.deps.logger?.write({ event: 'sandbox.backup_failed', projectId: id,
+        sandboxId: project.sandbox.id, operationId: operation.id, phase: backup.phase, error });
+      throw error;
     }
   }
 

@@ -38,24 +38,23 @@ test('marking a checkpointed project completed keeps it paused and explains sche
   expect(ui.calls.filter(call => call.method === 'POST')).toEqual([]);
 });
 
-test('failed paused Checkpoint offers an explicit backup retry', async ({ page, ui }) => {
+test('failed paused disk backup offers an explicit backup retry', async ({ page, ui }) => {
   ui.projects.get('paused').sandboxBackup = { id: 'backup', sandboxId: 'paused-box', status: 'failed', phase: '上传', error: '归档失败', updatedAt: '2026-01-01T00:00:00Z' };
   await page.goto('/#projects');
   const card = page.getByRole('article', { name: '暂停项目', exact: true });
   await expect(card.getByRole('button', { name: '重试磁盘备份', exact: true })).toBeVisible();
   await card.getByRole('button', { name: '重试磁盘备份', exact: true }).click();
-  await expect.poll(() => ui.count('POST', '/api/projects/paused/sandbox/checkpoint')).toBe(1);
-  await ui.checkpoint('paused', false);
-  expect(ui.calls.find(call => call.path === '/api/projects/paused/sandbox/checkpoint')?.status).toBe(200);
+  await expect.poll(() => ui.count('POST', '/api/projects/paused/backup')).toBe(1);
+  expect(ui.calls.find(call => call.path === '/api/projects/paused/backup')?.status).toBe(200);
 });
 
-test('paused project entry keeps a draft and never resumes until the user requests it', async ({ page, ui }) => {
+test('an existing disk backup does not block explicit resume; project viewing remains available', async ({ page, ui }) => {
   ui.projects.get('paused').sandboxBackup = { id: 'backup', sandboxId: 'paused-box', status: 'running', phase: '上传中', updatedAt: '2026-01-01T00:00:00Z' };
   await page.goto('/projects/paused');
   await expect.poll(() => ui.count('GET', '/api/projects/paused')).toBe(1);
   await expect(ui.editor).toBeEditable();
-  await ui.editor.fill('暂停期间先保存到浏览器的草稿');
-  await expect(ui.send).toBeDisabled();
+  await ui.editor.fill('备份期间仍可查看并编辑草稿');
+  await expect(ui.editor).toHaveValue('备份期间仍可查看并编辑草稿');
   expect(ui.count('POST', '/api/projects/paused/open')).toBe(0);
   expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(0);
   expect(ui.calls.filter(call => call.waitForOperation)).toEqual([]);
@@ -63,15 +62,34 @@ test('paused project entry keeps a draft and never resumes until the user reques
   await projectList(page);
   const card = page.getByRole('article', { name: '暂停项目', exact: true });
   await expect(card.getByText('磁盘备份：上传中', { exact: true })).toBeVisible();
+  await expect(card.getByRole('button', { name: '进入项目', exact: true })).toBeEnabled();
+  await expect(card.getByRole('button', { name: '标记已完成', exact: true })).toBeEnabled();
   await expect(card.getByRole('button', { name: '恢复运行', exact: true })).toBeEnabled();
+  expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(0);
+
   await card.getByRole('button', { name: '恢复运行', exact: true }).click();
   await expect.poll(() => ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(1);
+  expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(1);
   await ui.complete('paused');
   await projectList(page);
   await card.getByRole('button', { name: '进入项目', exact: true }).click();
-  await expect(ui.editor).toHaveValue('暂停期间先保存到浏览器的草稿');
+  await expect(ui.editor).toHaveValue('备份期间仍可查看并编辑草稿');
   await expect(ui.send).toBeEnabled();
   expect(ui.count('POST', '/api/projects/paused/open')).toBe(0);
+});
+
+test('paused project submits disk backup only after the explicit backup action', async ({ page, ui }) => {
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '暂停项目', exact: true });
+  await expect(card.getByRole('button', { name: '恢复运行', exact: true })).toBeEnabled();
+  await expect(card.getByRole('button', { name: '磁盘备份', exact: true })).toBeEnabled();
+  expect(ui.count('POST', '/api/projects/paused/backup')).toBe(0);
+
+  await card.getByRole('button', { name: '磁盘备份', exact: true }).click();
+  await expect.poll(() => ui.count('POST', '/api/projects/paused/backup')).toBe(1);
+  expect(ui.count('POST', '/api/projects/paused/backup')).toBe(1);
+  expect(ui.count('POST', '/api/projects/paused/sandbox/checkpoint')).toBe(0);
+  expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(0);
 });
 
 test('project creation waits for Sandbox creation, then opens the project', async ({ page, ui }) => {

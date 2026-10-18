@@ -59,42 +59,48 @@ test('cleanup preserves a preparing sandbox after a synchronous create failure',
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
-test('checkpoint wait can include asynchronous disk archive completion', async ({}, testInfo) => {
+test('backup wait can include asynchronous disk archive completion', async ({}, testInfo) => {
   let reads = 0;
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     reads++;
     res.end(JSON.stringify({ id: 'project', sandbox: { id: 'box', status: reads === 1 ? 'unavailable' : 'paused' },
-      sandboxOperation: { id: 'checkpoint', kind: 'checkpoint', status: 'succeeded' },
-      sandboxBackup: { id: 'archive', sandboxId: 'box', status: reads === 1 ? 'running' : 'succeeded', phase: '上传中', updatedAt: new Date().toISOString() },
+      sandboxOperation: { id: 'backup', kind: 'backup', status: 'succeeded' },
+      sandboxBackup: { id: 'backup', sandboxId: 'box', status: reads === 1 ? 'running' : 'succeeded', phase: '上传中', updatedAt: new Date().toISOString() },
       remoteArchives: reads === 1 ? [] : [{ id: 'archive' }] }));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const env = new LiveEnvironment(liveConfig({ COCELL_E2E_BASE_URL: `http://127.0.0.1:${server.address().port}`, COCELL_E2E_ACCESS_TOKEN: 'test-only-token' }),
     { journal: testInfo.outputPath('resources.json') });
   try {
-    const project = await env.waitProject('project', { kind: 'checkpoint', status: 'paused', waitForBackup: true });
+    const project = await env.waitProject('project', { kind: 'backup', status: 'paused', waitForBackup: true });
     expect(reads).toBe(2);
     expect(project.sandboxBackup.status).toBe('succeeded');
+    expect(project.sandboxBackup.id).toBe(project.sandboxOperation.id);
+    expect(project.sandboxBackup.sandboxId).toBe(project.sandbox.id);
     expect(project.remoteArchives[0].id).toBe('archive');
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
-test('cleanup submits one checkpoint, waits for its archive, archives, then deletes once', async ({}, testInfo) => {
+test('cleanup checkpoints once, backs up once, archives the backup, then deletes once', async ({}, testInfo) => {
   let reads = 0;
   let checkpointCalls = 0;
+  let backupCalls = 0;
   let archiveCalls = 0;
   let deleted = 0;
   let removed = false;
   let archived = false;
-  let backupReads = 0;
+  const calls = [];
   let env;
   const project = () => ({ id: 'owned', name: env.name('async-checkpoint'), status: archived ? 'archived' : 'active',
     ...(archived ? {} : { sandbox: { id: 'box', status: checkpointCalls ? 'paused' : 'ready' } }),
-    sandboxOperation: checkpointCalls
-      ? { id: 'checkpoint', kind: archived ? 'archive' : 'checkpoint', status: 'succeeded' }
-      : { id: 'create', kind: 'create', status: 'succeeded' },
-    ...(checkpointCalls ? { sandboxBackup: { id: 'checkpoint', sandboxId: 'box', status: backupReads++ < 2 ? 'running' : 'succeeded' } } : {}) });
+    sandboxOperation: archived
+      ? { id: 'archive-op', kind: 'archive', status: 'succeeded' }
+      : backupCalls ? { id: 'backup-op', kind: 'backup', status: 'succeeded' }
+        : checkpointCalls ? { id: 'checkpoint-op', kind: 'checkpoint', status: 'succeeded' }
+          : { id: 'create', kind: 'create', status: 'succeeded' },
+    ...(backupCalls ? { sandboxBackup: { id: 'backup-op', sandboxId: 'box', status: 'succeeded' },
+      remoteArchives: [{ id: 'archive', sourceSandboxId: 'box' }] } : {}) });
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify(removed ? [] : [project()])); return; }
@@ -108,22 +114,37 @@ test('cleanup submits one checkpoint, waits for its archive, archives, then dele
     if (req.url === '/api/projects/owned/sandbox/checkpoint' && req.method === 'POST') {
       checkpointCalls++;
       expect(checkpointCalls).toBe(1);
-      res.end(JSON.stringify({ ...project(), sandboxOperation: { id: 'checkpoint', kind: 'checkpoint', status: 'succeeded' } })); return;
+      calls.push('checkpoint');
+      res.end(JSON.stringify({ ...project(), sandboxOperation: { id: 'checkpoint-op', kind: 'checkpoint', status: 'succeeded' } })); return;
+    }
+    if (req.url === '/api/projects/owned/backup' && req.method === 'POST') {
+      backupCalls++;
+      expect(checkpointCalls).toBe(1);
+      expect(backupCalls).toBe(1);
+      calls.push('backup');
+      const state = project();
+      expect(state.sandboxOperation).toMatchObject({ id: state.sandboxBackup.id, kind: 'backup', status: 'succeeded' });
+      expect(state.sandboxBackup.sandboxId).toBe(state.sandbox.id);
+      res.end(JSON.stringify(state)); return;
     }
     if (req.url === '/api/projects/owned/archive' && req.method === 'POST') {
       archiveCalls++;
       expect(archiveCalls).toBe(1);
+      expect(backupCalls).toBe(1);
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const reqBody = Buffer.concat(chunks).toString();
       expect(JSON.parse(reqBody)).toEqual({ useExistingBackup: true });
+      calls.push('archive');
       archived = true;
       res.end(JSON.stringify(project())); return;
     }
     if (req.url === '/api/projects/owned' && req.method === 'DELETE') {
       expect(checkpointCalls).toBe(1);
+      expect(backupCalls).toBe(1);
       expect(archiveCalls).toBe(1);
       deleted++;
+      calls.push('delete');
       removed = true;
       res.end('{"ok":true}'); return;
     }
@@ -139,8 +160,54 @@ test('cleanup submits one checkpoint, waits for its archive, archives, then dele
     await env.cleanup();
     expect(reads).toBeGreaterThanOrEqual(3);
     expect(checkpointCalls).toBe(1);
+    expect(backupCalls).toBe(1);
     expect(archiveCalls).toBe(1);
     expect(deleted).toBe(1);
+    expect(calls).toEqual(['checkpoint', 'backup', 'archive', 'delete']);
+  } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
+});
+
+test('cleanup does not replay an unknown backup or archive/delete its sandbox', async ({}, testInfo) => {
+  let checkpointCalls = 0;
+  let backupCalls = 0;
+  let archiveCalls = 0;
+  let deleted = 0;
+  let env;
+  const project = { id: 'owned', name: '', status: 'active', sandbox: { id: 'box', status: 'ready' },
+    sandboxOperation: { id: 'create', kind: 'create', status: 'succeeded' } };
+  const server = createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify([project])); return; }
+    if (req.url === '/api/sessions') { res.end('[]'); return; }
+    if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[{"id":"box"}]}'); return; }
+    if (req.url === '/api/projects/owned' && req.method === 'GET') { res.end(JSON.stringify(project)); return; }
+    if (req.url === '/api/projects/owned/sandbox/checkpoint' && req.method === 'POST') {
+      checkpointCalls++;
+      project.sandbox.status = 'paused';
+      project.sandboxOperation = { id: 'checkpoint-op', kind: 'checkpoint', status: 'succeeded' };
+      res.end(JSON.stringify(project)); return;
+    }
+    if (req.url === '/api/projects/owned/backup' && req.method === 'POST') {
+      backupCalls++;
+      project.sandboxOperation = { id: 'backup-op', kind: 'backup', status: 'unknown', error: 'response lost' };
+      project.sandboxBackup = { id: 'backup-op', sandboxId: 'box', status: 'unknown', error: 'response lost' };
+      res.end(JSON.stringify(project)); return;
+    }
+    if (req.url === '/api/projects/owned/archive' && req.method === 'POST') { archiveCalls++; assert.fail('Unknown backup must not be followed by archive'); }
+    if (req.url === '/api/projects/owned' && req.method === 'DELETE') { deleted++; res.end('{"ok":true}'); return; }
+    res.statusCode = 404; res.end('{"error":"missing"}');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  env = new LiveEnvironment(liveConfig({ COCELL_E2E_BASE_URL: `http://127.0.0.1:${server.address().port}`, COCELL_E2E_ACCESS_TOKEN: 'test-only-token' }),
+    { journal: testInfo.outputPath('resources.json') });
+  project.name = env.name('unknown-backup');
+  env.projects.set('owned', project.name);
+  try {
+    await expect(env.cleanup()).rejects.toThrow('Integration cleanup failed');
+    expect(checkpointCalls).toBe(1);
+    expect(backupCalls).toBe(1);
+    expect(archiveCalls).toBe(0);
+    expect(deleted).toBe(0);
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 

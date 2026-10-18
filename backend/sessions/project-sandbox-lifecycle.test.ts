@@ -40,6 +40,7 @@ test('archiving deletes current and legacy attachment caches and blocks new uplo
     await writeFile(join(legacyDirectory, 'legacy.png'), 'legacy attachment');
     await manager.checkpointProjectSandbox(session.projectId!);
     await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
+    await manager.backupProjectNow(session.projectId!);
     await manager.archiveProjectNow(session.projectId!, { useExistingBackup: true });
     assert.equal(manager.getProject(session.projectId!).status, 'archived');
     await assert.rejects(access(image), { code: 'ENOENT' });
@@ -101,13 +102,24 @@ test('project entry stays read-only; explicit resume and checkpoint each keep th
     await operations().close();
     const paused = await manager.readProject(project.id);
     assert.equal(checkpointCalls, 1);
-    assert.equal(archiveCalls, 1, 'checkpoint archives the paused workspace once');
+    assert.equal(archiveCalls, 0, 'Checkpoint must not submit disk backup');
+    assert.equal(paused.sandboxBackup, undefined);
+    assert.equal(paused.remoteArchives?.length ?? 0, 0);
     assert.equal(paused.sandbox?.id, box.id);
     assert.equal(paused.sandbox?.status, 'paused');
     assert.equal(paused.sandboxOperation?.kind, 'checkpoint');
     assert.equal(paused.sandboxOperation?.status, 'succeeded');
-    assert.equal(paused.remoteArchives?.[0].id, archive.id);
     assert.equal(isProjectSandboxReady(paused), false);
+    const backupResponse = await app.request(`/api/projects/${project.id}/backup`, { method: 'POST' });
+    assert.equal(backupResponse.status, 200);
+    const backedUp = await backupResponse.json() as ProjectSummary;
+    assert.equal(archiveCalls, 1, 'Only the explicit backup request captures disk');
+    assert.equal(backedUp.sandboxOperation?.kind, 'backup');
+    assert.equal(backedUp.sandboxOperation?.status, 'succeeded');
+    assert.equal(backedUp.sandboxBackup?.status, 'succeeded');
+    assert.equal(backedUp.sandboxBackup?.id, backedUp.sandboxOperation?.id);
+    assert.equal(backedUp.remoteArchives?.[0].id, archive.id);
+    assert.equal(backedUp.sandbox?.status, 'paused');
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -146,7 +158,7 @@ test('unsupported persistent rebuild is reported without touching the sandbox or
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
-test('single-API idle checkpoint also backs up the paused workspace', async () => {
+test('single-API idle checkpoint only pauses and never captures disk', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-idle-backup-'));
   const state = new MemoryWebStateStore();
   const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
@@ -170,12 +182,13 @@ test('single-API idle checkpoint also backs up the paused workspace', async () =
     await manager.scheduledArchive();
     await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
     assert.equal(paused, true);
-    assert.equal(captures, 1);
+    assert.equal(captures, 0);
     const project = await manager.readProject('idle-project');
     assert.equal(project.sandboxOperation?.kind, 'checkpoint');
     assert.equal(project.sandboxOperation?.status, 'succeeded');
-    assert.equal(project.remoteArchives?.[0].id, 'idle-archive');
+    assert.equal(project.remoteArchives?.length ?? 0, 0);
+    assert.equal(project.sandboxBackup, undefined);
     await manager.scheduledArchive();
-    assert.equal(captures, 1, 'later scheduler ticks must not periodically back up a paused project');
+    assert.equal(captures, 0, 'later scheduler ticks must not back up a paused project');
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

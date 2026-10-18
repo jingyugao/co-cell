@@ -110,30 +110,71 @@ test('an older completion does not overwrite a newer request record', async () =
   } finally { release.resolve(); await f.close(); }
 });
 
-test('checkpoint publishes pause separately from a pending disk backup', async () => {
-  const captured = deferred(), release = deferred();
+test('checkpoint only pauses and permits the first explicit resume without capturing disk', async () => {
   const f = await fixture();
-  f.runtime.remoteArchives.capture = async () => { captured.resolve(); await release.promise; return archive; };
   try {
-    const accepted = await f.operations.start('project-one', 'checkpoint');
-    await accepted.done; await captured.promise;
+    await f.operations.run('project-one', 'checkpoint');
+    assert.equal((await f.runtime.querySandbox(f.projects.get('project-one').sandbox!)).status, 'paused');
     assert.equal(f.projects.get('project-one').sandboxOperation?.status, 'succeeded');
+    assert.equal(f.projects.get('project-one').sandboxBackup, undefined);
+    assert.equal(f.calls.includes('capture'), false);
+    await f.operations.run('project-one', 'resume');
+    assert.equal(f.calls.filter(call => call === 'resume').length, 1);
+    assert.equal((await f.runtime.querySandbox(f.projects.get('project-one').sandbox!)).status, 'ready');
+  } finally { await f.close(); }
+});
+
+test('explicit disk backup records progress independently and leaves the sandbox paused', async () => {
+  const captured = deferred(), release = deferred();
+  const f = await fixture({ sandbox: box('paused') });
+  f.runtime.remoteArchives.capture = async () => { f.calls.push('capture'); captured.resolve(); await release.promise; return archive; };
+  try {
+    const accepted = await f.operations.start('project-one', 'backup');
+    await captured.promise;
     assert.equal(f.projects.get('project-one').sandboxBackup?.status, 'running');
     await f.projects.update('project-one', { name: 'Still editable' });
-    release.resolve(); await accepted.settled;
-    assert.equal(f.projects.get('project-one').sandboxBackup?.status, 'succeeded');
+    release.resolve(); await accepted.done;
+    const project = f.projects.get('project-one');
+    assert.equal(project.sandboxOperation?.kind, 'backup');
+    assert.equal(project.sandboxOperation?.status, 'succeeded');
+    assert.equal(project.sandboxBackup?.status, 'succeeded');
+    assert.equal(project.sandboxBackup?.id, project.sandboxOperation?.id);
+    assert.equal((await f.runtime.querySandbox(project.sandbox!)).status, 'paused');
+    assert.deepEqual(f.calls, ['capture', 'inspect-archive']);
   } finally { release.resolve(); await f.close(); }
 });
 
-test('a failed background backup keeps pause success and its actual error', async () => {
-  const f = await fixture();
-  f.runtime.remoteArchives.capture = async () => { throw new CellboxError('UNKNOWN_OUTCOME', 'archive result unknown'); };
+test('an unknown explicit backup is visible and is never retried automatically', async () => {
+  const f = await fixture({ sandbox: box('paused') });
+  let captures = 0;
+  f.runtime.remoteArchives.capture = async () => { captures++; throw new CellboxError('UNKNOWN_OUTCOME', 'archive result unknown'); };
   try {
-    const accepted = await f.operations.start('project-one', 'checkpoint');
-    await accepted.done; await accepted.settled;
-    assert.equal(f.projects.get('project-one').sandboxOperation?.status, 'succeeded');
-    assert.equal(f.projects.get('project-one').sandboxBackup?.status, 'unknown');
-    assert.match(f.projects.get('project-one').sandboxBackup?.error ?? '', /archive result unknown/);
+    await assert.rejects(f.operations.run('project-one', 'backup'), /archive result unknown/);
+    const project = f.projects.get('project-one');
+    assert.equal(project.sandboxOperation?.status, 'unknown');
+    assert.equal(project.sandboxBackup?.status, 'unknown');
+    assert.equal((await f.runtime.querySandbox(project.sandbox!)).status, 'paused');
+    assert.match(project.sandboxBackup?.error ?? '', /archive result unknown/);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(captures, 1);
+  } finally { await f.close(); }
+});
+
+test('running disk backup is rejected without checkpoint or archive capture', async () => {
+  const f = await fixture();
+  try {
+    await assert.rejects(f.operations.run('project-one', 'backup'), /请先暂停/);
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.projects.get('project-one').sandboxBackup, undefined);
+  } finally { await f.close(); }
+});
+
+test('a failed sandbox can be backed up without checkpoint or resume', async () => {
+  const f = await fixture({ sandbox: { ...box('unavailable'), phase: 'failed' } });
+  try {
+    await f.operations.run('project-one', 'backup');
+    assert.equal(f.projects.get('project-one').sandboxBackup?.status, 'succeeded');
+    assert.deepEqual(f.calls, ['capture', 'inspect-archive']);
   } finally { await f.close(); }
 });
 

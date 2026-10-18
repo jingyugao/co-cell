@@ -22,16 +22,26 @@ export async function homeRebuild(env) {
     assert(result.text.trim(), 'Agent did not complete a real conversation');
     return result;
   };
-  await env.step('Prepare a workspace file and real conversation, then Checkpoint and verify its archive', async () => {
+  await env.step('Prepare a workspace file and real conversation, then Checkpoint and pause the Sandbox', async () => {
     await write(filename, before);
     assert.equal(await read(), before);
     initial = await record();
     const checkpointResponse = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(checkpointResponse.sandboxOperation.status, 'succeeded');
     assert.equal(checkpointResponse.sandbox.status, 'paused');
-    const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
-    archive = checkpointed.remoteArchives?.[0];
-    assert(archive, 'Checkpoint did not publish a workspace archive');
+    const paused = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+    assert.equal(paused.sandbox.id, ready.sandbox.id);
+    return { sandboxId: paused.sandbox.id, status: paused.sandbox.status };
+  });
+  await env.step('Back up the paused workspace and verify its archive', async () => {
+    const response = await env.json(`/api/projects/${project.id}/backup`, { method: 'POST', expectedStatus: 200,
+      timeoutMs: env.config.operationTimeout });
+    assert.equal(response.sandboxOperation.kind, 'backup');
+    assert.equal(response.sandboxOperation.status, 'succeeded');
+    const backedUp = await env.waitProject(project.id, { kind: 'backup', status: 'paused' });
+    assert.equal(backedUp.sandboxBackup?.status, 'succeeded');
+    archive = backedUp.remoteArchives?.[0];
+    assert(archive, 'Backup did not publish a workspace archive');
     assert(archive.sizeBytes > 0 && archive.threadIds.includes(initial.session.threadId));
     return { archiveId: archive.id, threadId: initial.session.threadId };
   });

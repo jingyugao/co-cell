@@ -21,6 +21,7 @@ async function fixture(overrides: Partial<Project> = {}, changes: Partial<Sandbo
   await store.saveProject(project);
   const projects = new ProjectService(store); await projects.init();
   const calls: string[] = [];
+  const logs: Record<string, unknown>[] = [];
   let observed: SandboxState['status'] = overrides.sandbox?.status ?? 'ready';
   const runtime = {
     async close() {}, async *run() {}, async *recover() {}, detach() {},
@@ -41,12 +42,12 @@ async function fixture(overrides: Partial<Project> = {}, changes: Partial<Sandbo
     },
     ...changes,
   } satisfies SandboxRuntime;
-  const operations = new ProjectSandboxOperations({ projects, runtime, threadIds: () => ['thread-one'],
+  const operations = new ProjectSandboxOperations({ projects, runtime, logger: { async write(record) { logs.push(record); } }, threadIds: () => ['thread-one'],
     ...(selection ? { selectRestoreImage: async () => ({ selection, release() {} }) } : {}),
     async saveSandbox(id, value, restore, image, expectedId) {
       if (!await projects.updateSandbox(id, value, restore, image, expectedId)) throw new Error('Project binding changed');
     }, detached: async () => { calls.push('detached'); } });
-  return { store, projects, operations, calls, runtime, async close() { await operations.close(); await projects.close(); await store.close(); } };
+  return { store, projects, operations, calls, runtime, logs, async close() { await operations.close(); await projects.close(); await store.close(); } };
 }
 
 test('an explicit resume submits once and reports its runtime result', async () => {
@@ -158,6 +159,30 @@ test('an unknown explicit backup is visible and is never retried automatically',
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(captures, 1);
   } finally { await f.close(); }
+});
+
+test('a concurrent BUSY resume does not turn a completed backup into a metadata conflict', async () => {
+  const captured = deferred(), release = deferred();
+  const f = await fixture({ sandbox: box('paused') }, {
+    async resume() { throw new CellboxError('BUSY', 'Box has an active operation', 409); },
+  });
+  f.runtime.remoteArchives.capture = async () => { f.calls.push('capture'); captured.resolve(); await release.promise; return archive; };
+  try {
+    const request = f.operations.run('project-one', 'backup');
+    await captured.promise;
+    await assert.rejects(f.operations.run('project-one', 'resume'), error => error instanceof CellboxError && error.code === 'BUSY');
+    const resumeId = f.projects.get('project-one').sandboxOperation!.id;
+    release.resolve(); await request;
+    const project = f.projects.get('project-one');
+    assert.equal(project.sandboxOperation?.id, resumeId);
+    assert.equal(project.sandboxOperation?.errorCode, 'BUSY');
+    assert.equal(project.sandboxBackup?.status, 'succeeded');
+    assert.equal(project.remoteArchives?.[0].id, archive.id);
+    assert.deepEqual(f.calls, ['capture', 'inspect-archive']);
+    const finished = f.logs.filter(record => record.event === 'sandbox.operation_phase' && record.status !== 'running');
+    assert.deepEqual(finished.map(record => [record.operation, record.status]), [['resume', 'failed'], ['backup', 'succeeded']]);
+    assert.equal(new Set(finished.map(record => record.operationId)).size, 2);
+  } finally { release.resolve(); await f.close(); }
 });
 
 test('running disk backup is rejected without checkpoint or archive capture', async () => {

@@ -30,7 +30,7 @@ export class ProjectSandboxOperations {
     saveSandbox: (id: string, sandbox: SandboxState, restore: boolean, image?: ProjectImageSelection, expectedSandboxId?: string | null) => Promise<void>;
     selectRestoreImage?: (project: Project, versionId?: string) => Promise<{ selection?: ProjectImageSelection; release(): void | Promise<void> }>;
     detached: (id: string) => Promise<void>;
-    logger?: RuntimeLog;
+    logger?: Pick<RuntimeLog, 'write'>;
   }) {}
 
   private async phase(id: string, phase: string) {
@@ -45,7 +45,8 @@ export class ProjectSandboxOperations {
   }
 
   private recordTiming(id: string, status: string, nextPhase?: string) {
-    const timing = this.timings.get(id);
+    const operationId = this.context.getStore()?.operation.id;
+    const timing = operationId ? this.timings.get(operationId) : undefined;
     if (!timing) return;
     const now = Date.now();
     void this.deps.logger?.write({ event: 'sandbox.operation_phase', projectId: id,
@@ -54,7 +55,7 @@ export class ProjectSandboxOperations {
       durationMs: now - timing.phaseStarted, totalDurationMs: now - timing.started,
       sandboxId: this.deps.projects.get(id).sandbox?.id });
     if (nextPhase) { timing.phase = nextPhase; timing.phaseStarted = now; }
-    else this.timings.delete(id);
+    else this.timings.delete(operationId!);
   }
 
   private operationKey(id: string, step: 'capture' | 'restore'): string {
@@ -113,7 +114,7 @@ export class ProjectSandboxOperations {
     await this.deps.projects.updateSandboxOperation(id, operation);
     const pending = { operationId: operation.id!, waiters: new Set<() => void>(), done: undefined as Promise<void> | undefined };
     this.pending.set(id, pending);
-    this.timings.set(id, { operationId: operation.id!, kind, started: Date.now(), phaseStarted: Date.now(), phase: operation.phase });
+    this.timings.set(operation.id!, { operationId: operation.id!, kind, started: Date.now(), phaseStarted: Date.now(), phase: operation.phase });
     const execute = async () => {
       try {
         if (kind === 'create') await this.create(id);
@@ -206,7 +207,10 @@ export class ProjectSandboxOperations {
       phase: '从已停止的磁盘备份数据', updatedAt: new Date().toISOString() };
     await this.deps.projects.updateSandboxBackup(id, backup);
     const phase = async (value: string) => {
-      await this.phase(id, value);
+      operation.phase = value; operation.updatedAt = new Date().toISOString();
+      // Observation records may have moved to another request while Cellbox works.
+      await this.deps.projects.updateSandboxOperation(id, { ...operation }, operation.id);
+      this.recordTiming(id, 'running', value);
       backup = { ...backup, phase: value, updatedAt: new Date().toISOString() };
       await this.deps.projects.updateSandboxBackup(id, backup, operation.id);
     };
@@ -231,7 +235,7 @@ export class ProjectSandboxOperations {
       // Remote deletion remains an explicit cleanup action, never a backup retry.
       await this.deps.projects.updateSandboxBackup(id, { ...backup, ...outcome, phase: '完成', status: 'succeeded' }, operation.id);
       Object.assign(operation, outcome);
-      await this.deps.projects.updateSandboxOperation(id, { ...operation });
+      await this.deps.projects.updateSandboxOperation(id, { ...operation }, operation.id);
     } catch (error) {
       const detail = operationError(error);
       await this.deps.projects.updateSandboxBackup(id, { ...backup, status: detail.unknown ? 'unknown' : 'failed',

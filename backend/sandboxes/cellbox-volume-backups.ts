@@ -34,13 +34,14 @@ export function createCellboxVolumeBackups(provider: CellboxSandboxProvider, pro
       const current = mountsFor(target);
       const native = saved.filter((ref): ref is CellboxVolumeBackupRef => ref.storageType === 'cellbox-volume');
       const volumes = new Set([...current.map(mount => mount.volumeId), ...native.map(ref => ref.volumeId)]);
-      const lists = await Promise.all([...volumes].map(async volumeId => {
+      const lists: CellboxVolumeBackupRef[][] = [];
+      for (const volumeId of volumes) {
         const snapshots = await provider.client.listVolumeBackups(volumeId);
         const destinations = current.filter(mount => mount.volumeId === volumeId);
         const fallback = native.find(ref => ref.volumeId === volumeId)?.mounts;
-        return snapshots.map(snapshot => reference(snapshot, destinations.length ? destinations : fallback ?? [],
-          native.find(ref => ref.volumeId === volumeId && ref.snapshotId === snapshot.id)));
-      }));
+        lists.push(snapshots.map(snapshot => reference(snapshot, destinations.length ? destinations : fallback ?? [],
+          native.find(ref => ref.volumeId === volumeId && ref.snapshotId === snapshot.id))));
+      }
       return [...saved.filter(ref => ref.storageType !== 'cellbox-volume'), ...lists.flat()]
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     },

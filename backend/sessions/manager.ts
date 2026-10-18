@@ -958,14 +958,16 @@ export class SessionManager {
       ...(backupPolicyError ? { backupPolicyError } : {}) }));
   }
 
-  /** Explicit archive browsing reads Cellbox; ordinary project polling never scans S3. */
-  async listArchiveProjects(): Promise<ProjectSummary[]> {
-    return Promise.all(this.projects.list({ includeRemoved: true }).map(async project => {
-      const references = this.remoteArchives?.list
-        ? await this.remoteArchives.list(this.projectWorkspace(project), project.remoteArchives ?? [])
-        : project.remoteArchives ?? [];
-      return this.projectSummary({ ...project, remoteArchives: references });
-    }));
+  /** The directory is a product index. Refresh native versions only for its selected project. */
+  async listArchiveProjects(archiveKey?: string): Promise<ProjectSummary[]> {
+    const projects = this.projects.list({ includeRemoved: true });
+    if (!archiveKey) return projects.map(project => this.projectSummary(project));
+    const project = projects.find(project => project.remoteArchives?.some(ref => ref.id === archiveKey));
+    if (!project) return [];
+    const references = this.remoteArchives?.list
+      ? await this.remoteArchives.list(this.projectWorkspace(project), project.remoteArchives ?? [])
+      : project.remoteArchives ?? [];
+    return [this.projectSummary({ ...project, remoteArchives: references })];
   }
 
   private projectSummary(project: Project): ProjectSummary {

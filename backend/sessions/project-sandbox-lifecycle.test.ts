@@ -7,6 +7,7 @@ import { Hono } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Project, ProjectSummary, Session, Settings } from '../../protocol/types.js';
 import type { SandboxMount, SandboxState } from '../../protocol/sandbox-types.js';
+import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { installProjectsRoutes } from '../projects/routes.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
@@ -424,4 +425,50 @@ test('BUSY and UNKNOWN backup outcomes keep the removed project recoverable and 
       assert.equal(manager.getProject(project.id).sandboxOperation?.status, code === 'UNKNOWN_OUTCOME' ? 'unknown' : 'failed');
     } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
   }
+});
+
+test('archive directory uses the local index and keyed version refresh queries only its owning project', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-archive-index-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const at = new Date().toISOString();
+  const archive = (projectId: string): RemoteArchiveRef => ({
+    storageType: 'cellbox-volume', id: `volume:${projectId}:${projectId}`, volumeId: projectId, snapshotId: projectId,
+    ownerKey: `project:${projectId}`, profileId: 'profile', mounts: [{ volumeId: projectId, mountPath: '/home/agent' }],
+    createdAt: at, threadIds: [],
+  });
+  const projects: Project[] = [
+    { id: 'archive-a', name: 'A', type: 1, requirementUrl: null, status: 'archived', removedAt: at,
+      executionMode: 'sandbox', workingDirectory: defaults.workingDirectory, remoteArchives: [archive('archive-a')], createdAt: at, updatedAt: at },
+    { id: 'archive-b', name: 'B', type: 1, requirementUrl: null, status: 'archived',
+      executionMode: 'sandbox', workingDirectory: defaults.workingDirectory, remoteArchives: [archive('archive-b')], createdAt: at, updatedAt: at },
+  ];
+  for (const project of projects) await state.saveProject(project);
+  const nativeQueries: string[] = [];
+  const runtime = {
+    async close() {},
+    remoteArchives: {
+      async list(target: { projectId?: string }, references: readonly RemoteArchiveRef[]) {
+        nativeQueries.push(target.projectId ?? 'missing-project-id');
+        return [...references];
+      },
+    },
+  } as unknown as SandboxRuntime;
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime);
+  try {
+    await manager.init();
+    const indexed = await manager.listArchiveProjects();
+    assert.deepEqual(indexed.map(project => project.id).sort(), ['archive-a', 'archive-b']);
+    assert.ok(indexed.find(project => project.id === 'archive-a')?.removedAt, 'removed projects remain recoverable from the local index');
+    assert.deepEqual(nativeQueries, [], 'opening the directory performs no native snapshots scan');
+
+    const selectedKey = archive('archive-b').id;
+    const selected = await manager.listArchiveProjects(selectedKey);
+    assert.deepEqual(selected.map(project => project.id), ['archive-b']);
+    assert.deepEqual(nativeQueries, ['archive-b'], 'refresh is scoped to the project that owns the selected key');
+
+    assert.deepEqual(await manager.listArchiveProjects('missing-volume-backup'), []);
+    assert.deepEqual(nativeQueries, ['archive-b'], 'an unknown key does not query any native catalog');
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

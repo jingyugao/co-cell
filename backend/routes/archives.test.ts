@@ -103,3 +103,56 @@ test('volume backups preserve unknown size and reject file browsing without remo
   }
   assert.equal(remoteCalls, 0);
 });
+
+test('archive directory is local, versions refresh only the selected project, and native files never query Cellbox', async () => {
+  const reference = (projectId: string, volumeId: string): RemoteArchiveRef => ({
+    storageType: 'cellbox-volume', id: `volume:${volumeId}:${projectId}`, volumeId, snapshotId: projectId,
+    ownerKey: `project:${projectId}`, profileId: 'profile-a', mounts: [{ volumeId, mountPath: '/home/agent' }],
+    createdAt: '2026-10-18T01:00:00.000Z', threadIds: [],
+  });
+  const projects = [
+    { id: 'project-a', name: 'A', remoteArchives: [reference('project-a', 'volume-a')] },
+    { id: 'project-b', name: 'B', remoteArchives: [reference('project-b', 'volume-b')] },
+  ];
+  const managerQueries: string[] = [];
+  let nativeDirectoryReads = 0;
+  const manager = {
+    async listArchiveProjects(archiveKey?: string) {
+      managerQueries.push(archiveKey ?? '<directory>');
+      if (archiveKey) {
+        const owner = projects.find(project => project.remoteArchives.some(item => item.id === archiveKey));
+        if (owner) nativeDirectoryReads++;
+        return owner ? [owner] : [];
+      }
+      return projects;
+    },
+    remoteArchives: {
+      async inspect() { nativeDirectoryReads++; throw new Error('native volume backups are not file archives'); },
+      async download() { nativeDirectoryReads++; throw new Error('native volume backups are not file archives'); },
+    },
+  } as unknown as SessionManager;
+  const app = new Hono();
+  installArchiveRoutes(app, manager);
+
+  const directory = await app.request('/api/archives');
+  assert.equal(directory.status, 200);
+  assert.equal((await directory.json()).length, 2);
+  assert.deepEqual(managerQueries, ['<directory>']);
+  assert.equal(nativeDirectoryReads, 0, 'opening the directory must not fan out to Restic snapshots');
+
+  const selected = projects[1].remoteArchives[0];
+  const versions = await app.request(`/api/archives/${selected.id}/versions`);
+  assert.equal(versions.status, 200);
+  assert.equal((await versions.json()).length, 1);
+  assert.deepEqual(managerQueries, ['<directory>', selected.id]);
+  assert.equal(nativeDirectoryReads, 1, 'only the selected project native catalog is refreshed');
+
+  const unknown = await app.request('/api/archives/not-a-known-backup/versions');
+  assert.equal(unknown.status, 404);
+  assert.equal(nativeDirectoryReads, 1, 'unknown keys do not query any native catalog');
+
+  const files = await app.request(`/api/archives/${selected.id}/files`);
+  assert.equal(files.status, 422);
+  assert.match((await files.json()).error, /暂不支持文件浏览/);
+  assert.equal(nativeDirectoryReads, 1, 'file browsing resolves from the local index only');
+});

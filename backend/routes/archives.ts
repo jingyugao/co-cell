@@ -10,7 +10,7 @@ import { matchesRemoteArchive } from '../archives/remote.js';
 const content = createArchiveReader();
 
 export function installArchiveRoutes(app: Hono, manager: SessionManager) {
-  const remoteOwner = async (key: string) => (await manager.listArchiveProjects()).find(project =>
+  const remoteOwner = async (key: string, refresh = false) => (await manager.listArchiveProjects(refresh ? key : undefined)).find(project =>
     project.remoteArchives?.some(reference => reference.id === key));
   const remoteReference = async (key: string, versionId?: string): Promise<RemoteArchiveRef | null> => {
     const owner = await remoteOwner(key);
@@ -53,7 +53,7 @@ export function installArchiveRoutes(app: Hono, manager: SessionManager) {
   });
 
   app.get('/api/archives/:key/versions', async c => {
-    const owner = await remoteOwner(c.req.param('key'));
+    const owner = await remoteOwner(c.req.param('key'), true);
     if (!owner) return c.json({ error: '归档不存在' }, 404);
     return c.json((owner.remoteArchives ?? []).map((reference, index, all) => ({
       id: reference.id, version: all.length - index, createdAt: reference.createdAt,

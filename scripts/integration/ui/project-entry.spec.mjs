@@ -113,9 +113,69 @@ test('opening a project with a failed create only rereads status and never creat
   project.sandboxOperation = { id: 'failed-create', kind: 'create', status: 'failed', error: 'Box creation failed', updatedAt: '2026-01-01T00:00:00Z' };
   await page.goto('/#projects');
   const card = page.getByRole('article', { name: '另一个项目', exact: true });
+  await expect(card.locator('.project-card-statuses .project-status')).toHaveText('尚未创建');
+  await expect(card.getByRole('button', { name: '新建 Sandbox', exact: true })).toBeEnabled();
+  await expect(card.getByRole('button', { name: '从备份恢复', exact: true })).toHaveCount(0);
   await card.getByRole('button', { name: '进入项目', exact: true }).click();
   await expect(page.getByRole('button', { name: '重新读取状态', exact: true })).toBeVisible();
   expect(ui.count('GET', '/api/projects/other')).toBeGreaterThan(0);
+  expect(ui.count('POST', '/api/projects/other/sandbox/create')).toBe(0);
+});
+
+test('a released project offers create and restore, while backup of its detached volume stays disabled', async ({ page, ui }) => {
+  const project = ui.projects.get('other');
+  delete project.sandbox;
+  project.sandboxMounts = [{ volumeId: 'released-volume', mountPath: '/workspace' }];
+  project.sandboxReclaimedAt = '2026-01-01T00:00:00Z';
+  project.latestBackup = { createdAt: '2025-12-31T00:00:00Z', sizeBytes: 128, checksum: 'a'.repeat(64) };
+  project.remoteArchives = [{ id: 'released-archive', createdAt: project.latestBackup.createdAt, sizeBytes: 128, sha256: 'a'.repeat(64), threadIds: [] }];
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '另一个项目', exact: true });
+  await expect(card.locator('.project-card-statuses .project-status')).toHaveText('已释放');
+  await expect(card.getByRole('button', { name: '新建 Sandbox', exact: true })).toBeEnabled();
+  await expect(card.getByRole('button', { name: '磁盘备份', exact: true })).toBeDisabled();
+  await expect(card.getByText('Cellbox 暂不支持直接备份已释放环境的挂载盘', { exact: true })).toBeVisible();
+  await expect(card.getByRole('button', { name: '从备份恢复', exact: true })).toBeEnabled();
+  expect(ui.count('POST', '/api/projects/other/backup')).toBe(0);
+  expect(ui.count('POST', '/api/projects/other/sandbox/create')).toBe(0);
+});
+
+test('a processing project refreshes through GET only and exposes no lifecycle mutation', async ({ page, ui }) => {
+  const project = ui.projects.get('other');
+  project.sandbox = { ...project.sandbox, status: 'ready' };
+  project.sandboxOperation = { id: 'checkpoint-running', kind: 'checkpoint', status: 'running', phase: 'Cellbox 正在暂停', updatedAt: '2026-01-01T00:00:00Z' };
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '另一个项目', exact: true });
+  await expect(card.locator('.project-card-statuses .project-status')).toHaveText('处理中');
+  await expect(card.locator('section[aria-label="Sandbox 操作"]').getByRole('button')).toHaveText(['刷新状态']);
+  const before = ui.calls.length;
+  await card.getByRole('button', { name: '刷新状态', exact: true }).click();
+  await expect.poll(() => ui.calls.length).toBeGreaterThan(before);
+  expect(ui.calls.slice(before).every(call => call.method === 'GET')).toBe(true);
+  expect(ui.calls.filter(call => call.method === 'POST' && /^\/api\/projects\/other\/(sandbox\/create|sandbox\/restore|sandbox\/resume|sandbox\/checkpoint|sandbox\/release|backup)$/.test(call.path))).toEqual([]);
+});
+
+test('an unknown Box allows status refresh and release, never create', async ({ page, ui }) => {
+  const project = ui.projects.get('other');
+  project.sandbox.status = 'unknown';
+  project.sandboxOperation = { id: 'resume-unknown', kind: 'resume', status: 'unknown', phase: '请求结果未知', error: 'Cellbox response lost', updatedAt: '2026-01-01T00:00:00Z' };
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '另一个项目', exact: true });
+  await expect(card.locator('.project-card-statuses .project-status')).toHaveText('状态未知');
+  await expect(card.getByRole('button', { name: '刷新状态', exact: true })).toBeEnabled();
+  await expect(card.getByRole('button', { name: '释放运行环境', exact: true })).toBeEnabled();
+  await expect(card.getByRole('button', { name: '新建 Sandbox', exact: true })).toHaveCount(0);
+  const before = ui.calls.length;
+  await card.getByRole('button', { name: '刷新状态', exact: true }).click();
+  await expect.poll(() => ui.calls.length).toBeGreaterThan(before);
+  expect(ui.calls.slice(before).every(call => call.method === 'GET')).toBe(true);
+  expect(ui.count('POST', '/api/projects/other/sandbox/create')).toBe(0);
+
+  let confirmation;
+  page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept(); });
+  await card.getByRole('button', { name: '释放运行环境', exact: true }).click();
+  await expect.poll(() => ui.count('POST', '/api/projects/other/sandbox/release')).toBe(1);
+  expect(confirmation).toContain('结束其中的进程');
   expect(ui.count('POST', '/api/projects/other/sandbox/create')).toBe(0);
 });
 
@@ -201,7 +261,9 @@ test('a broken Sandbox does not offer same-ID rebuild and labels backup restore 
   page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept(); });
   await card.getByRole('button', { name: '从备份恢复', exact: true }).click();
   await expect.poll(() => ui.count('POST', '/api/projects/other/sandbox/restore')).toBe(1);
-  expect(confirmation).toContain('恢复会创建新的 Sandbox');
+  expect(confirmation).toContain('新的 Sandbox');
+  expect(confirmation).toContain('新的挂载盘');
+  expect(confirmation).toContain('原挂载盘保留');
   await ui.complete('other');
   expect(ui.projects.get('other').sandbox.id).toBe('other-restored-box');
 });
@@ -232,6 +294,6 @@ test('releasing a runtime confirms process termination and keeps project mounts 
   expect(confirmation).toContain('挂载盘');
   await expect(card.getByText('project-volume')).toBeVisible();
   await expect(card.getByText('/workspace')).toBeVisible();
-  await expect(card.locator('.project-card-statuses .project-status')).toHaveText('无 Sandbox');
+  await expect(card.locator('.project-card-statuses .project-status')).toHaveText('已释放');
   expect(project.sandbox).toBeUndefined();
 });

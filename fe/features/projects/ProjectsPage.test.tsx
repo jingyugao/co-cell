@@ -26,7 +26,7 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
 
 test('ready sandbox offers a Checkpoint without starting a disk backup', () => {
   const html = page([project({ sandbox: { id: 'current', status: 'ready', template: 'default', workingDirectory: '/workspace' }, latestBackup: backup })]);
-  assert.match(html, /就绪/);
+  assert.match(html, /运行中/);
   assert.match(html, /Checkpoint · 暂停/);
   assert.match(html, /aria-label="项目操作"/);
   assert.match(html, /aria-label="Sandbox 操作"/);
@@ -56,7 +56,7 @@ test('abnormal and missing sandboxes use the recovery-or-first-create paths', ()
   assert.doesNotMatch(unknown, /恢复环境|重建 Sandbox|立即备份|>异常</);
 
   const missing = page([project()]);
-  assert.match(missing, /无 Sandbox/);
+  assert.match(missing, /尚未创建/);
   assert.match(missing, /进入项目/);
   assert.doesNotMatch(missing, /<button class="primary-button" disabled="">进入项目/);
   assert.match(missing, /新建 Sandbox/);
@@ -74,6 +74,19 @@ test('a released project offers new Sandbox and explicit backup restore independ
   assert.match(html, /Node Runtime · Cellbox stable/);
   assert.doesNotMatch(html, /Node Runtime · 1\.0/);
   assert.match(html, /保留的挂载盘[\s\S]*\/workspace[\s\S]*project-volume/);
+  assert.match(html, /<button[^>]*disabled=""[^>]*>磁盘备份<\/button>/);
+  assert.match(html, /Cellbox 暂不支持直接备份已释放环境的挂载盘/);
+});
+
+test('processing only offers read-only status refresh while unknown Box still offers explicit release', () => {
+  const processing = page([project({ sandbox: { id: 'box', template: 'default', status: 'ready', phase: 'suspending', workingDirectory: '/workspace' } })]);
+  const actions = processing.match(/aria-label="Sandbox 操作"[\s\S]*?<\/section>/)![0];
+  assert.match(actions, />刷新状态<\/button>/);
+  assert.doesNotMatch(actions, />释放运行环境<\/button>|>恢复运行<\/button>|>Checkpoint · 暂停<\/button>/);
+  const unknown = page([project({ sandbox: { id: 'box', template: 'default', status: 'unknown', workingDirectory: '/workspace' } })]);
+  assert.match(unknown, />释放运行环境<\/button>/);
+  assert.match(unknown, />刷新状态<\/button>/);
+  assert.doesNotMatch(unknown, />新建 Sandbox<\/button>/);
 });
 
 test('a running sandbox card shows the observed image version and revision instead of the saved template entry', () => {

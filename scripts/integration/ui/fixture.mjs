@@ -82,6 +82,7 @@ export const test = base.extend({
           data.sandboxOperation = operation('archive', 'succeeded');
         } else if (method === 'POST' && path.endsWith('/sandbox/release')) {
           delete data.sandbox;
+          data.sandboxReclaimedAt = now;
           data.sandboxOperation = operation('release', 'succeeded');
           status = 200;
         }
@@ -142,6 +143,7 @@ export const test = base.extend({
         const value = projects.get(id);
         const restoring = value.sandbox?.status === 'unavailable' && Boolean(value.remoteArchives?.length || value.latestBackup);
         value.sandbox = sandbox(id, 'ready');
+        delete value.sandboxReclaimedAt;
         if (restoring) value.sandbox.id = `${id}-restored-box`;
         value.sandboxOperation = operation(value.sandboxOperation?.kind ?? 'create', 'succeeded');
         await fulfillPending(id);

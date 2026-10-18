@@ -78,7 +78,7 @@ test('archive from a broken runtime is disabled while running work still permits
   ui.projects.get('paused').sandbox.status = 'unavailable';
   ui.projects.get('other').activeSessionId = 'running-session';
   ui.projects.get('other').sandboxOperation = { id: 'checkpoint-op', kind: 'checkpoint', status: 'running', phase: '暂停中', updatedAt: '2026-01-01T00:00:00Z' };
-  ui.projects.set('missing', { ...ui.projects.get('other'), id: 'missing', name: '无Sandbox项目', activeSessionId: null, sandbox: undefined });
+  ui.projects.set('missing', { ...ui.projects.get('other'), id: 'missing', name: '无Sandbox项目', activeSessionId: null, sandbox: undefined, sandboxOperation: undefined });
   await page.goto('/#projects');
   const broken = page.getByRole('article', { name: '暂停项目', exact: true });
   await expect(broken.getByRole('button', { name: '手动归档', exact: true })).toBeDisabled();
@@ -89,5 +89,5 @@ test('archive from a broken runtime is disabled while running work still permits
   await expect(active.getByRole('button', { name: '工具权限', exact: true })).toBeEnabled();
   const missing = page.getByRole('article', { name: '无Sandbox项目', exact: true });
   await expect(missing.getByRole('button', { name: '手动归档', exact: true })).toBeDisabled();
-  await expect(missing.getByText('当前没有可读取的磁盘，也没有成功备份，暂时无法归档。', { exact: true })).toBeVisible();
+  await expect(missing.getByText('当前没有 Sandbox，也没有成功备份，暂时无法归档。', { exact: true })).toBeVisible();
 });

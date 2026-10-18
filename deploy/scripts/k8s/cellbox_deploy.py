@@ -1,6 +1,7 @@
 """Build and deploy the single-process Cellbox server release."""
 
 import json
+from copy import deepcopy
 import os
 from pathlib import Path
 import re
@@ -91,11 +92,12 @@ class CellboxRelease:
             values["imageRegistry"] = existing["imageRegistry"]
         for key in ("objectStorage", "buildkit"):
             if isinstance(existing.get(key), dict):
-                values[key] = existing[key]
+                values[key] = deepcopy(existing[key])
         old_api = existing.get("api", {})
         api = {key: old_api[key] for key in ("namespace", "extraEnv", "nodeSelector", "configSecret", "manageSecrets", "initImage")
                if key in old_api}
         config = dict(old_api.get("config", {}))
+        config.pop("publicUrl", None)  # Removed with Cellbox's route/domain management.
         # A separately managed config Secret is intentionally opaque to Helm values.
         # The template bootstrap validates the selected profile through Cellbox's API.
         if api.get("manageSecrets", True):

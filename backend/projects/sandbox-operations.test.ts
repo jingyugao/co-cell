@@ -335,6 +335,60 @@ for (const code of ['BUSY', 'UNKNOWN_OUTCOME'] as const) test(`delete stops afte
   } finally { await f.close(); }
 });
 
+test('delete does not re-delete a restored Box already confirmed by release', async () => {
+  const retainedMount = { volumeId: 'volume-one', mountPath: `${workspace}/project-one` };
+  const restoredBox = { ...box('ready', 'restored-box'), mounts: [retainedMount] };
+  const f = await fixture({ sandbox: restoredBox, sandboxMounts: [retainedMount], pendingSandboxCleanup: [box('unknown', 'restored-box')] });
+  f.runtime.release = async () => { f.calls.push('release'); return { ...restoredBox, status: 'paused' }; };
+  f.runtime.remoteArchives.capture = async (_target, _key, options) => {
+    f.calls.push('capture'); await options?.onOperation?.('backup-op', 'volume-one'); return volumeArchive;
+  };
+  f.runtime.remoteArchives.removeVolume = async () => { f.calls.push('delete-volume'); };
+  try {
+    await f.operations.run('project-one', 'delete');
+    assert.equal(f.calls.filter(call => call === 'release').length, 1);
+    assert.equal(f.calls.filter(call => call === 'capture').length, 1);
+    assert.equal(f.calls.filter(call => call === 'delete-volume').length, 1);
+    assert.equal(f.calls.includes('delete:restored-box'), false, 'release already confirmed the Box is gone');
+  } finally { await f.close(); }
+});
+
+test('archive prunes an absent Box journal before cleanup and still deletes the backed-up volume', async () => {
+  const retainedMount = { volumeId: 'volume-one', mountPath: `${workspace}/project-one` };
+  const f = await fixture({ sandbox: undefined, sandboxMounts: [retainedMount], remoteArchives: [volumeArchive],
+    pendingSandboxCleanup: [box('unknown', 'already-gone-box')] }, {
+    async listProjectSandboxes() { f.calls.push('list-boxes'); return []; },
+  });
+  f.runtime.remoteArchives.removeVolume = async id => { assert.equal(id, 'volume-one'); f.calls.push('delete-volume'); };
+  try {
+    await f.operations.run('project-one', 'archive', { useExistingBackup: true });
+    const project = f.projects.get('project-one');
+    assert.deepEqual(f.calls, ['list-boxes', 'delete-volume', 'detached']);
+    assert.equal(project.pendingSandboxCleanup?.length ?? 0, 0);
+    assert.equal(project.pendingVolumeCleanup?.includes('volume-one'), false);
+    assert.ok(project.sandboxArtifactsCleanedAt);
+    assert.equal(project.remoteArchives?.[0].id, volumeArchive.id);
+  } finally { await f.close(); }
+});
+
+test('archive does not delete a backed-up volume when Box inventory cannot be read', async () => {
+  const retainedMount = { volumeId: 'volume-one', mountPath: `${workspace}/project-one` };
+  const f = await fixture({ sandbox: undefined, sandboxMounts: [retainedMount], remoteArchives: [volumeArchive],
+    pendingSandboxCleanup: [box('unknown', 'possibly-existing-box')] }, {
+    async listProjectSandboxes() { f.calls.push('list-boxes'); throw new Error('Cellbox inventory unavailable'); },
+  });
+  f.runtime.remoteArchives.removeVolume = async () => { f.calls.push('delete-volume'); };
+  try {
+    await f.operations.run('project-one', 'archive', { useExistingBackup: true });
+    const project = f.projects.get('project-one');
+    assert.deepEqual(f.calls, ['list-boxes']);
+    assert.ok(project.sandboxOperation?.cleanupError);
+    assert.deepEqual(project.pendingVolumeCleanup, ['volume-one']);
+    assert.equal(project.sandboxArtifactsCleanedAt, undefined);
+    assert.equal(project.remoteArchives?.[0].id, volumeArchive.id);
+  } finally { await f.close(); }
+});
+
 test('a paused archive is verified and stored before source destruction', async () => {
   const f = await fixture({ sandbox: box('paused') });
   f.runtime.deleteDanglingSandbox = async id => {

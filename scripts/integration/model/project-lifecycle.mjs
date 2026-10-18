@@ -222,7 +222,8 @@ export async function projectLifecycle(env) {
       assert.equal(restored.sandbox?.id, originalSandboxId, 'Completed restore unexpectedly replaced the Sandbox');
       assert.equal(restored.sandboxOperation?.id, before.sandboxOperation?.id, 'Completed restore unexpectedly started a Sandbox operation');
       const inventory = await json('/api/sandboxes');
-      assert.equal(inventory.sandboxes.filter(s => s.id === originalSandboxId).length, 1);
+      assert.deepEqual([...new Set(inventory.sandboxes.filter(s => s.project?.id === projectId).map(s => s.id))], [originalSandboxId],
+        'Completed restore unexpectedly created another project Sandbox');
       return { status: restored.status, sandboxId: restored.sandbox.id };
     });
     const finalBackup = backup;

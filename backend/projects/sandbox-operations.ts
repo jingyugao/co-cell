@@ -398,11 +398,12 @@ export class ProjectSandboxOperations {
       await runtime.detachSandbox(originalTarget);
     }
     const current = projects.get(id);
-    const pending = new Map((current.pendingSandboxCleanup ?? []).map(sandbox => [sandbox.id, sandbox]));
-    for (const sandbox of await runtime.listProjectSandboxes?.(id) ?? []) pending.set(sandbox.id, sandbox);
-    // Archive references and lifecycle history can outlive their purged source.
-    // Only recorded cleanup work and currently observed resources are candidates.
-    await projects.mergePendingSandboxCleanup(id, [...pending.values()]);
+    if (runtime.listProjectSandboxes) {
+      const observed = await runtime.listProjectSandboxes(id);
+      // Reconcile recorded candidates with Cellbox's current resources. An absent
+      // Box needs no destroy request; a failed inventory read stops cleanup.
+      await projects.finishSandboxCleanup(id, new Set((current.pendingSandboxCleanup ?? []).map(sandbox => sandbox.id)), observed);
+    }
     await this.cleanup(id, true);
     const afterBoxes = projects.get(id);
     const volumes = new Set([...(afterBoxes.pendingVolumeCleanup ?? []), ...(afterBoxes.sandboxMounts ?? []).map(mount => mount.volumeId)]);

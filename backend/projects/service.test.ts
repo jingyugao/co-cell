@@ -176,6 +176,39 @@ test('release then create preserves volumes and persists the actual stable revis
   await service.close(); await restarted.close();
 });
 
+test('binding a restored Box clears only its matching candidate cleanup journal', async () => {
+  const value = project();
+  const candidate = { ...value.sandbox!, id: 'restored-box' };
+  delete value.sandbox;
+  value.status = 'archived';
+  value.archivedAt = '2026-09-02T00:00:00.000Z';
+  value.pendingSandboxCleanup = [
+    candidate,
+    { ...candidate, id: 'other-candidate' },
+  ];
+  const service = new ProjectService(new MemoryState([value]));
+  await service.init();
+  try {
+    const bound = { ...candidate, mounts: [{ volumeId: 'volume-restored', mountPath: '/workspace' }] };
+    assert.equal(await service.updateSandbox(value.id, bound, true, undefined, null), true);
+    assert.deepEqual(service.get(value.id).pendingSandboxCleanup?.map(item => item.id), ['other-candidate']);
+  } finally { await service.close(); }
+});
+
+test('confirmed release clears only the released Box from pending cleanup', async () => {
+  const value = project();
+  value.pendingSandboxCleanup = [
+    { ...value.sandbox!, id: 'sandbox-1' },
+    { ...value.sandbox!, id: 'other-candidate' },
+  ];
+  const service = new ProjectService(new MemoryState([value]));
+  await service.init();
+  try {
+    await service.releaseSandbox(value.id, { ...value.sandbox!, id: 'sandbox-1' });
+    assert.deepEqual(service.get(value.id).pendingSandboxCleanup?.map(item => item.id), ['other-candidate']);
+  } finally { await service.close(); }
+});
+
 test('project can be viewed and edited while a Sandbox operation is running', async () => {
   const value = project();
   value.sandboxOperation = { id: 'resume-1', kind: 'resume', phase: '恢复中', status: 'running', updatedAt: value.updatedAt };

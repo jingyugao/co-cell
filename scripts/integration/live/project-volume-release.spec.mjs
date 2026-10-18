@@ -77,6 +77,6 @@ test('release a Box and recreate it with the same independent workspace volume',
     await releaseActiveBoxOnce();
     const remaining = await env.json(`/api/projects/${project.id}`);
     assert.equal(remaining.sandbox, undefined, 'Do not delete volumes until all test Box bindings are released');
-    await deleteVolumes(volumeIds);
+    // Fixture DELETE backs up these retained volumes before reclaiming them.
   }
 });

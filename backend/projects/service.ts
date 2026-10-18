@@ -158,6 +158,7 @@ export class ProjectService {
       const mounts = sandboxMounts(sandbox) ?? sandboxMounts(project.sandbox);
       if (mounts) project.sandboxMounts = mounts;
       if (sandbox.ownerKey) project.sandboxOwnerKey = sandbox.ownerKey;
+      if (project.pendingSandboxCleanup) project.pendingSandboxCleanup = project.pendingSandboxCleanup.filter(value => value.id !== sandbox.id);
       delete project.sandbox;
       const at = new Date().toISOString();
       project.sandboxReclaimedAt = at;
@@ -373,6 +374,7 @@ export class ProjectService {
       delete next.sandboxReclaimedAt;
       delete next.sandboxArtifactsCleanedAt;
       next.sandbox = structuredClone(sandbox);
+      if (next.pendingSandboxCleanup) next.pendingSandboxCleanup = next.pendingSandboxCleanup.filter(value => value.id !== sandbox.id);
       const mounts = sandboxMounts(sandbox);
       if (mounts) next.sandboxMounts = mounts;
       const boundVolumes = new Set(mounts?.map(mount => mount.volumeId) ?? []);

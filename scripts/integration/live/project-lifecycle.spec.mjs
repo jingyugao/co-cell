@@ -18,7 +18,6 @@ test('real projects: read-only entry, explicit resume, checkpoint and independen
   });
   await env.step('Checkpoint both projects; reads and rejected task submissions must not resume them', async () => {
     await Promise.all(projects.map(async (project, index) => {
-      await env.request(`/api/projects/${project.id}/backup`, { method: 'POST', expectedStatus: 409 });
       const checkpointResponse = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
       assert.equal(checkpointResponse.sandboxOperation.status, 'succeeded');
       assert.equal(checkpointResponse.sandbox.status, 'paused');

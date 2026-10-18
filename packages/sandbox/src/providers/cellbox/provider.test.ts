@@ -174,3 +174,24 @@ test('accepted mutation responses that cannot be decoded stay unknown and are ne
     assert.equal(submissions, 1);
   }
 });
+
+test('kill preserves a missing Box error and does not destroy or purge it', async () => {
+  const mutations: string[] = [];
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    const method = init?.method ?? 'GET';
+    if (path === '/v1/profiles') return Response.json([profile]);
+    if (path === '/v1/boxes/box-a' && method === 'GET')
+      return Response.json({ error: { code: 'NOT_FOUND', message: 'Box not found' } }, { status: 404 });
+    if (method === 'POST') {
+      mutations.push(path);
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`unexpected request ${method} ${path}`);
+  };
+
+  const instance = provider(fetch, { revisionId: 'rev-a' });
+  await assert.rejects(instance.kill('box-a'),
+    error => error instanceof CellboxError && error.code === 'NOT_FOUND');
+  assert.deepEqual(mutations, [], 'a missing Box must not trigger destroy or artifact purge');
+});

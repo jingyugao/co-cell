@@ -63,7 +63,7 @@ test('real browser: read-only project entry, explicit resume, and draft retentio
     await expect(send).toBeDisabled();
     assert.deepEqual(lifecycleWrites, [], 'Viewing a paused project must not resume it');
 
-    await page.getByRole('button', { name: '项目管理', exact: true }).click();
+    await projectList(page);
     const resumeResponse = page.waitForResponse(response => response.request().method() === 'POST'
       && new URL(response.url()).pathname === `/api/projects/${id}/sandbox/resume`, { timeout: env.config.operationTimeout });
     const start = performance.now();

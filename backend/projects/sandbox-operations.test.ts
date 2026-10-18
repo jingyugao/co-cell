@@ -183,6 +183,25 @@ test('cleanup failure is visible and is not automatically repeated', async () =>
   } finally { await f.close(); }
 });
 
+test('archiving a restored box does not delete purged sources from archive history', async () => {
+  const f = await fixture({ sandbox: box('paused', 'box-restored'), remoteArchives: [archive],
+    lifecycleHistory: [{ id: 'past-archive', action: 'archived', at: new Date(0).toISOString(), sandboxId: 'box-old' }] });
+  f.runtime.remoteArchives.capture = async () => ({ ...archive, id: 'archive-restored', sourceSandboxId: 'box-restored' });
+  f.runtime.remoteArchives.inspect = async value => value;
+  f.runtime.deleteDanglingSandbox = async id => {
+    f.calls.push('delete:' + id);
+    if (id === 'box-old') throw new CellboxError('NOT_FOUND', 'Box not found', 404);
+  };
+  try {
+    await f.operations.run('project-one', 'archive');
+    const project = f.projects.get('project-one');
+    assert.deepEqual(f.calls.filter(value => value.startsWith('delete:')), ['delete:box-restored']);
+    assert.equal(project.sandboxOperation?.cleanupError, undefined);
+    assert.equal(project.pendingSandboxCleanup?.length ?? 0, 0);
+    assert.equal(project.remoteArchives?.length, 2);
+  } finally { await f.close(); }
+});
+
 test('same-ID rebuild is unsupported without invoking a fallback', async () => {
   const f = await fixture({}, { async rebuildPersistent() { assert.fail('removed API'); } });
   try { await assert.rejects(f.operations.run('project-one', 'rebuild'), /不支持同 ID/); }

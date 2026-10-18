@@ -295,10 +295,8 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   }
   async kill(id: string) {
     await this.ready();
-    let box: CellboxBox | undefined;
-    try { box = await this.box(id); }
-    catch (error) { if (!(error instanceof CellboxError) || error.code !== 'NOT_FOUND') throw error; }
-    if (box && box.phase !== 'deleted') await this.act(id, 'destroy', `cocell-destroy-${id}`);
+    const box = await this.box(id);
+    if (box.phase !== 'deleted') await this.act(id, 'destroy', `cocell-destroy-${id}`);
     try {
       await this.client.purgeBoxArtifacts(id);
     }

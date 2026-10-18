@@ -385,11 +385,8 @@ export class ProjectSandboxOperations {
     const current = projects.get(id);
     const pending = new Map((current.pendingSandboxCleanup ?? []).map(sandbox => [sandbox.id, sandbox]));
     for (const sandbox of await runtime.listProjectSandboxes?.(id) ?? []) pending.set(sandbox.id, sandbox);
-    const sourceIds = [...(current.remoteArchives ?? []).map(ref => ref.sourceSandboxId),
-      ...(current.lifecycleHistory ?? []).filter(record => record.action === 'archived').flatMap(record => record.sandboxId ? [record.sandboxId] : [])];
-    for (const sourceId of sourceIds) {
-      if (!pending.has(sourceId)) pending.set(sourceId, { id: sourceId, status: 'unknown', template: 'legacy', workingDirectory: current.workingDirectory });
-    }
+    // Archive references and lifecycle history can outlive their purged source.
+    // Only recorded cleanup work and currently observed resources are candidates.
     await projects.mergePendingSandboxCleanup(id, [...pending.values()]);
     await this.cleanup(id, true);
     await this.deps.detached(id);

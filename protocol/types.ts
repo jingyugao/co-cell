@@ -104,7 +104,7 @@ export interface ProjectSandboxOperation {
   id?: string;
   /** Legacy ownership metadata retained for reading old records only. */
   resume?: { sandboxId: string; ownerId: string };
-  /** Runtime snapshot durably published by a completed resume operation. */
+  /** Legacy completion snapshot; current lifecycle actions record results without overwriting Box observations. */
   result?: { sandbox: SandboxState };
   /** Image selected by this restore request; no resource reservation. */
   imageSelection?: ProjectImageSelection;

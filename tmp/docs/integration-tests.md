@@ -22,7 +22,7 @@
 | --- | --- | --- |
 | harness | 创建响应丢失后的资源回收；拒绝删除非本次项目；清理失败导致测试失败；报告凭证脱敏 | 无 |
 | ui-desktop / ui-mobile | 暂停项目只读进入且可编辑草稿；明确恢复；unknown 不自动重放；创建立即进入；查询失败可刷新；旧会话先 SSE 后历史；Checkpoint 不挡查看；草稿隔离 | 本地 Vite、Chromium；API 为可控替身 |
-| live | 真实 UI 创建/明确恢复；并发只读进入不提交恢复；明确恢复请求独立并透传底层冲突；两个项目同时恢复；GET 不隐式唤醒；暂停时允许空会话元数据、拒绝任务执行；Checkpoint 只暂停、备份单独提交；文件归档恢复到新 Sandbox 后再次归档、删除 | 已部署 CoCell、Cellbox、Kubernetes 运行时和存储 |
+| live | 真实 UI 创建/明确恢复；并发只读进入不提交恢复；明确恢复请求按项目 Box ID 单次调用 provider 并透传底层冲突；两个项目同时恢复；GET 不隐式唤醒；暂停时允许空会话元数据、拒绝任务执行；Checkpoint 只暂停、备份单独提交；文件归档恢复到新 Sandbox 后再次归档、删除 | 已部署 CoCell、Cellbox、Kubernetes 运行时和存储 |
 | model lifecycle | 真实模型调用工具；Node 服务与文件下载；Checkpoint/Resume 保持 PID、实例标记和内存计数；显式备份、归档/恢复；恢复后的文件、会话上下文和重新启动服务 | live 依赖、可用模型、Sandbox 内预装 Node |
 | model user-input | 独立新会话及原会话续聊连续两次真实调用异步提问工具，API 回复、原生 call ID、答复状态持久化 | live 依赖、支持原生异步提问工具的模型 |
 | model reads | 真实子/孙代理、会话隔离、后续轮次上下文、原生历史新鲜度、历史与子代理接口耗时 | live 依赖、支持子代理的模型 |
@@ -92,13 +92,17 @@ UI 交互耗时与实际恢复耗时分别记录；普通集成测试不把单�
 
 ## 新版 Cellbox 适配：2026-10-18
 
-项目不再有通用控制锁、维护长租约或恢复重放。只读进入和真实状态查询独立，unknown 结果由用户决定下一步。SDK 与 App Server 连接缓存仅保护本地数据；生命周期请求不排队等待普通读取，冲突由 Cellbox 返回。自动政策不重复提交已失败或未知的动作。
+本轮进一步精简暂停/继续路径的代码尚未部署。下方此前的部署和现场验收记录保留其历史范围，不代表本轮新改造已部署或验收。
+
+本轮本地验证：387 项单测、`pnpm build` 和 70 项集成测试全部通过（harness 12、桌面 29、手机 29），无重跑。新增回归覆盖陈旧本地状态及 App Server 不可用不阻断生命周期提交、BUSY/未知结果仅提交一次、操作成功与后续状态查询失败分开呈现、恢复后重新计算空闲时间。集成报告：`tmp/integration/2026-10-18T08-40-33-615Z-1ab4c07c`；未执行本轮 live 验收。
+
+项目不再有通用控制锁、维护长租约或恢复重放。只读进入和真实状态查询独立，unknown 结果由用户决定下一步。暂停/继续通过项目绑定的 Box ID 各发出一次 provider pause/resume 调用，再由项目操作记录呈现结果；不先查本地或 Cellbox phase，不做 App Server readiness、环境准备或 Sandbox 绑定重写。Cellbox 冲突和未知结果照实返回，不自动重试。
 
 运行中纯磁盘归档和同 ID rebuild 已明确不支持。真实模型测试中的同 ID 重建改为验证 unsupported 且不改变原绑定/备份；归档恢复使用明确的 restore API。备份不自动删除旧归档，清理需明确调用 prune。真实环境与模型测试须针对已迁移的独立测试安装执行；本次本地代码验证不能代替部署验收。
 
-Checkpoint 只负责暂停 Sandbox，不自动触发备份。工作区备份通过 `POST /api/projects/:id/backup` 单独明确提交，仅支持 paused/failed Sandbox；running 返回 409。Cellbox 仍可能返回 BUSY，CoCell 不添加资源锁、隐藏重试或幂等承诺；Resume 与备份均呈现实际结果。归档可以从已暂停/failed 的资源生成备份，或明确复用已有备份。
+Checkpoint 只负责暂停 Sandbox，不自动触发备份。工作区备份通过 `POST /api/projects/:id/backup` 单独明确提交，仅支持 paused/failed Sandbox；running 返回 409。Cellbox 仍可能返回 BUSY，CoCell 不添加资源锁、隐藏重试或幂等承诺。Resume 与 pause 均按项目绑定 Box ID 各提交一次 provider 调用，并把真实成功、失败或未知结果写入操作记录；不预判 phase、不做 App Server readiness/环境准备或项目绑定重写。归档可以从已暂停/failed 的资源生成备份，或明确复用已有备份。
 
-本轮本地结果：379 项单测通过；桌面 28/28、手机 28/28 通过。完整集成运行 66/67，唯一 harness 失败来自测试文件编辑期间缺失导入，补齐后同一 harness 定向复验 1/1 通过。本地套件没有跳过或 flaky。
+此前迁移的本地结果：379 项单测通过；桌面 28/28、手机 28/28 通过。完整集成运行 66/67，唯一 harness 失败来自测试文件编辑期间缺失导入，补齐后同一 harness 定向复验 1/1 通过。本地套件没有跳过或 flaky。
 
 部署后的新版现场验收最终为 3 项通过、3 项专项未启用，报告位于 `tmp/integration/2026-10-18T06-36-14-834Z-0a9cb819`。覆盖真实 UI、Checkpoint/显式恢复/并发恢复，以及真实文件归档恢复到新 Sandbox 后再次归档和删除；所有测试项目和 CR 已清理。现场修正历史来源重复清理及 Box NOT_FOUND 后仍发送 purge 的问题，新增用例先在原实现复现失败，修正后相关运行时单测 103 项、类型检查和构建通过。原生工具 HOME、Git 工作目录、共享预热池专项和真实模型 full 尚未执行。
 

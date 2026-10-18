@@ -22,7 +22,7 @@ test('preview access releases the runtime stream once after success or failure',
     rebuild: async (_target: unknown, save: (value: SandboxState) => Promise<void>) => save(box),
     verifySandbox: async () => {},
     currentImageIdentity: async () => undefined,
-    resume: async () => box,
+    resume: async () => {},
     querySandbox: async () => box,
     track: async (_target: unknown, save: (value: SandboxState) => Promise<void>) => save(box),
     openServiceAccess: async () => {

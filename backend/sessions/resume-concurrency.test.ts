@@ -16,7 +16,7 @@ const initialProject = (): Project => ({ id: 'resume-project', name: 'Resume tes
   createdAt: at, updatedAt: at, sandbox: { id: 'resume-box', status: 'paused', template: 'test',
     workingDirectory: settings.workingDirectory, pausedAt: at } });
 
-async function fixture(resume: (target: Parameters<NonNullable<SandboxRuntime['resume']>>[0]) => Promise<Awaited<ReturnType<NonNullable<SandboxRuntime['resume']>>>>) {
+async function fixture(resume: (target: Parameters<NonNullable<SandboxRuntime['resume']>>[0], observeStatus: (status: 'paused' | 'ready') => void) => Promise<void>) {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-resume-contract-'));
   const state = new MemoryWebStateStore();
   await state.saveProject(initialProject());
@@ -26,9 +26,7 @@ async function fixture(resume: (target: Parameters<NonNullable<SandboxRuntime['r
     async close() {},
     async querySandbox(sandbox) { queryCalls++; return { ...sandbox, status: observedStatus }; },
     async resume(target) {
-      const result = await resume(target);
-      observedStatus = result.status === 'ready' ? 'ready' : 'paused';
-      return result;
+      await resume(target, status => { observedStatus = status; });
     },
   } satisfies Partial<SandboxRuntime>;
   const makeManager = async () => {
@@ -44,10 +42,10 @@ async function fixture(resume: (target: Parameters<NonNullable<SandboxRuntime['r
 test('project entry is read-only; each explicit resume submits once and surfaces Cellbox conflicts', async () => {
   let calls = 0;
   let mode: 'success' | 'busy' = 'success';
-  const f = await fixture(async target => {
+  const f = await fixture(async (_target, observeStatus) => {
     calls++;
     if (mode === 'busy') throw Object.assign(new Error('Cellbox reports BUSY'), { code: 'BUSY' });
-    return { ...target.sandbox!, status: 'ready' };
+    observeStatus('ready');
   });
   try {
     const entry = await f.manager.enterProject('resume-project');
@@ -57,6 +55,7 @@ test('project entry is read-only; each explicit resume submits once and surfaces
     const resumed = await f.manager.resumeProjectSandbox('resume-project');
     assert.equal(calls, 1, 'one explicit resume produced one runtime submission');
     assert.equal(resumed.sandbox?.id, 'resume-box');
+    assert.equal(resumed.sandbox?.status, 'ready', 'the returned project observes current Cellbox state');
     assert.equal(resumed.sandboxOperation?.status, 'succeeded');
 
     mode = 'busy';
@@ -69,16 +68,16 @@ test('project entry is read-only; each explicit resume submits once and surfaces
   } finally { await f.close(); }
 });
 
-test('project metadata edits made during resume survive its terminal sandbox update', async () => {
+test('project metadata edits made during resume survive completion', async () => {
   let calls = 0;
   let start!: () => void, finish!: () => void;
   const started = new Promise<void>(resolve => { start = resolve; });
   const barrier = new Promise<void>(resolve => { finish = resolve; });
-  const f = await fixture(async target => {
+  const f = await fixture(async (_target, observeStatus) => {
     calls++;
     start();
     await barrier;
-    return { ...target.sandbox!, status: 'ready' };
+    observeStatus('ready');
   });
   try {
     const resuming = f.manager.resumeProjectSandbox('resume-project');
@@ -88,6 +87,7 @@ test('project metadata edits made during resume survive its terminal sandbox upd
     const result = await resuming;
     assert.equal(calls, 1);
     assert.equal(result.name, 'Edited during resume');
+    assert.equal(result.sandbox?.status, 'ready');
     assert.equal((await f.state.getProject('resume-project'))?.name, 'Edited during resume');
     assert.equal(result.sandboxOperation?.status, 'succeeded');
   } finally { finish(); await f.close(); }

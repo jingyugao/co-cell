@@ -266,12 +266,11 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
       templateIdentity: { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] } };
   }
   async pause(id: string) {
-    await this.ready();
-    const box = await this.box(id);
-    if (box.phase === 'suspended') return true;
-    if (box.phase !== 'running') throw new CellboxError('CONFLICT', `Box ${id} is ${box.phase}`);
-    await this.act(id, 'suspend', `cocell-suspend-${id}-${box.generation}`);
+    await this.act(id, 'suspend');
     return true;
+  }
+  async resume(id: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    await this.act(id, 'resume', undefined, undefined, options.signal);
   }
   /** The marker refers to this box's same-node suspended state, not an independent checkpoint image. */
   async checkpoint(id: string): Promise<SandboxCheckpoint> {
@@ -306,7 +305,6 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     }
     return true;
   }
-  async resumeBox(id: string, key: string) { await this.ready(); return this.act(id, 'resume', key); }
   async suspendBox(id: string, key: string) { await this.ready(); return this.act(id, 'suspend', key); }
   async activateBox(id: string, key: string) { await this.ready(); return this.act(id, 'activate', key); }
   async restoreArchive(input: { ownerKey: string; archiveId: string }, _key: string) {

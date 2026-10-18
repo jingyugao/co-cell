@@ -33,16 +33,17 @@ test('read-only project entry does not resume; explicit resume trace spans cover
   let resumeStarted!: () => void;
   const started = new Promise<void>(resolve => { resumeStarted = resolve; });
   const barrier = new Promise<void>(resolve => { finishResume = resolve; });
+  let providerStatus: 'paused' | 'ready' = 'paused';
   const runtime = {
     async close() {},
-    async querySandbox(value) { return { ...value, status: 'paused' as const }; },
-    async resume(target) {
+    async querySandbox(value) { return { ...value, status: providerStatus }; },
+    async resume() {
       calls++;
       await traced('test.resume.runtime', {}, async () => { resumeStarted(); await barrier; });
-      return { ...target.sandbox!, status: 'ready' as const, pausedAt: undefined };
+      providerStatus = 'ready';
     },
   } satisfies Partial<SandboxRuntime>;
-  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as SandboxRuntime);
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
   const app = new Hono();
   app.use('*', traceHttpRequest);
   installProjectsRoutes(app, manager);
@@ -62,7 +63,9 @@ test('read-only project entry does not resume; explicit resume trace spans cover
     finishResume();
     const response = await responsePromise;
     assert.equal(response.status, 200);
-    assert.equal(((await response.json()) as Project).sandboxOperation?.status, 'succeeded');
+    const resumed = await response.json() as Project;
+    assert.equal(resumed.sandboxOperation?.status, 'succeeded');
+    assert.equal(resumed.sandbox?.status, 'ready', 'the response uses a fresh Cellbox state query');
     await new Promise<void>(resolve => setImmediate(resolve));
 
     const spans = exporter.getFinishedSpans();

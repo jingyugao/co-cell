@@ -28,8 +28,8 @@ async function fixture(overrides: Partial<Project> = {}, changes: Partial<Sandbo
     async file() { throw new Error('unused'); }, async history() { throw new Error('unused'); },
     async delete() {}, async rebuild() {},
     async querySandbox(value) { return { ...value, status: observed }; },
-    async resume(value) { calls.push('resume'); observed = 'ready'; return { ...value.sandbox!, status: 'ready' }; },
-    async checkpoint(value) { calls.push('checkpoint'); observed = 'paused'; return { ...value.sandbox!, status: 'paused' }; },
+    async resume() { calls.push('resume'); observed = 'ready'; },
+    async checkpoint() { calls.push('checkpoint'); observed = 'paused'; },
     async verifySandbox() { calls.push('verify'); }, async verifyHistory() { calls.push('history'); },
     async fenceSandbox(value) { calls.push('fence:' + value.id); }, async detachSandbox() { calls.push('detach'); },
     async deleteDanglingSandbox(id) { calls.push('delete:' + id); },
@@ -55,7 +55,8 @@ test('an explicit resume submits once and reports its runtime result', async () 
   try {
     await f.operations.run('project-one', 'resume');
     assert.deepEqual(f.calls, ['resume']);
-    assert.equal(f.projects.get('project-one').sandboxOperation?.result?.sandbox.status, 'ready');
+    assert.equal(f.projects.get('project-one').sandboxOperation?.status, 'succeeded');
+    assert.equal(f.projects.get('project-one').sandboxOperation?.result, undefined);
     assert.equal(f.projects.get('project-one').sandbox?.id, 'box-old');
   } finally { await f.close(); }
 });
@@ -88,7 +89,7 @@ test('Cellbox conflict is returned without retry, fallback create or rebuild', a
 
 test('project reads and metadata edits remain available during remote resume', async () => {
   const entered = deferred(), release = deferred();
-  const f = await fixture({}, { async resume(value) { entered.resolve(); await release.promise; return { ...value.sandbox!, status: 'ready' }; } });
+  const f = await fixture({}, { async resume() { entered.resolve(); await release.promise; } });
   try {
     const request = f.operations.run('project-one', 'resume'); await entered.promise;
     assert.equal(f.projects.get('project-one').id, 'project-one');
@@ -100,7 +101,7 @@ test('project reads and metadata edits remain available during remote resume', a
 
 test('an older completion does not overwrite a newer request record', async () => {
   const entered = deferred(), release = deferred(); let calls = 0;
-  const f = await fixture({}, { async resume(value) { if (++calls === 1) { entered.resolve(); await release.promise; } return { ...value.sandbox!, status: 'ready' }; } });
+  const f = await fixture({}, { async resume() { if (++calls === 1) { entered.resolve(); await release.promise; } } });
   try {
     const older = f.operations.run('project-one', 'resume'); await entered.promise;
     await f.operations.run('project-one', 'resume');
@@ -183,6 +184,20 @@ test('a concurrent BUSY resume does not turn a completed backup into a metadata 
     assert.deepEqual(finished.map(record => [record.operation, record.status]), [['resume', 'failed'], ['backup', 'succeeded']]);
     assert.equal(new Set(finished.map(record => record.operationId)).size, 2);
   } finally { release.resolve(); await f.close(); }
+});
+
+test('checkpoint delegates even when local state is paused and status/App Server checks would fail', async () => {
+  let submissions = 0;
+  const f = await fixture({ status: 'archived', sandbox: box('paused') }, {
+    async querySandbox() { assert.fail('no preflight state query'); },
+    async verifySandbox() { assert.fail('no App Server preflight'); },
+    async checkpoint() { submissions++; throw new CellboxError('CONFLICT', 'Only a running box can suspend', 409); },
+  });
+  try {
+    await assert.rejects(f.operations.run('project-one', 'checkpoint'), error => error instanceof CellboxError && error.code === 'CONFLICT');
+    assert.equal(submissions, 1);
+    assert.equal(f.projects.get('project-one').sandboxOperation?.errorCode, 'CONFLICT');
+  } finally { await f.close(); }
 });
 
 test('running disk backup is rejected without checkpoint or archive capture', async () => {

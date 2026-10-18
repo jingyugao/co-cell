@@ -93,7 +93,7 @@ function runtimeFor(control: Control): SandboxRuntime {
     async querySandbox(sandbox: NonNullable<Session['sandbox']>) { return { ...sandbox, status: 'ready' as const }; },
     async inspect(_target: WorkspaceTarget) { return {}; },
     async rebuild() {},
-    async checkpoint(target: WorkspaceTarget) { control.maintenanceCalls++; return target.sandbox!; },
+    async checkpoint() { control.maintenanceCalls++; },
     remoteArchives: { async capture() { control.archiveCaptures++; throw new Error('unexpected scheduled capture'); } },
     async *run(session: Session, turn: Turn, signal: AbortSignal,
       onSandbox: (value: NonNullable<Session['sandbox']>) => Promise<void>) { yield* observe('run', session, turn, signal, onSandbox); },

@@ -131,6 +131,23 @@ test('a resume conflict is surfaced without a second mutation', async () => {
   assert.equal(submissions, 1);
 });
 
+test('explicit pause and resume surface BUSY and unknown outcomes with exactly one request', async () => {
+  for (const action of ['pause', 'resume'] as const) {
+    for (const code of ['BUSY', 'UNKNOWN_OUTCOME']) {
+      const calls: string[] = [];
+      const instance = provider(async (input, init) => {
+        calls.push(`${init?.method ?? 'GET'} ${new URL(String(input)).pathname}`);
+        assert.equal(new Headers(init?.headers).has('Idempotency-Key'), false);
+        assert.equal(init?.body, undefined);
+        if (code === 'UNKNOWN_OUTCOME') throw new Error('response lost');
+        return Response.json({ error: { code, message: 'Box has an active operation' } }, { status: 409 });
+      }, { revisionId: 'rev-a' });
+      await assert.rejects(instance[action]('box-a'), error => error instanceof CellboxError && error.code === code);
+      assert.deepEqual(calls, [`POST /v1/boxes/box-a:${action === 'pause' ? 'suspend' : 'resume'}`]);
+    }
+  }
+});
+
 test('connect joins an existing resume using GET polling only', async () => {
   const requests: string[] = [];
   let polls = 0;

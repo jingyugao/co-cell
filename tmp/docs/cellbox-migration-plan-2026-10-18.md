@@ -6,12 +6,14 @@
 
 检视基线：CoCell `d6c3815343a789c70490763b5a847aa8a0c5a8b6`；Cellbox `6465c3e4b1205cde619f2681ede48d7ce1173b6b`，包括 `f0921f2` 的模板版本改造与 `6465c3e` 的单进程、SQLite 和生命周期简化。以下事实针对这些版本，后续实现前需重新核对目标提交和实际安装。
 
+本轮暂停/继续路径精简属于后续本地改造，尚未部署；第 12 节的部署与现场验收记录保持为此前版本的历史事实，不能视为本轮改造的部署验收。
+
 ### 已实现的入口和行为
 
 - Provider/client 使用 template/revision/build 与显式 suspend/resume/destroy/activate；不发送幂等键，不重放写请求。默认配置为 `CELLBOX_TEMPLATE_ID` / `CELLBOX_REVISION_ID` 二选一，`CELLBOX_PROFILE` 仅选择运行规格。
 - 新增明确的 `POST /api/projects/:id/sandbox/create` 和 `sandbox/restore`；前端进入项目只 GET。旧 `open` 也只读，旧 `rebuild` 保留兼容但同 ID 重建明确拒绝。
 - 删除项目控制锁、维护长租约、创建总锁、按周占用、恢复接管与重放、镜像全局队列/预占、Cellbox lease/route 管理。元数据保留短事务；旧回调不能覆盖已切换的本地 Sandbox 绑定。
-- SDK pause/destroy/resume 不跨远程请求持本地资源锁；普通 acquire 不隐式恢复。App Server 仅关闭自己的闲置缓存连接，活跃 RPC 和新读取不被本地维护栅栏阻挡。
+- 项目暂停/继续从项目绑定的 Cellbox Box ID 出发，分别单次调用 provider pause/resume，再把真实结果写入项目操作记录；不按本地 phase 短路或预判，不检查 App Server readiness、不做环境准备，也不重写项目 Sandbox 绑定。Provider 提交一次 Cellbox 生命周期动作并读取该 operation 结果；Cellbox 的 BUSY/CONFLICT/未知结果照实返回，不自动重试。
 - 返回 Cellbox 的错误 status/code 和脱敏 message；未确认写请求保存 unknown。远端成功响应无法读取或解析时，CoCell 返回错误 HTTP 状态并保留 upstreamStatus，避免把 unknown 当作成功。Checkpoint 只暂停 Sandbox；备份由用户通过独立入口明确提交，结果分别展示。定时政策不接管或重做 running/failed/unknown 的操作。
 - 归档只针对已暂停或底层允许的 failed 实例；运行中的纯磁盘归档、同 ID rebuild、revision 物理删除、请求级私仓凭据明确不支持。旧 OSS 归档也不伪称通过 Cellbox 删除。
 - 显式备份不附带远程删除旧归档，避免后续操作盲目重试未知删除。`POST /api/archives/prune` 是用户明确发起的独立清理，按项目保留数执行。
@@ -98,8 +100,8 @@ CoCell 接入新版 Cellbox 的 template/revision、显式生命周期和单节�
 | 修改名称、需求链接和备份保留数 | `PATCH /api/projects/:id` | 自有字段原子更新或短事务；不因 Sandbox 正在维护而统一拒绝普通信息编辑 |
 | 标记完成、恢复使用中 | 同一 PATCH 入口的 status 字段 | 校验业务状态并更新本地记录；不持有远端资源锁 |
 | 查看、修改工具角色 | `GET/PUT /api/projects/:id/tool-role` | 读取或更新角色关联；权限校验与数据写入独立处理，不套项目大锁 |
-| 进入项目 | `POST /api/projects/:id/open` | 当前会等待备份和已有操作，再尝试恢复；目标是查看先返回，恢复行为独立表达，单次提交，不因进入页面建立排他保证 |
-| 恢复运行、暂停 | `POST /api/projects/:id/sandbox/resume`、`checkpoint` | Checkpoint 只暂停，不自动备份；Cellbox 管理资源一致性，CoCell 展示实际状态、冲突和未知结果，不额外加资源锁 |
+| 进入项目 | `POST /api/projects/:id/open` | 只读返回；继续运行必须由用户明确调用 resume，不由进入页面触发 |
+| 恢复运行、暂停 | `POST /api/projects/:id/sandbox/resume`、`checkpoint` | 使用项目绑定的 Box ID 各提交一次 provider resume/pause，再记录操作结果；不预查状态、不做 App Server readiness 或环境准备、不改写 Sandbox 绑定，底层冲突与未知结果照实展示 |
 | 创建、重建或从备份恢复环境 | `POST /api/projects/:id/sandbox/rebuild` | 按实际支持的动作拆分；远端提交交 Cellbox，项目绑定只在本地短事务中更新 |
 | 归档项目 | `POST /api/projects/:id/archive` | 可从已暂停/failed 的资源生成备份，或明确复用已有备份；项目状态更新和清理分别记录结果，不把多步流程包进长锁、不承诺整体原子 |
 | 文件读取、下载和服务预览 | files、preview、service 路径 | 不加项目级锁；本地只管理自身连接，实际访问与生命周期冲突交给 Cellbox |
@@ -214,13 +216,11 @@ MySQL named lock 在 `COCELL_MULTI_API=1` 时启用；本地 Promise 队列和 M
 
 ### 7.1 查询、恢复和业务就绪
 
-读取项目、查询 Sandbox、读取文件和获取历史不隐式 resume。用户明确恢复时，查询到 suspended 才提交一次 resume；读到进行中的 operation 可以展示或等待；读到 running 直接报告运行态并单独检查业务就绪。
+读取项目、查询 Sandbox、读取文件和获取历史不隐式 resume。用户明确提交 resume 或 checkpoint 时，CoCell 用项目当前绑定的 Box ID 调用 provider.resume 或 provider.pause 一次；不先 GET Box 判断 running/suspended，不按本地 phase 短路，也不因 App Server readiness 或环境准备结果改变是否提交。Cellbox 返回的冲突、BUSY、失败或未知结果写入该项目操作记录并原样呈现；已有 operation 可通过 GET 查询，不重新提交。
 
-查询和提交之间发生状态变化，接受 Cellbox 返回的冲突，不自动换 generation 再试。恢复后使用响应或再次查询得到的新 generation，不能沿用旧句柄执行命令。
+这两个动作不重写项目 Sandbox 绑定，不启动 App Server readiness 探测或工作区环境准备。暂停/恢复对底层状态是否适用由 Cellbox 决定；请求冲突透传，不自动换 generation 或重试。
 
-移除 provider 的远端 `ensure-running` 调用；上层也不保留“无论什么状态都修复到 ready”的承诺。failed/deleted/staged 等状态按实际能力给出可选动作，不自动退化到创建、重建或恢复备份。
-
-Cellbox runtime running 与 Codex App Server 可用分开呈现。Codex 未就绪时可以报告“Sandbox 已运行，App Server 尚不可用”，不能把 resume 请求自动再执行一次。
+暂停/恢复不包含“修复到 ready”的语义；failed、deleted、staged 或其他状态的行为由 Cellbox 响应决定，CoCell 不自动退化为创建、重建或恢复备份。
 
 `POST /api/projects/:id/sandbox/checkpoint` 只负责暂停并返回暂停结果，不启动后台备份。用户需要工作区备份时，单独调用 `POST /api/projects/:id/backup`；仅 paused/failed Sandbox 可备份，running 返回 409。备份期间底层仍可能返回 BUSY；CoCell 不叠加资源锁、不自动重试写请求，也不向上承诺幂等。Resume 同样呈现底层真实结果。
 
@@ -369,7 +369,7 @@ CoCell 与 Cellbox 版本需要成对切换。新版本产生写入后，不能�
 
 - 系统模板、仓库模板和 revision 构建、查询、选择、默认值与预热信息可用；未知数量和过期观察正确显示。
 - 新项目固定 revision；stable 改变不替换已有实例；再次同步同一 tag 可以形成新 revision，不假定它与旧结果相同。
-- GET 和历史读取不唤醒实例；显式 suspend/resume 保持其真实语义，使用新 generation；Codex 就绪单独验证。
+- GET 和历史读取不唤醒实例；显式 pause/resume 各发出一次 provider 生命周期调用，记录真实 operation 结果；不做状态预查、App Server readiness、环境准备或项目 Sandbox 绑定重写，底层冲突不重试。
 - HTTP/WebSocket、文件、工具凭据和会话历史通过新实例验证；冲突直接呈现，测试不得靠无条件重试通过。
 - 归档前置条件、portable/image/agent 校验、staged 恢复与显式激活可用；不支持的入口明确显示不支持。
 - 文件恢复、会话历史验证与新旧绑定切换分别有结果；失败候选、清理残留和旧备份没有被静默删除。

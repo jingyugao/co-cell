@@ -117,6 +117,8 @@ export interface SandboxProvider {
   getInfo(sandboxId: string): Promise<SandboxInfo>;
   /** Display-only batch observation; missing IDs are omitted and state may be eventually consistent. */
   getInfos?(sandboxIds: string[]): Promise<SandboxInfo[]>;
+  /** Submit one explicit lifecycle request; the provider decides whether it is valid. */
+  resume?(sandboxId: string, options?: { signal?: AbortSignal }): Promise<void>;
   pause(sandboxId: string): Promise<boolean>;
   kill(sandboxId: string): Promise<boolean>;
 }

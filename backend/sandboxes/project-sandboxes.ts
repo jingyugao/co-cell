@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { SandboxManager, SandboxLease, SandboxRecord, SandboxInfo } from '@co-cell/sandbox';
+import type { SandboxManager, SandboxLease, SandboxRecord } from '@co-cell/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
 
@@ -121,27 +121,9 @@ export class ProjectSandboxes {
     return lease;
   }
 
-  async ensureRunning(target: WorkspaceTarget, operationKey: string, signal?: AbortSignal): Promise<{
-    lease: SandboxLease; info: SandboxInfo;
-  }> {
-    if (!target.sandbox) throw new Error('Project Sandbox does not exist');
-    this.track(target);
-    const key = resourceKey(target);
-    const lease = await this.manager.ensureRunning(key, operationKey, signal);
-    target.sandbox = this.project(lease.record, this.bindings.get(key)!.workingDirectory);
-    return { lease, info: lease.info! };
-  }
-
   async inspect(target: WorkspaceTarget) {
     this.track(target);
     return this.manager.inspect(resourceKey(target));
-  }
-
-  async checkpoint(target: WorkspaceTarget) {
-    const binding = this.track(target);
-    const record = await this.manager.pause(resourceKey(target));
-    target.sandbox = this.project(record, binding.workingDirectory);
-    return target.sandbox;
   }
 
   holdUsage(target: WorkspaceTarget, usageId: string) {

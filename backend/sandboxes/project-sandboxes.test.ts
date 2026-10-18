@@ -167,96 +167,36 @@ function fixture() {
   return { counts, sandbox, provider, manager, projects, target, record };
 }
 
-test('default mounted-home resume selects the configured template, GETs state, and submits one resume', async t => {
-  const calls: Array<{ method: string; path: string; body?: unknown; key?: string }> = [];
-  const capabilities = { exec: true, files: true, http: true, websocket: true, pty: false, reconnectExec: false,
-    freeze: false, suspend: 'same-node-checkpoint' as const, archives: 'workspace-best-effort', protectedTools: false,
-    sharedDirectory: true };
-  const box = (phase: CellboxBox['phase']): CellboxBox => ({ id: 'test-sandbox', ownerKey: 'project:project-resume',
-    profileId: 'k8s', templateId: 'codex', revisionId: 'codex-r1', templateName: 'Codex', templateVersion: '1', phase,
-    generation: phase === 'suspended' ? 9 : 10, resourceVersion: 12, image: 'mybox:latest', workspace: '/home/agent/workspace',
-    capabilities, createdAt: new Date(0).toISOString() });
-  let currentBox: CellboxBox = box('suspended');
-  const provider = new CellboxSandboxProvider({ baseUrl: 'http://cellbox.test', profileId: 'k8s', templateId: 'codex', fetch: async (input, init) => {
+test('pause and resume only submit Cellbox actions despite stale local state or unavailable App Server', async () => {
+  const calls: string[] = [];
+  const provider = new CellboxSandboxProvider({ baseUrl: 'http://cellbox.test', profileId: 'k8s', revisionId: 'rev-a', fetch: async (input, init) => {
     const url = new URL(String(input));
-    const method = init?.method ?? 'GET';
-    const headers = new Headers(init?.headers);
-    const raw = init?.body;
-    calls.push({ method, path: url.pathname, ...(raw ? { body: JSON.parse(String(raw)) } : {}),
-      ...(headers.get('idempotency-key') ? { key: headers.get('idempotency-key')! } : {}) });
-    if (url.pathname === '/v1/profiles') return Response.json([{ id: 'k8s', provider: 'resumable-k8s-pod',
-      capabilities, runtime: 'k8s', behavior: 'resumable', kind: 'k8s-resumable', image: 'mybox:latest',
-      workspace: '/home/agent/workspace', agent: { uid: 1000, gid: 1000 }, cpu: 2, memoryMiB: 4096 }]);
-    if (url.pathname === `/v1/boxes/${currentBox.id}` && method === 'GET') return Response.json(currentBox);
-    if (url.pathname === `/v1/boxes/${currentBox.id}:resume` && method === 'POST') {
-      assert.deepEqual(JSON.parse(String(raw)), { expectedGeneration: 9 });
-      currentBox = box('running');
-      const operation: CellboxOperation = { id: 'resume-operation', kind: 'resume', targetId: currentBox.id,
-        status: 'succeeded', version: 1, createdAt: new Date().toISOString() };
-      return Response.json(operation);
-    }
-    assert.fail(`unexpected Cellbox request: ${method} ${url.pathname}`);
+    calls.push(`${init?.method ?? 'GET'} ${url.pathname}`);
+    assert.equal(new Headers(init?.headers).has('Idempotency-Key'), false);
+    assert.equal(init?.body, undefined);
+    const kind = url.pathname.endsWith(':resume') ? 'resume' : 'suspend';
+    assert.equal(init?.method, 'POST');
+    assert.equal(url.pathname, `/v1/boxes/test-sandbox:${kind}`);
+    return Response.json({ id: `operation-${kind}`, kind, targetId: 'test-sandbox', status: 'succeeded', version: 1, createdAt: new Date().toISOString() });
   } });
   const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
   const projects = new ProjectSandboxes(manager, 'k8s');
-  let saves = 0, preparations = 0, remoteUsage = 0;
-  const target: WorkspaceTarget = { id: 'session-resume', projectId: 'project-resume',
-    settings: { workingDirectory: runtimePaths.root }, updatedAt: new Date().toISOString(),
-    sandbox: { id: 'test-sandbox', template: 'k8s', status: 'unknown', workingDirectory: runtimePaths.root,
-      image: { reference: 'mybox:latest', id: 'sha256:box', repoDigests: [] } } };
-  // Simulate a process recovered from durable state with a checkpoint marker
-  // and stale unknown status; the provider reads Cellbox state and resumes once.
-  manager.track(`project:${target.projectId}`, { id: 'test-sandbox', template: 'k8s', status: 'unavailable',
-    checkpoint: { id: 'cellbox-checkpoint', createdAt: new Date(0).toISOString() } }, async () => { saves++; });
-  projects.track(target, async () => { saves++; });
-  let finishHealth!: () => void;
-  const health = new Promise<void>(resolve => { finishHealth = resolve; });
-  let probes = 0, completed = false, stall = false;
-  let checkingCancelled!: () => void;
-  const cancelledCheck = new Promise<void>(resolve => { checkingCancelled = resolve; });
-  t.mock.method(CodexAppServerClient.prototype, 'connect', async () => {});
-  t.mock.method(CodexAppServerClient.prototype, 'close', async () => {});
-  t.mock.method(CodexAppServerClient.prototype, 'request', async (method: string) => {
-    assert.equal(method, 'thread/loaded/list');
-    probes++;
-    if (stall) { checkingCancelled(); return new Promise(() => {}); }
-    await health;
-    return { data: [] };
-  });
+  const target: WorkspaceTarget = { id: 'project-one', projectId: 'project-one', updatedAt: new Date().toISOString(),
+    settings: { workingDirectory: '/home/agent/workspace' },
+    sandbox: { id: 'test-sandbox', template: 'k8s', status: 'unavailable', workingDirectory: '/home/agent/workspace' } };
+  // A stale SDK binding and all application setup dependencies must be irrelevant.
+  manager.track('project:project-one', { id: 'obsolete-local-box', template: 'k8s', status: 'paused' }, async () => { assert.fail('no lifecycle binding writes'); });
   const runtime = new ContainerCodexRuntime({ paths: runtimePaths, sandboxes: projects, provider, apiKey: '',
-    appServer: async () => ({ url: 'ws://app-server.test' }),
-    sharedFilesMounted: () => true,
-    prepareRemote: async () => { preparations++; return true; },
-    acquireRemoteUsage: async () => { remoteUsage++; return async () => {}; } });
+    appServer: async () => { assert.fail('no App Server readiness dependency'); },
+    sharedFilesMounted: () => { assert.fail('no mount preflight'); },
+    prepareRemote: async () => { assert.fail('no environment preparation'); },
+    acquireRemoteUsage: async () => { assert.fail('no remote usage dependency'); } });
   try {
-    const pending = runtime.resume(target, undefined, 'project-resume-op').then(value => { completed = true; return value; });
-    await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(completed, false, 'Cellbox running must not complete resume before Codex responds');
-    assert.equal(probes, 1);
-    finishHealth();
-    const result = await pending;
-    assert.equal(result.status, 'ready');
-    assert.deepEqual(provider.defaultSelector, { templateId: 'codex' });
-    assert.deepEqual(calls.filter(call => call.path.startsWith('/v1/boxes/')).map(call => [call.method, call.path]), [
-      ['GET', `/v1/boxes/${box('running').id}`], ['POST', `/v1/boxes/${box('running').id}:resume`],
-      ['GET', `/v1/boxes/${box('running').id}`],
-    ]);
-    assert.equal(calls.some(call => call.key), false, 'resume must not send an idempotency key');
-    assert.equal(calls.filter(call => call.method === 'POST').length, 1);
-    assert.equal(saves, 0);
-    assert.equal(preparations, 0);
-    assert.equal(remoteUsage, 0);
-    assert.equal(manager.peek(`project:${target.projectId}`)?.checkpoint, undefined);
-    stall = true;
-    const controller = new AbortController();
-    const cancelled = assert.rejects(runtime.resume(target, controller.signal, 'project-cancelled-wait'), /entry cancelled/);
-    await cancelledCheck;
-    controller.abort(new Error('entry cancelled'));
-    await cancelled;
-    assert.equal(calls.filter(call => call.method === 'POST').length, 1, 'cancelling readiness must not replay the resume mutation');
-    assert.equal(target.sandbox?.id, 'test-sandbox', 'readiness cancellation preserves the restored Box');
-    assert.equal(manager.peek(`project:${target.projectId}`)?.checkpoint, undefined, 'a consumed checkpoint must not be replayed');
-  } finally { finishHealth(); await runtime.close(); await manager.close(); }
+    await runtime.resume(target);
+    await runtime.checkpoint(target);
+    assert.deepEqual(calls, ['POST /v1/boxes/test-sandbox:resume', 'POST /v1/boxes/test-sandbox:suspend']);
+    assert.equal(target.sandbox?.id, 'test-sandbox');
+  } finally { await runtime.close(); }
 });
 
 test('live Sandbox queries ignore reference status without preparing, connecting or persisting', async () => {

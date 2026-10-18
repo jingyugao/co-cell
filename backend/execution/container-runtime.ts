@@ -53,8 +53,8 @@ export interface SandboxRuntime {
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   rebuildPersistent?(target: WorkspaceTarget, key: string, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
-  resume?(target: WorkspaceTarget, signal?: AbortSignal, operationKey?: string): Promise<SandboxState>;
-  checkpoint?(target: WorkspaceTarget): Promise<SandboxState>;
+  resume?(target: WorkspaceTarget, signal?: AbortSignal): Promise<void>;
+  checkpoint?(target: WorkspaceTarget): Promise<void>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
   verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
   fenceSandbox?(sandbox: SandboxState): Promise<void>;
@@ -746,44 +746,17 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     throw new HttpError(422, '当前 Cellbox 不支持同 ID 重建；请明确选择从备份创建新环境。');
   }
 
-  async resume(target: WorkspaceTarget, signal?: AbortSignal, operationKey = `cocell-resume-${randomUUID()}`): Promise<SandboxState> {
+  async resume(target: WorkspaceTarget, signal?: AbortSignal): Promise<void> {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
-    signal?.throwIfAborted();
-    return traced('sandbox.resume', { 'sandbox.id': target.sandbox.id }, async () => {
-      const { lease, info } = await this.sandboxes.ensureRunning(target, operationKey, signal);
-      const preparation = this.runtimePreparations.get(lease.record.id) ?? {};
-      this.runtimePreparations.set(lease.record.id, preparation);
-      const entry: Entry = { sandbox: lease.sandbox, get metadata() { return lease.record; }, lease, preparation, info };
-      const mountedDefaultWorkspace = target.settings.workingDirectory === this.root
-        && this.options.sharedFilesMounted !== undefined
-        && info.capabilities?.sharedDirectory === true;
-      if (mountedDefaultWorkspace) {
-        try {
-          await traced('sandbox.appserver_ready', { 'sandbox.id': lease.record.id },
-            () => this.reader.waitUntilReady(lease.record.id, signal));
-          return { ...target.sandbox! };
-        }
-        finally { await lease.release(); }
-      }
-      let releaseRemote: (() => Promise<void>) | undefined;
-      try {
-        releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id, target.settings.workingDirectory, info);
-        entry.releaseRemote = releaseRemote;
-        signal?.throwIfAborted();
-        await traced('sandbox.prepare_environment', { 'sandbox.id': target.sandbox!.id },
-          () => this.prepareEnvironment(target, entry, signal ? AbortSignal.any([signal, AbortSignal.timeout(300_000)]) : AbortSignal.timeout(300_000)));
-        await traced('sandbox.appserver_ready', { 'sandbox.id': lease.record.id },
-          () => this.reader.waitUntilReady(lease.record.id, signal));
-        return { ...target.sandbox! };
-      } finally {
-        try { await releaseRemote?.(); } finally { await lease.release(); }
-      }
-    });
+    if (!this.options.provider.resume) throw new HttpError(503, 'Sandbox 不支持恢复运行');
+    await traced('sandbox.resume', { 'sandbox.id': target.sandbox.id },
+      () => this.options.provider.resume!(target.sandbox!.id, { signal }));
   }
 
-  async checkpoint(target: WorkspaceTarget) {
+  async checkpoint(target: WorkspaceTarget): Promise<void> {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
-    return this.sandboxes.checkpoint(target);
+    await traced('sandbox.checkpoint', { 'sandbox.id': target.sandbox.id },
+      () => this.options.provider.pause(target.sandbox!.id));
   }
 
   async verifySandbox(sandbox: SandboxState, timeoutMs?: number) {

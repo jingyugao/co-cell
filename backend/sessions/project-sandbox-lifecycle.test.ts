@@ -24,7 +24,7 @@ test('archiving deletes current and legacy attachment caches and blocks new uplo
   const runtime = {
     async close() {}, async rebuild(_target, save) { await save(box); },
     async querySandbox(value) { return { ...value, status: paused ? 'paused' as const : 'ready' as const }; },
-    async checkpoint(value) { paused = true; return { ...value.sandbox!, status: 'paused' as const }; },
+    async checkpoint() { paused = true; },
     async verifySandbox() {}, async fenceSandbox() {}, async detachSandbox() {}, async deleteDanglingSandbox() {},
     remoteArchives: { async capture() { return reference; }, async inspect() { return reference; },
       async restore() { throw new Error('unused'); }, async activate() {} },
@@ -53,7 +53,7 @@ test('archiving deletes current and legacy attachment caches and blocks new uplo
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
-test('project entry stays read-only; explicit resume and checkpoint each keep their own lifecycle result', async () => {
+test('project entry stays read-only; explicit lifecycle actions are observed from Cellbox', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-explicit-lifecycle-'));
   const state = new MemoryWebStateStore();
   const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
@@ -65,14 +65,18 @@ test('project entry stays read-only; explicit resume and checkpoint each keep th
     createdAt: at, updatedAt: at, sandbox: box };
   await state.saveProject(project);
   let providerStatus: SandboxState['status'] = 'paused';
+  let observationUnavailable = false;
   let resumeCalls = 0, checkpointCalls = 0, archiveCalls = 0;
   const archive = { id: 'lifecycle-archive', sourceSandboxId: box.id, imageId: 'image', createdAt: at,
     sizeBytes: 10, sha256: 'a'.repeat(64), threadIds: [] };
   const runtime = {
     async close() {},
-    async querySandbox(value) { return { ...value, status: providerStatus }; },
-    async resume(value) { resumeCalls++; providerStatus = 'ready'; return { ...value.sandbox!, status: 'ready', pausedAt: undefined }; },
-    async checkpoint(value) { checkpointCalls++; providerStatus = 'paused'; return { ...value.sandbox!, status: 'paused', pausedAt: at }; },
+    async querySandbox(value) {
+      if (observationUnavailable) throw new Error('Cellbox observation unavailable');
+      return { ...value, status: providerStatus };
+    },
+    async resume() { resumeCalls++; providerStatus = 'ready'; },
+    async checkpoint() { checkpointCalls++; providerStatus = 'paused'; },
     remoteArchives: { async capture() { archiveCalls++; return archive; }, async inspect(ref) { return ref; },
       async restore() { throw new Error('unused'); }, async activate() {} },
   } satisfies Partial<SandboxRuntime>;
@@ -96,6 +100,15 @@ test('project entry stays read-only; explicit resume and checkpoint each keep th
     assert.equal(resumed.sandbox?.id, box.id);
     assert.equal(resumed.sandboxOperation?.status, 'succeeded');
     assert.equal(isProjectSandboxReady(resumed), true);
+
+    observationUnavailable = true;
+    const unobserved = await app.request(`/api/projects/${project.id}/sandbox/resume`, { method: 'POST' });
+    assert.equal(unobserved.status, 200);
+    const completed = await unobserved.json() as ProjectSummary;
+    assert.equal(resumeCalls, 2, 'each explicit request reaches Cellbox even if the box is already running');
+    assert.equal(completed.sandboxOperation?.status, 'succeeded', 'a later observation failure cannot change the operation result');
+    assert.equal(completed.sandbox?.status, 'unknown', 'a completed resume does not fabricate a ready observation');
+    observationUnavailable = false;
 
     const checkpoint = await app.request(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST' });
     assert.equal(checkpoint.status, 200);
@@ -167,7 +180,8 @@ test('single-API idle checkpoint only pauses and never captures disk', async () 
   const runtime = {
     async close() {},
     async querySandbox(value) { return { ...value, status: paused ? 'paused' as const : 'ready' as const }; },
-    async checkpoint(value) { paused = true; return { ...value.sandbox!, status: 'paused' as const }; },
+    async resume() { paused = false; },
+    async checkpoint() { paused = true; },
     remoteArchives: { async capture(value) { assert.equal(value.sandbox?.status, 'paused'); captures++; return {
       id: 'idle-archive', sourceSandboxId: 'idle-box', imageId: 'image', createdAt: new Date().toISOString(), sizeBytes: 10, sha256: 'a'.repeat(64),
     }; }, async inspect(ref) { return ref; }, async restore() { throw new Error('unused'); }, async activate() {} },
@@ -190,5 +204,9 @@ test('single-API idle checkpoint only pauses and never captures disk', async () 
     assert.equal(project.sandboxBackup, undefined);
     await manager.scheduledArchive();
     assert.equal(captures, 0, 'later scheduler ticks must not back up a paused project');
+    await manager.resumeProjectSandbox('idle-project');
+    await manager.scheduledArchive();
+    assert.equal(paused, false, 'a successful explicit resume starts a new idle interval');
+    assert.equal(manager.getProject('idle-project').sandboxOperation?.kind, 'resume');
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

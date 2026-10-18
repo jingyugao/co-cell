@@ -35,12 +35,10 @@ export class ProjectSandboxOperations {
 
   private async phase(id: string, phase: string) {
     const scoped = this.context.getStore();
-    if (!scoped || this.deps.projects.get(id).sandboxOperation?.id !== scoped.operation.id)
-      throw new HttpError(409, '项目操作记录已变化，请查看各请求结果。');
+    if (!scoped) throw new Error('Sandbox request has no observation context');
     scoped.operation.phase = phase;
     scoped.operation.updatedAt = new Date().toISOString();
-    if (!await this.deps.projects.updateSandboxOperation(id, { ...scoped.operation }, scoped.operation.id))
-      throw new HttpError(409, '项目操作记录已变化，请查看各请求结果。');
+    await this.deps.projects.updateSandboxOperation(id, { ...scoped.operation }, scoped.operation.id);
     this.recordTiming(id, 'running', phase);
   }
 
@@ -106,7 +104,6 @@ export class ProjectSandboxOperations {
   async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
     const project = this.deps.projects.get(id);
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
-    if (kind === 'checkpoint' && project.status === 'archived') throw new HttpError(409, '已归档项目不能暂停');
     const selection = kind === 'restore' && this.deps.selectRestoreImage
       ? await this.deps.selectRestoreImage(project, options.imageVersionId) : undefined;
     const operation: ProjectSandboxOperation = { id: randomUUID(), kind, phase: '提交操作', status: 'running',
@@ -156,9 +153,7 @@ export class ProjectSandboxOperations {
     const project = this.context.getStore()!.project;
     if (!project.sandbox || !this.deps.runtime.resume) throw new HttpError(409, '项目没有可恢复的 Sandbox');
     await this.phase(id, '恢复运行');
-    const sandbox = await this.deps.runtime.resume(target(project));
-    await this.deps.saveSandbox(id, sandbox, false, undefined, project.sandbox?.id ?? null);
-    this.context.getStore()!.operation.result = { sandbox };
+    await this.deps.runtime.resume(target(project));
   }
 
   private async create(id: string) {
@@ -177,17 +172,11 @@ export class ProjectSandboxOperations {
   }
 
   private async checkpoint(id: string) {
-    const { projects, runtime } = this.deps;
-    const project = await this.inspect(id);
-    if (!project.sandbox || !['ready', 'paused'].includes(project.sandbox.status)) throw new HttpError(409, '仅运行中或已暂停的 Sandbox 可以创建 Checkpoint');
-    if (project.sandbox.status === 'ready') {
-      if (!runtime.checkpoint) throw new HttpError(503, 'Sandbox 不支持 Checkpoint');
-      await runtime.verifySandbox?.(project.sandbox);
-      await this.phase(id, '保存 Checkpoint 并暂停');
-      const paused = await runtime.checkpoint(target(project));
-      if (paused.status !== 'paused') throw new Error('Checkpoint 完成后 Sandbox 未暂停');
-      await this.deps.saveSandbox(id, paused, false);
-    }
+    const project = this.context.getStore()!.project;
+    if (!project.sandbox) throw new HttpError(409, '项目没有可暂停的 Sandbox');
+    if (!this.deps.runtime.checkpoint) throw new HttpError(503, 'Sandbox 不支持 Checkpoint');
+    await this.phase(id, '保存 Checkpoint 并暂停');
+    await this.deps.runtime.checkpoint(target(project));
   }
 
   private async inspect(id: string) {

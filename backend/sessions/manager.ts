@@ -620,10 +620,7 @@ export class SessionManager {
     }
     signal?.throwIfAborted();
     if (options.waitForOperation) await this.projects.refreshOne(id);
-    // Operation wait reads are backed by the durable project document. Avoid a
-    // second provider status request after the operation has published its
-    // terminal sandbox snapshot; readiness comes from operation completion.
-    if (options.waitForOperation) return this.projectSummary(await this.liveProject(this.projects.get(id), true));
+    // Operation results and the current Cellbox observation are independent.
     return this.projectSummary(await this.liveProject(this.projects.get(id), true));
   }
 
@@ -1011,7 +1008,6 @@ export class SessionManager {
   async resumeProjectSandbox(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
     signal?.throwIfAborted();
     await this.submitProjectSandboxOperation(id, 'resume');
-    await this.projects.refreshOne(id);
     signal?.throwIfAborted();
     return this.readProject(id);
   }
@@ -1079,6 +1075,8 @@ export class SessionManager {
       if (project.status !== 'active' || !project.sandbox) return false;
       const sessions = [...this.sessions.values()].filter(session => session.projectId === project.id);
       const lastActivity = Math.max(Date.parse(project.sandbox.lastActiveAt ?? project.createdAt),
+        project.sandboxOperation?.kind === 'resume' && project.sandboxOperation.status === 'succeeded'
+          ? Date.parse(project.sandboxOperation.updatedAt) : 0,
         ...sessions.map(session => Date.parse(session.updatedAt)));
       return !sessions.some(session => session.status === 'running') && now - lastActivity >= this.autoCheckpointAfterMs;
     };

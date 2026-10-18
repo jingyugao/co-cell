@@ -12,6 +12,8 @@ import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import { matchesRemoteArchive } from '../archives/remote.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
+import { BackupCatalogUnavailable } from '../sandboxes/cellbox-volume-backups.js';
+import { sandboxMounts } from '../../util/sandbox-mounts.js';
 
 type OperationOptions = { useExistingBackup?: boolean; imageVersionId?: string };
 
@@ -67,8 +69,11 @@ export class ProjectSandboxOperations {
   private async latestRemote(id: string): Promise<RemoteArchiveRef> {
     const remote = this.deps.runtime.remoteArchives;
     if (!remote) throw new HttpError(503, 'Cellbox 归档不可用');
-    const reference = this.deps.projects.get(id).remoteArchives?.[0];
+    const project = this.deps.projects.get(id);
+    const references = remote.list ? await remote.list(target(project), project.remoteArchives ?? []) : project.remoteArchives ?? [];
+    const reference = references[0];
     if (!reference) throw new HttpError(409, '未找到可恢复的最新 Cellbox 归档');
+    if (reference.storageType === 'cellbox-volume') return reference;
     let inspected;
     try { inspected = await remote.inspect(reference); }
     catch { throw new HttpError(409, '最新 Cellbox 归档不可用，操作已停止'); }
@@ -123,6 +128,7 @@ export class ProjectSandboxOperations {
         else if (kind === 'checkpoint') await this.checkpoint(id);
         else if (kind === 'restore') await this.restore(id, false, selection);
         else if (kind === 'backup') await this.backup(id);
+        else if (kind === 'delete') await this.remove(id);
         else if (kind === 'refresh') throw new HttpError(422, '当前 Cellbox 不支持原地刷新；请选择明确版本创建新环境。');
         else await this.archive(id, options.useExistingBackup === true);
         operation.status = 'succeeded'; operation.phase = operation.cleanupError ? '操作完成，资源清理未完成' : '完成'; operation.updatedAt = new Date().toISOString();
@@ -200,51 +206,61 @@ export class ProjectSandboxOperations {
   }
 
   private async backup(id: string) {
-    const project = await this.inspect(id);
-    const runtime = this.deps.runtime;
-    if (!project.sandbox) throw new HttpError(409, '项目没有可备份的持久化目录');
-    if (project.sandbox.status !== 'paused' && project.sandbox.phase !== 'failed') throw new HttpError(409, '请先暂停 Sandbox，再从磁盘生成备份');
-    if (!runtime.remoteArchives) throw new HttpError(503, 'Cellbox 归档不可用');
+    const project = this.deps.projects.get(id);
+    const remote = this.deps.runtime.remoteArchives;
+    if (!remote) throw new HttpError(503, 'Cellbox 备份不可用');
     const operation = this.context.getStore()!.operation;
-    let backup: NonNullable<Project['sandboxBackup']> = { id: operation.id!, sandboxId: project.sandbox.id, status: 'running',
-      phase: '从已停止的磁盘备份数据', updatedAt: new Date().toISOString() };
+    let backup: NonNullable<Project['sandboxBackup']> = { id: operation.id!,
+      ...(project.sandbox ? { sandboxId: project.sandbox.id } : {}), status: 'running',
+      phase: '提交磁盘备份', updatedAt: new Date().toISOString() };
     await this.deps.projects.updateSandboxBackup(id, backup);
-    const phase = async (value: string) => {
-      operation.phase = value; operation.updatedAt = new Date().toISOString();
-      // Observation records may have moved to another request while Cellbox works.
-      await this.deps.projects.updateSandboxOperation(id, { ...operation }, operation.id);
-      this.recordTiming(id, 'running', value);
-      backup = { ...backup, phase: value, updatedAt: new Date().toISOString() };
-      await this.deps.projects.updateSandboxBackup(id, backup, operation.id);
-    };
     const started = Date.now();
+    const threadIds = this.deps.threadIds(id);
     try {
-      await phase(backup.phase);
-      const captured = await runtime.remoteArchives.capture(target(project), this.operationKey(id, 'capture'));
-      const reference: RemoteArchiveRef = { ...captured, threadIds: this.deps.threadIds(id) };
-      if (reference.sourceSandboxId !== project.sandbox.id
-        || (project.sandbox.image?.id && reference.imageId !== project.sandbox.image.id)) {
-        throw new HttpError(409, 'Cellbox 归档来源与当前 Sandbox 不符，操作已停止');
-      }
-      await phase('校验备份');
-      const inspected = await runtime.remoteArchives.inspect(reference);
-      if (!matchesRemoteArchive(reference, inspected)) {
-        throw new HttpError(409, 'Cellbox 归档校验失败，操作已停止');
-      }
-      // Persist the reference before any archive operation may release the source box.
+      await this.phase(id, backup.phase);
+      const captured = await remote.capture(target(project), this.operationKey(id, 'capture'), {
+        onOperation: async (remoteOperationId, volumeId) => {
+          Object.assign(operation, { remoteOperationId, volumeId });
+          backup = { ...backup, remoteOperationId, volumeId, phase: 'Cellbox 备份中', updatedAt: new Date().toISOString() };
+          await this.deps.projects.updateSandboxOperation(id, { ...operation }, operation.id);
+          await this.deps.projects.updateSandboxBackup(id, backup, operation.id);
+        },
+      });
+      const reference: RemoteArchiveRef = { ...captured, threadIds };
+      const retentionError = reference.storageType === 'cellbox-volume' ? reference.retentionError : undefined;
+      if (reference.storageType === 'cellbox-volume') delete reference.retentionError;
       await this.deps.projects.saveRemoteArchive(id, reference);
-      const outcome = { durationMs: Date.now() - started, scannedBytes: reference.sizeBytes, verified: true,
-        updatedAt: new Date().toISOString() };
-      // Remote deletion remains an explicit cleanup action, never a backup retry.
+      let catalogError: string | undefined;
+      if (reference.storageType === 'cellbox-volume' && remote.list) {
+        const current = this.deps.projects.get(id);
+        try {
+          const catalog = await remote.list(target(current), (current.remoteArchives ?? []).filter(ref =>
+            ref.storageType === 'cellbox-volume' && ref.volumeId === reference.volumeId));
+          await this.deps.projects.reconcileVolumeBackups(id, reference.volumeId, catalog);
+        } catch (error) {
+          catalogError = operationError(error).message;
+          void this.deps.logger?.write({ event: 'sandbox.backup_catalog_failed', projectId: id, volumeId: reference.volumeId, error });
+        }
+      }
+      const outcome = { durationMs: Date.now() - started, ...(reference.sizeBytes === undefined ? {} : { sizeBytes: reference.sizeBytes }),
+        ...(reference.storageType === 'cellbox-volume' ? { volumeId: reference.volumeId, snapshotId: reference.snapshotId,
+          ...(reference.addedBytes === undefined ? {} : { addedBytes: reference.addedBytes }) } : {}),
+        ...(retentionError ? { retentionError } : {}), ...(catalogError ? { catalogError } : {}), updatedAt: new Date().toISOString() };
       await this.deps.projects.updateSandboxBackup(id, { ...backup, ...outcome, phase: '完成', status: 'succeeded' }, operation.id);
       Object.assign(operation, outcome);
       await this.deps.projects.updateSandboxOperation(id, { ...operation }, operation.id);
+      return reference;
     } catch (error) {
       const detail = operationError(error);
-      await this.deps.projects.updateSandboxBackup(id, { ...backup, status: detail.unknown ? 'unknown' : 'failed',
-        error: detail.message, updatedAt: new Date().toISOString() }, operation.id);
-      void this.deps.logger?.write({ event: 'sandbox.backup_failed', projectId: id,
-        sandboxId: project.sandbox.id, operationId: operation.id, phase: backup.phase, error });
+      if (error instanceof BackupCatalogUnavailable) {
+        Object.assign(operation, { volumeId: error.volumeId, snapshotId: error.snapshotId });
+        await this.deps.projects.updateSandboxBackup(id, { ...backup, volumeId: error.volumeId, snapshotId: error.snapshotId,
+          status: 'succeeded', phase: '备份已完成，版本信息暂不可用', catalogError: detail.message,
+          durationMs: Date.now() - started, updatedAt: new Date().toISOString() }, operation.id);
+      } else {
+        await this.deps.projects.updateSandboxBackup(id, { ...backup, status: detail.unknown ? 'unknown' : 'failed',
+          error: detail.message, updatedAt: new Date().toISOString() }, operation.id);
+      }
       throw error;
     }
   }
@@ -290,8 +306,8 @@ export class ProjectSandboxOperations {
     }
     const restoredProject = projects.get(id);
     if (reservation) restoredProject.imageSelection = reservation.selection;
-    const currentImage = await runtime.currentImageIdentity?.(target(restoredProject));
-    if (reference.storageType !== 'oss' && !reference.portable && currentImage && currentImage.id !== reference.imageId) {
+    const currentImage = reference.storageType === 'cellbox-volume' ? undefined : await runtime.currentImageIdentity?.(target(restoredProject));
+    if (reference.storageType !== 'cellbox-volume' && reference.storageType !== 'oss' && !reference.portable && currentImage && currentImage.id !== reference.imageId) {
       throw new HttpError(409, 'Cellbox 归档只能恢复到相同镜像，当前镜像已变化');
     }
     const project = await this.inspect(id);
@@ -304,6 +320,16 @@ export class ProjectSandboxOperations {
         await this.rememberCleanup(id, sandbox);
         void this.deps.logger?.write({ event: 'sandbox.operation_candidate', projectId: id,
           operationId: projects.get(id).sandboxOperation?.id, sandboxId: sandbox.id });
+      }, {
+        onOperation: async remoteOperationId => {
+          this.context.getStore()!.operation.remoteOperationId = remoteOperationId;
+          await projects.updateSandboxOperation(id, { ...this.context.getStore()!.operation }, this.context.getStore()!.operation.id);
+        },
+        onVolume: async ({ volumeId }) => {
+          this.context.getStore()!.operation.candidateVolumeId = volumeId;
+          await projects.rememberVolumeCleanup(id, volumeId);
+          await projects.updateSandboxOperation(id, { ...this.context.getStore()!.operation }, this.context.getStore()!.operation.id);
+        },
       });
     await this.rememberCleanup(id, candidate);
     if (restoredProject.imageSelection && candidate.image?.id !== restoredProject.imageSelection.image) {
@@ -320,9 +346,12 @@ export class ProjectSandboxOperations {
       await runtime.detachSandbox(target(project));
       await this.rememberCleanup(id, project.sandbox);
     }
+    const boundVolumes = new Set((sandboxMounts(candidate) ?? []).map(mount => mount.volumeId));
+    for (const mount of project.sandboxMounts ?? sandboxMounts(project.sandbox ?? {}) ?? [])
+      if (!boundVolumes.has(mount.volumeId)) await projects.rememberVolumeCleanup(id, mount.volumeId);
     await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, true, restoredProject.imageSelection, project.sandbox?.id ?? null);
     runtime.track?.(target(projects.get(id)), sandbox => this.deps.saveSandbox(id, sandbox, false));
-    await this.phase(id, '清理旧环境');
+    await this.phase(id, '清理旧 Sandbox');
     await this.cleanup(id, false, new Set(project.sandbox ? [project.sandbox.id] : []));
   }
 
@@ -331,22 +360,22 @@ export class ProjectSandboxOperations {
     const project = await this.inspect(id);
     const originalTarget = target(project);
     if (project.status !== 'archived' || project.sandbox) {
+      let captured: RemoteArchiveRef | undefined;
       if (project.archiveCleanupSourceId || useExistingBackup) {
         await this.latestRemote(id);
         // The operator explicitly accepted this immutable backup's date.
         // Stopping/deleting the source belongs to cleanup, not checkpointing.
-      } else if (project.sandbox) {
-        if (project.sandbox.status !== 'paused' && project.sandbox.phase !== 'failed')
-          throw new HttpError(422, '当前 Cellbox 不支持无 Checkpoint 的纯磁盘归档；请明确暂停后归档，或选择使用已有备份。');
-        await this.backup(id);
+      } else if (project.sandbox || project.sandboxMounts?.length) {
+        captured = await this.backup(id);
       } else {
         throw new HttpError(409, '项目没有可备份的持久化目录，请确认使用已有备份归档');
       }
-      const cleanupSource = project.sandbox ?? (project.remoteArchives?.[0] ? {
-        id: project.remoteArchives[0].sourceSandboxId, status: 'unknown' as const,
-        template: 'legacy', workingDirectory: project.workingDirectory,
-      } : undefined);
+      const cleanupSource = project.sandbox;
       if (cleanupSource) await projects.prepareArchiveCleanup(id, cleanupSource);
+      for (const mount of project.sandboxMounts ?? sandboxMounts(project.sandbox ?? {}) ?? [])
+        await projects.rememberVolumeCleanup(id, mount.volumeId);
+      if (captured?.storageType === 'cellbox-volume')
+        await projects.rememberVolumeCleanup(id, captured.volumeId);
       // Commit the durable archive before reclaiming resources. A cleanup
       // failure must not turn a verified disk archive back into a live project.
       await projects.archiveAndDetachSandbox(id, project.sandbox?.id ?? null, true);
@@ -375,8 +404,31 @@ export class ProjectSandboxOperations {
     // Only recorded cleanup work and currently observed resources are candidates.
     await projects.mergePendingSandboxCleanup(id, [...pending.values()]);
     await this.cleanup(id, true);
+    const afterBoxes = projects.get(id);
+    const volumes = new Set([...(afterBoxes.pendingVolumeCleanup ?? []), ...(afterBoxes.sandboxMounts ?? []).map(mount => mount.volumeId)]);
+    if (volumes.size && !runtime.remoteArchives?.removeVolume) throw new HttpError(503, 'Cellbox 磁盘清理不可用，项目记录已保留');
+    for (const volumeId of volumes) {
+      await this.phase(id, '清理已备份的磁盘');
+      await runtime.remoteArchives!.removeVolume!(volumeId);
+      await projects.finishVolumeCleanup(id, volumeId);
+    }
     await this.deps.detached(id);
     await projects.markArchivedArtifactsCleaned(id);
+  }
+
+  private async remove(id: string) {
+    const { projects } = this.deps;
+    let project = projects.get(id);
+    if (project.sandbox) {
+      await this.release(id);
+      project = projects.get(id);
+      this.context.getStore()!.project = project;
+    }
+    if (project.sandboxMounts?.length) await this.backup(id);
+    else if (project.remoteArchives?.length) await this.latestRemote(id);
+    for (const mount of project.sandboxMounts ?? []) await projects.rememberVolumeCleanup(id, mount.volumeId);
+    await projects.archiveAndDetachSandbox(id, null, true);
+    await this.cleanupArchived(id, target(project));
   }
 
   async close() { await Promise.allSettled(this.tasks); }

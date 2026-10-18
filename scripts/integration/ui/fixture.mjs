@@ -15,7 +15,7 @@ export const test = base.extend({
     // These cases test the real React application, separately from the live suites.
     const projects = new Map([['paused', project('paused', '暂停项目')], ['other', project('other', '另一个项目', 'ready')]]);
     const projectRoles = new Map([...projects.keys()].map(id => [id, defaultRoleId]));
-    const calls = [], historyReads = [], submissions = [], errors = [];
+    const calls = [], historyReads = [], submissions = [], errors = [], deleteFailures = new Map();
     const pendingRoutes = new Map(), pendingByRequest = new Map();
     const rememberPending = (id, route, kind, call) => {
       const pending = pendingRoutes.get(id) ?? new Set();
@@ -45,6 +45,11 @@ export const test = base.extend({
       const pending = pendingByRequest.get(request);
       if (pending) forgetPending(pending.id, pending.record);
     });
+    // UI-only screenshots must not depend on the external Google Fonts CDN.
+    // Production styles and fonts remain unchanged.
+    await page.route('https://fonts.googleapis.com/**', route => route.fulfill({
+      status: 200, contentType: 'text/css; charset=utf-8', body: '',
+    }));
     const session = { id: 'old-session', projectId: 'paused', title: '旧会话', threadId: 'existing-thread', status: 'idle', settings: defaults, turns: [], archivedAt: null, createdAt: now, updatedAt: now };
     const secondSession = { ...session, id: 'second-session', title: '同项目的另一个会话', threadId: 'second-thread' };
     const sessions = new Map([[session.id, session], [secondSession.id, secondSession]]);
@@ -76,6 +81,11 @@ export const test = base.extend({
           const next = request.postDataJSON();
           if (next.status !== undefined) { data.status = next.status; data.completedAt = next.status === 'completed' ? now : null; }
         }
+        else if (method === 'DELETE' && path === `/api/projects/${id}`) {
+          const error = deleteFailures.get(id);
+          if (error) { data = { error }; status = 500; }
+          else { projects.delete(id); data = { ok: true }; }
+        }
         else if (method === 'POST' && path.endsWith('/archive')) {
           data.status = 'archived'; data.archivedAt = now; delete data.sandbox;
           delete data.archiveCleanupSourceId; delete data.pendingSandboxCleanup;
@@ -100,7 +110,9 @@ export const test = base.extend({
           rememberPending(id, route, 'resume', call); return;
         } else if (method === 'POST' && path.endsWith('/backup')) {
           data.sandboxOperation = operation('backup', 'succeeded');
-          data.sandboxBackup = { id: data.sandboxOperation.id, sandboxId: data.sandbox.id, status: 'succeeded', phase: '完成', updatedAt: now };
+          data.sandboxBackup = { id: data.sandboxOperation.id, ...(data.sandbox?.id ? { sandboxId: data.sandbox.id } : {}),
+            ...(data.sandboxMounts?.[0]?.volumeId ? { volumeId: data.sandboxMounts[0].volumeId } : {}),
+            status: 'succeeded', phase: '完成', updatedAt: now };
           status = 200;
         } else if (method === 'POST' && path.endsWith('/sandbox/checkpoint')) {
           if (data.sandbox?.status === 'paused') {
@@ -135,6 +147,12 @@ export const test = base.extend({
     });
     const ui = {
       projects, calls, historyReads, submissions, sessions,
+      addCompletedProject(id = 'completed') {
+        const value = project(id, '已完成项目'); value.status = 'completed'; value.completedAt = now;
+        value.latestBackup = { createdAt: now, sizeBytes: 42, sha256: 'a'.repeat(64) };
+        projects.set(id, value); return value;
+      },
+      failDelete(id, message) { deleteFailures.set(id, message); },
       editor: page.getByRole('textbox', { name: '任务描述', exact: true }),
       send: page.getByRole('button', { name: '发送任务', exact: true }),
       setRunning() { session.status = 'running'; session.turns = [{ id: 'native-turn', nativeTurnId: 'native-turn', prompt: '原始任务', additionalUserInputs: ['相同补充', '相同补充'], images: [], items: [], status: 'running', codexAccepted: true, startedAt: now }]; },

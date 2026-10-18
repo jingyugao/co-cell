@@ -46,14 +46,21 @@ test('a running backup only disables its own duplicate action and never changes 
   assert.equal(projectSandboxActions(value).actions.find(action => action.id === 'backup')?.disabledReason, undefined);
 });
 
-test('retained volumes distinguish released from never created without exposing unsupported backup as executable', () => {
+test('released volumes allow backup without a Sandbox while missing mount information is visible', () => {
   const value = project({ sandboxMounts: [{ volumeId: 'volume', mountPath: '/workspace' }] });
   const released = projectSandboxActions(value);
   assert.equal(released.state, 'released');
-  assert.match(released.actions.find(action => action.id === 'backup')?.disabledReason ?? '', /不支持直接备份/);
+  assert.equal(released.actions.find(action => action.id === 'backup')?.disabledReason, undefined);
   assert.equal(released.actions.some(action => action.id === 'restore'), false);
   value.latestBackup = { createdAt: now, sizeBytes: 1, checksum: 'a'.repeat(64) };
   assert.equal(projectSandboxActions(value).actions.some(action => action.id === 'restore'), true);
+  value.sandboxBackup = { id: 'backup', volumeId: 'volume', status: 'running', phase: 'Cellbox 备份中', updatedAt: now };
+  assert.equal(projectSandboxActions(value).actions.find(action => action.id === 'backup')?.disabledReason, '磁盘备份正在进行中');
+  value.sandboxBackup.volumeId = 'other-volume';
+  assert.equal(projectSandboxActions(value).actions.find(action => action.id === 'backup')?.disabledReason, undefined);
+  delete value.sandboxMounts;
+  value.sandboxReclaimedAt = now;
+  assert.equal(projectSandboxActions(value).actions.find(action => action.id === 'backup')?.disabledReason, '当前未记录可备份的挂载盘');
   const fresh = projectSandboxActions(project());
   assert.equal(fresh.state, 'missing');
   assert.equal(fresh.actions.some(action => action.id === 'backup'), false);

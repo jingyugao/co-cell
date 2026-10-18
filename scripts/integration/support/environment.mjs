@@ -214,8 +214,7 @@ export class LiveEnvironment {
       try {
         const deadline = Date.now() + this.config.operationTimeout;
         const stoppedSessions = new Set();
-        let checkpointSubmitted = false;
-        let backupId;
+        let beforeDelete;
         for (;;) {
           const { data: project, response } = await this.request(`/api/projects/${id}`, { signal, expectedStatus: [200, 404] });
           if (response.status === 404) break;
@@ -232,54 +231,44 @@ export class LiveEnvironment {
             || project.sandboxOperation?.status === 'running'
             || project.sandboxBackup?.status === 'running';
           if (waiting) {
-            assert(Date.now() < deadline, `Timed out waiting for project ${id} operations and disk backup before cleanup`);
+            assert(Date.now() < deadline, `Timed out waiting for project ${id} operations and disk backup before DELETE`);
             await delay(250, undefined, { signal }); continue;
           }
           assert(!['unknown', 'failed'].includes(project.sandboxOperation?.status),
             `Project ${id} has a ${project.sandboxOperation?.status ?? 'unknown'} sandbox operation; cleanup will not replay it`);
           assert(!['failed', 'unknown'].includes(project.sandboxBackup?.status),
-            `Project ${id} disk backup failed: ${project.sandboxBackup?.error ?? 'unknown error'}`);
-          if (project.sandbox && project.status !== 'archived') {
-            assert(['ready', 'paused'].includes(project.sandbox.status),
-              `Project ${id} sandbox is ${project.sandbox.status}; cleanup will leave it for an operator`);
-            if (project.sandbox.status === 'ready' && !checkpointSubmitted) {
-              const checkpoint = await this.json(`/api/projects/${id}/sandbox/checkpoint`, {
-                method: 'POST', timeoutMs: this.config.operationTimeout, signal,
-              });
-              assert.equal(checkpoint.sandboxOperation?.kind, 'checkpoint');
-              assert.equal(checkpoint.sandboxOperation?.status, 'succeeded',
-                `Cleanup checkpoint for project ${id} did not succeed`);
-              assert.equal(checkpoint.sandbox?.status, 'paused');
-              checkpointSubmitted = true;
-              continue;
-            }
-            if (!backupId) {
-              const backedUp = await this.json(`/api/projects/${id}/backup`, {
-                method: 'POST', timeoutMs: this.config.operationTimeout, signal,
-              });
-              assert.equal(backedUp.sandboxOperation?.kind, 'backup');
-              assert.equal(backedUp.sandboxOperation?.status, 'succeeded', `Cleanup backup for project ${id} did not succeed`);
-              backupId = backedUp.sandboxOperation.id;
-              assert(backupId, 'Cleanup backup has no operation ID');
-              assert.equal(backedUp.sandboxBackup?.id, backupId);
-              assert.equal(backedUp.sandboxBackup?.sandboxId, project.sandbox.id);
-              assert.equal(backedUp.sandboxBackup?.status, 'succeeded');
-              continue;
-            }
-            assert.equal(project.sandboxBackup?.id, backupId, 'Cleanup backup observation was replaced');
-            assert.equal(project.sandboxBackup?.status, 'succeeded');
-            const archived = await this.json(`/api/projects/${id}/archive`, {
-              method: 'POST', timeoutMs: this.config.operationTimeout, signal, body: { useExistingBackup: true },
-            });
-            assert.equal(archived.status, 'archived', `Project ${id} was not archived after its explicit cleanup backup`);
-            continue;
-          }
-          assert(!project.sandbox, `Archived project ${id} still has a sandbox; cleanup will leave it for an operator`);
+            `Project ${id} disk backup result is ${project.sandboxBackup?.status ?? 'unknown'}; cleanup will not replay it`);
+          beforeDelete = project;
+          const retainedBefore = (project.remoteArchives ?? []).map(reference => ({
+            id: reference.id, storageType: reference.storageType ?? 'cellbox',
+            volumeId: reference.volumeId, snapshotId: reference.snapshotId,
+          }));
           await this.json(`/api/projects/${id}`, { method: 'DELETE', timeoutMs: this.config.operationTimeout, signal });
           await this.request(`/api/projects/${id}`, { signal, expectedStatus: 404 });
+          const archiveIndex = await this.json('/api/archives', { signal });
+          const retained = archiveIndex.filter(item => item.projectId === id).flatMap(item => item.archives ?? []);
+          const retainedSnapshots = retained.map(reference => ({
+            id: reference.key, storageType: reference.storageType,
+            volumeId: reference.volumeId, snapshotId: reference.snapshotId,
+          }));
+          const mounts = beforeDelete.sandboxMounts ?? beforeDelete.sandbox?.mounts ?? [];
+          const knownVolumeIds = new Set([
+            ...mounts.map(mount => mount.volumeId),
+            ...(beforeDelete.remoteArchives ?? []).flatMap(reference => reference.volumeId ? [reference.volumeId] : []),
+          ]);
+          for (const volumeId of knownVolumeIds) {
+            assert(retainedSnapshots.some(reference => reference.volumeId === volumeId),
+              `Project ${id} DELETE did not retain a snapshot for Volume ${volumeId}`);
+          }
+          if (!mounts.length && retainedBefore.length) {
+            const latestExisting = retainedBefore[0];
+            assert(retainedSnapshots.some(reference => reference.id === latestExisting.id),
+              `Project ${id} DELETE pruned the latest existing recovery snapshot ${latestExisting.id}`);
+          }
+          this.report.cleanup.push({ projectId: id, status: 'deleted_retained_backups', retainedSnapshots });
           break;
         }
-        this.report.cleanup.push({ projectId: id, status: 'deleted' });
+        if (!beforeDelete) this.report.cleanup.push({ projectId: id, status: 'already_removed' });
       } catch (error) { const message = this.redact(error.message); errors.push(message); this.report.cleanup.push({ projectId: id, status: 'failed', error: message }); }
     }
     if (!this.config.keepProjects && this.boxes.size) {

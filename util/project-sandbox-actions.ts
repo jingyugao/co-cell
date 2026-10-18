@@ -52,9 +52,12 @@ export function projectSandboxActions(project: ProjectSummary) {
     .map(id => {
       let disabledReason: string | undefined;
       if (id === 'backup') {
-        if (state === 'released') disabledReason = 'Cellbox 暂不支持直接备份已释放环境的挂载盘';
-        else if (state !== 'paused' && project.sandbox?.phase !== 'failed') disabledReason = '当前 Sandbox 状态不支持备份，请刷新状态';
-        else if (project.sandboxBackup?.status === 'running' && project.sandboxBackup.sandboxId === project.sandbox?.id) disabledReason = '磁盘备份正在进行中';
+        if (state === 'released' && !project.sandboxMounts?.length) disabledReason = '当前未记录可备份的挂载盘';
+        else if (state !== 'released' && state !== 'paused' && project.sandbox?.phase !== 'failed') disabledReason = '当前 Sandbox 状态不支持备份，请刷新状态';
+        else if (project.sandboxBackup?.status === 'running' && (
+          project.sandbox && project.sandboxBackup.sandboxId === project.sandbox.id
+          || project.sandboxBackup.volumeId && (project.sandbox?.mounts ?? project.sandboxMounts ?? []).some(mount => mount.volumeId === project.sandboxBackup!.volumeId)
+        )) disabledReason = '磁盘备份正在进行中';
       }
       return { id, label: actionLabels[id], disabledReason };
     });

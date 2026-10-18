@@ -10,7 +10,7 @@ import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import type { SessionManager } from '../sessions/manager.js';
 import { installArchiveRoutes } from './archives.js';
 
-test('archive routes expose only project-owned Cellbox references and clean private downloads', async () => {
+test('legacy archive routes expose the live archive directory and clean private downloads', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-archive-route-'));
   try {
     await writeFile(join(directory, 'note.txt'), 'note');
@@ -25,7 +25,8 @@ test('archive routes expose only project-owned Cellbox references and clean priv
     const calls: string[] = [];
     let downloadedPath: string | undefined;
     const manager = {
-      listProjects: () => [{ id: 'project-1', name: 'Project', remoteArchives: [reference] }],
+      listProjects: () => { throw new Error('archive listing must use the live backup directory'); },
+      async listArchiveProjects() { return [{ id: 'project-1', name: 'Project', remoteArchives: [reference] }]; },
       remoteArchives: {
         async inspect(value: RemoteArchiveRef) {
           calls.push(`inspect:${value.id}`);
@@ -38,13 +39,13 @@ test('archive routes expose only project-owned Cellbox references and clean priv
           await writeFile(path, bytes);
         },
       },
-      async pruneArchivedProjectArchives() { return 0; },
     } as unknown as SessionManager;
     const app = new Hono();
     installArchiveRoutes(app, manager);
 
     assert.equal((await app.request('/api/archives')).status, 200);
     assert.equal((await app.request(`/api/archives/${reference.id}/versions`)).status, 200);
+    assert.equal((await app.request('/api/archives/prune', { method: 'POST' })).status, 404);
     const unknown = 'arc-cccccccccccccccccccccccccccccccc';
     assert.equal((await app.request(`/api/archives/${unknown}/versions`)).status, 404);
     assert.equal((await app.request(`/api/archives/${unknown}/files`)).status, 404);
@@ -58,4 +59,47 @@ test('archive routes expose only project-owned Cellbox references and clean priv
     assert.ok(downloadedPath);
     await assert.rejects(stat(downloadedPath!));
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('volume backups preserve unknown size and reject file browsing without remote calls', async () => {
+  const reference: RemoteArchiveRef = {
+    storageType: 'cellbox-volume', id: 'volume:vol-a:backup-a', volumeId: 'vol-a', snapshotId: 'a'.repeat(64),
+    ownerKey: 'project:project-1:home', profileId: 'profile-a', mounts: [{ volumeId: 'vol-a', mountPath: '/home/agent' }],
+    createdAt: '2026-10-18T01:00:00.000Z', threadIds: ['thread-1'], addedBytes: 27,
+  };
+  let remoteCalls = 0;
+  const manager = {
+    async listArchiveProjects() { return [{ id: 'project-1', name: 'Project', remoteArchives: [reference] }]; },
+    remoteArchives: {
+      async inspect() { remoteCalls++; throw new Error('must not inspect a volume backup for file browsing'); },
+      async download() { remoteCalls++; throw new Error('must not download a volume backup'); },
+    },
+  } as unknown as SessionManager;
+  const app = new Hono();
+  installArchiveRoutes(app, manager);
+
+  const listing = await app.request('/api/archives');
+  const projectArchives = (await listing.json())[0].archives;
+  assert.equal(projectArchives[0].size, undefined);
+  assert.equal(projectArchives[0].browsable, false);
+  assert.equal(projectArchives[0].storageType, 'cellbox-volume');
+  assert.equal(projectArchives[0].volumeId, reference.volumeId);
+  assert.equal(projectArchives[0].snapshotId, reference.snapshotId);
+  assert.equal(projectArchives[0].addedBytes, 27);
+
+  const versions = await app.request(`/api/archives/${reference.id}/versions`);
+  const version = (await versions.json())[0];
+  assert.equal(version.sizeBytes, undefined);
+  assert.equal(version.bytesAdded, 27);
+  assert.equal(version.browsable, false);
+  assert.equal(version.storageType, 'cellbox-volume');
+  assert.equal(version.volumeId, reference.volumeId);
+  assert.equal(version.snapshotId, reference.snapshotId);
+
+  for (const path of ['files', 'file']) {
+    const response = await app.request(`/api/archives/${reference.id}/${path}`);
+    assert.equal(response.status, 422);
+    assert.match((await response.json()).error, /暂不支持文件浏览/);
+  }
+  assert.equal(remoteCalls, 0);
 });

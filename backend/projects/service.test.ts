@@ -184,12 +184,12 @@ test('project can be viewed and edited while a Sandbox operation is running', as
   await service.init();
 
   assert.equal(service.get(value.id).sandboxOperation?.status, 'running');
-  await service.update('project-1', { name: 'Renamed during resume', backupRetentionCount: 7 });
+  await service.update('project-1', { name: 'Renamed during resume', status: 'completed' });
   assert.equal(service.get('project-1').name, 'Renamed during resume');
-  assert.equal(service.get('project-1').backupRetentionCount, 7);
-  assert.equal(service.get('project-1').sandboxOperation?.id, 'resume-1');
-  await service.update('project-1', { status: 'completed' });
   assert.equal(service.get('project-1').status, 'completed');
+  assert.equal(service.get('project-1').sandboxOperation?.id, 'resume-1');
+  await service.update('project-1', { status: 'active' });
+  assert.equal(service.get('project-1').status, 'active');
   assert.equal(service.get('project-1').sandboxOperation?.id, 'resume-1');
 });
 
@@ -228,20 +228,69 @@ test('an archived Sandbox project cannot change status directly before rebuild',
   assert.equal(service.get(value.id).lifecycleHistory, undefined);
 });
 
-test('backup retention accepts and persists counts from 2 to 100', async () => {
-  const state = new MemoryState([project()]);
-  const service = new ProjectService(state);
+test('reconciling one Cellbox volume catalog preserves other backup indexes and captured threads', async () => {
+  const value = project();
+  const snapshotId = 'a'.repeat(64);
+  const volumeA = { storageType: 'cellbox-volume' as const, id: `volume:volume-a:${snapshotId}`, volumeId: 'volume-a',
+    snapshotId, ownerKey: 'owner-a', profileId: 'profile', mounts: [{ volumeId: 'volume-a', mountPath: '/home/agent' }],
+    createdAt: '2026-09-05T00:00:00.000Z', sizeBytes: 12, addedBytes: 3, threadIds: ['thread-a'] };
+  const volumeB = { ...volumeA, id: `volume:volume-b:${snapshotId}`, volumeId: 'volume-b', snapshotId,
+    mounts: [{ volumeId: 'volume-b', mountPath: '/home/agent' }], threadIds: ['thread-b'] };
+  const legacy = { id: 'legacy-archive', createdAt: '2026-09-04T00:00:00.000Z', sizeBytes: 99,
+    sha256: 'b'.repeat(64), imageId: 'image', sourceSandboxId: 'sandbox-old', threadIds: ['thread-legacy'], storageType: 'oss' as const };
+  value.remoteArchives = [volumeA, volumeB, legacy];
+  const service = new ProjectService(new MemoryState([value]));
   await service.init();
 
-  for (const count of [1, 101, 2.5]) {
-    await assert.rejects(service.update('project-1', { backupRetentionCount: count }), /备份保留数量/);
-  }
-  assert.equal(service.get('project-1').backupRetentionCount, undefined);
+  await service.reconcileVolumeBackups(value.id, 'volume-a', [{ ...volumeA, sizeBytes: undefined, addedBytes: undefined,
+    threadIds: [] }]);
+  const refs = service.get(value.id).remoteArchives ?? [];
+  assert.equal(refs.length, 3);
+  const refreshed = refs.find(ref => ref.storageType === 'cellbox-volume' && ref.volumeId === 'volume-a');
+  assert.ok(refreshed && refreshed.storageType === 'cellbox-volume');
+  assert.deepEqual(refreshed.threadIds, ['thread-a']);
+  assert.equal(refreshed.sizeBytes, undefined);
+  assert.equal(refreshed.addedBytes, undefined);
+  assert.equal('sha256' in refreshed, false);
+  assert.ok(refs.some(ref => ref.storageType === 'cellbox-volume' && ref.volumeId === 'volume-b' && ref.threadIds.includes('thread-b')));
+  assert.ok(refs.some(ref => ref.id === 'legacy-archive' && ref.threadIds.includes('thread-legacy')));
+});
 
-  await service.update('project-1', { backupRetentionCount: 2 });
-  assert.equal(state.projects[0].backupRetentionCount, 2);
-  await service.update('project-1', { backupRetentionCount: 100 });
-  assert.equal(service.get('project-1').backupRetentionCount, 100);
+test('binding a restored volume clears its matching pending cleanup record', async () => {
+  const value = project();
+  delete value.sandbox;
+  value.sandboxReclaimedAt = '2026-09-04T00:00:00.000Z';
+  value.pendingVolumeCleanup = ['restored-volume', 'unrelated-volume'];
+  const service = new ProjectService(new MemoryState([value]));
+  await service.init();
+
+  await service.updateSandbox(value.id, { ...value.sandbox!, id: 'restored-sandbox',
+    mounts: [{ volumeId: 'restored-volume', mountPath: '/home/agent' }] }, true);
+  assert.deepEqual(service.get(value.id).pendingVolumeCleanup, ['unrelated-volume']);
+});
+
+test('removed projects require completed volume cleanup and retain backup recovery metadata', async () => {
+  const value = project();
+  delete value.sandbox;
+  value.sandboxMounts = [{ volumeId: 'volume-to-clean', mountPath: '/home/agent' }];
+  value.pendingVolumeCleanup = ['volume-to-clean'];
+  value.remoteArchives = [{ storageType: 'cellbox-volume', id: `volume:volume-to-clean:${'c'.repeat(64)}`,
+    volumeId: 'volume-to-clean', snapshotId: 'c'.repeat(64), ownerKey: 'owner', profileId: 'profile',
+    mounts: [{ volumeId: 'volume-to-clean', mountPath: '/home/agent' }], createdAt: '2026-09-05T00:00:00.000Z',
+    threadIds: ['thread-recovery'] }];
+  const service = new ProjectService(new MemoryState([value]));
+  await service.init();
+
+  await assert.rejects(service.markRemoved(value.id), /仍有磁盘或运行环境待清理/);
+  await service.finishVolumeCleanup(value.id, 'volume-to-clean');
+  await service.markRemoved(value.id);
+  assert.equal(service.list().some(item => item.id === value.id), false);
+  const removed = service.list({ includeRemoved: true }).find(item => item.id === value.id);
+  assert.ok(removed?.removedAt);
+  assert.equal(removed?.sandboxMounts, undefined);
+  assert.equal(removed?.pendingVolumeCleanup?.length ?? 0, 0);
+  assert.equal(removed?.remoteArchives?.[0]?.id, value.remoteArchives[0].id);
+  assert.deepEqual(removed?.remoteArchives?.[0]?.threadIds, ['thread-recovery']);
 });
 
 test('weekly projects use a normal existence check and labels follow China week boundaries', async () => {

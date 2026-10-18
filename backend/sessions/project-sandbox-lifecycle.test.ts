@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { Hono } from 'hono';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Project, ProjectSummary, Session, Settings } from '../../protocol/types.js';
 import type { SandboxMount, SandboxState } from '../../protocol/sandbox-types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
@@ -313,4 +314,114 @@ test('single-API idle checkpoint only pauses and never captures disk', async () 
     assert.equal(paused, false, 'a successful explicit resume starts a new idle interval');
     assert.equal(manager.getProject('idle-project').sandboxOperation?.kind, 'resume');
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('deleting a completed project releases, backs up, removes its volume, and keeps only its recovery catalog', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-delete-volume-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const at = new Date().toISOString();
+  const mounts: SandboxMount[] = [{ volumeId: 'completed-volume', mountPath: '/home/agent' }];
+  const box: SandboxState = { id: 'completed-box', status: 'ready', template: 'default',
+    workingDirectory: defaults.workingDirectory, mounts };
+  const project: Project = { id: 'completed-project', name: 'Completed project', type: 1, requirementUrl: null,
+    status: 'completed', completedAt: at, archivedAt: null, executionMode: 'sandbox', workingDirectory: defaults.workingDirectory,
+    sandbox: box, sandboxMounts: mounts, sandboxOwnerKey: 'owner-key', createdAt: at, updatedAt: at };
+  const session: Session = { id: 'completed-session', projectId: project.id, threadId: 'thread-to-recover', title: 'Thread',
+    settings: defaults, status: 'idle', startedAt: at, archivedAt: null, createdAt: at, updatedAt: at, turns: [], sandbox: box };
+  await state.saveProject(project);
+  await state.saveSession(session);
+  const calls: string[] = [];
+  const backupId = 'd'.repeat(64);
+  const backup = { storageType: 'cellbox-volume' as const, id: `volume:${mounts[0].volumeId}:${backupId}`,
+    volumeId: mounts[0].volumeId, snapshotId: backupId, ownerKey: 'owner-key', profileId: 'profile', mounts,
+    createdAt: at, threadIds: [] as string[] };
+  const candidate: SandboxState = { id: 'restored-box', status: 'ready', template: 'default',
+    workingDirectory: defaults.workingDirectory, mounts };
+  let restoredThreadIds: string[] | undefined;
+  const runtime = {
+    async close() {},
+    async release() { calls.push('release'); return { ...box, status: 'unavailable' as const }; },
+    async verifySandbox() {}, async fenceSandbox() {}, async detachSandbox() {},
+    remoteArchives: {
+      async capture(target) { calls.push('backup'); assert.deepEqual(target.sandboxMounts, mounts); return backup; },
+      async inspect(ref) { return ref; }, async activate() {},
+      async removeVolume(volumeId: string) { calls.push(`delete-volume:${volumeId}`); },
+      async restore(_target, ref) { calls.push('restore'); restoredThreadIds = ref.threadIds; return candidate; },
+  },
+  } satisfies Partial<SandboxRuntime>;
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
+  const app = new Hono();
+  app.onError((error, c) => c.json({ error: error.message }, ((error as { status?: number }).status ?? 500) as ContentfulStatusCode));
+  installProjectsRoutes(app, manager);
+  try {
+    await manager.init();
+    const response = await app.request(`/api/projects/${project.id}`, { method: 'DELETE' });
+    assert.equal(response.status, 200);
+    await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
+    assert.deepEqual(calls, ['release', 'backup', `delete-volume:${mounts[0].volumeId}`]);
+    assert.equal(manager.listProjects().some(item => item.id === project.id), false);
+    assert.equal(manager.list().some(item => item.id === session.id), false);
+    assert.equal((await state.listSessions()).some(item => item.id === session.id), false);
+    assert.equal((await app.request(`/api/projects/${project.id}`)).status, 404);
+    const recovery = (await manager.listArchiveProjects()).find(item => item.id === project.id);
+    assert.ok(recovery?.removedAt);
+    assert.deepEqual(recovery?.remoteArchives?.[0]?.threadIds, ['thread-to-recover']);
+    assert.equal(recovery?.archiveVersions?.[0]?.id, backup.id);
+
+    await manager.restoreProjectSandbox(project.id);
+    assert.equal(manager.getProject(project.id).removedAt, undefined);
+    assert.equal(manager.listProjects().some(item => item.id === project.id), true);
+    assert.equal(manager.getProject(project.id).sandbox?.id, candidate.id);
+    assert.deepEqual(restoredThreadIds, ['thread-to-recover']);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('BUSY and UNKNOWN backup outcomes keep the removed project recoverable and never delete its volume', async () => {
+  for (const code of ['BUSY', 'UNKNOWN_OUTCOME'] as const) {
+    const directory = await mkdtemp(join(tmpdir(), `cocell-delete-backup-${code.toLowerCase()}-`));
+    const state = new MemoryWebStateStore();
+    const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+      modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+    const at = new Date().toISOString();
+    const mounts: SandboxMount[] = [{ volumeId: 'protected-volume', mountPath: '/home/agent' }];
+    const box: SandboxState = { id: 'protected-box', status: 'ready', template: 'default',
+      workingDirectory: defaults.workingDirectory, mounts };
+    const project: Project = { id: `protected-${code.toLowerCase()}`, name: 'Protected completed project', type: 1,
+      requirementUrl: null, status: 'completed', completedAt: at, archivedAt: null, executionMode: 'sandbox',
+      workingDirectory: defaults.workingDirectory, sandbox: box, sandboxMounts: mounts, createdAt: at, updatedAt: at };
+    const session: Session = { id: `protected-session-${code.toLowerCase()}`, projectId: project.id, threadId: 'thread-kept',
+      title: 'Thread', settings: defaults, status: 'idle', startedAt: at, archivedAt: null, createdAt: at, updatedAt: at,
+      turns: [], sandbox: box };
+    await state.saveProject(project);
+    await state.saveSession(session);
+    let captures = 0, volumeDeletes = 0;
+    const runtime = {
+      async close() {},
+      async release() { return { ...box, status: 'unavailable' as const }; },
+      remoteArchives: {
+        async capture() { captures++; throw new CellboxError(code, `Cellbox backup ${code}`, code === 'BUSY' ? 409 : 502); },
+        async inspect(ref) { return ref; }, async activate() {},
+        async restore() { assert.fail('failed backup must not proceed to restore'); },
+        async removeVolume() { volumeDeletes++; },
+      },
+    } satisfies Partial<SandboxRuntime>;
+    const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
+    const app = new Hono(); installProjectsRoutes(app, manager);
+    try {
+      await manager.init();
+      const response = await app.request(`/api/projects/${project.id}`, { method: 'DELETE' });
+      assert.notEqual(response.status, 200, `${code} must not report project deletion as successful`);
+      await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
+      assert.equal(captures, 1, `${code} backup is submitted once`);
+      assert.equal(volumeDeletes, 0, `${code} must stop before disk deletion`);
+      assert.equal(manager.listProjects().some(item => item.id === project.id), true);
+      assert.equal(manager.list().some(item => item.id === session.id), true);
+      assert.equal((await state.listSessions()).some(item => item.id === session.id), true);
+      assert.equal(manager.getProject(project.id).removedAt, undefined);
+      assert.equal(manager.getProject(project.id).sandboxOperation?.errorCode, code);
+      assert.equal(manager.getProject(project.id).sandboxOperation?.status, code === 'UNKNOWN_OUTCOME' ? 'unknown' : 'failed');
+    } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+  }
 });

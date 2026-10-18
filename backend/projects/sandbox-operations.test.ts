@@ -9,10 +9,15 @@ import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 import { ProjectService } from './service.js';
 import { ProjectSandboxOperations } from './sandbox-operations.js';
 import { CellboxError } from '../../packages/sandbox/src/providers/cellbox/client.js';
+import { BackupCatalogUnavailable } from '../sandboxes/cellbox-volume-backups.js';
 
 const workspace = '/home/agent/workspace';
 const box = (status: SandboxState['status'] = 'ready', id = 'box-old'): SandboxState => ({ id, status, template: 'test', workingDirectory: workspace });
 const archive: RemoteArchiveRef = { id: 'archive-one', sourceSandboxId: 'box-old', imageId: 'image-one', createdAt: new Date(0).toISOString(), sizeBytes: 10, sha256: 'a'.repeat(64), threadIds: ['thread-one'], portable: true };
+const volumeArchive: RemoteArchiveRef = { storageType: 'cellbox-volume', id: `volume:volume-one:${'b'.repeat(64)}`,
+  volumeId: 'volume-one', snapshotId: 'b'.repeat(64), ownerKey: 'project:project-one', profileId: 'profile-one',
+  mounts: [{ volumeId: 'volume-one', mountPath: `${workspace}/project-one` }], createdAt: '2026-10-18T00:00:00.000Z',
+  sizeBytes: 4096, addedBytes: 512, threadIds: ['thread-one'] };
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; };
 async function fixture(overrides: Partial<Project> = {}, changes: Partial<SandboxRuntime> = {}, selection?: ProjectImageSelection) {
   const store = new MemoryWebStateStore();
@@ -21,6 +26,7 @@ async function fixture(overrides: Partial<Project> = {}, changes: Partial<Sandbo
   await store.saveProject(project);
   const projects = new ProjectService(store); await projects.init();
   const calls: string[] = [];
+  const threadIds = ['thread-one'];
   const logs: Record<string, unknown>[] = [];
   let observed: SandboxState['status'] = overrides.sandbox?.status ?? 'ready';
   const runtime = {
@@ -38,17 +44,30 @@ async function fixture(overrides: Partial<Project> = {}, changes: Partial<Sandbo
       async inspect() { calls.push('inspect-archive'); return archive; },
       async restore(_target, _archive, _requestId, candidate) { const next = box('starting', 'box-new'); await candidate(next); return next; },
       async activate() { calls.push('activate'); },
-      async download() {}, async remove() { calls.push('remove-archive'); },
+      async download() {},
     },
     ...changes,
   } satisfies SandboxRuntime;
-  const operations = new ProjectSandboxOperations({ projects, runtime, logger: { async write(record) { logs.push(record); } }, threadIds: () => ['thread-one'],
+  const operations = new ProjectSandboxOperations({ projects, runtime, logger: { async write(record) { logs.push(record); } }, threadIds: () => [...threadIds],
     ...(selection ? { selectRestoreImage: async () => ({ selection, release() {} }) } : {}),
     async saveSandbox(id, value, restore, image, expectedId) {
       if (!await projects.updateSandbox(id, value, restore, image, expectedId)) throw new Error('Project binding changed');
     }, detached: async () => { calls.push('detached'); } });
-  return { store, projects, operations, calls, runtime, logs, async close() { await operations.close(); await projects.close(); await store.close(); } };
+  return { store, projects, operations, calls, runtime, logs, threadIds, async close() { await operations.close(); await projects.close(); await store.close(); } };
 }
+
+test('backup records threads known before submission rather than threads created while waiting', async () => {
+  const captured = deferred(), release = deferred();
+  const f = await fixture({ sandbox: undefined, sandboxMounts: volumeArchive.mounts });
+  f.runtime.remoteArchives.capture = async () => { captured.resolve(); await release.promise; return volumeArchive; };
+  try {
+    const request = f.operations.run('project-one', 'backup');
+    await captured.promise;
+    f.threadIds.push('thread-after-capture');
+    release.resolve(); await request;
+    assert.deepEqual(f.projects.get('project-one').remoteArchives?.[0].threadIds, ['thread-one']);
+  } finally { release.resolve(); await f.close(); }
+});
 
 test('an explicit resume submits once and reports its runtime result', async () => {
   const f = await fixture({ sandbox: box('paused') });
@@ -126,14 +145,20 @@ test('checkpoint only pauses and permits the first explicit resume without captu
   } finally { await f.close(); }
 });
 
-test('explicit disk backup records progress independently and leaves the sandbox paused', async () => {
+test('explicit backup supports retained mounts with no Sandbox and stores native optional measurements', async () => {
   const captured = deferred(), release = deferred();
-  const f = await fixture({ sandbox: box('paused') });
-  f.runtime.remoteArchives.capture = async () => { f.calls.push('capture'); captured.resolve(); await release.promise; return archive; };
+  const f = await fixture({ sandbox: undefined, sandboxMounts: volumeArchive.storageType === 'cellbox-volume' ? volumeArchive.mounts : [] });
+  f.runtime.remoteArchives.capture = async (_target, _key, options) => {
+    f.calls.push('capture');
+    await options?.onOperation?.('cellbox-op-backup', 'volume-one');
+    captured.resolve(); await release.promise; return volumeArchive;
+  };
   try {
     const accepted = await f.operations.start('project-one', 'backup');
     await captured.promise;
     assert.equal(f.projects.get('project-one').sandboxBackup?.status, 'running');
+    assert.equal(f.projects.get('project-one').sandboxBackup?.remoteOperationId, 'cellbox-op-backup');
+    assert.equal(f.projects.get('project-one').sandboxBackup?.volumeId, 'volume-one');
     await f.projects.update('project-one', { name: 'Still editable' });
     release.resolve(); await accepted.done;
     const project = f.projects.get('project-one');
@@ -141,24 +166,69 @@ test('explicit disk backup records progress independently and leaves the sandbox
     assert.equal(project.sandboxOperation?.status, 'succeeded');
     assert.equal(project.sandboxBackup?.status, 'succeeded');
     assert.equal(project.sandboxBackup?.id, project.sandboxOperation?.id);
-    assert.equal((await f.runtime.querySandbox(project.sandbox!)).status, 'paused');
-    assert.deepEqual(f.calls, ['capture', 'inspect-archive']);
+    assert.equal(project.sandboxBackup?.snapshotId, volumeArchive.storageType === 'cellbox-volume' ? volumeArchive.snapshotId : undefined);
+    assert.equal(project.sandboxBackup?.sizeBytes, 4096);
+    assert.equal(project.sandboxBackup?.addedBytes, 512);
+    assert.equal(project.remoteArchives?.[0].id, volumeArchive.id);
+    assert.equal(project.sandbox, undefined);
+    assert.deepEqual(f.calls, ['capture']);
   } finally { release.resolve(); await f.close(); }
 });
 
-test('an unknown explicit backup is visible and is never retried automatically', async () => {
-  const f = await fixture({ sandbox: box('paused') });
+for (const code of ['BUSY', 'UNKNOWN_OUTCOME'] as const) test(`backup ${code} comes from capture, is visible, and is never retried`, async () => {
+  const f = await fixture({ sandbox: undefined, sandboxMounts: volumeArchive.storageType === 'cellbox-volume' ? volumeArchive.mounts : [] });
   let captures = 0;
-  f.runtime.remoteArchives.capture = async () => { captures++; throw new CellboxError('UNKNOWN_OUTCOME', 'archive result unknown'); };
+  f.runtime.remoteArchives.capture = async (_target, _key, options) => {
+    captures++;
+    await options?.onOperation?.('cellbox-op-backup', 'volume-one');
+    throw new CellboxError(code, `capture returned ${code}`);
+  };
   try {
-    await assert.rejects(f.operations.run('project-one', 'backup'), /archive result unknown/);
+    await assert.rejects(f.operations.run('project-one', 'backup'), error => error instanceof CellboxError && error.code === code);
     const project = f.projects.get('project-one');
-    assert.equal(project.sandboxOperation?.status, 'unknown');
-    assert.equal(project.sandboxBackup?.status, 'unknown');
-    assert.equal((await f.runtime.querySandbox(project.sandbox!)).status, 'paused');
-    assert.match(project.sandboxBackup?.error ?? '', /archive result unknown/);
+    assert.equal(project.sandboxOperation?.status, code === 'UNKNOWN_OUTCOME' ? 'unknown' : 'failed');
+    assert.equal(project.sandboxBackup?.status, code === 'UNKNOWN_OUTCOME' ? 'unknown' : 'failed');
+    assert.equal(project.sandboxOperation?.remoteOperationId, 'cellbox-op-backup');
+    assert.equal(project.sandboxBackup?.remoteOperationId, 'cellbox-op-backup');
+    assert.match(project.sandboxBackup?.error ?? '', new RegExp(`capture returned ${code}`));
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(captures, 1);
+  } finally { await f.close(); }
+});
+
+test('native retention warning keeps the successful backup successful', async () => {
+  const f = await fixture({ sandbox: undefined, sandboxMounts: volumeArchive.storageType === 'cellbox-volume' ? volumeArchive.mounts : [] });
+  f.runtime.remoteArchives.capture = async () => ({ ...volumeArchive, retentionError: 'retention pruning failed' });
+  try {
+    await f.operations.run('project-one', 'backup');
+    const project = f.projects.get('project-one');
+    assert.equal(project.sandboxOperation?.status, 'succeeded');
+    assert.equal(project.sandboxBackup?.status, 'succeeded');
+    assert.equal(project.sandboxBackup?.retentionError, 'retention pruning failed');
+    assert.equal(project.remoteArchives?.[0].id, volumeArchive.id);
+    assert.equal('retentionError' in (project.remoteArchives?.[0] ?? {}), false, 'operation warning is not stored in the native archive pointer');
+  } finally { await f.close(); }
+});
+
+test('catalog failure records the native snapshot identity as successful data and does not clean it up', async () => {
+  const f = await fixture({ sandbox: undefined, sandboxMounts: volumeArchive.storageType === 'cellbox-volume' ? volumeArchive.mounts : [] });
+  f.runtime.remoteArchives.capture = async (_target, _key, options) => {
+    await options?.onOperation?.('cellbox-op-backup', 'volume-one');
+    throw new BackupCatalogUnavailable('volume-one', 'c'.repeat(64), new Error('catalog read failed'));
+  };
+  f.runtime.remoteArchives.removeVolume = async id => { f.calls.push(`delete-volume:${id}`); };
+  try {
+    await assert.rejects(f.operations.run('project-one', 'backup'), BackupCatalogUnavailable);
+    const project = f.projects.get('project-one');
+    assert.equal(project.sandboxOperation?.status, 'failed');
+    assert.equal(project.sandboxOperation?.volumeId, 'volume-one');
+    assert.equal(project.sandboxOperation?.snapshotId, 'c'.repeat(64));
+    assert.equal(project.sandboxBackup?.status, 'succeeded');
+    assert.equal(project.sandboxBackup?.volumeId, 'volume-one');
+    assert.equal(project.sandboxBackup?.snapshotId, 'c'.repeat(64));
+    assert.match(project.sandboxBackup?.catalogError ?? '', /暂时无法读取备份详情/);
+    assert.deepEqual(f.calls, []);
+    assert.equal(project.sandboxMounts?.[0]?.volumeId, 'volume-one');
   } finally { await f.close(); }
 });
 
@@ -179,7 +249,7 @@ test('a concurrent BUSY resume does not turn a completed backup into a metadata 
     assert.equal(project.sandboxOperation?.errorCode, 'BUSY');
     assert.equal(project.sandboxBackup?.status, 'succeeded');
     assert.equal(project.remoteArchives?.[0].id, archive.id);
-    assert.deepEqual(f.calls, ['capture', 'inspect-archive']);
+    assert.deepEqual(f.calls, ['capture']);
     const finished = f.logs.filter(record => record.event === 'sandbox.operation_phase' && record.status !== 'running');
     assert.deepEqual(finished.map(record => [record.operation, record.status]), [['resume', 'failed'], ['backup', 'succeeded']]);
     assert.equal(new Set(finished.map(record => record.operationId)).size, 2);
@@ -200,30 +270,68 @@ test('checkpoint delegates even when local state is paused and status/App Server
   } finally { await f.close(); }
 });
 
-test('running disk backup is rejected without checkpoint or archive capture', async () => {
-  const f = await fixture();
+test('backup delegates live Sandbox consistency to Cellbox without local status preflight', async () => {
+  const f = await fixture({ sandbox: { ...box('ready'), phase: 'running' }, sandboxMounts: volumeArchive.storageType === 'cellbox-volume' ? volumeArchive.mounts : [] });
   try {
-    await assert.rejects(f.operations.run('project-one', 'backup'), /请先暂停/);
-    assert.deepEqual(f.calls, []);
-    assert.equal(f.projects.get('project-one').sandboxBackup, undefined);
-  } finally { await f.close(); }
-});
-
-test('a failed sandbox can be backed up without checkpoint or resume', async () => {
-  const f = await fixture({ sandbox: { ...box('unavailable'), phase: 'failed' } });
-  try {
+    f.runtime.querySandbox = async () => { assert.fail('backup must not preflight Sandbox state'); };
+    f.runtime.remoteArchives.capture = async () => { f.calls.push('capture'); return volumeArchive; };
     await f.operations.run('project-one', 'backup');
     assert.equal(f.projects.get('project-one').sandboxBackup?.status, 'succeeded');
-    assert.deepEqual(f.calls, ['capture', 'inspect-archive']);
+    assert.deepEqual(f.calls, ['capture']);
   } finally { await f.close(); }
 });
 
-test('running disk-only archive is explicitly unsupported without implicit checkpoint', async () => {
-  const f = await fixture();
+test('archive captures a native volume without checkpointing or relying on Sandbox survival', async () => {
+  const f = await fixture({ sandbox: box('ready'), sandboxMounts: volumeArchive.storageType === 'cellbox-volume' ? volumeArchive.mounts : [] });
+  f.runtime.remoteArchives.capture = async () => { f.calls.push('capture'); return volumeArchive; };
   try {
-    await assert.rejects(f.operations.run('project-one', 'archive'), /不支持无 Checkpoint/);
-    assert.deepEqual(f.calls, []);
-    assert.equal(f.projects.get('project-one').status, 'active');
+    await f.operations.run('project-one', 'archive');
+    assert.equal(f.projects.get('project-one').status, 'archived');
+    assert.equal(f.projects.get('project-one').remoteArchives?.[0].id, volumeArchive.id);
+    assert.equal(f.calls.includes('checkpoint'), false);
+    assert.equal(f.calls.filter(call => call === 'capture').length, 1);
+  } finally { await f.close(); }
+});
+
+test('delete releases the Box, records a native backup, then deletes the retained volume', async () => {
+  const retainedMount = { volumeId: 'volume-one', mountPath: `${workspace}/project-one` };
+  const f = await fixture({ sandbox: { ...box('ready'), mounts: [retainedMount] }, sandboxMounts: [retainedMount] });
+  f.runtime.release = async () => { f.calls.push('release'); return { ...box('paused'), mounts: [retainedMount] }; };
+  f.runtime.remoteArchives.capture = async (_target, _key, options) => {
+    f.calls.push('capture'); await options?.onOperation?.('backup-op', 'volume-one'); return volumeArchive;
+  };
+  f.runtime.remoteArchives.removeVolume = async id => {
+    assert.equal(id, 'volume-one');
+    const project = f.projects.get('project-one');
+    assert.equal(project.remoteArchives?.[0].id, volumeArchive.id, 'the native snapshot is committed before volume deletion');
+    assert.ok(project.pendingVolumeCleanup?.includes(id));
+    f.calls.push('delete-volume');
+  };
+  try {
+    await f.operations.run('project-one', 'delete');
+    assert.deepEqual(f.calls.filter(call => ['release', 'capture', 'delete-volume'].includes(call)), ['release', 'capture', 'delete-volume']);
+    const project = f.projects.get('project-one');
+    assert.equal(project.status, 'archived');
+    assert.equal(project.sandbox, undefined);
+    assert.equal(project.pendingVolumeCleanup?.includes('volume-one'), false);
+    assert.ok(project.sandboxArtifactsCleanedAt);
+  } finally { await f.close(); }
+});
+
+for (const code of ['BUSY', 'UNKNOWN_OUTCOME'] as const) test(`delete stops after ${code} backup result and preserves the volume`, async () => {
+  const retainedMount = { volumeId: 'volume-one', mountPath: `${workspace}/project-one` };
+  const f = await fixture({ sandbox: { ...box('ready'), mounts: [retainedMount] }, sandboxMounts: [retainedMount] });
+  f.runtime.release = async () => { f.calls.push('release'); return { ...box('paused'), mounts: [retainedMount] }; };
+  f.runtime.remoteArchives.capture = async () => { f.calls.push('capture'); throw new CellboxError(code, `backup ${code}`); };
+  f.runtime.remoteArchives.removeVolume = async () => { f.calls.push('delete-volume'); };
+  try {
+    await assert.rejects(f.operations.run('project-one', 'delete'), error => error instanceof CellboxError && error.code === code);
+    assert.deepEqual(f.calls, ['release', 'capture']);
+    const project = f.projects.get('project-one');
+    assert.equal(project.sandbox, undefined, 'release completed before the backup was attempted');
+    assert.equal(project.sandboxMounts?.[0]?.volumeId, 'volume-one');
+    assert.notEqual(project.status, 'archived');
+    assert.equal(project.pendingVolumeCleanup?.includes('volume-one') ?? false, false);
   } finally { await f.close(); }
 });
 
@@ -298,6 +406,27 @@ test('restore verification failure leaves both source and failed candidate visib
     assert.equal(f.calls.some(call => call.startsWith('delete:')), false);
     assert.equal(f.projects.get('project-one').status, 'archived');
     assert.equal(f.projects.get('project-one').pendingSandboxCleanup?.[0]?.id, 'box-new');
+  } finally { await f.close(); }
+});
+
+test('volume restore failure keeps the new volume cleanup identity after Box creation fails', async () => {
+  const f = await fixture({ status: 'archived', sandbox: undefined, remoteArchives: [volumeArchive] });
+  f.runtime.remoteArchives.restore = async (_target, _reference, _requestId, _candidate, options) => {
+    await options?.onOperation?.('restore-op');
+    await options?.onVolume?.({ volumeId: 'restored-volume', ownerKey: 'project:project-one',
+      mounts: [{ volumeId: 'restored-volume', mountPath: `${workspace}/project-one` }] });
+    throw new Error('staged Box creation failed');
+  };
+  f.runtime.remoteArchives.removeVolume = async id => { f.calls.push(`delete-volume:${id}`); };
+  try {
+    await assert.rejects(f.operations.run('project-one', 'restore'), /staged Box creation failed/);
+    const project = f.projects.get('project-one');
+    assert.equal(project.sandboxOperation?.status, 'failed');
+    assert.equal(project.sandboxOperation?.remoteOperationId, 'restore-op');
+    assert.equal(project.sandboxOperation?.candidateVolumeId, 'restored-volume');
+    assert.deepEqual(project.pendingVolumeCleanup, ['restored-volume']);
+    assert.equal(project.status, 'archived');
+    assert.deepEqual(f.calls, [], 'failed staged restore does not automatically delete the disk');
   } finally { await f.close(); }
 });
 

@@ -11,7 +11,7 @@ import { mergeRecord } from '../infra/storage/record-merge.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 
 export type ProjectInput = { name?: string; requirementUrl?: string | null; type?: ProjectType; imageSelection?: ProjectImageSelection };
-export type ProjectUpdate = Partial<Omit<ProjectInput, 'imageSelection'>> & { status?: ProjectStatus; backupRetentionCount?: number };
+export type ProjectUpdate = Partial<Omit<ProjectInput, 'imageSelection'>> & { status?: ProjectStatus };
 
 /** Owns project records and guards operations against concurrent deletion. */
 export class ProjectService {
@@ -91,7 +91,9 @@ export class ProjectService {
     });
   }
 
-  list(): Project[] { return [...this.records.values()].map(project => structuredClone(project)); }
+  list(options: { includeRemoved?: boolean } = {}): Project[] {
+    return [...this.records.values()].filter(project => options.includeRemoved || !project.removedAt).map(project => structuredClone(project));
+  }
   find(id: string): Project | undefined { return structuredClone(this.records.get(id)); }
   isDeleting(id: string): boolean { return this.deleting.has(id); }
   activeSessionId(id: string): string | null { return this.activeSessions.get(id)?.values().next().value ?? null; }
@@ -169,13 +171,41 @@ export class ProjectService {
       project.latestBackup = { createdAt: archive.createdAt, sizeBytes: archive.sizeBytes, checksum: archive.sha256 };
     });
   }
-  async removeRemoteArchive(id: string, archiveId: string): Promise<void> {
+  async reconcileVolumeBackups(id: string, volumeId: string, archives: NonNullable<Project['remoteArchives']>): Promise<void> {
     await this.mutateSandboxMetadata(id, project => {
-      if (project.remoteArchives?.[0]?.id === archiveId) throw new HttpError(409, '不能删除最新的远程归档');
-      project.remoteArchives = (project.remoteArchives ?? []).filter(ref => ref.id !== archiveId);
+      const saved = new Map((project.remoteArchives ?? []).filter(ref => ref.storageType === 'cellbox-volume' && ref.volumeId === volumeId)
+        .map(ref => [ref.id, ref]));
+      project.remoteArchives = [...(project.remoteArchives ?? []).filter(ref => ref.storageType !== 'cellbox-volume' || ref.volumeId !== volumeId),
+        ...archives.filter(ref => ref.storageType === 'cellbox-volume' && ref.volumeId === volumeId)
+          .map(ref => ({ ...ref, threadIds: saved.get(ref.id)?.threadIds ?? ref.threadIds }))]
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      const latest = project.remoteArchives[0];
+      project.latestBackup = latest ? { createdAt: latest.createdAt, sizeBytes: latest.sizeBytes,
+        ...(latest.sha256 ? { checksum: latest.sha256 } : {}) } : undefined;
     });
   }
 
+  async rememberVolumeCleanup(id: string, volumeId: string) {
+    await this.mutateSandboxMetadata(id, project => {
+      project.pendingVolumeCleanup = [...new Set([...(project.pendingVolumeCleanup ?? []), volumeId])];
+    });
+  }
+
+  async finishVolumeCleanup(id: string, volumeId: string) {
+    await this.mutateSandboxMetadata(id, project => {
+      project.pendingVolumeCleanup = (project.pendingVolumeCleanup ?? []).filter(value => value !== volumeId);
+      project.sandboxMounts = project.sandboxMounts?.filter(mount => mount.volumeId !== volumeId);
+      if (!project.sandboxMounts?.length) { delete project.sandboxMounts; delete project.sandboxOwnerKey; }
+    });
+  }
+
+  async markRemoved(id: string) {
+    await this.mutateSandboxMetadata(id, project => {
+      if (project.sandbox || project.sandboxMounts?.length || project.pendingSandboxCleanup?.length || project.pendingVolumeCleanup?.length)
+        throw new HttpError(409, '仍有磁盘或运行环境待清理，项目记录已保留');
+      project.removedAt = new Date().toISOString();
+    });
+  }
   async updateSandboxOperation(id: string, operation: Project['sandboxOperation'], expectedId?: string) {
     let applied = false;
     await this.mutateSandboxMetadata(id, project => {
@@ -300,11 +330,6 @@ export class ProjectService {
           if (project.type !== 2 && input.requirementUrl) throw new HttpError(400, '只有飞书项目可以绑定飞书需求');
           project.requirementUrl = input.requirementUrl;
         }
-        if (input.backupRetentionCount !== undefined) {
-          if (!Number.isInteger(input.backupRetentionCount) || input.backupRetentionCount < 2 || input.backupRetentionCount > 100)
-            throw new HttpError(400, '备份保留数量须为 2 到 100');
-          project.backupRetentionCount = input.backupRetentionCount;
-        }
         if (input.name !== undefined) project.name = input.name.trim();
         const now = new Date().toISOString();
         if (input.status !== undefined && input.status !== project.status) {
@@ -343,12 +368,15 @@ export class ProjectService {
       if (restoreProject) {
         delete next.sandboxMounts;
         delete next.sandboxOwnerKey;
+        delete next.removedAt;
       }
       delete next.sandboxReclaimedAt;
       delete next.sandboxArtifactsCleanedAt;
       next.sandbox = structuredClone(sandbox);
       const mounts = sandboxMounts(sandbox);
       if (mounts) next.sandboxMounts = mounts;
+      const boundVolumes = new Set(mounts?.map(mount => mount.volumeId) ?? []);
+      if (next.pendingVolumeCleanup) next.pendingVolumeCleanup = next.pendingVolumeCleanup.filter(id => !boundVolumes.has(id));
       if (sandbox.ownerKey) next.sandboxOwnerKey = sandbox.ownerKey;
       next.workingDirectory = sandbox.workingDirectory;
       if (restoreProject) next.imageSelection = restoreImage ? structuredClone(restoreImage) : undefined;

@@ -26,13 +26,13 @@ test('opening a project is read-only, keeps history visible during an operation,
   await expect(page.getByText('历史任务内容', { exact: true })).toBeVisible();
 });
 
-test('marking a checkpointed project completed keeps it paused and explains scheduled archiving', async ({ page, ui }) => {
+test('marking a checkpointed project completed keeps it paused for explicit restore or deletion', async ({ page, ui }) => {
   await page.goto('/#projects');
   await page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('button', { name: '标记已完成', exact: true }).click();
   await page.getByRole('button', { name: /^已完成 \d+$/ }).click();
   const card = page.getByRole('article', { name: '暂停项目', exact: true });
-  await expect(card.getByRole('button', { name: '恢复使用中', exact: true })).toBeVisible();
-  await expect(card.getByText('完成满 1 天后会从磁盘备份最新数据并清理暂停环境，不恢复运行。', { exact: true })).toBeVisible();
+  await expect(card.getByRole('button', { name: '恢复', exact: true })).toBeVisible();
+  await expect(card.getByRole('button', { name: '删除', exact: true })).toBeVisible();
   expect(ui.projects.get('paused').status).toBe('completed');
   expect(ui.projects.get('paused').sandbox.status).toBe('paused');
   expect(ui.calls.filter(call => call.method === 'POST')).toEqual([]);
@@ -122,7 +122,7 @@ test('opening a project with a failed create only rereads status and never creat
   expect(ui.count('POST', '/api/projects/other/sandbox/create')).toBe(0);
 });
 
-test('a released project offers create and restore, while backup of its detached volume stays disabled', async ({ page, ui }) => {
+test('a released project backs up retained volume without creating a Sandbox', async ({ page, ui }) => {
   const project = ui.projects.get('other');
   delete project.sandbox;
   project.sandboxMounts = [{ volumeId: 'released-volume', mountPath: '/workspace' }];
@@ -133,11 +133,14 @@ test('a released project offers create and restore, while backup of its detached
   const card = page.getByRole('article', { name: '另一个项目', exact: true });
   await expect(card.locator('.project-card-statuses .project-status')).toHaveText('已释放');
   await expect(card.getByRole('button', { name: '新建 Sandbox', exact: true })).toBeEnabled();
-  await expect(card.getByRole('button', { name: '磁盘备份', exact: true })).toBeDisabled();
-  await expect(card.getByText('Cellbox 暂不支持直接备份已释放环境的挂载盘', { exact: true })).toBeVisible();
+  await expect(card.getByRole('button', { name: '磁盘备份', exact: true })).toBeEnabled();
+  await expect(card.getByText(/可直接备份保留的挂载盘/)).toBeVisible();
   await expect(card.getByRole('button', { name: '从备份恢复', exact: true })).toBeEnabled();
-  expect(ui.count('POST', '/api/projects/other/backup')).toBe(0);
+  await card.getByRole('button', { name: '磁盘备份', exact: true }).click();
+  await expect.poll(() => ui.count('POST', '/api/projects/other/backup')).toBe(1);
   expect(ui.count('POST', '/api/projects/other/sandbox/create')).toBe(0);
+  expect(ui.count('POST', '/api/projects/other/sandbox/restore')).toBe(0);
+  expect(ui.count('POST', '/api/projects/other/sandbox/checkpoint')).toBe(0);
 });
 
 test('a processing project refreshes through GET only and exposes no lifecycle mutation', async ({ page, ui }) => {

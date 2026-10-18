@@ -1,5 +1,8 @@
 import { injectTraceHeaders, traced } from '../../tracing.js';
 import { SpanKind } from '@opentelemetry/api';
+
+const cellboxVolumeIdPattern = /^[a-z0-9]([-a-z0-9]{0,53}[a-z0-9])?$/;
+const cellboxBackupIdPattern = /^[0-9a-f]{64}$/;
 /** The internal Cellbox REST contract. Calls require no Cellbox credential. */
 export interface CellboxCapabilities {
   exec: boolean; files: boolean; http: boolean; websocket: boolean;
@@ -44,6 +47,13 @@ export interface CellboxMount { volumeId: string; mountPath: string; readOnly?: 
 export interface CellboxVolume {
   id: string; ownerKey: string; profileId: string; nodeName: string; phase: string;
   resourceVersion: number; createdAt: string; operationId?: string; error?: { code: string; message: string };
+}
+export interface CellboxBackupPolicy {
+  engine: 'restic'; scope: 'volume'; keepLast: number; enabled: boolean;
+}
+export interface CellboxVolumeBackup {
+  id: string; createdAt: string; volumeId: string; ownerKey: string; profileId: string;
+  sizeBytes?: number; addedBytes?: number;
 }
 export interface CellboxBox {
   mounts?: CellboxMount[];
@@ -142,8 +152,11 @@ export class CellboxClient {
     // retaining spans for the box lifecycle and exec operations.
     const endpoint = path.split('?')[0];
     const coreMutation = method === 'POST' && (endpoint === '/v1/boxes' || endpoint === '/v1/boxes:restore'
+      || endpoint === '/v1/volumes' || endpoint === '/v1/volumes:restore'
       || /^\/v1\/boxes\/[^/]+:(?:suspend|resume|destroy|activate)$/.test(endpoint)
-      || /^\/v1\/boxes\/[^/]+\/execs$/.test(endpoint));
+      || /^\/v1\/boxes\/[^/]+\/execs$/.test(endpoint)
+      || /^\/v1\/volumes\/[^/]+\/backups$/.test(endpoint))
+      || method === 'DELETE' && /^\/v1\/volumes\/[^/]+$/.test(endpoint);
     if (!coreMutation) return this.requestImpl<T>(method, path, options);
     return traced('cellbox.http.client', { 'http.request.method': method, 'url.path': path.split('?')[0],
       'http.request.timeout_ms': options.timeoutMs ?? this.requestTimeoutMs },
@@ -248,10 +261,35 @@ export class CellboxClient {
   getBox(id: string, signal?: AbortSignal) { return this.request<CellboxBox>('GET', `/v1/boxes/${this.id(id)}`, { signal }); }
   listVolumes(signal?: AbortSignal) { return this.request<CellboxVolume[]>('GET', '/v1/volumes', { signal }); }
   getVolume(id: string, signal?: AbortSignal) { return this.request<CellboxVolume>('GET', `/v1/volumes/${this.id(id)}`, { signal }); }
+  getBackupPolicy(signal?: AbortSignal) { return this.request<CellboxBackupPolicy>('GET', '/v1/backup-policy', { signal }); }
   createVolume(input: { id?: string; ownerKey: string; profileId: string }) {
     return this.request<CellboxOperation>('POST', '/v1/volumes', { body: input });
   }
   deleteVolume(id: string) { return this.request<CellboxOperation>('DELETE', `/v1/volumes/${this.id(id)}`); }
+  createVolumeBackup(volumeId: string) {
+    if (!cellboxVolumeIdPattern.test(volumeId))
+      throw new CellboxError('INVALID_REQUEST', 'Invalid Cellbox volume ID');
+    return this.request<CellboxOperation>('POST', `/v1/volumes/${this.id(volumeId)}/backups`, { body: {} });
+  }
+  listVolumeBackups(volumeId: string, signal?: AbortSignal) {
+    if (!cellboxVolumeIdPattern.test(volumeId))
+      throw new CellboxError('INVALID_REQUEST', 'Invalid Cellbox volume ID');
+    return this.request<CellboxVolumeBackup[]>('GET', `/v1/volumes/${this.id(volumeId)}/backups`, { signal });
+  }
+  getVolumeBackup(volumeId: string, backupId: string, signal?: AbortSignal) {
+    if (!cellboxVolumeIdPattern.test(volumeId))
+      throw new CellboxError('INVALID_REQUEST', 'Invalid Cellbox volume ID');
+    if (!cellboxBackupIdPattern.test(backupId))
+      throw new CellboxError('INVALID_REQUEST', 'A full 64-character backup ID is required');
+    return this.request<CellboxVolumeBackup>('GET', `/v1/volumes/${this.id(volumeId)}/backups/${this.id(backupId)}`, { signal });
+  }
+  restoreVolume(input: { sourceVolumeId: string; backupId: string; ownerKey: string; id?: string }) {
+    if (!cellboxVolumeIdPattern.test(input.sourceVolumeId) || !cellboxBackupIdPattern.test(input.backupId) ||
+      typeof input.ownerKey !== 'string' || Buffer.byteLength(input.ownerKey, 'utf8') < 1 || Buffer.byteLength(input.ownerKey, 'utf8') > 256 ||
+      (input.id !== undefined && !cellboxVolumeIdPattern.test(input.id)))
+      throw new CellboxError('INVALID_REQUEST', 'Valid source volume ID, full backup ID, owner key, and optional target volume ID are required');
+    return this.request<CellboxOperation>('POST', '/v1/volumes:restore', { body: input });
+  }
   createBox(input: { id?: string; ownerKey: string; revisionId?: string; templateId?: string; staged?: boolean;
     homeVolumeId?: string; mounts?: CellboxMount[] }, _legacyKey?: string) {
     if (Boolean(input.revisionId) === Boolean(input.templateId)) throw new CellboxError('INVALID_REQUEST', 'Exactly one of revisionId or templateId is required');

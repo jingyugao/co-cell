@@ -19,8 +19,8 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
   return renderToStaticMarkup(<ProjectsPage
     projects={projects} config={config} loading={false} initialView={initialView}
     onRefresh={async () => projects} onCreate={async () => project()} onUpdate={async () => project()}
-    onCreateSandbox={async () => project()} onRestoreSandbox={async () => project()} onReleaseSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()} onBackupSandbox={async () => project()} onArchiveProject={async () => project()}
-    onOpenProject={() => {}} onMenu={() => {}} onBack={() => {}}
+    onDelete={async () => {}} onCreateSandbox={async () => project()} onRestoreSandbox={async () => project()} onReleaseSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()} onBackupSandbox={async () => project()} onArchiveProject={async () => project()}
+    onOpenProject={() => {}} onViewBackup={() => {}} onMenu={() => {}} onBack={() => {}}
   />);
 }
 
@@ -63,7 +63,7 @@ test('abnormal and missing sandboxes use the recovery-or-first-create paths', ()
   assert.doesNotMatch(missing, /<button[^>]*>恢复环境<\/button>/);
 });
 
-test('a released project offers new Sandbox and explicit backup restore independently', () => {
+test('a released project with retained mounts can back them up without creating a Sandbox', () => {
   const html = page([project({
     imageSelection: { imageId: 'node', imageName: 'Node Runtime', category: 'Node', versionId: 'old-entry', version: '1.0', templateId: 'node-template', revisionId: 'old-entry', image: 'registry.example/node:1.0' },
     latestBackup: backup,
@@ -74,8 +74,23 @@ test('a released project offers new Sandbox and explicit backup restore independ
   assert.match(html, /Node Runtime · Cellbox stable/);
   assert.doesNotMatch(html, /Node Runtime · 1\.0/);
   assert.match(html, /保留的挂载盘[\s\S]*\/workspace[\s\S]*project-volume/);
+  const sandboxActions = html.match(/aria-label="Sandbox 操作"[\s\S]*?<\/section>/)![0];
+  assert.match(sandboxActions, /<button[^>]*>磁盘备份<\/button>/);
+  assert.doesNotMatch(sandboxActions, /disabled=""[^>]*>磁盘备份/);
+  assert.doesNotMatch(html, /Cellbox 暂不支持直接备份已释放环境的挂载盘/);
+  assert.match(html, /可直接备份保留的挂载盘/);
+});
+
+test('a released project without retained mounts cannot request a disk backup', () => {
+  const html = page([project({ sandboxReclaimedAt: now })]);
   assert.match(html, /<button[^>]*disabled=""[^>]*>磁盘备份<\/button>/);
-  assert.match(html, /Cellbox 暂不支持直接备份已释放环境的挂载盘/);
+  assert.doesNotMatch(html, /可直接备份保留的挂载盘/);
+});
+
+test('a running Sandbox stays ineligible for archive even when mounts are recorded', () => {
+  const html = page([project({ sandbox: { id: 'running-box', template: 'default', status: 'ready', phase: 'running', workingDirectory: '/workspace' },
+    sandboxMounts: [{ volumeId: 'project-volume', mountPath: '/workspace' }] })]);
+  assert.match(html, /<button class="secondary-button" disabled="" title="请先暂停后归档，或明确选择使用已有备份">手动归档<\/button>/);
 });
 
 test('processing only offers read-only status refresh while unknown Box still offers explicit release', () => {
@@ -153,4 +168,71 @@ test('checkpoint only pauses; disk backup is separate and backup state never blo
 test('a completed backup operation is not shown on the project card', () => {
   const html = page([project({ sandboxOperation: { kind: 'backup', phase: '上传中', status: 'succeeded', updatedAt: now } })]);
   assert.doesNotMatch(html, /备份：已完成/);
+});
+
+test('completed project exposes only restore and delete actions without backup preview entry points', () => {
+  const html = page([project({ status: 'completed', latestBackup: backup, archiveVersions: [{ id: 'v1', version: 1, createdAt: now, sizeBytes: 42, bytesAdded: 42, label: '备份' }] })], 'completed');
+  const card = html.match(/<article class="project-card[\s\S]*?<\/article>/)![0];
+  const actions = card.match(/aria-label="项目操作"[\s\S]*?<\/section>/)![0];
+  assert.match(actions, />恢复<\/button>/);
+  assert.match(actions, />删除<\/button>/);
+  assert.doesNotMatch(actions, /工具权限|归档|进入项目|Sandbox|备份/);
+  assert.doesNotMatch(card, /archive-badge|查看归档|重建 Sandbox|Checkpoint|恢复运行|磁盘备份/);
+});
+
+test('volume snapshots show available metadata without opening the archive file browser', () => {
+  const unknownSize = page([project({ archiveVersions: [{ id: 'vol-snapshot', version: 1, createdAt: now,
+    label: '版本 1', browsable: false, storageType: 'cellbox-volume' }] })]);
+  assert.match(unknownSize, /磁盘备份/);
+  assert.match(unknownSize, /暂不支持文件浏览/);
+  assert.doesNotMatch(unknownSize, /undefined|NaN/);
+  assert.doesNotMatch(unknownSize, /<button class="archive-badge-entry/);
+  assert.match(unknownSize, /<span class="archive-badge-entry/);
+
+  const zero = page([project({ archiveVersions: [{ id: 'vol-snapshot-zero', version: 1, createdAt: now,
+    sizeBytes: 0, bytesAdded: 0, label: '版本 1', browsable: false, storageType: 'cellbox-volume' }] })]);
+  assert.match(zero, /0 B · \+0 B/);
+  assert.doesNotMatch(zero, /<button class="archive-badge-entry/);
+
+  const legacy = page([project({ archiveVersions: [{ id: 'legacy-archive', version: 1, createdAt: now,
+    sizeBytes: 42, label: '版本 1', browsable: true, storageType: 'cellbox' }] })]);
+  assert.match(legacy, /<button class="archive-badge-entry/);
+});
+
+test('backup retention failure is surfaced as an alert without hiding the completed backup', () => {
+  const html = page([project({ sandboxBackup: { id: 'volume-snapshot', status: 'succeeded', phase: '完成',
+    volumeId: 'volume-1', retentionError: '旧快照清理失败', updatedAt: now },
+    backupPolicy: { enabled: true, engine: 'restic', scope: 'volume', keepLast: 2 } })]);
+  assert.match(html, /备份已完成，但旧快照清理失败/);
+  assert.match(html, /旧快照清理失败/);
+  assert.match(html, /每个磁盘保留最近 2 版/);
+  assert.doesNotMatch(html, /保留最近 3 版/);
+});
+
+test('Cellbox backup policy lookup errors are shown without inventing a retention count', () => {
+  const html = page([project({ backupPolicyError: 'Cellbox 查询暂不可用' })]);
+  assert.match(html, /无法读取磁盘备份保留策略/);
+  assert.match(html, /Cellbox 查询暂不可用/);
+  assert.doesNotMatch(html, /每个磁盘保留最近 \d+ 版/);
+});
+
+test('catalog refresh errors say the disk backup succeeded and do not suggest retrying it', () => {
+  const backupError = page([project({ sandboxBackup: { id: 'volume-snapshot', volumeId: 'volume-1', status: 'succeeded',
+    phase: '完成', catalogError: 'Cellbox 目录暂不可用', updatedAt: now } })]);
+  assert.match(backupError, /磁盘备份已完成，但目录刷新失败/);
+  assert.match(backupError, /Cellbox 目录暂不可用/);
+  assert.match(backupError, /无需重试备份/);
+  assert.doesNotMatch(backupError, /磁盘备份失败|重试磁盘备份/);
+
+  const operationError = page([project({ sandboxOperation: { kind: 'backup', status: 'succeeded', phase: '完成',
+    catalogError: '目录刷新失败', updatedAt: now } })]);
+  assert.match(operationError, /磁盘备份已完成，但目录刷新失败/);
+  assert.match(operationError, /无需重试备份/);
+
+  const catalogOnlyFailure = page([project({
+    sandboxBackup: { id: 'snapshot', status: 'succeeded', phase: '完成', catalogError: '目录刷新失败', updatedAt: now },
+    sandboxOperation: { kind: 'backup', status: 'failed', phase: '目录刷新', error: '目录刷新失败', updatedAt: now },
+  })]);
+  assert.match(catalogOnlyFailure, /磁盘备份已完成，但目录刷新失败/);
+  assert.doesNotMatch(catalogOnlyFailure, /备份：失败|磁盘备份失败/);
 });

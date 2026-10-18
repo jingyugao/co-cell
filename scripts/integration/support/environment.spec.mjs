@@ -9,6 +9,7 @@ test('cleanup recovers a lost create response and never deletes an existing proj
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     if (req.url === '/api/projects') { res.end(JSON.stringify([...projects.values()])); return; }
+    if (req.url === '/api/archives') { res.end('[]'); return; }
     const id = req.url.split('/').at(-1);
     if (req.method === 'DELETE') { deleted.push(id); projects.delete(id); res.end('{"ok":true}'); return; }
     res.statusCode = projects.has(id) ? 200 : 404; res.end(JSON.stringify(projects.get(id) ?? { error: 'missing' }));
@@ -20,13 +21,14 @@ test('cleanup recovers a lost create response and never deletes an existing proj
     await expect(env.json('/api/projects/existing', { method: 'DELETE' })).rejects.toThrow('unowned resource');
     await env.cleanup();
     expect(deleted).toEqual(['owned']); expect(projects.has('existing')).toBe(true);
-    expect(JSON.parse(await readFile(env.journal, 'utf8')).cleanup).toEqual([{ projectId: 'owned', status: 'deleted' }]);
+    expect(JSON.parse(await readFile(env.journal, 'utf8')).cleanup).toEqual([{ projectId: 'owned', status: 'deleted_retained_backups', retainedSnapshots: [] }]);
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
-test('cleanup preserves a preparing sandbox after a synchronous create failure', async ({}, testInfo) => {
+test('cleanup DELETEs a test-owned project after a lost create response', async ({}, testInfo) => {
   const projects = new Map();
   const deleted = [];
+  const boxes = new Set(['box-created']);
   let env;
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
@@ -40,9 +42,10 @@ test('cleanup preserves a preparing sandbox after a synchronous create failure',
       res.statusCode = 201; res.end(JSON.stringify(project)); return;
     }
     if (req.url === '/api/projects') { res.end(JSON.stringify([...projects.values()])); return; }
-    if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[{"id":"box-created"}]}'); return; }
+    if (req.url === '/api/sandboxes') { res.end(JSON.stringify({ sandboxes: [...boxes].map(id => ({ id })) })); return; }
+    if (req.url === '/api/archives') { res.end('[]'); return; }
     const id = req.url.split('/').at(-1);
-    if (req.method === 'DELETE') { deleted.push(id); projects.delete(id); res.end('{"ok":true}'); return; }
+    if (req.method === 'DELETE') { deleted.push(id); projects.delete(id); boxes.delete('box-created'); res.end('{"ok":true}'); return; }
     if (req.method === 'GET' && projects.has(id)) projects.get(id).sandboxOperation.status = 'succeeded';
     res.statusCode = projects.has(id) ? 200 : 404; res.end(JSON.stringify(projects.get(id) ?? { error: 'missing' }));
   });
@@ -53,9 +56,9 @@ test('cleanup preserves a preparing sandbox after a synchronous create failure',
     await expect(env.createProject('synchronous-create')).rejects.toThrow('completed sandbox operation');
     expect(env.projects.get('created')).toBe(env.name('synchronous-create'));
     expect(env.boxes.has('box-created')).toBe(true);
-    await expect(env.cleanup()).rejects.toThrow('Integration cleanup failed');
-    expect(deleted).toEqual([]);
-    expect(projects.has('created')).toBe(true);
+    await env.cleanup();
+    expect(deleted).toEqual(['created']);
+    expect(projects.has('created')).toBe(false);
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
@@ -82,118 +85,53 @@ test('backup wait can include asynchronous disk archive completion', async ({}, 
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
-test('cleanup checkpoints once, backs up once, archives the backup, then deletes once', async ({}, testInfo) => {
-  let reads = 0;
-  let checkpointCalls = 0;
-  let backupCalls = 0;
-  let archiveCalls = 0;
-  let deleted = 0;
+test('cleanup DELETEs once, retains volume recovery metadata, and verifies resources are gone', async ({}, testInfo) => {
   let removed = false;
-  let archived = false;
-  const calls = [];
+  let deleted = 0;
   let env;
-  const project = () => ({ id: 'owned', name: env.name('async-checkpoint'), status: archived ? 'archived' : 'active',
-    ...(archived ? {} : { sandbox: { id: 'box', status: checkpointCalls ? 'paused' : 'ready' } }),
-    sandboxOperation: archived
-      ? { id: 'archive-op', kind: 'archive', status: 'succeeded' }
-      : backupCalls ? { id: 'backup-op', kind: 'backup', status: 'succeeded' }
-        : checkpointCalls ? { id: 'checkpoint-op', kind: 'checkpoint', status: 'succeeded' }
-          : { id: 'create', kind: 'create', status: 'succeeded' },
-    ...(backupCalls ? { sandboxBackup: { id: 'backup-op', sandboxId: 'box', status: 'succeeded' },
-      remoteArchives: [{ id: 'archive', sourceSandboxId: 'box' }] } : {}) });
+  const project = { id: 'owned', name: '', status: 'active', sandbox: { id: 'box', status: 'ready' },
+    sandboxMounts: [{ volumeId: 'volume-1', mountPath: '/workspace' }],
+    sandboxOperation: { id: 'create', kind: 'create', status: 'succeeded' } };
+  const retained = [{ key: 'volume-backup-key', storageType: 'cellbox-volume', volumeId: 'volume-1', snapshotId: 'a'.repeat(64) }];
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
-    if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify(removed ? [] : [project()])); return; }
+    if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify(removed ? [] : [project])); return; }
     if (req.url === '/api/sessions') { res.end('[]'); return; }
     if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[]}'); return; }
     if (req.url === '/api/projects/owned' && req.method === 'GET') {
       if (removed) { res.statusCode = 404; res.end('{"error":"missing"}'); return; }
-      reads++;
-      res.end(JSON.stringify(project())); return;
+      res.end(JSON.stringify(project)); return;
     }
-    if (req.url === '/api/projects/owned/sandbox/checkpoint' && req.method === 'POST') {
-      checkpointCalls++;
-      expect(checkpointCalls).toBe(1);
-      calls.push('checkpoint');
-      res.end(JSON.stringify({ ...project(), sandboxOperation: { id: 'checkpoint-op', kind: 'checkpoint', status: 'succeeded' } })); return;
-    }
-    if (req.url === '/api/projects/owned/backup' && req.method === 'POST') {
-      backupCalls++;
-      expect(checkpointCalls).toBe(1);
-      expect(backupCalls).toBe(1);
-      calls.push('backup');
-      const state = project();
-      expect(state.sandboxOperation).toMatchObject({ id: state.sandboxBackup.id, kind: 'backup', status: 'succeeded' });
-      expect(state.sandboxBackup.sandboxId).toBe(state.sandbox.id);
-      res.end(JSON.stringify(state)); return;
-    }
-    if (req.url === '/api/projects/owned/archive' && req.method === 'POST') {
-      archiveCalls++;
-      expect(archiveCalls).toBe(1);
-      expect(backupCalls).toBe(1);
-      const chunks = [];
-      for await (const chunk of req) chunks.push(chunk);
-      const reqBody = Buffer.concat(chunks).toString();
-      expect(JSON.parse(reqBody)).toEqual({ useExistingBackup: true });
-      calls.push('archive');
-      archived = true;
-      res.end(JSON.stringify(project())); return;
-    }
-    if (req.url === '/api/projects/owned' && req.method === 'DELETE') {
-      expect(checkpointCalls).toBe(1);
-      expect(backupCalls).toBe(1);
-      expect(archiveCalls).toBe(1);
-      deleted++;
-      calls.push('delete');
-      removed = true;
-      res.end('{"ok":true}'); return;
-    }
-    if (req.url === '/api/projects/owned' && req.method === 'HEAD') { res.statusCode = 404; res.end(); return; }
-    if (req.url === '/api/projects/owned') { res.statusCode = 404; res.end('{"error":"missing"}'); return; }
+    if (req.url === '/api/projects/owned' && req.method === 'DELETE') { deleted++; removed = true; res.end('{"ok":true}'); return; }
+    if (req.url === '/api/archives') { res.end(JSON.stringify([{ projectId: 'owned', archives: retained }])); return; }
     res.statusCode = 404; res.end('{"error":"missing"}');
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   env = new LiveEnvironment(liveConfig({ COCELL_E2E_BASE_URL: `http://127.0.0.1:${server.address().port}`, COCELL_E2E_ACCESS_TOKEN: 'test-only-token' }),
     { journal: testInfo.outputPath('resources.json') });
-  env.projects.set('owned', env.name('async-checkpoint'));
+  project.name = env.name('direct-delete');
+  env.projects.set('owned', project.name);
   try {
     await env.cleanup();
-    expect(reads).toBeGreaterThanOrEqual(3);
-    expect(checkpointCalls).toBe(1);
-    expect(backupCalls).toBe(1);
-    expect(archiveCalls).toBe(1);
     expect(deleted).toBe(1);
-    expect(calls).toEqual(['checkpoint', 'backup', 'archive', 'delete']);
+    const cleanup = JSON.parse(await readFile(env.journal, 'utf8')).cleanup[0];
+    expect(cleanup).toMatchObject({ projectId: 'owned', status: 'deleted_retained_backups',
+      retainedSnapshots: [{ id: 'volume-backup-key', storageType: 'cellbox-volume', volumeId: 'volume-1', snapshotId: 'a'.repeat(64) }] });
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
-test('cleanup does not replay an unknown backup or archive/delete its sandbox', async ({}, testInfo) => {
-  let checkpointCalls = 0;
-  let backupCalls = 0;
-  let archiveCalls = 0;
+test('cleanup leaves an unknown backup operation untouched instead of retrying or deleting it', async ({}, testInfo) => {
   let deleted = 0;
   let env;
-  const project = { id: 'owned', name: '', status: 'active', sandbox: { id: 'box', status: 'ready' },
-    sandboxOperation: { id: 'create', kind: 'create', status: 'succeeded' } };
+  const project = { id: 'owned', name: '', status: 'active', sandbox: { id: 'box', status: 'paused' },
+    sandboxOperation: { id: 'backup-op', kind: 'backup', status: 'unknown', error: 'response lost' },
+    sandboxBackup: { id: 'backup-op', sandboxId: 'box', status: 'unknown', error: 'response lost' } };
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify([project])); return; }
     if (req.url === '/api/sessions') { res.end('[]'); return; }
     if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[{"id":"box"}]}'); return; }
     if (req.url === '/api/projects/owned' && req.method === 'GET') { res.end(JSON.stringify(project)); return; }
-    if (req.url === '/api/projects/owned/sandbox/checkpoint' && req.method === 'POST') {
-      checkpointCalls++;
-      project.sandbox.status = 'paused';
-      project.sandboxOperation = { id: 'checkpoint-op', kind: 'checkpoint', status: 'succeeded' };
-      res.end(JSON.stringify(project)); return;
-    }
-    if (req.url === '/api/projects/owned/backup' && req.method === 'POST') {
-      backupCalls++;
-      project.sandboxOperation = { id: 'backup-op', kind: 'backup', status: 'unknown', error: 'response lost' };
-      project.sandboxBackup = { id: 'backup-op', sandboxId: 'box', status: 'unknown', error: 'response lost' };
-      res.end(JSON.stringify(project)); return;
-    }
-    if (req.url === '/api/projects/owned/archive' && req.method === 'POST') { archiveCalls++; assert.fail('Unknown backup must not be followed by archive'); }
     if (req.url === '/api/projects/owned' && req.method === 'DELETE') { deleted++; res.end('{"ok":true}'); return; }
     res.statusCode = 404; res.end('{"error":"missing"}');
   });
@@ -204,31 +142,21 @@ test('cleanup does not replay an unknown backup or archive/delete its sandbox', 
   env.projects.set('owned', project.name);
   try {
     await expect(env.cleanup()).rejects.toThrow('Integration cleanup failed');
-    expect(checkpointCalls).toBe(1);
-    expect(backupCalls).toBe(1);
-    expect(archiveCalls).toBe(0);
     expect(deleted).toBe(0);
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
-test('cleanup does not replay an unknown checkpoint or delete its sandbox', async ({}, testInfo) => {
-  let checkpointCalls = 0;
+test('cleanup leaves an unknown prior sandbox operation untouched instead of deleting it', async ({}, testInfo) => {
   let deleted = 0;
   let env;
   const project = { id: 'owned', name: '', status: 'active', sandbox: { id: 'box', status: 'ready' },
-    sandboxOperation: { id: 'create', kind: 'create', status: 'succeeded' } };
+    sandboxOperation: { id: 'checkpoint-op', kind: 'checkpoint', status: 'unknown', error: 'response lost' } };
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify([project])); return; }
     if (req.url === '/api/sessions') { res.end('[]'); return; }
     if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[{"id":"box"}]}'); return; }
     if (req.url === '/api/projects/owned' && req.method === 'GET') { res.end(JSON.stringify(project)); return; }
-    if (req.url === '/api/projects/owned/sandbox/checkpoint' && req.method === 'POST') {
-      checkpointCalls++;
-      project.sandboxOperation = { id: 'checkpoint-unknown', kind: 'checkpoint', status: 'unknown', error: 'response lost' };
-      res.end(JSON.stringify(project)); return;
-    }
-    if (req.url === '/api/projects/owned/archive' && req.method === 'POST') assert.fail('Unknown checkpoint must not be followed by archive');
     if (req.url === '/api/projects/owned' && req.method === 'DELETE') { deleted++; res.end('{"ok":true}'); return; }
     res.statusCode = 404; res.end('{"error":"missing"}');
   });
@@ -239,7 +167,6 @@ test('cleanup does not replay an unknown checkpoint or delete its sandbox', asyn
   env.projects.set('owned', project.name);
   try {
     await expect(env.cleanup()).rejects.toThrow('Integration cleanup failed');
-    expect(checkpointCalls).toBe(1);
     expect(deleted).toBe(0);
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });

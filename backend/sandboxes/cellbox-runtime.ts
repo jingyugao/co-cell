@@ -11,6 +11,7 @@ import type { AppServerEndpoint } from '../execution/container-runtime.js';
 import type { RemoteArchives } from '../archives/remote.js';
 import type { RemoteArchiveMetadata, RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import { downloadOssArchive } from '../archives/oss-download.js';
+import { createCellboxVolumeBackups } from './cellbox-volume-backups.js';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
 import { SandboxRuntimeConfig, type SandboxRuntimeConfigOptions } from './runtime-config.js';
@@ -45,42 +46,19 @@ export class CellboxRuntimeIntegration {
             },
         }]);
         const ossArchiveEndpoint = process.env.OSS_ENDPOINT;
+        const volumes = createCellboxVolumeBackups(options.provider, options.profileId, this.lifecycle);
         this.remoteArchives = {
-        capture: async (target, key, captureOptions) => {
-                if (!target.sandbox)
-                    throw new Error('Project has no Cellbox');
-                if (captureOptions?.diskOnly) {
-                    throw new HttpError(409, '当前环境不支持独立磁盘归档；请恢复环境后导出文件，或明确选择使用已有备份归档。');
-                }
-                const capabilities = !captureOptions?.diskOnly && target.sandbox.status !== 'paused' && ossArchiveEndpoint && !target.imageSelection ? (await options.provider.client.getBox(target.sandbox.id)).capabilities : undefined;
-                if (capabilities?.protectedTools) {
-                    await runtimeConfig.ensureArchiveCredentials(target.sandbox.id);
-                    const suffix = `${target.projectId ?? target.id}/${key.replace(/[^A-Za-z0-9._/-]/g, '_')}.tar.gz`;
-                    // Root debug reads private Codex state directly. Existing
-                    // non-root debug boxes still require agent-group read access.
-                    if (!capabilities.rootDebug) {
-                        const handle = await options.provider.connectForSetup(target.sandbox.id);
-                        await handle.commands.run(`chmod -R g+rX -- ${workspace}`, { timeoutMs: 120_000 });
-                    }
-                    const result = await options.provider.client.runTool(target.sandbox.id, 'cocell_archive_backup', [suffix], 5 * 60_000);
-                    if (result.exitCode !== 0) throw new Error(result.stderr || `OSS archive backup exited ${result.exitCode}`);
-                    const value = JSON.parse(result.stdout.trim());
-                    if (value.storageType !== 'oss' || value.objectKey !== `legacy-archives/${suffix}`) throw new Error('OSS backup returned invalid metadata');
-                    const image = await options.provider.currentImageIdentity(target.sandbox.id);
-                    return { id: `oss:${value.objectKey}`, createdAt: value.createdAt, sizeBytes: value.sizeBytes, sha256: value.sha256,
-                        imageId: image.id, sourceSandboxId: target.sandbox.id, storageType: 'oss', metadata: value };
-                }
-                const op = await options.provider.captureArchive(target.sandbox.id, key, captureOptions);
-                const id = op.result?.archiveId;
-                if (!id)
-                    throw new Error('Cellbox capture returned no archive ID');
-                return metadata(await options.provider.client.getArchive(id));
-        },
+            policy: volumes.policy,
+            list: volumes.list,
+            capture: volumes.capture,
+            removeVolume: volumes.removeVolume,
             inspect: async (ref) => {
+                if (ref.storageType === 'cellbox-volume') return volumes.inspect(ref);
                 if (ref.storageType === 'oss') return { id: ref.id, createdAt: ref.createdAt, sizeBytes: ref.sizeBytes, sha256: ref.sha256, imageId: ref.imageId, sourceSandboxId: ref.sourceSandboxId, storageType: 'oss', metadata: ref.metadata };
                 return metadata(await options.provider.client.getArchive(ref.id));
             },
-            restore: async (target, ref, key, onCandidate) => {
+            restore: async (target, ref, key, onCandidate, observation) => {
+                if (ref.storageType === 'cellbox-volume') return volumes.restore(target, ref, key, onCandidate, observation);
                 if (target.imageSelection && !target.imageSelection.revisionId) throw new HttpError(409, '旧导入镜像尚未迁移为 Cellbox revision。');
                 const context: SandboxLifecycleContext = { action: 'restore', resourceKey: `project:${target.projectId ?? target.id}` };
                 return this.lifecycle.run(context, async () => {
@@ -135,6 +113,7 @@ export class CellboxRuntimeIntegration {
                 });
             },
             download: async (ref, destination) => {
+                if (ref.storageType === 'cellbox-volume') throw new HttpError(422, 'Cellbox 磁盘备份暂不支持文件浏览');
                 if (ref.sizeBytes > 256 * 1024 * 1024)
                     throw new Error('Archive exceeds the 256 MiB interactive browsing limit');
                 if (ref.storageType === 'oss') return downloadOssArchive(ref, destination);
@@ -142,16 +121,6 @@ export class CellboxRuntimeIntegration {
                 if (bytes.byteLength !== ref.sizeBytes || createHash('sha256').update(bytes).digest('hex') !== ref.sha256)
                     throw new Error('Cellbox archive integrity check failed');
                 await writeFile(destination, bytes, { mode: 0o600, flag: 'wx' });
-            },
-            remove: async (ref) => {
-                if (ref.storageType === 'oss') throw new HttpError(422, '旧 OSS 归档不支持通过 Cellbox 删除，请检查对象存储后手动处理。');
-                try {
-                await options.provider.client.deleteArchive(ref.id);
-            }
-            catch (error) {
-                if (!(error instanceof CellboxError && error.code === 'NOT_FOUND'))
-                    throw error;
-                }
             },
         };
     }

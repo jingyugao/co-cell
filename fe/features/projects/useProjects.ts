@@ -3,7 +3,7 @@ import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type ProjectSandbox
 import { api, ApiError } from '../../lib/api';
 
 export type ProjectValues = { name: string; requirementUrl: string | null; type: ProjectType; imageId?: string; imageVersionId?: string };
-export type ProjectUpdate = Partial<Omit<ProjectValues, 'imageId' | 'imageVersionId'>> & { status?: ProjectStatus; backupRetentionCount?: number };
+export type ProjectUpdate = Partial<Omit<ProjectValues, 'imageId' | 'imageVersionId'>> & { status?: ProjectStatus };
 
 export function useProjects() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -44,6 +44,23 @@ export function useProjects() {
   const updateProject = useCallback(async (id: string, values: ProjectUpdate) => storeProject(
     await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(values) }),
   ), [storeProject]);
+  const deleteProject = useCallback(async (id: string) => {
+    sequence.current++;
+    const operation: ProjectSandboxOperation = { kind: 'delete', phase: '提交删除请求', status: 'running', updatedAt: new Date().toISOString() };
+    setProjects(current => current.map(project => project.id === id ? { ...project, sandboxOperation: operation } : project));
+    try {
+      await api<{ ok: true }>(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      sequence.current++;
+      setProjects(current => current.filter(project => project.id !== id));
+    } catch (error) {
+      setProjects(current => current.map(project => project.id === id ? { ...project, sandboxOperation: {
+        ...operation, status: !(error instanceof ApiError) || ['UNKNOWN_OUTCOME', 'TRANSPORT'].includes(error.code ?? '') ? 'unknown' : 'failed',
+        errorCode: error instanceof ApiError ? error.code : undefined,
+        error: error instanceof Error ? error.message : '删除结果未知，请刷新状态后决定下一步。',
+      } } : project));
+      throw error;
+    }
+  }, []);
   const runSandboxOperation = useCallback(async (id: string, kind: ProjectSandboxOperation['kind'], request: () => Promise<ProjectSummary>) => {
     sequence.current++;
     const operation: ProjectSandboxOperation = { kind, phase: '提交请求', status: 'running', updatedAt: new Date().toISOString() };
@@ -78,5 +95,5 @@ export function useProjects() {
   const archiveProject = useCallback((id: string, options: { useExistingBackup?: boolean } = {}) => runSandboxOperation(id, 'archive', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify(options) }),
   ), [runSandboxOperation]);
-  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
+  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
 }

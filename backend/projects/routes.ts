@@ -128,6 +128,6 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
       .parse({ waitForOperation: c.req.query('waitForOperation'), waitMs: c.req.query('waitMs') });
     return c.json(await manager.readProject(c.req.param('id'), options, c.req.raw.signal));
   });
-  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional(), backupRetentionCount: z.number().int().min(2).max(100).optional() }).parse(await c.req.json()))));
+  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional() }).parse(await c.req.json()))));
   app.delete('/api/projects/:id', async c => { await manager.deleteProject(c.req.param('id')); return c.json({ ok: true }); });
 }

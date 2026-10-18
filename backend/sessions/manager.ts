@@ -9,7 +9,6 @@ import type { SandboxRuntime, ServiceProxyAccess } from '../execution/container-
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
-import { pruneRemoteArchives } from '../archives/retention.js';
 
 import { HttpError } from '../../util/errors.js';
 import { holdResponse } from '../../util/http-stream.js';
@@ -620,7 +619,7 @@ export class SessionManager {
 
   async readProject(id: string, options: ProjectReadOptions = {}, signal?: AbortSignal): Promise<ProjectSummary> {
     await this.projects.refreshOne(id);
-    this.projects.get(id);
+    if (this.projects.get(id).removedAt) throw new HttpError(404, '项目不存在');
     if (options.waitForOperation) {
       await traced('project.wait', { 'operation.id': options.waitForOperation }, async () => {
         await this.waitForProjectOperation(id, options.waitForOperation!, options.waitMs ?? PROJECT_OPERATION_WAIT_MS, signal);
@@ -937,6 +936,12 @@ export class SessionManager {
 
   async listProjectsWithArchives(): Promise<ProjectSummary[]> {
     const summaries = this.listProjects();
+    let backupPolicy: ProjectSummary['backupPolicy'];
+    let backupPolicyError: string | undefined;
+    if (this.remoteArchives?.policy) {
+      try { backupPolicy = await this.remoteArchives.policy(); }
+      catch (error) { backupPolicyError = error instanceof Error ? error.message : 'Cellbox 备份策略暂不可用'; }
+    }
     const sandboxes = summaries.flatMap(project => project.sandbox ? [project.sandbox] : []);
     if (sandboxes.length) {
       let observations: Map<string, NonNullable<Project['sandbox']>>;
@@ -949,20 +954,38 @@ export class SessionManager {
       for (const project of summaries) if (project.sandbox)
         project.sandbox = observations.get(project.sandbox.id) ?? { ...project.sandbox, status: 'unknown' };
     }
-    return summaries.map(project => ({ ...project, archiveVersions: project.remoteArchives?.map((archive, index, all) => ({
-      id: archive.id, version: all.length - index, createdAt: archive.createdAt,
-      sizeBytes: archive.sizeBytes, label: `版本 ${all.length - index}`,
-    })) }));
+    return summaries.map(project => ({ ...project, ...(backupPolicy ? { backupPolicy } : {}),
+      ...(backupPolicyError ? { backupPolicyError } : {}) }));
+  }
+
+  /** Explicit archive browsing reads Cellbox; ordinary project polling never scans S3. */
+  async listArchiveProjects(): Promise<ProjectSummary[]> {
+    return Promise.all(this.projects.list({ includeRemoved: true }).map(async project => {
+      const references = this.remoteArchives?.list
+        ? await this.remoteArchives.list(this.projectWorkspace(project), project.remoteArchives ?? [])
+        : project.remoteArchives ?? [];
+      return this.projectSummary({ ...project, remoteArchives: references });
+    }));
   }
 
   private projectSummary(project: Project): ProjectSummary {
     return structuredClone({ ...project, status: project.status ?? (project.archivedAt ? 'archived' : 'active'), archivedAt: project.archivedAt ?? null, sessionCount: [...this.sessions.values()].filter(session => session.projectId === project.id).length,
       latestBackup: project.latestBackup,
+      archiveVersions: project.remoteArchives?.map((archive, index, all) => ({
+        id: archive.id, version: all.length - index, createdAt: archive.createdAt,
+        ...(archive.sizeBytes === undefined ? {} : { sizeBytes: archive.sizeBytes }),
+        ...(archive.storageType === 'cellbox-volume' && archive.addedBytes !== undefined ? { bytesAdded: archive.addedBytes } : {}),
+        browsable: archive.storageType !== 'cellbox-volume', storageType: archive.storageType ?? 'cellbox', label: `版本 ${all.length - index}`,
+      })),
       activeSessionId: this.projects.activeSessionId(project.id)
         ?? [...this.sessions.values()].find(session => session.projectId === project.id && session.status === 'running')?.id ?? null });
   }
 
-  getProject(id: string): ProjectSummary { return this.projectSummary(this.projects.get(id)); }
+  getProject(id: string): ProjectSummary {
+    const project = this.projects.get(id);
+    if (project.removedAt) throw new HttpError(404, '项目不存在');
+    return this.projectSummary(project);
+  }
 
   async createProject(input: ProjectInput, settings?: Settings): Promise<ProjectSummary> {
     return this.createProjectLocal(input, settings);
@@ -1106,21 +1129,6 @@ export class SessionManager {
     }
   }
 
-  async pruneArchivedProjectArchives(): Promise<number> {
-    const remote = this.remoteArchives;
-    if (!remote) return 0;
-    let removed = 0;
-    for (const project of this.projects.list().filter(p => p.status === 'archived')) {
-      removed += await (async () => {
-        const current = this.projects.get(project.id);
-        if (current.status !== 'archived') return 0;
-        return pruneRemoteArchives(current.remoteArchives ?? [], current.backupRetentionCount ?? 2,
-          remote, id => this.projects.removeRemoteArchive(project.id, id));
-      })();
-    }
-    return removed;
-  }
-
   private isSandboxReferenced(sandboxId: string): boolean {
     return this.projects.list().some(project => project.sandbox?.id === sandboxId)
       || [...this.sessions.values()].some(session => !session.projectId && session.sandbox?.id === sandboxId);
@@ -1167,10 +1175,16 @@ export class SessionManager {
 
   private async deleteProjectLocal(id: string) {
     const current = this.projects.get(id);
-    if (current.executionMode === 'sandbox' && current.sandbox) {
+    if (current.removedAt) throw new HttpError(404, '项目不存在');
+    if (current.executionMode === 'sandbox') {
       if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-      // Preserve and verify the latest workspace before deleting its source.
-      await this.sandboxOperations.run(id, 'archive');
+      await this.sandboxOperations.run(id, 'delete');
+      for (const session of [...this.sessions.values()].filter(session => session.projectId === id)) {
+        await Promise.allSettled([...(this.uploads.get(session.id) ?? [])]);
+        await this.removeSession(session.id);
+      }
+      await this.projects.markRemoved(id);
+      return;
     }
     await this.projects.delete(id, async project => {
       const sessions = [...this.sessions.values()].filter(session => session.projectId === id);

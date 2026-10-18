@@ -13,9 +13,7 @@ export async function prepareImageRequest(url: string, userCommand?: string) {
     ['util/gitlab-tool-host.mjs', '/opt/product/cocell/util/gitlab-tool-host.mjs'],
     ['util/tool-runtime-identity.mjs', '/opt/product/cocell/util/tool-runtime-identity.mjs'],
     ['deploy/box-wrap/tools/cocell-proxy', '/opt/cellbox/tools/cocell-proxy'],
-    ['deploy/box-wrap/oss-archive-backup.mjs', '/opt/product/cocell/oss-archive-backup.mjs'],
     ['deploy/box-wrap/oss-archive-restore.mjs', '/opt/product/cocell/oss-archive-restore.mjs'],
-    ['deploy/box-wrap/tools/cocell-archive-backup', '/opt/cellbox/tools/cocell-archive-backup'],
     ['deploy/box-wrap/tools/cocell-archive-restore', '/opt/cellbox/tools/cocell-archive-restore'],
   ];
   const files = await Promise.all(sources.map(async ([source, path]) => ({ path,

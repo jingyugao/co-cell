@@ -109,13 +109,20 @@ export interface ProjectSandboxOperation {
   /** Image selected by this restore request; no resource reservation. */
   imageSelection?: ProjectImageSelection;
   /** Checkpoint only pauses the Sandbox; workspace backup is a separate explicit operation. */
-  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild' | 'release';
+  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild' | 'release' | 'delete';
+  /** Native operation/resource identities, for inspection only; never replayed. */
+  remoteOperationId?: string;
+  volumeId?: string;
+  candidateVolumeId?: string;
   phase: string;
   status: 'running' | 'failed' | 'succeeded' | 'unknown';
   error?: string;
   errorCode?: string;
   /** Archive is durable; reclaiming the old runtime or cache can be retried independently. */
   cleanupError?: string;
+  retentionError?: string;
+  catalogError?: string;
+  sizeBytes?: number;
   durationMs?: number;
   scannedBytes?: number;
   addedBytes?: number;
@@ -129,7 +136,14 @@ export type ProjectType = 1 | 2 | 3;
 
 export interface ProjectSandboxBackup {
   id: string;
-  sandboxId: string;
+  sandboxId?: string;
+  volumeId?: string;
+  remoteOperationId?: string;
+  snapshotId?: string;
+  retentionError?: string;
+  catalogError?: string;
+  sizeBytes?: number;
+  addedBytes?: number;
   status: 'running' | 'failed' | 'succeeded' | 'unknown';
   phase: string;
   error?: string;
@@ -153,6 +167,8 @@ export interface Project {
   workingDirectory: string;
   /** `archivedAt` is retained for legacy records and archive grouping. */
   status?: ProjectStatus;
+  /** Removed from project lists; the backup/recovery index remains available. */
+  removedAt?: string;
   completedAt?: string | null;
   imageSelection?: ProjectImageSelection;
   sandbox?: SandboxState;
@@ -166,13 +182,14 @@ export interface Project {
   sandboxArtifactsCleanedAt?: string;
 	/** Product references only; archive bytes and integrity belong to the box service. */
 	remoteArchives?: import('./remote-archive-types.js').RemoteArchiveRef[];
-  backupRetentionCount?: number;
   latestBackup?: LatestBackupSummary;
   sandboxOperation?: ProjectSandboxOperation;
   /** Result of an explicit workspace backup, independent of checkpoint outcome. */
   sandboxBackup?: ProjectSandboxBackup;
   /** Uncommitted replacement containers and retired containers awaiting cleanup. */
   pendingSandboxCleanup?: SandboxState[];
+  /** Restored disks whose Sandbox creation/binding has not completed. */
+  pendingVolumeCleanup?: string[];
   /** Verified archive source awaiting cleanup; survives retries/restarts after archiving. */
   archiveCleanupSourceId?: string;
   archivedAt?: string | null;
@@ -196,8 +213,10 @@ export interface ArchiveVersionSummary {
   id: string;
   version: number;
   createdAt: string;
-  sizeBytes: number;
+  sizeBytes?: number;
   bytesAdded?: number;
+  browsable?: boolean;
+  storageType?: 'cellbox' | 'oss' | 'cellbox-volume';
   label: string;
 }
 
@@ -205,6 +224,8 @@ export interface ArchiveVersionSummary {
  * 201, other operations return 200 with a terminal result, or a request error.
  * Running operations may still be observed through read-only queries after a disconnect. */
 export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null;
+  backupPolicy?: import('./remote-archive-types.js').VolumeBackupPolicy;
+  backupPolicyError?: string;
   /** Cellbox archive versions, newest first. */
   archiveVersions?: ArchiveVersionSummary[];
 }

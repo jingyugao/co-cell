@@ -87,11 +87,13 @@ class CellboxRelease:
         existing_server = existing.get("server", {})
         legacy_migration = not (isinstance(existing_server, dict) and existing_server.get("nodeName"))
         values = {}
+        if isinstance(existing.get("imageRegistry"), str) and existing["imageRegistry"].strip():
+            values["imageRegistry"] = existing["imageRegistry"]
         for key in ("objectStorage", "buildkit"):
             if isinstance(existing.get(key), dict):
                 values[key] = existing[key]
         old_api = existing.get("api", {})
-        api = {key: old_api[key] for key in ("namespace", "extraEnv", "nodeSelector", "configSecret", "manageSecrets")
+        api = {key: old_api[key] for key in ("namespace", "extraEnv", "nodeSelector", "configSecret", "manageSecrets", "initImage")
                if key in old_api}
         config = dict(old_api.get("config", {}))
         # A separately managed config Secret is intentionally opaque to Helm values.

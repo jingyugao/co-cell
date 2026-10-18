@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -119,7 +120,9 @@ def main() -> int:
             raise RuntimeError("Set COCELL_SANDBOX_IMAGE_TAG to identify the built runtime revision")
         # This POST also has no retry key. Any uncertain result must be resolved by reading the catalog.
         status, operation = request(base, f"/v1/templates/{family_id}/revisions", client, "POST",
-                                    {"userVersion": version, "baseImage": image, "profileId": profile, "warmSlots": 0})
+                                    {"userVersion": version, "baseImage": image, "profileId": profile, "warmSlots": 0,
+                                     "runCommand": "docker run --entrypoint /usr/local/bin/node "
+                                                   + shlex.quote(image) + " /opt/product/cocell/launcher.mjs"})
         if status != 202 or not isinstance(operation, dict) or not operation.get("id"):
             raise RuntimeError("Revision build submission was not confirmed; inspect Cellbox operations before retrying")
         operation_id = operation["id"]

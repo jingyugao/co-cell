@@ -4,6 +4,8 @@ import { isDeepStrictEqual } from 'node:util';
 import type { Project, ProjectStatus, ProjectType, Settings } from '../../protocol/types.js';
 import { projectWeekOf } from '../../util/project-types.js';
 import { HttpError } from '../../util/errors.js';
+import { sandboxMounts } from '../../util/sandbox-mounts.js';
+import type { SandboxState } from '../../protocol/sandbox-types.js';
 import { RecordWriteQueue } from '../infra/storage/record-write-queue.js';
 import { mergeRecord } from '../infra/storage/record-merge.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
@@ -146,6 +148,19 @@ export class ProjectService {
       project.status = 'archived'; project.completedAt = null; project.archivedAt = at;
       project.lifecycleHistory = [...(project.lifecycleHistory ?? []), { id: randomUUID(), action: 'archived', at, ...(sourceId ? { sandboxId: sourceId } : {}) }];
     }, true);
+  }
+
+  async releaseSandbox(id: string, sandbox: SandboxState): Promise<void> {
+    await this.mutateSandboxMetadata(id, project => {
+      if (project.sandbox?.id !== sandbox.id) throw new HttpError(409, '项目 Sandbox 引用已变化，请检查已释放的实例。');
+      const mounts = sandboxMounts(sandbox) ?? sandboxMounts(project.sandbox);
+      if (mounts) project.sandboxMounts = mounts;
+      if (sandbox.ownerKey) project.sandboxOwnerKey = sandbox.ownerKey;
+      delete project.sandbox;
+      const at = new Date().toISOString();
+      project.sandboxReclaimedAt = at;
+      project.lifecycleHistory = [...(project.lifecycleHistory ?? []), { id: randomUUID(), action: 'released', at, sandboxId: sandbox.id }];
+    });
   }
 
   async saveRemoteArchive(id: string, archive: NonNullable<Project['remoteArchives']>[number]): Promise<void> {
@@ -321,13 +336,20 @@ export class ProjectService {
       // Compare only our binding inside the record transaction; no remote lock.
       const expected = expectedSandboxId === undefined ? sandbox.id : expectedSandboxId;
       if (expectedSandboxId !== undefined && (next.sandbox?.id ?? null) !== expected && next.sandbox?.id !== sandbox.id) return;
-      if (expectedSandboxId === undefined && !next.sandbox && (restoreProject || next.status !== 'archived')) {
+      if (expectedSandboxId === undefined && !next.sandbox && (restoreProject || !next.sandboxReclaimedAt && next.status !== 'archived')) {
         // Initial creation can establish a previously absent binding.
       } else if (expectedSandboxId === undefined && next.sandbox?.id !== sandbox.id) return;
       applied = true;
+      if (restoreProject) {
+        delete next.sandboxMounts;
+        delete next.sandboxOwnerKey;
+      }
       delete next.sandboxReclaimedAt;
       delete next.sandboxArtifactsCleanedAt;
       next.sandbox = structuredClone(sandbox);
+      const mounts = sandboxMounts(sandbox);
+      if (mounts) next.sandboxMounts = mounts;
+      if (sandbox.ownerKey) next.sandboxOwnerKey = sandbox.ownerKey;
       next.workingDirectory = sandbox.workingDirectory;
       if (restoreProject) next.imageSelection = restoreImage ? structuredClone(restoreImage) : undefined;
       if (restoreProject && next.status === 'archived') {

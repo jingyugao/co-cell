@@ -25,6 +25,7 @@ import { MODEL_TOKEN_RATES } from '../../util/model-costs.js';
 import type { ImageCatalog } from '../images/service.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
+import { sandboxMounts } from '../../util/sandbox-mounts.js';
 import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../util/user-input.js';
 import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 import { applyTurnEvent } from '../../util/session-events.js';
@@ -116,6 +117,14 @@ export class SessionManager {
           ? this.imageCatalog.acquireRestoreSelection(project, versionId)
           : { selection: project.imageSelection, release() {} },
         logger: this.logger,
+        released: async id => {
+          for (const session of this.sessions.values()) {
+            if (session.projectId !== id) continue;
+            delete session.sandbox;
+            await this.save(session);
+            this.publish(session.id, { type: 'state', session: this.get(session.id) });
+          }
+        },
         detached: async id => {
           for (const session of this.sessions.values()) {
             if (session.projectId !== id) continue;
@@ -1012,6 +1021,11 @@ export class SessionManager {
     return this.readProject(id);
   }
 
+  async releaseProjectSandbox(id: string): Promise<ProjectSummary> {
+    await this.submitProjectSandboxOperation(id, 'release');
+    return this.readProject(id);
+  }
+
   /** Opening a project is a read; restoring it is an explicit user operation. */
   async enterProject(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
     return this.readProject(id, {}, signal);
@@ -1192,7 +1206,8 @@ export class SessionManager {
     if (projectId) {
       const project = this.projects.find(projectId);
       const replacing = project?.sandbox?.id !== sandbox.id;
-      const freshEnvironment = replacing && project?.sandboxOperation?.kind === 'create';
+      const freshEnvironment = replacing && project?.sandboxOperation?.kind === 'create'
+        && !(project.sandboxMounts ?? sandboxMounts(project.sandbox ?? {}))?.length;
       if (!await this.projects.updateSandbox(projectId, sandbox, restoreProject, restoreImage, expectedSandboxId)) {
         if (expectedSandboxId !== undefined) throw new HttpError(409, '项目 Sandbox 引用已变化，请检查新旧资源状态。');
         return;
@@ -1654,7 +1669,8 @@ export class SessionManager {
 
   private projectWorkspace(project: Project): WorkspaceTarget {
     return { id: project.id, projectId: project.id, settings: { workingDirectory: project.workingDirectory },
-      imageSelection: structuredClone(project.imageSelection), sandbox: structuredClone(project.sandbox), updatedAt: project.updatedAt };
+      imageSelection: structuredClone(project.imageSelection), sandbox: structuredClone(project.sandbox),
+      sandboxMounts: structuredClone(project.sandboxMounts), sandboxOwnerKey: project.sandboxOwnerKey, updatedAt: project.updatedAt };
   }
 
   async preview(projectId: string, href: string) {

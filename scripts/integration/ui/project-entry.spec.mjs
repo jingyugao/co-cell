@@ -107,6 +107,18 @@ test('project creation waits for Sandbox creation, then opens the project', asyn
   expect(ui.count('POST', '/api/projects/new/open')).toBe(0);
 });
 
+test('opening a project with a failed create only rereads status and never creates', async ({ page, ui }) => {
+  const project = ui.projects.get('other');
+  delete project.sandbox;
+  project.sandboxOperation = { id: 'failed-create', kind: 'create', status: 'failed', error: 'Box creation failed', updatedAt: '2026-01-01T00:00:00Z' };
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '另一个项目', exact: true });
+  await card.getByRole('button', { name: '进入项目', exact: true }).click();
+  await expect(page.getByRole('button', { name: '重新读取状态', exact: true })).toBeVisible();
+  expect(ui.count('GET', '/api/projects/other')).toBeGreaterThan(0);
+  expect(ui.count('POST', '/api/projects/other/sandbox/create')).toBe(0);
+});
+
 test('a paused session does not trigger resume; history loads after an explicit resume', async ({ page, ui }) => {
   await page.goto('/sessions/old-session');
   await expect(ui.editor).toBeEditable();
@@ -192,4 +204,34 @@ test('a broken Sandbox does not offer same-ID rebuild and labels backup restore 
   expect(confirmation).toContain('恢复会创建新的 Sandbox');
   await ui.complete('other');
   expect(ui.projects.get('other').sandbox.id).toBe('other-restored-box');
+});
+
+test('creating a Sandbox is independent from restoring an available backup', async ({ page, ui }) => {
+  const project = ui.projects.get('other');
+  delete project.sandbox;
+  project.latestBackup = { createdAt: '2025-01-01T00:00:00Z', sizeBytes: 128, checksum: 'a'.repeat(64) };
+  project.remoteArchives = [{ id: 'existing-archive', createdAt: project.latestBackup.createdAt, sizeBytes: 128, sha256: 'a'.repeat(64), threadIds: [] }];
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '另一个项目', exact: true });
+  await card.getByRole('button', { name: '新建 Sandbox', exact: true }).click();
+  await expect.poll(() => ui.count('POST', '/api/projects/other/sandbox/create')).toBe(1);
+  expect(ui.count('POST', '/api/projects/other/sandbox/restore')).toBe(0);
+  await ui.complete('other');
+});
+
+test('releasing a runtime confirms process termination and keeps project mounts visible', async ({ page, ui }) => {
+  const project = ui.projects.get('paused');
+  project.sandboxMounts = [{ volumeId: 'project-volume', mountPath: '/workspace', readOnly: false }];
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '暂停项目', exact: true });
+  let confirmation;
+  page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept(); });
+  await card.getByRole('button', { name: '释放运行环境', exact: true }).click();
+  await expect.poll(() => ui.count('POST', '/api/projects/paused/sandbox/release')).toBe(1);
+  expect(confirmation).toContain('结束其中的进程');
+  expect(confirmation).toContain('挂载盘');
+  await expect(card.getByText('project-volume')).toBeVisible();
+  await expect(card.getByText('/workspace')).toBeVisible();
+  await expect(card.locator('.project-card-statuses .project-status')).toHaveText('无 Sandbox');
+  expect(project.sandbox).toBeUndefined();
 });

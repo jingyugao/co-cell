@@ -7,6 +7,7 @@ import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { Session, StreamMessage, Turn } from '../../protocol/types.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import { ContainerCodexRuntime } from '../execution/container-runtime.js';
+import { AppServerReader } from '../execution/app-server-reader.js';
 import { runTurn } from '../execution/runner.js';
 import { ProjectSandboxes } from './project-sandboxes.js';
 import type { WorkspaceTarget } from './types.js';
@@ -196,6 +197,36 @@ test('pause and resume only submit Cellbox actions despite stale local state or 
     await runtime.checkpoint(target);
     assert.deepEqual(calls, ['POST /v1/boxes/test-sandbox:resume', 'POST /v1/boxes/test-sandbox:suspend']);
     assert.equal(target.sandbox?.id, 'test-sandbox');
+  } finally { await runtime.close(); }
+});
+
+test('pause and release close our unused sockets before submitting without probing App Server readiness', async t => {
+  let closes = 0;
+  t.mock.method(CodexAppServerClient.prototype, 'connect', async () => {});
+  t.mock.method(CodexAppServerClient.prototype, 'close', async () => { closes++; });
+  t.mock.method(CodexAppServerClient.prototype, 'request', async () => { assert.fail('no readiness RPC'); });
+  const reader = new AppServerReader(async () => ({ url: 'ws://app-server.test' }), error => assert.fail(String(error)));
+  const { provider, projects, record, target } = fixture();
+  target.sandbox = record;
+  const calls: string[] = [];
+  provider.pause = async () => { assert.equal(closes, 1, 'an unused cached socket must not keep Cellbox BUSY'); calls.push('pause'); return true; };
+  provider.release = async () => {
+    calls.push('release');
+    if (closes === 1) throw new CellboxError('BUSY', 'active RPC belongs to Cellbox admission', 409);
+    return { sandboxId: record.id, state: 'unknown', startedAt: new Date(0), metadata: { phase: 'deleted' } };
+  };
+  const runtime = new ContainerCodexRuntime({ paths: runtimePaths, provider, sandboxes: projects, apiKey: '',
+    prepareRemote: async () => { assert.fail('no environment preparation'); }, appServerReader: reader });
+  try {
+    await reader.read(record.id, async () => {});
+    await runtime.checkpoint(target);
+    const active = await reader.acquire(record.id);
+    await assert.rejects(runtime.release(target), error => error instanceof CellboxError && error.code === 'BUSY');
+    assert.deepEqual(calls, ['pause', 'release'], 'BUSY is not retried');
+    await active.release();
+    await runtime.release(target);
+    assert.equal(closes, 2);
+    assert.deepEqual(calls, ['pause', 'release', 'release']);
   } finally { await runtime.close(); }
 });
 

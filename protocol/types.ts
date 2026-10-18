@@ -104,12 +104,12 @@ export interface ProjectSandboxOperation {
   id?: string;
   /** Legacy ownership metadata retained for reading old records only. */
   resume?: { sandboxId: string; ownerId: string };
-  /** Legacy completion snapshot; current lifecycle actions record results without overwriting Box observations. */
+  /** Operation outcome, including a released Box; independent of current Box observations. */
   result?: { sandbox: SandboxState };
   /** Image selected by this restore request; no resource reservation. */
   imageSelection?: ProjectImageSelection;
   /** Checkpoint only pauses the Sandbox; workspace backup is a separate explicit operation. */
-  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild';
+  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild' | 'release';
   phase: string;
   status: 'running' | 'failed' | 'succeeded' | 'unknown';
   error?: string;
@@ -156,6 +156,10 @@ export interface Project {
   completedAt?: string | null;
   imageSelection?: ProjectImageSelection;
   sandbox?: SandboxState;
+  /** Retained mounts survive releasing the project's current Box. */
+  sandboxMounts?: import('./sandbox-types.js').SandboxMount[];
+  /** Cellbox ownership namespace of the retained mounts, including restored volumes. */
+  sandboxOwnerKey?: string;
   /** Timestamp at which archiving released the project's Sandbox binding. */
   sandboxReclaimedAt?: string;
   /** Confirmed runtime and Cellbox artifact cleanup; absent on legacy archives awaiting reconciliation. */
@@ -178,7 +182,7 @@ export interface Project {
 }
 export interface ProjectLifecycleRecord {
   id: string;
-  action: 'completed' | 'archived' | 'restored';
+  action: 'completed' | 'archived' | 'restored' | 'released';
   at: string;
   sandboxId?: string;
 }

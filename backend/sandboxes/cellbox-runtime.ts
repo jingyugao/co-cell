@@ -101,7 +101,11 @@ export class CellboxRuntimeIntegration {
                             const result = await options.provider.client.runTool(candidate.id, 'cocell_archive_restore', [JSON.stringify(ref.metadata), ossArchiveEndpoint], 5 * 60_000);
                             if (result.exitCode !== 0) throw new Error(result.stderr || `OSS archive restore exited ${result.exitCode}`);
                         });
-                        candidate.image = await options.provider.currentImageIdentity(candidate.id);
+                        const box = await options.provider.client.getBox(candidate.id);
+                        candidate.mounts = box.mounts;
+                        candidate.homeVolumeId = box.homeVolumeId;
+                        candidate.ownerKey = box.ownerKey;
+                        candidate.image = { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] };
                         return candidate;
                     }
                     const op = await options.provider.client.restoreBox({ ...options.provider.defaultSelector, ownerKey: `project:${target.projectId ?? target.id}:restore:${key}`, archiveId: ref.id, ...(target.imageSelection?.revisionId ? { revisionId: target.imageSelection.revisionId, templateId: undefined } : {}), ...(ref.portable ? { acceptImageChange: true } : {}) });
@@ -110,6 +114,9 @@ export class CellboxRuntimeIntegration {
                     context.sandboxId = candidate.id;
                     await this.timed('cellbox.restore_operation', candidate.id, () => options.provider.waitForOperation(op));
                     const box = await options.provider.client.getBox(candidate.id);
+                    candidate.mounts = box.mounts;
+                    candidate.homeVolumeId = box.homeVolumeId;
+                    candidate.ownerKey = box.ownerKey;
                     if (box.phase !== 'staged')
                         throw new Error('Cellbox did not return a staged restore candidate');
                     candidate.image = { reference: box.image, id: box.imageId ?? box.image, repoDigests: [] };

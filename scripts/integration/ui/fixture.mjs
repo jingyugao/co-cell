@@ -80,6 +80,10 @@ export const test = base.extend({
           data.status = 'archived'; data.archivedAt = now; delete data.sandbox;
           delete data.archiveCleanupSourceId; delete data.pendingSandboxCleanup;
           data.sandboxOperation = operation('archive', 'succeeded');
+        } else if (method === 'POST' && path.endsWith('/sandbox/release')) {
+          delete data.sandbox;
+          data.sandboxOperation = operation('release', 'succeeded');
+          status = 200;
         }
         else if (method === 'POST' && path.endsWith('/open')) {
           if (data.sandbox?.status === 'ready' && data.sandboxOperation?.status !== 'running') {

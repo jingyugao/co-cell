@@ -19,7 +19,7 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
   return renderToStaticMarkup(<ProjectsPage
     projects={projects} config={config} loading={false} initialView={initialView}
     onRefresh={async () => projects} onCreate={async () => project()} onUpdate={async () => project()}
-    onRebuildSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()} onBackupSandbox={async () => project()} onArchiveProject={async () => project()}
+    onCreateSandbox={async () => project()} onRestoreSandbox={async () => project()} onReleaseSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()} onBackupSandbox={async () => project()} onArchiveProject={async () => project()}
     onOpenProject={() => {}} onMenu={() => {}} onBack={() => {}}
   />);
 }
@@ -59,8 +59,18 @@ test('abnormal and missing sandboxes use the recovery-or-first-create paths', ()
   assert.match(missing, /无 Sandbox/);
   assert.match(missing, /进入项目/);
   assert.doesNotMatch(missing, /<button class="primary-button" disabled="">进入项目/);
-  assert.match(missing, /创建 Sandbox/);
+  assert.match(missing, /新建 Sandbox/);
   assert.doesNotMatch(missing, /<button[^>]*>恢复环境<\/button>/);
+});
+
+test('a released project offers new Sandbox and explicit backup restore independently', () => {
+  const html = page([project({
+    latestBackup: backup,
+    sandboxMounts: [{ volumeId: 'project-volume', mountPath: '/workspace' }],
+  })]);
+  assert.match(html, /新建 Sandbox/);
+  assert.match(html, /从备份恢复/);
+  assert.match(html, /保留的挂载盘[\s\S]*\/workspace[\s\S]*project-volume/);
 });
 
 test('paused sandbox shows its state and resumes the same environment', () => {

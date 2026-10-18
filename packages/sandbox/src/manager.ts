@@ -60,6 +60,7 @@ const cloneRecord = (record: SandboxRecord): SandboxRecord => ({
     repoDigests: [...record.templateIdentity.repoDigests],
   } } : {}),
   ...(record.checkpoint ? { checkpoint: { ...record.checkpoint } } : {}),
+  ...(record.mounts ? { mounts: structuredClone(record.mounts) } : {}),
 });
 
 const assertResourceKey = (resourceKey: string) => {
@@ -216,6 +217,17 @@ export class SandboxManager {
         `Sandbox resource ${resourceKey} was untracked`,
       ));
       this.log({ event: 'sandbox.untracked', resourceKey, sandboxId: current.record.id });
+    });
+  }
+
+  /** Invalidate only our cached handles after the provider confirms release. */
+  async forgetReleased(resourceKey: string, sandboxId: string): Promise<void> {
+    await this.lock(resourceKey, async () => {
+      const current = this.entries.get(resourceKey);
+      if (!current || current.record.id !== sandboxId) return;
+      this.entries.delete(resourceKey);
+      current.sandbox = undefined;
+      current.invalidation.abort(new SandboxManagerError('not_accessible', `Sandbox ${sandboxId} was released`));
     });
   }
 
@@ -574,9 +586,13 @@ export class SandboxManager {
           metadata: create.metadata,
         });
         let templateIdentity: SandboxRecord['templateIdentity'];
+        let storage: Pick<SandboxRecord, 'mounts' | 'homeVolumeId' | 'ownerKey'> = {};
         try {
           const info = await this.provider.getInfo(sandbox.sandboxId);
           templateIdentity = info.templateIdentity;
+          storage = { ...(info.mounts ? { mounts: structuredClone(info.mounts) } : {}),
+            ...(info.metadata?.ownerKey ? { ownerKey: info.metadata.ownerKey } : {}),
+            ...(info.homeVolumeId ? { homeVolumeId: info.homeVolumeId } : {}) };
           context.metadata = { ...create.metadata, ...info.metadata };
         } catch (error) {
           // Identity enrichment must not turn a successfully-created remote
@@ -588,6 +604,7 @@ export class SandboxManager {
           id: sandbox.sandboxId, template: create.template, status: 'starting',
           lastActiveAt: now, version: 0,
           ...(templateIdentity ? { templateIdentity } : {}),
+          ...storage,
         }, persist);
         entry.persistencePending = true;
         // Persist and publish the local binding atomically with respect to
@@ -965,11 +982,16 @@ export class SandboxManager {
     const pausedAt = status === 'paused' ? entry.record.pausedAt ?? new Date().toISOString() : undefined;
     const identityChanged = info.templateIdentity
       && JSON.stringify(entry.record.templateIdentity) !== JSON.stringify(info.templateIdentity);
-    if (entry.record.status !== status || entry.record.pausedAt !== pausedAt || entry.record.operation || identityChanged) {
+    const storageChanged = info.mounts && JSON.stringify(entry.record.mounts) !== JSON.stringify(info.mounts)
+      || info.homeVolumeId && entry.record.homeVolumeId !== info.homeVolumeId;
+    if (entry.record.status !== status || entry.record.pausedAt !== pausedAt || entry.record.operation || identityChanged || storageChanged) {
       if (status !== 'ready') entry.sandbox = undefined;
       await this.change(resourceKey, entry, {
         status, pausedAt, operation: undefined, error: undefined,
         ...(info.templateIdentity ? { templateIdentity: info.templateIdentity } : {}),
+        ...(info.mounts ? { mounts: structuredClone(info.mounts) } : {}),
+        ...(info.homeVolumeId ? { homeVolumeId: info.homeVolumeId } : {}),
+        ...(info.metadata?.ownerKey ? { ownerKey: info.metadata.ownerKey } : {}),
       });
     }
   }

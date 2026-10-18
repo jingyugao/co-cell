@@ -2,11 +2,17 @@
 
 日期：2026-10-18。
 
+最新补充（独立 Volume 适配）：下文已部署/现场验收状态仅记录此前版本。本轮 `POST /api/projects/:id/sandbox/release` 与 Cellbox 独立 Volume 适配仍未部署、未做 live 验证；本地构建与 395 项单测通过，桌面/手机回归及两项定位修正后的定向复验已完成，详见集成测试指南。目标 Cellbox 是 `cell-box-volumes` 的 `feat/independent-home-volumes` 分支 `50bedcb`（含 `807335d` 的独立卷和共享挂载改造），尚未合入 master。
+
 状态：适配代码已在 feature 分支实现，并已按用户授权切换主安装；本地检查及新版现场回归已完成。用户确认保留旧数据供后续迁移，旧 Sandbox 与旧归档暂不可用。75 个原有项目、188 个会话、28 个旧 CR 均已核对保留；测试安装未操作。第 2–6 节的“当前/原有”源码盘点描述改造前基线；实施和部署结果以本节及第 12 节为准。
 
 检视基线：CoCell `d6c3815343a789c70490763b5a847aa8a0c5a8b6`；Cellbox `6465c3e4b1205cde619f2681ede48d7ce1173b6b`，包括 `f0921f2` 的模板版本改造与 `6465c3e` 的单进程、SQLite 和生命周期简化。以下事实针对这些版本，后续实现前需重新核对目标提交和实际安装。
 
 本轮暂停/继续路径精简属于后续本地改造，尚未部署；第 12 节的部署与现场验收记录保持为此前版本的历史事实，不能视为本轮改造的部署验收。
+
+独立 Volume 适配同样属于后续本地改造：`POST /api/projects/:id/sandbox/release` 对当前 Box 单次提交 destroy，成功后保存终态 `mounts`/`homeVolumeId` 并解除 Sandbox 绑定；不自动 purge Box 元数据、不删除 Volume。Cellbox 卷 API 能力检查只在首次 release 执行一次，用于拒绝会连 HOME 一并删除的旧 server，不是状态预查；旧安装需升级后才能 release。新建 Sandbox 复用保存的 mounts 和真实 `ownerKey`，保留项目和会话 `threadId`。Cellbox 对旧 Box 的 legacy HOME 仅在 destroy 时生成独立 Volume ID，release 必须在 purge 前保存该终态引用。Box 元数据仍可能受 Cellbox TTL/purge 影响，不承诺永久保留。
+
+从备份 restore 是独立路径，Cellbox 总是为恢复候选创建新 HOME Volume，不复用 release 保存的 mounts/volume；候选成功切换后保存新返回的 mounts/`homeVolumeId`。新建或 release 结果未知时不自动重试。共享 Volume 可被多个 Box 引用，不承诺独占；归档和删除需按实际 mounts 与仍引用该 Volume 的 Box 处理。
 
 ### 已实现的入口和行为
 

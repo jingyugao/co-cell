@@ -4,13 +4,117 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { Hono } from 'hono';
-import type { Project, ProjectSummary, Settings } from '../../protocol/types.js';
-import type { SandboxState } from '../../protocol/sandbox-types.js';
+import type { Project, ProjectSummary, Session, Settings } from '../../protocol/types.js';
+import type { SandboxMount, SandboxState } from '../../protocol/sandbox-types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { installProjectsRoutes } from '../projects/routes.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 import { SessionManager, type CodexClient } from './manager.js';
 import { canEnterProject, isProjectSandboxReady } from '../../util/project-sandbox.js';
+import { CellboxError } from '../../packages/sandbox/src/providers/cellbox/client.js';
+
+type VolumeSandboxState = SandboxState;
+type VolumeProject = Project;
+
+test('release keeps project mounts and conversation thread for a new Box on the same volume', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-release-volume-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const at = new Date().toISOString();
+  const mounts: SandboxMount[] = [{ volumeId: 'workspace-volume', mountPath: '/home/agent' }];
+  const original = { id: 'released-box', status: 'ready' as const, template: 'default',
+    workingDirectory: defaults.workingDirectory } satisfies VolumeSandboxState;
+  const project: VolumeProject = { id: 'release-project', name: 'Release project', type: 1, requirementUrl: null,
+    status: 'active', executionMode: 'sandbox', workingDirectory: defaults.workingDirectory, completedAt: null, archivedAt: null,
+    createdAt: at, updatedAt: at, sandbox: original };
+  const session: Session = { id: 'release-session', projectId: project.id, threadId: 'thread-kept', title: 'Existing thread',
+    settings: defaults, status: 'idle', startedAt: at, archivedAt: null, createdAt: at, updatedAt: at, turns: [], sandbox: original };
+  await state.saveProject(project);
+  await state.saveSession(session);
+  const calls: string[] = [];
+  const recreated = { ...original, id: 'replacement-box', status: 'ready' as const, mounts } satisfies VolumeSandboxState;
+  const runtime = {
+    async close() {},
+    async release(target) {
+      calls.push('release');
+      assert.equal(target.sandbox?.id, original.id);
+      assert.equal(target.sandbox?.homeVolumeId, undefined, 'Legacy Box state has not published its promoted HOME volume yet');
+      return { ...target.sandbox!, status: 'unavailable' as const, homeVolumeId: 'workspace-volume' };
+    },
+    async rebuild(target, save) {
+      calls.push('create');
+      assert.equal(target.sandbox, undefined, 'Released Box reference must not be reused');
+      assert.deepEqual(target.sandboxMounts, mounts,
+        'Create must receive the project volume attachment after release');
+      await save(recreated);
+    },
+    async verifySandbox() {},
+  } satisfies Partial<SandboxRuntime> & { release(target: import('../sandboxes/types.js').WorkspaceTarget): Promise<SandboxState> };
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
+  const app = new Hono(); installProjectsRoutes(app, manager);
+  try {
+    await manager.init();
+    const releasedResponse = await app.request(`/api/projects/${project.id}/sandbox/release`, { method: 'POST' });
+    assert.equal(releasedResponse.status, 200);
+    const released = await releasedResponse.json() as ProjectSummary;
+    assert.equal(released.sandbox, undefined);
+    assert.deepEqual(released.sandboxMounts, mounts);
+    assert.deepEqual(calls, ['release']);
+    assert.equal(manager.get(session.id).threadId, 'thread-kept');
+
+    const createdResponse = await app.request(`/api/projects/${project.id}/sandbox/create`, { method: 'POST' });
+    assert.equal(createdResponse.status, 200);
+    const created = await createdResponse.json() as ProjectSummary;
+    assert.equal(created.sandbox?.id, recreated.id);
+    assert.deepEqual((created.sandbox as VolumeSandboxState).mounts, mounts);
+    assert.deepEqual(created.sandboxMounts, mounts);
+    assert.equal(manager.get(session.id).threadId, 'thread-kept');
+    assert.deepEqual(calls, ['release', 'create']);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('release BUSY and UNKNOWN outcomes submit once and retain Box, volume, and thread bindings', async () => {
+  for (const code of ['BUSY', 'UNKNOWN_OUTCOME'] as const) {
+    const directory = await mkdtemp(join(tmpdir(), `cocell-release-${code.toLowerCase()}-`));
+    const state = new MemoryWebStateStore();
+    const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+      modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+    const at = new Date().toISOString();
+    const mounts: SandboxMount[] = [{ volumeId: 'workspace-volume', mountPath: '/home/agent' }];
+    const box = { id: 'release-box', status: 'ready' as const, template: 'default',
+      workingDirectory: defaults.workingDirectory, mounts } satisfies VolumeSandboxState;
+    const project: VolumeProject = { id: `release-${code.toLowerCase()}`, name: 'Release failure', type: 1, requirementUrl: null,
+      status: 'active', executionMode: 'sandbox', workingDirectory: defaults.workingDirectory, completedAt: null, archivedAt: null,
+      createdAt: at, updatedAt: at, sandbox: box, sandboxMounts: mounts };
+    const session: Session = { id: `session-${code.toLowerCase()}`, projectId: project.id, threadId: 'thread-kept', title: 'Existing thread',
+      settings: defaults, status: 'idle', startedAt: at, archivedAt: null, createdAt: at, updatedAt: at, turns: [], sandbox: box };
+    await state.saveProject(project);
+    await state.saveSession(session);
+    let submissions = 0;
+    const runtime = {
+      async close() {},
+      async release() {
+        submissions++;
+        throw new CellboxError(code, `Cellbox release ${code}`, code === 'BUSY' ? 409 : 502);
+      },
+    } satisfies Partial<SandboxRuntime> & { release(target: import('../sandboxes/types.js').WorkspaceTarget): Promise<SandboxState> };
+    const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
+    const app = new Hono(); installProjectsRoutes(app, manager);
+    try {
+      await manager.init();
+      const response = await app.request(`/api/projects/${project.id}/sandbox/release`, { method: 'POST' });
+      assert.notEqual(response.status, 200, `${code} must not be reported as a successful release`);
+      await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
+      const retained = manager.getProject(project.id);
+      assert.equal(submissions, 1, `${code} release is not automatically replayed`);
+      assert.equal(retained.sandbox?.id, box.id);
+      assert.deepEqual(retained.sandboxMounts, mounts);
+      assert.equal(manager.get(session.id).threadId, 'thread-kept');
+      assert.equal(retained.sandboxOperation?.errorCode, code);
+    } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+  }
+});
 
 test('archiving deletes current and legacy attachment caches and blocks new uploads', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-archive-cache-'));

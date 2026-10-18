@@ -16,7 +16,8 @@ import { querySandbox } from '../sandboxes/status.js';
 type OperationOptions = { useExistingBackup?: boolean; imageVersionId?: string };
 
 const target = (project: Project): WorkspaceTarget => ({ id: project.id, projectId: project.id,
-  settings: { workingDirectory: project.workingDirectory }, imageSelection: project.imageSelection, sandbox: project.sandbox, updatedAt: project.updatedAt });
+  settings: { workingDirectory: project.workingDirectory }, imageSelection: project.imageSelection, sandbox: project.sandbox,
+  sandboxMounts: project.sandboxMounts, sandboxOwnerKey: project.sandboxOwnerKey, updatedAt: project.updatedAt });
 
 export class ProjectSandboxOperations {
   private tasks = new Set<Promise<void>>();
@@ -30,6 +31,7 @@ export class ProjectSandboxOperations {
     saveSandbox: (id: string, sandbox: SandboxState, restore: boolean, image?: ProjectImageSelection, expectedSandboxId?: string | null) => Promise<void>;
     selectRestoreImage?: (project: Project, versionId?: string) => Promise<{ selection?: ProjectImageSelection; release(): void | Promise<void> }>;
     detached: (id: string) => Promise<void>;
+    released?: (id: string) => Promise<void>;
     logger?: Pick<RuntimeLog, 'write'>;
   }) {}
 
@@ -116,6 +118,7 @@ export class ProjectSandboxOperations {
       try {
         if (kind === 'create') await this.create(id);
         else if (kind === 'resume') await this.resume(id);
+        else if (kind === 'release') await this.release(id);
         else if (kind === 'rebuild') throw new HttpError(422, '当前 Cellbox 不支持同 ID 重建；可从备份创建新环境。');
         else if (kind === 'checkpoint') await this.checkpoint(id);
         else if (kind === 'restore') await this.restore(id, false, selection);
@@ -160,7 +163,6 @@ export class ProjectSandboxOperations {
     const { projects, runtime } = this.deps;
     const project = projects.get(id);
     if (project.status === 'archived') throw new HttpError(409, '已归档项目须从备份恢复');
-    if (project.remoteArchives?.length) throw new HttpError(409, '项目已有备份，请使用恢复环境');
     await this.phase(id, '创建并准备环境');
     await runtime.rebuild(target(project), sandbox => this.deps.saveSandbox(id, sandbox, false, undefined, project.sandbox?.id ?? null));
     const candidate = projects.get(id).sandbox;
@@ -169,6 +171,18 @@ export class ProjectSandboxOperations {
     if (!runtime.verifySandbox) throw new HttpError(503, 'Sandbox 不支持就绪验证');
     await runtime.verifySandbox(candidate);
     await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, false);
+  }
+
+  private async release(id: string) {
+    const project = this.context.getStore()!.project;
+    if (!project.sandbox) throw new HttpError(409, '项目没有可释放的 Sandbox');
+    if (!this.deps.runtime.release) throw new HttpError(503, 'Sandbox 不支持保留磁盘的释放操作');
+    await this.phase(id, '释放运行环境并保留磁盘');
+    const sandbox = await this.deps.runtime.release(target(project));
+    this.context.getStore()!.operation.result = { sandbox };
+    await this.deps.projects.releaseSandbox(id, sandbox);
+    await this.deps.runtime.forgetReleasedSandbox?.(target(project));
+    await this.deps.released?.(id);
   }
 
   private async checkpoint(id: string) {

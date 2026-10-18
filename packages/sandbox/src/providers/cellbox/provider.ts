@@ -63,6 +63,7 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   private readonly revisionId?: string;
   private initialized = false;
   private profile?: CellboxProfile;
+  private volumeAPI?: Promise<void>;
   constructor(options: CellboxSandboxProviderOptions) {
     this.client = new CellboxClient(options);
     this.profileId = options.profileId;
@@ -195,7 +196,10 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     const templateId = metadataTemplateId ?? (metadataRevisionId ? undefined : (template === this.templateId ? template : undefined) ?? this.templateId);
     if (Boolean(revisionId) === Boolean(templateId)) throw new CellboxError('INVALID_REQUEST', 'Exactly one Cellbox templateId or revisionId must be selected');
     const staged = options.metadata?.cellboxStaged === 'true';
-    const op = await this.client.createBox({ ownerKey, ...(revisionId ? { revisionId } : { templateId: templateId! }), ...(staged ? { staged: true } : {}) });
+    const mounts = options.metadata?.cellboxMounts ? JSON.parse(options.metadata.cellboxMounts) : undefined;
+    const homeVolumeId = options.metadata?.cellboxHomeVolumeId;
+    const op = await this.client.createBox({ ownerKey, ...(revisionId ? { revisionId } : { templateId: templateId! }),
+      ...(mounts ? { mounts } : homeVolumeId ? { homeVolumeId } : {}), ...(staged ? { staged: true } : {}) });
     await this.wait(op);
     const box = await this.box(op.targetId);
     if (box.phase !== 'running' && !(staged && box.phase === 'staged')) throw new CellboxError('CONFLICT', `Created box ${box.id} is ${box.phase}`);
@@ -258,6 +262,8 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   private boxInfo(box: CellboxBox): SandboxInfo {
     const startedAt = new Date(box.createdAt);
     return { sandboxId: box.id, state: !box.operationId && box.phase === 'running' ? 'running' : !box.operationId && box.phase === 'suspended' ? 'paused' : 'unknown',
+      ...(box.mounts ? { mounts: structuredClone(box.mounts) } : {}),
+      ...(box.homeVolumeId ? { homeVolumeId: box.homeVolumeId } : {}),
       startedAt,
       metadata: { ownerKey: box.ownerKey, profileId: box.profileId, generation: String(box.generation), phase: box.phase,
         ...(box.operationId ? { operationId: box.operationId } : {}),
@@ -292,17 +298,24 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   async rebuildPersistent(_id: string, _key: string) {
     throw new CellboxError('UNSUPPORTED_CAPABILITY', 'Cellbox does not support rebuilding a persistent Box');
   }
+  async release(id: string): Promise<SandboxInfo> {
+    // Older Cellbox destroys HOME with the Box. This is a protocol check, not
+    // a phase preflight; never submit that destructive API as a retained release.
+    this.volumeAPI ??= this.client.listVolumes().then(() => {}, error => {
+      this.volumeAPI = undefined;
+      if (error instanceof CellboxError && error.code === 'NOT_FOUND')
+        throw new CellboxError('UNSUPPORTED_CAPABILITY', 'Cellbox must support independent volumes before releasing a Sandbox');
+      throw error;
+    });
+    await this.volumeAPI;
+    const operation = await this.act(id, 'destroy');
+    // Terminal operations carry legacy HOME promotion as well as explicit mounts.
+    const box = operation.box ?? await this.client.getBox(id);
+    if (box.id !== id) throw new CellboxError('PROTOCOL', 'Cellbox release returned metadata for another Box');
+    return this.boxInfo(box);
+  }
   async kill(id: string) {
-    await this.ready();
-    const box = await this.box(id);
-    if (box.phase !== 'deleted') await this.act(id, 'destroy', `cocell-destroy-${id}`);
-    try {
-      await this.client.purgeBoxArtifacts(id);
-    }
-    catch (error) {
-      // Preserve the underlying cleanup failure for callers to report.
-      throw new CellboxError('CLEANUP_FAILED', 'Cellbox artifact cleanup has not completed', undefined, { cause: error });
-    }
+    await this.release(id);
     return true;
   }
   async suspendBox(id: string, key: string) { await this.ready(); return this.act(id, 'suspend', key); }

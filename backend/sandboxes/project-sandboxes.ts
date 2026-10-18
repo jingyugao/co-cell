@@ -42,9 +42,19 @@ export class ProjectSandboxes {
     this.bindings.delete(resourceKey(target));
   }
 
+  async forgetReleased(target: WorkspaceTarget) {
+    if (!target.sandbox) return;
+    const key = resourceKey(target), binding = this.bindings.get(key);
+    await this.manager.forgetReleased(key, target.sandbox.id);
+    if (this.bindings.get(key) === binding && !this.manager.peek(key)) this.bindings.delete(key);
+  }
+
   private project(record: SandboxRecord, workingDirectory: string): SandboxState {
     return {
       id: record.id, template: record.template, workingDirectory,
+      ...(record.ownerKey ? { ownerKey: record.ownerKey } : {}),
+      ...(record.mounts ? { mounts: structuredClone(record.mounts) } : {}),
+      ...(record.homeVolumeId ? { homeVolumeId: record.homeVolumeId } : {}),
       ...(record.templateIdentity ? { image: structuredClone(record.templateIdentity) } : {}),
       status: record.status === 'deleted' ? 'unavailable' : record.status,
       ...(record.lastActiveAt ? { lastActiveAt: record.lastActiveAt } : {}),
@@ -111,6 +121,8 @@ export class ProjectSandboxes {
       ...(options.create ? { create: {
         template: this.template,
         metadata: {
+          ...(target.sandboxOwnerKey ? { cellboxOwnerKey: target.sandboxOwnerKey } : {}),
+          ...(target.sandboxMounts?.length ? { cellboxMounts: JSON.stringify(target.sandboxMounts) } : {}),
           ...(target.imageSelection?.revisionId ? { cellboxRevisionId: target.imageSelection.revisionId } : {}),
           app: 'codex-web', sessionId: target.id, workingDirectory: target.settings.workingDirectory,
           ...(target.projectId ? { projectId: target.projectId } : {}),

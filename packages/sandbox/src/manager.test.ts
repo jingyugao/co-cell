@@ -51,6 +51,28 @@ const record = (status: SandboxRecord['status'] = 'paused'): SandboxRecord => ({
   ...(status === 'paused' ? { pausedAt: new Date(0).toISOString() } : {}),
 });
 
+test('confirmed remote release forgets cached leases and preserves retained mount identities on creation', async () => {
+  const fake = fixture('running');
+  const mounts = [{ volumeId: 'volume-one', mountPath: '/home/agent' }];
+  const info = fake.provider.getInfo;
+  fake.provider.getInfo = async id => ({ ...await info(id), mounts, homeVolumeId: 'volume-one',
+    metadata: { ownerKey: 'project:one:restore:older' } });
+  const manager = new SandboxManager({ provider: fake.provider });
+  try {
+    const lease = await manager.acquire('project:one', { usageId: 'read', create: { template: 'template-1' }, persist: async () => {} });
+    assert.deepEqual(lease.record.mounts, mounts);
+    assert.equal(lease.record.ownerKey, 'project:one:restore:older');
+    await manager.forgetReleased('project:one', lease.record.id);
+    assert.equal(manager.peek('project:one'), undefined);
+    await lease.release();
+    assert.equal(manager.peek('project:one'), undefined, 'a stale lease cannot restore the released binding');
+    manager.track('project:one', { ...record('ready'), id: 'replacement' }, async () => {});
+    await manager.forgetReleased('project:one', 'sandbox-1');
+    assert.equal(manager.peek('project:one')?.id, 'replacement', 'forgetting an old Box cannot invalidate its replacement');
+    assert.equal(fake.counts.kill, 0, 'cache invalidation never submits another remote operation');
+  } finally { await manager.close(); }
+});
+
 test('lifecycle hooks surround transitions while acquire reuse and inspection stay read-only', async () => {
   const fake = fixture('running');
   const calls: string[] = [];

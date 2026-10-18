@@ -296,3 +296,20 @@ test('archive started without a Sandbox cannot detach a binding created in the m
   assert.equal(service.get(initial.id).status, 'active');
   await service.close();
 });
+
+test('late callbacks cannot reattach a released Box and explicit creation retains the promoted volume owner', async () => {
+  const original = project();
+  const service = new ProjectService(new MemoryState([original]));
+  await service.init();
+  const released = { ...original.sandbox!, homeVolumeId: 'retained-volume', ownerKey: 'project:project-1:restore:older' };
+  try {
+    await service.releaseSandbox(original.id, released);
+    assert.equal(await service.updateSandbox(original.id, original.sandbox!), false);
+    assert.equal(service.get(original.id).sandbox, undefined);
+    assert.equal(service.get(original.id).sandboxOwnerKey, released.ownerKey);
+    assert.deepEqual(service.get(original.id).sandboxMounts, [{ volumeId: 'retained-volume', mountPath: '/home/agent' }]);
+    const replacement = { ...released, id: 'new-box' };
+    assert.equal(await service.updateSandbox(original.id, replacement, false, undefined, null), true);
+    assert.equal(service.get(original.id).sandbox?.id, replacement.id);
+  } finally { await service.close(); }
+});

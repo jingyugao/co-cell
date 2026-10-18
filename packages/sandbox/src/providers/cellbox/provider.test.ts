@@ -192,17 +192,15 @@ test('accepted mutation responses that cannot be decoded stay unknown and are ne
   }
 });
 
-test('kill preserves a missing Box error and does not destroy or purge it', async () => {
+test('release returns a missing Box error after one request without purging or retrying', async () => {
   const mutations: string[] = [];
   const fetch: typeof globalThis.fetch = async (input, init) => {
     const path = new URL(String(input)).pathname;
     const method = init?.method ?? 'GET';
-    if (path === '/v1/profiles') return Response.json([profile]);
-    if (path === '/v1/boxes/box-a' && method === 'GET')
-      return Response.json({ error: { code: 'NOT_FOUND', message: 'Box not found' } }, { status: 404 });
+    if (path === '/v1/volumes') return Response.json([]);
     if (method === 'POST') {
       mutations.push(path);
-      return new Response(null, { status: 204 });
+      return Response.json({ error: { code: 'NOT_FOUND', message: 'Box not found' } }, { status: 404 });
     }
     throw new Error(`unexpected request ${method} ${path}`);
   };
@@ -210,5 +208,48 @@ test('kill preserves a missing Box error and does not destroy or purge it', asyn
   const instance = provider(fetch, { revisionId: 'rev-a' });
   await assert.rejects(instance.kill('box-a'),
     error => error instanceof CellboxError && error.code === 'NOT_FOUND');
-  assert.deepEqual(mutations, [], 'a missing Box must not trigger destroy or artifact purge');
+  assert.deepEqual(mutations, ['/v1/boxes/box-a:destroy']);
+});
+
+test('release preserves promoted legacy HOME metadata from the terminal operation without purge', async () => {
+  const calls: string[] = [];
+  const instance = provider(async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    calls.push(`${init?.method ?? 'GET'} ${path}`);
+    if (path === '/v1/volumes') return Response.json([]);
+    if (path === '/v1/boxes/box-a:destroy') return Response.json({ ...op('destroy'),
+      box: box('running', { phase: 'deleted', homeVolumeId: 'legacy-volume' }) });
+    assert.fail(`unexpected ${path}`);
+  }, { revisionId: 'rev-a' });
+  const released = await instance.release('box-a');
+  assert.equal(released.homeVolumeId, 'legacy-volume');
+  assert.equal(released.metadata?.phase, 'deleted');
+  assert.deepEqual(calls, ['GET /v1/volumes', 'POST /v1/boxes/box-a:destroy']);
+});
+
+test('release refuses an old Cellbox server before a destructive request', async () => {
+  const calls: string[] = [];
+  const instance = provider(async (input, init) => {
+    calls.push(`${init?.method ?? 'GET'} ${new URL(String(input)).pathname}`);
+    return Response.json({ error: { code: 'NOT_FOUND', message: 'Endpoint not found' } }, { status: 404 });
+  }, { revisionId: 'rev-a' });
+  await assert.rejects(instance.release('box-a'), error => error instanceof CellboxError && error.code === 'UNSUPPORTED_CAPABILITY');
+  assert.deepEqual(calls, ['GET /v1/volumes']);
+});
+
+test('create forwards retained mounts in order with their actual owner, without reserving shared volumes', async () => {
+  const mounts = [{ volumeId: 'shared-volume', mountPath: '/home/agent' },
+    { volumeId: 'shared-volume', mountPath: '/data', readOnly: true }];
+  const bodies: unknown[] = [];
+  const instance = provider(async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === '/v1/profiles') return Response.json([profile]);
+    if (path === '/v1/boxes') { bodies.push(JSON.parse(String(init?.body))); return Response.json(op('create')); }
+    if (path === '/v1/boxes/box-a') return Response.json(box('running', { mounts }));
+    assert.fail(`unexpected ${path}`);
+  }, { revisionId: 'rev-a' });
+  await instance.create('profile-a', { timeoutMs: 60_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+    metadata: { projectId: 'p1', cellboxOwnerKey: 'project:p1:restore:previous', cellboxMounts: JSON.stringify(mounts) } });
+  assert.deepEqual(bodies, [{ ownerKey: 'project:p1:restore:previous', revisionId: 'rev-a', mounts }]);
+  assert.deepEqual((await instance.getInfo('box-a')).mounts, mounts);
 });

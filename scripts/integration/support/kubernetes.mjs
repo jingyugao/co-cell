@@ -75,6 +75,80 @@ export async function testWorkspaceWriter(env, projectId) {
   };
 }
 
+/** Explicitly delete only an unreferenced Cellbox volume owned by one test project. */
+export async function testOwnedVolumeCleaner(env, projectId) {
+  assert(env.projects.has(projectId), 'Volume cleanup requires a project owned by this test');
+  const context = process.env.COCELL_E2E_KUBE_CONTEXT;
+  assert(context, 'Volume cleanup requires COCELL_E2E_KUBE_CONTEXT');
+  const namespace = process.env.COCELL_E2E_CELLBOX_NAMESPACE ?? 'cell-box';
+  const release = process.env.COCELL_E2E_HELM_RELEASE ?? process.env.COCELL_HELM_RELEASE ?? 'co-cell';
+  const values = JSON.parse((await exec('helm', ['--kube-context', context, '-n', process.env.COCELL_E2E_NAMESPACE ?? process.env.COCELL_NAMESPACE ?? 'co-cell',
+    'get', 'values', release, '-o', 'json'], { timeout: 30_000 })).stdout);
+  assert(values.cellbox?.clientId, 'Missing Cellbox client namespace');
+  const transport = await forwardService(context, namespace, 'cellbox-api', 8090);
+  env.transports.push(transport);
+  const request = async (method, path, allowNonJson = false) => {
+    const response = await fetch(`${transport.base}${path}`, {
+      method, headers: { 'X-Cellbox-Client-ID': values.cellbox.clientId },
+      signal: AbortSignal.any([env.controller.signal, AbortSignal.timeout(30_000)]), redirect: 'error',
+    });
+    const text = await response.text();
+    let data;
+    try { data = text ? JSON.parse(text) : undefined; }
+    catch {
+      if (!allowNonJson) throw new Error(`Cellbox ${method} ${path} returned invalid JSON`);
+    }
+    return { response, data, text };
+  };
+  const capability = await request('GET', '/v1/volumes', true);
+  assert([200, 404].includes(capability.response.status),
+    `Cellbox volume capability lookup failed: HTTP ${capability.response.status}`);
+  const cleanup = async volumeIds => {
+    const project = await env.json(`/api/projects/${projectId}`);
+    assert(project.name.startsWith(`${env.prefix} `), 'Project ownership changed; refusing volume cleanup');
+    env.report.volumeCleanup ??= [];
+    for (const volumeId of [...new Set(volumeIds)]) {
+      const record = { projectId, volumeId, status: 'checking' };
+      env.report.volumeCleanup.push(record);
+      await env.persist();
+      const volumeResult = await request('GET', `/v1/volumes/${encodeURIComponent(volumeId)}`);
+      if (volumeResult.response.status === 404) { record.status = 'already-absent'; await env.persist(); continue; }
+      assert.equal(volumeResult.response.status, 200, `Cellbox volume lookup failed: HTTP ${volumeResult.response.status}`);
+      assert.equal(volumeResult.data.ownerKey, `project:${projectId}`, 'Volume is not owned by this test project');
+
+      const boxesResult = await request('GET', '/v1/boxes');
+      assert.equal(boxesResult.response.status, 200, `Cellbox Box inventory failed: HTTP ${boxesResult.response.status}`);
+      const references = boxesResult.data.filter(box => box.phase !== 'deleted'
+        && (box.homeVolumeId === volumeId || (box.mounts ?? []).some(mount => mount.volumeId === volumeId)));
+      assert.deepEqual(references, [], 'Refusing to delete a volume still referenced by any Box');
+
+      const deleted = await request('DELETE', `/v1/volumes/${encodeURIComponent(volumeId)}`);
+      assert.equal(deleted.response.status, 202, `Cellbox volume delete was not accepted: HTTP ${deleted.response.status}`);
+      assert(deleted.data?.id, 'Cellbox volume delete response has no operation ID');
+      record.operationId = deleted.data.id; record.status = 'deleting'; await env.persist();
+      const deadline = Date.now() + env.config.operationTimeout;
+      for (;;) {
+        const operation = await request('GET', `/v1/operations/${encodeURIComponent(record.operationId)}`);
+        assert.equal(operation.response.status, 200, `Cellbox volume operation lookup failed: HTTP ${operation.response.status}`);
+        if (operation.data.status === 'failed') throw new Error(`Cellbox volume deletion failed: ${env.redact(operation.data.error?.message ?? 'unknown error')}`);
+        if (operation.data.status === 'unknown') {
+          record.status = 'unknown'; await env.persist();
+          throw new Error(`Cellbox volume deletion outcome is unknown; operation ${record.operationId} was not replayed`);
+        }
+        if (operation.data.status === 'succeeded') break;
+        assert(Date.now() < deadline, 'Timed out waiting for the single Cellbox volume deletion request');
+        await delay(250, undefined, { signal: env.controller.signal });
+      }
+      const final = await request('GET', `/v1/volumes/${encodeURIComponent(volumeId)}`);
+      assert.equal(final.response.status, 200, 'Deleted volume tombstone is missing');
+      assert.equal(final.data.phase, 'deleted', 'Volume deletion did not reach the deleted tombstone phase');
+      record.status = 'deleted'; await env.persist();
+    }
+  };
+  cleanup.supportsVolumes = capability.response.status === 200;
+  return cleanup;
+}
+
 /** Fault injection is limited to the existing execution Pod of this test's project. */
 export async function failTestSandbox(env, projectId) {
   assert(env.projects.has(projectId), 'Fault injection requires a project owned by this test');

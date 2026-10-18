@@ -113,7 +113,7 @@ export class AppServerReader {
   }
 
   /** Release our unused cached sockets; active requests and races go to Cellbox admission. */
-  private async closeIdle(id: string): Promise<void> {
+  async closeIdle(id: string): Promise<void> {
     const idle = [...this.live].filter(connection => connection.id === id && !connection.users);
     for (const connection of idle) this.retire(id, connection);
     const errors = await Promise.all(idle.map(connection => connection.drained));

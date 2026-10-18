@@ -12,8 +12,18 @@ export interface SandboxImageIdentity {
   createdAt?: string;
 }
 
+/** Cellbox owns the volume and its lifetime; mounting does not reserve it. */
+export interface SandboxMount {
+  volumeId: string;
+  mountPath: string;
+  readOnly?: boolean;
+}
+
 /** Sandbox reference and live observation; status is never persisted by CoCell. */
 export interface SandboxState {
+  ownerKey?: string;
+  mounts?: SandboxMount[];
+  homeVolumeId?: string;
   /** Request-local observations from Cellbox; never used as a resource lock. */
   phase?: string;
   generation?: number;

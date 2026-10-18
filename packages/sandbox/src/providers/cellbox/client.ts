@@ -6,6 +6,7 @@ export interface CellboxCapabilities {
   pty: boolean; reconnectExec: boolean; freeze: boolean;
   suspend: 'none' | 'same-node-checkpoint'; archives: string; protectedTools: boolean;
   sharedDirectory?: boolean;
+  persistentHome?: boolean;
   mountedDebugHome?: boolean;
   rootDebug?: boolean;
   credentialBatch?: boolean;
@@ -39,7 +40,14 @@ export interface CellboxBuildRequest {
 }
 export type CellboxPhase = 'creating' | 'running' | 'checkpointing' | 'suspending' | 'suspended'
   | 'resuming' | 'restoring' | 'staged' | 'deleting' | 'deleted' | 'failed';
+export interface CellboxMount { volumeId: string; mountPath: string; readOnly?: boolean }
+export interface CellboxVolume {
+  id: string; ownerKey: string; profileId: string; nodeName: string; phase: string;
+  resourceVersion: number; createdAt: string; operationId?: string; error?: { code: string; message: string };
+}
 export interface CellboxBox {
+  mounts?: CellboxMount[];
+  homeVolumeId?: string;
   id: string; ownerKey: string; profileId: string; templateId: string; revisionId: string;
   templateName: string; templateVersion: string; phase: CellboxPhase; generation: number;
   resourceVersion: number; image: string; imageId?: string; workspace: string;
@@ -47,6 +55,7 @@ export interface CellboxBox {
   error?: { code: string; message: string };
 }
 export interface CellboxOperation {
+  box?: CellboxBox;
   id: string; kind: string; targetId: string; status: 'queued' | 'running' | 'succeeded' | 'failed';
   stage?: string; input?: CellboxBuildRequest; version: number; createdAt: string; startedAt?: string;
   updatedAt?: string; finishedAt?: string;
@@ -237,8 +246,16 @@ export class CellboxClient {
   listResourceBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes?observation=resource', { signal }); }
   listCheckpoints(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/checkpoints', { signal }); }
   getBox(id: string, signal?: AbortSignal) { return this.request<CellboxBox>('GET', `/v1/boxes/${this.id(id)}`, { signal }); }
-  createBox(input: { ownerKey: string; revisionId?: string; templateId?: string; staged?: boolean }, _legacyKey?: string) {
+  listVolumes(signal?: AbortSignal) { return this.request<CellboxVolume[]>('GET', '/v1/volumes', { signal }); }
+  getVolume(id: string, signal?: AbortSignal) { return this.request<CellboxVolume>('GET', `/v1/volumes/${this.id(id)}`, { signal }); }
+  createVolume(input: { id?: string; ownerKey: string; profileId: string }) {
+    return this.request<CellboxOperation>('POST', '/v1/volumes', { body: input });
+  }
+  deleteVolume(id: string) { return this.request<CellboxOperation>('DELETE', `/v1/volumes/${this.id(id)}`); }
+  createBox(input: { id?: string; ownerKey: string; revisionId?: string; templateId?: string; staged?: boolean;
+    homeVolumeId?: string; mounts?: CellboxMount[] }, _legacyKey?: string) {
     if (Boolean(input.revisionId) === Boolean(input.templateId)) throw new CellboxError('INVALID_REQUEST', 'Exactly one of revisionId or templateId is required');
+    if (input.homeVolumeId && input.mounts?.length) throw new CellboxError('INVALID_REQUEST', 'Specify mounts or homeVolumeId, not both');
     return this.request<CellboxOperation>('POST', '/v1/boxes', { body: input });
   }
   restoreBox(input: { ownerKey: string; archiveId: string; revisionId?: string; templateId?: string; acceptImageChange?: boolean }, _legacyKey?: string) {

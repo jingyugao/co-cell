@@ -94,7 +94,15 @@ UI 交互耗时与实际恢复耗时分别记录；普通集成测试不把单�
 
 本轮进一步精简暂停/继续路径的代码尚未部署。下方此前的部署和现场验收记录保留其历史范围，不代表本轮新改造已部署或验收。
 
-本轮本地验证：387 项单测、`pnpm build` 和 70 项集成测试全部通过（harness 12、桌面 29、手机 29），无重跑。新增回归覆盖陈旧本地状态及 App Server 不可用不阻断生命周期提交、BUSY/未知结果仅提交一次、操作成功与后续状态查询失败分开呈现、恢复后重新计算空闲时间。集成报告：`tmp/integration/2026-10-18T08-40-33-615Z-1ab4c07c`；未执行本轮 live 验收。
+最新的独立 Volume 适配仍未部署、未做 live 验证；目标 Cellbox 为尚未合入 master 的 `cell-box-volumes` 分支 `feat/independent-home-volumes` / `50bedcb`（含 `807335d` 的独立卷和共享挂载改造）。本轮 `pnpm build`、395 项单测和项目卡片组件 8 项通过。本地集成全量 74/76 通过；两个释放用例因状态文本重复导致定位歧义，修正定位后桌面和手机定向 2/2 通过，没有重跑整套。全量报告：`tmp/integration/2026-10-18T10-40-14-493Z-64137ddd`；定向报告：`tmp/integration/2026-10-18T10-47-38-594Z-72816762`。
+
+新增 `POST /api/projects/:id/sandbox/release`：首次 release 先做一次 `/v1/volumes` 协议能力检查，避免旧 Cellbox 在 destroy 时删除 HOME；这是协议兼容检查，不是 Box 状态预查。随后只对当前 Box 单次提交 destroy，不自动 purge Box 元数据或删除 Volume。release 保存终态 `mounts`/`homeVolumeId`，解除 Sandbox 绑定，同时保留项目及会话 `threadId`。旧 Box 的 legacy HOME volume ID 只在 destroy 时生成，因此须在 purge 前保存终态 Box 信息。Box 元数据仍受 Cellbox TTL/purge 影响，不承诺永久保留；旧安装需升级 Cellbox 后才能 release。
+
+新建 Sandbox 传入原 mounts 与真实 `ownerKey`，复用已保存 Volume；共享 Volume 允许多个 Box 引用，不假设独占。备份 restore 与 release 分开，Cellbox restore 总创建新 Volume；恢复候选的 mounts/`homeVolumeId` 在成功切换后保存。新建或 release 结果未知时不自动重试。尚未完成的 live 验证应覆盖新建后 release、再次创建复用原 mounts、备份 restore 得到新卷，以及旧 Cellbox 协议检查拒绝 release；完成后再追加实际测试结果。
+
+暂停/释放前仅关闭本进程无人使用的 App Server 缓存连接，避免自己的闲置 WebSocket 导致底层 BUSY；不发送 readiness RPC、不阻挡活跃读取，竞争交由 Cellbox 返回。回归先复现绕过缓存关闭导致的失败，再验证关闭闲置连接及活跃读取 BUSY 单次提交。新 live 卷旅程依据底层 `/v1/volumes` 能力判断旧安装；新版响应缺失挂载信息会失败，不会跳过。
+
+此前暂停/继续精简验证：387 项单测、`pnpm build` 和 70 项集成测试全部通过（harness 12、桌面 29、手机 29），无重跑。新增回归覆盖陈旧本地状态及 App Server 不可用不阻断生命周期提交、BUSY/未知结果仅提交一次、操作成功与后续状态查询失败分开呈现、恢复后重新计算空闲时间。集成报告：`tmp/integration/2026-10-18T08-40-33-615Z-1ab4c07c`；未执行本轮 live 验收。
 
 项目不再有通用控制锁、维护长租约或恢复重放。只读进入和真实状态查询独立，unknown 结果由用户决定下一步。暂停/继续通过项目绑定的 Box ID 各发出一次 provider pause/resume 调用，再由项目操作记录呈现结果；不先查本地或 Cellbox phase，不做 App Server readiness、环境准备或 Sandbox 绑定重写。Cellbox 冲突和未知结果照实返回，不自动重试。
 

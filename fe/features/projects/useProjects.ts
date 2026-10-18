@@ -57,9 +57,15 @@ export function useProjects() {
     }
     finally { await refreshProjects().catch(() => undefined); }
   }, [refreshProjects, storeProject]);
-  const rebuildSandbox = useCallback((id: string, imageVersionId?: string) => runSandboxOperation(id, projects.find(project => project.id === id)?.remoteArchives?.length ? 'restore' : 'create', () =>
-    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/${projects.find(project => project.id === id)?.remoteArchives?.length ? 'restore' : 'create'}`, { method: 'POST', body: JSON.stringify(imageVersionId ? { imageVersionId } : {}) }),
-  ), [projects, runSandboxOperation]);
+  const createSandbox = useCallback((id: string) => runSandboxOperation(id, 'create', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/create`, { method: 'POST' }),
+  ), [runSandboxOperation]);
+  const restoreSandbox = useCallback((id: string, imageVersionId?: string) => runSandboxOperation(id, 'restore', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/restore`, { method: 'POST', body: JSON.stringify(imageVersionId ? { imageVersionId } : {}) }),
+  ), [runSandboxOperation]);
+  const releaseSandbox = useCallback((id: string) => runSandboxOperation(id, 'release', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/release`, { method: 'POST' }),
+  ), [runSandboxOperation]);
   const resumeSandbox = useCallback((id: string) => runSandboxOperation(id, 'resume', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/resume`, { method: 'POST' }),
   ), [runSandboxOperation]);
@@ -72,5 +78,5 @@ export function useProjects() {
   const archiveProject = useCallback((id: string, options: { useExistingBackup?: boolean } = {}) => runSandboxOperation(id, 'archive', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify(options) }),
   ), [runSandboxOperation]);
-  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, rebuildSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
+  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
 }

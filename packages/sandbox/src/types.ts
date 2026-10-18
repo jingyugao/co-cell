@@ -34,7 +34,11 @@ export interface SandboxHandle {
     rename(from: string, to: string, options?: { user?: string; signal?: AbortSignal }): Promise<void>;
   };
 }
+export interface SandboxMount { volumeId: string; mountPath: string; readOnly?: boolean }
+
 export interface SandboxInfo {
+  mounts?: SandboxMount[];
+  homeVolumeId?: string;
   sandboxId: string; state: 'running' | 'paused' | 'unknown';
   startedAt: Date; endAt?: Date; metadata?: Record<string, string>;
   /** Provider capabilities observed with this state snapshot. */
@@ -64,6 +68,9 @@ export type SandboxOperation =
 
 /** Persisted provider state. Application workspace and execution state stay outside this package. */
 export interface SandboxRecord {
+  ownerKey?: string;
+  mounts?: SandboxMount[];
+  homeVolumeId?: string;
   id: string;
   status: SandboxStatus;
   template: string;
@@ -119,6 +126,8 @@ export interface SandboxProvider {
   getInfos?(sandboxIds: string[]): Promise<SandboxInfo[]>;
   /** Submit one explicit lifecycle request; the provider decides whether it is valid. */
   resume?(sandboxId: string, options?: { signal?: AbortSignal }): Promise<void>;
+  /** End a Box, retaining its volumes and returning the terminal metadata. */
+  release?(sandboxId: string): Promise<SandboxInfo>;
   pause(sandboxId: string): Promise<boolean>;
   kill(sandboxId: string): Promise<boolean>;
 }

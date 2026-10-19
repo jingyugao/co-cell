@@ -92,13 +92,17 @@ UI 交互耗时与实际恢复耗时分别记录；普通集成测试不把单�
 
 ## 新版 Cellbox 适配：2026-10-18
 
-本轮进一步精简暂停/继续路径的代码尚未部署。下方此前的部署和现场验收记录保留其历史范围，不代表本轮新改造已部署或验收。
+当前状态（2026-10-19）：暂停/继续精简、独立 Volume 和 Cellbox 增量备份接入均已部署。已验收的 CoCell 应用代码为 `08ec1fbd`，Cellbox 为 `16102c8`；真实备份由 Cellbox 在所有引用实例停止后读取 Volume，默认保留最近 3 版。
 
-最新的独立 Volume 适配仍未部署、未做 live 验证；目标 Cellbox 为尚未合入 master 的 `cell-box-volumes` 分支 `feat/independent-home-volumes` / `50bedcb`（含 `807335d` 的独立卷和共享挂载改造）。本轮 `pnpm build`、395 项单测和项目卡片组件 8 项通过。本地集成全量 74/76 通过；两个释放用例因状态文本重复导致定位歧义，修正定位后桌面和手机定向 2/2 通过，没有重跑整套。全量报告：`tmp/integration/2026-10-18T10-40-14-493Z-64137ddd`；定向报告：`tmp/integration/2026-10-18T10-47-38-594Z-72816762`。
+最新验证：`pnpm build`（含类型检查）通过；profile 更新脚本回归 1 项、镜像目录单测 8 项、默认镜像桌面/手机用例 6 项通过。`pnpm test:integration:live` 为 4 项通过、3 项工具/预热池专项未启用，没有重试。覆盖真实备份恢复、浏览器只读进入与显式恢复、并发恢复、释放后创建新 Box 并复用同一 Volume。报告：`tmp/integration/2026-10-19T03-12-30-683Z-4ea2085a`；本地默认镜像回归：`tmp/integration/2026-10-19T03-08-43-868Z-29b52a92`。报告和安装配置不提交。
+
+修复了新镜像删除旧备份工具后 profile 仍声明该工具、导致容器启动即退出的问题。profile 更新会移除 `cocell_archive_backup`，保留其他工具；revision 保存构建时的 profile，因此已有错误 revision 必须重建，不能仅修改 server 配置。仓库默认恢复版本读取 Cellbox stable；CoCell 全局默认选择不再回写仓库的本地默认版本字段。下方保留各实现阶段的历史记录。
+
+独立 Volume 实现阶段的历史记录：当时尚未部署、未做 live 验证；目标 Cellbox 为当时尚未合入 master 的 `cell-box-volumes` 分支 `feat/independent-home-volumes` / `50bedcb`（含 `807335d` 的独立卷和共享挂载改造）。该阶段 `pnpm build`、395 项单测和项目卡片组件 8 项通过。本地集成全量 74/76 通过；两个释放用例因状态文本重复导致定位歧义，修正定位后桌面和手机定向 2/2 通过，没有重跑整套。全量报告：`tmp/integration/2026-10-18T10-40-14-493Z-64137ddd`；定向报告：`tmp/integration/2026-10-18T10-47-38-594Z-72816762`。
 
 新增 `POST /api/projects/:id/sandbox/release`：首次 release 先做一次 `/v1/volumes` 协议能力检查，避免旧 Cellbox 在 destroy 时删除 HOME；这是协议兼容检查，不是 Box 状态预查。随后只对当前 Box 单次提交 destroy，不自动 purge Box 元数据或删除 Volume。release 保存终态 `mounts`/`homeVolumeId`，解除 Sandbox 绑定，同时保留项目及会话 `threadId`。旧 Box 的 legacy HOME volume ID 只在 destroy 时生成，因此须在 purge 前保存终态 Box 信息。Box 元数据仍受 Cellbox TTL/purge 影响，不承诺永久保留；旧安装需升级 Cellbox 后才能 release。
 
-新建 Sandbox 传入原 mounts 与真实 `ownerKey`，复用已保存 Volume；共享 Volume 允许多个 Box 引用，不假设独占。备份 restore 与 release 分开，Cellbox restore 总创建新 Volume；恢复候选的 mounts/`homeVolumeId` 在成功切换后保存。新建或 release 结果未知时不自动重试。尚未完成的 live 验证应覆盖新建后 release、再次创建复用原 mounts、备份 restore 得到新卷，以及旧 Cellbox 协议检查拒绝 release；完成后再追加实际测试结果。
+新建 Sandbox 传入原 mounts 与真实 `ownerKey`，复用已保存 Volume；共享 Volume 允许多个 Box 引用，不假设独占。备份 restore 与 release 分开，Cellbox restore 总创建新 Volume；恢复候选的 mounts/`homeVolumeId` 在成功切换后保存。新建或 release 结果未知时不自动重试。2026-10-19 的真实运行验收已覆盖释放后复用原 mounts 和备份恢复得到新 Volume；旧 Cellbox 的拒绝路径仍由协议测试覆盖。
 
 暂停/释放前仅关闭本进程无人使用的 App Server 缓存连接，避免自己的闲置 WebSocket 导致底层 BUSY；不发送 readiness RPC、不阻挡活跃读取，竞争交由 Cellbox 返回。回归先复现绕过缓存关闭导致的失败，再验证关闭闲置连接及活跃读取 BUSY 单次提交。新 live 卷旅程依据底层 `/v1/volumes` 能力判断旧安装；新版响应缺失挂载信息会失败，不会跳过。
 

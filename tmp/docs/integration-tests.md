@@ -9,7 +9,7 @@
 | `scripts/integration/conversation-reads.mjs` | 真实模型、原生历史、子/孙代理、会话隔离、读取耗时 | `model/conversation-reads.mjs`，保留实际对话断言 |
 | `scripts/integration/project-lifecycle.mjs` | 真实模型生成文件/Go 服务、异步提问、Checkpoint、进程连续性、备份恢复 | `model/project-lifecycle.mjs`，复用统一配置和清理，服务样例改用平台已有 Node 标准库 |
 | `backend/access/app-integration.test.ts` | Hono 路由、登录、预览 Cookie；后端依赖替身 | 保留原位置，属于进程内集成测试 |
-| `backend/sessions/project-sandbox-lifecycle.test.ts`、`backend/projects/*.test.ts` | Manager、维护锁、状态提交、生命周期错误；运行时替身 | 保留原位置，定位业务状态问题 |
+| `backend/sessions/project-sandbox-lifecycle.test.ts`、`backend/projects/*.test.ts` | Manager、元数据短事务、状态提交、生命周期错误；运行时替身 | 保留原位置，定位业务状态问题 |
 | `packages/sandbox/src/providers/cellbox/provider.test.ts` | Provider 协议、超时、轮询等替身边界 | 保留原位置，定位适配器问题 |
 | `fe/**/*.test.ts(x)` | 导航、历史合并、组件静态渲染 | 保留原位置，补充浏览器测试 |
 | 临时 Python/Playwright 验证脚本 | 立即进入项目、自动恢复、可编辑草稿、真实 k3s 冒烟 | 迁入 `ui/` 与 `live/`，不再依赖临时目录中的程序 |
@@ -21,13 +21,13 @@
 | 分组 | 用例 | 外部依赖 |
 | --- | --- | --- |
 | harness | 创建响应丢失后的资源回收；拒绝删除非本次项目；清理失败导致测试失败；报告凭证脱敏 | 无 |
-| ui-desktop / ui-mobile | 暂停项目可进入；等待期间可输入且禁止发送；创建立即进入；创建/恢复失败与重试；刷新保留草稿；旧会话先 SSE 后历史；Checkpoint 进行中进入；切换项目停止轮询、草稿隔离 | 本地 Vite、Chromium；API 为可控替身 |
-| live | 真实 UI 创建/自动恢复；单项目并发进入去重；两个项目同时恢复；GET 不隐式唤醒；暂停时允许空会话元数据、拒绝任务执行；恢复保持 box ID；再次 Checkpoint 验证 App Server | 已部署 CoCell、Cellbox、Kubernetes 运行时和存储 |
-| model lifecycle | 真实模型调用工具；Node 服务与文件下载；Checkpoint/Resume 保持 PID、实例标记和内存计数；备份/归档/恢复；恢复后的文件、会话上下文和重新启动服务 | live 依赖、可用模型、Sandbox 内预装 Node |
+| ui-desktop / ui-mobile | 暂停项目只读进入且可编辑草稿；明确恢复；unknown 不自动重放；创建立即进入；查询失败可刷新；旧会话先 SSE 后历史；Checkpoint 不挡查看；草稿隔离 | 本地 Vite、Chromium；API 为可控替身 |
+| live | 真实 UI 创建/明确恢复；并发只读进入不提交恢复；明确恢复请求按项目 Box ID 单次调用 provider 并透传底层冲突；两个项目同时恢复；GET 不隐式唤醒；暂停时允许空会话元数据、拒绝任务执行；Checkpoint 只暂停、备份单独提交；文件归档恢复到新 Sandbox 后再次归档、删除 | 已部署 CoCell、Cellbox、Kubernetes 运行时和存储 |
+| model lifecycle | 真实模型调用工具；Node 服务与文件下载；Checkpoint/Resume 保持 PID、实例标记和内存计数；显式备份、归档/恢复；恢复后的文件、会话上下文和重新启动服务 | live 依赖、可用模型、Sandbox 内预装 Node |
 | model user-input | 独立新会话及原会话续聊连续两次真实调用异步提问工具，API 回复、原生 call ID、答复状态持久化 | live 依赖、支持原生异步提问工具的模型 |
 | model reads | 真实子/孙代理、会话隔离、后续轮次上下文、原生历史新鲜度、历史与子代理接口耗时 | live 依赖、支持子代理的模型 |
 
-`pnpm test:integration:full --list` 是用例清单的权威入口。目前包括 2 个基础设施用例、6 个桌面和 6 个手机用例、2 条真实服务旅程、3 条真实模型旅程。模型旅程内部通过步骤报告区分多个断言阶段。
+`pnpm test:integration:full --list` 是当前用例清单的权威入口。模型旅程内部通过步骤报告区分多个断言阶段。
 
 ## 运行
 
@@ -83,14 +83,44 @@ UI 交互耗时与实际恢复耗时分别记录；普通集成测试不把单�
 ## 重点维护规则
 
 - 改项目入口、草稿、导航或异步就绪：补充/更新 `ui/`，跑桌面和手机回归。
-- 改创建、Checkpoint、Resume、幂等或状态读取：更新 `live/`，对测试安装执行真实旅程。
+- 改创建、Checkpoint、Resume、错误分类或状态读取：更新 `live/`，对测试安装执行真实旅程。
 - 改原生历史、子代理、异步提问、备份恢复：更新 `model/` 对应旅程，不能用伪造对话替代。
 - 缺陷修复与回归断言放在同一 MR；失败先区分产品缺陷、环境故障、测试缺陷，禁止用无条件重试或跳过隐藏问题。
 - GitHub Actions 在 PR 和 master 上执行类型检查、构建及默认浏览器回归，保留 7 天报告。真实集群/模型测试通过本机或有对应配置的运行环境执行。
 
 此模块覆盖 CoCell 产品关键闭环，不包含 Cellbox API 重启、节点丢失、OSS 故障注入、冷缓存容量压测、镜像构建或外部飞书服务完整测试。故障注入应在隔离环境维护独立套件，不能混入每次运行的默认回归。
 
-## 修复与实测：2026-10-04
+## 新版 Cellbox 适配：2026-10-18
+
+当前状态（2026-10-19）：暂停/继续精简、独立 Volume 和 Cellbox 增量备份接入均已部署。已验收的 CoCell 应用代码为 `08ec1fbd`，Cellbox 为 `16102c8`；真实备份由 Cellbox 在所有引用实例停止后读取 Volume，默认保留最近 3 版。
+
+最新验证：`pnpm build`（含类型检查）通过；profile 更新脚本回归 1 项、镜像目录单测 8 项、默认镜像桌面/手机用例 6 项通过。`pnpm test:integration:live` 为 4 项通过、3 项工具/预热池专项未启用，没有重试。覆盖真实备份恢复、浏览器只读进入与显式恢复、并发恢复、释放后创建新 Box 并复用同一 Volume。报告：`tmp/integration/2026-10-19T03-12-30-683Z-4ea2085a`；本地默认镜像回归：`tmp/integration/2026-10-19T03-08-43-868Z-29b52a92`。报告和安装配置不提交。
+
+修复了新镜像删除旧备份工具后 profile 仍声明该工具、导致容器启动即退出的问题。profile 更新会移除 `cocell_archive_backup`，保留其他工具；revision 保存构建时的 profile，因此已有错误 revision 必须重建，不能仅修改 server 配置。仓库默认恢复版本读取 Cellbox stable；CoCell 全局默认选择不再回写仓库的本地默认版本字段。下方保留各实现阶段的历史记录。
+
+独立 Volume 实现阶段的历史记录：当时尚未部署、未做 live 验证；目标 Cellbox 为当时尚未合入 master 的 `cell-box-volumes` 分支 `feat/independent-home-volumes` / `50bedcb`（含 `807335d` 的独立卷和共享挂载改造）。该阶段 `pnpm build`、395 项单测和项目卡片组件 8 项通过。本地集成全量 74/76 通过；两个释放用例因状态文本重复导致定位歧义，修正定位后桌面和手机定向 2/2 通过，没有重跑整套。全量报告：`tmp/integration/2026-10-18T10-40-14-493Z-64137ddd`；定向报告：`tmp/integration/2026-10-18T10-47-38-594Z-72816762`。
+
+新增 `POST /api/projects/:id/sandbox/release`：首次 release 先做一次 `/v1/volumes` 协议能力检查，避免旧 Cellbox 在 destroy 时删除 HOME；这是协议兼容检查，不是 Box 状态预查。随后只对当前 Box 单次提交 destroy，不自动 purge Box 元数据或删除 Volume。release 保存终态 `mounts`/`homeVolumeId`，解除 Sandbox 绑定，同时保留项目及会话 `threadId`。旧 Box 的 legacy HOME volume ID 只在 destroy 时生成，因此须在 purge 前保存终态 Box 信息。Box 元数据仍受 Cellbox TTL/purge 影响，不承诺永久保留；旧安装需升级 Cellbox 后才能 release。
+
+新建 Sandbox 传入原 mounts 与真实 `ownerKey`，复用已保存 Volume；共享 Volume 允许多个 Box 引用，不假设独占。备份 restore 与 release 分开，Cellbox restore 总创建新 Volume；恢复候选的 mounts/`homeVolumeId` 在成功切换后保存。新建或 release 结果未知时不自动重试。2026-10-19 的真实运行验收已覆盖释放后复用原 mounts 和备份恢复得到新 Volume；旧 Cellbox 的拒绝路径仍由协议测试覆盖。
+
+暂停/释放前仅关闭本进程无人使用的 App Server 缓存连接，避免自己的闲置 WebSocket 导致底层 BUSY；不发送 readiness RPC、不阻挡活跃读取，竞争交由 Cellbox 返回。回归先复现绕过缓存关闭导致的失败，再验证关闭闲置连接及活跃读取 BUSY 单次提交。新 live 卷旅程依据底层 `/v1/volumes` 能力判断旧安装；新版响应缺失挂载信息会失败，不会跳过。
+
+此前暂停/继续精简验证：387 项单测、`pnpm build` 和 70 项集成测试全部通过（harness 12、桌面 29、手机 29），无重跑。新增回归覆盖陈旧本地状态及 App Server 不可用不阻断生命周期提交、BUSY/未知结果仅提交一次、操作成功与后续状态查询失败分开呈现、恢复后重新计算空闲时间。集成报告：`tmp/integration/2026-10-18T08-40-33-615Z-1ab4c07c`；未执行本轮 live 验收。
+
+项目不再有通用控制锁、维护长租约或恢复重放。只读进入和真实状态查询独立，unknown 结果由用户决定下一步。暂停/继续通过项目绑定的 Box ID 各发出一次 provider pause/resume 调用，再由项目操作记录呈现结果；不先查本地或 Cellbox phase，不做 App Server readiness、环境准备或 Sandbox 绑定重写。Cellbox 冲突和未知结果照实返回，不自动重试。
+
+运行中纯磁盘归档和同 ID rebuild 已明确不支持。真实模型测试中的同 ID 重建改为验证 unsupported 且不改变原绑定/备份；归档恢复使用明确的 restore API。备份不自动删除旧归档，清理需明确调用 prune。真实环境与模型测试须针对已迁移的独立测试安装执行；本次本地代码验证不能代替部署验收。
+
+Checkpoint 只负责暂停 Sandbox，不自动触发备份。工作区备份通过 `POST /api/projects/:id/backup` 单独明确提交，仅支持 paused/failed Sandbox；running 返回 409。Cellbox 仍可能返回 BUSY，CoCell 不添加资源锁、隐藏重试或幂等承诺。Resume 与 pause 均按项目绑定 Box ID 各提交一次 provider 调用，并把真实成功、失败或未知结果写入操作记录；不预判 phase、不做 App Server readiness/环境准备或项目绑定重写。归档可以从已暂停/failed 的资源生成备份，或明确复用已有备份。
+
+此前迁移的本地结果：379 项单测通过；桌面 28/28、手机 28/28 通过。完整集成运行 66/67，唯一 harness 失败来自测试文件编辑期间缺失导入，补齐后同一 harness 定向复验 1/1 通过。本地套件没有跳过或 flaky。
+
+部署后的新版现场验收最终为 3 项通过、3 项专项未启用，报告位于 `tmp/integration/2026-10-18T06-36-14-834Z-0a9cb819`。覆盖真实 UI、Checkpoint/显式恢复/并发恢复，以及真实文件归档恢复到新 Sandbox 后再次归档和删除；所有测试项目和 CR 已清理。现场修正历史来源重复清理及 Box NOT_FOUND 后仍发送 purge 的问题，新增用例先在原实现复现失败，修正后相关运行时单测 103 项、类型检查和构建通过。原生工具 HOME、Git 工作目录、共享预热池专项和真实模型 full 尚未执行。
+
+## 历史修复与实测：2026-10-04
+
+以下为旧版历史结果，其中的维护栅栏与隐式恢复行为已在 2026-10-18 改造中移除，不代表当前版本已完成真实安装验证。
 
 首次真实模型测试发现，历史读取连接会保留 60 秒，导致紧接着的 Checkpoint/删除被 Cellbox 拒绝；子代理测试还因授权上下文未完整传递而没有生成孙代理。修复后验证如下：
 
@@ -104,3 +134,5 @@ UI 交互耗时与实际恢复耗时分别记录；普通集成测试不把单�
 运行时通过统一生命周期前置钩子阻止新读取、等待已有 RPC 结束并关闭连接，操作成功或失败后均释放限制；手动/自动 Checkpoint 和删除共用此流程。WebSocket 关闭等待真实握手完成，错误脱敏保留维护期间的 BUSY 分类。子代理测试传递明确用户授权及历史上下文，并在断言前保存实际代理树作为失败证据。
 
 Cellbox 另行修复内部服务/文件 I/O 绕过生命周期接入锁的问题，同时消除 Service/Store 反向加锁。新增回归在修复前失败、修复后通过；服务层 Go race 检查和全仓 Go 测试通过，与 CoCell 联合部署完成上述真实验证。此前 API 超时缺少线程栈，不能断言它就是那次超时原因。
+
+Checkpoint/独立备份拆分补充验收（2026-10-18，应用 `cf30a956`）：后端/SDK/util 单测 385 项、组件测试 7 项、本地 harness/桌面/手机 70 项全部通过；新版现场 3 项通过、3 项工具/预热池专项未启用，报告 `tmp/integration/2026-10-18T07-50-27-786Z-87a83c1a`。现场覆盖 Checkpoint 后立即首次 resume、独立备份、真实文件恢复与再次归档；4 个测试项目及其 Sandbox 已全部清理。模型 full 未执行。

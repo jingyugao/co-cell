@@ -51,6 +51,28 @@ const record = (status: SandboxRecord['status'] = 'paused'): SandboxRecord => ({
   ...(status === 'paused' ? { pausedAt: new Date(0).toISOString() } : {}),
 });
 
+test('confirmed remote release forgets cached leases and preserves retained mount identities on creation', async () => {
+  const fake = fixture('running');
+  const mounts = [{ volumeId: 'volume-one', mountPath: '/home/agent' }];
+  const info = fake.provider.getInfo;
+  fake.provider.getInfo = async id => ({ ...await info(id), mounts, homeVolumeId: 'volume-one',
+    metadata: { ownerKey: 'project:one:restore:older' } });
+  const manager = new SandboxManager({ provider: fake.provider });
+  try {
+    const lease = await manager.acquire('project:one', { usageId: 'read', create: { template: 'template-1' }, persist: async () => {} });
+    assert.deepEqual(lease.record.mounts, mounts);
+    assert.equal(lease.record.ownerKey, 'project:one:restore:older');
+    await manager.forgetReleased('project:one', lease.record.id);
+    assert.equal(manager.peek('project:one'), undefined);
+    await lease.release();
+    assert.equal(manager.peek('project:one'), undefined, 'a stale lease cannot restore the released binding');
+    manager.track('project:one', { ...record('ready'), id: 'replacement' }, async () => {});
+    await manager.forgetReleased('project:one', 'sandbox-1');
+    assert.equal(manager.peek('project:one')?.id, 'replacement', 'forgetting an old Box cannot invalidate its replacement');
+    assert.equal(fake.counts.kill, 0, 'cache invalidation never submits another remote operation');
+  } finally { await manager.close(); }
+});
+
 test('lifecycle hooks surround transitions while acquire reuse and inspection stay read-only', async () => {
   const fake = fixture('running');
   const calls: string[] = [];
@@ -76,6 +98,23 @@ test('lifecycle hooks surround transitions while acquire reuse and inspection st
     await resumed.release();
     await manager.destroy('project:one');
     assert.deepEqual(calls, ['pre:create', 'post:create', 'pre:pause', 'post:pause', 'pre:resume', 'post:resume', 'pre:destroy', 'post:destroy']);
+  } finally { await manager.close(); }
+});
+
+test('create submission preserves an unknown provider outcome and does not replay', async () => {
+  const fake = fixture();
+  const unknown = Object.assign(new Error('Cellbox create response lost'), { name: 'CellboxError', code: 'UNKNOWN_OUTCOME' });
+  let submissions = 0;
+  fake.provider.create = async () => { submissions++; throw unknown; };
+  const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
+  try {
+    await assert.rejects(manager.acquire('resource', { usageId: 'create-once', create: { template: 'template-1' }, persist: async () => {} }),
+      (error: unknown) => {
+        assert.equal((error as Error).cause, unknown);
+        assert.equal(((error as Error).cause as typeof unknown).code, 'UNKNOWN_OUTCOME');
+        return true;
+      });
+    assert.equal(submissions, 1, 'the manager does not replay an uncertain provider create');
   } finally { await manager.close(); }
 });
 
@@ -156,7 +195,7 @@ test('an externally resumed generation runs connect hooks instead of reusing a s
   } finally { await manager.close(); }
 });
 
-test('concurrent acquire connects once and registers both usages', async () => {
+test('concurrent acquire connects once and pause forwards to provider with active usages', async () => {
   const fake = fixture('paused', 20);
   const saved: SandboxRecord[] = [];
   const persist = async (value: SandboxRecord) => { saved.push(value); };
@@ -167,11 +206,10 @@ test('concurrent acquire connects once and registers both usages', async () => {
     manager.acquire('resource', { usageId: 'turn-2' }),
   ]);
   assert.equal(fake.counts.connect, 1);
-  await assert.rejects(manager.pause('resource'), SandboxBusyError);
+  await manager.pause('resource');
+  assert.equal(fake.counts.pause, 1, 'the manager does not promise usage-based exclusion for a provider lifecycle request');
   await first.release();
   await second.release();
-  await manager.pause('resource');
-  assert.equal(fake.counts.pause, 1);
   assert.ok(saved.length > 0);
   await manager.close();
 });
@@ -338,7 +376,71 @@ test('inspect rechecks the binding after snapshotting a deleted entry', async ()
   await manager.close();
 });
 
-test('destructive operations fail promptly while an acquire is connecting', async () => {
+test('a blocked sweep inspection holds no local lock and cannot overwrite a later pause', async () => {
+  let state: SandboxInfo['state'] = 'running';
+  let blockInspection = true;
+  let inspectionStarted!: () => void;
+  const started = new Promise<void>(resolve => { inspectionStarted = resolve; });
+  let releaseInspection!: () => void;
+  const inspectionGate = new Promise<void>(resolve => { releaseInspection = resolve; });
+  const provider: SandboxProvider = {
+    create: async () => ({ sandboxId: 'sandbox-1' } as SandboxHandle),
+    connect: async id => ({ sandboxId: id } as SandboxHandle),
+    getInfo: async id => {
+      const observedState = state;
+      if (blockInspection) { inspectionStarted(); await inspectionGate; }
+      return { sandboxId: id, state: observedState, startedAt: new Date(0) };
+    },
+    pause: async () => { state = 'paused'; return true; },
+    kill: async () => true,
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000, autoCheckpointAfterMs: Number.MAX_SAFE_INTEGER } });
+  manager.track('resource', record('ready'), async () => {});
+  try {
+    const sweeping = (manager as unknown as { sweep(): Promise<void> }).sweep();
+    await started;
+    const pauseResult = await Promise.race([
+      manager.pause('resource').then(() => 'paused'),
+      wait(100).then(() => 'blocked'),
+    ]);
+    assert.equal(pauseResult, 'paused', 'a remote sweep read must not hold the resource lock');
+    assert.equal(manager.peek('resource')?.status, 'paused');
+    blockInspection = false;
+    releaseInspection();
+    await sweeping;
+    assert.equal(manager.peek('resource')?.status, 'paused', 'the stale running observation must not overwrite pause');
+  } finally {
+    blockInspection = false;
+    releaseInspection();
+    await manager.close();
+  }
+});
+
+test('a failed automatic checkpoint is reported once and is not blindly resubmitted on later sweeps', async () => {
+  let checkpointCalls = 0;
+  let inspections = 0;
+  const provider: SandboxProvider & { checkpoint(id: string): Promise<{ id: string; createdAt: string }>; restore(id: string, checkpointId: string): Promise<void> } = {
+    create: async () => ({ sandboxId: 'sandbox-1' } as SandboxHandle),
+    connect: async id => ({ sandboxId: id } as SandboxHandle),
+    getInfo: async id => { inspections++; return { sandboxId: id, state: 'running', startedAt: new Date(0) }; },
+    checkpoint: async () => { checkpointCalls++; throw new Error('checkpoint response uncertain'); },
+    restore: async () => {},
+    pause: async () => true,
+    kill: async () => true,
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000, autoCheckpointAfterMs: 1 } });
+  manager.track('resource', { ...record('ready'), lastActiveAt: new Date(0).toISOString() }, async () => {});
+  try {
+    const sweep = (manager as unknown as { sweep(): Promise<void> }).sweep.bind(manager);
+    await sweep();
+    await sweep();
+    assert.equal(checkpointCalls, 1, 'a failed result is left for a later explicit decision, not blindly replayed');
+    assert.equal(inspections, 1, 'the later sweep still performs a read-only provider inspection');
+    assert.equal(manager.peek('resource')?.status, 'ready');
+  } finally { await manager.close(); }
+});
+
+test('remote lifecycle requests reach the provider while acquire is connecting; local rebinding stays busy', async () => {
   const fake = fixture('paused');
   let connectStarted!: () => void;
   const started = new Promise<void>(resolve => { connectStarted = resolve; });
@@ -351,26 +453,19 @@ test('destructive operations fail promptly while an acquire is connecting', asyn
     return connect(...args);
   };
   const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
-  manager.track('resource', record(), async () => {});
+  manager.track('resource', record('ready'), async () => {});
   const acquiring = manager.acquire('resource', { usageId: 'turn-1' });
   await started;
   try {
-    const failFast = <T>(operation: Promise<T>) => Promise.race([
-      assert.rejects(operation, SandboxBusyError),
-      wait(100).then(() => { throw new Error('destructive operation waited for connect'); }),
-    ]);
-    await Promise.all([
-      failFast(manager.pause('resource')),
-      failFast(manager.destroy('resource')),
-      failFast(manager.untrack('resource', 'sandbox-1')),
-      failFast(manager.replace('resource', 'sandbox-1', { ...record(), id: 'sandbox-2' })),
-    ]);
-    assert.equal(fake.counts.pause, 0);
-    assert.equal(fake.counts.kill, 0);
-    assert.equal(manager.peek('resource')?.id, 'sandbox-1');
+    await Promise.race([manager.pause('resource'), wait(100).then(() => { throw new Error('pause waited for connect'); })]);
+    await Promise.race([manager.destroy('resource'), wait(100).then(() => { throw new Error('destroy waited for connect'); })]);
+    assert.equal(fake.counts.pause, 1);
+    assert.equal(fake.counts.kill, 1);
+    await assert.rejects(manager.untrack('resource', 'sandbox-1'), SandboxBusyError);
+    await assert.rejects(manager.replace('resource', 'sandbox-1', { ...record(), id: 'sandbox-2' }), SandboxBusyError);
+    assert.equal(manager.peek('resource')?.status, 'deleted');
   } finally { finishConnect(); }
-  const lease = await acquiring;
-  await lease.release();
+  await assert.rejects(acquiring, { code: 'not_accessible' });
   await manager.close();
 });
 
@@ -401,7 +496,7 @@ test('close drains an in-flight connect after leaving the resource lock', async 
   await lease.release();
 });
 
-test('detached usage stays busy and the same usage can recover it', async () => {
+test('detached usage is local bookkeeping and does not block provider lifecycle requests', async () => {
   const fake = fixture('running');
   const persist = async () => {};
   const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
@@ -409,7 +504,8 @@ test('detached usage stays busy and the same usage can recover it', async () => 
   const original = await manager.acquire('resource', { usageId: 'turn-1' });
   await original.release({ detached: true });
   fake.setState('paused');
-  await assert.rejects(manager.pause('resource'), SandboxBusyError);
+  await manager.pause('resource');
+  assert.equal(fake.counts.pause, 1);
   const recovered = await manager.acquire('resource', { usageId: 'turn-1' });
   assert.equal(fake.counts.connect, 2);
   await recovered.release();
@@ -418,14 +514,13 @@ test('detached usage stays busy and the same usage can recover it', async () => 
   await manager.close();
 });
 
-test('holdUsage is idempotent, blocks destruction, and is taken over by acquire', async () => {
+test('holdUsage is local bookkeeping and is taken over by acquire', async () => {
   const fake = fixture('paused');
   const persist = async () => {};
   const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
   manager.track('resource', record(), persist);
   manager.holdUsage('resource', 'turn-1');
   manager.holdUsage('resource', 'turn-1');
-  await assert.rejects(manager.destroy('resource'), SandboxBusyError);
   const lease = await manager.acquire('resource', { usageId: 'turn-1' });
   await lease.release();
   await manager.destroy('resource');
@@ -440,7 +535,6 @@ test('one of several detached usages can resume the shared sandbox', async () =>
   manager.holdUsage('resource', 'turn-2');
   const first = await manager.acquire('resource', { usageId: 'turn-1' });
   await first.release();
-  await assert.rejects(manager.destroy('resource'), SandboxBusyError);
   const second = await manager.acquire('resource', { usageId: 'turn-2' });
   await second.release();
   await manager.destroy('resource');
@@ -617,14 +711,14 @@ test('ordinary acquire only attaches to a running Cellbox and never invokes ensu
     state = 'paused';
     manager.track('paused-resource', { ...record('paused'), id: 'sandbox-1',
       checkpoint: { id: 'legacy-checkpoint', createdAt: new Date(0).toISOString() } }, async () => {});
-    await assert.rejects(manager.acquire('paused-resource', { usageId: 'normal-work' }), /explicit ensure-running is required/);
+    await assert.rejects(manager.acquire('paused-resource', { usageId: 'normal-work', operationKey: 'must-not-resume' }), /explicit ensure-running is required/);
     assert.equal(connects, 1, 'paused ordinary acquire is rejected before provider connect');
     assert.equal(ensures, 0, 'paused ordinary acquire does not submit a lifecycle command');
     assert.equal(restores, 0, 'Cellbox checkpoint markers are not implicitly restored');
   } finally { await manager.close(); }
 });
 
-test('explicit running ensure coexists with an active usage, while pause remains busy', async () => {
+test('explicit running ensure and pause are forwarded despite active local usage', async () => {
   const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
   let ensures = 0, pauses = 0;
   const provider: SandboxProvider = {
@@ -647,16 +741,14 @@ test('explicit running ensure coexists with an active usage, while pause remains
     const original = await manager.acquire('resource', { usageId: 'active-session' });
     const operation = await manager.ensureRunning('resource', 'resume-operation');
     assert.equal(ensures, 1, 'explicit ensure reaches the provider despite a live local usage');
-    assert.deepEqual(usageIds(), ['active-session', 'operation:resume-operation']);
+    assert.deepEqual(usageIds(), ['active-session', 'request:resume-operation:1']);
 
     await operation.release();
-    assert.deepEqual(usageIds(), ['active-session'], 'releasing the temporary operation lease preserves the original lease');
-    await assert.rejects(manager.pause('resource'), { code: 'busy' });
-    assert.equal(pauses, 0, 'pause remains protected while the original execution owns its usage');
+    assert.deepEqual(usageIds(), ['active-session'], 'the temporary local lease is independent from the original usage');
+    await manager.pause('resource');
+    assert.equal(pauses, 1, 'pause is sent to the provider while local usage is active');
 
     await original.release();
-    await manager.pause('resource');
-    assert.equal(pauses, 1, 'pause is allowed after the execution usage releases');
   } finally { await manager.close(); }
 });
 
@@ -690,10 +782,12 @@ test('Cellbox suspended ensure preserves the provider BUSY error and the existin
   } finally { await manager.close(); }
 });
 
-test('same-key ensure-running calls join one provider command and share operation usage', async () => {
+test('same-key ensure-running calls submit independently and get distinct local usages', async () => {
   const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
   let submissions = 0;
   let finish!: () => void;
+  let submitted!: () => void;
+  const bothSubmitted = new Promise<void>(resolve => { submitted = resolve; });
   const gate = new Promise<void>(resolve => { finish = resolve; });
   const provider: SandboxProvider = {
     create: async () => handle,
@@ -701,6 +795,7 @@ test('same-key ensure-running calls join one provider command and share operatio
     getInfo: async () => { assert.fail('ensure-running must not inspect before submission'); },
     ensureRunning: async () => {
       submissions++;
+      if (submissions === 2) submitted();
       await gate;
       return { handle, info: { sandboxId: 'sandbox-1', state: 'running', startedAt: new Date(0), endAt: new Date(9999999999999) } };
     },
@@ -710,13 +805,12 @@ test('same-key ensure-running calls join one provider command and share operatio
   manager.track('resource', record('paused'), async () => {});
   try {
     const first = manager.ensureRunning('resource', 'same-operation');
-    await waitForConnectWaiters(manager, 'resource', 1);
     const second = manager.ensureRunning('resource', 'same-operation');
-    await waitForConnectWaiters(manager, 'resource', 2);
-    assert.equal(submissions, 1);
+    await bothSubmitted;
+    assert.equal(submissions, 2, 'the manager does not coalesce provider lifecycle commands by request key');
     finish();
     const [firstLease, secondLease] = await Promise.all([first, second]);
-    assert.equal(submissions, 1);
+    assert.notEqual(firstLease.usageId, secondLease.usageId);
     await firstLease.release();
     assert.equal(manager.peek('resource')?.status, 'ready');
     await secondLease.release();
@@ -793,15 +887,15 @@ test('recovered unknown checkpoint record resumes through one explicit command w
   } finally { await manager.close(); }
 });
 
-test('unknown ensure-running outcome preserves provider code, key, and resumable local operation', async () => {
+test('unknown ensure-running outcome is returned without replay or a fabricated local transition', async () => {
   const handle = { sandboxId: 'sandbox-1' } as SandboxHandle;
   const error = Object.assign(new Error('submission response lost'), { name: 'CellboxError', code: 'UNKNOWN_OUTCOME', idempotencyKey: 'resume-op-unknown' });
-  let writes = 0;
+  let writes = 0, submissions = 0;
   const provider: SandboxProvider = {
     create: async () => handle,
     connect: async () => { assert.fail('ensure-running must not fall back to connect'); },
     getInfo: async () => { assert.fail('ensure-running must not inspect before submission'); },
-    ensureRunning: async () => { throw error; },
+    ensureRunning: async () => { submissions++; throw error; },
     pause: async () => true, kill: async () => true,
   };
   const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
@@ -812,7 +906,9 @@ test('unknown ensure-running outcome preserves provider code, key, and resumable
     assert.equal((caught as typeof error).idempotencyKey, 'resume-op-unknown');
     return true;
   });
-  assert.equal(manager.peek('resource')?.operation, 'resuming');
+  assert.equal(manager.peek('resource')?.status, 'paused');
+  assert.equal(manager.peek('resource')?.operation, undefined);
+  assert.equal(submissions, 1, 'the manager submits once and leaves a later attempt to the caller');
   assert.equal(writes, 0);
   await manager.close();
 });
@@ -850,16 +946,65 @@ test('a stopped provider instance is unavailable on inspection and can become re
   } finally { await manager.close(); }
 });
 
-test('repeated pause preserves the original pausedAt', async () => {
+test('pause is forwarded even when the local snapshot already says paused', async () => {
   const fake = fixture('paused');
   const pausedAt = new Date(0).toISOString();
   const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
   manager.track('resource', { ...record(), pausedAt }, async () => {});
   const result = await manager.pause('resource');
-  assert.equal(result.pausedAt, pausedAt);
-  assert.equal(fake.counts.pause, 0);
+  assert.notEqual(result.pausedAt, pausedAt);
+  assert.equal(fake.counts.pause, 1, 'a stale local observation does not suppress the provider request');
   await manager.close();
 });
+
+test('destroy reaches the provider while pause is pending and pause cannot overwrite deleted state', async () => {
+  const fake = fixture('running');
+  let started!: () => void;
+  let finish!: () => void;
+  const pauseStarted = new Promise<void>(resolve => { started = resolve; });
+  const pauseGate = new Promise<void>(resolve => { finish = resolve; });
+  const originalPause = fake.provider.pause;
+  fake.provider.pause = async id => {
+    started();
+    await pauseGate;
+    return originalPause(id);
+  };
+  const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
+  manager.track('resource', record('ready'), async () => {});
+  try {
+    const pausing = manager.pause('resource');
+    await pauseStarted;
+    await manager.destroy('resource');
+    assert.equal(fake.counts.kill, 1, 'destroy is not queued behind the remote pause request');
+    assert.equal(manager.peek('resource')?.status, 'deleted');
+    finish();
+    await pausing;
+    assert.equal(manager.peek('resource')?.status, 'deleted', 'a late pause response cannot overwrite a completed destroy');
+  } finally {
+    finish();
+    await manager.close();
+  }
+});
+
+for (const action of ['pause', 'destroy'] as const) {
+  test(`${action} submits once and preserves an unknown provider outcome in the cause chain`, async () => {
+    const fake = fixture('running');
+    const unknown = Object.assign(new Error('Cellbox mutation outcome is unknown'), { name: 'CellboxError', code: 'UNKNOWN_OUTCOME' });
+    let submissions = 0;
+    if (action === 'pause') fake.provider.pause = async () => { submissions++; throw unknown; };
+    else fake.provider.kill = async () => { submissions++; throw unknown; };
+    const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
+    manager.track('resource', record('ready'), async () => {});
+    try {
+      await assert.rejects(manager[action]('resource'), (error: unknown) => {
+        assert.equal((error as Error).cause, unknown);
+        assert.equal(((error as Error).cause as typeof unknown).code, 'UNKNOWN_OUTCOME');
+        return true;
+      });
+      assert.equal(submissions, 1, 'a failed request is not replayed by the manager');
+    } finally { await manager.close(); }
+  });
+}
 
 test('an aborted waiter returns promptly without cancelling or leaking the shared connection', async () => {
   const fake = fixture('paused', 80);
@@ -922,7 +1067,7 @@ test('late cancellation restores a detached recovery claim while discarding its 
   await manager.close();
 });
 
-test('a failed create persistence does not create a replacement sandbox', async () => {
+test('failed create persistence keeps the remote identity observable without publishing a local binding', async () => {
   const fake = fixture('paused');
   let saves = 0;
   const persist = async () => {
@@ -932,12 +1077,85 @@ test('a failed create persistence does not create a replacement sandbox', async 
   const manager = new SandboxManager({ provider: fake.provider, policy: { scanIntervalMs: 60_000 } });
   await assert.rejects(
     manager.acquire('resource', { usageId: 'turn-1', persist, create: { template: 'template-1' } }),
-    SandboxPersistenceError,
+    (error: unknown) => {
+      assert(error instanceof SandboxPersistenceError);
+      assert.equal((error as Error & { sandboxId?: string }).sandboxId, 'sandbox-1');
+      return true;
+    },
   );
-  const lease = await manager.acquire('resource', { usageId: 'turn-1', persist });
+  assert.equal(manager.peek('resource'), undefined, 'a failed persistence must not publish an in-memory-only binding');
+  await assert.rejects(manager.acquire('resource', { usageId: 'turn-1', persist }), { code: 'not_tracked' });
   assert.equal(fake.counts.create, 1);
-  await lease.release();
   await manager.close();
+});
+
+test('concurrent creates publish only the binding whose persistence succeeds', async () => {
+  let createCalls = 0;
+  let bothCreatesSubmitted!: () => void;
+  const bothSubmitted = new Promise<void>(resolve => { bothCreatesSubmitted = resolve; });
+  let releaseFirstCreate!: () => void;
+  const firstCreateGate = new Promise<void>(resolve => { releaseFirstCreate = resolve; });
+  let releaseSecondCreate!: () => void;
+  const secondCreateGate = new Promise<void>(resolve => { releaseSecondCreate = resolve; });
+  let releaseFirstPersist!: () => void;
+  const firstPersistGate = new Promise<void>(resolve => { releaseFirstPersist = resolve; });
+  let firstPersistStarted!: () => void;
+  const firstPersist = new Promise<void>(resolve => { firstPersistStarted = resolve; });
+  let secondInspectStarted!: () => void;
+  const secondInspect = new Promise<void>(resolve => { secondInspectStarted = resolve; });
+  let killCalls = 0;
+  const provider: SandboxProvider = {
+    create: async () => {
+      const number = ++createCalls;
+      if (number === 2) bothCreatesSubmitted();
+      if (number === 1) await firstCreateGate;
+      if (number === 2) await secondCreateGate;
+      return { sandboxId: `sandbox-${number}` } as SandboxHandle;
+    },
+    connect: async id => ({ sandboxId: id } as SandboxHandle),
+    getInfo: async id => {
+      if (id === 'sandbox-2') secondInspectStarted();
+      return { sandboxId: id, state: 'running', startedAt: new Date(0) };
+    },
+    pause: async () => true,
+    kill: async () => { killCalls++; return true; },
+  };
+  const persist = async (value: SandboxRecord) => {
+    if (value.id === 'sandbox-1') {
+      firstPersistStarted();
+      await firstPersistGate;
+      return;
+    }
+    throw new Error('binding CAS conflict');
+  };
+  const manager = new SandboxManager({ provider, policy: { scanIntervalMs: 60_000 } });
+  try {
+    const firstAcquire = manager.acquire('resource', { usageId: 'first', persist, create: { template: 'template-1' } });
+    const secondAcquire = manager.acquire('resource', { usageId: 'second', persist, create: { template: 'template-1' } });
+    await bothSubmitted;
+    releaseFirstCreate();
+    await firstPersist;
+    releaseSecondCreate();
+    await secondInspect;
+    releaseFirstPersist();
+    const [firstResult, secondResult] = await Promise.allSettled([firstAcquire, secondAcquire]);
+    assert.equal(firstResult.status, 'fulfilled');
+    assert.equal(secondResult.status, 'rejected');
+    if (secondResult.status === 'rejected') {
+      assert(secondResult.reason instanceof SandboxPersistenceError);
+      assert.equal((secondResult.reason as Error & { sandboxId?: string }).sandboxId, 'sandbox-2');
+      assert.match(secondResult.reason.message, /sandbox-2/);
+    }
+    assert.equal(createCalls, 2, 'both remote create requests are submitted independently');
+    assert.equal(manager.peek('resource')?.id, 'sandbox-1', 'the failed persistence candidate never replaces the committed local binding');
+    assert.equal(killCalls, 0, 'the manager does not destroy a remote resource after a persistence conflict');
+    if (firstResult.status === 'fulfilled') await firstResult.value.release();
+  } finally {
+    releaseFirstCreate();
+    releaseSecondCreate();
+    releaseFirstPersist();
+    await manager.close();
+  }
 });
 
 test('replace persists through the original callback before switching and invalidates the old handle', async () => {

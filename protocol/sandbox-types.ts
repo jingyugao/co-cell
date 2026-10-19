@@ -1,5 +1,8 @@
 /** Immutable OCI image identity captured by the selected sandbox backend. */
 export interface SandboxImageIdentity {
+  /** Actual Cellbox identities resolved when this Sandbox was created. */
+  templateId?: string;
+  revisionId?: string;
   /** Mutable reference requested by the service, for example `cellbox:latest`. */
   reference: string;
   /** Docker content ID or an immutable registry reference (`repository@sha256:...`). */
@@ -12,8 +15,23 @@ export interface SandboxImageIdentity {
   createdAt?: string;
 }
 
+/** Cellbox owns the volume and its lifetime; mounting does not reserve it. */
+export interface SandboxMount {
+  volumeId: string;
+  mountPath: string;
+  readOnly?: boolean;
+}
+
 /** Sandbox reference and live observation; status is never persisted by CoCell. */
 export interface SandboxState {
+  ownerKey?: string;
+  mounts?: SandboxMount[];
+  homeVolumeId?: string;
+  /** Request-local observations from Cellbox; never used as a resource lock. */
+  phase?: string;
+  generation?: number;
+  operationId?: string;
+  observedAt?: string;
   lastActiveAt?: string;
   pausedAt?: string;
   id: string;

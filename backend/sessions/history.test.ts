@@ -329,7 +329,7 @@ test('an archived Sandbox reports that history cannot be loaded until restoratio
   } finally { await f.close(); }
 });
 
-test('maintenance invalidates an in-flight history result without rejecting the lifecycle operation', async () => {
+test('history remains readable while a project lifecycle operation is pending', async () => {
   const f = await fixture();
   let finishRead!: () => void;
   let entered!: () => void;
@@ -349,29 +349,22 @@ test('maintenance invalidates an in-flight history result without rejecting the 
       return { turns: [{ ...old, prompt: 'stale history' }] };
     };
     const read = manager.read(session.id);
-    const rejected = assert.rejects(read, /环境正在切换/);
     await reading;
     const projects = (manager as unknown as { projects: import('../projects/service.js').ProjectService }).projects;
-    const release = projects.beginMaintenance(session.projectId!);
-    try {
-      assert.equal(signal.aborted, true);
-      assert.throws(() => projects.beginRead(session.projectId), /维护/);
-      let drained = false;
-      const draining = projects.drainReads(session.projectId!).then(() => { drained = true; });
-      await Promise.resolve();
-      assert.equal(drained, false, 'maintenance waits for underlying read cleanup');
+    {
+      assert.equal(signal.aborted, false);
+      const additionalRead = projects.beginRead(session.projectId);
+      assert.equal(additionalRead.signal.aborted, false);
       finishRead();
-      await rejected;
-      await draining;
-      assert.equal(manager.get(session.id).historyError, undefined, 'cancelled old reads must not change current history errors');
-      assert.notEqual(manager.get(session.id).turns[0].prompt, 'stale history');
-    } finally { release(); }
-    f.runtime.history = async () => ({ turns: [old] });
-    assert.equal((await manager.read(session.id)).historyError, undefined);
+      const snapshot = await read;
+      assert.equal(snapshot.historyError, undefined);
+      assert.ok(snapshot.turns.some(turn => turn.id === old.id), 'the saved/native history remains available during the operation');
+      additionalRead.release();
+    }
   } finally { finishRead?.(); await f.close(); }
 });
 
-test('preview and file streams are cancelled by maintenance; writes and running tasks still block it', async () => {
+test('preview and file streams remain available while a project lifecycle operation is pending', async () => {
   const f = await fixture();
   try {
     const manager = await f.start();
@@ -382,22 +375,18 @@ test('preview and file streams are cancelled by maintenance; writes and running 
     const stream = () => new Response(new ReadableStream({ cancel() { cancelled++; } }));
     f.runtime.service = async () => stream();
     f.runtime.fileResponse = async () => stream();
-    for (const response of [
+    const responses = [
       await manager.projectService(projectId, 8000, '/', new Request('http://localhost/')),
       await manager.projectFileResponse(projectId, '/home/agent/workspace/file.txt', new Request('http://localhost/file')),
-    ]) {
+    ];
+    for (const response of responses) {
       assert.ok(response.body);
     }
-    const release = projects.beginMaintenance(projectId);
-    await projects.drainReads(projectId);
+    assert.equal(cancelled, 0, 'project maintenance does not cancel reads locally');
+    assert.equal(projects.beginRead(projectId).signal.aborted, false);
+    await Promise.all([responses[0].body!.cancel(), responses[1].body!.cancel()]);
     assert.equal(cancelled, 2);
-    release();
-    const response = await manager.projectService(projectId, 8000, '/', new Request('http://localhost/', { method: 'POST' }));
-    assert.throws(() => projects.beginMaintenance(projectId), /正在使用/);
-    await response.body!.cancel();
     const finishTask = projects.startSession(projectId, session.id);
-    assert.throws(() => projects.beginMaintenance(projectId), /正在使用/);
     finishTask();
-    projects.beginMaintenance(projectId)();
   } finally { await f.close(); }
 });

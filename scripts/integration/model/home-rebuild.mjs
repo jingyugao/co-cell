@@ -11,6 +11,14 @@ export async function homeRebuild(env) {
   const filename = `recovery-${randomUUID()}.txt`;
   const before = `before-backup-${randomUUID()}\n`, latest = `after-backup-${randomUUID()}\n`;
   let archive, initial, newer, savedHistory;
+  const assertVolumeBackup = value => {
+    assert(value, 'Backup did not publish a Cellbox Volume snapshot');
+    assert.equal(value.storageType, 'cellbox-volume');
+    assert(value.volumeId, 'Volume snapshot is missing its volume ID');
+    assert.match(value.snapshotId, /^[a-f0-9]{64}$/);
+    assert.equal(value.sha256, undefined, 'Native volume snapshots must not claim a tar checksum');
+    assert.equal(value.imageId, undefined, 'Native volume snapshots must not claim an image ID');
+  };
   const read = () => env.json(fileURL(ready, filename));
   const history = current => current.turns.map(turn => ({ nativeTurnId: turn.nativeTurnId ?? turn.id, prompt: turn.prompt,
     status: turn.status, replies: turn.items.filter(item => item.type === 'agent_message').map(item => item.text) }));
@@ -22,18 +30,28 @@ export async function homeRebuild(env) {
     assert(result.text.trim(), 'Agent did not complete a real conversation');
     return result;
   };
-  await env.step('Prepare a workspace file and real conversation, then Checkpoint and verify its archive', async () => {
+  await env.step('Prepare a workspace file and real conversation, then Checkpoint and pause the Sandbox', async () => {
     await write(filename, before);
     assert.equal(await read(), before);
     initial = await record();
     const checkpointResponse = await env.json(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(checkpointResponse.sandboxOperation.status, 'succeeded');
     assert.equal(checkpointResponse.sandbox.status, 'paused');
-    const checkpointed = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused', waitForBackup: true });
-    archive = checkpointed.remoteArchives?.[0];
-    assert(archive, 'Checkpoint did not publish a workspace archive');
-    assert(archive.sizeBytes > 0 && archive.threadIds.includes(initial.session.threadId));
-    return { archiveId: archive.id, threadId: initial.session.threadId };
+    const paused = await env.waitProject(project.id, { kind: 'checkpoint', status: 'paused' });
+    assert.equal(paused.sandbox.id, ready.sandbox.id);
+    return { sandboxId: paused.sandbox.id, status: paused.sandbox.status };
+  });
+  await env.step('Back up the paused workspace and verify its Volume snapshot', async () => {
+    const response = await env.json(`/api/projects/${project.id}/backup`, { method: 'POST', expectedStatus: 200,
+      timeoutMs: env.config.operationTimeout });
+    assert.equal(response.sandboxOperation.kind, 'backup');
+    assert.equal(response.sandboxOperation.status, 'succeeded');
+    const backedUp = await env.waitProject(project.id, { kind: 'backup', status: 'paused' });
+    assert.equal(backedUp.sandboxBackup?.status, 'succeeded');
+    archive = backedUp.remoteArchives?.[0];
+    assertVolumeBackup(archive);
+    assert(archive.threadIds.includes(initial.session.threadId));
+    return { volumeId: archive.volumeId, snapshotId: archive.snapshotId, sizeBytes: archive.sizeBytes, threadId: initial.session.threadId };
   });
   await env.step('Activate the restored archive before adding newer data', async () => {
     const archived = await env.json(`/api/projects/${project.id}/archive`, {
@@ -42,12 +60,13 @@ export async function homeRebuild(env) {
     assert.equal(archived.status, 'archived');
     assert.equal(archived.sandboxOperation.status, 'succeeded');
     assert.equal(archived.sandbox, undefined);
-    const restoredNow = await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    const restoredNow = await env.json(`/api/projects/${project.id}/sandbox/restore`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(restoredNow.sandboxOperation.status, 'succeeded');
     assert.equal(restoredNow.sandboxOperation.kind, 'restore');
     assert.equal(restoredNow.sandbox.status, 'ready');
     const restored = await env.waitProject(project.id, { kind: 'restore', status: 'ready' });
     assert.notEqual(restored.sandbox.id, ready.sandbox.id);
+    assert.notEqual(restored.sandboxMounts?.[0]?.volumeId, archive.volumeId, 'Native restore must create a new Volume');
     ready = restored;
     assert.equal(await read(), before);
     const current = await env.json(`/api/sessions/${session.id}`);
@@ -63,28 +82,25 @@ export async function homeRebuild(env) {
     savedHistory = history(await env.json(`/api/sessions/${session.id}`));
     assert(savedHistory.some(turn => turn.nativeTurnId === initial.turn.nativeTurnId));
     assert(savedHistory.some(turn => turn.nativeTurnId === newer.turn.nativeTurnId));
-    env.report.homeRebuildEvidence = { filename, before, latest, archiveId: archive.id, savedHistory };
+    env.report.homeRebuildEvidence = { filename, before, latest, volumeId: archive.volumeId, snapshotId: archive.snapshotId, savedHistory };
     await env.persist();
     return { nativeTurnId: newer.turn.nativeTurnId };
   });
-  await env.step('Lose the test execution and rebuild the same HOME without archive rollback', async () => {
+  await env.step('Report same-ID rebuild as unsupported while preserving the original binding and backup', async () => {
     const failure = await failTestSandbox(env, project.id);
     await env.waitProject(project.id, { status: 'unavailable' });
-    const rebuild = await env.json(`/api/projects/${project.id}/sandbox/rebuild`, { method: 'POST', body: {}, expectedStatus: 200, timeoutMs: env.config.operationTimeout });
-    assert.equal(rebuild.sandboxOperation.status, 'succeeded');
-    assert.equal(rebuild.sandbox.status, 'ready');
-    const rebuilt = await env.waitProject(project.id, { kind: 'rebuild', status: 'ready' });
-    assert.equal(rebuilt.sandbox.id, ready.sandbox.id, 'Rebuild replaced the HOME owner');
-    assert.equal(rebuilt.remoteArchives[0].id, archive.id);
-    assert.equal(await read(), latest, 'Rebuild lost the file written after backup');
-    const current = await env.json(`/api/sessions/${session.id}`);
-    assert.equal(current.threadId, initial.session.threadId);
-    assert.deepEqual(history(current), savedHistory, 'Rebuild lost or changed native conversation history');
-    const continued = await record();
-    assert.equal(continued.session.threadId, initial.session.threadId);
-    assert.deepEqual(history(continued.session).slice(0, savedHistory.length), savedHistory);
-    assert.equal(history(continued.session).length, savedHistory.length + 1);
-    assert.equal(await read(), latest);
-    return { ...failure, sandboxId: rebuilt.sandbox.id, threadId: current.threadId, turns: continued.session.turns.length };
+    const rejected = await env.json(`/api/projects/${project.id}/sandbox/rebuild`, {
+      method: 'POST', body: {}, expectedStatus: 422, timeoutMs: env.config.operationTimeout,
+    });
+    assert.match(rejected.error, /不支持同 ID 重建/);
+    const current = await env.json(`/api/projects/${project.id}`);
+    assert.equal(current.sandbox.id, ready.sandbox.id);
+    assert.equal(current.remoteArchives[0].snapshotId, archive.snapshotId);
+    assert.equal(current.remoteArchives[0].volumeId, archive.volumeId);
+    assert.equal(current.sandboxOperation.status, 'failed');
+    env.report.homeRebuildEvidence.sameIdRebuildUnsupported = true;
+    await env.persist();
+    return { ...failure, sandboxId: current.sandbox.id, volumeId: archive.volumeId, snapshotId: archive.snapshotId };
+
   });
 }

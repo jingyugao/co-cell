@@ -100,22 +100,29 @@ export interface Turn {
 }
 export type ProjectStatus = 'active' | 'completed' | 'archived';
 export interface ProjectSandboxOperation {
-  /** Resume completion confirms runtime restoration; health diagnostics do not gate it. */
-	/** Persisted intention ID used for remote operation idempotency. */
-	id?: string;
-  /** Resume intent and API ownership; recovery preserves the operation identity. */
+  /** Local request identifier for observation; never used for remote replay. */
+  id?: string;
+  /** Legacy ownership metadata retained for reading old records only. */
   resume?: { sandboxId: string; ownerId: string };
-  /** Runtime snapshot durably published by a completed resume operation. */
+  /** Operation outcome, including a released Box; independent of current Box observations. */
   result?: { sandbox: SandboxState };
-  /** Image reserved by an in-flight or uncertain archived restore. */
+  /** Image selected by this restore request; no resource reservation. */
   imageSelection?: ProjectImageSelection;
-  /** Checkpoint completes when paused; its workspace backup has independent status. */
-  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild';
+  /** Checkpoint only pauses the Sandbox; workspace backup is a separate explicit operation. */
+  kind: 'create' | 'checkpoint' | 'backup' | 'restore' | 'archive' | 'refresh' | 'resume' | 'rebuild' | 'release' | 'delete';
+  /** Native operation/resource identities, for inspection only; never replayed. */
+  remoteOperationId?: string;
+  volumeId?: string;
+  candidateVolumeId?: string;
   phase: string;
-  status: 'running' | 'failed' | 'succeeded';
+  status: 'running' | 'failed' | 'succeeded' | 'unknown';
   error?: string;
+  errorCode?: string;
   /** Archive is durable; reclaiming the old runtime or cache can be retried independently. */
   cleanupError?: string;
+  retentionError?: string;
+  catalogError?: string;
+  sizeBytes?: number;
   durationMs?: number;
   scannedBytes?: number;
   addedBytes?: number;
@@ -129,8 +136,15 @@ export type ProjectType = 1 | 2 | 3;
 
 export interface ProjectSandboxBackup {
   id: string;
-  sandboxId: string;
-  status: 'running' | 'failed' | 'succeeded';
+  sandboxId?: string;
+  volumeId?: string;
+  remoteOperationId?: string;
+  snapshotId?: string;
+  retentionError?: string;
+  catalogError?: string;
+  sizeBytes?: number;
+  addedBytes?: number;
+  status: 'running' | 'failed' | 'succeeded' | 'unknown';
   phase: string;
   error?: string;
   durationMs?: number;
@@ -153,22 +167,29 @@ export interface Project {
   workingDirectory: string;
   /** `archivedAt` is retained for legacy records and archive grouping. */
   status?: ProjectStatus;
+  /** Removed from project lists; the backup/recovery index remains available. */
+  removedAt?: string;
   completedAt?: string | null;
   imageSelection?: ProjectImageSelection;
   sandbox?: SandboxState;
+  /** Retained mounts survive releasing the project's current Box. */
+  sandboxMounts?: import('./sandbox-types.js').SandboxMount[];
+  /** Cellbox ownership namespace of the retained mounts, including restored volumes. */
+  sandboxOwnerKey?: string;
   /** Timestamp at which archiving released the project's Sandbox binding. */
   sandboxReclaimedAt?: string;
   /** Confirmed runtime and Cellbox artifact cleanup; absent on legacy archives awaiting reconciliation. */
   sandboxArtifactsCleanedAt?: string;
 	/** Product references only; archive bytes and integrity belong to the box service. */
 	remoteArchives?: import('./remote-archive-types.js').RemoteArchiveRef[];
-  backupRetentionCount?: number;
   latestBackup?: LatestBackupSummary;
   sandboxOperation?: ProjectSandboxOperation;
-  /** Background workspace capture; failure never changes the checkpoint outcome. */
+  /** Result of an explicit workspace backup, independent of checkpoint outcome. */
   sandboxBackup?: ProjectSandboxBackup;
   /** Uncommitted replacement containers and retired containers awaiting cleanup. */
   pendingSandboxCleanup?: SandboxState[];
+  /** Restored disks whose Sandbox creation/binding has not completed. */
+  pendingVolumeCleanup?: string[];
   /** Verified archive source awaiting cleanup; survives retries/restarts after archiving. */
   archiveCleanupSourceId?: string;
   archivedAt?: string | null;
@@ -178,7 +199,7 @@ export interface Project {
 }
 export interface ProjectLifecycleRecord {
   id: string;
-  action: 'completed' | 'archived' | 'restored';
+  action: 'completed' | 'archived' | 'restored' | 'released';
   at: string;
   sandboxId?: string;
 }
@@ -192,8 +213,10 @@ export interface ArchiveVersionSummary {
   id: string;
   version: number;
   createdAt: string;
-  sizeBytes: number;
+  sizeBytes?: number;
   bytesAdded?: number;
+  browsable?: boolean;
+  storageType?: 'cellbox' | 'oss' | 'cellbox-volume';
   label: string;
 }
 
@@ -201,6 +224,8 @@ export interface ArchiveVersionSummary {
  * 201, other operations return 200 with a terminal result, or a request error.
  * Running operations may still be observed through read-only queries after a disconnect. */
 export interface ProjectSummary extends Project { sessionCount: number; activeSessionId: string | null;
+  backupPolicy?: import('./remote-archive-types.js').VolumeBackupPolicy;
+  backupPolicyError?: string;
   /** Cellbox archive versions, newest first. */
   archiveVersions?: ArchiveVersionSummary[];
 }
@@ -313,3 +338,12 @@ export type StreamMessage =
   | { type: 'snapshot'; session: Session }
   | { type: 'sdk'; turnId: string; event: AgentEvent }
   | { type: 'state'; session: Session };
+
+
+/** Provider failures keep their classification; an unreadable accepted mutation is still an API error. */
+export interface ApiErrorResponse {
+  error: string | { message?: string; code?: string };
+  code?: string;
+  /** Original upstream success status when CoCell cannot confirm the mutation result. */
+  upstreamStatus?: number;
+}

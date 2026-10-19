@@ -10,17 +10,17 @@ import { matchesRemoteArchive } from '../archives/remote.js';
 const content = createArchiveReader();
 
 export function installArchiveRoutes(app: Hono, manager: SessionManager) {
-  const remoteOwner = (key: string) => manager.listProjects().find(project =>
+  const remoteOwner = async (key: string, refresh = false) => (await manager.listArchiveProjects(refresh ? key : undefined)).find(project =>
     project.remoteArchives?.some(reference => reference.id === key));
-  const remoteReference = (key: string, versionId?: string): RemoteArchiveRef | null => {
-    const owner = remoteOwner(key);
+  const remoteReference = async (key: string, versionId?: string): Promise<RemoteArchiveRef | null> => {
+    const owner = await remoteOwner(key);
     return owner?.remoteArchives?.find(reference => reference.id === (versionId ?? key)) ?? null;
   };
 
-  async function withArchive<T>(key: string, versionId: string | undefined,
+  async function withArchive<T>(reference: RemoteArchiveRef | null,
     read: (source: ReturnType<typeof content.artifactFromFile>) => Promise<T>): Promise<T | null> {
-    const reference = remoteReference(key, versionId);
     if (!reference) return null;
+    if (reference.storageType === 'cellbox-volume') throw new Error('Cellbox 磁盘备份暂不支持文件浏览');
     const remote = manager.remoteArchives;
     if (!remote?.download) throw new Error('Cellbox 归档浏览不可用');
     if (!Number.isSafeInteger(reference.sizeBytes) || reference.sizeBytes < 1
@@ -39,50 +39,57 @@ export function installArchiveRoutes(app: Hono, manager: SessionManager) {
     } finally { await rm(directory, { recursive: true, force: true }); }
   }
 
-  app.get('/api/archives', c => {
-    const result = manager.listProjects().flatMap(project => {
+  app.get('/api/archives', async c => {
+    const result = (await manager.listArchiveProjects()).flatMap(project => {
       const archives = (project.remoteArchives ?? []).map(reference => ({ key: reference.id,
-        createdAt: reference.createdAt, size: reference.sizeBytes }));
+        createdAt: reference.createdAt, ...(reference.sizeBytes !== undefined ? { size: reference.sizeBytes } : {}),
+        ...(reference.storageType === 'cellbox-volume' ? { volumeId: reference.volumeId, snapshotId: reference.snapshotId,
+          ...(reference.addedBytes === undefined ? {} : { addedBytes: reference.addedBytes }) } : {}),
+        storageType: reference.storageType ?? 'cellbox', browsable: reference.storageType !== 'cellbox-volume' }));
       return archives.length ? [{ projectId: project.id, projectName: project.name,
         latestAt: archives[0].createdAt, count: archives.length, archives }] : [];
     });
     return c.json(result.sort((a, b) => b.latestAt.localeCompare(a.latestAt)));
   });
 
-  app.get('/api/archives/:key/versions', c => {
-    const owner = remoteOwner(c.req.param('key'));
+  app.get('/api/archives/:key/versions', async c => {
+    const owner = await remoteOwner(c.req.param('key'), true);
     if (!owner) return c.json({ error: '归档不存在' }, 404);
     return c.json((owner.remoteArchives ?? []).map((reference, index, all) => ({
       id: reference.id, version: all.length - index, createdAt: reference.createdAt,
-      sizeBytes: reference.sizeBytes, label: `版本 ${all.length - index}`,
+      ...(reference.sizeBytes !== undefined ? { sizeBytes: reference.sizeBytes } : {}),
+      ...('addedBytes' in reference && reference.addedBytes !== undefined ? { bytesAdded: reference.addedBytes } : {}),
+      browsable: reference.storageType !== 'cellbox-volume', storageType: reference.storageType ?? 'cellbox',
+      ...(reference.storageType === 'cellbox-volume' ? { volumeId: reference.volumeId, snapshotId: reference.snapshotId } : {}),
+      label: `版本 ${all.length - index}`,
     })));
   });
 
   app.get('/api/archives/:key/files', async c => {
+    const reference = await remoteReference(c.req.param('key'), c.req.query('version'));
+    if (reference?.storageType === 'cellbox-volume')
+      return c.json({ error: 'Cellbox 磁盘备份暂不支持文件浏览' }, 422);
     const path = content.normalizePath(c.req.query('path') || '');
     if (path === null) return c.json({ error: '无效的文件路径' }, 400);
     try {
-      const listing = await withArchive(c.req.param('key'), c.req.query('version'), archive => content.listFiles(archive, path));
+      const listing = await withArchive(reference, archive => content.listFiles(archive, path));
       if (!listing) return c.json({ error: '归档文件不存在' }, 404);
       return c.json({ path, ...listing });
     } catch (error) { return c.json({ error: (error as Error).message }, 500); }
   });
 
   app.get('/api/archives/:key/file', async c => {
+    const reference = await remoteReference(c.req.param('key'), c.req.query('version'));
+    if (reference?.storageType === 'cellbox-volume')
+      return c.json({ error: 'Cellbox 磁盘备份暂不支持文件浏览' }, 422);
     const path = content.normalizePath(c.req.query('path') || '');
     if (path === null) return c.json({ error: '无效的文件路径' }, 400);
     if (!path) return c.json({ error: '缺少文件路径' }, 400);
     try {
-      const file = await withArchive(c.req.param('key'), c.req.query('version'), archive => content.readFile(archive, path));
+      const file = await withArchive(reference, archive => content.readFile(archive, path));
       if (!file) return c.json({ error: '归档文件不存在' }, 404);
       return c.json({ path, ...file });
     } catch (error) { return c.json({ error: (error as Error).message }, 500); }
   });
 
-  app.post('/api/archives/prune', async c => {
-    try {
-      const deleted = await manager.pruneArchivedProjectArchives();
-      return c.json({ deleted, message: `已清理 ${deleted} 个旧归档` });
-    } catch (error) { return c.json({ error: (error as Error).message }, 500); }
-  });
 }

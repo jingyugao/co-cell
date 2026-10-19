@@ -101,7 +101,7 @@ test('rebuild endpoint returns the newly bound Sandbox for an archived project',
     sandbox: { id: 'new-sandbox', status: 'ready' },
   });
 
-  for (const removed of ['archive', 'restore', 'reclaim']) {
+  for (const removed of ['archive', 'reclaim']) {
     assert.equal((await app.request(`/api/projects/project-to-rebuild/sandbox/${removed}`, { method: 'POST' })).status, 404);
   }
 });
@@ -116,15 +116,19 @@ test('resume endpoint returns 200 after its operation reaches a terminal state',
   assert.deepEqual(await response.json(), { id: 'project-to-resume', sandbox: { id: 'same-sandbox', status: 'ready' } });
 });
 
-test('open endpoint returns only after its operation reaches a terminal state', async () => {
+test('open endpoint returns the current snapshot even while a lifecycle operation is running', async () => {
   const app = new Hono();
-  let operationStatus: 'succeeded' | 'failed' = 'succeeded';
+  let operationStatus: 'succeeded' | 'failed' | 'running' = 'succeeded';
   installProjectsRoutes(app, { enterProject: async (id: string) => ({ id,
     sandboxOperation: { id: 'op-1', kind: 'resume', status: operationStatus, phase: '恢复中', updatedAt: new Date().toISOString() },
   }) as never } as unknown as Parameters<typeof installProjectsRoutes>[1]);
   const completed = await app.request('/api/projects/project-1/open', { method: 'POST' });
   assert.equal(completed.status, 200);
   assert.equal((await completed.json() as { sandboxOperation: { status: string } }).sandboxOperation.status, 'succeeded');
+  operationStatus = 'running';
+  const running = await app.request('/api/projects/project-1/open', { method: 'POST' });
+  assert.equal(running.status, 200);
+  assert.equal((await running.json() as { sandboxOperation: { status: string } }).sandboxOperation.status, 'running');
   operationStatus = 'failed';
   const failed = await app.request('/api/projects/project-1/open', { method: 'POST' });
   assert.equal(failed.status, 200, 'terminal lifecycle failures carry their operation snapshot');
@@ -148,4 +152,17 @@ test('project reads forward an exact bounded operation wait and reject unbounded
     assert.equal((await app.request(`/api/projects/project-1?${query}`)).status, 400);
   }
   assert.equal(calls.length, 1);
+});
+
+
+test('explicit create and restore routes submit the chosen action once', async () => {
+  const calls: unknown[] = [];
+  const app = new Hono();
+  installProjectsRoutes(app, {
+    async createProjectSandbox(id: string) { calls.push(['create', id]); return { id } as never; },
+    async restoreProjectSandbox(id: string, versionId?: string) { calls.push(['restore', id, versionId]); return { id } as never; },
+  } as unknown as Parameters<typeof installProjectsRoutes>[1]);
+  assert.equal((await app.request('/api/projects/p/sandbox/create', { method: 'POST' })).status, 200);
+  assert.equal((await app.request('/api/projects/p/sandbox/restore', { method: 'POST', body: JSON.stringify({ imageVersionId: 'v2' }) })).status, 200);
+  assert.deepEqual(calls, [['create', 'p'], ['restore', 'p', 'v2']]);
 });

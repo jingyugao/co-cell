@@ -4,14 +4,119 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { Hono } from 'hono';
-import type { ProjectSummary, Settings } from '../../protocol/types.js';
-import type { SandboxState } from '../../protocol/sandbox-types.js';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
+import type { Project, ProjectSummary, Session, Settings } from '../../protocol/types.js';
+import type { SandboxMount, SandboxState } from '../../protocol/sandbox-types.js';
+import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
-import type { ProjectService } from '../projects/service.js';
 import { installProjectsRoutes } from '../projects/routes.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 import { SessionManager, type CodexClient } from './manager.js';
 import { canEnterProject, isProjectSandboxReady } from '../../util/project-sandbox.js';
+import { CellboxError } from '../../packages/sandbox/src/providers/cellbox/client.js';
+
+type VolumeSandboxState = SandboxState;
+type VolumeProject = Project;
+
+test('release keeps project mounts and conversation thread for a new Box on the same volume', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-release-volume-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const at = new Date().toISOString();
+  const mounts: SandboxMount[] = [{ volumeId: 'workspace-volume', mountPath: '/home/agent' }];
+  const original = { id: 'released-box', status: 'ready' as const, template: 'default',
+    workingDirectory: defaults.workingDirectory } satisfies VolumeSandboxState;
+  const project: VolumeProject = { id: 'release-project', name: 'Release project', type: 1, requirementUrl: null,
+    status: 'active', executionMode: 'sandbox', workingDirectory: defaults.workingDirectory, completedAt: null, archivedAt: null,
+    createdAt: at, updatedAt: at, sandbox: original };
+  const session: Session = { id: 'release-session', projectId: project.id, threadId: 'thread-kept', title: 'Existing thread',
+    settings: defaults, status: 'idle', startedAt: at, archivedAt: null, createdAt: at, updatedAt: at, turns: [], sandbox: original };
+  await state.saveProject(project);
+  await state.saveSession(session);
+  const calls: string[] = [];
+  const recreated = { ...original, id: 'replacement-box', status: 'ready' as const, mounts } satisfies VolumeSandboxState;
+  const runtime = {
+    async close() {},
+    async release(target) {
+      calls.push('release');
+      assert.equal(target.sandbox?.id, original.id);
+      assert.equal(target.sandbox?.homeVolumeId, undefined, 'Legacy Box state has not published its promoted HOME volume yet');
+      return { ...target.sandbox!, status: 'unavailable' as const, homeVolumeId: 'workspace-volume' };
+    },
+    async rebuild(target, save) {
+      calls.push('create');
+      assert.equal(target.sandbox, undefined, 'Released Box reference must not be reused');
+      assert.deepEqual(target.sandboxMounts, mounts,
+        'Create must receive the project volume attachment after release');
+      await save(recreated);
+    },
+    async verifySandbox() {},
+  } satisfies Partial<SandboxRuntime> & { release(target: import('../sandboxes/types.js').WorkspaceTarget): Promise<SandboxState> };
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
+  const app = new Hono(); installProjectsRoutes(app, manager);
+  try {
+    await manager.init();
+    const releasedResponse = await app.request(`/api/projects/${project.id}/sandbox/release`, { method: 'POST' });
+    assert.equal(releasedResponse.status, 200);
+    const released = await releasedResponse.json() as ProjectSummary;
+    assert.equal(released.sandbox, undefined);
+    assert.deepEqual(released.sandboxMounts, mounts);
+    assert.deepEqual(calls, ['release']);
+    assert.equal(manager.get(session.id).threadId, 'thread-kept');
+
+    const createdResponse = await app.request(`/api/projects/${project.id}/sandbox/create`, { method: 'POST' });
+    assert.equal(createdResponse.status, 200);
+    const created = await createdResponse.json() as ProjectSummary;
+    assert.equal(created.sandbox?.id, recreated.id);
+    assert.deepEqual((created.sandbox as VolumeSandboxState).mounts, mounts);
+    assert.deepEqual(created.sandboxMounts, mounts);
+    assert.equal(manager.get(session.id).threadId, 'thread-kept');
+    assert.deepEqual(calls, ['release', 'create']);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('release BUSY and UNKNOWN outcomes submit once and retain Box, volume, and thread bindings', async () => {
+  for (const code of ['BUSY', 'UNKNOWN_OUTCOME'] as const) {
+    const directory = await mkdtemp(join(tmpdir(), `cocell-release-${code.toLowerCase()}-`));
+    const state = new MemoryWebStateStore();
+    const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+      modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+    const at = new Date().toISOString();
+    const mounts: SandboxMount[] = [{ volumeId: 'workspace-volume', mountPath: '/home/agent' }];
+    const box = { id: 'release-box', status: 'ready' as const, template: 'default',
+      workingDirectory: defaults.workingDirectory, mounts } satisfies VolumeSandboxState;
+    const project: VolumeProject = { id: `release-${code.toLowerCase()}`, name: 'Release failure', type: 1, requirementUrl: null,
+      status: 'active', executionMode: 'sandbox', workingDirectory: defaults.workingDirectory, completedAt: null, archivedAt: null,
+      createdAt: at, updatedAt: at, sandbox: box, sandboxMounts: mounts };
+    const session: Session = { id: `session-${code.toLowerCase()}`, projectId: project.id, threadId: 'thread-kept', title: 'Existing thread',
+      settings: defaults, status: 'idle', startedAt: at, archivedAt: null, createdAt: at, updatedAt: at, turns: [], sandbox: box };
+    await state.saveProject(project);
+    await state.saveSession(session);
+    let submissions = 0;
+    const runtime = {
+      async close() {},
+      async release() {
+        submissions++;
+        throw new CellboxError(code, `Cellbox release ${code}`, code === 'BUSY' ? 409 : 502);
+      },
+    } satisfies Partial<SandboxRuntime> & { release(target: import('../sandboxes/types.js').WorkspaceTarget): Promise<SandboxState> };
+    const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
+    const app = new Hono(); installProjectsRoutes(app, manager);
+    try {
+      await manager.init();
+      const response = await app.request(`/api/projects/${project.id}/sandbox/release`, { method: 'POST' });
+      assert.notEqual(response.status, 200, `${code} must not be reported as a successful release`);
+      await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
+      const retained = manager.getProject(project.id);
+      assert.equal(submissions, 1, `${code} release is not automatically replayed`);
+      assert.equal(retained.sandbox?.id, box.id);
+      assert.deepEqual(retained.sandboxMounts, mounts);
+      assert.equal(manager.get(session.id).threadId, 'thread-kept');
+      assert.equal(retained.sandboxOperation?.errorCode, code);
+    } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+  }
+});
 
 test('archiving deletes current and legacy attachment caches and blocks new uploads', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-archive-cache-'));
@@ -25,7 +130,7 @@ test('archiving deletes current and legacy attachment caches and blocks new uplo
   const runtime = {
     async close() {}, async rebuild(_target, save) { await save(box); },
     async querySandbox(value) { return { ...value, status: paused ? 'paused' as const : 'ready' as const }; },
-    async checkpoint(value) { paused = true; return { ...value.sandbox!, status: 'paused' as const }; },
+    async checkpoint() { paused = true; },
     async verifySandbox() {}, async fenceSandbox() {}, async detachSandbox() {}, async deleteDanglingSandbox() {},
     remoteArchives: { async capture() { return reference; }, async inspect() { return reference; },
       async restore() { throw new Error('unused'); }, async activate() {} },
@@ -39,7 +144,10 @@ test('archiving deletes current and legacy attachment caches and blocks new uplo
     const legacyDirectory = join(directory, 'images', session.id);
     await mkdir(legacyDirectory, { recursive: true });
     await writeFile(join(legacyDirectory, 'legacy.png'), 'legacy attachment');
-    await manager.archiveProjectNow(session.projectId!);
+    await manager.checkpointProjectSandbox(session.projectId!);
+    await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
+    await manager.backupProjectNow(session.projectId!);
+    await manager.archiveProjectNow(session.projectId!, { useExistingBackup: true });
     assert.equal(manager.getProject(session.projectId!).status, 'archived');
     await assert.rejects(access(image), { code: 'ENOENT' });
     await assert.rejects(access(legacyDirectory), { code: 'ENOENT' });
@@ -51,237 +159,90 @@ test('archiving deletes current and legacy attachment caches and blocks new uplo
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
-test('project creation verifies readiness; resume preserves the box without repeating diagnostics', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'cocell-provision-'));
+test('project entry stays read-only; explicit lifecycle actions are observed from Cellbox', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-explicit-lifecycle-'));
   const state = new MemoryWebStateStore();
   const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
     modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
-  const box: SandboxState = { id: 'project-box', status: 'ready', template: 'default', workingDirectory: defaults.workingDirectory };
-  let providerBox = { ...box };
-  let finishPreparation!: () => void;
-  const preparation = new Promise<void>(resolve => { finishPreparation = resolve; });
-  let saveBinding!: (value: SandboxState) => Promise<void>;
-  let verifications = 0, inspections = 0, createCalls = 0, resumeCalls = 0, queryCalls = 0;
-  let failVerification = false;
-  let failCapture = false;
-  let failResume = false;
-  let resumeBarrier = Promise.resolve();
+  const at = new Date().toISOString();
+  const box: SandboxState = { id: 'project-box', status: 'paused', template: 'default', workingDirectory: defaults.workingDirectory, pausedAt: at };
+  const project: Project = { id: 'lifecycle-project', name: 'Lifecycle project', type: 1, requirementUrl: null,
+    status: 'active', executionMode: 'sandbox', workingDirectory: defaults.workingDirectory, completedAt: null, archivedAt: null,
+    createdAt: at, updatedAt: at, sandbox: box };
+  await state.saveProject(project);
+  let providerStatus: SandboxState['status'] = 'paused';
+  let observationUnavailable = false;
+  let resumeCalls = 0, checkpointCalls = 0, archiveCalls = 0;
+  const archive = { id: 'lifecycle-archive', sourceSandboxId: box.id, imageId: 'image', createdAt: at,
+    sizeBytes: 10, sha256: 'a'.repeat(64), threadIds: [] };
   const runtime = {
     async close() {},
-    async rebuild(_target, save) {
-      createCalls++; saveBinding = save; providerBox = { ...box, status: 'ready' };
-      await save({ ...box });
-      await preparation;
+    async querySandbox(value) {
+      if (observationUnavailable) throw new Error('Cellbox observation unavailable');
+      return { ...value, status: providerStatus };
     },
-    async querySandbox(sandbox) { queryCalls++; return { ...sandbox, status: providerBox.status }; },
-    async querySandboxes(sandboxes) { queryCalls++; return sandboxes.map(sandbox => ({ ...sandbox, status: providerBox.status })); },
-    async verifySandbox() { verifications++; if (failVerification) throw new Error('App Server unavailable'); },
-    async inspect() { inspections++; },
-    async checkpoint(target) { assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'paused' }; return { ...providerBox }; },
-    async resume(target) { resumeCalls++; assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'ready' };
-      await resumeBarrier;
-      if (failResume) throw new Error('Runtime restore outcome unavailable'); return { ...providerBox }; },
-    remoteArchives: { async capture(target) { assert.equal(target.sandbox?.status, 'paused'); if (failCapture) throw new Error('archive storage unavailable'); return { id: 'archive-checkpoint', createdAt: new Date().toISOString(), sizeBytes: 10, sha256: 'a'.repeat(64), imageId: 'image', sourceSandboxId: box.id }; },
-      async inspect(ref) { return ref; }, async restore() { throw new Error('unused'); }, async activate() {} },
-    async fenceSandbox() {}, async detachSandbox() {}, async deleteDanglingSandbox() {},
-    async delete(target) { assert.equal(target.sandbox?.id, box.id); providerBox = { ...box, status: 'unavailable' }; await saveBinding({ ...providerBox }); },
+    async resume() { resumeCalls++; providerStatus = 'ready'; },
+    async checkpoint() { checkpointCalls++; providerStatus = 'paused'; },
+    remoteArchives: { async capture() { archiveCalls++; return archive; }, async inspect(ref) { return ref; },
+      async restore() { throw new Error('unused'); }, async activate() {} },
   } satisfies Partial<SandboxRuntime>;
   const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
   const app = new Hono(); installProjectsRoutes(app, manager);
   const operations = () => (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations;
-  const waitFor = async <T>(read: () => Promise<T | undefined>, ready: (value: T | undefined) => boolean) => {
-    const deadline = Date.now() + 4_000;
-    let value = await read();
-    while (!ready(value) && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-      value = await read();
-    }
-    assert(ready(value), 'timed out waiting for durable lifecycle state');
-    return value as T;
-  };
   try {
     await manager.init();
-    let createSettled = false;
-    const createResponse = Promise.resolve(app.request('/api/projects', { method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'immediate sandbox' }) }));
-    void createResponse.then(() => { createSettled = true; });
-    const creating = await waitFor(async () => (await state.listProjects())[0], project => project?.sandboxOperation?.kind === 'create');
-    const createOperationId = creating.sandboxOperation!.id!;
-    assert.equal(creating.sandboxOperation?.status, 'running');
-    await new Promise(resolve => setTimeout(resolve, 1_600));
-    assert.equal(createSettled, false, 'create must keep the request open while runtime preparation exceeds the old 1.5s budget');
-    assert.equal((await state.getProject(creating.id))?.sandboxOperation?.id, createOperationId,
-      'the in-flight operation remains readable from durable project history');
-    const created = creating as ProjectSummary;
-    assert.equal(canEnterProject(created), true);
-    assert.equal(isProjectSandboxReady(created), false);
-    let duringEntrySettled = false;
-    const duringEntryResponse = Promise.resolve(app.request(`/api/projects/${created.id}/open`, { method: 'POST' }))
-      .then(response => { duringEntrySettled = true; return response; });
-    await assert.rejects(manager.create({ projectId: created.id }), /维护/);
-    const duringCreate = await (await app.request('/api/projects?refreshSandboxes=1')).json() as ProjectSummary[];
-    assert.equal(duringCreate[0].sandbox?.status, 'ready', 'live provider status is returned during creation maintenance');
-    assert.equal(inspections, 0, 'polling must not inspect, prepare, resume, or verify the Sandbox');
-    assert.equal(resumeCalls, 0);
-    assert.equal(verifications, 0);
-    assert.equal(canEnterProject(duringCreate[0]), true);
-    assert.equal(isProjectSandboxReady(duringCreate[0]), false);
-    await assert.rejects(manager.checkpointProjectSandbox(created.id), /维护/);
-    assert.equal(duringEntrySettled, false, 'open joins in-flight creation and waits for a usable sandbox');
-    finishPreparation();
-    const response = await createResponse;
-    assert.equal(response.status, 201);
-    const completedCreate = await response.json() as ProjectSummary;
-    assert.equal(completedCreate.sandboxOperation?.id, createOperationId);
-    assert.equal(completedCreate.sandboxOperation?.status, 'succeeded');
-    const duringEntry = await duringEntryResponse;
-    assert.equal(duringEntry.status, 200);
-    assert.equal((await duringEntry.json() as ProjectSummary).sandboxOperation?.status, 'succeeded');
-    await operations().close();
-    assert.equal(createCalls, 1);
-    assert.equal(verifications, 1);
-    const readyAfterCreate = await manager.readProject(created.id);
-    assert.equal(readyAfterCreate.sandbox?.status, 'ready');
-    assert.equal(canEnterProject(readyAfterCreate), true);
-    // The persistent runtime callback must use current lifecycle state after creation.
-    providerBox = { ...box, status: 'paused' };
-    await saveBinding({ ...providerBox });
-    assert.equal((await manager.readProject(created.id)).sandbox?.status, 'paused');
-    providerBox = { ...box, status: 'ready' };
-    await saveBinding({ ...providerBox });
-    assert.equal((await manager.readProject(created.id)).sandbox?.status, 'ready');
-    const projects = (manager as unknown as { projects: ProjectService }).projects;
-    const finishTask = projects.startSession(created.id, 'active-task');
-    try {
-      await assert.rejects(manager.checkpointProjectSandbox(created.id), /正在使用/);
-      const beforePoll = { inspections, rebuilds: createCalls, resumes: resumeCalls, verifications };
-      const activeList = await manager.listProjectsWithArchives();
-      assert.equal(activeList[0].sandbox?.status, 'ready');
-      assert.deepEqual({ inspections, rebuilds: createCalls, resumes: resumeCalls, verifications }, beforePoll,
-        'read-only polling during an active task does not start lifecycle work');
-    }
-    finally { finishTask(); }
-    const checkpoint = await app.request(`/api/projects/${created.id}/sandbox/checkpoint`, { method: 'POST' });
+    const entry = await app.request(`/api/projects/${project.id}/open`, { method: 'POST' });
+    assert.equal(entry.status, 200);
+    const read = await entry.json() as ProjectSummary;
+    assert.equal(read.sandbox?.status, 'paused');
+    assert.equal(resumeCalls, 0, 'open reads state and does not resume');
+    assert.equal(canEnterProject(read), true);
+    assert.equal(isProjectSandboxReady(read), false);
+
+    const response = await app.request(`/api/projects/${project.id}/sandbox/resume`, { method: 'POST' });
+    assert.equal(response.status, 200);
+    const resumed = await response.json() as ProjectSummary;
+    assert.equal(resumeCalls, 1, 'explicit resume submits once');
+    assert.equal(resumed.sandbox?.id, box.id);
+    assert.equal(resumed.sandboxOperation?.status, 'succeeded');
+    assert.equal(isProjectSandboxReady(resumed), true);
+
+    observationUnavailable = true;
+    const unobserved = await app.request(`/api/projects/${project.id}/sandbox/resume`, { method: 'POST' });
+    assert.equal(unobserved.status, 200);
+    const completed = await unobserved.json() as ProjectSummary;
+    assert.equal(resumeCalls, 2, 'each explicit request reaches Cellbox even if the box is already running');
+    assert.equal(completed.sandboxOperation?.status, 'succeeded', 'a later observation failure cannot change the operation result');
+    assert.equal(completed.sandbox?.status, 'unknown', 'a completed resume does not fabricate a ready observation');
+    observationUnavailable = false;
+
+    const checkpoint = await app.request(`/api/projects/${project.id}/sandbox/checkpoint`, { method: 'POST' });
     assert.equal(checkpoint.status, 200);
     await operations().close();
-    const pausedAfterCheckpoint = await manager.readProject(created.id);
-    assert.equal(pausedAfterCheckpoint.sandbox?.status, 'paused');
-    assert.equal(canEnterProject(pausedAfterCheckpoint), true);
-    assert.equal(isProjectSandboxReady(pausedAfterCheckpoint), false);
-    let finishResume!: () => void;
-    resumeBarrier = new Promise<void>(resolve => { finishResume = resolve; });
-    let opensSettled = 0;
-    const opened = [1, 2].map(() => Promise.resolve(app.request(`/api/projects/${created.id}/open`, { method: 'POST' }))
-      .then(response => { opensSettled++; return response; }));
-    const resuming = await waitFor(() => state.getProject(created.id), project => project?.sandboxOperation?.kind === 'resume'
-      && project.sandboxOperation.status === 'running');
-    const operationId = resuming.sandboxOperation!.id!;
-    assert.equal(resumeCalls, 1);
-    await new Promise(resolve => setTimeout(resolve, 1_600));
-    assert.equal(opensSettled, 0, 'concurrent open requests must remain pending beyond the old 1.5s wait budget');
-    assert.equal((await state.getProject(created.id))?.sandboxOperation?.id, operationId,
-      'the running resume operation remains visible while callers wait');
-    const joinedEntry = manager.enterProject(created.id);
-    await assert.rejects(manager.create({ projectId: created.id }), /维护/);
-    let notified = false;
-    const beforeWaitQueries = queryCalls;
-    const waitingResponse = Promise.resolve(app.request(`/api/projects/${created.id}?waitForOperation=${operationId}&waitMs=10000`))
-      .then(response => { notified = true; return response; });
-    await new Promise<void>(resolve => setImmediate(resolve));
-    assert.equal(notified, false, 'runtime ready alone cannot finish the wait');
-    assert.equal(queryCalls, beforeWaitQueries, 'waiting for completion does not poll the provider');
-    const mutateProject = state.mutateProject.bind(state);
-    let persistReached!: () => void, commitResult!: () => void;
-    const persistenceStarted = new Promise<void>(resolve => { persistReached = resolve; });
-    const persistenceBarrier = new Promise<void>(resolve => { commitResult = resolve; });
-    state.mutateProject = async (id, mutate) => {
-      const current = await state.getProject(id);
-      if (current?.sandboxOperation?.id === operationId && current.sandboxOperation.status === 'running') {
-        const projected = structuredClone(current);
-        mutate(projected);
-        if (projected.sandboxOperation?.id === operationId && projected.sandboxOperation.status === 'succeeded') {
-          persistReached(); await persistenceBarrier;
-        }
-      }
-      return mutateProject(id, mutate);
-    };
-    const projectService = (manager as unknown as { projects: ProjectService }).projects;
-    finishResume(); await persistenceStarted;
-    try {
-      assert.equal(notified, false, 'completion must be durable before notifying readers');
-      assert.equal(projectService.isMaintaining(created.id), true);
-    } finally { commitResult(); }
-    const completionResponse = await waitingResponse;
-    assert.equal(completionResponse.status, 200);
-    const completion = await completionResponse.json() as ProjectSummary;
-    assert.equal(completion.sandboxOperation?.id, operationId);
-    assert.equal(completion.sandboxOperation?.status, 'succeeded');
-    assert.equal(isProjectSandboxReady(completion), true);
-    assert.equal(projectService.isMaintaining(created.id), false, 'notified clients can begin execution');
-    state.mutateProject = mutateProject;
-    const openResponses = await Promise.all(opened);
-    assert.ok(openResponses.every(response => response.status === 200));
-    const entries = await Promise.all(openResponses.map(response => response.json() as Promise<ProjectSummary>));
-    assert.equal(entries[0].sandboxOperation?.id, operationId);
-    assert.equal(entries[1].sandboxOperation?.id, operationId);
-    assert.ok(entries.every(entry => entry.sandboxOperation?.status === 'succeeded' && isProjectSandboxReady(entry)));
-    assert.equal((await joinedEntry).sandboxOperation?.status, 'succeeded');
-    await operations().close();
-    assert.equal(resumeCalls, 1, 'concurrent entries and repeated entry during preparation share one resume');
-    await manager.enterProject(created.id);
-    assert.equal(resumeCalls, 2, 'a new idle project entry rechecks runtime through ensure-running');
-    assert.equal(verifications, 2, 'creation and checkpoint inspect health; resume relies on runtime completion');
-    assert.equal((await manager.readProject(created.id)).sandbox?.id, box.id);
-    assert.equal(createCalls, 1, 'resume must not provision a second sandbox');
-    assert.equal(canEnterProject(await manager.readProject(created.id)), true);
-    providerBox = { ...box, status: 'paused' };
-    await saveBinding({ ...providerBox });
-    failVerification = true;
-    await manager.resumeProjectSandbox(created.id); await operations().close();
-    assert.equal((await manager.readProject(created.id)).sandboxOperation?.status, 'succeeded');
-    assert.equal(canEnterProject(await manager.readProject(created.id)), true);
-    assert.equal(verifications, 2, 'a diagnostic failure cannot delay or fail a restored execution');
-    providerBox = { ...box, status: 'paused' };
-    await saveBinding({ ...providerBox });
-    failResume = true;
-    let restoreFailure: unknown;
-    try { await manager.resumeProjectSandbox(created.id); } catch (error) { restoreFailure = error; }
-    assert.match(String(restoreFailure), /Runtime restore outcome unavailable/);
-    await operations().close();
-    const failed = await manager.readProject(created.id);
-    assert.equal(failed.sandboxOperation?.status, 'failed');
-    assert.equal(canEnterProject(failed), true);
-    assert.equal(isProjectSandboxReady(failed), false);
-    const beforeFailedPoll = { queries: queryCalls, inspections, resumes: resumeCalls, verifications };
-    const failedPoll = await manager.listProjectsWithArchives();
-    assert.equal(failedPoll[0].sandbox?.status, 'ready', 'provider state is refreshed even after a failed restore operation');
-    assert.equal(failedPoll[0].sandboxOperation?.status, 'failed');
-    assert.equal(canEnterProject(failedPoll[0]), true);
-    assert.equal(isProjectSandboxReady(failedPoll[0]), false, 'a successful provider query does not erase the failed-operation gate');
-    assert.equal(queryCalls, beforeFailedPoll.queries + 1);
-    assert.deepEqual({ inspections, resumes: resumeCalls, verifications }, {
-      inspections: beforeFailedPoll.inspections, resumes: beforeFailedPoll.resumes, verifications: beforeFailedPoll.verifications,
-    }, 'polling after failed restore only queries provider status');
-    failVerification = false;
-    failResume = false;
-    await manager.rebuildProjectSandbox(created.id); await operations().close();
-    const rebuilt = await manager.readProject(created.id);
-    assert.equal(canEnterProject(rebuilt), true);
-    assert.equal(rebuilt.sandbox?.id, box.id);
-    // Runtime persistence during deletion must respect the deletion guard
-    // without failing or resurrecting the project.
-    failCapture = true;
-    await assert.rejects(manager.deleteProject(created.id), /archive storage unavailable/);
-    assert.equal((await manager.readProject(created.id)).sandbox?.status, 'paused');
-    assert.equal((await state.listProjects()).length, 1, 'failed backup must preserve project and source disk');
-    failCapture = false;
-    await manager.deleteProject(created.id);
-    assert.equal((await state.listProjects()).length, 0);
-    assert.throws(() => manager.getProject(created.id), /不存在/);
-  } finally { finishPreparation(); await manager.close(); await rm(directory, { recursive: true, force: true }); }
+    const paused = await manager.readProject(project.id);
+    assert.equal(checkpointCalls, 1);
+    assert.equal(archiveCalls, 0, 'Checkpoint must not submit disk backup');
+    assert.equal(paused.sandboxBackup, undefined);
+    assert.equal(paused.remoteArchives?.length ?? 0, 0);
+    assert.equal(paused.sandbox?.id, box.id);
+    assert.equal(paused.sandbox?.status, 'paused');
+    assert.equal(paused.sandboxOperation?.kind, 'checkpoint');
+    assert.equal(paused.sandboxOperation?.status, 'succeeded');
+    assert.equal(isProjectSandboxReady(paused), false);
+    const backupResponse = await app.request(`/api/projects/${project.id}/backup`, { method: 'POST' });
+    assert.equal(backupResponse.status, 200);
+    const backedUp = await backupResponse.json() as ProjectSummary;
+    assert.equal(archiveCalls, 1, 'Only the explicit backup request captures disk');
+    assert.equal(backedUp.sandboxOperation?.kind, 'backup');
+    assert.equal(backedUp.sandboxOperation?.status, 'succeeded');
+    assert.equal(backedUp.sandboxBackup?.status, 'succeeded');
+    assert.equal(backedUp.sandboxBackup?.id, backedUp.sandboxOperation?.id);
+    assert.equal(backedUp.remoteArchives?.[0].id, archive.id);
+    assert.equal(backedUp.sandbox?.status, 'paused');
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
-test('rebuild endpoint chooses mounted HOME despite an existing older archive', async () => {
+test('unsupported persistent rebuild is reported without touching the sandbox or older archive', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-home-rebuild-'));
   const state = new MemoryWebStateStore();
   const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
@@ -292,31 +253,31 @@ test('rebuild endpoint chooses mounted HOME despite an existing older archive', 
     status: 'active', completedAt: null, archivedAt: null, executionMode: 'sandbox', workingDirectory: defaults.workingDirectory,
     sandbox: box, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     remoteArchives: [{ id: 'old-archive', createdAt: '2025-01-01T00:00:00Z', sizeBytes: 128, sha256: 'a'.repeat(64), imageId: 'image', sourceSandboxId: 'old-box', threadIds: [] }] });
-  let rebuilt = false;
+  let rebuildCalls = 0, archiveCalls = 0;
   const runtime = {
     async close() {},
-    async querySandbox(value) { return { ...value, status: rebuilt ? 'ready' as const : 'unavailable' as const }; },
-    async rebuildPersistent(target, _key, save) { assert.equal(target.sandbox?.id, box.id); rebuilt = true; await save({ ...box, status: 'ready' }); },
+    async querySandbox(value) { return { ...value, status: 'unavailable' as const }; },
+    async rebuildPersistent() { rebuildCalls++; },
     async verifySandbox() {}, async verifyHistory() {},
     async rebuild() { assert.fail('must not create an empty sandbox'); },
     async deleteDanglingSandbox() { assert.fail('must retain HOME'); },
-    remoteArchives: { async capture() { assert.fail('must not archive'); }, async inspect() { assert.fail('must not inspect archive'); },
+    remoteArchives: { async capture() { archiveCalls++; assert.fail('must not archive'); }, async inspect() { archiveCalls++; assert.fail('must not inspect archive'); },
       async restore() { assert.fail('must not roll back archive'); }, async activate() {} },
   } satisfies Partial<SandboxRuntime>;
   const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
   try {
     await manager.init();
-    const accepted = await manager.rebuildProjectSandbox('mounted-project');
-    assert.equal(accepted.sandboxOperation?.kind, 'rebuild');
+    await assert.rejects(manager.rebuildProjectSandbox('mounted-project'), /不支持同 ID 重建/);
     const operations = (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations;
     await operations.close();
     assert.equal(manager.getProject('mounted-project').sandbox?.id, box.id);
-    assert.equal(manager.getProject('mounted-project').sandboxOperation?.status, 'succeeded');
-    assert.equal(rebuilt, true);
+    assert.equal(manager.getProject('mounted-project').sandboxOperation?.status, 'failed');
+    assert.equal(rebuildCalls, 0);
+    assert.equal(archiveCalls, 0);
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
-test('single-API idle checkpoint also backs up the paused workspace', async () => {
+test('single-API idle checkpoint only pauses and never captures disk', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-idle-backup-'));
   const state = new MemoryWebStateStore();
   const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
@@ -325,7 +286,8 @@ test('single-API idle checkpoint also backs up the paused workspace', async () =
   const runtime = {
     async close() {},
     async querySandbox(value) { return { ...value, status: paused ? 'paused' as const : 'ready' as const }; },
-    async checkpoint(value) { paused = true; return { ...value.sandbox!, status: 'paused' as const }; },
+    async resume() { paused = false; },
+    async checkpoint() { paused = true; },
     remoteArchives: { async capture(value) { assert.equal(value.sandbox?.status, 'paused'); captures++; return {
       id: 'idle-archive', sourceSandboxId: 'idle-box', imageId: 'image', createdAt: new Date().toISOString(), sizeBytes: 10, sha256: 'a'.repeat(64),
     }; }, async inspect(ref) { return ref; }, async restore() { throw new Error('unused'); }, async activate() {} },
@@ -340,12 +302,173 @@ test('single-API idle checkpoint also backs up the paused workspace', async () =
     await manager.scheduledArchive();
     await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
     assert.equal(paused, true);
-    assert.equal(captures, 1);
+    assert.equal(captures, 0);
     const project = await manager.readProject('idle-project');
     assert.equal(project.sandboxOperation?.kind, 'checkpoint');
     assert.equal(project.sandboxOperation?.status, 'succeeded');
-    assert.equal(project.remoteArchives?.[0].id, 'idle-archive');
+    assert.equal(project.remoteArchives?.length ?? 0, 0);
+    assert.equal(project.sandboxBackup, undefined);
     await manager.scheduledArchive();
-    assert.equal(captures, 1, 'later scheduler ticks must not periodically back up a paused project');
+    assert.equal(captures, 0, 'later scheduler ticks must not back up a paused project');
+    await manager.resumeProjectSandbox('idle-project');
+    await manager.scheduledArchive();
+    assert.equal(paused, false, 'a successful explicit resume starts a new idle interval');
+    assert.equal(manager.getProject('idle-project').sandboxOperation?.kind, 'resume');
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('deleting a completed project releases, backs up, removes its volume, and keeps only its recovery catalog', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-delete-volume-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const at = new Date().toISOString();
+  const mounts: SandboxMount[] = [{ volumeId: 'completed-volume', mountPath: '/home/agent' }];
+  const box: SandboxState = { id: 'completed-box', status: 'ready', template: 'default',
+    workingDirectory: defaults.workingDirectory, mounts };
+  const project: Project = { id: 'completed-project', name: 'Completed project', type: 1, requirementUrl: null,
+    status: 'completed', completedAt: at, archivedAt: null, executionMode: 'sandbox', workingDirectory: defaults.workingDirectory,
+    sandbox: box, sandboxMounts: mounts, sandboxOwnerKey: 'owner-key', createdAt: at, updatedAt: at };
+  const session: Session = { id: 'completed-session', projectId: project.id, threadId: 'thread-to-recover', title: 'Thread',
+    settings: defaults, status: 'idle', startedAt: at, archivedAt: null, createdAt: at, updatedAt: at, turns: [], sandbox: box };
+  await state.saveProject(project);
+  await state.saveSession(session);
+  const calls: string[] = [];
+  const backupId = 'd'.repeat(64);
+  const backup = { storageType: 'cellbox-volume' as const, id: `volume:${mounts[0].volumeId}:${backupId}`,
+    volumeId: mounts[0].volumeId, snapshotId: backupId, ownerKey: 'owner-key', profileId: 'profile', mounts,
+    createdAt: at, threadIds: [] as string[] };
+  const candidate: SandboxState = { id: 'restored-box', status: 'ready', template: 'default',
+    workingDirectory: defaults.workingDirectory, mounts };
+  let restoredThreadIds: string[] | undefined;
+  const runtime = {
+    async close() {},
+    async release() { calls.push('release'); return { ...box, status: 'unavailable' as const }; },
+    async verifySandbox() {}, async fenceSandbox() {}, async detachSandbox() {},
+    remoteArchives: {
+      async capture(target) { calls.push('backup'); assert.deepEqual(target.sandboxMounts, mounts); return backup; },
+      async inspect(ref) { return ref; }, async activate() {},
+      async removeVolume(volumeId: string) { calls.push(`delete-volume:${volumeId}`); },
+      async restore(_target, ref) { calls.push('restore'); restoredThreadIds = ref.threadIds; return candidate; },
+  },
+  } satisfies Partial<SandboxRuntime>;
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
+  const app = new Hono();
+  app.onError((error, c) => c.json({ error: error.message }, ((error as { status?: number }).status ?? 500) as ContentfulStatusCode));
+  installProjectsRoutes(app, manager);
+  try {
+    await manager.init();
+    const response = await app.request(`/api/projects/${project.id}`, { method: 'DELETE' });
+    assert.equal(response.status, 200);
+    await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
+    assert.deepEqual(calls, ['release', 'backup', `delete-volume:${mounts[0].volumeId}`]);
+    assert.equal(manager.listProjects().some(item => item.id === project.id), false);
+    assert.equal(manager.list().some(item => item.id === session.id), false);
+    assert.equal((await state.listSessions()).some(item => item.id === session.id), false);
+    assert.equal((await app.request(`/api/projects/${project.id}`)).status, 404);
+    const recovery = (await manager.listArchiveProjects()).find(item => item.id === project.id);
+    assert.ok(recovery?.removedAt);
+    assert.deepEqual(recovery?.remoteArchives?.[0]?.threadIds, ['thread-to-recover']);
+    assert.equal(recovery?.archiveVersions?.[0]?.id, backup.id);
+
+    await manager.restoreProjectSandbox(project.id);
+    assert.equal(manager.getProject(project.id).removedAt, undefined);
+    assert.equal(manager.listProjects().some(item => item.id === project.id), true);
+    assert.equal(manager.getProject(project.id).sandbox?.id, candidate.id);
+    assert.deepEqual(restoredThreadIds, ['thread-to-recover']);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('BUSY and UNKNOWN backup outcomes keep the removed project recoverable and never delete its volume', async () => {
+  for (const code of ['BUSY', 'UNKNOWN_OUTCOME'] as const) {
+    const directory = await mkdtemp(join(tmpdir(), `cocell-delete-backup-${code.toLowerCase()}-`));
+    const state = new MemoryWebStateStore();
+    const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+      modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+    const at = new Date().toISOString();
+    const mounts: SandboxMount[] = [{ volumeId: 'protected-volume', mountPath: '/home/agent' }];
+    const box: SandboxState = { id: 'protected-box', status: 'ready', template: 'default',
+      workingDirectory: defaults.workingDirectory, mounts };
+    const project: Project = { id: `protected-${code.toLowerCase()}`, name: 'Protected completed project', type: 1,
+      requirementUrl: null, status: 'completed', completedAt: at, archivedAt: null, executionMode: 'sandbox',
+      workingDirectory: defaults.workingDirectory, sandbox: box, sandboxMounts: mounts, createdAt: at, updatedAt: at };
+    const session: Session = { id: `protected-session-${code.toLowerCase()}`, projectId: project.id, threadId: 'thread-kept',
+      title: 'Thread', settings: defaults, status: 'idle', startedAt: at, archivedAt: null, createdAt: at, updatedAt: at,
+      turns: [], sandbox: box };
+    await state.saveProject(project);
+    await state.saveSession(session);
+    let captures = 0, volumeDeletes = 0;
+    const runtime = {
+      async close() {},
+      async release() { return { ...box, status: 'unavailable' as const }; },
+      remoteArchives: {
+        async capture() { captures++; throw new CellboxError(code, `Cellbox backup ${code}`, code === 'BUSY' ? 409 : 502); },
+        async inspect(ref) { return ref; }, async activate() {},
+        async restore() { assert.fail('failed backup must not proceed to restore'); },
+        async removeVolume() { volumeDeletes++; },
+      },
+    } satisfies Partial<SandboxRuntime>;
+    const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
+    const app = new Hono(); installProjectsRoutes(app, manager);
+    try {
+      await manager.init();
+      const response = await app.request(`/api/projects/${project.id}`, { method: 'DELETE' });
+      assert.notEqual(response.status, 200, `${code} must not report project deletion as successful`);
+      await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
+      assert.equal(captures, 1, `${code} backup is submitted once`);
+      assert.equal(volumeDeletes, 0, `${code} must stop before disk deletion`);
+      assert.equal(manager.listProjects().some(item => item.id === project.id), true);
+      assert.equal(manager.list().some(item => item.id === session.id), true);
+      assert.equal((await state.listSessions()).some(item => item.id === session.id), true);
+      assert.equal(manager.getProject(project.id).removedAt, undefined);
+      assert.equal(manager.getProject(project.id).sandboxOperation?.errorCode, code);
+      assert.equal(manager.getProject(project.id).sandboxOperation?.status, code === 'UNKNOWN_OUTCOME' ? 'unknown' : 'failed');
+    } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+  }
+});
+
+test('archive directory uses the local index and keyed version refresh queries only its owning project', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-archive-index-'));
+  const state = new MemoryWebStateStore();
+  const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const at = new Date().toISOString();
+  const archive = (projectId: string): RemoteArchiveRef => ({
+    storageType: 'cellbox-volume', id: `volume:${projectId}:${projectId}`, volumeId: projectId, snapshotId: projectId,
+    ownerKey: `project:${projectId}`, profileId: 'profile', mounts: [{ volumeId: projectId, mountPath: '/home/agent' }],
+    createdAt: at, threadIds: [],
+  });
+  const projects: Project[] = [
+    { id: 'archive-a', name: 'A', type: 1, requirementUrl: null, status: 'archived', removedAt: at,
+      executionMode: 'sandbox', workingDirectory: defaults.workingDirectory, remoteArchives: [archive('archive-a')], createdAt: at, updatedAt: at },
+    { id: 'archive-b', name: 'B', type: 1, requirementUrl: null, status: 'archived',
+      executionMode: 'sandbox', workingDirectory: defaults.workingDirectory, remoteArchives: [archive('archive-b')], createdAt: at, updatedAt: at },
+  ];
+  for (const project of projects) await state.saveProject(project);
+  const nativeQueries: string[] = [];
+  const runtime = {
+    async close() {},
+    remoteArchives: {
+      async list(target: { projectId?: string }, references: readonly RemoteArchiveRef[]) {
+        nativeQueries.push(target.projectId ?? 'missing-project-id');
+        return [...references];
+      },
+    },
+  } as unknown as SandboxRuntime;
+  const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime);
+  try {
+    await manager.init();
+    const indexed = await manager.listArchiveProjects();
+    assert.deepEqual(indexed.map(project => project.id).sort(), ['archive-a', 'archive-b']);
+    assert.ok(indexed.find(project => project.id === 'archive-a')?.removedAt, 'removed projects remain recoverable from the local index');
+    assert.deepEqual(nativeQueries, [], 'opening the directory performs no native snapshots scan');
+
+    const selectedKey = archive('archive-b').id;
+    const selected = await manager.listArchiveProjects(selectedKey);
+    assert.deepEqual(selected.map(project => project.id), ['archive-b']);
+    assert.deepEqual(nativeQueries, ['archive-b'], 'refresh is scoped to the project that owns the selected key');
+
+    assert.deepEqual(await manager.listArchiveProjects('missing-volume-backup'), []);
+    assert.deepEqual(nativeQueries, ['archive-b'], 'an unknown key does not query any native catalog');
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

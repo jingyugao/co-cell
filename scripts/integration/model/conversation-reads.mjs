@@ -142,13 +142,17 @@ export async function conversationReads(env) {
     const reads = Array.from({ length: 4 }, (_, index) => request(index % 2
       ? `/api/sessions/${sessionId}/subagents` : `/api/sessions/${sessionId}`, { expectedStatus: [200, 409] }));
     const results = await Promise.allSettled([...reads,
-      json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout })]);
+      json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', expectedStatus: [200, 409], timeoutMs: env.config.operationTimeout })]);
     for (const result of results) if (result.status === 'rejected') throw result.reason;
-    const accepted = results.at(-1).value;
+    let accepted = results.at(-1).value;
+    if (accepted.code) {
+      assert(['BUSY', 'CONFLICT', 'STALE_GENERATION'].includes(accepted.code), 'Only a confirmed conflict permits another explicit checkpoint');
+      accepted = await json(`/api/projects/${projectId}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    }
     assert.equal(accepted.sandboxOperation.status, 'succeeded');
     assert.equal(accepted.sandbox.status, 'paused');
     const paused = await env.waitProject(projectId, { kind: 'checkpoint', status: 'paused', operationId: accepted.sandboxOperation.id });
-    const opened = await json(`/api/projects/${projectId}/open`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
+    const opened = await json(`/api/projects/${projectId}/sandbox/resume`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(opened.sandboxOperation.status, 'succeeded');
     assert.equal(opened.sandbox.status, 'ready');
     const ready = await env.waitProject(projectId, { kind: 'resume', status: 'ready', operationId: opened.sandboxOperation.id });

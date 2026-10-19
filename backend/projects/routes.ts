@@ -8,10 +8,9 @@ import { applicationCookies, applicationSetCookie, previewLocation } from './pre
 import { serviceHost } from './service-host.js';
 import { PROJECT_OPERATION_WAIT_MS } from '../../protocol/types.js';
 
-type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
+type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'createProjectSandbox' | 'restoreProjectSandbox' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'releaseProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
 
 function projectOperationResponse(c: Context, project: Awaited<ReturnType<ProjectRoutesManager['enterProject']>>) {
-  if (project.sandboxOperation?.status === 'running') throw new HttpError(503, '沙箱操作尚未完成，请查询项目状态');
   return c.json(project, 200);
 }
 
@@ -54,11 +53,21 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
     const input = z.object({ imageVersionId: z.string().min(1).max(256).optional() }).strict().parse(parsed);
     return projectOperationResponse(c, await manager.rebuildProjectSandbox(c.req.param('id'), input.imageVersionId));
   });
+  app.post('/api/projects/:id/sandbox/create', async c => projectOperationResponse(c,
+    await manager.createProjectSandbox(c.req.param('id'))));
+  app.post('/api/projects/:id/sandbox/restore', async c => {
+    const body = await c.req.text();
+    let parsed: unknown;
+    try { parsed = body ? JSON.parse(body) : {}; } catch { throw new HttpError(400, '请求 JSON 无效'); }
+    const input = z.object({ imageVersionId: z.string().min(1).max(256).optional() }).strict().parse(parsed);
+    return projectOperationResponse(c, await manager.restoreProjectSandbox(c.req.param('id'), input.imageVersionId));
+  });
   app.post('/api/projects/:id/open', async c => projectOperationResponse(c,
     await manager.enterProject(c.req.param('id'), c.req.raw.signal)));
   app.post('/api/projects/:id/sandbox/resume', async c => projectOperationResponse(c,
     await manager.resumeProjectSandbox(c.req.param('id'), c.req.raw.signal)));
   app.post('/api/projects/:id/sandbox/checkpoint', async c => projectOperationResponse(c, await manager.checkpointProjectSandbox(c.req.param('id'))));
+  app.post('/api/projects/:id/sandbox/release', async c => projectOperationResponse(c, await manager.releaseProjectSandbox(c.req.param('id'))));
   app.post('/api/projects/:id/sandbox/refresh-runtime', async c => projectOperationResponse(c, await manager.refreshProjectSandboxRuntime(c.req.param('id'))));
   const content = async (c: Context) => {
     const path = c.req.query('path');
@@ -119,6 +128,6 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
       .parse({ waitForOperation: c.req.query('waitForOperation'), waitMs: c.req.query('waitMs') });
     return c.json(await manager.readProject(c.req.param('id'), options, c.req.raw.signal));
   });
-  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional(), backupRetentionCount: z.number().int().min(2).max(100).optional() }).parse(await c.req.json()))));
+  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional() }).parse(await c.req.json()))));
   app.delete('/api/projects/:id', async c => { await manager.deleteProject(c.req.param('id')); return c.json({ ok: true }); });
 }

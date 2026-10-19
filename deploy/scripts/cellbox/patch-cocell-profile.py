@@ -52,6 +52,9 @@ else:
     guest.setdefault("env", {}).pop("COCELL_LAUNCHER_SHARED_DIRECTORY", None)
 # Register the protected entries once; auto-trusted imports inherit them.
 tools = guest.setdefault("tools", [])
+# Disk backups are owned by Cellbox; CoCell no longer ships this tool.
+# Preserve restore and operator-managed tools.
+tools[:] = [tool for tool in tools if tool.get("id") != "cocell_archive_backup"]
 names = json.loads(Path(sample_path).with_name("proxy-tools.json").read_text())
 for name in names:
     tool_id = "cocell_" + name.replace("-", "_")

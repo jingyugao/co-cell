@@ -34,12 +34,18 @@ export interface SandboxHandle {
     rename(from: string, to: string, options?: { user?: string; signal?: AbortSignal }): Promise<void>;
   };
 }
+export interface SandboxMount { volumeId: string; mountPath: string; readOnly?: boolean }
+
 export interface SandboxInfo {
+  mounts?: SandboxMount[];
+  homeVolumeId?: string;
   sandboxId: string; state: 'running' | 'paused' | 'unknown';
   startedAt: Date; endAt?: Date; metadata?: Record<string, string>;
   /** Provider capabilities observed with this state snapshot. */
   capabilities?: Record<string, boolean | string>;
   templateIdentity?: {
+    templateId?: string;
+    revisionId?: string;
     reference: string;
     id: string;
     repoDigests: string[];
@@ -64,6 +70,9 @@ export type SandboxOperation =
 
 /** Persisted provider state. Application workspace and execution state stay outside this package. */
 export interface SandboxRecord {
+  ownerKey?: string;
+  mounts?: SandboxMount[];
+  homeVolumeId?: string;
   id: string;
   status: SandboxStatus;
   template: string;
@@ -117,6 +126,10 @@ export interface SandboxProvider {
   getInfo(sandboxId: string): Promise<SandboxInfo>;
   /** Display-only batch observation; missing IDs are omitted and state may be eventually consistent. */
   getInfos?(sandboxIds: string[]): Promise<SandboxInfo[]>;
+  /** Submit one explicit lifecycle request; the provider decides whether it is valid. */
+  resume?(sandboxId: string, options?: { signal?: AbortSignal }): Promise<void>;
+  /** End a Box, retaining its volumes and returning the terminal metadata. */
+  release?(sandboxId: string): Promise<SandboxInfo>;
   pause(sandboxId: string): Promise<boolean>;
   kill(sandboxId: string): Promise<boolean>;
 }
@@ -159,7 +172,7 @@ export interface AcquireSandboxOptions {
   usageId: string;
   purpose?: string;
   signal?: AbortSignal;
-  /** Stable idempotency key for an explicit ensure-running request. */
+  /** Local request identifier for an explicit resume; provides no deduplication. */
   operationKey?: string;
   /** Registers an existing record when track() was not called first. */
   record?: SandboxRecord;

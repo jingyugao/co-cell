@@ -13,7 +13,12 @@ test('CoCell profile enables automatic import trust and registers all proxy tool
     const peer = { id: 'other', provider: 'docker', image: `registry.example/other@sha256:${'a'.repeat(64)}`, guest: { tools: [] } };
     const values = { api: { manageSecrets: true, config: { clientId: 'cocell', profiles: [
       { id: 'cocell', provider: 'resumable-k8s-pod', nodeName: 'test-node', image: `registry.example/old@sha256:${'a'.repeat(64)}`,
-        guest: { tools: [{ id: 'operator-backup', executable: '/operator/backup' }] } }, peer,
+        guest: { tools: [
+          { id: 'operator-backup', executable: '/operator/backup' },
+          { id: 'cocell_archive_backup', executable: '/opt/cellbox/tools/cocell-archive-backup', args: ['legacy'] },
+          { id: 'cocell_archive_restore', executable: '/opt/cellbox/tools/cocell-archive-restore', args: ['restore'] },
+          { id: 'other-archive-tool', executable: '/operator/archive' },
+        ] } }, peer,
     ] } } };
     const image = `registry.example/new@sha256:${'b'.repeat(64)}`;
     const update = input => JSON.parse(execFileSync('uv', ['run', '--no-project', 'python', 'deploy/scripts/cellbox/patch-cocell-profile.py',
@@ -30,6 +35,10 @@ test('CoCell profile enables automatic import trust and registers all proxy tool
       assert.equal(tool.passThroughArgs, true);
     }
     assert(profile.guest.tools.some(tool => tool.id === 'operator-backup'));
+    assert(profile.guest.tools.some(tool => tool.id === 'cocell_archive_restore'), 'Cellbox archive restore must remain registered');
+    assert(profile.guest.tools.some(tool => tool.id === 'other-archive-tool'), 'unrelated tools must remain registered');
+    assert.equal(profile.guest.tools.some(tool => tool.id === 'cocell_archive_backup'), false,
+      'the removed CoCell backup payload must not remain registered');
     assert.deepEqual(update({ api: { ...values.api, config: patched.api.config } }), {}, 'An identical profile must not trigger another rollout');
   } finally { await rm(root, { recursive: true, force: true }); }
 });

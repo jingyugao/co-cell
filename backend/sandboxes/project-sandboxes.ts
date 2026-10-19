@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { SandboxManager, SandboxLease, SandboxRecord, SandboxInfo } from '@co-cell/sandbox';
+import type { SandboxManager, SandboxLease, SandboxRecord } from '@co-cell/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
 
@@ -16,7 +16,7 @@ const resourceKey = (target: WorkspaceTarget) => target.projectId ? `project:${t
 export class ProjectSandboxes {
   private bindings = new Map<string, Binding>();
 
-  constructor(readonly manager: SandboxManager, private template: string) {}
+  constructor(readonly manager: SandboxManager, private template: string, private defaultTemplateId?: string) {}
 
   get templateReference() { return this.template; }
 
@@ -42,9 +42,19 @@ export class ProjectSandboxes {
     this.bindings.delete(resourceKey(target));
   }
 
+  async forgetReleased(target: WorkspaceTarget) {
+    if (!target.sandbox) return;
+    const key = resourceKey(target), binding = this.bindings.get(key);
+    await this.manager.forgetReleased(key, target.sandbox.id);
+    if (this.bindings.get(key) === binding && !this.manager.peek(key)) this.bindings.delete(key);
+  }
+
   private project(record: SandboxRecord, workingDirectory: string): SandboxState {
     return {
       id: record.id, template: record.template, workingDirectory,
+      ...(record.ownerKey ? { ownerKey: record.ownerKey } : {}),
+      ...(record.mounts ? { mounts: structuredClone(record.mounts) } : {}),
+      ...(record.homeVolumeId ? { homeVolumeId: record.homeVolumeId } : {}),
       ...(record.templateIdentity ? { image: structuredClone(record.templateIdentity) } : {}),
       status: record.status === 'deleted' ? 'unavailable' : record.status,
       ...(record.lastActiveAt ? { lastActiveAt: record.lastActiveAt } : {}),
@@ -99,8 +109,10 @@ export class ProjectSandboxes {
     operationKey?: string;
   } = {}): Promise<SandboxLease> {
     const binding = this.track(target, options.save);
+    if (options.create && target.imageSelection && !target.imageSelection.templateId) throw new Error('项目仍引用旧导入镜像，请先迁移为 Cellbox template。');
     if (options.create && !binding.save) throw new Error('项目沙箱的持久化入口尚未配置');
     const key = resourceKey(target);
+    const templateId = target.imageSelection?.templateId ?? this.defaultTemplateId;
     const lease = await this.manager.acquire(key, {
       usageId: options.usageId ?? randomUUID(),
       purpose: options.usageId ? 'execution' : 'workspace',
@@ -110,7 +122,9 @@ export class ProjectSandboxes {
       ...(options.create ? { create: {
         template: this.template,
         metadata: {
-          ...(target.imageSelection ? { cellboxImportedImageId: target.imageSelection.importedImageId } : {}),
+          ...(target.sandboxOwnerKey ? { cellboxOwnerKey: target.sandboxOwnerKey } : {}),
+          ...(target.sandboxMounts?.length ? { cellboxMounts: JSON.stringify(target.sandboxMounts) } : {}),
+          ...(templateId ? { cellboxTemplateId: templateId } : {}),
           app: 'codex-web', sessionId: target.id, workingDirectory: target.settings.workingDirectory,
           ...(target.projectId ? { projectId: target.projectId } : {}),
         },
@@ -120,27 +134,9 @@ export class ProjectSandboxes {
     return lease;
   }
 
-  async ensureRunning(target: WorkspaceTarget, operationKey: string, signal?: AbortSignal): Promise<{
-    lease: SandboxLease; info: SandboxInfo;
-  }> {
-    if (!target.sandbox) throw new Error('Project Sandbox does not exist');
-    this.track(target);
-    const key = resourceKey(target);
-    const lease = await this.manager.ensureRunning(key, operationKey, signal);
-    target.sandbox = this.project(lease.record, this.bindings.get(key)!.workingDirectory);
-    return { lease, info: lease.info! };
-  }
-
   async inspect(target: WorkspaceTarget) {
     this.track(target);
     return this.manager.inspect(resourceKey(target));
-  }
-
-  async checkpoint(target: WorkspaceTarget) {
-    const binding = this.track(target);
-    const record = await this.manager.pause(resourceKey(target));
-    target.sandbox = this.project(record, binding.workingDirectory);
-    return target.sandbox;
   }
 
   holdUsage(target: WorkspaceTarget, usageId: string) {

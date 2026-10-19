@@ -1,452 +1,328 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { CellboxClient, CellboxError, type CellboxImportedImage } from '../../packages/sandbox/src/providers/cellbox/client.js';
-import type { ManagedImage, AddImageRepositoryInput, RegistryAuth, SyncImageVersionInput, ProjectImageSelection, ImageVersionUsage } from '../../protocol/image-types.js';
+import { randomUUID } from 'node:crypto';
+import { CellboxClient, CellboxError } from '../../packages/sandbox/src/providers/cellbox/client.js';
+import type { ManagedImage, AddImageRepositoryInput, RegistryAuth, SyncImageVersionInput, ProjectImageSelection, ImageVersionUsage, DefaultImageSelection } from '../../protocol/image-types.js';
 import type { Project } from '../../protocol/types.js';
 import type { ImageCatalogStore, ImageRecord, ImageVersionRecord } from './store.js';
 import { prepareImageRequest } from './build-command.js';
-import { HttpError } from '../../util/errors.js';
+import { HttpError, redactCredentials } from '../../util/errors.js';
 import { DockerRegistryClient, normalizeRepository, registryImageReference, type ImageRegistry } from './registry.js';
-import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 
-const publicImage = ({ versionLifecycle: _lifecycle, deletedAt: _deletedAt, ...record }: ImageRecord): ManagedImage => ({ ...record,
-  versions: record.versions.filter(version => !version.deletedAt).map(({ request: _request, preparationKey: _preparationKey, requiresRegistryAuth, ...version }) => ({ ...version, registryAuthRequired: requiresRegistryAuth })) });
-const preparationKey = (request: ImageVersionRecord['request']) => createHash('sha256')
-  .update(JSON.stringify([request.url, request.platform, request.buildCommand, request.runCommand])).digest('hex');
-const usageLabels: Record<string, string> = {
-  'boxes-reference-image': 'Cellbox 中仍有环境或 Checkpoint 引用此镜像',
-  'profiles-reference-image': '系统运行配置仍引用此镜像',
-  'warm-default-reference-image': '预热默认镜像仍引用此版本，请先切换默认镜像',
-  'archives-reference-image': 'Cellbox 中仍有依赖原镜像的备份',
-  'image-operation-running': 'Cellbox 正在构建或清理镜像',
-  'manifest-not-deletable': '此镜像不属于平台可清理的成品仓库',
-  'deletion-pending': '此镜像正在清理或上次清理尚未确认',
-};
+const publicImage = ({ deletedAt: _deletedAt, legacyImport: _legacyImport, ...record }: ImageRecord): ManagedImage => ({
+  ...record,
+  migrationRequired: record.migrationRequired || (!record.templateId && record.origin === 'managed' && !record.templateStatus) || undefined,
+  versions: record.versions.map(({ request: _request, preparationKey: _preparationKey, requiresRegistryAuth, ...version }) => ({
+    ...version,
+    registryAuthRequired: requiresRegistryAuth ?? version.registryAuthRequired,
+    migrationRequired: version.migrationRequired || (!version.revisionId && Boolean(version.importedImageId)) || undefined,
+  })),
+});
 
+const statusOf = (operation: { status: string }): ImageVersionRecord['status'] => operation.status as ImageVersionRecord['status'];
+const usageUnsupported = (): ImageVersionUsage => ({ deletable: false,
+  blockers: ['Cellbox 不支持物理删除 revision；可将版本退休'], manifestShared: false });
+
+/** CoCell stores product labels and the default selection; Cellbox owns templates and revisions. */
 export class ImageCatalog {
   private records = new Map<string, ImageRecord>();
-  private queue: Promise<unknown> = Promise.resolve();
-  private reservations = new Map<string, number>();
   constructor(private store: ImageCatalogStore, private client: CellboxClient, private profileId: string,
     private registry: ImageRegistry = new DockerRegistryClient(), private projects: () => Project[] | Promise<Project[]> = () => [],
-    private coordinator?: SharedCoordinator) {}
-  async init() {
-    await this.exclusive(async () => {
-      await this.loadRecords();
-      await this.syncWarmDefault(await this.store.loadDefaultImage());
-    });
-  }
-  private async syncWarmDefault(selection?: { imageId: string; versionId: string }) {
-    const resolved = selection ? await this.resolveAvailable(selection.imageId, selection.versionId) : undefined;
-    await this.client.setWarmDefaultImage(this.profileId, resolved?.importedImageId);
-  }
+    private options: { defaultTemplateId?: string; defaultRevisionId?: string } = {}) {}
+
+  async init() { await this.loadRecords(); }
   private async loadRecords() {
     const records = await this.store.listImages();
     this.records = new Map(records.map(image => [image.id, image]));
-  }
-  private exclusive<T>(work: () => Promise<T>): Promise<T> {
-    const task = this.queue.catch(() => {}).then(() => {
-      const refreshAndRun = async () => { await this.loadRecords(); return work(); };
-      return this.coordinator ? this.coordinator.run('managed-image-catalog', refreshAndRun) : refreshAndRun();
-    });
-    this.queue = task;
-    return task;
   }
   private async save(image: ImageRecord) {
     await this.store.saveImage(image);
     this.records.set(image.id, image);
   }
-  private async refresh() {
+  private async defaultSelection(): Promise<DefaultImageSelection | undefined> {
+    const saved = await this.store.loadDefaultImage();
+    if (saved?.templateId && saved.revisionId) return saved;
+    if (this.options.defaultRevisionId) {
+      const revision = await this.client.getTemplateRevision(this.options.defaultRevisionId);
+      return { templateId: revision.templateId, revisionId: revision.id };
+    }
+    if (this.options.defaultTemplateId) {
+      const template = await this.client.getTemplate(this.options.defaultTemplateId);
+      if (template.stableRevisionId) return { templateId: template.id, revisionId: template.stableRevisionId };
+    }
+    return undefined;
+  }
+  private async refreshOperations() {
+    await this.loadRecords();
     for (const stored of this.records.values()) {
       if (stored.deletedAt) continue;
       const record = structuredClone(stored);
       let changed = false;
+      if (record.templateStatus === 'submitting') {
+        record.templateStatus = 'unknown';
+        record.error = '提交结果尚未确认，Cellbox template 创建结果未知；不会自动重提';
+        changed = true;
+      }
       for (const version of record.versions) {
-        if (version.deletedAt) continue;
-        if (version.cleanup) {
-          if (version.cleanup.operationId && version.cleanup.status !== 'failed') {
-            try {
-              const operation = await this.client.getOperation(version.cleanup.operationId);
-              if (operation.status === 'succeeded') { version.deletedAt = new Date().toISOString(); delete version.cleanup; }
-              else if (operation.status === 'failed') { version.cleanup.status = 'failed'; version.cleanup.error = operation.error?.message ?? 'Cellbox 镜像清理失败'; }
-              changed = true;
-            } catch { if (version.cleanup) version.cleanup.error = '清理结果暂时无法确认，请刷新或重试'; changed = true; }
-          }
+        if (version.status === 'submitting' && !version.operationId) {
+          version.status = 'unknown';
+          version.error = '提交结果尚未确认，Cellbox build 提交结果未知；不会自动重提';
+          changed = true;
           continue;
         }
-        if (version.status === 'submitting') {
-          version.status = 'unknown'; version.error = '提交结果待确认，请用原请求重试确认'; changed = true;
-        }
         if (!version.operationId || !['queued', 'running', 'unknown'].includes(version.status)) continue;
-        let operation;
-        try { operation = await this.client.getOperation(version.operationId); }
-        catch (error) {
-          if (!(error instanceof CellboxError)) throw error;
-          version.error = '暂时无法查询构建结果，请刷新重试';
-          if (error.code === 'NOT_FOUND') version.status = 'unknown';
-          changed = true; continue;
+        try {
+          const operation = await this.client.getOperation(version.operationId);
+          version.status = statusOf(operation);
+          if (operation.status === 'failed') version.error = redactCredentials(operation.error?.message ?? 'Cellbox revision 构建失败');
+          if (operation.status === 'succeeded') {
+            const revisionId = operation.result?.revisionId;
+            if (!revisionId) {
+              version.status = 'failed';
+              version.error = 'Cellbox 构建成功但未返回 revisionId';
+            } else {
+              const revision = await this.client.getTemplateRevision(revisionId);
+              version.revisionId = revision.id;
+              version.templateId = revision.templateId;
+              version.image = revision.image;
+              version.source = revision.resolvedBaseImage;
+              version.status = 'succeeded';
+              delete version.error;
+            }
+          }
+          changed = true;
+        } catch (error) {
+          version.error = error instanceof Error ? redactCredentials(error.message) : '无法读取 Cellbox 构建状态';
+          changed = true;
         }
-        changed = true;
-        version.status = operation.status;
-        delete version.error;
-        if (operation.status === 'failed') version.error = operation.error?.message ?? '镜像构建失败';
-        if (operation.status === 'succeeded') {
-          const id = operation.result?.importedImageId;
-          if (!id) { version.status = 'failed'; version.error = 'Cellbox 未返回导入镜像 ID'; continue; }
-          const image = await this.client.getImage(id);
-          version.importedImageId = image.id; version.image = image.image;
-          version.resolvedSource = image.resolvedSource; version.warnings = image.warnings;
-          delete version.error;
-        }
-      }
-      if (!record.defaultVersionId) {
-        const ready = record.versions.find(version => !version.deletedAt && !version.deprecatedAt && !version.cleanup && version.status === 'succeeded' && version.projectReady !== false);
-        if (ready) { record.defaultVersionId = ready.id; changed = true; }
       }
       if (changed) await this.save(record);
     }
   }
-  private external(images: CellboxImportedImage[]): ManagedImage[] {
-    const known = new Set([...this.records.values()].flatMap(image => image.versions.map(version => version.importedImageId)));
-    const groups = new Map<string, ManagedImage>();
-    for (const image of images) {
-      if (known.has(image.id) || image.deleting) continue;
-      const source = image.source;
-      const repository = source.replace(/@.*$/, '').replace(/:[^/]+$/, '');
-      const id = `cellbox:${repository}`;
-      const group = groups.get(id) ?? { id, name: repository, repository, category: '已导入', origin: 'cellbox' as const, versions: [] };
-      group.versions.push({ id: image.id, version: source.includes('@') ? source.split('@')[1] : source.slice(repository.length + 1) || 'latest',
-        source, status: 'succeeded', importedImageId: image.id, image: image.image, resolvedSource: image.resolvedSource,
-        projectReady: image.command[0] === '/usr/local/bin/node' && image.command[1] === '/opt/product/cocell/launcher.mjs',
-        deprecatedAt: this.records.get(id)?.versionLifecycle?.[image.id]?.deprecatedAt,
-        warnings: image.warnings, createdAt: image.createdAt });
-      groups.set(id, group);
+  private legacyRecords(): ManagedImage[] {
+    return [...this.records.values()].filter(record => !record.deletedAt && !record.templateId && !record.templateStatus && record.origin === 'managed')
+      .map(record => ({ ...publicImage(record), migrationRequired: true, versions: record.versions.map(version => ({
+        ...version, migrationRequired: true, projectReady: false,
+      })) }));
+  }
+  private async remoteCatalog(): Promise<ManagedImage[]> {
+    const templates = await this.client.listTemplates();
+    const selected = await this.defaultSelection();
+    const templateItems: ManagedImage[] = await Promise.all(templates.map(async template => {
+      const owner = [...this.records.values()].find(record => record.templateId === template.id && !record.deletedAt);
+      const revisions = await this.client.listTemplateRevisions(template.id);
+      const localVersions = owner?.versions ?? [];
+      const versions: ImageVersionRecord[] = revisions.map(revision => {
+        const local = localVersions.find(value => value.revisionId === revision.id);
+        return { ...(local ?? {}), id: revision.id, templateId: template.id, revisionId: revision.id,
+          version: revision.version, userVersion: revision.userVersion, source: revision.resolvedBaseImage, image: revision.image,
+          status: 'succeeded', createdAt: revision.createdAt,
+          deprecatedAt: revision.status === 'retired' ? local?.deprecatedAt ?? revision.updatedAt : undefined,
+          projectReady: Boolean(owner) || selected?.revisionId === revision.id,
+          buildCommand: revision.buildCommand, runCommand: revision.runCommand,
+          isDefault: selected?.templateId === template.id && selected.revisionId === revision.id,
+        };
+      });
+      for (const local of localVersions) if (!local.revisionId && local.status !== 'failed') versions.unshift(local);
+      return {
+        id: owner?.id ?? `cellbox:${template.id}`, templateId: template.id,
+        name: owner?.name ?? template.name, category: owner?.category ?? 'Cellbox',
+        repository: owner?.repository, buildCommand: owner?.buildCommand,
+        registryAuthRequired: owner?.registryAuthRequired,
+        defaultVersionId: template.stableRevisionId,
+        origin: owner ? 'managed' as const : 'cellbox' as const,
+        versions,
+      };
+    }));
+    const remoteIds = new Set(templates.map(template => template.id));
+    for (const record of this.records.values()) {
+      if (record.templateId && !remoteIds.has(record.templateId) && !record.deletedAt) {
+        templateItems.push({ ...publicImage(record), migrationRequired: true });
+      }
+      if (!record.templateId && record.templateStatus && !record.deletedAt) templateItems.push(publicImage(record));
     }
-    return [...groups.values()];
+    return templateItems;
   }
-  private async readImages(includeExternalDuplicates = false): Promise<ManagedImage[]> {
-    await this.refresh();
-    const [images, profiles] = await Promise.all([this.client.listImages(), this.client.listProfiles()]);
-    const profile = profiles.find(profile => profile.id === this.profileId);
-    const builtin: ManagedImage[] = profile ? [{ id: 'default', name: '系统基础镜像', category: '系统', origin: 'profile',
-      versions: [{ id: 'default', version: '当前配置', source: profile.image, image: profile.image, status: 'succeeded', projectReady: true, createdAt: '' }] }] : [];
-    const managed = [...this.records.values()].filter(image => image.origin === 'managed' && !image.deletedAt).map(publicImage);
-    const repositories = new Set(managed.map(image => normalizeRepository(image.repository!).replace(/^https?:\/\//, '')));
-    const selected = await this.store.loadDefaultImage();
-    const external = this.external(images).filter(image => includeExternalDuplicates || selected?.imageId === image.id || !repositories.has(normalizeRepository(image.repository!).replace(/^https?:\/\//, '')));
-    return [...builtin, ...managed, ...external].map(image => ({ ...image, versions: image.versions.map(version => ({ ...version,
-      isDefault: selected ? selected.imageId === image.id && selected.versionId === version.id : image.origin === 'profile' })) }));
+  async list(): Promise<ManagedImage[]> {
+    await this.refreshOperations();
+    const [remote, selected] = await Promise.all([this.remoteCatalog(), this.defaultSelection()]);
+    const legacy = this.legacyRecords();
+    const all = [...remote, ...legacy];
+    if (selected && !all.some(image => image.versions.some(version => version.id === selected.revisionId))) {
+      try {
+        const revision = await this.client.getTemplateRevision(selected.revisionId);
+        const template = await this.client.getTemplate(selected.templateId);
+        all.unshift({ id: `cellbox:${template.id}`, templateId: template.id, name: template.name, category: '系统', origin: 'profile',
+          versions: [{ id: revision.id, templateId: template.id, revisionId: revision.id, version: revision.version,
+            source: revision.resolvedBaseImage, image: revision.image, status: 'succeeded', createdAt: revision.createdAt, isDefault: true }] });
+      } catch { /* Keep the configured selection visible as unresolved in its consumers. */ }
+    }
+    return all.map(image => ({ ...image, versions: image.versions.map(version => ({ ...version,
+      isDefault: Boolean(selected && selected.templateId === version.templateId && selected.revisionId === version.revisionId),
+    })) }));
   }
-  list(): Promise<ManagedImage[]> {
-    return this.exclusive(() => this.readImages());
-  }
-  addRepository(input: AddImageRepositoryInput): Promise<ManagedImage> {
-    return this.exclusive(async () => {
-      const repository = normalizeRepository(input.repository);
-      if (!input.name.trim() || !input.category.trim()) throw new HttpError(400, '请输入仓库名称和类型');
-      if ([...this.records.values()].some(image => image.origin === 'managed' && !image.deletedAt && image.repository === repository)) throw new HttpError(409, '该镜像仓库已添加，请进入仓库同步版本');
-      if ([...this.records.values()].some(image => image.origin === 'managed' && !image.deletedAt && image.name === input.name.trim() && image.category === input.category.trim())) throw new HttpError(409, '同类型仓库名称已存在');
-      // Validate the complete build command before saving the repository.
-      await prepareImageRequest(registryImageReference(repository, 'latest'), input.buildCommand);
-      const record: ImageRecord = { id: randomUUID(), name: input.name.trim(), category: input.category.trim(), repository,
-        origin: 'managed', versions: [], registryAuthRequired: Boolean(input.registryAuthRequired),
-        ...(input.buildCommand ? { buildCommand: input.buildCommand } : {}) };
-      await this.save(record);
-      return publicImage(record);
-    });
-  }
-  private repository(id: string, auth?: RegistryAuth) {
-    const image = this.records.get(id);
-    if (!image?.repository || image.deletedAt || image.origin !== 'managed') throw new HttpError(404, '镜像仓库不存在，请先添加仓库');
-    if (image.registryAuthRequired && !auth) throw new HttpError(400, '请提供私有仓库用户名和 Token，平台不保存这些凭证');
-    return image;
-  }
-  tags(imageId: string, auth?: RegistryAuth, last?: string) {
-    return this.exclusive(async () => {
-      const image = this.repository(imageId, auth);
-      return this.registry.listTags(image.repository!, auth, { last, limit: 100 });
-    });
-  }
-  sync(imageId: string, input: SyncImageVersionInput): Promise<ManagedImage> {
-    return this.exclusive(async () => {
-      await this.refresh();
-      const stored = this.repository(imageId, input.registryAuth);
-      // Unknown acceptance must be confirmed with its original request before
-      // another import can claim the single image builder.
-      const pending = [...this.records.values()].flatMap(image => image.versions)
-        .find(version => ['queued', 'running', 'unknown', 'submitting'].includes(version.status));
-      if (pending) {
-        if (stored.versions.includes(pending) && pending.version === input.tag && pending.status !== 'unknown') return publicImage(stored);
-        throw new HttpError(409, '已有版本正在同步或结果待确认，请等待完成或确认结果');
-      }
-      const digest = await this.registry.resolveTag(stored.repository!, input.tag, input.registryAuth);
-      const desired = await prepareImageRequest(registryImageReference(stored.repository!, digest), stored.buildCommand);
-      const key = preparationKey(desired);
-      const existing = stored.versions.find(version => !version.deletedAt && !version.cleanup && version.version === input.tag);
-      if (existing?.upstreamDigest === digest && existing.status === 'succeeded' && (existing.preparationKey ?? preparationKey(existing.request)) === key) return publicImage(stored);
-      // An unchanged source and operator script already produced a working
-      // environment. Repackage that immutable result when only our CLI payload
-      // changes, instead of re-running downloads and other operator side effects.
-      const prior = stored.versions.find(version => !version.deletedAt && !version.cleanup && version.status === 'succeeded'
-        && version.upstreamDigest === digest && version.buildCommand === stored.buildCommand && version.projectReady !== false
-        && version.importedImageId && version.image && /^[^\s@]+@sha256:[a-f0-9]{64}$/.test(version.image));
-      let request = desired, reuse = false;
-      if (prior) {
-        try {
-          const image = await this.client.getImage(prior.importedImageId!);
-          if (!image.deleting && image.image === prior.image) {
-            request = await prepareImageRequest(prior.image!); reuse = true;
-          }
-        } catch (error) {
-          if (!(error instanceof CellboxError) || error.code !== 'NOT_FOUND') throw error;
-        }
-      }
-      const source = registryImageReference(stored.repository!, input.tag);
-      const record = structuredClone(stored);
-      const version: ImageVersionRecord = { id: randomUUID(), version: input.tag, source, upstreamDigest: digest,
-        status: 'submitting', createdAt: new Date().toISOString(), request, preparationKey: key, projectReady: true, requiresRegistryAuth: !reuse && Boolean(input.registryAuth),
-        ...(stored.buildCommand ? { buildCommand: stored.buildCommand } : {}), runCommand: request.runCommand };
-      record.versions.unshift(version);
-      // Save the exact request and key before submitting any external mutation.
-      await this.save(record);
-      await this.submit(record, version, reuse ? undefined : input.registryAuth);
-      return publicImage(this.records.get(record.id)!);
-    });
-  }
-  retry(imageId: string, versionId: string, auth?: RegistryAuth) {
-    return this.exclusive(async () => {
-      const stored = this.records.get(imageId);
-      if (!stored) throw new HttpError(404, '镜像不存在');
-      const record = structuredClone(stored);
-      const version = record.versions.find(version => version.id === versionId);
-      if (!version) throw new HttpError(404, '版本不存在');
-      if (!['unknown', 'submitting'].includes(version.status)) throw new HttpError(409, '只有结果未确认的导入请求可以原样重试');
-      if (version.requiresRegistryAuth && !auth) throw new HttpError(400, '请重新提供私有仓库凭证，平台不保存这些凭证');
-      if (!version.requiresRegistryAuth && auth) throw new HttpError(400, '原请求未携带仓库凭证，请保持请求一致');
-      await this.submit(record, version, auth, true);
-      return publicImage(this.records.get(imageId)!);
-    });
-  }
-  private async submit(record: ImageRecord, version: ImageVersionRecord, registryAuth?: RegistryAuth, retry = false) {
+  async addRepository(input: AddImageRepositoryInput): Promise<ManagedImage> {
+    await this.loadRecords();
+    const repository = normalizeRepository(input.repository);
+    if (!input.name.trim() || !input.category.trim()) throw new HttpError(400, '请输入仓库名称和类型');
+    if ([...this.records.values()].some(image => !image.deletedAt && (image.templateId || image.templateStatus) && image.repository === repository)) throw new HttpError(409, '该镜像仓库已添加，请进入仓库同步版本');
+    if ([...this.records.values()].some(image => !image.deletedAt && (image.templateId || image.templateStatus)
+      && image.name === input.name.trim() && image.category === input.category.trim())) throw new HttpError(409, '同类型仓库名称已存在');
+    await prepareImageRequest(registryImageReference(repository, 'latest'), input.buildCommand);
+    const record: ImageRecord = { id: randomUUID(), name: input.name.trim(), category: input.category.trim(), repository,
+      origin: 'managed', versions: [], templateStatus: 'submitting', registryAuthRequired: Boolean(input.registryAuthRequired),
+      ...(input.buildCommand ? { buildCommand: input.buildCommand } : {}) } as ImageRecord;
+    await this.save(record);
     try {
-      const operation = await this.client.importImage({ ...version.request, ...(registryAuth ? { registryAuth } : {}) }, `cocell-image-${version.id}`);
-      version.operationId = operation.id;
-      // Completion is reconciled through GET so the imported image metadata is fetched too.
-      version.status = operation.status === 'succeeded' ? 'running' : operation.status;
-      if (operation.status === 'failed') version.error = operation.error?.message ?? '导入失败';
-      else delete version.error;
+      const template = await this.client.createTemplate({ name: record.name, description: `CoCell image repository: ${repository}` });
+      record.templateId = template.id;
+      record.templateStatus = 'ready';
+      delete record.error;
     } catch (error) {
-      const uncertain = retry || !(error instanceof CellboxError) || error.code === 'UNKNOWN_OUTCOME';
-      version.status = uncertain ? 'unknown' : 'failed';
-      version.error = uncertain ? '提交结果待确认，请用原请求重试确认' : (error as Error).message;
-      if (registryAuth?.password) version.error = version.error.replaceAll(registryAuth.password, '[redacted]');
+      record.templateStatus = error instanceof CellboxError && error.code !== 'UNKNOWN_OUTCOME' ? 'failed' : 'unknown';
+      record.error = error instanceof Error ? redactCredentials(error.message) : 'Cellbox template 创建结果未知';
     }
     await this.save(record);
+    return publicImage(record);
+  }
+  private repository(id: string) {
+    const image = this.records.get(id);
+    if (!image?.repository || image.deletedAt || image.origin !== 'managed') throw new HttpError(404, '镜像仓库不存在，请先添加仓库');
+    if (!image.templateId) throw new HttpError(409, '该仓库尚未关联 Cellbox template，状态待确认或需要迁移');
+    return image;
+  }
+  async tags(imageId: string, auth?: RegistryAuth, last?: string) {
+    await this.loadRecords();
+    const image = this.repository(imageId);
+    if (image.registryAuthRequired && !auth) throw new HttpError(400, '请提供私有仓库用户名和 Token；凭证仅用于查询');
+    return this.registry.listTags(image.repository!, auth, { last, limit: 100 });
+  }
+  async sync(imageId: string, input: SyncImageVersionInput): Promise<ManagedImage> {
+    await this.loadRecords();
+    const stored = this.repository(imageId);
+    if (input.registryAuth) throw new HttpError(422, 'UNSUPPORTED: Cellbox template build does not accept per-request registry credentials');
+    if (stored.registryAuthRequired) throw new HttpError(422, 'UNSUPPORTED: 私有仓库构建凭据需配置在 Cellbox 部署侧；当前版本不支持请求级凭据');
+    const digest = await this.registry.resolveTag(stored.repository!, input.tag);
+    const prepared = await prepareImageRequest(registryImageReference(stored.repository!, digest), stored.buildCommand);
+    const record = structuredClone(stored);
+    const version: ImageVersionRecord = { id: randomUUID(), userVersion: input.tag, version: input.tag,
+      templateId: stored.templateId, source: registryImageReference(stored.repository!, input.tag), upstreamDigest: digest,
+      status: 'submitting', createdAt: new Date().toISOString(), projectReady: true, buildCommand: stored.buildCommand,
+      runCommand: prepared.runCommand };
+    record.versions.unshift(version);
+    await this.save(record);
+    try {
+      const operation = await this.client.createTemplateRevision(stored.templateId!, {
+        userVersion: input.tag, baseImage: prepared.url, profileId: this.profileId,
+        buildCommand: prepared.buildCommand, runCommand: prepared.runCommand, platform: 'linux/amd64',
+      });
+      version.operationId = operation.id;
+      version.status = operation.status === 'succeeded' ? 'running' : statusOf(operation);
+      if (operation.status === 'failed') version.error = redactCredentials(operation.error?.message ?? 'Cellbox revision 构建失败');
+      else delete version.error;
+    } catch (error) {
+      version.status = error instanceof CellboxError && error.code !== 'UNKNOWN_OUTCOME' ? 'failed' : 'unknown';
+      version.error = error instanceof Error ? redactCredentials(error.message) : 'Cellbox 构建提交结果未知';
+    }
+    await this.save(record);
+    return publicImage(record);
+  }
+  async retry(_imageId: string, _versionId: string, _auth?: RegistryAuth): Promise<ManagedImage> {
+    throw new HttpError(410, '结果待确认的构建不会自动重放；请检查 Cellbox 状态，或明确提交一次新的构建');
   }
   async resolve(imageId: string, versionId: string): Promise<ProjectImageSelection | undefined> {
-    return this.exclusive(() => this.resolveAvailable(imageId, versionId));
-  }
-  private async resolveAvailable(imageId: string, versionId: string): Promise<ProjectImageSelection | undefined> {
-    const image = (await this.readImages(true)).find(image => image.id === imageId);
-    const version = image?.versions.find(version => version.id === versionId);
+    const images = await this.list();
+    const image = images.find(value => value.id === imageId);
+    const version = image?.versions.find(value => value.id === versionId);
     if (!image || !version) throw new HttpError(404, '镜像或版本不存在');
-    if (version.deprecatedAt) throw new HttpError(409, '镜像版本已弃用，请选择生效中的版本');
-    if (version.cleanup) throw new HttpError(409, '镜像版本正在清理或清理结果待确认');
-    if (version.status !== 'succeeded') throw new HttpError(409, '请选择已导入成功的镜像版本');
-    if (version.projectReady === false) throw new HttpError(409, '此版本尚未配置 CoCell 启动器，请添加源仓库并同步对应版本');
-    if (image.origin === 'profile') return undefined;
-    if (!version.importedImageId || !version.image) throw new HttpError(409, '镜像版本尚未就绪');
-    const remote = await this.client.getImage(version.importedImageId);
-    if (remote.deleting) throw new HttpError(409, 'Cellbox 正在清理此镜像版本');
-    if (remote.image !== version.image) throw new HttpError(409, '镜像身份与版本记录不一致');
+    return this.resolveVersion(image, version);
+  }
+  private async resolveVersion(image: ManagedImage, version: ManagedImage['versions'][number]): Promise<ProjectImageSelection> {
+    if (version.migrationRequired || !version.revisionId || !version.templateId)
+      throw new HttpError(409, '此旧 importedImage 尚未迁移到 Cellbox revision，不能用于新项目');
+    if (version.deprecatedAt) throw new HttpError(409, 'Cellbox revision 已退休，请选择生效中的版本');
+    if (version.projectReady === false) throw new HttpError(409, '此 Cellbox revision 尚未配置 CoCell 启动器，不能用于 CoCell 项目');
+    const remote = await this.client.getTemplateRevision(version.revisionId);
+    if (remote.status !== 'active') throw new HttpError(409, 'Cellbox revision 已退休，请选择生效中的版本');
     return { imageId: image.id, imageName: image.name, category: image.category, versionId: version.id,
-      version: version.version, importedImageId: remote.id, image: remote.image };
+      version: version.version, templateId: remote.templateId, revisionId: remote.id, image: remote.image };
   }
-
-  /** Reserve while a project or staged restore becomes a durable reference. */
-  acquireSelection(imageId: string, versionId: string) {
-    return this.exclusive(async () => this.reserve(await this.resolveAvailable(imageId, versionId)));
+  async acquireSelection(imageId: string, versionId: string) {
+    return { selection: await this.resolve(imageId, versionId), release: async () => {} };
   }
-  acquireDefaultSelection() {
-    return this.exclusive(async () => {
-      const selected = await this.store.loadDefaultImage();
-      return this.reserve(selected ? await this.resolveAvailable(selected.imageId, selected.versionId) : undefined);
-    });
-  }
-  private async reserve(selection?: ProjectImageSelection) {
-    const key = selection?.image;
-    let lease: SharedLease | undefined;
-    if (key && this.coordinator) {
-      lease = await this.coordinator.tryAcquire(`image-reservation:${key}`) ?? undefined;
-      if (!lease) throw new HttpError(409, '此镜像版本正在被其他项目创建或恢复');
+  async acquireDefaultSelection() {
+    const selected = await this.defaultSelection();
+    if (!selected) throw new HttpError(503, '未配置系统默认 Cellbox template/revision');
+    const images = await this.list();
+    const image = images.find(value => value.templateId === selected.templateId || value.id === `cellbox:${selected.templateId}`);
+    const version = image?.versions.find(value => value.revisionId === selected.revisionId);
+    if (!image || !version) {
+      const remote = await this.client.getTemplateRevision(selected.revisionId);
+      const template = await this.client.getTemplate(selected.templateId);
+      return { selection: { imageId: `cellbox:${template.id}`, imageName: template.name, category: '系统', versionId: remote.id,
+        version: remote.version, templateId: remote.templateId, revisionId: remote.id, image: remote.image }, release: async () => {} };
     }
-    if (key) this.reservations.set(key, (this.reservations.get(key) ?? 0) + 1);
-    let released = false;
-    return { selection, release: async () => {
-      if (released || !key) return;
-      released = true;
-      const count = (this.reservations.get(key) ?? 1) - 1;
-      if (count) this.reservations.set(key, count); else this.reservations.delete(key);
-      await lease?.release();
-    } };
+    return { selection: await this.resolveVersion(image, version), release: async () => {} };
   }
-  acquireRestoreSelection(project: Project, versionId?: string) {
-    return this.exclusive(async () => {
-      if (!project.imageSelection) {
-        if (versionId) throw new HttpError(400, '系统镜像项目不能选择其他仓库版本');
-        return this.reserve();
-      }
-      const image = (await this.readImages(true)).find(image => image.id === project.imageSelection!.imageId);
-      if (!image) throw new HttpError(409, '项目镜像仓库已不可用，请先同步可用版本');
-      const selected = versionId ?? image.defaultVersionId ?? image.versions
-        .filter(value => value.status === 'succeeded' && !value.deprecatedAt && !value.cleanup && value.projectReady !== false)
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]?.id;
-      if (!selected) throw new HttpError(409, '仓库没有可恢复的镜像版本，请先同步版本');
-      return this.reserve(await this.resolveAvailable(image.id, selected));
+  async acquireRestoreSelection(project: Project, versionId?: string) {
+    if (!project.imageSelection) {
+      if (versionId) throw new HttpError(400, '系统默认镜像项目不能选择其他仓库版本');
+      const selected = await this.acquireDefaultSelection();
+      return selected;
+    }
+    if (project.imageSelection.migrationRequired || !project.imageSelection.templateId || !project.imageSelection.revisionId)
+      throw new HttpError(409, '项目仍引用旧 importedImage，请先迁移项目镜像后再恢复');
+    const images = await this.list();
+    const image = images.find(value => value.templateId === project.imageSelection!.templateId);
+    if (!image) throw new HttpError(409, '项目 Cellbox template 不可用');
+    const selectedId = versionId ?? image.defaultVersionId ?? project.imageSelection.revisionId;
+    const version = image.versions.find(value => value.id === selectedId || value.revisionId === selectedId);
+    if (!version) throw new HttpError(409, '项目选择的 Cellbox revision 不可用');
+    return { selection: await this.resolveVersion(image, version), release: async () => {} };
+  }
+  async setDefault(imageId: string, versionId: string): Promise<ManagedImage> {
+    const images = await this.list();
+    const image = images.find(value => value.id === imageId);
+    const version = image?.versions.find(value => value.id === versionId);
+    if (!image || !version) throw new HttpError(404, '镜像或版本不存在');
+    const selection = await this.resolveVersion(image, version);
+    await this.store.saveDefaultImage({ templateId: selection.templateId!, revisionId: selection.revisionId! });
+    return (await this.list()).find(value => value.id === imageId)!;
+  }
+  async setDeprecated(imageId: string, versionId: string, deprecated: boolean): Promise<ManagedImage> {
+    const images = await this.list();
+    const image = images.find(value => value.id === imageId);
+    const version = image?.versions.find(value => value.id === versionId);
+    if (!image || !version) throw new HttpError(404, '镜像或版本不存在');
+    if (!version.revisionId) throw new HttpError(409, '旧 importedImage 无法通过新接口退休，请先迁移');
+    if (version.isDefault && deprecated) throw new HttpError(409, '请先切换 CoCell 默认 revision，再退休此版本');
+    const remote = await this.client.getTemplateRevision(version.revisionId);
+    const updated = await this.client.updateTemplateRevision(remote.id, {
+      status: deprecated ? 'retired' : 'active', expectedGeneration: remote.generation,
     });
-  }
-  setDefault(imageId: string, versionId: string) {
-    return this.exclusive(async () => {
-      const selected = await this.resolveAvailable(imageId, versionId);
-      const previous = await this.store.loadDefaultImage();
-      const stored = this.records.get(imageId);
-      const record = stored?.origin === 'managed' ? structuredClone(stored) : undefined;
-      if (record) record.defaultVersionId = versionId;
-      await this.client.setWarmDefaultImage(this.profileId, selected?.importedImageId);
-      try { await this.store.saveDefaultImage(selected ? { imageId, versionId } : undefined, record); }
-      catch (error) {
-        // Keep the published warm target aligned with durable selection on a failed write.
-        await this.syncWarmDefault(previous).catch(() => {});
-        throw error;
-      }
-      if (record) this.records.set(record.id, record);
-      return (await this.readImages(true)).find(image => image.id === imageId)!;
-    });
-  }
-  setDeprecated(imageId: string, versionId: string, deprecated: boolean): Promise<ManagedImage> {
-    return this.exclusive(async () => {
-      const image = (await this.readImages()).find(value => value.id === imageId);
-      const version = image?.versions.find(value => value.id === versionId);
-      if (!image || !version) throw new HttpError(404, '镜像或版本不存在');
-      if (image.origin === 'profile') throw new HttpError(400, '系统默认镜像由平台配置管理');
-      if (deprecated && version.isDefault) throw new HttpError(409, '请先设置其他默认镜像，再弃用此版本');
-      if (version.cleanup) throw new HttpError(409, '镜像版本正在清理或清理结果待确认');
-      const deprecatedAt = deprecated ? version.deprecatedAt ?? new Date().toISOString() : undefined;
-      if (image.origin === 'cellbox') {
-        const record = structuredClone(this.records.get(imageId) ?? { ...image, versions: [] });
-        record.versionLifecycle ??= {};
-        if (deprecatedAt) record.versionLifecycle[versionId] = { deprecatedAt };
-        else delete record.versionLifecycle[versionId];
+    const record = this.records.get(image.id);
+    if (record) {
+      const local = record.versions.find(value => value.revisionId === version.revisionId);
+      if (local) {
+        if (updated.status === 'retired') local.deprecatedAt = updated.updatedAt;
+        else delete local.deprecatedAt;
         await this.save(record);
-        return { ...image, versions: image.versions.map(value => value.id === versionId ? { ...value, deprecatedAt } : value) };
       }
-      const record = structuredClone(this.records.get(imageId)!);
-      const target = record.versions.find(value => value.id === versionId)!;
-      if (deprecatedAt) target.deprecatedAt = deprecatedAt;
-      else delete target.deprecatedAt;
-      if (record.defaultVersionId === versionId && deprecated) delete record.defaultVersionId;
-      if (!record.defaultVersionId) record.defaultVersionId = record.versions.find(value =>
-        !value.deletedAt && !value.deprecatedAt && !value.cleanup && value.status === 'succeeded' && value.projectReady !== false)?.id;
-      await this.save(record);
-      return publicImage(record);
-    });
-  }
-  removeRepository(imageId: string): Promise<void> {
-    return this.exclusive(async () => {
-      await this.refresh();
-      const stored = this.records.get(imageId);
-      if (!stored || stored.origin !== 'managed') throw new HttpError(404, '镜像仓库不存在');
-      if (stored.deletedAt) return;
-      if (stored.versions.some(version => !version.deletedAt)) throw new HttpError(409, '请先清理仓库的所有版本');
-      if ((await this.projects()).some(project => project.imageSelection?.imageId === imageId || project.sandboxOperation?.imageSelection?.imageId === imageId))
-        throw new HttpError(409, '仍有项目引用此镜像仓库');
-      const record = structuredClone(stored);
-      record.deletedAt = new Date().toISOString();
-      delete record.defaultVersionId;
-      await this.save(record);
-    });
-  }
-  private cleanupVersion(imageId: string, versionId: string) {
-    const record = this.records.get(imageId);
-    const version = record?.versions.find(value => value.id === versionId && !value.deletedAt);
-    if (!record || record.deletedAt || !version) throw new HttpError(404, '镜像或版本不存在');
-    return { record, version };
-  }
-  private async blockers(record: ImageRecord, version: ImageVersionRecord) {
-    const blockers: string[] = [];
-    const global = await this.store.loadDefaultImage();
-    if (global?.imageId === record.id && global.versionId === version.id) blockers.push('当前默认镜像，请先指定其他默认镜像');
-    if (record.defaultVersionId === version.id) blockers.push('仓库默认版本，请先指定其他默认版本');
-    if (['submitting', 'queued', 'running', 'unknown'].includes(version.status)) blockers.push('版本仍在同步或导入结果待确认');
-    if (version.image && (this.reservations.has(version.image) || await this.hasSharedReservation(version.image))) blockers.push('版本正在被创建或恢复操作使用');
-    for (const project of await this.projects()) {
-      const selected = project.imageSelection;
-      if (project.status !== 'archived' && selected && (selected.versionId === version.id || selected.image === version.image)) blockers.push(`项目「${project.name}」仍固定此版本`);
-      const staged = project.sandboxOperation?.status !== 'succeeded' ? project.sandboxOperation?.imageSelection : undefined;
-      if (staged && (staged.versionId === version.id || staged.image === version.image)) blockers.push(`项目「${project.name}」的恢复操作仍引用此版本`);
-      if ([project.sandbox, ...(project.pendingSandboxCleanup ?? [])].some(box => box && version.image && box.image?.id === version.image)) blockers.push(`项目「${project.name}」仍有 Sandbox 或待清理环境使用此镜像`);
-      if (project.remoteArchives?.some(ref => ref.storageType !== 'oss' && !ref.portable && ref.imageId === version.image)) blockers.push(`项目「${project.name}」有依赖原镜像的备份`);
     }
-    return [...new Set(blockers)];
+    return (await this.list()).find(value => value.id === imageId)!;
   }
-  private async hasSharedReservation(image: string) {
-    if (!this.coordinator) return false;
-    const lease = await this.coordinator.tryAcquire(`image-reservation:${image}`);
-    if (!lease) return true;
-    await lease.release();
-    return false;
+  async removeRepository(imageId: string): Promise<void> {
+    await this.loadRecords();
+    const stored = this.records.get(imageId);
+    if (!stored || stored.origin !== 'managed') throw new HttpError(404, '镜像仓库不存在');
+    if (stored.deletedAt) return;
+    if (stored.versions.some(version => version.revisionId && !version.deprecatedAt)) throw new HttpError(409, '请先退休仓库的所有版本');
+    if ((await this.projects()).some(project => project.imageSelection?.imageId === imageId))
+      throw new HttpError(409, '仍有项目引用此镜像仓库');
+    const record = structuredClone(stored);
+    record.deletedAt = new Date().toISOString();
+    await this.save(record);
   }
-  usage(imageId: string, versionId: string): Promise<ImageVersionUsage> {
-    return this.exclusive(async () => {
-      await this.refresh();
-      const { record, version } = this.cleanupVersion(imageId, versionId);
-      const blockers = await this.blockers(record, version);
-      const remote = version.importedImageId ? await this.client.imageUsage(version.importedImageId) : undefined;
-      if (remote) blockers.push(...remote.blockers.map(reason => usageLabels[reason] ?? 'Cellbox 检测到此镜像仍不可清理'));
-      return { deletable: blockers.length === 0 && (!remote || remote.deletable), blockers, manifestShared: remote?.manifestShared ?? false };
-    });
-  }
-  removeVersion(imageId: string, versionId: string): Promise<ManagedImage> {
-    return this.exclusive(async () => {
-      await this.refresh();
-      const { record: stored, version: original } = this.cleanupVersion(imageId, versionId);
-      const blockers = await this.blockers(stored, original);
-      if (blockers.length) throw new HttpError(409, blockers.join('；'));
-      const record = structuredClone(stored), version = record.versions.find(value => value.id === versionId)!;
-      if (!version.importedImageId) {
-        version.deletedAt = new Date().toISOString();
-        await this.save(record); return publicImage(record);
-      }
-      const previousCleanup = version.cleanup;
-      const freshAttempt = !previousCleanup || previousCleanup.status === 'failed';
-      if (!version.cleanup || version.cleanup.status === 'failed') version.cleanup = { id: randomUUID(), status: 'unknown' };
-      await this.save(record);
-      try {
-        const operation = await this.client.deleteImage(version.importedImageId, `cocell-image-delete-${version.cleanup.id}`);
-        version.cleanup.operationId = operation.id;
-        version.cleanup.status = operation.status === 'failed' ? 'failed' : 'pending';
-        version.cleanup.error = operation.error?.message;
-      } catch (error) {
-        // A response can be lost after manifest deletion. Keep the version
-        // unavailable and retry the original key until its outcome is known.
-        if (error instanceof CellboxError && error.code === 'NOT_FOUND') {
-          version.deletedAt = new Date().toISOString(); delete version.cleanup;
-        } else if (freshAttempt && error instanceof CellboxError && error.status && error.status >= 400 && error.status < 500
-          && ['CONFLICT', 'BUSY', 'INVALID_REQUEST', 'UNAUTHENTICATED', 'FORBIDDEN', 'UNSUPPORTED_CAPABILITY'].includes(error.code)) {
-          // These responses reject a fresh request before an operation starts.
-          // A rejected retry must retain the previous failed operation: Cellbox
-          // may still fence this image after a failed registry deletion.
-          version.cleanup = previousCleanup;
-          await this.save(record);
-          throw new HttpError(error.code === 'CONFLICT' || error.code === 'BUSY' ? 409 : 502,
-            error.code === 'CONFLICT' || error.code === 'BUSY' ? 'Cellbox 检测到镜像仍被引用或其他镜像操作正在执行，请刷新后重试' : 'Cellbox 无法执行镜像清理，请检查接口和 Registry 配置');
-        } else {
-          version.cleanup.error = error instanceof CellboxError ? error.message : '清理结果待确认，请重试';
-          version.cleanup.status = 'unknown';
-        }
-      }
-      await this.save(record);
-      await this.refresh();
-      return publicImage(this.records.get(imageId)!);
-    });
+  async usage(_imageId: string, _versionId: string): Promise<ImageVersionUsage> { return usageUnsupported(); }
+  async removeVersion(_imageId: string, _versionId: string): Promise<ManagedImage> {
+    throw new HttpError(410, 'Cellbox 不支持物理删除 revision；请通过版本操作将其退休');
   }
 }

@@ -53,8 +53,10 @@ export interface SandboxRuntime {
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   rebuildPersistent?(target: WorkspaceTarget, key: string, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
-  resume?(target: WorkspaceTarget, signal?: AbortSignal, operationKey?: string): Promise<SandboxState>;
-  checkpoint?(target: WorkspaceTarget): Promise<SandboxState>;
+  resume?(target: WorkspaceTarget, signal?: AbortSignal): Promise<void>;
+  checkpoint?(target: WorkspaceTarget): Promise<void>;
+  release?(target: WorkspaceTarget): Promise<SandboxState>;
+  forgetReleasedSandbox?(target: WorkspaceTarget): Promise<void>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
   verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
   fenceSandbox?(sandbox: SandboxState): Promise<void>;
@@ -155,8 +157,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private safeError(error: unknown): Error {
     let message = error instanceof Error ? error.message : String(error);
     if (this.options.apiKey) message = message.replaceAll(this.options.apiKey, '[REDACTED]');
-    const safe = new Error(message);
-    if (error && typeof error === 'object' && 'code' in error && error.code === 'BUSY') Object.assign(safe, { code: 'BUSY' });
+    const safe = new Error(message, { cause: error });
+    if (error && typeof error === 'object' && 'code' in error) Object.assign(safe, { code: error.code });
     return safe;
   }
 
@@ -179,7 +181,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     return { sandbox: lease.sandbox, get metadata() { return lease.record; }, lease, preparation, releaseRemote, info: lease.info };
   }
 
-  private async release(entry: Entry, failed = false, detached = false) {
+  private async releaseEntry(entry: Entry, failed = false, detached = false) {
     try {
       try {
         await entry.releaseRemote?.();
@@ -332,7 +334,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       await codex?.close();
       await connection?.release();
       // Native completion is authoritative; activity persistence is maintenance.
-      if (entry) await this.release(entry, true, detached);
+      if (entry) await this.releaseEntry(entry, true, detached);
     }
   }
 
@@ -514,7 +516,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       signal.removeEventListener('abort', interrupt);
       this.detachRequests.delete(turn.id);
       await connection?.release();
-      if (entry) await this.release(entry, true, observerDetached);
+      if (entry) await this.releaseEntry(entry, true, observerDetached);
     }
   }
 
@@ -535,7 +537,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const release = async () => {
       if (released) return;
       released = true;
-      await this.release(entry, true);
+      await this.releaseEntry(entry, true);
     };
     try {
       const access = await this.options.serviceAccess(entry.sandbox.sandboxId, port);
@@ -551,7 +553,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const release = async () => {
       if (released) return;
       released = true;
-      await this.release(entry, true);
+      await this.releaseEntry(entry, true);
     };
     try {
       const access = await this.options.serviceAccess(entry.sandbox.sandboxId, port);
@@ -581,15 +583,15 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (this.closing) throw new HttpError(503, 'Sandbox 运行时正在关闭');
     let entry: Entry;
     try { entry = await this.acquire(session, false, undefined, undefined, request.signal); }
-    catch (error) { throw new HttpError(502, this.safeError(error).message); }
+    catch (error) { throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) }); }
     try {
       const response = await cellboxWorkspaceFileResponse(entry.sandbox, session.settings.workingDirectory, path, request);
-      if (!response.body) { await this.release(entry, false); return response; }
-      return holdResponse(response, () => this.release(entry, false), request.signal);
+      if (!response.body) { await this.releaseEntry(entry, false); return response; }
+      return holdResponse(response, () => this.releaseEntry(entry, false), request.signal);
     } catch (error) {
-      await this.release(entry, true);
+      await this.releaseEntry(entry, true);
       if (error instanceof HttpError) throw error;
-      throw new HttpError(502, this.safeError(error).message);
+      throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) });
     }
   }
 
@@ -597,7 +599,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (this.closing) throw new HttpError(503, 'Sandbox 运行时正在关闭');
     let entry: Entry;
     try { entry = await this.acquire(session, false, undefined, undefined, signal); }
-    catch (error) { throw new HttpError(502, this.safeError(error).message); }
+    catch (error) { throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) }); }
     let failed = false;
     try {
       return await readCellboxWorkspaceFile(entry.sandbox,
@@ -606,8 +608,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       failed = true;
       if (error instanceof HttpError) throw error;
       if (/not found|404/i.test(String(error))) await this.sandboxes.inspect(session).catch(() => { });
-      throw new HttpError(502, this.safeError(error).message);
-    } finally { await this.release(entry, failed); }
+      throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) });
+    } finally { await this.releaseEntry(entry, failed); }
   }
 
   async history(session: Session, options: { cursor?: string; limit?: number; signal?: AbortSignal } = {}): Promise<NativeHistory> {
@@ -722,7 +724,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     // prevents execution but does not change its paused runtime state.
     const status = info.state === 'running' ? 'ready' : info.state === 'paused' || phase === 'suspended' ? 'paused'
       : ['creating', 'resuming', 'restoring', 'checkpointing', 'suspending', 'staged'].includes(phase ?? '') ? 'starting' : 'unavailable';
-    return { ...sandbox, status, ...(info.templateIdentity ? { image: info.templateIdentity } : {}) };
+    return { ...sandbox, status, phase, generation: info.metadata?.generation ? Number(info.metadata.generation) : undefined,
+      ...(info.metadata?.ownerKey ? { ownerKey: info.metadata.ownerKey } : {}),
+      ...(info.mounts ? { mounts: structuredClone(info.mounts) } : {}),
+      ...(info.homeVolumeId ? { homeVolumeId: info.homeVolumeId } : {}),
+      operationId: info.metadata?.operationId, observedAt: new Date().toISOString(), ...(info.templateIdentity ? { image: info.templateIdentity } : {}) };
   }
 
   async rebuild(target: WorkspaceTarget, onSandbox: SaveSandbox) {
@@ -739,58 +745,38 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       }
     }
     const entry = await this.acquire(target, true, onSandbox, undefined, undefined, true);
-    try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.release(entry); }
+    try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.releaseEntry(entry); }
   }
-  async rebuildPersistent(target: WorkspaceTarget, key: string, onSandbox: SaveSandbox) {
-    if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在，无法沿用挂载目录');
-    this.sandboxes.track(target, onSandbox);
-    const provider = this.options.provider as SandboxProvider & { rebuildPersistent?: (id: string, key: string) => Promise<void> };
-    if (!provider.rebuildPersistent) throw new HttpError(503, 'Sandbox 不支持保留挂载目录重建');
-    this.runtimePreparations.delete(target.sandbox.id);
-    await this.sandboxes.manager.lifecycle.run({ action: 'reconcile', resourceKey: `project:${target.projectId ?? target.id}`, sandboxId: target.sandbox.id, metadata: { restoreRuntimeConfig: 'true' } },
-      () => provider.rebuildPersistent!(target.sandbox!.id, key));
-    await this.sandboxes.inspect(target);
-    await onSandbox(await this.resume(target, undefined, `cocell-rebuild-resume-${key}`));
+  async rebuildPersistent(_target: WorkspaceTarget, _requestId: string, _onSandbox: SaveSandbox): Promise<void> {
+    throw new HttpError(422, '当前 Cellbox 不支持同 ID 重建；请明确选择从备份创建新环境。');
   }
 
-  async resume(target: WorkspaceTarget, signal?: AbortSignal, operationKey = `cocell-resume-${randomUUID()}`): Promise<SandboxState> {
+  async resume(target: WorkspaceTarget, signal?: AbortSignal): Promise<void> {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
-    signal?.throwIfAborted();
-    return traced('sandbox.resume', { 'sandbox.id': target.sandbox.id }, async () => {
-      const { lease, info } = await this.sandboxes.ensureRunning(target, operationKey, signal);
-      const preparation = this.runtimePreparations.get(lease.record.id) ?? {};
-      this.runtimePreparations.set(lease.record.id, preparation);
-      const entry: Entry = { sandbox: lease.sandbox, get metadata() { return lease.record; }, lease, preparation, info };
-      const mountedDefaultWorkspace = target.settings.workingDirectory === this.root
-        && this.options.sharedFilesMounted !== undefined
-        && info.capabilities?.sharedDirectory === true;
-      if (mountedDefaultWorkspace) {
-        try {
-          await traced('sandbox.appserver_ready', { 'sandbox.id': lease.record.id },
-            () => this.reader.waitUntilReady(lease.record.id, signal));
-          return { ...target.sandbox! };
-        }
-        finally { await lease.release(); }
-      }
-      let releaseRemote: (() => Promise<void>) | undefined;
-      try {
-        releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id, target.settings.workingDirectory, info);
-        entry.releaseRemote = releaseRemote;
-        signal?.throwIfAborted();
-        await traced('sandbox.prepare_environment', { 'sandbox.id': target.sandbox!.id },
-          () => this.prepareEnvironment(target, entry, signal ? AbortSignal.any([signal, AbortSignal.timeout(300_000)]) : AbortSignal.timeout(300_000)));
-        await traced('sandbox.appserver_ready', { 'sandbox.id': lease.record.id },
-          () => this.reader.waitUntilReady(lease.record.id, signal));
-        return { ...target.sandbox! };
-      } finally {
-        try { await releaseRemote?.(); } finally { await lease.release(); }
-      }
-    });
+    if (!this.options.provider.resume) throw new HttpError(503, 'Sandbox 不支持恢复运行');
+    await traced('sandbox.resume', { 'sandbox.id': target.sandbox.id },
+      () => this.options.provider.resume!(target.sandbox!.id, { signal }));
   }
 
-  async checkpoint(target: WorkspaceTarget) {
+  async checkpoint(target: WorkspaceTarget): Promise<void> {
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
-    return this.sandboxes.checkpoint(target);
+    await this.reader.closeIdle(target.sandbox.id);
+    await traced('sandbox.checkpoint', { 'sandbox.id': target.sandbox.id },
+      () => this.options.provider.pause(target.sandbox!.id));
+  }
+
+  async release(target: WorkspaceTarget): Promise<SandboxState> {
+    if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
+    if (!this.options.provider.release) throw new HttpError(503, 'Sandbox 不支持保留磁盘的释放操作');
+    await this.reader.closeIdle(target.sandbox.id);
+    const info = await traced('sandbox.release', { 'sandbox.id': target.sandbox.id },
+      () => this.options.provider.release!(target.sandbox!.id));
+    return this.sandboxObservation(target.sandbox, info);
+  }
+
+  async forgetReleasedSandbox(target: WorkspaceTarget) {
+    await this.sandboxes.forgetReleased(target);
+    if (target.sandbox) this.runtimePreparations.delete(target.sandbox.id);
   }
 
   async verifySandbox(sandbox: SandboxState, timeoutMs?: number) {

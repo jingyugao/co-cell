@@ -4,8 +4,8 @@ test('manual archive confirms persistent disk backup and moves a paused project 
   await page.goto('/#projects');
   const card = page.getByRole('article', { name: '暂停项目', exact: true });
   page.once('dialog', async dialog => {
-    expect(dialog.message()).toContain('备份最新持久化磁盘文件');
-    expect(dialog.message()).toContain('运行中的进程不会保存');
+    expect(dialog.message()).toContain('备份已暂停的工作区');
+    expect(dialog.message()).toContain('不支持跳过 Checkpoint');
     await dialog.dismiss();
   });
   await card.getByRole('button', { name: '手动归档', exact: true }).click();
@@ -39,7 +39,7 @@ test('failed sandbox offers an explicit dated-backup archive path', async ({ pag
   await expect(page.getByText('「暂停项目」已归档，可在“归档”页查看。', { exact: true })).toBeVisible();
 });
 
-test('completed disk archive reports cleanup pending as success and retries cleanup without a second backup', async ({ page, ui }) => {
+test('completed disk archive reports cleanup pending and exposes a user-controlled cleanup retry', async ({ page, ui }) => {
   const project = ui.projects.get('paused');
   project.latestBackup = { createdAt: '2026-01-01T00:00:00Z', sizeBytes: 42, sha256: 'a'.repeat(64) };
   let attempts = 0, input;
@@ -74,16 +74,20 @@ test('completed disk archive reports cleanup pending as success and retries clea
   expect(attempts).toBe(2);
 });
 
-test('manual archive attempts a disk backup for unavailable sandboxes; missing disks and active work stay locked', async ({ page, ui }) => {
+test('archive from a broken runtime is disabled while running work still permits project inspection', async ({ page, ui }) => {
   ui.projects.get('paused').sandbox.status = 'unavailable';
   ui.projects.get('other').activeSessionId = 'running-session';
-  ui.projects.set('missing', { ...ui.projects.get('other'), id: 'missing', name: '无Sandbox项目', activeSessionId: null, sandbox: undefined });
+  ui.projects.get('other').sandboxOperation = { id: 'checkpoint-op', kind: 'checkpoint', status: 'running', phase: '暂停中', updatedAt: '2026-01-01T00:00:00Z' };
+  ui.projects.set('missing', { ...ui.projects.get('other'), id: 'missing', name: '无Sandbox项目', activeSessionId: null, sandbox: undefined, sandboxOperation: undefined });
   await page.goto('/#projects');
   const broken = page.getByRole('article', { name: '暂停项目', exact: true });
-  await expect(broken.getByRole('button', { name: '手动归档', exact: true })).toBeEnabled();
+  await expect(broken.getByRole('button', { name: '手动归档', exact: true })).toBeDisabled();
+  await expect(broken.getByRole('button', { name: '手动归档', exact: true })).toHaveAttribute('title', '请先暂停后归档，或明确选择使用已有备份');
   const active = page.getByRole('article', { name: '另一个项目', exact: true });
   await expect(active.getByRole('button', { name: '手动归档', exact: true })).toBeDisabled();
+  await expect(active.getByRole('button', { name: '进入项目', exact: true })).toBeEnabled();
+  await expect(active.getByRole('button', { name: '工具权限', exact: true })).toBeEnabled();
   const missing = page.getByRole('article', { name: '无Sandbox项目', exact: true });
   await expect(missing.getByRole('button', { name: '手动归档', exact: true })).toBeDisabled();
-  await expect(missing.getByText('当前没有可读取的磁盘，也没有成功备份，暂时无法归档。', { exact: true })).toBeVisible();
+  await expect(missing.getByText('当前没有 Sandbox，也没有成功备份，暂时无法归档。', { exact: true })).toBeVisible();
 });

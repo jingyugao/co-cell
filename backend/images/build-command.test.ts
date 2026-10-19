@@ -20,6 +20,11 @@ test('managed image payload resolves both proxy entrypoints and their shared imp
       await writeFile(destination, file.content);
     }
     const product = join(root, 'opt/product/cocell');
+    const shippedPaths = files.map(file => file.path);
+    assert.equal(shippedPaths.some(path => path.includes('oss-archive-backup') || path.includes('cocell-archive-backup')), false,
+      'new images must not include the removed OSS archive generator');
+    assert(shippedPaths.includes('/opt/product/cocell/oss-archive-restore.mjs'), 'legacy OSS archive restore remains available');
+    assert(shippedPaths.includes('/opt/cellbox/tools/cocell-archive-restore'), 'legacy restore protected tool remains available');
     for (const name of ['protected-tool', 'tool-client']) {
       await symlink(`deploy/box-wrap/${name}.mjs`, join(product, `${name}.mjs`));
     }

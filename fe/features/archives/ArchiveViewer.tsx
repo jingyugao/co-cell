@@ -24,7 +24,7 @@ function fmtMtime(ts?: string) {
 type Props = {
   archiveKey: string;
   versionId?: string;
-  archiveMeta: { sizeBytes: number; bytesAdded?: number; createdAt: string } | null;
+  archiveMeta: { sizeBytes?: number; bytesAdded?: number; createdAt: string } | null;
   onClose: () => void;
 };
 
@@ -83,10 +83,10 @@ export default function ArchiveViewer({ archiveKey, versionId, archiveMeta, onCl
           <Icon name="folder" size={14} />
           <span className="archive-viewer-key" title={archiveKey}>{archiveKey.slice(0, 8)}</span>
           {archiveMeta && <>
-            <span className="archive-viewer-sep">·</span>
-            <span className="archive-viewer-size">{fmtSize(archiveMeta.sizeBytes)}
+            {archiveMeta.sizeBytes !== undefined && <><span className="archive-viewer-sep">·</span><span className="archive-viewer-size">{fmtSize(archiveMeta.sizeBytes)}
               {archiveMeta.bytesAdded === undefined ? '' : ` · 新增 ${fmtSize(archiveMeta.bytesAdded)}`}</span>
-            <span className="archive-viewer-sep">·</span>
+            </>}
+            {archiveMeta.sizeBytes !== undefined && <span className="archive-viewer-sep">·</span>}
             <span className="archive-viewer-time">{fmtTime(archiveMeta.createdAt)}</span>
           </>}
         </div>

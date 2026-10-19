@@ -312,7 +312,7 @@ test('project mutation uses the latest locked row, skips no-op writes, and rolls
   const id = 'mutate-project';
   const latest: Project = {
     id, name: 'latest name', requirementUrl: null, requirementStatus: 'externally refreshed',
-    executionMode: 'sandbox', workingDirectory: '/latest', backupRetentionCount: 9,
+    executionMode: 'sandbox', workingDirectory: '/latest',
     createdAt: now, updatedAt: now,
   };
   let stored = structuredClone(latest);
@@ -341,7 +341,6 @@ test('project mutation uses the latest locked row, skips no-op writes, and rolls
   assert.equal(result.name, 'callback name');
   assert.equal(stored.name, 'callback name');
   assert.equal(stored.requirementStatus, 'externally refreshed');
-  assert.equal(stored.backupRetentionCount, 9);
   assert.equal(stored.workingDirectory, '/latest');
   assert.equal(statements[0], 'begin');
   assert.equal(statements[1], 'SELECT document FROM projects WHERE id = ? FOR UPDATE');

@@ -48,7 +48,7 @@ class MemoryState implements WebStateStore {
   async close() {}
 }
 
-test('restart fails only an interrupted background backup and retains successful pause', async () => {
+test('restart retains a completed pause and marks an interrupted background backup unknown', async () => {
   const value = project();
   value.sandboxOperation = { id: 'pause-1', kind: 'checkpoint', status: 'succeeded', phase: '完成', updatedAt: value.updatedAt };
   value.sandboxBackup = { id: 'pause-1', sandboxId: 'sandbox-1', status: 'running', phase: '校验备份', updatedAt: value.updatedAt };
@@ -56,9 +56,24 @@ test('restart fails only an interrupted background backup and retains successful
   const service = new ProjectService(state);
   await service.init();
   assert.equal(service.get(value.id).sandboxOperation?.status, 'succeeded');
-  assert.equal(service.get(value.id).sandboxBackup?.status, 'failed');
-  assert.equal(service.isMaintaining(value.id), false);
-  assert.equal((await state.getProject(value.id))?.sandboxBackup?.status, 'failed');
+  assert.equal(service.get(value.id).sandboxBackup?.status, 'unknown');
+  assert.equal((await state.getProject(value.id))?.sandboxBackup?.status, 'unknown');
+  await service.close();
+});
+
+test('restart marks an interrupted Sandbox operation unknown without changing its identity', async () => {
+  const value = project();
+  value.sandboxOperation = { id: 'resume-unknown', kind: 'resume', status: 'running', phase: '恢复中', updatedAt: value.updatedAt };
+  const state = new MemoryState([value]);
+  const service = new ProjectService(state);
+  await service.init();
+
+  const operation = service.get(value.id).sandboxOperation;
+  assert.equal(operation?.id, 'resume-unknown');
+  assert.equal(operation?.kind, 'resume');
+  assert.equal(operation?.status, 'unknown');
+  assert.match(operation?.error ?? '', /结果未确认/);
+  assert.equal((await state.getProject(value.id))?.sandboxOperation?.status, 'unknown');
   await service.close();
 });
 
@@ -76,10 +91,8 @@ test('scoped shared refresh point-reads one project and skips protected projects
   assert.equal(state.projectReads, 1);
   assert.equal(state.projectLists, 1, 'only initialization lists the full project table');
 
-  const release = service.beginMaintenance('project-2');
   await service.refreshOne('project-2');
-  release();
-  assert.equal(service.get('project-2').name, 'Other project', 'refresh does not replace a locally maintained project');
+  assert.equal(service.get('project-2').name, 'remote unrelated', 'maintenance does not block viewing the current record');
   assert.equal(state.projectReads, 2);
 });
 
@@ -136,178 +149,81 @@ test('resume metadata status-only callbacks are no-ops, while pausedAt and activ
   assert.equal(service.get('project-1').sandbox?.lastActiveAt, '2026-09-03T00:00:00.000Z');
 });
 
-test('resume permits descriptive metadata edits but keeps lifecycle status changes guarded', async () => {
+test('release then create preserves volumes and persists the actual stable revision across restart', async () => {
+  const value = project();
+  value.imageSelection = { imageId: 'python', imageName: 'Python', category: '开发', templateId: 'tpl-python',
+    revisionId: 'rev-old', versionId: 'rev-old', version: '1.0-r1', image: 'python@sha256:old' };
+  const mounts = [{ volumeId: 'retained-home', mountPath: '/home/agent' }];
+  value.sandbox = { ...value.sandbox!, mounts, ownerKey: 'project:actual-owner' };
+  const state = new MemoryState([value]);
+  const service = new ProjectService(state);
+  await service.init();
+  await service.releaseSandbox(value.id, value.sandbox);
+  assert.equal(service.get(value.id).imageSelection?.revisionId, 'rev-old');
+
+  const image = { templateId: 'tpl-python', revisionId: 'rev-stable', version: '2.0-r1',
+    reference: 'python@sha256:stable', id: 'sha256:stable', repoDigests: [] };
+  await service.updateSandbox(value.id, { ...value.sandbox, id: 'new-box', image }, false, undefined, null);
+  assert.deepEqual(service.get(value.id).imageSelection, { ...value.imageSelection,
+    revisionId: 'rev-stable', versionId: 'rev-stable', version: '2.0-r1', image: image.reference });
+  assert.deepEqual(service.get(value.id).sandboxMounts, mounts);
+  assert.equal(service.get(value.id).sandboxOwnerKey, 'project:actual-owner');
+
+  const restarted = new ProjectService(state);
+  await restarted.init();
+  assert.equal(restarted.get(value.id).imageSelection?.revisionId, 'rev-stable');
+  assert.deepEqual(restarted.get(value.id).sandbox?.image, image);
+  await service.close(); await restarted.close();
+});
+
+test('binding a restored Box clears only its matching candidate cleanup journal', async () => {
+  const value = project();
+  const candidate = { ...value.sandbox!, id: 'restored-box' };
+  delete value.sandbox;
+  value.status = 'archived';
+  value.archivedAt = '2026-09-02T00:00:00.000Z';
+  value.pendingSandboxCleanup = [
+    candidate,
+    { ...candidate, id: 'other-candidate' },
+  ];
+  const service = new ProjectService(new MemoryState([value]));
+  await service.init();
+  try {
+    const bound = { ...candidate, mounts: [{ volumeId: 'volume-restored', mountPath: '/workspace' }] };
+    assert.equal(await service.updateSandbox(value.id, bound, true, undefined, null), true);
+    assert.deepEqual(service.get(value.id).pendingSandboxCleanup?.map(item => item.id), ['other-candidate']);
+  } finally { await service.close(); }
+});
+
+test('confirmed release clears only the released Box from pending cleanup', async () => {
+  const value = project();
+  value.pendingSandboxCleanup = [
+    { ...value.sandbox!, id: 'sandbox-1' },
+    { ...value.sandbox!, id: 'other-candidate' },
+  ];
+  const service = new ProjectService(new MemoryState([value]));
+  await service.init();
+  try {
+    await service.releaseSandbox(value.id, { ...value.sandbox!, id: 'sandbox-1' });
+    assert.deepEqual(service.get(value.id).pendingSandboxCleanup?.map(item => item.id), ['other-candidate']);
+  } finally { await service.close(); }
+});
+
+test('project can be viewed and edited while a Sandbox operation is running', async () => {
   const value = project();
   value.sandboxOperation = { id: 'resume-1', kind: 'resume', phase: '恢复中', status: 'running', updatedAt: value.updatedAt };
   const state = new MemoryState([value]);
   const service = new ProjectService(state, undefined, undefined, true);
   await service.init();
 
-  await service.update('project-1', { name: 'Renamed during resume', backupRetentionCount: 7 });
+  assert.equal(service.get(value.id).sandboxOperation?.status, 'running');
+  await service.update('project-1', { name: 'Renamed during resume', status: 'completed' });
   assert.equal(service.get('project-1').name, 'Renamed during resume');
-  assert.equal(service.get('project-1').backupRetentionCount, 7);
+  assert.equal(service.get('project-1').status, 'completed');
   assert.equal(service.get('project-1').sandboxOperation?.id, 'resume-1');
-  await assert.rejects(service.update('project-1', { status: 'completed' }), /维护/);
+  await service.update('project-1', { status: 'active' });
   assert.equal(service.get('project-1').status, 'active');
-});
-
-test('resume claims serialize owners and recovery transfers only the same operation', async () => {
-  const state = new MemoryState([project()]);
-  const service = new ProjectService(state, undefined, undefined, true);
-  await service.init();
-
-  const first = await service.claimResume('project-1', 'api-a');
-  assert.equal(first.started, true);
-  const duplicate = await service.claimResume('project-1', 'api-a');
-  assert.equal(duplicate.started, false);
-  const duplicateFromOtherApi = await service.claimResume('project-1', 'api-b');
-  assert.equal(duplicateFromOtherApi.started, false, 'a duplicate cannot steal a live owner’s claim');
-  assert.equal(duplicateFromOtherApi.project.sandboxOperation?.resume?.ownerId, 'api-a');
-
-  const opId = first.project.sandboxOperation!.id!;
-  const recovered = await service.claimResume('project-1', 'api-b', { operationId: opId, previousOwnerId: 'api-a' });
-  assert.equal(recovered.started, true);
-  assert.equal(recovered.project.sandboxOperation?.id, opId);
-  assert.deepEqual(recovered.project.sandboxOperation?.resume, { sandboxId: 'sandbox-1', ownerId: 'api-b' });
-  await assert.rejects(service.claimResume('project-1', 'api-c', { operationId: opId, previousOwnerId: 'api-a' }), /恢复操作已变化/);
-});
-
-test('resume completion is conditional and commits the final sandbox plus operation once', async () => {
-  const state = new MemoryState([project()]);
-  const service = new ProjectService(state, undefined, undefined, true);
-  await service.init();
-  const claim = await service.claimResume('project-1', 'api-a');
-  const opId = claim.project.sandboxOperation!.id!;
-  const writes = state.projectWrites;
-
-  assert.equal(await service.finishResume('project-1', { operationId: opId, ownerId: 'stale-api', sandboxId: 'sandbox-1' }, {}), false);
-  assert.equal(state.projectWrites, writes, 'stale completion does not write the project');
-
-  // Simulate a concurrent unrelated API edit after claim; finish must merge
-  // onto the latest durable row rather than saving the claim-time snapshot.
-  state.projects[0].name = 'renamed elsewhere';
-  const finished = await service.finishResume('project-1', { operationId: opId, ownerId: 'api-a', sandboxId: 'sandbox-1' }, {
-    sandbox: { ...claim.project.sandbox!, status: 'ready', pausedAt: undefined, lastActiveAt: '2026-09-03T00:00:00.000Z' },
-  });
-  assert.equal(finished, true);
-  assert.equal(state.projectWrites, writes + 1);
-  assert.equal(service.get('project-1').name, 'renamed elsewhere');
-  assert.equal(service.get('project-1').sandbox?.pausedAt, undefined);
-  assert.ok(service.get('project-1').sandbox?.lastActiveAt, 'successful resume records fresh activity');
-  assert.equal(service.get('project-1').sandboxOperation?.status, 'succeeded');
-});
-
-test('a queued same-instance rename cannot regress a committed resume or disappear from cache', async () => {
-  class DelayedTerminalState extends MemoryState {
-    commitReached!: () => void;
-    allowCommit!: () => void;
-    holdTerminal = false;
-    async mutateProject(id: string, mutate: (current: Project) => void) {
-      const current = this.projects.find(item => item.id === id);
-      if (this.holdTerminal && current?.sandboxOperation?.status === 'running') {
-        const projected = structuredClone(current);
-        mutate(projected);
-        if (projected.sandboxOperation?.status === 'succeeded') {
-          this.holdTerminal = false;
-          this.commitReached();
-          await new Promise<void>(resolve => { this.allowCommit = resolve; });
-        }
-      }
-      return super.mutateProject(id, mutate);
-    }
-  }
-  const state = new DelayedTerminalState([project()]);
-  const service = new ProjectService(state, undefined, undefined, true);
-  await service.init();
-  const claim = await service.claimResume('project-1', 'api-a');
-  const operationId = claim.project.sandboxOperation!.id!;
-  let commitReached!: () => void;
-  const reached = new Promise<void>(resolve => { commitReached = resolve; });
-  state.commitReached = commitReached;
-  state.holdTerminal = true;
-
-  const finish = service.finishResume('project-1', { operationId, ownerId: 'api-a', sandboxId: 'sandbox-1' }, {});
-  await reached;
-  const rename = service.update('project-1', { name: 'renamed while resume commits' });
-  await Promise.resolve();
-  state.allowCommit();
-  assert.equal(await finish, true);
-  await rename;
-
-  const cached = service.get('project-1');
-  const durable = state.projects[0];
-  assert.equal(cached.sandboxOperation?.status, 'succeeded');
-  assert.equal(durable.sandboxOperation?.status, 'succeeded', 'the queued field-level save must preserve the terminal operation');
-  assert.equal(cached.name, 'renamed while resume commits');
-  assert.equal(durable.name, 'renamed while resume commits');
-});
-
-test('resume publishes one isolated result and rejects a result for another Box', async () => {
-  const state = new MemoryState([project()]);
-  const service = new ProjectService(state, undefined, undefined, true);
-  await service.init();
-  const claim = await service.claimResume('project-1', 'api-a');
-  const expected = { operationId: claim.project.sandboxOperation!.id!, ownerId: 'api-a', sandboxId: 'sandbox-1' };
-  const writes = state.projectWrites;
-  const result = { ...claim.project.sandbox!, status: 'ready' as const };
-  await assert.rejects(service.finishResume('project-1', expected, { sandbox: { ...result, id: 'different-box' } }), /身份已变化/);
-  assert.equal(state.projectWrites, writes);
-  assert.equal(await service.finishResume('project-1', expected, { sandbox: result }), true);
-  result.id = 'mutated-by-caller';
-  const stored = await state.getProject('project-1');
-  assert.equal(stored?.sandboxOperation?.result?.sandbox.id, 'sandbox-1');
-  assert.equal(stored?.sandboxOperation?.result?.sandbox.status, 'ready');
-  assert.equal(stored?.sandbox?.status, 'unknown', 'an operation result is not the live runtime state');
-  assert.equal(state.projectWrites, writes + 1);
-});
-
-test('shared refresh waits for in-flight writes, honors skipped scopes, and refreshes baselines safely', async () => {
-  class DelayedState extends MemoryState {
-    holdNext = false;
-    lastPrevious?: Project;
-    entered!: () => void;
-    releaseSave!: () => void;
-    async saveProject(value: Project, previous?: Project) {
-      this.lastPrevious = previous;
-      if (this.holdNext) {
-        this.holdNext = false;
-        const gate = new Promise<void>(resolve => { this.releaseSave = resolve; });
-        this.entered();
-        await gate;
-      }
-      await super.saveProject(value);
-    }
-  }
-  const state = new DelayedState([project()]);
-  const service = new ProjectService(state, undefined, undefined, true);
-  await service.init();
-
-  state.projects[0].name = 'remote skipped update';
-  await service.refresh(new Set(['project-1']));
-  assert.equal(service.get('project-1').name, 'Archive history');
-  assert.equal(state.projectReads, 0);
-
-  let signalEntered!: () => void;
-  const entered = new Promise<void>(resolve => { signalEntered = resolve; });
-  state.entered = signalEntered;
-  state.holdNext = true;
-  const update = service.update('project-1', { name: 'local write' });
-  await entered;
-  let refreshed = false;
-  const refresh = service.refresh().then(() => { refreshed = true; });
-  await new Promise(resolve => setTimeout(resolve, 0));
-  assert.equal(refreshed, false);
-  state.releaseSave();
-  await Promise.all([update, refresh]);
-  assert.equal(service.get('project-1').name, 'local write');
-  assert.equal(state.projectReads, 1, 'only the stale list entry is reread after the save advances its baseline');
-
-  state.projects[0].name = 'new remote baseline';
-  await service.refresh();
-  assert.equal(service.get('project-1').name, 'new remote baseline');
-  assert.equal(state.projectReads, 1, 'ordinary bulk refreshes do not issue per-project point reads');
-  await service.update('project-1', { name: 'final local write' });
-  assert.equal(state.lastPrevious?.name, 'new remote baseline');
+  assert.equal(service.get('project-1').sandboxOperation?.id, 'resume-1');
 });
 
 test('archive detaches the Sandbox and rebuilding restores the project with a new binding', async () => {
@@ -345,23 +261,72 @@ test('an archived Sandbox project cannot change status directly before rebuild',
   assert.equal(service.get(value.id).lifecycleHistory, undefined);
 });
 
-test('backup retention accepts and persists counts from 2 to 100', async () => {
-  const state = new MemoryState([project()]);
-  const service = new ProjectService(state);
+test('reconciling one Cellbox volume catalog preserves other backup indexes and captured threads', async () => {
+  const value = project();
+  const snapshotId = 'a'.repeat(64);
+  const volumeA = { storageType: 'cellbox-volume' as const, id: `volume:volume-a:${snapshotId}`, volumeId: 'volume-a',
+    snapshotId, ownerKey: 'owner-a', profileId: 'profile', mounts: [{ volumeId: 'volume-a', mountPath: '/home/agent' }],
+    createdAt: '2026-09-05T00:00:00.000Z', sizeBytes: 12, addedBytes: 3, threadIds: ['thread-a'] };
+  const volumeB = { ...volumeA, id: `volume:volume-b:${snapshotId}`, volumeId: 'volume-b', snapshotId,
+    mounts: [{ volumeId: 'volume-b', mountPath: '/home/agent' }], threadIds: ['thread-b'] };
+  const legacy = { id: 'legacy-archive', createdAt: '2026-09-04T00:00:00.000Z', sizeBytes: 99,
+    sha256: 'b'.repeat(64), imageId: 'image', sourceSandboxId: 'sandbox-old', threadIds: ['thread-legacy'], storageType: 'oss' as const };
+  value.remoteArchives = [volumeA, volumeB, legacy];
+  const service = new ProjectService(new MemoryState([value]));
   await service.init();
 
-  for (const count of [1, 101, 2.5]) {
-    await assert.rejects(service.update('project-1', { backupRetentionCount: count }), /备份保留数量/);
-  }
-  assert.equal(service.get('project-1').backupRetentionCount, undefined);
-
-  await service.update('project-1', { backupRetentionCount: 2 });
-  assert.equal(state.projects[0].backupRetentionCount, 2);
-  await service.update('project-1', { backupRetentionCount: 100 });
-  assert.equal(service.get('project-1').backupRetentionCount, 100);
+  await service.reconcileVolumeBackups(value.id, 'volume-a', [{ ...volumeA, sizeBytes: undefined, addedBytes: undefined,
+    threadIds: [] }]);
+  const refs = service.get(value.id).remoteArchives ?? [];
+  assert.equal(refs.length, 3);
+  const refreshed = refs.find(ref => ref.storageType === 'cellbox-volume' && ref.volumeId === 'volume-a');
+  assert.ok(refreshed && refreshed.storageType === 'cellbox-volume');
+  assert.deepEqual(refreshed.threadIds, ['thread-a']);
+  assert.equal(refreshed.sizeBytes, undefined);
+  assert.equal(refreshed.addedBytes, undefined);
+  assert.equal('sha256' in refreshed, false);
+  assert.ok(refs.some(ref => ref.storageType === 'cellbox-volume' && ref.volumeId === 'volume-b' && ref.threadIds.includes('thread-b')));
+  assert.ok(refs.some(ref => ref.id === 'legacy-archive' && ref.threadIds.includes('thread-legacy')));
 });
 
-test('weekly projects are unique per China week and become last-week projects in the following week', async () => {
+test('binding a restored volume clears its matching pending cleanup record', async () => {
+  const value = project();
+  delete value.sandbox;
+  value.sandboxReclaimedAt = '2026-09-04T00:00:00.000Z';
+  value.pendingVolumeCleanup = ['restored-volume', 'unrelated-volume'];
+  const service = new ProjectService(new MemoryState([value]));
+  await service.init();
+
+  await service.updateSandbox(value.id, { ...value.sandbox!, id: 'restored-sandbox',
+    mounts: [{ volumeId: 'restored-volume', mountPath: '/home/agent' }] }, true);
+  assert.deepEqual(service.get(value.id).pendingVolumeCleanup, ['unrelated-volume']);
+});
+
+test('removed projects require completed volume cleanup and retain backup recovery metadata', async () => {
+  const value = project();
+  delete value.sandbox;
+  value.sandboxMounts = [{ volumeId: 'volume-to-clean', mountPath: '/home/agent' }];
+  value.pendingVolumeCleanup = ['volume-to-clean'];
+  value.remoteArchives = [{ storageType: 'cellbox-volume', id: `volume:volume-to-clean:${'c'.repeat(64)}`,
+    volumeId: 'volume-to-clean', snapshotId: 'c'.repeat(64), ownerKey: 'owner', profileId: 'profile',
+    mounts: [{ volumeId: 'volume-to-clean', mountPath: '/home/agent' }], createdAt: '2026-09-05T00:00:00.000Z',
+    threadIds: ['thread-recovery'] }];
+  const service = new ProjectService(new MemoryState([value]));
+  await service.init();
+
+  await assert.rejects(service.markRemoved(value.id), /仍有磁盘或运行环境待清理/);
+  await service.finishVolumeCleanup(value.id, 'volume-to-clean');
+  await service.markRemoved(value.id);
+  assert.equal(service.list().some(item => item.id === value.id), false);
+  const removed = service.list({ includeRemoved: true }).find(item => item.id === value.id);
+  assert.ok(removed?.removedAt);
+  assert.equal(removed?.sandboxMounts, undefined);
+  assert.equal(removed?.pendingVolumeCleanup?.length ?? 0, 0);
+  assert.equal(removed?.remoteArchives?.[0]?.id, value.remoteArchives[0].id);
+  assert.deepEqual(removed?.remoteArchives?.[0]?.threadIds, ['thread-recovery']);
+});
+
+test('weekly projects use a normal existence check and labels follow China week boundaries', async () => {
   let now = new Date('2026-09-13T10:00:00.000Z'); // Sunday evening in China
   const service = new ProjectService(new MemoryState([]), async () => ({ name: 'unused', status: null }), () => now);
   await service.init();
@@ -378,6 +343,19 @@ test('weekly projects are unique per China week and become last-week projects in
   const next = await service.create({ name: '下周重点', type: 3 }, settings);
   assert.equal(next.weekOf, '2026-09-14');
   assert.equal(projectTypeLabel(next.type, next.weekOf, now), '本周项目');
+});
+
+test('concurrent weekly project creation has no reservation or uniqueness guarantee', async () => {
+  const service = new ProjectService(new MemoryState([]), async () => ({ name: 'unused', status: null }), () => new Date('2026-09-13T10:00:00.000Z'));
+  await service.init();
+  const settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace' } as Settings;
+  const created = await Promise.all([
+    service.create({ name: '并发本周项目 A', type: 3 }, settings),
+    service.create({ name: '并发本周项目 B', type: 3 }, settings),
+  ]);
+  assert.equal(created.length, 2);
+  assert.equal(created[0].weekOf, created[1].weekOf);
+  assert.equal(service.list().filter(value => value.type === 3).length, 2);
 });
 
 test('Feishu projects require a requirement link', async () => {
@@ -399,4 +377,48 @@ test('new project role initialization completes before creation returns and roll
   await assert.rejects(failed.create({ name: 'Failed' }, { workingDirectory: '/tmp', executionMode: 'local' } as Settings), /Role store unavailable/);
   assert.deepEqual(failed.list(), []);
   assert.equal((await state.listProjects()).length, 1);
+});
+
+
+test('late Sandbox callbacks cannot replace a newer binding or reattach an archived source', async () => {
+  const service = new ProjectService(new MemoryState([project()]));
+  await service.init();
+  const replacement = { ...service.get('project-1').sandbox!, id: 'sandbox-new' };
+  assert.equal(await service.updateSandbox('project-1', replacement, false, undefined, 'sandbox-1'), true);
+  assert.equal(await service.updateSandbox('project-1', { ...replacement, id: 'sandbox-1' }), false);
+  assert.equal(await service.updateSandbox('project-1', { ...replacement, id: 'stale-candidate' }, false, undefined, 'sandbox-1'), false);
+  assert.equal(service.get('project-1').sandbox?.id, 'sandbox-new');
+  await service.archiveAndDetachSandbox('project-1', 'sandbox-new');
+  assert.equal(await service.updateSandbox('project-1', replacement), false);
+  assert.equal(service.get('project-1').sandbox, undefined);
+  await service.close();
+});
+
+test('archive started without a Sandbox cannot detach a binding created in the meantime', async () => {
+  const initial = project(); delete initial.sandbox;
+  const service = new ProjectService(new MemoryState([initial]));
+  await service.init();
+  const current = { id: 'new-box', template: 'base', status: 'ready' as const, workingDirectory: initial.workingDirectory };
+  assert.equal(await service.updateSandbox(initial.id, current, false, undefined, null), true);
+  await assert.rejects(service.archiveAndDetachSandbox(initial.id, null), /Sandbox 已变化/);
+  assert.equal(service.get(initial.id).sandbox?.id, current.id);
+  assert.equal(service.get(initial.id).status, 'active');
+  await service.close();
+});
+
+test('late callbacks cannot reattach a released Box and explicit creation retains the promoted volume owner', async () => {
+  const original = project();
+  const service = new ProjectService(new MemoryState([original]));
+  await service.init();
+  const released = { ...original.sandbox!, homeVolumeId: 'retained-volume', ownerKey: 'project:project-1:restore:older' };
+  try {
+    await service.releaseSandbox(original.id, released);
+    assert.equal(await service.updateSandbox(original.id, original.sandbox!), false);
+    assert.equal(service.get(original.id).sandbox, undefined);
+    assert.equal(service.get(original.id).sandboxOwnerKey, released.ownerKey);
+    assert.deepEqual(service.get(original.id).sandboxMounts, [{ volumeId: 'retained-volume', mountPath: '/home/agent' }]);
+    const replacement = { ...released, id: 'new-box' };
+    assert.equal(await service.updateSandbox(original.id, replacement, false, undefined, null), true);
+    assert.equal(service.get(original.id).sandbox?.id, replacement.id);
+  } finally { await service.close(); }
 });

@@ -15,25 +15,6 @@
     "env": {},
     "tools": [
       {
-        "id": "cocell_archive_backup",
-        "executable": "/opt/cellbox/tools/cocell-archive-backup",
-        "args": [
-          "--endpoint",
-          "REPLACE_WITH_OSS_ENDPOINT",
-          "--bucket",
-          "co-cell-archives",
-          "--region",
-          "us-east-1",
-          "--prefix",
-          "legacy-archives"
-        ],
-        "inputPatterns": ["[A-Za-z0-9][A-Za-z0-9._/-]{0,199}"],
-        "credentialEnv": {
-          "AWS_ACCESS_KEY_ID": "cocell_oss_access_key",
-          "AWS_SECRET_ACCESS_KEY": "cocell_oss_secret_key"
-        }
-      },
-      {
         "id": "cocell_archive_restore",
         "executable": "/opt/cellbox/tools/cocell-archive-restore",
         "args": [],

@@ -214,6 +214,7 @@ export class LiveEnvironment {
       try {
         const deadline = Date.now() + this.config.operationTimeout;
         const stoppedSessions = new Set();
+        let beforeDelete;
         for (;;) {
           const { data: project, response } = await this.request(`/api/projects/${id}`, { signal, expectedStatus: [200, 404] });
           if (response.status === 404) break;
@@ -230,14 +231,44 @@ export class LiveEnvironment {
             || project.sandboxOperation?.status === 'running'
             || project.sandboxBackup?.status === 'running';
           if (waiting) {
-            assert(Date.now() < deadline, `Timed out waiting for project ${id} operations and disk backup before cleanup`);
+            assert(Date.now() < deadline, `Timed out waiting for project ${id} operations and disk backup before DELETE`);
             await delay(250, undefined, { signal }); continue;
           }
+          assert(!['unknown', 'failed'].includes(project.sandboxOperation?.status),
+            `Project ${id} has a ${project.sandboxOperation?.status ?? 'unknown'} sandbox operation; cleanup will not replay it`);
+          assert(!['failed', 'unknown'].includes(project.sandboxBackup?.status),
+            `Project ${id} disk backup result is ${project.sandboxBackup?.status ?? 'unknown'}; cleanup will not replay it`);
+          beforeDelete = project;
+          const retainedBefore = (project.remoteArchives ?? []).map(reference => ({
+            id: reference.id, storageType: reference.storageType ?? 'cellbox',
+            volumeId: reference.volumeId, snapshotId: reference.snapshotId,
+          }));
           await this.json(`/api/projects/${id}`, { method: 'DELETE', timeoutMs: this.config.operationTimeout, signal });
           await this.request(`/api/projects/${id}`, { signal, expectedStatus: 404 });
+          const archiveIndex = await this.json('/api/archives', { signal });
+          const retained = archiveIndex.filter(item => item.projectId === id).flatMap(item => item.archives ?? []);
+          const retainedSnapshots = retained.map(reference => ({
+            id: reference.key, storageType: reference.storageType,
+            volumeId: reference.volumeId, snapshotId: reference.snapshotId,
+          }));
+          const mounts = beforeDelete.sandboxMounts ?? beforeDelete.sandbox?.mounts ?? [];
+          const knownVolumeIds = new Set([
+            ...mounts.map(mount => mount.volumeId),
+            ...(beforeDelete.remoteArchives ?? []).flatMap(reference => reference.volumeId ? [reference.volumeId] : []),
+          ]);
+          for (const volumeId of knownVolumeIds) {
+            assert(retainedSnapshots.some(reference => reference.volumeId === volumeId),
+              `Project ${id} DELETE did not retain a snapshot for Volume ${volumeId}`);
+          }
+          if (!mounts.length && retainedBefore.length) {
+            const latestExisting = retainedBefore[0];
+            assert(retainedSnapshots.some(reference => reference.id === latestExisting.id),
+              `Project ${id} DELETE pruned the latest existing recovery snapshot ${latestExisting.id}`);
+          }
+          this.report.cleanup.push({ projectId: id, status: 'deleted_retained_backups', retainedSnapshots });
           break;
         }
-        this.report.cleanup.push({ projectId: id, status: 'deleted' });
+        if (!beforeDelete) this.report.cleanup.push({ projectId: id, status: 'already_removed' });
       } catch (error) { const message = this.redact(error.message); errors.push(message); this.report.cleanup.push({ projectId: id, status: 'failed', error: message }); }
     }
     if (!this.config.keepProjects && this.boxes.size) {

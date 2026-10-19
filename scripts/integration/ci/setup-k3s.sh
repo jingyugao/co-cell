@@ -15,6 +15,16 @@ k3s_version='v1.34.1+k3s1'
 gvisor_version='20260914.0'
 curl -fsSL "https://raw.githubusercontent.com/k3s-io/k3s/${k3s_version}/install.sh" -o "$work/install-k3s.sh"
 sudo env INSTALL_K3S_VERSION="$k3s_version" sh "$work/install-k3s.sh" server --disable=traefik --disable=servicelb --disable=metrics-server
+node_ip="$(ip -4 route get 1.1.1.1 | awk '{for (i=1;i<=NF;i++) if ($i == "src") {print $(i+1); exit}}')"
+[[ "$node_ip" =~ ^[0-9.]+$ ]] || { echo 'Cannot determine the disposable CI node IPv4 address' >&2; exit 1; }
+printf 'COCELL_CI_NODE_IP=%s\n' "$node_ip" >> "$GITHUB_ENV"
+sudo install -d -m 755 /etc/rancher/k3s
+sudo tee /etc/rancher/k3s/registries.yaml >/dev/null <<EOF
+mirrors:
+  "${node_ip}:5000":
+    endpoint:
+      - "http://${node_ip}:5000"
+EOF
 mkdir -p "$HOME/.kube"
 sudo cp /etc/rancher/k3s/k3s.yaml "$work/kubeconfig"
 sudo chown "$(id -u):$(id -g)" "$work/kubeconfig"

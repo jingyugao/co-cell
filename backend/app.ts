@@ -8,7 +8,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
 import type { AppConfig } from '../protocol/types.js';
 import { SessionManager } from './sessions/manager.js';
-import { HttpError } from '../util/errors.js';
+import { HttpError, providerError } from '../util/errors.js';
 import type { SandboxInventoryReader } from './sandboxes/inventory.js';
 import { SharedFiles } from './shared-files/service.js';
 import type { ConnectionStore } from './connections/store.js';
@@ -65,6 +65,8 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   });
   app.use('/api/*', bodyLimit({ maxSize: 12 * 1024 * 1024, onError: c => c.json({ error: '请求过大，图片最大 10 MB' }, 413) }));
   app.onError((error, c) => {
+    const detail = providerError(error);
+    if (detail) return c.json({ error: detail.message, code: detail.code, ...(detail.upstreamStatus ? { upstreamStatus: detail.upstreamStatus } : {}) }, detail.status as 400);
     if (error instanceof HttpError) return c.json({ error: error.message }, error.status as 400);
     if (error instanceof z.ZodError) return c.json({ error: error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ') }, 400);
     if (error instanceof SyntaxError) return c.json({ error: '请求 JSON 格式错误' }, 400);

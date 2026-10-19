@@ -28,7 +28,7 @@ function Resources({ sandbox, kind }: { sandbox: SandboxRecord; kind: 'cpu' | 'm
 }
 function CleanupStatus({ sandbox }: { sandbox: SandboxRecord }) {
   if (!sandbox.dangling) return null;
-  return <small className="sandbox-cleanup-note unknown">未关联当前项目。确认无用后可手动删除。</small>;
+  return <small className="sandbox-cleanup-note unknown">未关联当前项目。确认无用后可释放运行环境并保留挂载盘。</small>;
 }
 
 export default function SandboxManager({ config, onOpenSession, onOpenProject, onMenu, onBack }: { config: AppConfig | null; onOpenProject: (id: string) => void; onOpenSession: (id: string) => void; onMenu: () => void; onBack: () => void }) {
@@ -38,8 +38,8 @@ export default function SandboxManager({ config, onOpenSession, onOpenProject, o
   const [query, setQuery] = useState('');
   const [state, setState] = useState('all');
   const [refresh, setRefresh] = useState(0);
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  const [deleting, setDeleting] = useState<string | null>(null);
+  const [confirmRelease, setConfirmRelease] = useState<string | null>(null);
+  const [releasing, setReleasing] = useState<string | null>(null);
   const request = useRef<AbortController | null>(null);
   useEffect(() => {
     let alive = true;
@@ -65,17 +65,17 @@ export default function SandboxManager({ config, onOpenSession, onOpenProject, o
   const paused = sandboxes.filter(box => box.state === 'paused').length;
   const dangling = sandboxes.filter(box => box.dangling === true).length;
   const visible = sandboxes.filter(box => (state === 'all' || sandboxInventoryPhase(box) === state) && `${box.id} ${box.template} ${box.project?.name ?? ''} ${box.project?.requirementUrl ?? ''} ${(box.sessions ?? (box.session ? [box.session] : [])).map(session => session.title + ' ' + session.id).join(' ')}`.toLowerCase().includes(query.trim().toLowerCase()));
-  async function deleteSandbox(id: string) {
-    if (confirmDelete !== id || deleting) return;
-    setDeleting(id); setError('');
+  async function releaseSandbox(id: string) {
+    if (confirmRelease !== id || releasing) return;
+    setReleasing(id); setError('');
     try {
       await api<unknown>(`/api/sandboxes/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      setConfirmDelete(null);
+      setConfirmRelease(null);
       setData(current => current ? { ...current, sandboxes: current.sandboxes.filter(item => item.id !== id) } : current);
       setRefresh(value => value + 1);
     } catch (err) {
-      setError(`删除沙箱失败：${err instanceof Error ? err.message : '请重试。'}`);
-    } finally { setDeleting(null); }
+      setError(`释放运行环境失败：${err instanceof Error ? err.message : '请重试。'}`);
+    } finally { setReleasing(null); }
   }
   return <main className="main-pane sandbox-page">
     <header className="topbar"><button className="icon-button mobile-only" aria-label="打开导航" onClick={onMenu}>☰</button><div className="breadcrumbs"><span>工作空间</span><span className="slash">/</span><strong>沙箱管理</strong></div><button className="secondary-button" onClick={onBack}>返回对话</button></header>
@@ -96,9 +96,9 @@ export default function SandboxManager({ config, onOpenSession, onOpenProject, o
             <td><span className={`sandbox-state ${box.state}`}><i />{sandboxInventoryLabel(box)}</span>{box.inventorySource && <small className="sandbox-metric-note">{box.inventorySource === 'node' ? '节点本地 · Checkpoint' : 'Kubernetes · Cellbox'}</small>}<small className="sandbox-metric-note" title={box.metricsMessage}>{box.metricsStatus === 'available' && box.metrics ? `采样 ${date(box.metrics.timestamp)}` : box.metricsStatus === 'paused' ? '暂停中，无实时采样' : box.metricsStatus === 'pending' ? '等待指标采样' : '指标暂不可用'}</small>{box.metricsMessage && <small className="sandbox-metric-note">{box.metricsMessage}</small>}</td>
             <td><Resources sandbox={box} kind="cpu" /></td><td><Resources sandbox={box} kind="memory" /></td><td><Resources sandbox={box} kind="disk" /></td>
             <td className="sandbox-times">{box.startedAt && <><span>启动于</span><time dateTime={box.startedAt}>{date(box.startedAt)}</time></>}{box.endAt && box.state === 'running' && <><span>预计暂停</span><time dateTime={box.endAt}>{date(box.endAt)}</time></>}{box.pausedAt && <><span>暂停于</span><time dateTime={box.pausedAt}>{date(box.pausedAt)}</time></>}</td>
-            <td className="sandbox-actions">{box.dangling === true ? confirmDelete === box.id ? <div className="sandbox-delete-confirm" role="group" aria-label={`确认删除悬挂沙箱 ${box.id}`}><p>物理删除沙箱及其中全部文件，删除后无法恢复。</p><button className="secondary-button" disabled={deleting === box.id} onClick={() => setConfirmDelete(null)}>取消</button><button className="sandbox-danger-button" disabled={Boolean(deleting)} onClick={() => void deleteSandbox(box.id)}>{deleting === box.id ? '删除中…' : '确认删除'}</button></div> : <button className="sandbox-delete-button" disabled={Boolean(deleting)} onClick={() => setConfirmDelete(box.id)}>物理删除</button> : <span>—</span>}</td>
+            <td className="sandbox-actions">{box.dangling === true ? confirmRelease === box.id ? <div className="sandbox-delete-confirm" role="group" aria-label={`确认释放悬挂沙箱 ${box.id}`}><p>将结束实例进程并保留挂载盘，本次操作不会主动清除 Cellbox 元数据。</p><button className="secondary-button" disabled={releasing === box.id} onClick={() => setConfirmRelease(null)}>取消</button><button className="sandbox-danger-button" disabled={Boolean(releasing)} onClick={() => void releaseSandbox(box.id)}>{releasing === box.id ? '释放中…' : '确认释放'}</button></div> : <button className="sandbox-delete-button" disabled={Boolean(releasing)} onClick={() => setConfirmRelease(box.id)}>释放运行环境</button> : <span>—</span>}</td>
           </tr>)}</tbody></table></div>}
-          <div className="sandbox-footnote"><span className="sandbox-mobile-hint">左右滑动表格查看资源用量。<br /></span>有清理计划的悬挂沙箱会在保留期结束后自动删除；来源不明的悬挂沙箱不会自动清理。也可确认后手动物理删除。</div>
+          <div className="sandbox-footnote"><span className="sandbox-mobile-hint">左右滑动表格查看资源用量。<br /></span>有清理计划的悬挂沙箱会在保留期结束后按策略清理；来源不明的悬挂沙箱不会自动清理。也可确认后释放运行环境，结束实例进程并保留挂载盘。</div>
         </section>
       </>}
     </div>

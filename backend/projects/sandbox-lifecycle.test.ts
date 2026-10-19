@@ -14,8 +14,9 @@ test('sweep archives only completed Sandbox projects after the grace period', as
   const now = Date.parse('2026-04-01T00:00:00.000Z');
   const threshold = 24 * 60 * 60 * 1000;
   const projects = [
-    project('eligible', { status: 'completed', completedAt: new Date(now - threshold).toISOString() }),
+    project('running', { status: 'completed', completedAt: new Date(now - threshold).toISOString() }),
     project('paused', { status: 'completed', completedAt: new Date(now - threshold).toISOString(), sandbox: { ...sandbox, status: 'paused' } }),
+    project('failed-phase', { status: 'completed', completedAt: new Date(now - threshold).toISOString(), sandbox: { ...sandbox, status: 'unavailable', phase: 'failed' } }),
     project('paused-recent', { status: 'completed', completedAt: new Date(now - threshold + 1).toISOString(), sandbox: { ...sandbox, status: 'paused' } }),
     project('unavailable', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'unavailable' } }),
     project('unknown', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'unknown' } }),
@@ -32,7 +33,7 @@ test('sweep archives only completed Sandbox projects after the grace period', as
     if (options?.useExistingBackup) existingBackups.push(id);
   }, now: () => now });
   await service.sweep();
-  assert.deepEqual(reclaimed, ['eligible', 'paused']);
+  assert.deepEqual(reclaimed, ['paused', 'failed-phase']);
   assert.deepEqual(existingBackups, [], 'automatic reclamation must preserve the latest disk contents');
   await service.close();
 });
@@ -41,8 +42,8 @@ test('completion age is independent of project and sandbox activity timestamps',
   const now = Date.parse('2026-04-01T00:00:00.000Z');
   const day = 24 * 60 * 60 * 1000;
   const projects = [
-    project('completed-old', { status: 'completed', completedAt: new Date(now - day).toISOString(), updatedAt: new Date(now).toISOString(), sandbox: { ...sandbox, lastActiveAt: new Date(now).toISOString() } }),
-    project('completed-recent', { status: 'completed', completedAt: new Date(now - day + 1).toISOString(), updatedAt: new Date(0).toISOString(), sandbox: { ...sandbox, lastActiveAt: new Date(0).toISOString() } }),
+    project('completed-old', { status: 'completed', completedAt: new Date(now - day).toISOString(), updatedAt: new Date(now).toISOString(), sandbox: { ...sandbox, status: 'paused', lastActiveAt: new Date(now).toISOString() } }),
+    project('completed-recent', { status: 'completed', completedAt: new Date(now - day + 1).toISOString(), updatedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'paused', lastActiveAt: new Date(0).toISOString() } }),
   ];
   const reclaimed: string[] = [];
   const service = new SandboxLifecycleService({ listProjects: () => projects, reclaim: async id => { reclaimed.push(id); }, now: () => now });
@@ -58,7 +59,7 @@ test('overlapping sweeps share one serial pass', async () => {
   let concurrent = 0;
   let maximumConcurrent = 0;
   const service = new SandboxLifecycleService({
-    listProjects: () => [project('one', { status: 'completed', completedAt: new Date(0).toISOString() }), project('two', { status: 'completed', completedAt: new Date(0).toISOString() })], archivedReclaimAfterMs: 0, now: () => 1,
+    listProjects: () => [project('one', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'paused' } }), project('two', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'paused' } })], archivedReclaimAfterMs: 0, now: () => 1,
     reclaim: async id => {
       reclaimed.push(id); concurrent++; maximumConcurrent = Math.max(maximumConcurrent, concurrent);
       if (id === 'one') await blocked;
@@ -76,16 +77,31 @@ test('overlapping sweeps share one serial pass', async () => {
   await service.close();
 });
 
-test('one reclaim failure does not stop the pass or cause an immediate retry', async () => {
+test('failed, unknown, and running saved operation results are not resubmitted by later sweeps', async () => {
+  const projects = [
+    ...(['running', 'unknown', 'failed'] as const).map(status => project(status, {
+      status: 'completed', completedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'paused' },
+    })),
+    project('backup-pending', { status: 'completed', completedAt: new Date(0).toISOString(),
+      sandbox: { ...sandbox, status: 'paused' }, sandboxBackup: {
+        id: 'backup-1', sandboxId: 'sandbox-backup-pending', status: 'unknown', phase: '校验备份', updatedAt: new Date(0).toISOString(),
+      } }),
+    project('healthy-running', { status: 'completed', completedAt: new Date(0).toISOString() }),
+  ];
   const calls: string[] = [];
   const service = new SandboxLifecycleService({
-    listProjects: () => [project('fails', { status: 'completed', completedAt: new Date(0).toISOString() }), project('succeeds', { status: 'completed', completedAt: new Date(0).toISOString() })], archivedReclaimAfterMs: 0, now: () => 1,
-    reclaim: async id => { calls.push(id); if (id === 'fails') throw new Error('busy'); },
+    listProjects: () => projects, archivedReclaimAfterMs: 0, now: () => 1,
+    reclaim: async id => {
+      calls.push(id);
+      const value = projects.find(item => item.id === id)!;
+      value.sandboxOperation = { id: `operation-${id}`, kind: 'archive', phase: '请求结果未知', status:
+        id === 'running' ? 'running' : id === 'unknown' ? 'unknown' : 'failed', updatedAt: new Date(0).toISOString() };
+    },
   });
   await service.sweep();
-  assert.deepEqual(calls, ['fails', 'succeeds']);
+  assert.deepEqual(calls, ['running', 'unknown', 'failed']);
   await service.sweep();
-  assert.deepEqual(calls, ['fails', 'succeeds', 'fails', 'succeeds']);
+  assert.deepEqual(calls, ['running', 'unknown', 'failed'], 'saved nonterminal/failed operations require user decision');
   await service.close();
 });
 
@@ -94,7 +110,7 @@ test('close waits for the current reclaim and stops the remaining pass', async (
   const blocked = new Promise<void>(resolve => { release = resolve; });
   const calls: string[] = [];
   const service = new SandboxLifecycleService({
-    listProjects: () => [project('one', { status: 'completed', completedAt: new Date(0).toISOString() }), project('two', { status: 'completed', completedAt: new Date(0).toISOString() })], archivedReclaimAfterMs: 0, now: () => 1,
+    listProjects: () => [project('one', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'paused' } }), project('two', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: { ...sandbox, status: 'paused' } })], archivedReclaimAfterMs: 0, now: () => 1,
     reclaim: async id => { calls.push(id); await blocked; },
   });
   void service.sweep();

@@ -25,7 +25,7 @@ export default function RepositoryForm({ categories, busy, onSubmit, onCancel }:
     <label>镜像仓库地址<input aria-label="镜像仓库地址" required maxLength={2048} value={repository} disabled={busy} placeholder="docker.io/team/image 或 registry.example.com/team/image" onChange={event => setRepository(event.target.value)} /><small>支持 Docker Hub 仓库网页链接。不填写 Tag；HTTP 仓库请明确填写 http://。</small></label>
     <label>构建命令（可选）<textarea rows={5} value={buildCommand} disabled={busy} placeholder="同步每个版本时，在源镜像中安装或复制所需工具" onChange={event => setBuildCommand(event.target.value)} /></label>
     <label className="image-checkbox"><input type="checkbox" checked={privateRegistry} disabled={busy} onChange={event => setPrivateRegistry(event.target.checked)} />私有仓库认证</label>
-    <p className="project-form-hint">添加仓库后进入版本页面，选择上游 Tag 同步；每个版本都使用此构建命令。</p>
+    <p className="project-form-hint">添加仓库会创建 Cellbox template。同步每个 Tag 都会构建一个新 revision。私有仓库凭据由 Cellbox 部署侧配置，页面凭据仅能查询 Tag。</p>
     {error && <p className="project-error" role="alert">{error}</p>}
     <div className="project-form-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onCancel}>取消</button><button className="primary-button" disabled={busy}>{busy ? '添加中…' : '添加并进入仓库'}</button></div>
   </form>;

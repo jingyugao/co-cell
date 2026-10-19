@@ -21,6 +21,9 @@ kube_context="${COCELL_KUBE_CONTEXT:-k3s}"
 namespace="${COCELL_NAMESPACE:-co-cell}"
 release="${COCELL_HELM_RELEASE:-co-cell}"
 chart="${COCELL_HELM_CHART:-./deploy/helm/co-cell}"
+cellbox_profile="${CELLBOX_PROFILE:-}"
+cellbox_template="${CELLBOX_TEMPLATE_ID:-}"
+cellbox_revision="${CELLBOX_REVISION_ID:-}"
 
 if [[ $# -gt 1 ]]; then
   echo "usage: $0 [IMAGE_TAG]" >&2
@@ -122,6 +125,20 @@ if [[ ! -d "$chart" ]]; then
   echo "Helm chart not found: $chart" >&2
   exit 1
 fi
+if [[ -z "$cellbox_profile" ]]; then
+  echo "Set CELLBOX_PROFILE to the Cellbox runtime profile" >&2
+  exit 2
+fi
+if [[ ( -n "$cellbox_template" && -n "$cellbox_revision" ) || ( -z "$cellbox_template" && -z "$cellbox_revision" ) ]]; then
+  echo "Set exactly one of CELLBOX_TEMPLATE_ID or CELLBOX_REVISION_ID" >&2
+  exit 2
+fi
+cellbox_args=(--set-string "cellbox.profile=${cellbox_profile}")
+if [[ -n "$cellbox_template" ]]; then
+  cellbox_args+=(--set-string "cellbox.templateId=${cellbox_template}" --set-string cellbox.revisionId=)
+else
+  cellbox_args+=(--set-string cellbox.templateId= --set-string "cellbox.revisionId=${cellbox_revision}")
+fi
 
 image="${image_repository}:${image_tag}"
 echo "Building ${image} for linux/amd64 with the local Docker cache"
@@ -137,6 +154,7 @@ helm upgrade "$release" "$chart" \
   "${preview_args[@]}" \
   "${multi_api_args[@]}" \
   "${mount_args[@]}" \
+  "${cellbox_args[@]}" \
   --set-string "image.repository=${image_repository}" \
   --set-string "image.tag=${image_tag}" \
   --set-string image.digest= \

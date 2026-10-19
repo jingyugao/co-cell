@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import type { Socket } from 'node:net';
 import { SandboxLifecycle, type SandboxHandle } from '@co-cell/sandbox';
-import type { CellboxArchive, CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
+import type { CellboxArchive, CellboxSandboxProvider, CellboxVolumeBackup } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import type { SecretService } from '../secrets/service.js';
 import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
@@ -85,10 +85,10 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
   const archiveBytes = Buffer.from('cellbox archive bytes');
   const archive: CellboxArchive = {
     id: 'archive-1', sourceBoxId: 'box-1', profileId: 'k8s', imageId: 'image@sha256:abc',
+    templateId: 'tpl-a', revisionId: 'rev-a', templateName: 'agent', templateVersion: '1.0-r1',
     agent: { uid: 11000, gid: 11000 }, sha256: createHash('sha256').update(archiveBytes).digest('hex'),
     size: archiveBytes.length, consistency: 'workspace-best-effort', createdAt: new Date().toISOString(),
   };
-  let leaseRenews = 0, leaseReleases = 0;
   const access = { url: 'http://cellbox.test/v1/boxes/box-1/services/4500/', headers: {} };
   const provider = {
     client: {
@@ -106,31 +106,23 @@ function fakeProvider(overrides: Record<string, unknown> = {}) {
     activateBox: async () => { events.push('activate'); },
     captureArchive: async () => ({ result: { archiveId: archive.id } }),
     getServiceAccess: async () => access,
-    createLease: async () => ({ id: 'lease-1' }),
-    renewLease: async () => { leaseRenews++; },
-    releaseLease: async () => { leaseReleases++; },
+    defaultSelector: { revisionId: 'rev-a' },
     ...overrides,
   } as unknown as CellboxSandboxProvider;
-  return { provider, events, credentialWrites, archive, archiveBytes,
-    counts: () => ({ leaseRenews, leaseReleases }) };
+  return { provider, events, credentialWrites, archive, archiveBytes };
 }
 
-test('imported images skip credentials, use native archives and restore with the pinned image', async () => {
-  const previousEndpoint = process.env.OSS_ENDPOINT;
-  process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
+test('revision selected images skip credentials and legacy archives restore with the pinned revision', async () => {
   const { handle } = fakeHandle();
   const fake = fakeProvider();
   fake.provider.client.getBox = async () => ({ phase: 'staged', generation: 1, image: 'image@sha256:abc',
     capabilities: { protectedTools: false } }) as never;
-  fake.provider.captureArchive = async (_id, key) => {
-    assert.equal(key, 'capture-imported');
-    return { result: { archiveId: fake.archive.id } } as never;
-  };
-  const imageSelection = { imageId: 'python', imageName: 'Python', category: '开发', versionId: 'v1', version: 'v1',
-    importedImageId: 'imported-python-v1', image: 'image@sha256:abc' };
+  const imageSelection = { templateId: 'tpl-python', revisionId: 'rev-python', imageId: 'python', imageName: 'Python',
+    category: '开发', versionId: 'v1', version: 'v1', image: 'image@sha256:abc' };
   fake.archive.portable = true;
   fake.provider.client.restoreBox = async input => {
-    assert.equal(input.importedImageId, imageSelection.importedImageId);
+    assert.equal(input.revisionId, imageSelection.revisionId);
+    assert.equal(input.templateId, undefined);
     assert.equal(input.acceptImageChange, true);
     return { id: 'restore', targetId: 'box-1' } as never;
   };
@@ -139,18 +131,15 @@ test('imported images skip credentials, use native archives and restore with the
   try {
     await runtime.prepare(handle, { ...target, imageSelection }, AbortSignal.timeout(5000));
     assert.equal(fake.credentialWrites.length, 0);
-    // Operator-approved imported images can have tools, but still need native
-    // portable archives: the protected OSS restore path only supports profiles.
-    fake.provider.client.getBox = async () => ({ phase: 'staged', generation: 1, image: 'image@sha256:abc',
-      capabilities: { protectedTools: true } }) as never;
-    const archive = await runtime.remoteArchives.capture({ ...target, imageSelection }, 'capture-imported');
-    assert.equal(archive.id, fake.archive.id);
-    assert.equal(archive.portable, true);
-    const candidate = await runtime.remoteArchives.restore({ ...target, imageSelection }, { ...archive, threadIds: [] }, 'restore-imported', async () => {});
+    const reference: RemoteArchiveRef = { id: fake.archive.id, createdAt: fake.archive.createdAt,
+      sizeBytes: fake.archive.size, sha256: fake.archive.sha256, imageId: fake.archive.imageId,
+      sourceSandboxId: fake.archive.sourceBoxId, threadIds: [], portable: true };
+    const inspected = await runtime.remoteArchives.inspect(reference);
+    assert.equal(inspected.id, fake.archive.id);
+    const candidate = await runtime.remoteArchives.restore({ ...target, imageSelection }, reference, 'restore-imported', async () => {});
     assert.equal(candidate.image?.reference, imageSelection.image);
   } finally {
     await runtime.close();
-    if (previousEndpoint === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previousEndpoint;
   }
 });
 
@@ -178,70 +167,54 @@ test('startup reconciliation leaves paused sandboxes asleep and archive workflow
   } finally { await runtime.close(); }
 });
 
-test('only usage leases renew; anonymous App Server access needs no timer', async t => {
-  const callbacks: Array<() => void> = [];
-  t.mock.method(globalThis, 'setInterval', ((callback: () => void) => {
-    callbacks.push(callback);
-    return { unref() {} } as NodeJS.Timeout;
-  }) as typeof setInterval);
-  t.mock.method(globalThis, 'clearInterval', (() => {}) as typeof clearInterval);
-  const { provider, counts } = fakeProvider();
+test('App Server access uses the direct service URL without registering a lease or route', async () => {
+  const { provider } = fakeProvider();
   const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {} });
   const endpoint = await runtime.appServer('box-1');
   assert.equal(endpoint.url, 'ws://cellbox.test/v1/boxes/box-1/services/4500/');
   assert.deepEqual(endpoint.headers, {});
-  const releaseLease = await runtime.acquireUsage('box-1');
-  assert.equal(callbacks.length, 1);
-  callbacks.forEach(callback => callback());
-  await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(counts(), { leaseRenews: 1, leaseReleases: 0 });
-  await releaseLease();
-  await runtime.close();
-  assert.deepEqual(counts(), { leaseRenews: 1, leaseReleases: 1 });
-});
-
-test('mounted default-workspace initialization skips an empty remote lease; execution and custom setup retain it', async () => {
-  let leases = 0;
-  const { provider } = fakeProvider({
-    client: { getBox: async () => ({ capabilities: { sharedDirectory: true } }) },
-    createLease: async () => { leases++; return { id: 'lease-1' }; },
-  });
-  const runtime = new CellboxRuntimeIntegration({ provider, profileId: 'k8s', appServerArgs: [], env: {}, sharedDirectory: true });
-  await (await runtime.acquireUsage('box-1', '/home/agent/workspace'))();
-  assert.equal(leases, 0);
-  await (await runtime.acquireUsage('box-1', '/home/agent/workspace/project'))();
-  await (await runtime.acquireUsage('box-1'))();
-  assert.equal(leases, 2);
+  assert.equal('acquireUsage' in runtime, false);
   await runtime.close();
 });
 
-test('OSS backup skips permission changes for root debug and supports existing non-root boxes', async () => {
-  const previous = process.env.OSS_ENDPOINT;
-  process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
-  const { handle, commands } = fakeHandle();
-  const fake = fakeProvider({ handle });
-  let rootDebug = true;
-  fake.provider.client.getBox = async () => ({ phase: 'running', generation: 1, capabilities: { protectedTools: true, rootDebug } }) as Awaited<ReturnType<typeof fake.provider.client.getBox>>;
-  fake.provider.currentImageIdentity = async () => ({ reference: 'prepared:test', id: 'sha256:prepared', repoDigests: [] });
-  fake.provider.client.runTool = async (_boxId, tool, args) => {
-    assert.equal(tool, 'cocell_archive_backup');
-    assert.deepEqual(args, ['project-1/capture-key.tar.gz']);
-    assert.equal(commands.some(call => call.command === 'chmod -R g+rX -- /home/agent/workspace'), !rootDebug);
-    return { ...result, stdout: JSON.stringify({ storageType: 'oss', objectKey: 'legacy-archives/project-1/capture-key.tar.gz',
-      createdAt: '2026-09-27T00:00:00.000Z', sizeBytes: 10, sha256: 'a'.repeat(64) }) };
+test('runtime schedules a volume backup from retained mounts without requiring a Box', async () => {
+  const fake = fakeProvider();
+  const calls: string[] = [];
+  const volumeId = 'project-home';
+  const snapshotId = 'a'.repeat(64);
+  const mounts = [{ volumeId, mountPath: '/home/agent' }];
+  const snapshot: CellboxVolumeBackup = { id: snapshotId, createdAt: '2026-10-18T01:00:00.000Z', volumeId,
+    ownerKey: 'project:project-1:home', profileId: 'k8s', sizeBytes: 4096, addedBytes: 512 };
+  fake.provider.client.getBox = async () => { calls.push('get-box'); assert.fail('retained mounts must avoid Box lookup'); };
+  fake.provider.client.createVolumeBackup = async id => {
+    calls.push(`submit:${id}`);
+    return { id: 'volume-backup-op', targetId: id, kind: 'volume-backup', status: 'running', version: 1,
+      createdAt: snapshot.createdAt } as never;
   };
+  fake.provider.client.getVolumeBackup = async (id, backupId) => {
+    calls.push(`get-backup:${id}:${backupId}`);
+    return snapshot;
+  };
+  fake.provider.waitForOperation = async operation => {
+    calls.push(`wait:${operation.id}`);
+    return { ...operation, status: 'succeeded', result: { volumeId, backupId: snapshotId } } as never;
+  };
+  fake.provider.client.createBox = async () => { calls.push('create-box'); assert.fail('backup must not create a Box'); };
   const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {} });
   try {
-    const archive = await runtime.remoteArchives.capture(target, 'capture-key');
-    assert.equal(archive.storageType, 'oss');
-    assert.equal(archive.sourceSandboxId, target.sandbox.id);
-    assert.equal(commands.length, 0);
-    rootDebug = false;
-    await runtime.remoteArchives.capture(target, 'capture-key');
-  } finally {
-    await runtime.close();
-    if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;
-  }
+    const operationCallbacks: string[] = [];
+    const captured = await runtime.remoteArchives.capture({ ...target, sandbox: undefined, sandboxMounts: mounts }, 'capture-correlation', {
+      onOperation: async (operationId, selectedVolumeId) => { operationCallbacks.push(`${operationId}:${selectedVolumeId}`); },
+    });
+    assert.deepEqual(calls, [`submit:${volumeId}`, 'wait:volume-backup-op', `get-backup:${volumeId}:${snapshotId}`]);
+    assert.deepEqual(operationCallbacks, [`volume-backup-op:${volumeId}`]);
+    assert.equal(captured.id, `volume:${volumeId}:${snapshotId}`);
+    assert.equal(captured.storageType, 'cellbox-volume');
+    assert.equal(captured.volumeId, volumeId);
+    assert.equal(captured.snapshotId, snapshotId);
+    assert.deepEqual(captured.mounts, mounts);
+    assert.equal(captured.sourceSandboxId, undefined);
+  } finally { await runtime.close(); }
 });
 
 test('restore records candidate before waiting, activates after setup, and verifies bounded archive bytes', async () => {
@@ -401,54 +374,4 @@ test('environment preparation and readiness retries never distribute credentials
     await runtime.prepare(handle, target, AbortSignal.timeout(5_000));
     assert.equal(credentialWrites.length, 0);
   } finally { await runtime.close(); }
-});
-
-test('paused default images capture through Cellbox disk archives without guest commands or credentials', async () => {
-  const previous = process.env.OSS_ENDPOINT;
-  process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
-  const fake = fakeProvider();
-  fake.provider.client.runTool = async () => { assert.fail('paused capture must not execute in the guest'); };
-  fake.provider.connectForSetup = async () => { assert.fail('paused capture must not connect or resume'); };
-  let captures = 0;
-  fake.provider.captureArchive = async (id, key) => {
-    assert.equal(id, target.sandbox.id); assert.equal(key, 'paused-disk'); captures++;
-    return { id: 'capture-paused', kind: 'archive', targetId: id, status: 'succeeded', version: 1,
-      createdAt: new Date().toISOString(), result: { archiveId: fake.archive.id } };
-  };
-  const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {} });
-  try {
-    const archive = await runtime.remoteArchives.capture({ ...target, sandbox: { ...target.sandbox, status: 'paused' } }, 'paused-disk');
-    assert.equal(archive.id, fake.archive.id);
-    assert.equal(captures, 1);
-    assert.equal(fake.credentialWrites.length, 0);
-  } finally {
-    await runtime.close();
-    if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;
-  }
-});
-
-for (const status of ['ready', 'unavailable', 'unknown'] as const) test(`${status} disk archive uses the native node API without guest tools`, async () => {
-  const previous = process.env.OSS_ENDPOINT;
-  process.env.OSS_ENDPOINT = 'http://127.0.0.1:9002';
-  const fake = fakeProvider();
-  fake.provider.client.getBox = async () => ({ capabilities: { diskArchives: true, protectedTools: true } }) as never;
-  fake.provider.client.runTool = async () => { assert.fail('disk archive must not use guest backup tools'); };
-  fake.provider.connectForSetup = async () => { assert.fail('disk archive must not start or prepare the guest'); };
-  fake.provider.captureArchive = async (id, key, options) => {
-    assert.equal(id, target.sandbox.id); assert.equal(key, 'disk-only');
-    assert.deepEqual(options, { diskOnly: true });
-    return { result: { archiveId: fake.archive.id } } as never;
-  };
-  const runtime = new CellboxRuntimeIntegration({ provider: fake.provider, profileId: 'k8s', appServerArgs: [], env: {} });
-  try {
-    const archive = await runtime.remoteArchives.capture({ ...target, sandbox: { ...target.sandbox, status } }, 'disk-only', { diskOnly: true });
-    assert.equal(archive.id, fake.archive.id);
-    assert.equal(fake.credentialWrites.length, 0);
-    fake.provider.client.getBox = async () => ({ capabilities: {} }) as never;
-    fake.provider.captureArchive = async () => { assert.fail('old servers or storage layouts must not silently ignore diskOnly'); };
-    await assert.rejects(runtime.remoteArchives.capture(target, 'unsupported-disk', { diskOnly: true }), /不支持独立磁盘归档/);
-  } finally {
-    await runtime.close();
-    if (previous === undefined) delete process.env.OSS_ENDPOINT; else process.env.OSS_ENDPOINT = previous;
-  }
 });

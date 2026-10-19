@@ -1,11 +1,15 @@
 import { injectTraceHeaders, traced } from '../../tracing.js';
 import { SpanKind } from '@opentelemetry/api';
+
+const cellboxVolumeIdPattern = /^[a-z0-9]([-a-z0-9]{0,53}[a-z0-9])?$/;
+const cellboxBackupIdPattern = /^[0-9a-f]{64}$/;
 /** The internal Cellbox REST contract. Calls require no Cellbox credential. */
 export interface CellboxCapabilities {
   exec: boolean; files: boolean; http: boolean; websocket: boolean;
   pty: boolean; reconnectExec: boolean; freeze: boolean;
   suspend: 'none' | 'same-node-checkpoint'; archives: string; protectedTools: boolean;
   sharedDirectory?: boolean;
+  persistentHome?: boolean;
   mountedDebugHome?: boolean;
   rootDebug?: boolean;
   credentialBatch?: boolean;
@@ -22,43 +26,62 @@ export interface CellboxProfile {
   image: string; workspace: string; agent: { uid: number; gid: number };
   cpu: number; memoryMiB: number;
 }
-export type CellboxPhase = 'creating' | 'running' | 'freezing' | 'frozen' | 'unfreezing'
-  | 'rebuilding' | 'checkpointing' | 'suspending' | 'suspended' | 'resuming' | 'restoring' | 'staged' | 'deleting' | 'deleted' | 'failed';
+export interface CellboxTemplate {
+  id: string; name: string; description?: string; defaultWarmSlots: number;
+  stableRevisionId?: string; generation: number; createdAt: string; updatedAt: string;
+}
+export interface CellboxTemplateRevision {
+  id: string; templateId: string; templateName: string; description?: string; userVersion: string;
+  revision: number; version: string; profileId: string; baseImage: string; resolvedBaseImage: string;
+  image: string; buildCommand?: string; runCommand?: string; platform: string; cpu: number;
+  memoryMiB: number; warmSlots: number; status: 'active' | 'retired'; generation: number;
+  buildOperationId: string; createdAt: string; updatedAt: string;
+}
+export interface CellboxBuildRequest {
+  userVersion: string; baseImage: string; profileId: string; buildCommand?: string;
+  runCommand?: string; platform?: string; warmSlots?: number;
+}
+export type CellboxPhase = 'creating' | 'running' | 'checkpointing' | 'suspending' | 'suspended'
+  | 'resuming' | 'restoring' | 'staged' | 'deleting' | 'deleted' | 'failed';
+export interface CellboxMount { volumeId: string; mountPath: string; readOnly?: boolean }
+export interface CellboxVolume {
+  id: string; ownerKey: string; profileId: string; nodeName: string; phase: string;
+  resourceVersion: number; createdAt: string; operationId?: string; error?: { code: string; message: string };
+}
+export interface CellboxBackupPolicy {
+  engine: 'restic'; scope: 'volume'; keepLast: number; enabled: boolean;
+}
+export interface CellboxVolumeBackup {
+  id: string; createdAt: string; volumeId: string; ownerKey: string; profileId: string;
+  sizeBytes?: number; addedBytes?: number;
+}
 export interface CellboxBox {
-  id: string; ownerKey: string; profileId: string; phase: CellboxPhase; generation: number;
-  resourceVersion: number; importedImageId?: string; image: string; imageId?: string; workspace: string;
+  mounts?: CellboxMount[];
+  homeVolumeId?: string;
+  id: string; ownerKey: string; profileId: string; templateId: string; revisionId: string;
+  templateName: string; templateVersion: string; phase: CellboxPhase; generation: number;
+  resourceVersion: number; image: string; imageId?: string; workspace: string;
   capabilities: CellboxCapabilities; operationId?: string; executionId?: string; observedAt?: string; createdAt: string;
   error?: { code: string; message: string };
 }
-export interface CellboxImportedImage {
-  id: string; source: string; resolvedSource: string; image: string; platform: string;
-  command: string[]; env: Record<string, string>; workingDir: string;
-  buildCommand?: string; ports: number[]; warnings: string[]; key: string; createdAt: string;
-  deleting?: boolean;
-}
-export interface CellboxImportImageInput {
-  url: string; buildCommand?: string; runCommand?: string; platform?: 'linux/amd64';
-  registryAuth?: { username: string; password: string };
-}
 export interface CellboxOperation {
-  id: string; kind: string; targetId: string; status: 'queued' | 'running' | 'succeeded' | 'failed';
-  version: number; createdAt: string; finishedAt?: string;
-  result?: Record<string, string>; error?: { code: string; message: string };
-  /** Authoritative terminal Box snapshot returned by ensure-running. */
   box?: CellboxBox;
+  id: string; kind: string; targetId: string; status: 'queued' | 'running' | 'succeeded' | 'failed';
+  stage?: string; input?: CellboxBuildRequest; version: number; createdAt: string; startedAt?: string;
+  updatedAt?: string; finishedAt?: string;
+  result?: Record<string, string>; error?: { code: string; message: string };
 }
 export interface CellboxExecution {
   id: string; boxId: string; operationId: string; state: 'running' | 'exited' | 'unknown';
   result?: { stdout: string; stderr: string; exitCode: number; truncated?: boolean };
 }
-export interface CellboxRoute { id: string; boxId: string; port: number; url: string }
 export interface CellboxArchive {
-  id: string; sourceBoxId: string; profileId: string; imageId: string;
+  id: string; sourceBoxId: string; profileId: string; imageId: string; templateId: string;
+  revisionId: string; templateName: string; templateVersion: string; manifestVersion?: number;
   agent: { uid: number; gid: number }; sha256: string; size: number;
   consistency: string; createdAt: string;
   portable?: boolean;
 }
-export interface CellboxLease { id: string; boxId: string; purpose: string; expiresAt: string }
 export type CellboxErrorCode =
   | 'INVALID_REQUEST' | 'UNAUTHENTICATED' | 'FORBIDDEN' | 'NOT_FOUND' | 'CONFLICT' | 'BUSY'
   | 'STALE_GENERATION' | 'UNSUPPORTED_CAPABILITY' | 'TIMEOUT' | 'ARCHIVE_INCOMPATIBLE'
@@ -66,7 +89,7 @@ export type CellboxErrorCode =
 
 export class CellboxError extends Error {
   constructor(public readonly code: CellboxErrorCode, message: string, public readonly status?: number,
-    public readonly idempotencyKey?: string, options?: ErrorOptions) {
+    options?: ErrorOptions) {
     super(message, options);
     this.name = 'CellboxError';
   }
@@ -87,7 +110,7 @@ function statusCode(status: number): CellboxErrorCode {
 
 export interface CellboxClientOptions {
   baseUrl: string;
-  /** Data/idempotency namespace; defaults to the API's configured clientId. */
+  /** Tenant namespace; defaults to the API's configured clientId. */
   clientId?: string;
   fetch?: typeof fetch;
   requestTimeoutMs?: number;
@@ -113,8 +136,6 @@ export class CellboxClient {
       throw new CellboxError('INVALID_REQUEST', 'requestTimeoutMs must be a positive integer');
   }
   get origin() { return new URL(this.baseUrl).origin; }
-  /** Server-side access uses the configured API gateway, independent of public route DNS. */
-  serviceUrl(routeId: string) { return `${this.baseUrl}/s/${this.id(routeId)}/`; }
   private clientHeaders(): Record<string, string> {
     return this.clientId ? { 'X-Cellbox-Client-ID': this.clientId } : {};
   }
@@ -125,31 +146,29 @@ export class CellboxClient {
     return { url: `${this.baseUrl}/v1/boxes/${this.id(boxId)}/services/${port}/`, headers: this.clientHeaders() };
   }
   private request<T>(method: string, path: string, options: {
-    body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
+    body?: unknown; bytes?: Uint8Array; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
   } = {}): Promise<T> {
-    // GETs and non-lifecycle mutations are usually metadata, leases, or
-    // maintenance calls. Keep trace context flowing through them, while
+    // GETs and metadata mutations keep trace context flowing through them, while
     // retaining spans for the box lifecycle and exec operations.
     const endpoint = path.split('?')[0];
     const coreMutation = method === 'POST' && (endpoint === '/v1/boxes' || endpoint === '/v1/boxes:restore'
-      || /^\/v1\/boxes\/[^/]+:(?:suspend|resume|ensure-running|destroy|activate|reconcile|rebuild)$/.test(endpoint)
-      || /^\/v1\/boxes\/[^/]+\/execs$/.test(endpoint));
+      || endpoint === '/v1/volumes' || endpoint === '/v1/volumes:restore'
+      || /^\/v1\/boxes\/[^/]+:(?:suspend|resume|destroy|activate)$/.test(endpoint)
+      || /^\/v1\/boxes\/[^/]+\/execs$/.test(endpoint)
+      || /^\/v1\/volumes\/[^/]+\/backups$/.test(endpoint))
+      || method === 'DELETE' && /^\/v1\/volumes\/[^/]+$/.test(endpoint);
     if (!coreMutation) return this.requestImpl<T>(method, path, options);
     return traced('cellbox.http.client', { 'http.request.method': method, 'url.path': path.split('?')[0],
       'http.request.timeout_ms': options.timeoutMs ?? this.requestTimeoutMs },
     () => this.requestImpl<T>(method, path, options), SpanKind.CLIENT);
   }
   private async requestImpl<T>(method: string, path: string, options: {
-    body?: unknown; bytes?: Uint8Array; key?: string; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
+    body?: unknown; bytes?: Uint8Array; signal?: AbortSignal; response?: 'json' | 'bytes' | 'empty'; maxBytes?: number; timeoutMs?: number;
   }): Promise<T> {
     if (options.signal?.aborted) throw new CellboxError('TRANSPORT', 'Cellbox request was cancelled before submission');
     const outgoing = this.clientHeaders();
     injectTraceHeaders(outgoing);
     const headers = new Headers(outgoing);
-    if (options.key !== undefined) {
-      if (!options.key || options.key.length > 200) throw new CellboxError('INVALID_REQUEST', 'Idempotency key must contain 1..200 characters');
-      headers.set('Idempotency-Key', options.key);
-    }
     let body: BodyInit | undefined;
     if (options.bytes) { headers.set('Content-Type', 'application/octet-stream'); body = new Uint8Array(options.bytes); }
     else if (options.body !== undefined) { headers.set('Content-Type', 'application/json'); body = JSON.stringify(options.body); }
@@ -161,32 +180,29 @@ export class CellboxClient {
     } catch (cause) {
       const mutation = method !== 'GET';
       throw new CellboxError(mutation ? 'UNKNOWN_OUTCOME' : 'TRANSPORT',
-        mutation ? options.key
-          ? 'Cellbox mutation outcome is unknown; retry with the same idempotency key or inspect its operation'
-          : 'Cellbox mutation outcome is unknown; inspect server state before retry'
-          : 'Cellbox request failed',
-        undefined, options.key, { cause });
+        mutation ? 'Cellbox mutation outcome is unknown; inspect server state before deciding what to do'
+          : 'Cellbox request failed', undefined, { cause });
     }
     if (!response.ok) {
       let error: { code?: string; message?: string } | undefined;
       try { error = (JSON.parse(Buffer.from(await this.readBounded(response, 1024 * 1024)).toString()) as { error?: { code?: string; message?: string } }).error; }
       catch { /* Preserve HTTP status. */ }
-      throw new CellboxError(error?.code ?? statusCode(response.status), error?.message ?? `Cellbox HTTP ${response.status}`, response.status, options.key);
+      throw new CellboxError(error?.code ?? statusCode(response.status), error?.message ?? `Cellbox HTTP ${response.status}`, response.status);
     }
     if (options.response === 'empty') return undefined as T;
     let bytes: Uint8Array;
     try { bytes = await this.readBounded(response, options.maxBytes ?? (options.response === 'bytes' ? 16 * 1024 * 1024 : 8 * 1024 * 1024)); }
     catch (cause) {
-      if (cause instanceof CellboxError) throw cause;
+      if (cause instanceof CellboxError && method === 'GET') throw cause;
       throw new CellboxError(method === 'GET' ? 'TRANSPORT' : 'UNKNOWN_OUTCOME',
-        method === 'GET' ? 'Cellbox response could not be read' : 'Cellbox mutation response was interrupted; inspect its operation before retry',
-        response.status, options.key, { cause });
+        method === 'GET' ? 'Cellbox response could not be read' : 'Cellbox mutation response was interrupted; inspect server state before deciding what to do',
+        response.status, { cause });
     }
     if (options.response === 'bytes') return bytes as T;
     try { return JSON.parse(Buffer.from(bytes).toString()) as T; }
     catch (cause) { throw new CellboxError(method === 'GET' ? 'PROTOCOL' : 'UNKNOWN_OUTCOME',
-      method === 'GET' ? 'Cellbox returned invalid JSON' : 'Cellbox mutation response was invalid; inspect its operation before retry',
-      response.status, options.key, { cause }); }
+      method === 'GET' ? 'Cellbox returned invalid JSON' : 'Cellbox mutation response was invalid; inspect server state before deciding what to do',
+      response.status, { cause }); }
   }
   private async readBounded(response: Response, maxBytes: number): Promise<Uint8Array> {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new CellboxError('INVALID_REQUEST', 'Response byte limit must be a nonnegative safe integer');
@@ -217,46 +233,87 @@ export class CellboxClient {
     return result;
   }
   private id(id: string) { return encodeURIComponent(id); }
-  importImage(input: CellboxImportImageInput, key: string) {
-    return this.request<CellboxOperation>('POST', '/v1/images:import', { body: input, key });
+  listTemplates(signal?: AbortSignal) { return this.request<CellboxTemplate[]>('GET', '/v1/templates', { signal }); }
+  getTemplate(id: string, signal?: AbortSignal) { return this.request<CellboxTemplate>('GET', `/v1/templates/${this.id(id)}`, { signal }); }
+  createTemplate(input: { name: string; description?: string; defaultWarmSlots?: number }) {
+    return this.request<CellboxTemplate>('POST', '/v1/templates', { body: input });
   }
-  listImages() { return this.request<CellboxImportedImage[]>('GET', '/v1/images'); }
-  getImage(id: string) { return this.request<CellboxImportedImage>('GET', `/v1/images/${this.id(id)}`); }
-  imageUsage(id: string) { return this.request<{ deletable: boolean; blockers: string[]; manifestShared: boolean }>('GET', `/v1/images/${this.id(id)}/usage`); }
-  deleteImage(id: string, key: string) { return this.request<CellboxOperation>('DELETE', `/v1/images/${this.id(id)}`, { key }); }
+  updateTemplate(id: string, input: { expectedGeneration: number; description?: string; defaultWarmSlots?: number; stableRevisionId?: string }) {
+    return this.request<CellboxTemplate>('PATCH', `/v1/templates/${this.id(id)}`, { body: input });
+  }
+  listTemplateRevisions(templateId: string, userVersion?: string, signal?: AbortSignal) {
+    const query = userVersion === undefined ? '' : `?userVersion=${encodeURIComponent(userVersion)}`;
+    return this.request<CellboxTemplateRevision[]>('GET', `/v1/templates/${this.id(templateId)}/revisions${query}`, { signal });
+  }
+  createTemplateRevision(templateId: string, input: CellboxBuildRequest) {
+    return this.request<CellboxOperation>('POST', `/v1/templates/${this.id(templateId)}/revisions`, { body: input });
+  }
+  getTemplateRevision(id: string, signal?: AbortSignal) {
+    return this.request<CellboxTemplateRevision>('GET', `/v1/template-revisions/${this.id(id)}`, { signal });
+  }
+  updateTemplateRevision(id: string, input: { expectedGeneration: number; description?: string; status?: 'active' | 'retired'; warmSlots?: number }) {
+    return this.request<CellboxTemplateRevision>('PATCH', `/v1/template-revisions/${this.id(id)}`, { body: input });
+  }
   listProfiles(signal?: AbortSignal) { return this.request<CellboxProfile[]>('GET', '/v1/profiles', { signal }); }
-  setWarmDefaultImage(profileId: string, importedImageId?: string) {
-    return this.request<{ image: string }>('PUT', `/v1/profiles/${this.id(profileId)}/warm-default`, { body: importedImageId ? { importedImageId } : {} });
-  }
   listBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes', { signal }); }
   listResourceBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes?observation=resource', { signal }); }
   listCheckpoints(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/checkpoints', { signal }); }
   getBox(id: string, signal?: AbortSignal) { return this.request<CellboxBox>('GET', `/v1/boxes/${this.id(id)}`, { signal }); }
-  createBox(input: { profileId: string; ownerKey: string; importedImageId?: string; staged?: boolean }, key: string) {
-    return this.request<CellboxOperation>('POST', '/v1/boxes', { body: input, key });
+  listVolumes(signal?: AbortSignal) { return this.request<CellboxVolume[]>('GET', '/v1/volumes', { signal }); }
+  getVolume(id: string, signal?: AbortSignal) { return this.request<CellboxVolume>('GET', `/v1/volumes/${this.id(id)}`, { signal }); }
+  getBackupPolicy(signal?: AbortSignal) { return this.request<CellboxBackupPolicy>('GET', '/v1/backup-policy', { signal }); }
+  createVolume(input: { id?: string; ownerKey: string; profileId: string }) {
+    return this.request<CellboxOperation>('POST', '/v1/volumes', { body: input });
   }
-  restoreBox(input: { profileId: string; ownerKey: string; archiveId: string; importedImageId?: string; acceptImageChange?: boolean }, key: string) {
-    return this.request<CellboxOperation>('POST', '/v1/boxes:restore', { body: input, key });
+  deleteVolume(id: string) { return this.request<CellboxOperation>('DELETE', `/v1/volumes/${this.id(id)}`); }
+  createVolumeBackup(volumeId: string) {
+    if (!cellboxVolumeIdPattern.test(volumeId))
+      throw new CellboxError('INVALID_REQUEST', 'Invalid Cellbox volume ID');
+    return this.request<CellboxOperation>('POST', `/v1/volumes/${this.id(volumeId)}/backups`, { body: {} });
   }
-  actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate' | 'reconcile' | 'rebuild', key: string,
+  listVolumeBackups(volumeId: string, signal?: AbortSignal) {
+    if (!cellboxVolumeIdPattern.test(volumeId))
+      throw new CellboxError('INVALID_REQUEST', 'Invalid Cellbox volume ID');
+    return this.request<CellboxVolumeBackup[]>('GET', `/v1/volumes/${this.id(volumeId)}/backups`, { signal });
+  }
+  getVolumeBackup(volumeId: string, backupId: string, signal?: AbortSignal) {
+    if (!cellboxVolumeIdPattern.test(volumeId))
+      throw new CellboxError('INVALID_REQUEST', 'Invalid Cellbox volume ID');
+    if (!cellboxBackupIdPattern.test(backupId))
+      throw new CellboxError('INVALID_REQUEST', 'A full 64-character backup ID is required');
+    return this.request<CellboxVolumeBackup>('GET', `/v1/volumes/${this.id(volumeId)}/backups/${this.id(backupId)}`, { signal });
+  }
+  restoreVolume(input: { sourceVolumeId: string; backupId: string; ownerKey: string; id?: string }) {
+    if (!cellboxVolumeIdPattern.test(input.sourceVolumeId) || !cellboxBackupIdPattern.test(input.backupId) ||
+      typeof input.ownerKey !== 'string' || Buffer.byteLength(input.ownerKey, 'utf8') < 1 || Buffer.byteLength(input.ownerKey, 'utf8') > 256 ||
+      (input.id !== undefined && !cellboxVolumeIdPattern.test(input.id)))
+      throw new CellboxError('INVALID_REQUEST', 'Valid source volume ID, full backup ID, owner key, and optional target volume ID are required');
+    return this.request<CellboxOperation>('POST', '/v1/volumes:restore', { body: input });
+  }
+  createBox(input: { id?: string; ownerKey: string; revisionId?: string; templateId?: string; staged?: boolean;
+    homeVolumeId?: string; mounts?: CellboxMount[] }, _legacyKey?: string) {
+    if (Boolean(input.revisionId) === Boolean(input.templateId)) throw new CellboxError('INVALID_REQUEST', 'Exactly one of revisionId or templateId is required');
+    if (input.homeVolumeId && input.mounts?.length) throw new CellboxError('INVALID_REQUEST', 'Specify mounts or homeVolumeId, not both');
+    return this.request<CellboxOperation>('POST', '/v1/boxes', { body: input });
+  }
+  restoreBox(input: { ownerKey: string; archiveId: string; revisionId?: string; templateId?: string; acceptImageChange?: boolean }, _legacyKey?: string) {
+    if (Boolean(input.revisionId) === Boolean(input.templateId)) throw new CellboxError('INVALID_REQUEST', 'Exactly one of revisionId or templateId is required');
+    return this.request<CellboxOperation>('POST', '/v1/boxes:restore', { body: input });
+  }
+  actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate', _legacyKey?: string,
     options: { timeoutMs?: number; expectedGeneration?: number; signal?: AbortSignal } = {}) {
     if (options.expectedGeneration !== undefined && (!Number.isSafeInteger(options.expectedGeneration) || options.expectedGeneration < 1))
       throw new CellboxError('INVALID_REQUEST', 'expectedGeneration must be a positive safe integer');
     const body = options.expectedGeneration === undefined ? undefined : { expectedGeneration: options.expectedGeneration };
-    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { key, body, timeoutMs: options.timeoutMs, signal: options.signal });
+    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { body, timeoutMs: options.timeoutMs, signal: options.signal });
   }
-  ensureRunning(id: string, key: string, options: { expectedGeneration?: number; signal?: AbortSignal; timeoutMs?: number } = {}) {
-    if (options.expectedGeneration !== undefined && (!Number.isSafeInteger(options.expectedGeneration) || options.expectedGeneration < 1))
-      throw new CellboxError('INVALID_REQUEST', 'expectedGeneration must be a positive safe integer');
-    const body = options.expectedGeneration === undefined ? undefined : { expectedGeneration: options.expectedGeneration };
-    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:ensure-running`, { key, body, signal: options.signal, timeoutMs: options.timeoutMs });
-  }
+
   /** Purge owned artifacts after destruction; old APIs must fail rather than silently skip cleanup. */
   purgeBoxArtifacts(id: string) {
     return this.request<void>('POST', `/v1/boxes/${this.id(id)}:purge`, { response: 'empty' });
   }
-  exec(id: string, input: { argv: string[]; expectedGeneration: number; cwd?: string; env?: Record<string, string>; timeoutMs?: number }, key: string, signal?: AbortSignal) {
-    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}/execs`, { body: input, key, signal });
+  exec(id: string, input: { argv: string[]; expectedGeneration: number; cwd?: string; env?: Record<string, string>; timeoutMs?: number }, signal?: AbortSignal) {
+    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}/execs`, { body: input, signal });
   }
   getOperation(id: string, signal?: AbortSignal, waitMs = 0) {
     if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > 10_000) throw new CellboxError('INVALID_REQUEST', 'waitMs must be 0..10000');
@@ -277,7 +334,7 @@ export class CellboxClient {
         method: options.method ?? 'GET', headers, redirect: 'error',
         signal: options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal,
       });
-    } catch (cause) { throw new CellboxError('TRANSPORT', 'Cellbox file request failed', undefined, undefined, { cause }); }
+    } catch (cause) { throw new CellboxError('TRANSPORT', 'Cellbox file request failed', undefined, { cause }); }
     finally { clearTimeout(timer); }
     if (!response.ok && response.status !== 304 && response.status !== 416 && response.status !== 412) {
       let error: { code?: string; message?: string } | undefined;
@@ -321,16 +378,9 @@ export class CellboxClient {
     return this.request<{ stdout: string; stderr: string; exitCode: number; truncated?: boolean }>('POST',
       `/v1/boxes/${this.id(boxId)}/tools/${this.id(tool)}`, { body: { args, timeoutMs }, timeoutMs: timeoutMs + 30_000 });
   }
-  createRoute(boxId: string, port: number) { return this.request<CellboxRoute>('POST', '/v1/routes', { body: { boxId, port } }); }
-  createLease(boxId: string, purpose: string, ttlSeconds = 60) {
-    return this.request<CellboxLease>('POST', `/v1/boxes/${this.id(boxId)}/leases`, { body: { purpose, ttlSeconds } });
-  }
-  renewLease(id: string, purpose: string, ttlSeconds = 60) {
-    return this.request<CellboxLease>('PATCH', `/v1/leases/${this.id(id)}`, { body: { purpose, ttlSeconds } });
-  }
-  releaseLease(id: string) { return this.request<void>('DELETE', `/v1/leases/${this.id(id)}`, { response: 'empty' }); }
-  captureArchive(boxId: string, key: string, options?: { diskOnly: boolean }) {
-    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(boxId)}/archives`, { key, ...(options ? { body: options } : {}) });
+  captureArchive(boxId: string, _legacyKey?: string, options?: { diskOnly: boolean }) {
+    if (options?.diskOnly) throw new CellboxError('UNSUPPORTED_CAPABILITY', 'Cellbox archives do not support diskOnly capture');
+    return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(boxId)}/archives`);
   }
   listArchives() { return this.request<CellboxArchive[]>('GET', '/v1/archives'); }
   getArchive(id: string) { return this.request<CellboxArchive>('GET', `/v1/archives/${this.id(id)}`); }

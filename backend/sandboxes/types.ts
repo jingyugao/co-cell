@@ -8,6 +8,8 @@ export interface WorkspaceTarget {
   settings: { workingDirectory: string };
   imageSelection?: ProjectImageSelection;
   sandbox?: SandboxState;
+  sandboxMounts?: import('../../protocol/sandbox-types.js').SandboxMount[];
+  sandboxOwnerKey?: string;
   updatedAt: string;
 }
 export type ThreadWorkspace = WorkspaceTarget & { threadId: string | null; startedAt?: string; nativeHistoryPath?: string };

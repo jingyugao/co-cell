@@ -51,16 +51,23 @@ export class SandboxLifecycleService {
     const eligible = (await this.options.listProjects()).filter(project => {
       if (project.executionMode !== 'sandbox') return false;
       if (project.status !== 'completed') return false;
-      // Paused projects are backed up from disk without waking execution.
-      // Unhealthy/missing environments still require explicit confirmation.
-      if (project.sandbox?.status !== 'ready' && project.sandbox?.status !== 'paused' && !project.archiveCleanupSourceId) return false;
+      // A failed, unknown, or still-running operation needs an explicit user
+      // decision; a later sweep must not submit that mutation again.
+      if (project.sandboxOperation && project.sandboxOperation.status !== 'succeeded') return false;
+      if (project.sandboxBackup && project.sandboxBackup.status !== 'succeeded') return false;
+      // Automatic capture is disk-only: it can read a paused box or a box whose
+      // failed phase confirms execution has stopped. It never checkpoints a
+      // running box implicitly. A committed archive may still need cleanup.
+      if (project.sandbox) {
+        if (project.sandbox.status !== 'paused' && project.sandbox.phase !== 'failed') return false;
+      } else if (!project.archiveCleanupSourceId) return false;
       const timestamp = Date.parse(project.completedAt ?? '');
       return Number.isFinite(timestamp) && timestamp <= cutoff;
     });
     for (const project of eligible) {
       if (this.closed) break;
       try { await this.options.reclaim(project.id, { useExistingBackup: false }); }
-      catch { /* A busy project or transient failure is retried by a later sweep. */ }
+      catch { /* The next sweep consults persisted operation/backup state before any new submission. */ }
     }
   }
 

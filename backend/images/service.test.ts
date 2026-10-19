@@ -1,637 +1,204 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { Hono } from 'hono';
-import { z } from 'zod';
-import { CellboxClient, type CellboxOperation, type CellboxImportedImage } from '../../packages/sandbox/src/providers/cellbox/client.js';
+import { CellboxClient, CellboxError, type CellboxOperation, type CellboxTemplate, type CellboxTemplateRevision } from '../../packages/sandbox/src/providers/cellbox/client.js';
 import type { DefaultImageSelection } from '../../protocol/image-types.js';
+import type { Project } from '../../protocol/types.js';
 import type { ImageRecord } from './store.js';
 import { ImageCatalog } from './service.js';
-import { installImageRoutes } from './routes.js';
-import { installProjectsRoutes } from '../projects/routes.js';
-import { HttpError } from '../../util/errors.js';
-import type { Project } from '../../protocol/types.js';
-import { MemoryCoordinator } from '../infra/storage/coordination.js';
 
-function fixture() {
-  const documents = new Map<string, ImageRecord>();
-  const images = new Map<string, CellboxImportedImage>();
+function fixture(seed: ImageRecord[] = []) {
+  const documents = new Map(seed.map(record => [record.id, structuredClone(record)]));
+  const templates = new Map<string, CellboxTemplate>();
+  const revisions = new Map<string, CellboxTemplateRevision>();
   const operations = new Map<string, CellboxOperation>();
-  const submissions: Array<{ key: string; body: Record<string, unknown> }> = [];
-  const deletions: string[] = [];
-  const warmRequests: Array<Record<string, unknown>> = [];
-  const defaultSaves: Array<DefaultImageSelection | undefined> = [];
-  const projects: Project[] = [];
-  const upstream = new Map(['v1', 'v2', 'v3', 'latest'].map((tag, i) => [tag, `sha256:${String(i + 1).repeat(64)}`]));
-  let loseResponse = false;
-  let rejectDeletion = false;
-  let rejectWarmDefault = false;
-  let rejectDefaultSave = false;
-  let defaultImage: DefaultImageSelection | undefined;
-  const store = { listImages: async () => structuredClone([...documents.values()]),
-    saveImage: async (image: ImageRecord) => { documents.set(image.id, structuredClone(image)); },
-    loadDefaultImage: async () => structuredClone(defaultImage),
-    saveDefaultImage: async (selection: DefaultImageSelection | undefined, image?: ImageRecord) => {
-      if (rejectDefaultSave) throw new Error('default metadata unavailable');
-      if (image) documents.set(image.id, structuredClone(image));
-      defaultImage = structuredClone(selection);
-      defaultSaves.push(structuredClone(selection));
-    } };
-  const client = new CellboxClient({ baseUrl: 'http://cellbox.test', fetch: async (input, init) => {
-    const path = new URL(String(input)).pathname;
-    const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200 });
-    if (path === '/v1/profiles') return json([{ id: 'cocell', image: 'registry/default@sha256:default' }]);
-    if (path === '/v1/profiles/cocell/warm-default' && init?.method === 'PUT') {
-      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
-      warmRequests.push(body);
-      if (rejectWarmDefault) return new Response(JSON.stringify({ error: { code: 'UNAVAILABLE', message: 'warm pool unavailable' } }), { status: 503 });
-      const importedImageId = body.importedImageId as string | undefined;
-      return json({ image: importedImageId ? images.get(importedImageId)?.image ?? 'registry/prepared@sha256:missing' : 'registry/default@sha256:default' });
-    }
-    if (path === '/v1/images:import') {
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      const key = new Headers(init?.headers).get('Idempotency-Key')!;
-      const previous = submissions.find(submission => submission.key === key);
-      submissions.push({ key, body });
-      assert.ok([...documents.values()].some(image => image.versions.some(version => `cocell-image-${version.id}` === key)), 'request must be durable before submission');
-      if (previous && JSON.stringify(previous.body) !== JSON.stringify(body)) return new Response(JSON.stringify({ error: { code: 'CONFLICT', message: 'request changed' } }), { status: 409 });
-      const operation: CellboxOperation = operations.get(key) ?? { id: key, kind: 'image-import', targetId: key, status: 'running', version: 1, createdAt: new Date().toISOString() };
-      operations.set(key, operation);
-      if (loseResponse) { loseResponse = false; throw new Error('connection lost after acceptance'); }
-      return json(operation);
-    }
-    if (path === '/v1/images') return json([...images.values()]);
-    if (path.startsWith('/v1/images/')) {
-      if (path.endsWith('/usage')) return json({ deletable: true, blockers: [], manifestShared: false });
-      const image = images.get(decodeURIComponent(path.slice('/v1/images/'.length)));
-      if (init?.method === 'DELETE') {
-        if (rejectDeletion) return new Response(JSON.stringify({ error: { code: 'CONFLICT', message: 'box still references image' } }), { status: 409 });
-        const key = new Headers(init.headers).get('Idempotency-Key')!;
-        deletions.push(key);
-        const operation: CellboxOperation = operations.get(key) ?? { id: key, kind: 'image-delete', targetId: image!.id, status: 'running', version: 1, createdAt: '' };
-        operations.set(key, operation);
-        if (loseResponse) { loseResponse = false; throw new Error('connection lost after deletion acceptance'); }
-        return json(operation);
-      }
-      return image ? json(image) : new Response(JSON.stringify({ error: { code: 'NOT_FOUND', message: 'missing image' } }), { status: 404 });
-    }
-    if (path.startsWith('/v1/operations/')) return json(operations.get(decodeURIComponent(path.slice('/v1/operations/'.length))));
-    throw new Error(`Unexpected path ${path}`);
-  } });
-  const catalog = (coordinator?: MemoryCoordinator) => new ImageCatalog(store, client, 'cocell', {
-    listTags: async () => ({ tags: [...upstream.keys()] }),
-    resolveTag: async (_repository, tag) => { const digest = upstream.get(tag); if (!digest) throw new HttpError(404, 'Tag 不存在'); return digest; },
-  }, () => projects, coordinator);
-  function finish(operationId: string, source: string) {
-    const operation = operations.get(operationId)!;
-    operation.status = 'succeeded'; operation.result = { importedImageId: operationId };
-    const imageDigest = createHash('sha256').update(operationId).digest('hex');
-    images.set(operationId, { id: operationId, source, resolvedSource: `${source}@sha256:source`, image: `registry/prepared@sha256:${imageDigest}`,
-      platform: 'linux/amd64', command: ['/usr/local/bin/node', '/opt/product/cocell/launcher.mjs'], env: {}, workingDir: '/home/agent/workspace',
-      ports: [], warnings: ['runs as agent'], key: operationId, createdAt: new Date().toISOString() });
-  }
-  return { catalog, documents, submissions, deletions, warmRequests, defaultSaves, projects, operations, images, upstream, finish,
-    rejectDeletion: (reject: boolean) => { rejectDeletion = reject; }, loseResponse: () => { loseResponse = true; },
-    rejectWarmDefault: (reject: boolean) => { rejectWarmDefault = reject; },
-    rejectDefaultSave: (reject: boolean) => { rejectDefaultSave = reject; },
-    setDefaultImage: (selection: DefaultImageSelection | undefined) => { defaultImage = structuredClone(selection); } };
+  const builds: Array<{ templateId: string; input: Record<string, unknown> }> = [];
+  const templateUpdates: Array<{ id: string; input: Record<string, unknown> }> = [];
+  const defaultWrites: Array<DefaultImageSelection | undefined> = [];
+  let defaultSelection: DefaultImageSelection | undefined;
+  let unknownNextBuild = false;
+  const store = {
+    listImages: async () => structuredClone([...documents.values()]),
+    saveImage: async (record: ImageRecord) => { documents.set(record.id, structuredClone(record)); },
+    loadDefaultImage: async () => structuredClone(defaultSelection),
+    saveDefaultImage: async (selection: DefaultImageSelection | undefined, record?: ImageRecord) => {
+      defaultSelection = structuredClone(selection);
+      defaultWrites.push(structuredClone(selection));
+      if (record) documents.set(record.id, structuredClone(record));
+    },
+  };
+  const client = {
+    async listTemplates() { return [...templates.values()]; },
+    async getTemplate(id: string) { const value = templates.get(id); if (!value) throw new CellboxError('NOT_FOUND', 'template missing'); return value; },
+    async createTemplate(input: { name: string; description?: string }) {
+      const value: CellboxTemplate = { id: `template-${templates.size + 1}`, ...input, defaultWarmSlots: 0,
+        generation: 1, createdAt: '2026-10-18T00:00:00.000Z', updatedAt: '2026-10-18T00:00:00.000Z' };
+      templates.set(value.id, value); return value;
+    },
+    async updateTemplate(id: string, input: Record<string, unknown>) { templateUpdates.push({ id, input }); return templates.get(id)!; },
+    async listTemplateRevisions(id: string) { return [...revisions.values()].filter(value => value.templateId === id); },
+    async createTemplateRevision(templateId: string, input: Record<string, unknown>) {
+      if (unknownNextBuild) { unknownNextBuild = false; throw new CellboxError('UNKNOWN_OUTCOME', 'response lost'); }
+      const index = builds.length + 1;
+      builds.push({ templateId, input });
+      const operation: CellboxOperation = { id: `build-${index}`, kind: 'template-build', targetId: templateId,
+        status: 'running', version: 1, createdAt: '2026-10-18T00:00:00.000Z' };
+      operations.set(operation.id, operation);
+      const revision: CellboxTemplateRevision = { id: `revision-${index}`, templateId, templateName: templates.get(templateId)!.name,
+        userVersion: String(input.userVersion), revision: index, version: `${input.userVersion}-r${index}`, profileId: String(input.profileId),
+        baseImage: String(input.baseImage), resolvedBaseImage: `${input.baseImage}@sha256:resolved`, image: `built@sha256:${index}`,
+        buildCommand: String(input.buildCommand), runCommand: String(input.runCommand), platform: 'linux/amd64', cpu: 2, memoryMiB: 2048,
+        warmSlots: 0, status: 'active', generation: 1, buildOperationId: operation.id,
+        createdAt: '2026-10-18T00:00:00.000Z', updatedAt: '2026-10-18T00:00:00.000Z' };
+      revisions.set(revision.id, revision);
+      return operation;
+    },
+    async getTemplateRevision(id: string) { const value = revisions.get(id); if (!value) throw new CellboxError('NOT_FOUND', 'revision missing'); return value; },
+    async updateTemplateRevision(id: string, input: { status: 'active' | 'retired'; expectedGeneration: number }) {
+      const value = revisions.get(id)!;
+      const updated = { ...value, status: input.status, generation: value.generation + 1, updatedAt: '2026-10-18T01:00:00.000Z' };
+      revisions.set(id, updated); return updated;
+    },
+    async getOperation(id: string) { const value = operations.get(id); if (!value) throw new CellboxError('NOT_FOUND', 'operation missing'); return value; },
+  } as unknown as CellboxClient;
+  const registry = {
+    listTags: async () => ({ tags: ['v1', 'v2'] }),
+    resolveTag: async (_repository: string, tag: string) => `sha256:${(tag === 'v1' ? '1' : '2').repeat(64)}`,
+  };
+  const catalog = (options: { defaultTemplateId?: string; defaultRevisionId?: string } = {}) => new ImageCatalog(store, client, 'profile-test', registry, undefined, options);
+  return { catalog, documents, templates, revisions, operations, builds, templateUpdates, defaultWrites,
+    setUnknownNextBuild() { unknownNextBuild = true; },
+    completeBuild(id: string) {
+      const operation = operations.get(id)!;
+      operation.status = 'succeeded';
+      operation.result = { revisionId: operation.id.replace('build-', 'revision-') };
+    },
+  };
 }
 
-async function completeSync(f: ReturnType<typeof fixture>, catalog: ImageCatalog, imageId: string, tag: string, auth?: { username: string; password: string }) {
-  const result = await catalog.sync(imageId, { tag, ...(auth ? { registryAuth: auth } : {}) });
-  const version = result.versions[0];
-  f.finish(version.operationId!, version.source);
-  await catalog.list();
-  return version;
-}
-
-function emulatePreFingerprintVersion(f: ReturnType<typeof fixture>, imageId: string, versionId: string) {
-  const record = f.documents.get(imageId)!;
-  const version = record.versions.find(value => value.id === versionId)!;
-  // Older records retained the exact Cellbox request but had no desired-request fingerprint.
-  // A stale platform packaging script simulates the previous CoCell payload.
-  version.request.buildCommand = 'old platform payload without the current native tooling';
-  delete version.preparationKey;
-  f.documents.set(imageId, structuredClone(record));
-  return structuredClone(version);
-}
-
-test('image catalog refreshes durable records under a shared lock and shares live restore reservations', async () => {
-  const f = fixture(), coordinator = new MemoryCoordinator();
-  const firstCatalog = f.catalog(coordinator), secondCatalog = f.catalog(coordinator);
-  await Promise.all([firstCatalog.init(), secondCatalog.init()]);
-  const repository = await firstCatalog.addRepository({ name: 'Shared', category: '开发', repository: 'team/shared' });
-  await assert.rejects(secondCatalog.addRepository({ name: 'Shared', category: '开发', repository: 'team/shared' }), /该镜像仓库已添加/);
-
-  const first = (await firstCatalog.sync(repository.id, { tag: 'v1' })).versions[0];
-  f.finish(first.operationId!, first.source);
-  await firstCatalog.list();
-  const second = (await firstCatalog.sync(repository.id, { tag: 'v2' })).versions[0];
-  f.finish(second.operationId!, second.source);
-  await firstCatalog.list();
-  const pinned = (await firstCatalog.resolve(repository.id, first.id))!;
-  const reservation = await firstCatalog.acquireRestoreSelection({ id: 'archived-project', name: 'archived',
-    executionMode: 'sandbox', workingDirectory: '/workspace', status: 'archived', imageSelection: pinned,
-    requirementUrl: null, createdAt: '', updatedAt: '' }, second.id);
-  await assert.rejects(secondCatalog.removeVersion(repository.id, second.id), /正在被创建或恢复/);
-  await reservation.release();
-  f.projects.push({ id: 'restore-p', name: 'restore-p', executionMode: 'sandbox', workingDirectory: '/workspace',
-    status: 'archived', imageSelection: pinned, requirementUrl: null, createdAt: '', updatedAt: '',
-    sandboxOperation: { kind: 'restore', phase: '恢复 Sandbox', status: 'failed', updatedAt: '', imageSelection: reservation.selection } });
-  await assert.rejects(secondCatalog.removeVersion(repository.id, second.id), /恢复操作仍引用此版本/);
-  delete f.projects[0].sandboxOperation;
-  await secondCatalog.removeVersion(repository.id, second.id);
-  await coordinator.close();
-});
-
-test('version cleanup protects pinned projects, backups, defaults and in-flight restore reservations', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Go', category: '开发', repository: 'team/go' });
-  const first = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(first.operationId!, first.source);
-  const original = (await catalog.resolve(repo.id, first.id))!;
-  const second = (await catalog.sync(repo.id, { tag: 'v2' })).versions[0]; f.finish(second.operationId!, second.source);
-  await catalog.resolve(repo.id, second.id);
-  assert.equal((await catalog.list()).find(image => image.id === repo.id)?.defaultVersionId, first.id, 'sync alone must not switch restore defaults');
-  await assert.rejects(catalog.removeVersion(repo.id, first.id), /默认版本/);
-  await catalog.setDefault(repo.id, second.id);
-  const project: Project = { id: 'p', name: 'Go 服务', requirementUrl: null, executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', status: 'active', imageSelection: original, createdAt: '', updatedAt: '' };
-  f.projects.push(project);
-  await assert.rejects(catalog.removeVersion(repo.id, first.id), /仍固定此版本/);
-  project.status = 'archived';
-  project.remoteArchives = [{ id: 'archive', createdAt: '', sizeBytes: 1, sha256: 'a'.repeat(64), imageId: original.image, sourceSandboxId: 'box', threadIds: [] }];
-  await assert.rejects(catalog.removeVersion(repo.id, first.id), /依赖原镜像的备份/);
-  project.remoteArchives[0].portable = true;
-  const restore = await catalog.acquireRestoreSelection(project);
-  assert.equal(restore.selection?.versionId, second.id); await restore.release();
-  const oldRestore = await catalog.acquireRestoreSelection(project, first.id);
-  await assert.rejects(catalog.removeVersion(repo.id, first.id), /创建或恢复操作/); await oldRestore.release();
-  project.pendingSandboxCleanup = [{ id: 'stale', template: 'cocell', status: 'unavailable', workingDirectory: project.workingDirectory, image: { id: original.image, reference: original.image, repoDigests: [] } }];
-  await assert.rejects(catalog.removeVersion(repo.id, first.id), /待清理环境/);
-  project.pendingSandboxCleanup = [];
-  assert.equal((await catalog.usage(repo.id, first.id)).deletable, true);
-  f.rejectDeletion(true);
-  await assert.rejects(catalog.removeVersion(repo.id, first.id), /镜像仍被引用/);
-  assert.deepEqual(await catalog.resolve(repo.id, first.id), original, 'a rejected delete must leave the version available');
-  f.rejectDeletion(false);
-  const pending = await catalog.removeVersion(repo.id, first.id);
-  assert.equal(pending.versions.find(version => version.id === first.id)?.cleanup?.status, 'pending');
-  await assert.rejects(catalog.resolve(repo.id, first.id), /正在清理/);
-  const cleanup = f.operations.get(f.deletions[0])!; cleanup.status = 'succeeded'; f.images.delete(cleanup.targetId);
-  assert.equal((await catalog.list()).find(image => image.id === repo.id)?.versions.some(version => version.id === first.id), false);
-  assert.equal((await catalog.acquireRestoreSelection(project)).selection?.versionId, second.id);
-});
-
-test('lost cleanup acceptance remains unavailable across restart and retries the durable key', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
-  const old = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(old.operationId!, old.source);
-  await catalog.resolve(repo.id, old.id);
-  const next = (await catalog.sync(repo.id, { tag: 'v2' })).versions[0]; f.finish(next.operationId!, next.source);
-  await catalog.setDefault(repo.id, next.id);
-  f.loseResponse();
-  const unknown = await catalog.removeVersion(repo.id, old.id);
-  assert.equal(unknown.versions.find(version => version.id === old.id)?.cleanup?.status, 'unknown');
-  const restarted = f.catalog(); await restarted.init();
-  await assert.rejects(restarted.resolve(repo.id, old.id), /正在清理/);
-  await restarted.removeVersion(repo.id, old.id);
-  assert.equal(f.deletions[0], f.deletions[1]);
-  const operation = f.operations.get(f.deletions[0])!; operation.status = 'succeeded'; f.images.delete(operation.targetId);
-  assert.equal((await restarted.list()).find(image => image.id === repo.id)?.versions.length, 1);
-});
-
-test('versions resolve to distinct immutable images; records survive restart without credentials', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Python', category: '开发环境', repository: 'team/python',
-    buildCommand: 'cp /bundled/git /usr/local/bin/git' });
-  assert.equal(repo.repository, 'docker.io/team/python'); assert.equal(repo.versions.length, 0); assert.equal(f.submissions.length, 0);
-  assert.deepEqual((await catalog.tags(repo.id)).tags, [...f.upstream.keys()]);
-  const first = await catalog.sync(repo.id, { tag: 'v1', registryAuth: { username: 'private-user', password: 'private-password' } });
-  await assert.rejects(catalog.resolve(first.id, first.versions[0].id), /已导入成功/);
-  f.finish(first.versions[0].operationId!, 'team/python:v1');
-  const pinned = await catalog.resolve(first.id, first.versions[0].id);
-  const second = await catalog.sync(first.id, { tag: 'v2' });
-  f.finish(second.versions[0].operationId!, 'team/python:v2');
-  const restarted = f.catalog(); await restarted.init();
-  assert.deepEqual(await restarted.resolve(first.id, first.versions[0].id), pinned);
-  assert.notEqual((await restarted.resolve(first.id, second.versions[0].id))?.importedImageId, pinned?.importedImageId);
-  assert.equal((await restarted.list()).find(image => image.id === first.id)?.versions.length, 2);
-  assert.doesNotMatch(JSON.stringify([...f.documents.values()]), /private-password|private-user/);
-  assert.doesNotMatch(JSON.stringify(first), /private-password|private-user|"request"/);
-  assert.equal(f.submissions[0].body.registryAuth && (f.submissions[0].body.registryAuth as { password: string }).password, 'private-password');
-  assert.match(String(f.submissions[0].body.buildCommand), /\/bin\/sh -ec 'cp \/bundled\/git/);
-  assert.match(String(f.submissions[0].body.buildCommand), /launcher\.mjs/);
-  assert.doesNotMatch(String(f.submissions[0].body.buildCommand), /apt-get|curl|npm install/);
-  assert.equal(f.submissions[0].body.url, `docker.io/team/python@${f.upstream.get('v1')}`);
-  assert.equal(f.submissions[0].body.runCommand, `docker run -w /home/agent/workspace --entrypoint /usr/local/bin/node 'docker.io/team/python@${f.upstream.get('v1')}' /opt/product/cocell/launcher.mjs`);
-  await restarted.sync(first.id, { tag: 'v1' });
-  assert.equal(f.submissions.length, 2, 'unchanged upstream digest must not rebuild');
-});
-
-test('an upstream tag update creates a new pinned revision without changing existing project selections', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
-  const first = await catalog.sync(repo.id, { tag: 'latest' });
-  const original = first.versions[0]; f.finish(original.operationId!, original.source);
-  const selection = await catalog.resolve(repo.id, original.id);
-  f.upstream.set('latest', `sha256:${'a'.repeat(64)}`);
-  const updated = await catalog.sync(repo.id, { tag: 'latest' });
-  assert.equal(updated.versions.length, 2);
-  assert.equal(updated.versions[0].version, 'latest'); assert.equal(updated.versions[1].version, 'latest');
-  assert.notEqual(updated.versions[0].id, original.id);
-  assert.equal(f.submissions[1].body.url, `docker.io/team/node@sha256:${'a'.repeat(64)}`);
-  f.finish(updated.versions[0].operationId!, updated.versions[0].source);
-  const restarted = f.catalog(); await restarted.init();
-  assert.deepEqual(await restarted.resolve(repo.id, original.id), selection);
-  assert.notEqual((await restarted.resolve(repo.id, updated.versions[0].id))?.image, selection?.image);
-});
-
-test('global default persists across restart, marks one version, and updates warm target', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const profile = (await catalog.list()).find(image => image.origin === 'profile')!;
-  assert.equal(profile.versions[0].isDefault, true, 'profile image is the fallback before a global choice exists');
-  const repo = await catalog.addRepository({ name: 'Doris', category: '数据库', repository: 'team/doris' });
-  const first = await completeSync(f, catalog, repo.id, 'v1');
-  const second = await completeSync(f, catalog, repo.id, 'v2');
-  const secondSelection = (await catalog.resolve(repo.id, second.id))!;
-
-  const selected = await catalog.setDefault(repo.id, second.id);
-  assert.equal(selected.versions.find(version => version.id === second.id)?.isDefault, true);
-  assert.equal(selected.versions.find(version => version.id === first.id)?.isDefault, false);
-  assert.deepEqual(f.defaultSaves.at(-1), { imageId: repo.id, versionId: second.id });
-  assert.equal(f.warmRequests.at(-1)?.importedImageId, secondSelection.importedImageId);
-  await assert.rejects(catalog.setDeprecated(repo.id, second.id, true), /先设置其他默认镜像/);
-  await assert.rejects(catalog.removeVersion(repo.id, second.id), /当前默认镜像/);
-
-  const restarted = f.catalog(); await restarted.init();
-  const listed = (await restarted.list()).flatMap(image => image.versions.filter(version => version.isDefault));
-  assert.deepEqual(listed.map(version => [version.id, version.importedImageId]), [[second.id, secondSelection.importedImageId]]);
-  assert.equal(f.warmRequests.at(-1)?.importedImageId, secondSelection.importedImageId, 'restart reconciles Cellbox to the persisted selection');
-  const reservation = await restarted.acquireDefaultSelection();
-  assert.deepEqual(reservation.selection, secondSelection);
-  await reservation.release();
-});
-
-test('changing the global default affects new projects while existing selections stay pinned', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repoA = await catalog.addRepository({ name: 'MySQL', category: '数据库', repository: 'team/mysql' });
-  const repoB = await catalog.addRepository({ name: 'K8s', category: '集群', repository: 'team/k8s' });
-  const mysql = await completeSync(f, catalog, repoA.id, 'v1');
-  const k8s = await completeSync(f, catalog, repoB.id, 'v1');
-  await catalog.setDefault(repoA.id, mysql.id);
-  const existingPin = await catalog.acquireDefaultSelection();
-  assert.equal(existingPin.selection?.imageId, repoA.id);
-  assert.equal(existingPin.selection?.versionId, mysql.id);
-
-  await catalog.setDefault(repoB.id, k8s.id);
-  const newPin = await catalog.acquireDefaultSelection();
-  assert.equal(existingPin.selection?.imageId, repoA.id, 'an acquired selection remains immutable after the default changes');
-  assert.equal(newPin.selection?.imageId, repoB.id);
-  const defaults = (await catalog.list()).flatMap(image => image.versions.filter(version => version.isDefault));
-  assert.deepEqual(defaults.map(version => version.id), [k8s.id], 'only one version across all repositories is default');
-  await existingPin.release(); await newPin.release();
-});
-
-test('invalid, failed, and deprecated versions cannot become the global default', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
-  const failed = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0];
-  const failedOperation = f.operations.get(failed.operationId!)!;
-  failedOperation.status = 'failed'; failedOperation.error = { code: 'BUILD_FAILED', message: 'synthetic failure' };
-  await catalog.list();
-  await assert.rejects(catalog.setDefault(repo.id, failed.id), /已导入成功/);
-  await assert.rejects(catalog.setDefault(repo.id, 'missing-version'), /不存在/);
-
-  const ready = await completeSync(f, catalog, repo.id, 'v2');
-  await catalog.setDeprecated(repo.id, ready.id, true);
-  await assert.rejects(catalog.setDefault(repo.id, ready.id), /已弃用/);
-  assert.equal(f.defaultSaves.length, 0, 'rejected candidates do not persist a default');
-  assert.equal(f.warmRequests.filter(body => body.importedImageId).length, 0);
-});
-
-test('warm-default failure leaves global selection and managed metadata unchanged', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Doris', category: '数据库', repository: 'team/doris' });
-  const version = await completeSync(f, catalog, repo.id, 'v1');
-  const priorRepoDefault = f.documents.get(repo.id)?.defaultVersionId;
-  f.rejectWarmDefault(true);
-  await assert.rejects(catalog.setDefault(repo.id, version.id), /warm pool unavailable/);
-  assert.equal(f.defaultSaves.length, 0);
-  assert.equal(f.documents.get(repo.id)?.defaultVersionId, priorRepoDefault);
-  assert.equal((await catalog.list()).find(image => image.id === repo.id)?.versions.find(value => value.id === version.id)?.isDefault, false);
-});
-
-test('a failed durable default write restores the previous warm target', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
-  const first = await completeSync(f, catalog, repo.id, 'v1');
-  const second = await completeSync(f, catalog, repo.id, 'v2');
-  await catalog.setDefault(repo.id, first.id);
-  f.rejectDefaultSave(true);
-  await assert.rejects(catalog.setDefault(repo.id, second.id), /metadata unavailable/);
-  assert.equal(f.documents.get(repo.id)?.defaultVersionId, first.id);
-  assert.equal(f.warmRequests.at(-1)?.importedImageId, (await catalog.resolve(repo.id, first.id))?.importedImageId);
-  const listed = (await catalog.list()).flatMap(image => image.versions.filter(version => version.isDefault));
-  assert.deepEqual(listed.map(version => version.id), [first.id]);
-});
-
-test('an external default remains visible after adding its repository and can reset to the system image', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const remote: CellboxImportedImage = { id: 'external', source: 'docker.io/team/external:v1', resolvedSource: 'docker.io/team/external@sha256:' + 'a'.repeat(64),
-    image: 'registry/prepared@sha256:' + 'b'.repeat(64), platform: 'linux/amd64', command: ['/usr/local/bin/node', '/opt/product/cocell/launcher.mjs'],
-    workingDir: '/home/agent/workspace', env: {}, ports: [], warnings: [], key: 'external', createdAt: new Date().toISOString() };
-  f.images.set(remote.id, remote);
-  const external = (await catalog.list()).find(image => image.origin === 'cellbox')!;
-  await catalog.setDefault(external.id, remote.id);
-  await catalog.addRepository({ name: 'External', category: '开发', repository: 'team/external' });
-  assert.equal((await catalog.list()).find(image => image.id === external.id)?.versions[0].isDefault, true);
-  await catalog.setDefault('default', 'default');
-  assert.deepEqual(f.warmRequests.at(-1), {});
-  assert.deepEqual((await catalog.list()).flatMap(image => image.versions.filter(version => version.isDefault)).map(version => version.id), ['default']);
-  assert.equal((await catalog.acquireDefaultSelection()).selection, undefined);
-});
-
-test('init preserves an explicit default and requests profile fallback when none is saved', async () => {
-  const f = fixture(); const initial = f.catalog(); await initial.init();
-  assert.deepEqual(f.warmRequests[0], {}, 'no selection restores the profile-configured warm image');
-  const repo = await initial.addRepository({ name: 'MySQL', category: '数据库', repository: 'team/mysql' });
-  const version = await completeSync(f, initial, repo.id, 'v1');
-  const selection = (await initial.resolve(repo.id, version.id))!;
-  await initial.setDefault(repo.id, version.id);
-  f.warmRequests.length = 0;
-
-  const restarted = f.catalog(); await restarted.init();
-  assert.deepEqual(f.warmRequests, [{ importedImageId: selection.importedImageId }]);
-  assert.deepEqual(f.defaultSaves.at(-1), { imageId: repo.id, versionId: version.id }, 'init reconciles Cellbox without rewriting metadata');
-});
-
-test('native packaging refresh reuses an immutable prepared image and skips the operator build script', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const operatorCommand = 'cp /bundled/git /usr/local/bin/git';
-  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox',
-    buildCommand: operatorCommand, registryAuthRequired: true });
-  const auth = { username: 'synthetic-user', password: 'synthetic-password' };
-  const initial = await completeSync(f, catalog, repo.id, 'v1', auth);
-  assert.equal(f.submissions[0].body.registryAuth && (f.submissions[0].body.registryAuth as { password: string }).password, auth.password);
-  const prepared = emulatePreFingerprintVersion(f, repo.id, initial.id);
-
-  const refreshed = await catalog.sync(repo.id, { tag: 'v1', registryAuth: auth });
-  assert.equal(f.submissions.length, 2);
-  assert.equal(f.submissions[1].body.url, prepared.image);
-  assert.equal(f.submissions[1].body.registryAuth, undefined, 'upstream credentials must not reach the internal prepared-image import');
-  assert.doesNotMatch(String(f.submissions[1].body.buildCommand), /cp \/bundled\/git/);
-  assert.match(String(f.submissions[1].body.buildCommand), /launcher\.mjs/);
-  assert.doesNotMatch(JSON.stringify(refreshed), /preparationKey/);
-});
-
-test('retry after a failed repackaging sync reuses the earlier successful prepared image', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox',
-    buildCommand: 'cp /bundled/git /usr/local/bin/git' });
-  const initial = await completeSync(f, catalog, repo.id, 'v1');
-  const prepared = emulatePreFingerprintVersion(f, repo.id, initial.id);
-
-  const failed = await catalog.sync(repo.id, { tag: 'v1' });
-  const failedOperation = f.operations.get(failed.versions[0].operationId!)!;
-  failedOperation.status = 'failed'; failedOperation.error = { code: 'BUILD_FAILED', message: 'Cellbox unavailable' };
-  await catalog.list();
-  const retry = await catalog.sync(repo.id, { tag: 'v1' });
-  assert.equal(f.submissions.length, 3);
-  assert.equal(f.submissions[1].body.url, prepared.image);
-  assert.equal(f.submissions[2].body.url, prepared.image);
-  assert.equal(f.submissions[2].body.registryAuth, undefined);
-  assert.equal(retry.versions[0].status, 'running');
-});
-
-test('successful repackaging remains idempotent for the same source digest and operator command', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox',
-    buildCommand: 'cp /bundled/git /usr/local/bin/git' });
-  const initial = await completeSync(f, catalog, repo.id, 'v1');
-  emulatePreFingerprintVersion(f, repo.id, initial.id);
-
-  const repackaged = await completeSync(f, catalog, repo.id, 'v1');
-  assert.equal(f.submissions.length, 2);
-  const repeated = await catalog.sync(repo.id, { tag: 'v1' });
-  assert.equal(f.submissions.length, 2, 'an identical successful desired package must not start another import');
-  assert.equal(repeated.versions[0].id, repackaged.id);
-});
-
-test('changed upstream digest or operator build command forces a fresh upstream build', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const initialCommand = 'cp /bundled/git /usr/local/bin/git';
-  const repo = await catalog.addRepository({ name: 'Mybox', category: '开发环境', repository: 'team/mybox', buildCommand: initialCommand });
-  await completeSync(f, catalog, repo.id, 'v1');
-
-  const changedDigest = `sha256:${'b'.repeat(64)}`;
-  f.upstream.set('v1', changedDigest);
-  const sourceUpdate = await catalog.sync(repo.id, { tag: 'v1' });
-  assert.equal(f.submissions[1].body.url, `docker.io/team/mybox@${changedDigest}`);
-  assert.match(String(f.submissions[1].body.buildCommand), /cp \/bundled\/git/);
-  f.finish(sourceUpdate.versions[0].operationId!, sourceUpdate.versions[0].source);
-  await catalog.list();
-
-  const record = f.documents.get(repo.id)!;
-  record.buildCommand = 'echo changed-operator-command';
-  f.documents.set(repo.id, structuredClone(record));
-  const commandUpdate = await catalog.sync(repo.id, { tag: 'v1' });
-  assert.equal(f.submissions[2].body.url, `docker.io/team/mybox@${changedDigest}`);
-  assert.match(String(f.submissions[2].body.buildCommand), /echo changed-operator-command/);
-  assert.equal(commandUpdate.versions[0].status, 'running');
-});
-
-test('uncertain submission survives restart and retries the same request and key', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init(); f.loseResponse();
-  const repo = await catalog.addRepository({ name: 'Private', category: '开发', repository: 'team/private', registryAuthRequired: true });
-  await assert.rejects(catalog.tags(repo.id), /提供私有仓库/);
-  const image = await catalog.sync(repo.id, { tag: 'v1', registryAuth: { username: 'u', password: 'secret' } });
-  assert.equal(image.versions[0].status, 'unknown');
-  const restarted = f.catalog(); await restarted.init();
-  await assert.rejects(restarted.sync(repo.id, { tag: 'v2', registryAuth: { username: 'u', password: 'secret' } }), /结果待确认/);
-  await assert.rejects(restarted.retry(image.id, image.versions[0].id), /重新提供私有仓库凭证/);
-  const uncertain = await restarted.retry(image.id, image.versions[0].id, { username: 'u', password: 'incorrect' });
-  assert.equal(uncertain.versions[0].status, 'unknown', 'a retry conflict must not mark the original operation failed');
-  await restarted.retry(image.id, image.versions[0].id, { username: 'u', password: 'secret' });
-  assert.deepEqual(f.submissions[0], f.submissions[2]);
-  f.finish(f.submissions[2].key, 'team/private:v1');
-  assert.equal((await restarted.list()).find(value => value.id === image.id)?.versions[0].status, 'succeeded');
-});
-
-test('existing Cellbox versions are grouped and retain readiness validation', async () => {
+test('catalog creates a Cellbox template and each explicit sync submits one new revision build', async () => {
   const f = fixture();
-  for (const version of ['v1', 'v2']) {
-    f.operations.set(version, { id: version, kind: 'image-import', targetId: version, status: 'running', version: 1, createdAt: '' });
-    f.finish(version, `registry:5000/team/python:${version}`);
-  }
-  f.images.get('v1')!.command = ['/bin/sleep', 'infinity'];
-  const catalog = f.catalog(); await catalog.init();
-  const existing = (await catalog.list()).find(image => image.origin === 'cellbox')!;
-  assert.equal(existing.name, 'registry:5000/team/python'); assert.equal(existing.versions.length, 2);
-  await assert.rejects(catalog.resolve(existing.id, 'v1'), /未配置 CoCell 启动器/);
-  assert.equal((await catalog.resolve(existing.id, 'v2'))?.importedImageId, 'v2');
-  await assert.rejects(catalog.sync(existing.id, { tag: 'v3' }), /镜像仓库不存在/);
+  const catalog = f.catalog();
+  const repository = await catalog.addRepository({ name: 'Node 开发', category: '开发', repository: 'team/node', buildCommand: 'npm install' });
+  assert.equal(repository.templateStatus, 'ready');
+  assert.equal(f.templates.size, 1);
+
+  const first = await catalog.sync(repository.id, { tag: 'v1' });
+  assert.equal(f.builds.length, 1);
+  assert.equal(f.builds[0].input.baseImage, `docker.io/team/node@sha256:${'1'.repeat(64)}`);
+  assert.equal(first.versions[0].status, 'running');
+  f.completeBuild('build-1');
+  const ready = await catalog.list();
+  const selected = ready.find(image => image.id === repository.id)!.versions.find(version => version.revisionId === 'revision-1')!;
+  assert.equal(selected.status, 'succeeded');
+
+  await catalog.sync(repository.id, { tag: 'v1' });
+  assert.equal(f.builds.length, 2, 'a deliberate second submit is a new build, even for the same tag');
+  assert.notEqual(f.builds[0].input, f.builds[1].input);
 });
 
-test('build failures remain visible and cannot be chosen; active builds prevent a second submission', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
-  const image = await catalog.sync(repo.id, { tag: 'v1' });
-  await assert.rejects(catalog.sync(image.id, { tag: 'v2' }), /已有版本正在同步/);
-  assert.equal(f.submissions.length, 1);
-  const operation = f.operations.get(image.versions[0].operationId!)!;
-  operation.status = 'failed'; operation.error = { code: 'BUILD_FAILED', message: 'Codex missing' };
-  const version = (await catalog.list()).find(value => value.id === image.id)!.versions[0];
-  assert.equal(version.status, 'failed'); assert.equal(version.error, 'Codex missing');
-  await assert.rejects(catalog.resolve(image.id, version.id), /已导入成功/);
-  const retry = await catalog.sync(image.id, { tag: 'v1' });
-  assert.notEqual(retry.versions[0].id, version.id); assert.equal(f.submissions.length, 2);
-});
-
-test('project API resolves selections on the server and rejects incomplete or forged selection metadata', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
-  const image = await catalog.sync(repo.id, { tag: 'v1' });
-  f.finish(image.versions[0].operationId!, 'team/node:v1');
-  const app = new Hono();
-  app.onError((error, c) => c.json({ error: error.message }, error instanceof HttpError ? error.status as 400 : error instanceof z.ZodError ? 400 : 500));
-  const created: unknown[] = [];
-  installImageRoutes(app, catalog);
-  installProjectsRoutes(app, { createProject: async (input: Parameters<Parameters<typeof installProjectsRoutes>[1]['createProject']>[0]) => { created.push(input); return input as never; } } as unknown as Parameters<typeof installProjectsRoutes>[1], undefined, catalog);
-  const post = (body: unknown) => app.request('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  assert.equal((await post({ name: 'test', imageId: image.id })).status, 400);
-  assert.equal((await post({ name: 'test', imageSelection: { importedImageId: 'foreign' } })).status, 400);
-  assert.equal((await post({ name: 'test', imageId: image.id, imageVersionId: image.versions[0].id })).status, 201);
-  assert.equal((created[0] as { imageSelection: { importedImageId: string } }).imageSelection.importedImageId, image.versions[0].operationId);
-  assert.equal((await post({ name: 'default' })).status, 201);
-  const repositoryRequest = (body: unknown) => app.request('/api/images/repositories', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  assert.equal((await repositoryRequest({ name: 'Invalid', category: '开发', repository: 'team/other:v1' })).status, 400);
-  assert.equal((await repositoryRequest({ name: 'Invalid', category: '开发', repository: 'team/other', registryAuth: { username: 'u', password: 'secret' } })).status, 400);
-  const registered = await repositoryRequest({ name: 'Other', category: '开发', repository: 'team/other' });
-  assert.equal(registered.status, 201);
-  const saved = await registered.json() as { id: string; versions: unknown[] };
-  assert.deepEqual(saved.versions, []); assert.equal(f.submissions.length, 1, 'adding a repository must not build any version');
-  const tags = await app.request(`/api/images/${saved.id}/tags`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-  assert.equal(tags.status, 200); assert.deepEqual(await tags.json(), { tags: [...f.upstream.keys()] });
-  assert.equal((await repositoryRequest({ name: 'Duplicate', category: '开发', repository: 'docker.io/team/other' })).status, 409);
-  const sync = (body: unknown) => app.request(`/api/images/${repo.id}/versions/sync`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  assert.equal((await sync({ tag: 'v1', version: 'fake', url: 'foreign/image:v1' })).status, 400);
-  assert.equal((await sync({ tag: '../v1' })).status, 400);
-  assert.equal((await sync({ tag: 'v1' })).status, 202);
-});
-
-test('a rejected cleanup retry retains the failed operation for safe retry', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
-  const old = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(old.operationId!, old.source);
-  await catalog.resolve(repo.id, old.id);
-  const next = (await catalog.sync(repo.id, { tag: 'v2' })).versions[0]; f.finish(next.operationId!, next.source);
-  await catalog.setDefault(repo.id, next.id);
-  await catalog.removeVersion(repo.id, old.id);
-  const operation = f.operations.get(f.deletions[0])!;
-  operation.status = 'failed'; operation.error = { code: 'TRANSPORT', message: 'Registry deletion failed' };
-  await catalog.list();
-  f.rejectDeletion(true);
-  await assert.rejects(catalog.removeVersion(repo.id, old.id), /镜像仍被引用/);
-  const listed = (await catalog.list()).find(image => image.id === repo.id)!;
-  assert.equal(listed.versions.find(version => version.id === old.id)?.cleanup?.status, 'failed');
-  await assert.rejects(catalog.resolve(repo.id, old.id), /正在清理/);
-});
-
-
-test('deprecation persists, blocks new selections and moves restore default without changing pinned projects', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Go', category: '开发', repository: 'team/go' });
-  const first = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(first.operationId!, first.source);
-  const pinned = (await catalog.resolve(repo.id, first.id))!;
-  const second = (await catalog.sync(repo.id, { tag: 'v2' })).versions[0]; f.finish(second.operationId!, second.source);
-  const project: Project = { id: 'p', name: 'Pinned', requirementUrl: null, executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', status: 'active', imageSelection: pinned, createdAt: '', updatedAt: '' };
-  f.projects.push(project);
-  const app = new Hono();
-  app.onError((error, c) => c.json({ error: error.message }, error instanceof HttpError ? error.status as 400 : error instanceof z.ZodError ? 400 : 500));
-  installImageRoutes(app, catalog);
-  const patch = (body: unknown) => app.request(`/api/images/${repo.id}/versions/${first.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  assert.equal((await patch({ deprecated: 'true' })).status, 400);
-  assert.equal((await patch({ deprecated: true })).status, 200);
-  assert.equal((await catalog.list()).find(value => value.id === repo.id)?.defaultVersionId, second.id);
-  assert.deepEqual(project.imageSelection, pinned);
-  assert.equal(f.deletions.length, 0, 'deprecation must not delete the runtime image');
-  const restarted = f.catalog(); await restarted.init();
-  await assert.rejects(restarted.acquireSelection(repo.id, first.id), /已弃用/);
-  await assert.rejects(restarted.setDefault(repo.id, first.id), /已弃用/);
-  await assert.rejects(restarted.acquireRestoreSelection(project, first.id), /已弃用/);
-  const restore = await restarted.acquireRestoreSelection(project);
-  assert.equal(restore.selection?.versionId, second.id); await restore.release();
-  await restarted.setDeprecated(repo.id, second.id, true);
-  assert.equal((await restarted.list()).find(value => value.id === repo.id)?.defaultVersionId, undefined);
-  await assert.rejects(restarted.acquireRestoreSelection(project), /没有可恢复/);
-  await restarted.setDeprecated(repo.id, first.id, false);
-  assert.deepEqual(await restarted.resolve(repo.id, first.id), pinned);
-  assert.equal((await restarted.list()).find(value => value.id === repo.id)?.defaultVersionId, first.id);
-});
-
-test('Cellbox-discovered image lifecycle flags survive restart without duplicating inventory or enabling repository sync', async () => {
+test('unknown build submission is shown as unknown and is never replayed', async () => {
   const f = fixture();
-  f.operations.set('external', { id: 'external', kind: 'image-import', targetId: 'external', status: 'running', version: 1, createdAt: '' });
-  f.finish('external', 'docker.io/team/node:v1');
-  const catalog = f.catalog(); await catalog.init();
-  const image = (await catalog.list()).find(value => value.origin === 'cellbox')!;
-  await catalog.setDeprecated(image.id, 'external', true);
-  const restarted = f.catalog(); await restarted.init();
-  const inventory = (await restarted.list()).filter(value => value.id === image.id);
-  assert.equal(inventory.length, 1); assert.ok(inventory[0].versions[0].deprecatedAt);
-  await assert.rejects(restarted.resolve(image.id, 'external'), /已弃用/);
-  await assert.rejects(restarted.sync(image.id, { tag: 'v2' }), /镜像仓库不存在/);
-  await assert.rejects(restarted.setDeprecated('default', 'default', true), /平台配置/);
-  await restarted.setDeprecated(image.id, 'external', false);
-  assert.equal((await restarted.resolve(image.id, 'external'))?.importedImageId, 'external');
-  const repo = await restarted.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
-  assert.equal(repo.origin, 'managed', 'lifecycle flags must not prevent adding the upstream repository');
+  const catalog = f.catalog();
+  const repository = await catalog.addRepository({ name: 'Python', category: '开发', repository: 'team/python' });
+  f.setUnknownNextBuild();
+  const result = await catalog.sync(repository.id, { tag: 'v1' });
+  assert.equal(result.versions[0].status, 'unknown');
+  assert.match(result.versions[0].error!, /response lost/);
+  await assert.rejects(catalog.retry(repository.id, result.versions[0].id), /不会自动重放/);
+  assert.equal(f.builds.length, 0);
+  await catalog.sync(repository.id, { tag: 'v1' });
+  assert.equal(f.builds.length, 1, 'a new user submission creates one distinct operation');
+});
+
+test('startup changes an interrupted submitting record to unknown without sending a request', async () => {
+  const f = fixture();
+  f.documents.set('interrupted-template', { id: 'interrupted-template', name: 'Pending', category: '开发',
+    origin: 'managed', repository: 'team/pending', versions: [], templateStatus: 'submitting' });
+  f.documents.set('interrupted-build', { id: 'interrupted-build', name: 'Build', category: '开发',
+    origin: 'managed', templateId: 'template-existing', repository: 'team/build', templateStatus: 'ready',
+    versions: [{ id: 'pending-version', templateId: 'template-existing', version: 'v1', source: 'team/build:v1',
+      status: 'submitting', createdAt: '2026-10-18T00:00:00.000Z' }] });
+  const result = await f.catalog().list();
+  assert.equal(result.find(image => image.id === 'interrupted-template')?.templateStatus, 'unknown');
+  assert.equal(result.find(image => image.id === 'interrupted-build')?.versions[0].status, 'unknown');
+  assert.equal(f.builds.length, 0);
+});
+
+test('CoCell default selection is local and does not change Cellbox stable or warm settings', async () => {
+  const f = fixture();
+  const catalog = f.catalog();
+  const repository = await catalog.addRepository({ name: 'Go', category: '开发', repository: 'team/go' });
+  const submitted = await catalog.sync(repository.id, { tag: 'v1' });
+  f.completeBuild(submitted.versions[0].operationId!);
+  const version = (await catalog.list()).find(image => image.id === repository.id)!.versions.find(value => value.revisionId)!;
+  await catalog.setDefault(repository.id, version.id);
+  assert.deepEqual(f.defaultWrites.at(-1), { templateId: repository.templateId, revisionId: version.revisionId });
+  assert.equal(f.documents.get(repository.id)?.defaultVersionId, undefined, 'global default does not become a repository restore default');
+  assert.deepEqual(f.templateUpdates, []);
+});
+
+test('repository restore default follows Cellbox stable while CoCell global default remains independent', async () => {
+  const f = fixture();
+  const catalog = f.catalog();
+  const repository = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
+
+  const first = await catalog.sync(repository.id, { tag: 'v1' });
+  f.completeBuild(first.versions[0].operationId!);
+  f.templates.get(repository.templateId!)!.stableRevisionId = 'revision-1';
+  await catalog.setDefault(repository.id, 'revision-1');
+
+  const second = await catalog.sync(repository.id, { tag: 'v2' });
+  f.completeBuild(second.versions[0].operationId!);
+  f.templates.get(repository.templateId!)!.stableRevisionId = 'revision-2';
+  const record = f.documents.get(repository.id)!;
+  record.defaultVersionId = 'revision-1'; // stale pre-migration repository default
+  f.documents.set(repository.id, record);
+
+  const listed = (await catalog.list()).find(image => image.id === repository.id)!;
+  assert.equal(listed.defaultVersionId, 'revision-2');
+  const originalSelection = await catalog.resolve(repository.id, 'revision-1');
+  const restored = await catalog.acquireRestoreSelection({ id: 'project-one', imageSelection: originalSelection } as Project);
+  assert.equal(restored.selection.revisionId, 'revision-2');
+
+  const globalDefault = await catalog.acquireDefaultSelection();
+  assert.equal(globalDefault.selection.revisionId, 'revision-1');
+  assert.deepEqual(f.defaultWrites.at(-1), { templateId: repository.templateId, revisionId: 'revision-1' });
+  assert.deepEqual(f.templateUpdates, []);
+});
+
+test('legacy imported image is visible for migration and cannot resolve as a revision', async () => {
+  const old: ImageRecord = { id: 'old-repo', name: '旧仓库', category: '开发', origin: 'managed', repository: 'team/old',
+    versions: [{ id: 'old-image', version: 'v1', source: 'team/old:v1', importedImageId: 'img-old', image: 'team/old@sha256:abc',
+      status: 'succeeded', createdAt: '2025-01-01T00:00:00.000Z' }] };
+  const f = fixture([old]);
+  const catalog = f.catalog();
+  const listed = await catalog.list();
+  assert.equal(listed.find(image => image.id === old.id)?.migrationRequired, true);
+  await assert.rejects(catalog.resolve(old.id, 'old-image'), /尚未迁移/);
+});
+
+test('request-scoped private registry credentials are explicitly unsupported and are not persisted', async () => {
+  const f = fixture();
+  const catalog = f.catalog();
+  const repository = await catalog.addRepository({ name: '私有镜像', category: '开发', repository: 'team/private', registryAuthRequired: true });
+  await assert.rejects(catalog.sync(repository.id, { tag: 'v1', registryAuth: { username: 'user', password: 'secret' } }), /UNSUPPORTED/);
+  assert.equal(JSON.stringify([...f.documents.values()]).includes('secret'), false);
+  assert.equal(f.builds.length, 0);
 });
 
 
-test('repository cleanup requires all versions removed and remains hidden across restart', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'Demo', category: '开发', repository: 'team/demo' });
-  const version = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(version.operationId!, version.source);
-  await assert.rejects(catalog.removeRepository(repo.id), /所有版本/);
-  await catalog.setDeprecated(repo.id, version.id, true);
-  await catalog.removeVersion(repo.id, version.id);
-  const operation = f.operations.get(f.deletions[0])!; operation.status = 'succeeded'; f.images.delete(operation.targetId);
-  await catalog.removeRepository(repo.id);
-  await catalog.removeRepository(repo.id);
-  const restarted = f.catalog(); await restarted.init();
-  assert.equal((await restarted.list()).some(image => image.id === repo.id), false);
-  await assert.rejects(restarted.sync(repo.id, { tag: 'v2' }), /镜像仓库不存在/);
-  await restarted.addRepository({ name: 'Demo', category: '开发', repository: 'team/demo' });
-});
-
-test('managed repositories hide duplicate imports while pinned imports still resolve and restore', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const source = 'registry.example/team/mybox@sha256:' + 'a'.repeat(64);
-  f.images.set('external', { id: 'external', source, resolvedSource: source, image: 'registry/prepared@sha256:' + 'b'.repeat(64),
-    platform: 'linux/amd64', command: ['/usr/local/bin/node', '/opt/product/cocell/launcher.mjs'], env: {}, workingDir: '/home/agent/workspace',
-    ports: [], warnings: [], key: 'external', createdAt: new Date().toISOString() });
-  const pinned = (await catalog.resolve('cellbox:registry.example/team/mybox', 'external'))!;
-  await catalog.addRepository({ name: 'mybox', category: '自定义', repository: 'http://registry.example/team/mybox' });
-  assert.equal((await catalog.list()).filter(image => image.repository?.endsWith('/team/mybox')).length, 1);
-  assert.deepEqual(await catalog.resolve(pinned.imageId, pinned.versionId), pinned);
-  const project: Project = { id: 'p', name: 'existing', status: 'active', executionMode: 'sandbox', workingDirectory: '/home/agent/workspace',
-    requirementUrl: null, createdAt: '', updatedAt: '', imageSelection: pinned };
-  const reservation = await catalog.acquireRestoreSelection(project);
-  assert.deepEqual(reservation.selection, pinned); await reservation.release();
-});
-
-test('sync rebuilds unchanged upstream content when the platform tool installation changes', async () => {
-  const f = fixture(); const catalog = f.catalog(); await catalog.init();
-  const repo = await catalog.addRepository({ name: 'mybox', category: '自定义', repository: 'team/mybox' });
-  const first = (await catalog.sync(repo.id, { tag: 'v1' })).versions[0]; f.finish(first.operationId!, first.source);
-  await catalog.list();
-  const saved = f.documents.get(repo.id)!;
-  saved.versions[0].request.buildCommand = 'old launcher without proxies';
-  delete saved.versions[0].preparationKey;
-  const restarted = f.catalog(); await restarted.init();
-  const rebuilt = await restarted.sync(repo.id, { tag: 'v1' });
-  assert.equal(rebuilt.versions.length, 2);
-  assert.notEqual(rebuilt.versions[0].id, first.id);
-  assert.match(String(f.submissions.at(-1)!.body.buildCommand), /proxy-tool-ids\.json/);
-  assert.match(String(f.submissions.at(-1)!.body.buildCommand), /\/usr\/local\/bin\/\$tool/);
+test('configured revision and template selectors resolve the actual default without rewriting stable', async () => {
+  const f = fixture();
+  const owner = f.catalog();
+  const repository = await owner.addRepository({ name: 'System', category: '系统', repository: 'team/system' });
+  await owner.sync(repository.id, { tag: 'v1' });
+  f.completeBuild('build-1');
+  f.templates.get(repository.templateId!)!.stableRevisionId = 'revision-1';
+  for (const options of [{ defaultRevisionId: 'revision-1' }, { defaultTemplateId: repository.templateId! }]) {
+    const selected = await f.catalog(options).acquireDefaultSelection();
+    assert.equal(selected.selection.revisionId, 'revision-1');
+    assert.equal(selected.selection.templateId, repository.templateId);
+  }
+  assert.deepEqual(f.defaultWrites, []);
+  assert.deepEqual(f.templateUpdates, []);
 });

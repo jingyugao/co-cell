@@ -106,9 +106,6 @@ export class ImageCatalog {
   private async remoteCatalog(): Promise<ManagedImage[]> {
     const templates = await this.client.listTemplates();
     const selected = await this.defaultSelection();
-    const defaults = new Map<string, string>();
-    for (const record of this.records.values()) if (record.templateId && record.defaultVersionId)
-      defaults.set(record.templateId, record.defaultVersionId);
     const templateItems: ManagedImage[] = await Promise.all(templates.map(async template => {
       const owner = [...this.records.values()].find(record => record.templateId === template.id && !record.deletedAt);
       const revisions = await this.client.listTemplateRevisions(template.id);
@@ -125,13 +122,12 @@ export class ImageCatalog {
         };
       });
       for (const local of localVersions) if (!local.revisionId && local.status !== 'failed') versions.unshift(local);
-      const chosenDefault = defaults.get(template.id);
       return {
         id: owner?.id ?? `cellbox:${template.id}`, templateId: template.id,
         name: owner?.name ?? template.name, category: owner?.category ?? 'Cellbox',
         repository: owner?.repository, buildCommand: owner?.buildCommand,
         registryAuthRequired: owner?.registryAuthRequired,
-        defaultVersionId: chosenDefault,
+        defaultVersionId: template.stableRevisionId,
         origin: owner ? 'managed' as const : 'cellbox' as const,
         versions,
       };
@@ -288,11 +284,7 @@ export class ImageCatalog {
     const version = image?.versions.find(value => value.id === versionId);
     if (!image || !version) throw new HttpError(404, '镜像或版本不存在');
     const selection = await this.resolveVersion(image, version);
-    const record = image.origin === 'managed' ? this.records.get(image.id) : undefined;
-    const nextRecord = record ? structuredClone(record) : undefined;
-    if (nextRecord) nextRecord.defaultVersionId = versionId;
-    await this.store.saveDefaultImage({ templateId: selection.templateId!, revisionId: selection.revisionId! }, nextRecord);
-    if (nextRecord) this.records.set(nextRecord.id, nextRecord);
+    await this.store.saveDefaultImage({ templateId: selection.templateId!, revisionId: selection.revisionId! });
     return (await this.list()).find(value => value.id === imageId)!;
   }
   async setDeprecated(imageId: string, versionId: string, deprecated: boolean): Promise<ManagedImage> {

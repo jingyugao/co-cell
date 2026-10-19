@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CellboxClient, CellboxError, type CellboxOperation, type CellboxTemplate, type CellboxTemplateRevision } from '../../packages/sandbox/src/providers/cellbox/client.js';
 import type { DefaultImageSelection } from '../../protocol/image-types.js';
+import type { Project } from '../../protocol/types.js';
 import type { ImageRecord } from './store.js';
 import { ImageCatalog } from './service.js';
 
@@ -132,6 +133,36 @@ test('CoCell default selection is local and does not change Cellbox stable or wa
   const version = (await catalog.list()).find(image => image.id === repository.id)!.versions.find(value => value.revisionId)!;
   await catalog.setDefault(repository.id, version.id);
   assert.deepEqual(f.defaultWrites.at(-1), { templateId: repository.templateId, revisionId: version.revisionId });
+  assert.equal(f.documents.get(repository.id)?.defaultVersionId, undefined, 'global default does not become a repository restore default');
+  assert.deepEqual(f.templateUpdates, []);
+});
+
+test('repository restore default follows Cellbox stable while CoCell global default remains independent', async () => {
+  const f = fixture();
+  const catalog = f.catalog();
+  const repository = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
+
+  const first = await catalog.sync(repository.id, { tag: 'v1' });
+  f.completeBuild(first.versions[0].operationId!);
+  f.templates.get(repository.templateId!)!.stableRevisionId = 'revision-1';
+  await catalog.setDefault(repository.id, 'revision-1');
+
+  const second = await catalog.sync(repository.id, { tag: 'v2' });
+  f.completeBuild(second.versions[0].operationId!);
+  f.templates.get(repository.templateId!)!.stableRevisionId = 'revision-2';
+  const record = f.documents.get(repository.id)!;
+  record.defaultVersionId = 'revision-1'; // stale pre-migration repository default
+  f.documents.set(repository.id, record);
+
+  const listed = (await catalog.list()).find(image => image.id === repository.id)!;
+  assert.equal(listed.defaultVersionId, 'revision-2');
+  const originalSelection = await catalog.resolve(repository.id, 'revision-1');
+  const restored = await catalog.acquireRestoreSelection({ id: 'project-one', imageSelection: originalSelection } as Project);
+  assert.equal(restored.selection.revisionId, 'revision-2');
+
+  const globalDefault = await catalog.acquireDefaultSelection();
+  assert.equal(globalDefault.selection.revisionId, 'revision-1');
+  assert.deepEqual(f.defaultWrites.at(-1), { templateId: repository.templateId, revisionId: 'revision-1' });
   assert.deepEqual(f.templateUpdates, []);
 });
 

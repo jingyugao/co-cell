@@ -43,6 +43,7 @@ export interface ManagedImage {
   repository?: string;
   buildCommand?: string;
   registryAuthRequired?: boolean;
+  /** Cellbox's current stable revision, used as this template's restore default. */
   defaultVersionId?: string;
   versions: ImageVersion[];
   migrationRequired?: boolean;

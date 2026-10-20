@@ -2,6 +2,7 @@ import type { Pool, RowDataPacket } from 'mysql2/promise';
 import type { ProxyTool, SecretFormat, SecretVersion } from '../../protocol/secret-types.js';
 import { MySqlRoleRepository, type RoleRepository } from './role-repository.js';
 import type { NativeSecretFiles } from './native-files.js';
+import { HttpError } from '../../util/errors.js';
 
 export interface StoredSecret {
   /** Old formats remain readable until the operator replaces their contents. */
@@ -41,8 +42,14 @@ export class MySqlSecretRepository implements SecretRepository {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS secrets (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL, format VARCHAR(10) NOT NULL, mutable BOOLEAN NOT NULL, enabled BOOLEAN NOT NULL, version BIGINT UNSIGNED NOT NULL, current_version_id CHAR(36) NOT NULL, ciphertext MEDIUMTEXT NOT NULL, created_at VARCHAR(30) NOT NULL, updated_at VARCHAR(30) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS secret_tool_configs (secret_id CHAR(36) PRIMARY KEY, tool VARCHAR(32) NOT NULL, path VARCHAR(256) NOT NULL, alias VARCHAR(64) NOT NULL, CONSTRAINT secret_tool_config_secret_fk FOREIGN KEY(secret_id) REFERENCES secrets(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS secret_versions (id CHAR(36) PRIMARY KEY, secret_id CHAR(36) NOT NULL, source VARCHAR(10) NOT NULL, base_version BIGINT UNSIGNED NULL, created_at VARCHAR(30) NOT NULL, project_id CHAR(36) NULL, invocation_id CHAR(36) NULL, changes_json JSON NOT NULL, ciphertext MEDIUMTEXT NOT NULL, INDEX secret_history(secret_id,created_at), CONSTRAINT secret_versions_secret_fk FOREIGN KEY(secret_id) REFERENCES secrets(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
-    await this.pool.query(`CREATE TABLE IF NOT EXISTS project_tool_runtimes (box_id VARCHAR(200) PRIMARY KEY, project_id CHAR(36) NOT NULL, generation BIGINT UNSIGNED NOT NULL, CONSTRAINT tool_runtimes_project_fk FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
-    await this.pool.query(`CREATE TABLE IF NOT EXISTS sandbox_runtime_configs (box_id VARCHAR(200) NOT NULL, generation BIGINT UNSIGNED NOT NULL, slot VARCHAR(64) NOT NULL, digest CHAR(64) NOT NULL, applied_at VARCHAR(30) NOT NULL, PRIMARY KEY(box_id,generation,slot), CONSTRAINT runtime_configs_box_fk FOREIGN KEY(box_id) REFERENCES project_tool_runtimes(box_id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS project_tool_runtimes (box_id VARCHAR(200) PRIMARY KEY, project_id CHAR(36) NOT NULL, generation BIGINT UNSIGNED NOT NULL, INDEX project_tool_runtimes_project_id_idx(project_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS sandbox_runtime_configs (box_id VARCHAR(200) NOT NULL, generation BIGINT UNSIGNED NOT NULL, slot VARCHAR(64) NOT NULL, digest CHAR(64) NOT NULL, applied_at VARCHAR(30) NOT NULL, PRIMARY KEY(box_id,generation,slot)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    for (const [table, constraint] of [['project_tool_runtimes', 'tool_runtimes_project_fk'], ['sandbox_runtime_configs', 'runtime_configs_box_fk']]) {
+      const [constraints] = await this.pool.query<RowDataPacket[]>(`SELECT CONSTRAINT_NAME FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME=? AND CONSTRAINT_NAME=?`, [table, constraint]);
+      if (constraints.length) await this.pool.query(`ALTER TABLE \`${table}\` DROP FOREIGN KEY \`${constraint}\``);
+    }
+    const [runtimeIndexes] = await this.pool.query<RowDataPacket[]>(`SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='project_tool_runtimes' AND COLUMN_NAME='project_id' AND SEQ_IN_INDEX=1`);
+    if (!runtimeIndexes.length) await this.pool.query('CREATE INDEX project_tool_runtimes_project_id_idx ON project_tool_runtimes(project_id)');
     await this.roles.init();
   }
   private registration(row: RowDataPacket): StoredSecret {
@@ -162,7 +169,17 @@ export class MySqlSecretRepository implements SecretRepository {
     return { currentMigrated, historyCleared };
   }
   async registerRuntime(boxId: string, projectId: string, generation: number) {
-    await this.pool.query('INSERT INTO project_tool_runtimes(box_id,project_id,generation) VALUES(?,?,?) ON DUPLICATE KEY UPDATE project_id=VALUES(project_id),generation=VALUES(generation)', [boxId, projectId, generation]);
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [projects] = await connection.query<RowDataPacket[]>('SELECT id FROM projects WHERE id=? FOR UPDATE', [projectId]);
+      if (!projects.length) throw new HttpError(404, '项目不存在');
+      // Lock an existing runtime row so registration is ordered with
+      // markRuntimeConfigs and forgetRuntime for this Box.
+      await connection.query('SELECT box_id FROM project_tool_runtimes WHERE box_id=? FOR UPDATE', [boxId]);
+      await connection.query('INSERT INTO project_tool_runtimes(box_id,project_id,generation) VALUES(?,?,?) ON DUPLICATE KEY UPDATE project_id=VALUES(project_id),generation=VALUES(generation)', [boxId, projectId, generation]);
+      await connection.commit();
+    } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
   }
   async runtime(boxId: string) { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT project_id,generation FROM project_tool_runtimes WHERE box_id=?', [boxId]); return rows[0] ? { projectId: rows[0].project_id as string, generation: Number(rows[0].generation) } : null; }
   async runtimeConfig(boxId: string, generation: number) {
@@ -176,8 +193,32 @@ export class MySqlSecretRepository implements SecretRepository {
     const entries = Object.entries(digests);
     if (!entries.length) return;
     const now = new Date().toISOString();
-    await this.pool.query(`INSERT INTO sandbox_runtime_configs(box_id,generation,slot,digest,applied_at) VALUES ${entries.map(() => '(?,?,?,?,?)').join(',')} ON DUPLICATE KEY UPDATE digest=VALUES(digest),applied_at=VALUES(applied_at)`,
-      entries.flatMap(([slot, digest]) => [boxId, generation, slot, digest, now]));
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      // Discover the owning project without taking the runtime lock first,
+      // then follow project -> runtime ordering used by project deletion.
+      const [owners] = await connection.query<RowDataPacket[]>('SELECT project_id FROM project_tool_runtimes WHERE box_id=?', [boxId]);
+      if (!owners.length) throw new HttpError(404, '运行时不存在');
+      const projectId = owners[0].project_id as string;
+      const [projects] = await connection.query<RowDataPacket[]>('SELECT id FROM projects WHERE id=? FOR UPDATE', [projectId]);
+      if (!projects.length) throw new HttpError(404, '项目不存在');
+      const [runtimes] = await connection.query<RowDataPacket[]>('SELECT project_id FROM project_tool_runtimes WHERE box_id=? FOR UPDATE', [boxId]);
+      if (!runtimes.length) throw new HttpError(404, '运行时不存在');
+      if (runtimes[0].project_id !== projectId) throw new HttpError(409, '运行时所属项目已变更');
+      await connection.query(`INSERT INTO sandbox_runtime_configs(box_id,generation,slot,digest,applied_at) VALUES ${entries.map(() => '(?,?,?,?,?)').join(',')} ON DUPLICATE KEY UPDATE digest=VALUES(digest),applied_at=VALUES(applied_at)`,
+        entries.flatMap(([slot, digest]) => [boxId, generation, slot, digest, now]));
+      await connection.commit();
+    } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
   }
-  async forgetRuntime(boxId: string) { await this.pool.query('DELETE FROM project_tool_runtimes WHERE box_id=?', [boxId]); }
+  async forgetRuntime(boxId: string) {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      await connection.query('SELECT box_id FROM project_tool_runtimes WHERE box_id=? FOR UPDATE', [boxId]);
+      await connection.query('DELETE FROM sandbox_runtime_configs WHERE box_id=?', [boxId]);
+      await connection.query('DELETE FROM project_tool_runtimes WHERE box_id=?', [boxId]);
+      await connection.commit();
+    } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+  }
 }

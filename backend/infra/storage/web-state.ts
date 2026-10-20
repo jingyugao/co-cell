@@ -74,7 +74,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS managed_images (id CHAR(36) PRIMARY KEY, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS image_settings (name VARCHAR(100) PRIMARY KEY, document JSON NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     const [existing] = await this.pool.query<Array<RowDataPacket & { TABLE_NAME: string; COLUMN_NAME: string }>>(`SELECT TABLE_NAME,COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN ('projects','sessions') AND COLUMN_NAME='document'`);
-    if (existing.length) throw new Error('The projects/sessions document schema is no longer supported. Configure an empty CoCell metadata database; automatic migration is intentionally disabled.');
+    if (existing.length) throw new Error('Legacy projects/sessions document tables must be archived first. Stop the old CoCell instances, then run pnpm metadata:archive-legacy against the same MYSQL_URL. Other tables and archived data are preserved.');
     await this.pool.query(`CREATE TABLE IF NOT EXISTS projects (
       id CHAR(36) PRIMARY KEY,name VARCHAR(100) NOT NULL,type TINYINT UNSIGNED NOT NULL DEFAULT 1,week_of DATE NULL,
       requirement_url TEXT NULL,requirement_status VARCHAR(255) NULL,execution_mode ENUM('sandbox','local') NOT NULL,
@@ -100,7 +100,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       context_output_tokens BIGINT UNSIGNED NULL,context_model VARCHAR(200) NULL,context_observed_at DATETIME(3) NULL,
       context_source ENUM('responses','rollout') NULL,archived_at DATETIME(3) NULL,started_at DATETIME(3) NOT NULL,
       created_at DATETIME(3) NOT NULL,updated_at DATETIME(3) NOT NULL,INDEX sessions_project_updated(project_id,updated_at),
-      INDEX sessions_status(status),CONSTRAINT sessions_project_fk FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL
+      INDEX sessions_status(status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS session_turns (
       id CHAR(36) PRIMARY KEY,session_id CHAR(36) NOT NULL,target_turn_id CHAR(36) NOT NULL,type ENUM('message','steer','question_reply') NOT NULL,
@@ -114,9 +114,15 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       sdk_output_tokens BIGINT UNSIGNED NULL,sdk_reasoning_output_tokens BIGINT UNSIGNED NULL,
       started_at DATETIME(3) NOT NULL,completed_at DATETIME(3) NULL,error TEXT NULL,
       INDEX session_turns_target(session_id,target_turn_id),INDEX session_turns_session(session_id,started_at),
-      INDEX session_turns_native(session_id,native_turn_id),INDEX session_turns_question_request(session_id,question_request_id),
-      CONSTRAINT session_turns_session_fk FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+      INDEX session_turns_native(session_id,native_turn_id),INDEX session_turns_question_request(session_id,question_request_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
+    const [foreignKeys] = await this.pool.query<Array<RowDataPacket & { TABLE_NAME: string; CONSTRAINT_NAME: string }>>(
+      "SELECT TABLE_NAME,CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME IN ('sessions','session_turns') AND CONSTRAINT_TYPE='FOREIGN KEY'");
+    for (const key of foreignKeys) {
+      const name = key.CONSTRAINT_NAME.replaceAll('`', '``');
+      const table = key.TABLE_NAME.replaceAll('`', '``');
+      await this.pool.query(`ALTER TABLE \`${table}\` DROP FOREIGN KEY \`${name}\``);
+    }
     const [schemaColumns] = await this.pool.query<Array<RowDataPacket & { TABLE_NAME: string; COLUMN_NAME: string }>>(
       `SELECT TABLE_NAME,COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND
        ((TABLE_NAME='projects' AND COLUMN_NAME IN ('current_box_id','image_catalog_id','mounts_json')) OR
@@ -126,7 +132,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     const expectedSchemaKeys = ['projects.current_box_id','projects.image_catalog_id','projects.mounts_json',
       'sessions.model','sessions.execution_mode','sessions.turn_count','session_turns.target_turn_id','session_turns.params_json','session_turns.question_request_id',
       'session_turns.sdk_input_tokens','session_turns.sdk_cached_input_tokens','session_turns.sdk_cache_write_input_tokens','session_turns.sdk_output_tokens','session_turns.sdk_reasoning_output_tokens'];
-    if (expectedSchemaKeys.some(key => !schemaKeys.has(key))) throw new Error('CoCell relational metadata schema is incomplete. Configure a new empty metadata database; automatic schema migration is disabled.');
+    if (expectedSchemaKeys.some(key => !schemaKeys.has(key))) throw new Error('CoCell relational metadata schema is incomplete; restore a complete schema before starting. The metadata archive command only handles the legacy document schema.');
     const [questionIndex] = await this.pool.query<Array<RowDataPacket & { INDEX_NAME: string }>>(
       `SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='session_turns' AND INDEX_NAME='session_turns_question_request' LIMIT 1`);
     if (!questionIndex.length) throw new Error('CoCell session_turns question request index is missing; automatic schema migration is disabled.');
@@ -263,8 +269,40 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     const [rows] = await this.pool.query<Array<RowDataPacket & SessionTurnRow>>('SELECT * FROM session_turns WHERE session_id=? ORDER BY started_at,id', [sessionId]);
     return rows.map(inputRequestFromRow);
   }
-  async deleteProject(id: string) { await this.pool.query('DELETE FROM projects WHERE id = ?', [id]); }
-  async deleteSession(id: string) { await this.pool.query('DELETE FROM sessions WHERE id = ?', [id]); }
+  async deleteProject(id: string) {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [projects] = await connection.query<RowDataPacket[]>('SELECT id FROM projects WHERE id=? FOR UPDATE', [id]);
+      if (!projects.length) { await connection.commit(); return; }
+      // Secret repositories are optional for standalone metadata consumers.
+      const [tables] = await connection.query<Array<RowDataPacket & { TABLE_NAME: string }>>(
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN ('project_tool_roles','project_tool_runtimes','sandbox_runtime_configs')");
+      const present = new Set(tables.map(table => table.TABLE_NAME));
+      if (present.has('project_tool_runtimes')) {
+        const [runtimes] = await connection.query<Array<RowDataPacket & { box_id: string }>>('SELECT box_id FROM project_tool_runtimes WHERE project_id=? FOR UPDATE', [id]);
+        if (present.has('sandbox_runtime_configs')) for (const runtime of runtimes)
+          await connection.query('DELETE FROM sandbox_runtime_configs WHERE box_id=?', [runtime.box_id]);
+        await connection.query('DELETE FROM project_tool_runtimes WHERE project_id=?', [id]);
+      }
+      if (present.has('project_tool_roles')) await connection.query('DELETE FROM project_tool_roles WHERE project_id=?', [id]);
+      await connection.query('UPDATE sessions SET project_id=NULL WHERE project_id=?', [id]);
+      await connection.query('DELETE FROM projects WHERE id=?', [id]);
+      await connection.commit();
+    } catch (error) { await connection.rollback().catch(() => undefined); throw error; }
+    finally { connection.release(); }
+  }
+  async deleteSession(id: string) {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      await connection.query('SELECT id FROM sessions WHERE id=? FOR UPDATE', [id]);
+      await connection.query('DELETE FROM session_turns WHERE session_id=?', [id]);
+      await connection.query('DELETE FROM sessions WHERE id=?', [id]);
+      await connection.commit();
+    } catch (error) { await connection.rollback().catch(() => undefined); throw error; }
+    finally { connection.release(); }
+  }
   async close() { await this.pool.end(); }
   private document<T>(value: T | string): T { return typeof value === 'string' ? JSON.parse(value) as T : value; }
   private async saveProjectWith(executor: Pick<Pool, 'query'>, project: Project) {
@@ -290,6 +328,10 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
+      if (session.projectId) {
+        const [projects] = await connection.query<RowDataPacket[]>('SELECT id FROM projects WHERE id=? AND removed_at IS NULL FOR UPDATE', [session.projectId]);
+        if (!projects.length) throw new HttpError(409, '项目已删除，不能保存会话');
+      }
       const [found] = await connection.query<Array<RowDataPacket & Record<string, unknown>>>(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE id=? FOR UPDATE`, [session.id]);
       let effective = session;
       if (previous && !found[0]) throw new HttpError(409, '记录已被删除，请刷新后重试');

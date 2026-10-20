@@ -26,7 +26,15 @@ export class MySqlRoleRepository implements RoleRepository {
   async init() {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS tool_roles (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE, connections JSON NOT NULL, created_at VARCHAR(30) NOT NULL, updated_at VARCHAR(30) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS tool_role_settings (id TINYINT UNSIGNED PRIMARY KEY, default_role_id CHAR(36) NULL, CONSTRAINT tool_role_default_fk FOREIGN KEY(default_role_id) REFERENCES tool_roles(id) ON DELETE RESTRICT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
-    await this.pool.query(`CREATE TABLE IF NOT EXISTS project_tool_roles (project_id CHAR(36) PRIMARY KEY, role_id CHAR(36) NULL, CONSTRAINT project_role_project_fk FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE, CONSTRAINT project_role_role_fk FOREIGN KEY(role_id) REFERENCES tool_roles(id) ON DELETE RESTRICT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS project_tool_roles (project_id CHAR(36) PRIMARY KEY, role_id CHAR(36) NULL, INDEX project_tool_roles_role_id_idx(role_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    // Existing installations may still have the constraints from an earlier
+    // version. Drop only these project/role links; other secret FKs remain.
+    for (const constraint of ['project_role_project_fk', 'project_role_role_fk']) {
+      const [constraints] = await this.pool.query<RowDataPacket[]>(`SELECT CONSTRAINT_NAME FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME='project_tool_roles' AND CONSTRAINT_NAME=?`, [constraint]);
+      if (constraints.length) await this.pool.query(`ALTER TABLE project_tool_roles DROP FOREIGN KEY \`${constraint}\``);
+    }
+    const [roleIndexes] = await this.pool.query<RowDataPacket[]>(`SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='project_tool_roles' AND COLUMN_NAME='role_id' AND SEQ_IN_INDEX=1`);
+    if (!roleIndexes.length) await this.pool.query('CREATE INDEX project_tool_roles_role_id_idx ON project_tool_roles(role_id)');
     await this.pool.query(`CREATE TABLE IF NOT EXISTS tool_role_migrations (id TINYINT UNSIGNED PRIMARY KEY, completed_at VARCHAR(30) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query('INSERT IGNORE INTO tool_role_settings(id,default_role_id) VALUES(1,NULL)');
   }
@@ -139,7 +147,7 @@ export class MySqlRoleRepository implements RoleRepository {
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
-      await connection.query('SELECT id FROM projects WHERE id=? FOR UPDATE', [projectId]);
+      await this.requireProject(connection, projectId);
       if (roleId !== null) await this.requireRole(connection, roleId);
       await connection.query('INSERT INTO project_tool_roles(project_id,role_id) VALUES(?,?) ON DUPLICATE KEY UPDATE role_id=VALUES(role_id)', [projectId, roleId]);
       await connection.commit();
@@ -158,6 +166,10 @@ export class MySqlRoleRepository implements RoleRepository {
       const [settings] = await connection.query<RowDataPacket[]>('SELECT default_role_id FROM tool_role_settings WHERE id=1 LOCK IN SHARE MODE');
       const roleId = settings[0]?.default_role_id as string | null | undefined;
       if (!roleId) throw new HttpError(503, '工具角色尚未初始化，请先完成服务初始化');
+      // Keep the global lock order settings -> project -> role, matching
+      // deleteRole's settings -> role order and serializing project removal.
+      await this.requireProject(connection, projectId);
+      await this.requireRole(connection, roleId);
       // The default value is read once while locked. Insert-if-absent preserves
       // explicit null assignments and any assignment made concurrently.
       await connection.query('INSERT IGNORE INTO project_tool_roles(project_id,role_id) VALUES(?,?)', [projectId, roleId]);
@@ -168,6 +180,11 @@ export class MySqlRoleRepository implements RoleRepository {
   private async requireRole(connection: PoolConnection, roleId: string): Promise<void> {
     const [rows] = await connection.query<RowDataPacket[]>('SELECT id FROM tool_roles WHERE id=? LOCK IN SHARE MODE', [roleId]);
     if (!rows.length) throw new HttpError(404, '角色不存在');
+  }
+
+  private async requireProject(connection: PoolConnection, projectId: string): Promise<void> {
+    const [rows] = await connection.query<RowDataPacket[]>('SELECT id FROM projects WHERE id=? FOR UPDATE', [projectId]);
+    if (!rows.length) throw new HttpError(404, '项目不存在');
   }
 }
 

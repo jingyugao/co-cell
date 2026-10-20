@@ -10,7 +10,7 @@ const sources = [
   'util/tool-runtime-identity.mjs',
 ];
 
-export async function readToolWrapperAssets() {
+async function readToolWrapperAssets() {
   return Promise.all(sources.map(async path => ({ path,
     content: await readFile(new URL(`../../${path}`, import.meta.url), 'utf8') })));
 }

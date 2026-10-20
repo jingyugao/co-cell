@@ -75,7 +75,7 @@ const appServerArguments=appServerArgs(modelConfig, configOverrides).slice(1);
 const appServerEnv = {...(apiKey ? {CODEX_API_KEY:apiKey} : {}),
   ...(process.env.CODEX_MODEL_METADATA_JSON ? { CODEX_MODEL_METADATA_JSON: process.env.CODEX_MODEL_METADATA_JSON } : {})};
 const sharedDirectory = await loadSharedMountConfig();
-if (multiApi && !sharedDirectory) throw new Error('Multi-API native credentials require the shared persistent directory');
+if (!sharedDirectory) throw new Error('CoCell tool wrappers require the shared persistent directory');
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
 const webState = createWebStateStore(mysqlUrl, new NativeSecretFiles(resolve(sharedDataRoot, 'runtime/debug-homes'), secretCrypto));
 if (sharedDirectory) {
@@ -179,8 +179,7 @@ if (coordinator) {
   if (lease) try { await reconcileProjects(); } finally { await lease.release(); }
 } else await reconcileProjects();
 const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.env.CELLBOX_PROFILE!, undefined,
-  () => webState.listProjects(), {defaultTemplateId:process.env.CELLBOX_TEMPLATE_ID,defaultRevisionId:process.env.CELLBOX_REVISION_ID,
-    mountedToolWrappers:sharedDirectory});
+  () => webState.listProjects(), {defaultTemplateId:process.env.CELLBOX_TEMPLATE_ID,defaultRevisionId:process.env.CELLBOX_REVISION_ID});
 await imageCatalog.init();
 manager.setImageCatalog(imageCatalog);
 const config: AppConfig = { models: availableModels, sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,

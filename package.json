@@ -12,6 +12,7 @@
     "build": "pnpm typecheck && vite build",
     "start": "NODE_ENV=production tsx backend/index.ts",
     "typecheck": "tsc --noEmit",
+    "metadata:archive-legacy": "tsx scripts/archive-legacy-metadata.ts",
     "capture:http": "tsx backend/infra/diagnostics/capture-demo.ts",
     "sandbox:timing": "node scripts/diagnostics/sandbox-timing.mjs",
     "credentials:import": "tsx backend/connections/import-local.ts",

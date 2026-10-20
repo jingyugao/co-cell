@@ -28,6 +28,8 @@ import { sandboxMounts } from '../../util/sandbox-mounts.js';
 import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../util/user-input.js';
 import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 import { applyTurnEvent } from '../../util/session-events.js';
+import type { InputRequestRecord, InputRequestType } from '../../protocol/input-request-types.js';
+import type { InputRequestHook } from '../../packages/agentcore/src/index.mjs';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -35,11 +37,14 @@ type ActiveExecution = {
   controller: AbortController;
   done: Promise<void>;
   turnId?: string;
-  steer?(text: string): Promise<boolean>;
+  steer?(text: string, onInputRequest?: InputRequestHook): Promise<boolean>;
   lease?: SharedLease;
   finish(): Promise<void>;
 };
 class NativeTurnAcceptancePending extends Error {}
+class NativeTurnNotReceiving extends HttpError {
+  constructor() { super(409, 'Codex 已不再接收当前任务的追加消息，请刷新会话后重试'); }
+}
 type SubscriptionWatch = {
   timer: ReturnType<typeof setInterval>;
   pending?: Promise<void>;
@@ -81,6 +86,7 @@ export class SessionManager {
   private historyReads = new Map<string, Promise<void>>();
   private userInputAnswers = new Map<string, { threadId: Session['threadId']; answers: NativeUserInputAnswers }>();
   private userInputDeliveries = new Map<string, Promise<void>>();
+  private inputTasks = new Set<Promise<void>>();
   private historyErrors = new Map<string, string>();
   private billingReads = new Map<string, Promise<SessionCostBreakdown>>();
   private savedSessions = new Map<string, Session>();
@@ -181,6 +187,11 @@ export class SessionManager {
               if (request && request.status !== 'answered') { Object.assign(request, reply); changed = true; }
             }
           }
+          if (local?.turns.some(turn => turn.userInputRequests?.length)) {
+            const before = JSON.stringify(local.turns.map(turn => turn.userInputRequests));
+            await this.applyRecordedReplies(local);
+            changed ||= before !== JSON.stringify(local.turns.map(turn => turn.userInputRequests));
+          }
           if (changed) this.publish(id, { type: 'state', session: this.get(id) });
           return;
         }
@@ -238,7 +249,9 @@ export class SessionManager {
       await this.refreshSharedState();
       for (const candidate of [...this.sessions.values()]) {
         if (this.closing || this.active.has(candidate.id)) continue;
-        if (!candidate.turns.some(turn => turn.status === 'running' || turn.userInputRequests?.some(request => request.status === 'queued'))) continue;
+        const queued = (await this.state.listInputRequests?.(candidate.id) ?? [])
+          .some(input => input.type === 'question_reply' && input.status === 'queued');
+        if (!queued && !candidate.turns.some(turn => turn.status === 'running')) continue;
         await this.sessionMutation(candidate.id, async () => {
           if (this.closing || this.active.has(candidate.id)) return;
           let session = this.lookup(candidate.id);
@@ -373,7 +386,9 @@ export class SessionManager {
     });
     if (!this.coordinator) for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
     for (const session of this.sessions.values()) {
-      if (!this.coordinator && session.turns.some(turn => turn.userInputRequests?.some(request => request.status === 'queued')) && !this.active.has(session.id)) void this.startQueuedUserInput(session.id);
+      if (!this.coordinator && !this.active.has(session.id)
+        && (await this.state.listInputRequests?.(session.id) ?? []).some(input => input.type === 'question_reply' && input.status === 'queued'))
+        void this.startQueuedUserInput(session.id).catch(error => console.error('Queued input recovery failed:', error));
     }
     this.lifecycle?.start();
     if (this.coordinator) {
@@ -412,26 +427,97 @@ export class SessionManager {
     return execution;
   }
 
-  private executeTurn(session: Session, turn: Turn, execution: ActiveExecution, recovering = false) {
+  private inputHook(input: InputRequestRecord): InputRequestHook {
+    return async event => {
+      input.method = event.method;
+      input.params = structuredClone(event.params);
+      if (event.threadRequest) input.threadRequest = structuredClone(event.threadRequest);
+      input.status = event.phase;
+      if (event.phase === 'sending') input.sentAt = new Date().toISOString();
+      if (event.nativeTurnId) input.nativeTurnId = event.nativeTurnId;
+      if (event.phase === 'accepted') input.acceptedAt = new Date().toISOString();
+      if (event.error) input.error = event.error;
+      await this.state.saveInputRequest?.(input);
+    };
+  }
+
+  private async applyRecordedReplies(session: Pick<Session, 'id' | 'turns'>): Promise<void> {
+    const inputs = await this.state.listInputRequests?.(session.id) ?? [];
+    const replies: NativeUserInputAnswers = new Map();
+    for (const input of inputs) {
+      if (input.type !== 'question_reply' || input.status === 'failed') continue;
+      collectNativeUserInputAnswers([{ id: input.turnId, prompt: input.input, images: [], items: [],
+        status: 'completed', codexAccepted: true, startedAt: input.acceptedAt ?? input.createdAt }], replies);
+    }
+    for (const turn of session.turns) {
+      const derived = withNativeUserInput(turn, replies);
+      if (derived.userInputRequests) turn.userInputRequests = derived.userInputRequests.map(request => {
+        const matches = inputs.filter(input => input.type === 'question_reply' && input.requestId === request.id && input.status !== 'failed');
+        const input = matches.find(input => input.status === 'accepted') ?? matches.at(-1);
+        return input ? { ...request, status: input.status === 'accepted' ? 'answered' : 'queued', deliveryStatus: input.status } : request;
+      });
+    }
+  }
+
+  private async queueInput(sessionId: string, turnId: string, input: string, type: InputRequestType,
+    options: { id?: string; images?: string[]; requestId?: string } = {}): Promise<InputRequestRecord> {
+    const request: InputRequestRecord = { id: options.id ?? randomUUID(), sessionId, turnId, type,
+      input, images: options.images, requestId: options.requestId, status: 'queued', createdAt: new Date().toISOString() };
+    await this.state.saveInputRequest?.(request);
+    return request;
+  }
+
+  private async submitSteer(session: Session, turn: Turn, prompt: string,
+    execution: ActiveExecution | undefined, input?: InputRequestRecord): Promise<boolean> {
+    const request = input ?? await this.queueInput(session.id, turn.id, prompt, 'steer');
+    request.turnId = turn.id;
+    const hook = this.inputHook(request);
+    try {
+      const accepted = execution?.steer ? await execution.steer(prompt, hook)
+        : this.sandbox?.steer ? await this.sandbox.steer(session, turn, prompt, hook) : false;
+      // Runtimes implementing the generic SandboxRuntime interface can confirm
+      // receipt without exposing a native RPC hook.
+      if (accepted && request.status !== 'accepted') {
+        request.status = 'accepted'; request.acceptedAt = new Date().toISOString(); request.nativeTurnId = turn.nativeTurnId;
+        await this.state.saveInputRequest?.(request);
+      } else if (!accepted && request.status === 'queued') {
+        request.status = 'failed'; request.error = '当前轮次不再接收追加输入';
+        await this.state.saveInputRequest?.(request);
+      }
+      return accepted;
+    } catch (error) {
+      if (request.status !== 'accepted' && request.status !== 'failed') {
+        request.status = 'unknown'; request.error = error instanceof Error ? error.message : String(error);
+        await this.state.saveInputRequest?.(request);
+      }
+      throw error;
+    }
+  }
+
+  private executeTurn(session: Session, turn: Turn, execution: ActiveExecution, recovering = false, input?: InputRequestRecord) {
     const id = session.id;
     execution.turnId = turn.id;
     const running = runTurn(session, turn, execution.controller, {
       client: this.client, sandbox: this.sandbox, logger: this.logger, recovering,
-      save: () => this.save(session), publish: message => this.publish(id, message), snapshot: () => this.get(id),
+      save: async () => {
+        if (input) {
+          if (turn.codexAccepted && input.status !== 'accepted') {
+            input.status = 'accepted'; input.nativeTurnId = turn.nativeTurnId;
+            input.acceptedAt = new Date().toISOString();
+            await this.state.saveInputRequest?.(input);
+          } else if (turn.status !== 'running' && ['queued', 'sending'].includes(input.status)) {
+            input.status = input.status === 'sending' ? 'unknown' : 'failed'; input.error = turn.error;
+            await this.state.saveInputRequest?.(input);
+          }
+        }
+        await this.save(session);
+      }, publish: message => this.publish(id, message), snapshot: () => this.get(id),
       updateSandbox: sandbox => this.updateSandbox(session.projectId, id, sandbox),
       onSteer: steer => { execution.steer = steer; },
+      onInputRequest: input ? this.inputHook(input) : undefined,
       canPersist: () => !execution.lease?.signal.aborted,
     }).finally(async () => {
       if (execution.lease?.signal.aborted) { await execution.finish(); return; }
-      if (session.settings.executionMode === 'sandbox' && session.status !== 'running'
-        && !(session.turnCount ?? 0) && !session.turns.some(candidate => candidate.codexAccepted)) {
-        try {
-          await this.writer.wait(id);
-          await this.state.deleteSession(id);
-        } catch (error) {
-          console.error('Unaccepted session cleanup failed:', error instanceof Error ? error.message : 'unknown error');
-        }
-      }
       await execution.finish();
       if (!this.closing) void this.startQueuedUserInput(id).catch(error => console.error('Queued user input failed:', error));
       if (this.notifications && turn.status !== 'running') {
@@ -478,36 +564,38 @@ export class SessionManager {
     const questionTurn = session.turns.find(matches);
     const request = questionTurn?.userInputRequests?.find(item => item.id === requestId);
     if (!questionTurn || !request) throw new HttpError(404, '问题不存在');
-    if (this.coordinator) {
-      const persisted = await this.state.getSession(id);
-      const savedRequest = persisted?.turns.flatMap(turn => turn.userInputRequests ?? []).find(item => item.id === requestId);
-      if (savedRequest && savedRequest.status !== 'pending') throw new HttpError(409, '问题已经回答');
-    }
+    const submissions = await this.state.listInputRequests?.(id) ?? [];
+    if (submissions.some(input => input.requestId === requestId && ['queued', 'sending', 'accepted', 'unknown'].includes(input.status)))
+      throw new HttpError(409, '问题已回答或答案接收状态待确认');
     if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
     if (answers && answers.length !== request.questions.length) throw new HttpError(400, '请回答所有问题');
     if (!answers && request.questions.length > 1) throw new HttpError(400, '请分别回答所有问题');
-    request.answers = answers ?? [answer];
-    request.status = 'queued'; request.answer = answer; request.answeredAt = new Date().toISOString(); session.updatedAt = request.answeredAt;
-    await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
-    await this.startQueuedUserInput(id);
+    const values = answers ?? [answer];
+    const prompt = '<send_user_message_question_reply>\n' + JSON.stringify(request.questions.map((question, index) => ({
+      answer: values[index], question: question.title,
+      questionItemId: JSON.stringify(['request_user_input_async', request.id, index]),
+    }))) + '\n</send_user_message_question_reply>';
+    await this.queueInput(id, questionTurn.id, prompt, 'question_reply', { requestId });
+    request.answers = values; request.answer = answer; request.status = 'queued';
+    request.answeredAt = new Date().toISOString();
+    this.publish(id, { type: 'state', session: this.get(id) });
+    await this.startQueuedUserInputLocal(id);
     const snapshot = this.get(id);
-    // Starting the reply makes it the latest turn. Return the updated question
-    // too, so clients can replace the form they just submitted.
     if (!snapshot.turns.some(turn => turn.id === questionTurn.id)) snapshot.turns.unshift(structuredClone(questionTurn));
     return snapshot;
   }
 
   private async startQueuedUserInput(id: string): Promise<void> {
     if (this.closing) return;
-    return this.sessionMutation(id, () => this.startQueuedUserInputLocal(id));
+    const task = this.sessionMutation(id, () => this.startQueuedUserInputLocal(id));
+    this.inputTasks.add(task);
+    try { await task; } finally { this.inputTasks.delete(task); }
   }
 
   private async startQueuedUserInputLocal(id: string): Promise<void> {
+    if (this.closing) return;
     const pending = this.userInputDeliveries.get(id);
-    if (pending) {
-      await pending;
-      return this.startQueuedUserInputLocal(id);
-    }
+    if (pending) { await pending; return; }
     const delivery = this.deliverQueuedUserInput(id);
     this.userInputDeliveries.set(id, delivery);
     try { await delivery; }
@@ -515,70 +603,33 @@ export class SessionManager {
   }
 
   private async deliverQueuedUserInput(id: string) {
-    const session = await this.refreshSessionSandbox(this.lookup(id));
-    for (const [index, source] of session.turns.entries()) for (const request of source.userInputRequests ?? []) {
-      if (request.status !== 'queued' || !request.answer) continue;
-      const prompt = `<send_user_message_question_reply>\n${JSON.stringify(request.questions.map((question, index) => ({
-        answer: request.answers?.[index] ?? request.answer,
-        question: question.title,
-        questionItemId: JSON.stringify(['request_user_input_async', request.id, index]),
-      })))}\n</send_user_message_question_reply>`;
-      if (this.coordinator && session.threadId && session.settings.executionMode === 'sandbox' && this.sandbox) {
-        // A successful native send may precede a failed metadata save. Confirm
-        // native receipt before replaying a durable queue entry after takeover.
-        const history = await this.sandbox.history(session, { limit: 20 });
-        const received = history.turns.find(turn => turn.prompt === prompt || turn.additionalUserInputs?.includes(prompt));
-        if (received) {
-          request.status = 'answered'; request.answerTurnId = received.id;
-          await this.save(session); continue;
+    const submissions = await this.state.listInputRequests?.(id) ?? [];
+    for (const input of submissions) {
+      if (input.type !== 'question_reply' || input.status !== 'queued' || this.closing) continue;
+      if (this.active.get(id)?.turnId === input.id) continue;
+      let turnId: string;
+      try { turnId = await this.startTurnLocal(id, input.input, input.images ?? [], input); }
+      catch (error) {
+        if (error instanceof NativeTurnNotReceiving) {
+          // A definitive rejection is a completed RPC attempt, not an unknown
+          // delivery. Keep it and queue a new attempt for the owner's finalizer.
+          await this.queueInput(id, input.turnId, input.input, 'question_reply', { requestId: input.requestId });
+          if (!this.active.has(id) && !this.lookup(id).turns.some(turn => turn.status === 'running'))
+            await this.deliverQueuedUserInput(id);
+          return;
         }
+        const failed = this.lookup(id).turns.flatMap(turn => turn.userInputRequests ?? [])
+          .find(request => request.id === input.requestId);
+        if (failed) { failed.status = 'pending'; delete failed.answer; delete failed.answers; delete failed.answeredAt; }
+        throw error;
       }
-      const execution = this.active.get(id);
-      const remote = !execution && this.coordinator && session.settings.executionMode === 'sandbox'
-        ? session.turns.find(turn => turn.status === 'running' && turn.nativeTurnId) : undefined;
-      if (remote && this.sandbox?.steer) {
-        let accepted: boolean;
-        try { accepted = await this.sandbox.steer(session, remote, prompt); }
-        catch (error) {
-          request.status = 'pending'; delete request.answer; delete request.answers; delete request.answeredAt;
-          await this.save(session); throw error;
-        }
-        if (accepted) {
-          request.status = 'answered'; request.answerTurnId = remote.id;
-          await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
-          continue;
-        }
-        // Another observer owns finalization. Leave the durable reply queued;
-        // shared recovery drains it once the native terminal state is saved.
-        return;
-      }
-      if (execution) {
-        const target = session.turns.find(turn => turn.id === execution.turnId);
-        if (!target?.nativeTurnId || !execution.steer) return;
-        let accepted: boolean;
-        try { accepted = await execution.steer(prompt); }
-        catch (error) {
-          // Do not replay an RPC with an unknown delivery outcome at turn end.
-          request.status = 'pending';
-          delete request.answer; delete request.answers; delete request.answeredAt;
-          await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
-          throw error;
-        }
-        if (accepted) {
-          request.status = 'answered'; request.answerTurnId = target.id;
-          session.updatedAt = new Date().toISOString();
-          await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
-          continue;
-        }
-        // The native turn can finish before our observer sees completion.
-        // Its finalizer drains this queue after releasing the active execution.
-        if (this.active.has(id)) return;
-      }
-      const existing = session.turns.slice(index + 1).find(turn => turn.prompt === prompt && Date.parse(turn.startedAt) >= Date.parse(request.answeredAt ?? request.createdAt));
-      const answerTurnId = existing?.id ?? await this.startTurn(id, prompt);
-      request.status = 'answered'; request.answerTurnId = answerTurnId; session.updatedAt = new Date().toISOString();
-      await this.save(session); this.publish(id, { type: 'state', session: this.get(id) });
-      if (!existing) return;
+      const session = this.lookup(id);
+      const request = session.turns.flatMap(turn => turn.userInputRequests ?? []).find(request => request.id === input.requestId);
+      if (request) { request.status = 'answered'; request.answerTurnId = turnId; }
+      this.publish(id, { type: 'state', session: this.get(id) });
+      // A newly started native turn has not been accepted yet. Its finalizer
+      // will drain any further queued replies after releasing execution.
+      if (this.active.get(id)?.turnId === input.id) return;
     }
   }
 
@@ -662,7 +713,7 @@ export class SessionManager {
       const snapshot = await this.snapshot(id);
       if (!session.threadId) {
         this.historyErrors.delete(id);
-        return { ...snapshot, turns: session.turns.filter(turn => turn.status === 'running'), historyNextCursor: null,
+        return { ...snapshot, turns: session.turns.filter(turn => turn.status === 'running' || turn.type), historyNextCursor: null,
           historyError: undefined };
       }
       if (session.projectId && (!this.projects.get(session.projectId).sandbox)) {
@@ -684,7 +735,9 @@ export class SessionManager {
         const live = session.turns.filter(turn => turn.status === 'running');
         for (const turn of live) if (!turns.some(candidate => candidate.id === turn.id)) turns.push(turn);
         turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
-        return { ...snapshot, turns: this.withUserInputHistory(session, turns), historyNextCursor: page.nextCursor ?? null, historyError: undefined };
+        const result = { ...snapshot, turns: this.withUserInputHistory(session, turns), historyNextCursor: page.nextCursor ?? null, historyError: undefined };
+        await this.applyRecordedReplies(result);
+        return result;
       } catch (error) {
         if (error instanceof HttpError && error.status === 409) throw error;
         console.error('Native history read failed:', error instanceof Error ? error.message : 'unknown error');
@@ -701,9 +754,11 @@ export class SessionManager {
     const session = this.lookup(id);
     if (session.settings.executionMode !== 'sandbox' || !session.threadId) throw new HttpError(400, '此会话没有可分页的 Sandbox 历史');
     const page = await this.readSandboxHistory(session, { cursor, limit: 20 });
-    return { turns: this.withUserInputHistory(session, page.turns.map(turn => withNativeUserInput({ ...turn,
+    const result = { turns: this.withUserInputHistory(session, page.turns.map(turn => withNativeUserInput({ ...turn,
       userInputRequests: session.turns.find(old => old.id === turn.id || old.nativeTurnId === turn.id)?.userInputRequests ?? turn.userInputRequests,
     })).sort((left, right) => left.startedAt.localeCompare(right.startedAt))), nextCursor: page.nextCursor ?? null };
+    await this.applyRecordedReplies({ id, turns: result.turns });
+    return result;
   }
 
   private withUserInputHistory(session: Session, turns: Turn[]): Turn[] {
@@ -858,7 +913,7 @@ export class SessionManager {
       // Otherwise the post-stop history refresh makes the conversation appear
       // to lose the Agent's visible output.
       const storedOnlyItems = stored.items.filter(item => !turn.items.some(native => native.id === item.id));
-      return { ...turn, id: stored.id, nativeTurnId: turn.id, sdkUsage: stored.sdkUsage,
+      return { ...turn, id: stored.id, type: stored.type, nativeTurnId: turn.id, sdkUsage: stored.sdkUsage,
         prompt: turn.prompt || stored.prompt,
         images: turn.images.length ? turn.images : stored.images,
         items: [...turn.items, ...storedOnlyItems],
@@ -1446,18 +1501,16 @@ export class SessionManager {
   }
 
   private save(session: Session): Promise<void> {
-    // Keep the visible transcript available independently of Sandbox. Native
-    // history can enrich it later, but an unavailable or archived Sandbox must
-    // not make completed messages disappear after a Web restart.
+    // Persist submitted inputs, control boundaries and statistics. Native
+    // App Server history owns the output; never copy it into MySQL snapshots.
     const turns = session.turns.map(turn => ({
-      id: turn.id, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
+      id: turn.id, type: turn.type, nativeTurnId: turn.nativeTurnId, startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
       codexAccepted: turn.codexAccepted, error: turn.error,
       prompt: turn.prompt,
       additionalUserInputs: turn.additionalUserInputs,
       images: turn.images,
-      items: turn.items,
+      items: [],
       userInputRequests: turn.userInputRequests,
-      itemTimestamps: turn.itemTimestamps,
       usage: turn.usage, sdkUsage: turn.sdkUsage,
       contextUsage: turn.contextUsage?.map(({ blockEstimates, blockTokenizer, blockTexts, ...call }) => call),
     }));
@@ -1527,7 +1580,7 @@ export class SessionManager {
     }
   }
 
-  private async startTurnLocal(id: string, prompt: string, images: string[] = []): Promise<string> {
+  private async startTurnLocal(id: string, prompt: string, images: string[] = [], submission?: InputRequestRecord): Promise<string> {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     let session = await this.refreshSessionSandbox(this.lookup(id));
     if (session.projectId && this.projects.get(session.projectId).status !== 'active') {
@@ -1549,17 +1602,19 @@ export class SessionManager {
         let accepted = false;
         try {
           if (execution && this.active.get(id) === execution && execution.steer) {
-            accepted = await execution.steer(prompt);
+            accepted = await this.submitSteer(session, current, prompt, execution, submission);
           } else if (this.coordinator && session.settings.executionMode === 'sandbox' && this.sandbox?.steer) {
-            accepted = await this.sandbox.steer(session, current, prompt);
+            accepted = await this.submitSteer(session, current, prompt, undefined, submission);
           }
-        } catch {
+        } catch (error) {
           // A failed steer RPC can have an unknown delivery outcome. Never
           // retry it automatically or start a separate turn on this request.
+          if (submission?.type === 'question_reply') throw error;
           throw new HttpError(502, '追加消息的接收状态不确定，请检查会话后再继续');
         }
-        if (!accepted) throw new HttpError(409, 'Codex 已不再接收当前任务的追加消息，请刷新会话后重试');
-        current.additionalUserInputs = [...(current.additionalUserInputs ?? []), prompt];
+        if (!accepted) throw new NativeTurnNotReceiving();
+        if (submission?.type !== 'question_reply')
+          current.additionalUserInputs = [...(current.additionalUserInputs ?? []), prompt];
         session.updatedAt = new Date().toISOString();
         await this.save(session);
         this.publish(id, { type: 'state', session: this.get(id) });
@@ -1589,7 +1644,8 @@ export class SessionManager {
         try { path = await realpath(image); } catch { throw new HttpError(400, '图片附件不存在，请重新上传'); }
         if (!imageRoots.some(root => path.startsWith(root))) throw new HttpError(400, '只能使用此会话上传的图片');
       }
-      const turn: Turn = { id: randomUUID(), prompt, images, codexAccepted: false, status: 'running', phase: 'starting', items: [], itemTimestamps: {}, startedAt: new Date().toISOString() };
+      const turn: Turn = { id: submission?.id ?? randomUUID(), type: submission?.type ?? 'message', prompt, images,
+        codexAccepted: false, status: 'running', phase: 'starting', items: [], itemTimestamps: {}, startedAt: new Date().toISOString() };
       // The Sandbox owns a long-lived App Server. Web holds the live RPC
       // connection, so there is no per-turn worker process to persist.
       execution.turnId = turn.id;
@@ -1598,8 +1654,11 @@ export class SessionManager {
       session.updatedAt = turn.startedAt;
       if (session.title === '新任务') session.title = prompt.slice(0, 60);
       await this.save(session);
+      const input = submission ?? await this.queueInput(id, turn.id, prompt, 'message', { id: turn.id, images });
+      input.turnId = turn.id;
+      await this.state.saveInputRequest?.(input);
       this.publish(id, { type: 'state', session: this.get(id) });
-      this.executeTurn(session, turn, execution);
+      this.executeTurn(session, turn, execution, false, input);
       return turn.id;
     } catch (error) {
       this.sessions.set(id, previous);
@@ -1781,6 +1840,7 @@ export class SessionManager {
     }
     await Promise.allSettled(detachments);
     await Promise.allSettled([...this.active.values()].map(execution => execution.done));
+    await Promise.allSettled([...this.inputTasks, ...this.userInputDeliveries.values()]);
     try {
       await this.sandbox?.close();
       await Promise.all([this.writer.drain(), this.projects.close()]);

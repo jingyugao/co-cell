@@ -6,6 +6,36 @@ export class AppServerRpcError extends Error {
   constructor(rpc, method) { super(`${method}: ${rpc.message}`); this.name = 'AppServerRpcError'; this.rpc = rpc; }
 }
 
+const safeThreadRequest = (method, params) => {
+  const safeParams = {};
+  for (const key of ['threadId', 'model', 'modelProvider', 'cwd', 'approvalPolicy', 'sandbox']) {
+    if (params[key] !== undefined) safeParams[key] = params[key];
+  }
+  const safeConfig = {};
+  for (const key of ['web_search', 'sandbox_workspace_write.network_access', 'sandbox_workspace_write.writable_roots']) {
+    if (params.config?.[key] !== undefined) safeConfig[key] = params.config[key];
+  }
+  if (Object.keys(safeConfig).length) safeParams.config = safeConfig;
+  return { method, params: safeParams };
+};
+
+async function sendInputRequest(client, method, params, hook, threadRequest, nativeTurnId) {
+  if (hook) await hook({ phase: 'sending', method, params: structuredClone(params), ...(threadRequest ? { threadRequest: structuredClone(threadRequest) } : {}) });
+  let response;
+  try {
+    response = await client.request(method, params);
+  } catch (error) {
+    if (hook) await hook({ phase: error instanceof AppServerRpcError ? 'failed' : 'unknown', method, params: structuredClone(params),
+      ...(threadRequest ? { threadRequest: structuredClone(threadRequest) } : {}), ...(nativeTurnId ? { nativeTurnId } : {}),
+      error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+  const acceptedTurnId = method === 'turn/start' ? response?.turn?.id : nativeTurnId;
+  if (hook) await hook({ phase: 'accepted', method, params: structuredClone(params),
+    ...(threadRequest ? { threadRequest: structuredClone(threadRequest) } : {}), ...(acceptedTurnId ? { nativeTurnId: acceptedTurnId } : {}) });
+  return { response, nativeTurnId: acceptedTurnId };
+}
+
 /** Owns a local stdio child. Run this inside the independent sandbox worker for detached execution. */
 export class CodexAppServerClient extends EventEmitter {
   constructor(options = {}) { super(); this.options = options; this.pending = new Map(); this.nextId = 1; this.closed = false; }
@@ -112,10 +142,14 @@ export class CodexAppServerClient extends EventEmitter {
   }
   threadStart(params) { return this.request('thread/start', params); }
   threadResume(params) { return this.request('thread/resume', params); }
-  turnStart(params) { return this.request('turn/start', params); }
-  async steerTurn(threadId, expectedTurnId, text) {
+  async turnStart(params, onInputRequest, threadRequest) {
+    const { response } = await sendInputRequest(this, 'turn/start', params, onInputRequest, threadRequest);
+    return response;
+  }
+  async steerTurn(threadId, expectedTurnId, text, onInputRequest, threadRequest) {
     try {
-      await this.request('turn/steer', { threadId, expectedTurnId, input: [{ type: 'text', text, text_elements: [] }] });
+      const params = { threadId, expectedTurnId, input: [{ type: 'text', text, text_elements: [] }] };
+      await sendInputRequest(this, 'turn/steer', params, onInputRequest, threadRequest, expectedTurnId);
       return true;
     } catch (error) {
       if (error instanceof AppServerRpcError && /no active turn/i.test(error.rpc.message)) return false;
@@ -250,12 +284,13 @@ export class Codex {
 }
 export class Thread {
   constructor(codex, options, id = null) { this.codex = codex; this.options = options; this.id = id; this.running = false; }
-  async steer(text) {
+  async steer(text, onInputRequest = this.options.onInputRequest) {
     if (!this.activeClient || !this.activeTurnId) return false;
-    return this.activeClient.steerTurn(this.id, this.activeTurnId, text);
+    return this.activeClient.steerTurn(this.id, this.activeTurnId, text, onInputRequest,
+      this.lastThreadRequest);
   }
   async runStreamed(input, options = {}) { return { events: this.execute(input, options) }; }
-  async *execute(input, { signal, outputSchema } = {}) {
+  async *execute(input, { signal, outputSchema, onInputRequest = this.options.onInputRequest } = {}) {
     if (this.running) throw new Error('A turn is already running on this thread');
     this.running = true;
     let client, stream, turnId;
@@ -280,21 +315,26 @@ export class Thread {
       };
       const params = { ...(opts.model ? { model: opts.model } : {}), ...(opts.modelProvider ? { modelProvider: opts.modelProvider } : {}), cwd: opts.workingDirectory,
         approvalPolicy: opts.approvalPolicy ?? 'never', sandbox: opts.sandboxMode ?? 'workspace-write', config: threadConfig };
+      let threadRequest = safeThreadRequest(this.id ? 'thread/resume' : 'thread/start', { ...params, ...(this.id ? { threadId: this.id } : {}) });
       let response = await client.request(this.id ? 'thread/resume' : 'thread/start', { ...params, ...(this.id ? { threadId: this.id } : {}) });
       // Loaded App Server threads retain their original provider on resume.
       // Adopt a changed channel configuration by forking the full native history.
       // Unchanged providers keep their thread across subsequent turns.
       if (this.id && opts.modelProvider && response.modelProvider && response.modelProvider !== opts.modelProvider) {
-        response = await client.request('thread/fork', { ...params, threadId: this.id });
+        const forkParams = { ...params, threadId: this.id };
+        threadRequest = safeThreadRequest('thread/fork', forkParams);
+        response = await client.request('thread/fork', forkParams);
       }
       this.id = response.thread.id;
+      this.lastThreadRequest = threadRequest;
       yield { type: 'thread.started', thread_id: this.id };
       signal?.throwIfAborted();
       if (this.codex.closed) throw new Error('Codex observer is closed');
       const userInput = typeof input === 'string' ? [{ type: 'text', text: input }] : input;
-      const result = await client.turnStart({ threadId: this.id, input: userInput.map(part => part.type === 'local_image' ? { type: 'localImage', path: part.path } : { type: 'text', text: part.text, text_elements: [] }),
+      const turnParams = { threadId: this.id, input: userInput.map(part => part.type === 'local_image' ? { type: 'localImage', path: part.path } : { type: 'text', text: part.text, text_elements: [] }),
         ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.modelReasoningEffort ? { effort: opts.modelReasoningEffort } : {}), ...(outputSchema ? { outputSchema } : {}) });
+        ...(opts.modelReasoningEffort ? { effort: opts.modelReasoningEffort } : {}), ...(outputSchema ? { outputSchema } : {}) };
+      const result = await client.turnStart(turnParams, onInputRequest, threadRequest);
       turnId = result.turn.id;
       this.activeClient = client; this.activeTurnId = turnId;
       signal?.addEventListener('abort', abort, { once: true });

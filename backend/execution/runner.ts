@@ -1,4 +1,4 @@
-import type { Codex, Input, Thread, ThreadOptions } from '../../packages/agentcore/src/index.mjs';
+import type { Codex, Input, InputRequestHook, Thread, ThreadOptions } from '../../packages/agentcore/src/index.mjs';
 import type { AgentEvent, Session, StreamMessage, Turn } from '../../protocol/types.js';
 import { applyTurnEvent } from '../../util/session-events.js';
 import { HttpError } from '../../util/errors.js';
@@ -18,7 +18,8 @@ type TurnExecutionDependencies = {
   /** Whether this process still owns the right to persist this execution. */
   canPersist?(): boolean;
   recovering?: boolean;
-  onSteer?(steer: (text: string) => Promise<boolean>): void;
+  onInputRequest?: InputRequestHook;
+  onSteer?(steer: (text: string, onInputRequest?: InputRequestHook) => Promise<boolean>): void;
 };
 
 /** Persist turn boundaries; native Sandbox history can reconstruct coalesced deltas. */
@@ -43,20 +44,21 @@ export async function runTurn(session: Session, turn: Turn, controller: AbortCon
   try {
     assertCanPersist();
     const { model, executionMode, ...settings } = session.settings;
-    const options: ThreadOptions = { ...settings, ...(model ? { model } : {}), approvalPolicy: 'never', skipGitRepoCheck: true };
+    const options: ThreadOptions = { ...settings, ...(model ? { model } : {}), approvalPolicy: 'never', skipGitRepoCheck: true,
+      onInputRequest: dependencies.onInputRequest };
     let events: AsyncGenerator<AgentEvent>;
     if (executionMode === 'sandbox') {
       if (!sandbox) throw new HttpError(503, 'Sandbox 未配置，无法运行此沙箱会话');
       const observe = dependencies.recovering ? sandbox.recover.bind(sandbox) : sandbox.run.bind(sandbox);
-      if (sandbox.steer) dependencies.onSteer?.(text => sandbox.steer!(session, turn, text));
+      if (sandbox.steer) dependencies.onSteer?.((text, onInputRequest) => sandbox.steer!(session, turn, text, onInputRequest));
       events = observe(session, turn, controller.signal, async sandbox => {
         assertCanPersist();
         await updateSandbox(sandbox);
         assertCanPersist();
-      });
+      }, dependencies.onInputRequest);
     } else {
       const thread: Thread = session.threadId ? client.resumeThread(session.threadId, options) : client.startThread(options);
-      dependencies.onSteer?.(text => thread.steer(text));
+      dependencies.onSteer?.((text, onInputRequest) => thread.steer(text, onInputRequest));
       const input: Input = turn.images.length ? [{ type: 'text', text: turn.prompt }, ...turn.images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
       ({ events } = await thread.runStreamed(input, { signal: controller.signal }));
     }

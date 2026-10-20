@@ -26,7 +26,7 @@ export class ImageCatalog {
   private records = new Map<string, ImageRecord>();
   constructor(private store: ImageCatalogStore, private client: CellboxClient, private profileId: string,
     private registry: ImageRegistry = new DockerRegistryClient(), private projects: () => Project[] | Promise<Project[]> = () => [],
-    private options: { defaultTemplateId?: string; defaultRevisionId?: string } = {}) {}
+    private options: { defaultTemplateId?: string; defaultRevisionId?: string; mountedToolWrappers?: boolean } = {}) {}
 
   async init() { await this.loadRecords(); }
   private async loadRecords() {
@@ -166,7 +166,7 @@ export class ImageCatalog {
     if ([...this.records.values()].some(image => !image.deletedAt && (image.templateId || image.templateStatus) && image.repository === repository)) throw new HttpError(409, '该镜像仓库已添加，请进入仓库同步版本');
     if ([...this.records.values()].some(image => !image.deletedAt && (image.templateId || image.templateStatus)
       && image.name === input.name.trim() && image.category === input.category.trim())) throw new HttpError(409, '同类型仓库名称已存在');
-    await prepareImageRequest(registryImageReference(repository, 'latest'), input.buildCommand);
+    await prepareImageRequest(registryImageReference(repository, 'latest'), input.buildCommand, this.options);
     const record: ImageRecord = { id: randomUUID(), name: input.name.trim(), category: input.category.trim(), repository,
       origin: 'managed', versions: [], templateStatus: 'submitting', registryAuthRequired: Boolean(input.registryAuthRequired),
       ...(input.buildCommand ? { buildCommand: input.buildCommand } : {}) } as ImageRecord;
@@ -201,7 +201,7 @@ export class ImageCatalog {
     if (input.registryAuth) throw new HttpError(422, 'UNSUPPORTED: Cellbox template build does not accept per-request registry credentials');
     if (stored.registryAuthRequired) throw new HttpError(422, 'UNSUPPORTED: 私有仓库构建凭据需配置在 Cellbox 部署侧；当前版本不支持请求级凭据');
     const digest = await this.registry.resolveTag(stored.repository!, input.tag);
-    const prepared = await prepareImageRequest(registryImageReference(stored.repository!, digest), stored.buildCommand);
+    const prepared = await prepareImageRequest(registryImageReference(stored.repository!, digest), stored.buildCommand, this.options);
     const record = structuredClone(stored);
     const version: ImageVersionRecord = { id: randomUUID(), userVersion: input.tag, version: input.tag,
       templateId: stored.templateId, source: registryImageReference(stored.repository!, input.tag), upstreamDigest: digest,

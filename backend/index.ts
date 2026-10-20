@@ -32,6 +32,7 @@ import { NativeSecretFiles } from './secrets/native-files.js';
 import { SecretService } from './secrets/service.js';
 import { SharedFiles } from './shared-files/service.js';
 import { publishSharedDirectory } from './shared-files/mount.js';
+import { publishToolWrappers } from './shared-files/tool-wrappers.js';
 import { loadSharedMountConfig } from './shared-files/config.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
@@ -78,7 +79,10 @@ if (multiApi && !sharedDirectory) throw new Error('Multi-API native credentials 
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
 const webState = createWebStateStore(mysqlUrl, new NativeSecretFiles(resolve(sharedDataRoot, 'runtime/debug-homes'), secretCrypto));
 if (sharedDirectory) {
-  const publish = () => publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
+  const publish = async () => {
+    await publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
+    await publishToolWrappers(sharedDataRoot);
+  };
   if (coordinator) await coordinator.run('cocell-shared-startup-config', publish);
   else await publish();
 }
@@ -175,7 +179,8 @@ if (coordinator) {
   if (lease) try { await reconcileProjects(); } finally { await lease.release(); }
 } else await reconcileProjects();
 const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.env.CELLBOX_PROFILE!, undefined,
-  () => webState.listProjects(), {defaultTemplateId:process.env.CELLBOX_TEMPLATE_ID,defaultRevisionId:process.env.CELLBOX_REVISION_ID});
+  () => webState.listProjects(), {defaultTemplateId:process.env.CELLBOX_TEMPLATE_ID,defaultRevisionId:process.env.CELLBOX_REVISION_ID,
+    mountedToolWrappers:sharedDirectory});
 await imageCatalog.init();
 manager.setImageCatalog(imageCatalog);
 const config: AppConfig = { models: availableModels, sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,

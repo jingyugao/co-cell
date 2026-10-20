@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import type { ThreadEvent } from './types.js';
+import type { InputRequestHook, InputThreadRequest, ThreadEvent } from './types.js';
 export type * from './types.js';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface RpcError { code: number; message: string; data?: unknown }
@@ -17,8 +17,8 @@ export class CodexAppServerClient extends EventEmitter {
   events(): AsyncIterableIterator<AppServerEvent> & { drain(): AppServerEvent[]; return(): Promise<IteratorResult<AppServerEvent>> };
   threadStart(params: unknown): Promise<any>;
   threadResume(params: unknown): Promise<any>;
-  turnStart(params: unknown): Promise<any>;
-  steerTurn(threadId: string, expectedTurnId: string, text: string): Promise<boolean>;
+  turnStart(params: unknown, onInputRequest?: InputRequestHook, threadRequest?: InputThreadRequest): Promise<any>;
+  steerTurn(threadId: string, expectedTurnId: string, text: string, onInputRequest?: InputRequestHook, threadRequest?: InputThreadRequest): Promise<boolean>;
   turnInterrupt(params: unknown): Promise<any>;
   close(): Promise<void>;
 }
@@ -31,7 +31,8 @@ export interface ThreadOptions {
  model?: string; modelProvider?: string; providerConfig?: Record<string, unknown>; workingDirectory?: string; sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
  modelReasoningEffort?: string; webSearchMode?: 'disabled' | 'cached' | 'live'; networkAccessEnabled?: boolean;
  approvalPolicy?: 'never' | 'on-request' | 'on-failure' | 'untrusted'; additionalDirectories?: string[]; skipGitRepoCheck?: boolean;
+ onInputRequest?: InputRequestHook;
 }
 export class Codex { constructor(options?: CodexOptions); startThread(options?: ThreadOptions): Thread; resumeThread(id: string, options?: ThreadOptions): Thread; close(): Promise<void>; }
-export class Thread { readonly id: string | null; steer(text: string): Promise<boolean>; runStreamed(input: Input, options?: { signal?: AbortSignal; outputSchema?: unknown }): Promise<{ events: AsyncGenerator<AgentEvent> }>; }
+export class Thread { readonly id: string | null; steer(text: string, onInputRequest?: InputRequestHook): Promise<boolean>; runStreamed(input: Input, options?: { signal?: AbortSignal; outputSchema?: unknown; onInputRequest?: InputRequestHook }): Promise<{ events: AsyncGenerator<AgentEvent> }>; }
 export function appServerArgs(config?: Record<string, unknown>, configOverrides?: string[]): string[];

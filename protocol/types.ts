@@ -2,6 +2,7 @@ import type { ProjectImageSelection } from './image-types.js';
 import type { SandboxImageIdentity, SandboxState } from './sandbox-types.js';
 import type { ThreadEvent, ThreadItem, Usage } from './agent-protocol.js';
 import type { UserInputRequest } from './user-input-types.js';
+import type { InputRequestType } from './input-request-types.js';
 
 export type SessionStatus = 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
 export interface RetryState {
@@ -70,6 +71,8 @@ export interface Settings {
  * An uncertain RPC outcome must not be automatically resubmitted. */
 export interface SubmitTurnResponse { turnId: string }
 export interface Turn {
+  /** Kind of the submission that started this native execution. */
+  type?: InputRequestType;
   segment?: number;
   compactions?: Array<{ segment: number; timestamp: string; beforeItemIndex: number }>;
   nativeTurnId?: string;

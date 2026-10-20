@@ -11,7 +11,7 @@ import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxRecord, Cellbo
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import { readCellboxWorkspaceFile, cellboxWorkspaceFileResponse } from '../sandboxes/cellbox-files.js';
 import { holdResponse } from '../../util/http-stream.js';
-import type { ThreadOptions } from '../../packages/agentcore/src/index.mjs';
+import type { InputRequestHook, ThreadOptions } from '../../packages/agentcore/src/index.mjs';
 import type { AgentEvent } from '../../protocol/types.js';
 import type { Session, SubagentConversation, Turn } from '../../protocol/types.js';
 import type { NativeHistory } from './native-history.mjs';
@@ -32,11 +32,11 @@ export interface SandboxRuntime {
   observe?(session: Session, turn: Turn, signal: AbortSignal): AsyncGenerator<NativeTurnObservation>;
 	remoteArchives?: import('../archives/remote.js').RemoteArchives;
   currentImageIdentity?(target?: WorkspaceTarget): Promise<SandboxImageIdentity>;
-  run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
-  recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
+  run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onInputRequest?: InputRequestHook): AsyncGenerator<AgentEvent>;
+  recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>, onInputRequest?: InputRequestHook): AsyncGenerator<AgentEvent>;
   detach(turn: Turn): void;
   interrupt?(session: Session, turn: Turn): Promise<void>;
-  steer?(session: Session, turn: Turn, text: string): Promise<boolean>;
+  steer?(session: Session, turn: Turn, text: string, onInputRequest?: InputRequestHook): Promise<boolean>;
   openServiceAccess?(session: WorkspaceTarget, port: number, signal: AbortSignal): Promise<ServiceProxyAccess>;
   service?(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response>;
   file(session: WorkspaceTarget, path: string, signal?: AbortSignal): Promise<WorkspaceFileResult>;
@@ -271,7 +271,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
    * The App Server is the Sandbox entrypoint. Web owns the JSON-RPC client and
    * persistence, so ordinary execution no longer needs a copied worker or journal.
    */
-  private async *runAppServer(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox): AsyncGenerator<AgentEvent> {
+  private async *runAppServer(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, onInputRequest?: InputRequestHook): AsyncGenerator<AgentEvent> {
     if (!this.options.appServer) throw new Error('Sandbox App Server endpoint is not configured');
     const observer = new AbortController();
     this.observers.set(turn.id, observer);
@@ -303,7 +303,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       observer.signal.throwIfAborted();
       const options = { workingDirectory: session.settings.workingDirectory, ...(session.settings.model ? { model: session.settings.model } : {}), ...modelOptions,
         modelReasoningEffort: session.settings.modelReasoningEffort, sandboxMode: 'danger-full-access' as const,
-        webSearchMode: session.settings.webSearchMode, networkAccessEnabled: true, approvalPolicy: 'never' as const, skipGitRepoCheck: true };
+        webSearchMode: session.settings.webSearchMode, networkAccessEnabled: true, approvalPolicy: 'never' as const, skipGitRepoCheck: true, onInputRequest };
       const thread = session.threadId ? codex.resumeThread(session.threadId, options) : codex.startThread(options);
       const input = images.length ? [{ type: 'text' as const, text: turn.prompt }, ...images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
       const streamed = await thread.runStreamed(input, { signal });
@@ -324,8 +324,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     }
   }
 
-  async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox): AsyncGenerator<AgentEvent> {
-    yield* this.runAppServer(session, turn, signal, onSandbox);
+  async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, onInputRequest?: InputRequestHook): AsyncGenerator<AgentEvent> {
+    yield* this.runAppServer(session, turn, signal, onSandbox, onInputRequest);
   }
 
   /** Observe an accepted turn without acquiring usage, sending input, or interrupting it. */
@@ -505,7 +505,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     }
   }
 
-  async *recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox): AsyncGenerator<AgentEvent> {
+  async *recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, _onInputRequest?: InputRequestHook): AsyncGenerator<AgentEvent> {
     yield* this.recoverAppServer(session, turn, signal, onSandbox);
   }
 
@@ -606,9 +606,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       return { turns: (response.data ?? []).map((rawTurn: any) => this.mapAppServerTurn(rawTurn)), nextCursor: response.nextCursor ?? null };
     }, options.signal).catch(error => { throw this.safeError(error); });
   }
-  async steer(session: Session, turn: Turn, text: string): Promise<boolean> {
+  async steer(session: Session, turn: Turn, text: string, onInputRequest?: InputRequestHook): Promise<boolean> {
     if (!session.sandbox || !session.threadId || !turn.nativeTurnId) return false;
-    return this.reader.read(session.sandbox.id, client => client.steerTurn(session.threadId!, turn.nativeTurnId!, text));
+    return this.reader.read(session.sandbox.id, client => client.steerTurn(session.threadId!, turn.nativeTurnId!, text, onInputRequest));
   }
   async interrupt(session: Session, turn: Turn): Promise<void> {
     if (!session.sandbox || !session.threadId || !turn.nativeTurnId) {

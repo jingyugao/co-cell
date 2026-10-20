@@ -175,4 +175,22 @@ export type TurnOptions = {
     outputSchema?: unknown;
     /** AbortSignal to cancel the turn. */
     signal?: AbortSignal;
+    /** Persist the exact Codex input request before sending and record its outcome. */
+    onInputRequest?: InputRequestHook;
 };
+
+export type InputRequestMethod = 'turn/start' | 'turn/steer';
+export type InputThreadRequest = {
+    method: 'thread/start' | 'thread/resume' | 'thread/fork';
+    /** Safe configuration snapshot; provider credentials and headers are excluded. */
+    params: Record<string, unknown>;
+};
+export type InputRequestEvent = {
+    phase: 'sending' | 'accepted' | 'failed' | 'unknown';
+    method: InputRequestMethod;
+    params: Record<string, unknown>;
+    nativeTurnId?: string;
+    error?: string;
+    threadRequest?: InputThreadRequest;
+};
+export type InputRequestHook = (event: InputRequestEvent) => void | Promise<void>;

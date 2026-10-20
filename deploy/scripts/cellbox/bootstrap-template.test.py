@@ -38,7 +38,7 @@ class BootstrapTemplateTests(unittest.TestCase):
         self.port_forward = mock.Mock()
         self.port_forward.poll.return_value = None
         self.popen = mock.patch.object(bootstrap.subprocess, "Popen", return_value=self.port_forward)
-        self.popen.start()
+        self.popen_mock = self.popen.start()
         self.addCleanup(self.popen.stop)
 
         health = mock.MagicMock()
@@ -76,7 +76,7 @@ class BootstrapTemplateTests(unittest.TestCase):
                 "userVersion": "2.3.4",
                 "baseImage": IMAGE,
                 "profileId": "profile-small",
-                "warmSlots": 0,
+                "warmSlots": 1,
                 "runCommand": f"docker run --entrypoint /usr/local/bin/node {IMAGE} /opt/product/cocell/launcher.mjs",
             })
             self.assertTrue(selector.is_file())
@@ -112,6 +112,64 @@ class BootstrapTemplateTests(unittest.TestCase):
             self.assertEqual(submissions[0][1], "POST")
             self.assertEqual(len(calls), 3)
             self.assertFalse(selector.exists())
+
+    def test_new_template_uses_same_default_and_revision_warm_slots(self):
+        os.environ["CELLBOX_TEMPLATE_ID"] = ""
+        os.environ["COCELL_CELLBOX_CREATE_TEMPLATE"] = "1"
+        calls = []
+
+        def request(_base, path, _client, method="GET", payload=None):
+            calls.append((path, method, payload))
+            if path == "/v1/profiles":
+                return 200, [{"id": "profile-small"}]
+            if path == "/v1/templates" and method == "POST":
+                return 201, {"id": "template-created"}
+            if path == "/v1/templates/template-created/revisions" and method == "POST":
+                return 202, {"id": "operation-123"}
+            if path == "/v1/operations/operation-123":
+                return 200, {"status": "succeeded", "result": {"revisionId": "revision-456"}}
+            self.fail(f"Unexpected Cellbox request: {method} {path}")
+
+        with mock.patch.object(bootstrap, "request", side_effect=request):
+            with mock.patch("sys.stdout"):
+                self.assertEqual(bootstrap.main(), 0)
+
+        template_posts = [call for call in calls if call[0] == "/v1/templates"]
+        revision_posts = [call for call in calls if call[0] == "/v1/templates/template-created/revisions"]
+        self.assertEqual(template_posts[0][2]["defaultWarmSlots"], 1)
+        self.assertEqual(revision_posts[0][2]["warmSlots"], 1)
+
+    def test_explicit_zero_disables_warm_slots_for_new_template_and_revision(self):
+        os.environ["CELLBOX_TEMPLATE_ID"] = ""
+        os.environ["COCELL_CELLBOX_CREATE_TEMPLATE"] = "1"
+        os.environ["COCELL_CELLBOX_WARM_SLOTS"] = "0"
+
+        def request(_base, path, _client, method="GET", payload=None):
+            if path == "/v1/profiles":
+                return 200, [{"id": "profile-small"}]
+            if path == "/v1/templates" and method == "POST":
+                self.assertEqual(payload["defaultWarmSlots"], 0)
+                return 201, {"id": "template-created"}
+            if path == "/v1/templates/template-created/revisions" and method == "POST":
+                self.assertEqual(payload["warmSlots"], 0)
+                return 202, {"id": "operation-123"}
+            if path == "/v1/operations/operation-123":
+                return 200, {"status": "succeeded", "result": {"revisionId": "revision-456"}}
+            self.fail(f"Unexpected Cellbox request: {method} {path}")
+
+        with mock.patch.object(bootstrap, "request", side_effect=request):
+            with mock.patch("sys.stdout"):
+                self.assertEqual(bootstrap.main(), 0)
+
+    def test_invalid_warm_slots_is_rejected_before_network_or_port_forward(self):
+        for invalid in ("", "-1", "+1", "1.5", "abc", " 1"):
+            with self.subTest(value=invalid):
+                os.environ["COCELL_CELLBOX_WARM_SLOTS"] = invalid
+                with mock.patch.object(bootstrap, "request") as request_mock:
+                    with self.assertRaisesRegex(SystemExit, "non-negative integer"):
+                        bootstrap.main()
+                self.popen_mock.assert_not_called()
+                request_mock.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -46,6 +46,33 @@ class CellboxRelease:
     def kube(self, *args: str) -> tuple[str, ...]:
         return ("kubectl", "--context", self.context, "--namespace", self.namespace, *args)
 
+    def check_runtime(self, values: dict) -> None:
+        controller = values.get("controller", {})
+        runsc = controller.get("runsc") or "/usr/local/bin/runsc"
+        if not isinstance(runsc, str):
+            raise RuntimeError("Cellbox runtime preflight requires controller.runsc to be a path")
+        checks = (("flags",), ("help", "create"))
+        required_flags = ("-restore-page-loading", "-no-root-container")
+        for check, required_flag in zip(checks, required_flags):
+            command = " ".join(check)
+            args = self.kube("exec", "deployment/cellbox-server", "-c", "server", "--",
+                             "nsenter", "--target=1", "--mount", "--root", "--", runsc, *check)
+            try:
+                result = subprocess.run(args, check=False, text=True, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, timeout=20)
+            except (OSError, subprocess.TimeoutExpired) as err:
+                raise RuntimeError(
+                    f"Cellbox runtime preflight could not inspect {runsc} ({command}); configure a tested matching fork runsc/shim/wrapper and keep existing checkpoints on their current runtime"
+                ) from err
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Cellbox runtime preflight could not inspect {runsc} ({command}, exit {result.returncode}); configure a tested matching fork runsc/shim/wrapper and keep existing checkpoints on their current runtime"
+                )
+            if required_flag not in result.stdout:
+                raise RuntimeError(
+                    f"Cellbox runtime {runsc} lacks {required_flag}; configure a tested matching fork runsc/shim/wrapper and keep existing checkpoints on their current runtime"
+                )
+
     def publish_server(self) -> str:
         endpoint = os.environ.get("COCELL_REGISTRY_ENDPOINT", "")
         if not re.fullmatch(r"http://[^/\s]+", endpoint):
@@ -111,8 +138,14 @@ class CellboxRelease:
         api.update({"enabled": True, "namespace": self.namespace, "replicas": 1, "config": config})
         values["api"] = api
         controller = existing.get("controller", {})
-        allowed_controller = ("warmPoolSize", "extraEnv", "criDirectory", "criSocket", "nodeSelector", "tolerations")
+        allowed_controller = ("warmPoolSize", "extraEnv", "criDirectory", "criSocket", "nodeSelector", "tolerations",
+                             "nodeBase", "runsc", "shim")
         values["controller"] = {key: controller[key] for key in allowed_controller if key in controller}
+        runtime_class = existing.get("runtimeClass")
+        if isinstance(runtime_class, dict):
+            values["runtimeClass"] = {key: runtime_class[key] for key in ("create", "name", "handler") if key in runtime_class}
+        if isinstance(existing.get("crd"), dict):
+            values["crd"] = {key: existing["crd"][key] for key in ("create",) if key in existing["crd"]}
         server = existing.get("server", {})
         values["server"] = {key: server[key] for key in ("resources",) if key in server}
         values["server"].update({"nodeName": self.node_name})

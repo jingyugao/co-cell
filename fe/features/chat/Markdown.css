@@ -142,6 +142,22 @@
 .markdown .markdown-code-header button:hover:not(:disabled) { color: #607d44; border-color: #d8e2c9; background: #f9fcf4; }
 .markdown .markdown-code-header button:focus-visible { outline: 2px solid #a6b88c; outline-offset: 2px; }
 
+.markdown .markdown-code-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.markdown .markdown-mermaid-diagram {
+  max-width: 100%;
+  padding: 16px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  background: #fff;
+}
+.markdown .markdown-mermaid-diagram > svg { display: block; margin: 0 auto; }
+.markdown .markdown-mermaid-diagram:focus-visible { outline: 2px solid #acbd93; outline-offset: -2px; }
+.markdown .markdown-mermaid-status,
+.markdown .markdown-mermaid-error { padding: 13px 15px; font-size: 0.9em; }
+.markdown .markdown-mermaid-status { color: #68715d; }
+.markdown .markdown-mermaid-error { color: #8a442e; border-bottom: 1px solid #e2e8d8; }
+.markdown .markdown-mermaid-error p { max-height: 10em; margin: 5px 0 0; overflow: auto; white-space: pre-wrap; }
+
 .markdown pre,
 .markdown .markdown-code-block pre {
   display: block;

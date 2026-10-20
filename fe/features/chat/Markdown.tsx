@@ -3,6 +3,7 @@ import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markd
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import { MermaidDiagram } from './MermaidDiagram';
 import { fileContentUrl, fileViewUrl, resolveResource, type ResourceContext } from '../../lib/resource-links';
 
 export type FileSelection = { path: string; line?: number; fragment?: string };
@@ -109,6 +110,8 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   const code = isValidElement<{ children?: ReactNode; className?: string }>(child) ? child : undefined;
   const content = typeof code?.props.children === 'string' ? code.props.children : '';
   const language = code?.props.className?.match(/(?:^|\s)language-([^\s]+)/)?.[1];
+  const mermaid = language?.toLowerCase() === 'mermaid';
+  const [showSource, setShowSource] = useState(false);
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(timer.current), []);
@@ -118,7 +121,13 @@ function CodeBlock({ children }: { children?: ReactNode }) {
     catch { setCopyState('failed'); }
     timer.current = setTimeout(() => setCopyState('idle'), 2000);
   }
-  return <div className="markdown-code-block"><div className="markdown-code-header"><span>{language || '代码'}</span><button type="button" onClick={() => void copy()} aria-label="复制代码"><span aria-live="polite">{copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败，请重试' : '复制代码'}</span></button></div><pre tabIndex={0}><CodeBlockContext.Provider value={true}>{children}</CodeBlockContext.Provider></pre></div>;
+  const source = <pre tabIndex={0}><CodeBlockContext.Provider value={true}>{children}</CodeBlockContext.Provider></pre>;
+  return <div className="markdown-code-block"><div className="markdown-code-header"><span>{language || '代码'}</span>
+    <div className="markdown-code-actions">
+      {mermaid && <button type="button" onClick={() => setShowSource(value => !value)} aria-pressed={showSource}>{showSource ? '查看图表' : '查看源码'}</button>}
+      <button type="button" onClick={() => void copy()} aria-label="复制代码"><span aria-live="polite">{copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败，请重试' : '复制代码'}</span></button>
+    </div>
+  </div>{mermaid && !showSource ? <MermaidDiagram source={content} fallback={source} /> : source}</div>;
 }
 
 const components: Components = {

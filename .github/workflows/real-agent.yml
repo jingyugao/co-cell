@@ -29,7 +29,6 @@ jobs:
     env:
       CELLBOX_SOURCE_DIR: ${{ github.workspace }}/cellbox-source
       COCELL_GVISOR_SOURCE_DIR: ${{ github.workspace }}/gvisor-source
-      COCELL_GVISOR_RELEASE_DIR: ${{ runner.temp }}/cocell-gvisor
       COCELL_E2E_MODEL: ${{ vars.COCELL_E2E_MODEL || secrets.COCELL_E2E_MODEL }}
       OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
       CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
@@ -46,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: jingyugao/cell-box
-          ref: 18208c13173715fb82dfc87dfd1d6dfba64841d3
+          ref: 56d4664c6fe9327f445056845a9ef8e23bac6b22
           path: cellbox-source
       - uses: actions/checkout@v4
         with:
@@ -72,6 +71,7 @@ jobs:
       - name: Build pinned gVisor release
         run: |
           test "$(git -C "$COCELL_GVISOR_SOURCE_DIR" rev-parse HEAD)" = fe674565335026d0b688291941f4d5fcbb542b6d
+          export COCELL_GVISOR_RELEASE_DIR="$RUNNER_TEMP/cocell-gvisor"
           mkdir -p "$COCELL_GVISOR_RELEASE_DIR"
           make -C "$COCELL_GVISOR_SOURCE_DIR" copy OPTIONS='--jobs=2 --local_resources=memory=4096' TARGETS=//:release DESTINATION="$COCELL_GVISOR_RELEASE_DIR/"
           printf 'COCELL_GVISOR_SOURCE_DIR=%s\n' "$COCELL_GVISOR_SOURCE_DIR" >> "$GITHUB_ENV"

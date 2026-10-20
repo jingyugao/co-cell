@@ -32,6 +32,7 @@ import { NativeSecretFiles } from './secrets/native-files.js';
 import { SecretService } from './secrets/service.js';
 import { SharedFiles } from './shared-files/service.js';
 import { publishSharedDirectory } from './shared-files/mount.js';
+import { publishToolWrappers } from './shared-files/tool-wrappers.js';
 import { loadSharedMountConfig } from './shared-files/config.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
@@ -74,11 +75,14 @@ const appServerArguments=appServerArgs(modelConfig, configOverrides).slice(1);
 const appServerEnv = {...(apiKey ? {CODEX_API_KEY:apiKey} : {}),
   ...(process.env.CODEX_MODEL_METADATA_JSON ? { CODEX_MODEL_METADATA_JSON: process.env.CODEX_MODEL_METADATA_JSON } : {})};
 const sharedDirectory = await loadSharedMountConfig();
-if (multiApi && !sharedDirectory) throw new Error('Multi-API native credentials require the shared persistent directory');
+if (!sharedDirectory) throw new Error('CoCell tool wrappers require the shared persistent directory');
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
 const webState = createWebStateStore(mysqlUrl, new NativeSecretFiles(resolve(sharedDataRoot, 'runtime/debug-homes'), secretCrypto));
 if (sharedDirectory) {
-  const publish = () => publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
+  const publish = async () => {
+    await publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
+    await publishToolWrappers(sharedDataRoot);
+  };
   if (coordinator) await coordinator.run('cocell-shared-startup-config', publish);
   else await publish();
 }

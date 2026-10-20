@@ -5,6 +5,8 @@ const LEGACY_TABLES = [
   'projects',
   'sessions',
   'session_turns',
+  'model_runtime_routes',
+  'project_tool_grants',
   'project_tool_roles',
   'project_tool_runtimes',
   'sandbox_runtime_configs',

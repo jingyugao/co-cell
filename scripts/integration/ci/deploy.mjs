@@ -15,7 +15,8 @@ const nodeName = nodes[0].metadata.name;
 const nodeIP = nodes[0].status.addresses.find(address => address.type === 'InternalIP')?.address;
 assert(nodeIP && nodeIP === process.env.COCELL_CI_NODE_IP, 'K3s node address does not match the configured disposable registry address');
 const cellbox = process.env.CELLBOX_SOURCE_DIR;
-assert(cellbox && process.env.RUNNER_TEMP);
+assert(cellbox && process.env.RUNNER_TEMP && process.env.COCELL_CI_RUNSC && process.env.COCELL_CI_SHIM,
+  'The pinned Cellbox fork runtime paths must be exported by setup-k3s.sh');
 const work = join(process.env.RUNNER_TEMP, 'cocell-ci');
 await mkdir(work, { recursive: true, mode: 0o700 });
 const credentials = { token: randomBytes(32).toString('hex'), masterKey: randomBytes(32).toString('base64'),
@@ -110,7 +111,8 @@ const cellboxValues = { server: { image: images.server, imagePullPolicy: 'Never'
   profiles: [{ id: 'cocell-ci', provider: 'resumable-k8s-pod', image: sandboxImage, namespace, nodeName, cpu: 1, memoryMiB: 1024,
     guest: { workspace: '/home/agent/workspace', agent: { uid: 11000, gid: 11000 }, debug: { uid: 11001, gid: 11001 },
       command: ['/usr/local/bin/node', '/opt/product/cocell/launcher.mjs'], env: {}, tools: [] } }] } },
-  controller: { warmPoolSize: 0, criDirectory: '/run/k3s/containerd', criSocket: '/run/k3s/containerd/containerd.sock' },
+  controller: { criDirectory: '/run/k3s/containerd', criSocket: '/run/k3s/containerd/containerd.sock',
+    runsc: process.env.COCELL_CI_RUNSC, shim: process.env.COCELL_CI_SHIM },
   buildkit: { enabled: true, repository: `${nodeIP}:5000/cocell-ci/template`, registryHost: `${nodeIP}:5000`, registryHTTP: true },
   objectStorage: { endpoint: `http://minio.${namespace}.svc.cluster.local:9000`, bucket: 'cocell-ci', credentialsSecret: 'ci-storage' },
 };

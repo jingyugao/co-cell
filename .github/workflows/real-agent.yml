@@ -28,6 +28,8 @@ jobs:
     timeout-minutes: 90
     env:
       CELLBOX_SOURCE_DIR: ${{ github.workspace }}/cellbox-source
+      COCELL_GVISOR_SOURCE_DIR: ${{ github.workspace }}/gvisor-source
+      COCELL_GVISOR_RELEASE_DIR: ${{ runner.temp }}/cocell-gvisor
       COCELL_E2E_MODEL: ${{ vars.COCELL_E2E_MODEL || secrets.COCELL_E2E_MODEL }}
       OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
       CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
@@ -44,8 +46,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: jingyugao/cell-box
-          ref: 16102c8172618c9bb62b8b50c7c0fa96a65f458b
+          ref: 18208c13173715fb82dfc87dfd1d6dfba64841d3
           path: cellbox-source
+      - uses: actions/checkout@v4
+        with:
+          repository: jingyugao/gvisor
+          ref: fe674565335026d0b688291941f4d5fcbb542b6d
+          path: gvisor-source
       - uses: actions/setup-node@v4
         with:
           node-version: 22.18.0
@@ -62,6 +69,13 @@ jobs:
           key: ${{ runner.os }}-cocell-native-go-minio-0d7408fc-${{ hashFiles('cellbox-source/go.mod', 'cellbox-source/go.sum') }}
       - name: Check model configuration
         run: node scripts/integration/ci/check-model.mjs
+      - name: Build pinned gVisor release
+        run: |
+          test "$(git -C "$COCELL_GVISOR_SOURCE_DIR" rev-parse HEAD)" = fe674565335026d0b688291941f4d5fcbb542b6d
+          mkdir -p "$COCELL_GVISOR_RELEASE_DIR"
+          make -C "$COCELL_GVISOR_SOURCE_DIR" copy OPTIONS='--jobs=2 --local_resources=memory=4096' TARGETS=//:release DESTINATION="$COCELL_GVISOR_RELEASE_DIR/"
+          printf 'COCELL_GVISOR_SOURCE_DIR=%s\n' "$COCELL_GVISOR_SOURCE_DIR" >> "$GITHUB_ENV"
+          printf 'COCELL_GVISOR_RELEASE_DIR=%s\n' "$COCELL_GVISOR_RELEASE_DIR" >> "$GITHUB_ENV"
       - name: Install test dependencies
         run: |
           corepack enable

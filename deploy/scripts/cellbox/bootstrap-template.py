@@ -54,6 +54,10 @@ def main() -> int:
     image = sys.argv[1]
     if not re.fullmatch(r"[^\s@]+@sha256:[a-f0-9]{64}", image):
         raise SystemExit("Expected an immutable repository@sha256:digest image")
+    warm_slots_value = os.environ.get("COCELL_CELLBOX_WARM_SLOTS", "1")
+    if not re.fullmatch(r"[0-9]+", warm_slots_value):
+        raise SystemExit("COCELL_CELLBOX_WARM_SLOTS must be a non-negative integer")
+    warm_slots = int(warm_slots_value)
     profile = os.environ.get("CELLBOX_PROFILE", "").strip()
     client = os.environ.get("CELLBOX_CLIENT_ID", "").strip()
     family_id = os.environ.get("CELLBOX_TEMPLATE_ID", "").strip()
@@ -100,7 +104,7 @@ def main() -> int:
             # the operator must inspect the catalog before attempting another create.
             status, template = request(base, "/v1/templates", client, "POST",
                                        {"name": os.environ.get("COCELL_CELLBOX_TEMPLATE_NAME", "cocell-system"),
-                                        "description": "CoCell system runtime", "defaultWarmSlots": 0})
+                                        "description": "CoCell system runtime", "defaultWarmSlots": warm_slots})
             if status != 201 or not isinstance(template, dict) or not template.get("id"):
                 raise RuntimeError("Template create did not return a confirmed ID; inspect the catalog before retrying")
             family_id = template["id"]
@@ -120,7 +124,8 @@ def main() -> int:
             raise RuntimeError("Set COCELL_SANDBOX_IMAGE_TAG to identify the built runtime revision")
         # This POST also has no retry key. Any uncertain result must be resolved by reading the catalog.
         status, operation = request(base, f"/v1/templates/{family_id}/revisions", client, "POST",
-                                    {"userVersion": version, "baseImage": image, "profileId": profile, "warmSlots": 0,
+                                    {"userVersion": version, "baseImage": image, "profileId": profile,
+                                     "warmSlots": warm_slots,
                                      "runCommand": "docker run --entrypoint /usr/local/bin/node "
                                                    + shlex.quote(image) + " /opt/product/cocell/launcher.mjs"})
         if status != 202 or not isinstance(operation, dict) or not operation.get("id"):

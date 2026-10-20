@@ -277,17 +277,18 @@ test('unsupported persistent rebuild is reported without touching the sandbox or
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
-test('single-API idle checkpoint only pauses and never captures disk', async () => {
+test('single-API idle checkpoint skips system, only pauses, and never captures disk', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-idle-backup-'));
   const state = new MemoryWebStateStore();
   const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
     modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
-  let paused = false, captures = 0;
+  const paused = new Set<string>();
+  let captures = 0;
   const runtime = {
     async close() {},
-    async querySandbox(value) { return { ...value, status: paused ? 'paused' as const : 'ready' as const }; },
-    async resume() { paused = false; },
-    async checkpoint() { paused = true; },
+    async querySandbox(value) { return { ...value, status: paused.has(value.id) ? 'paused' as const : 'ready' as const }; },
+    async resume(target) { paused.delete(target.sandbox!.id); },
+    async checkpoint(target) { paused.add(target.sandbox!.id); },
     remoteArchives: { async capture(value) { assert.equal(value.sandbox?.status, 'paused'); captures++; return {
       id: 'idle-archive', sourceSandboxId: 'idle-box', imageId: 'image', createdAt: new Date().toISOString(), sizeBytes: 10, sha256: 'a'.repeat(64),
     }; }, async inspect(ref) { return ref; }, async restore() { throw new Error('unused'); }, async activate() {} },
@@ -296,12 +297,17 @@ test('single-API idle checkpoint only pauses and never captures disk', async () 
   await state.saveProject({ id: 'idle-project', name: 'idle project', status: 'active', executionMode: 'sandbox', requirementUrl: null,
     workingDirectory: defaults.workingDirectory, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(),
     sandbox: { id: 'idle-box', status: 'ready', template: 'default', workingDirectory: defaults.workingDirectory } });
+  await state.saveProject({ id: 'system-project', name: 'system', status: 'active', executionMode: 'sandbox', requirementUrl: null,
+    workingDirectory: defaults.workingDirectory, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(),
+    sandbox: { id: 'system-box', status: 'ready', template: 'default', workingDirectory: defaults.workingDirectory } });
   const manager = new SessionManager({} as CodexClient, directory, defaults, state, runtime as unknown as SandboxRuntime);
   try {
     await manager.init();
     await manager.scheduledArchive();
     await (manager as unknown as { sandboxOperations: { close(): Promise<void> } }).sandboxOperations.close();
-    assert.equal(paused, true);
+    assert.equal(paused.has('idle-box'), true);
+    assert.equal(paused.has('system-box'), false, 'system stays running even after exceeding the idle timeout');
+    assert.equal(manager.getProject('system-project').sandboxOperation, undefined);
     assert.equal(captures, 0);
     const project = await manager.readProject('idle-project');
     assert.equal(project.sandboxOperation?.kind, 'checkpoint');
@@ -312,8 +318,10 @@ test('single-API idle checkpoint only pauses and never captures disk', async () 
     assert.equal(captures, 0, 'later scheduler ticks must not back up a paused project');
     await manager.resumeProjectSandbox('idle-project');
     await manager.scheduledArchive();
-    assert.equal(paused, false, 'a successful explicit resume starts a new idle interval');
+    assert.equal(paused.has('idle-box'), false, 'a successful explicit resume starts a new idle interval');
     assert.equal(manager.getProject('idle-project').sandboxOperation?.kind, 'resume');
+    await manager.checkpointProjectSandbox('system-project');
+    assert.equal(paused.has('system-box'), true, 'system still supports an explicit manual pause');
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
 

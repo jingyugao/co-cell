@@ -54,7 +54,7 @@ test('legacy running turns are cancelled on restart instead of resubmitted', asy
 
 test('an accepted App Server turn is recovered after restart without submitting its prompt again', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'hive-app-server-recovery-'));
-  let recoveries = 0, launches = 0, tracked = 0;
+  let recoveries = 0, launches = 0;
   let markRecoveryStarted!: () => void;
   let finishRecovery!: () => void;
   const recoveryStarted = new Promise<void>(resolve => { markRecoveryStarted = resolve; });
@@ -62,7 +62,6 @@ test('an accepted App Server turn is recovered after restart without submitting 
   const runtime = {
     ...provisioning,
     async close() {},
-    trackExecution(_session: Session, turn: Turn) { tracked++; assert.equal(turn.nativeTurnId, 'native-turn'); },
     async *run() { launches++; assert.fail('must not resubmit an accepted App Server turn'); },
     async *recover(_session: Session, turn: Turn) {
       recoveries++;
@@ -100,7 +99,6 @@ test('an accepted App Server turn is recovered after restart without submitting 
     assert.equal(phaseWhileRecoveryIsBlocked, 'recovering');
     await second.waitForIdle(session.id);
     const recovered = second.get(session.id);
-    assert.equal(tracked, 1);
     assert.equal(recoveries, 1);
     assert.equal(launches, 0);
     assert.equal(recovered.status, 'completed');

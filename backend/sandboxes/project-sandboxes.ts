@@ -1,157 +1,122 @@
-import { randomUUID } from 'node:crypto';
-import type { SandboxManager, SandboxLease, SandboxRecord } from '@co-cell/sandbox';
+import { SandboxLifecycle, type SandboxHandle, type SandboxInfo, type SandboxLifecycleContext, type SandboxProvider, type SandboxRecord } from '@co-cell/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from './types.js';
+import { HttpError } from '../../util/errors.js';
 
 export type SaveSandbox = (state: SandboxState) => Promise<void>;
-type Binding = {
-  workingDirectory: string;
-  save?: SaveSandbox;
-  persist: (record: SandboxRecord) => Promise<void>;
-};
-
+type ProjectReference = Pick<WorkspaceTarget, 'sandbox' | 'imageSelection' | 'sandboxMounts' | 'sandboxOwnerKey'>;
+export interface ProjectSandboxAccess {
+  sandbox: SandboxHandle;
+  info: SandboxInfo;
+  record: SandboxRecord;
+}
 const resourceKey = (target: WorkspaceTarget) => target.projectId ? `project:${target.projectId}` : `session:${target.id}`;
 
-/** Adapts project-owned records without exposing projects to the sandbox package. */
+/** Reads the durable project reference for each operation; never retains bindings or handles. */
 export class ProjectSandboxes {
-  private bindings = new Map<string, Binding>();
-
-  constructor(readonly manager: SandboxManager, private template: string, private defaultTemplateId?: string) {}
+  constructor(private provider: SandboxProvider, private template: string, private defaultTemplateId?: string,
+    readonly lifecycle = new SandboxLifecycle(), private readProject?: (id: string) => Promise<ProjectReference | undefined>) {}
 
   get templateReference() { return this.template; }
 
-  async replace(target: WorkspaceTarget, replacement: SandboxState) {
-    const binding = this.track(target);
-    const { workingDirectory: _directory, image, ...record } = replacement;
-    const managerRecord = { ...record, status: record.status === 'unknown' ? 'unavailable' as const : record.status,
-      ...(image ? { templateIdentity: structuredClone(image) } : {}) };
-    if (target.sandbox) {
-      await this.manager.replace(resourceKey(target), target.sandbox.id, managerRecord);
-    } else {
-      if (!binding.save) throw new Error('项目沙箱的持久化入口尚未配置');
-      await this.manager.bind(resourceKey(target), managerRecord, binding.persist);
-    }
-    target.sandbox = structuredClone(replacement);
+  async refresh(target: WorkspaceTarget) {
+    if (!target.projectId || !this.readProject) return;
+    const project = await this.readProject(target.projectId);
+    if (!project) throw new HttpError(404, '项目不存在');
+    for (const key of ['sandbox', 'imageSelection', 'sandboxMounts', 'sandboxOwnerKey'] as const)
+      Object.assign(target, { [key]: structuredClone(project[key]) });
   }
 
-  /** Detach the project binding while leaving its remote sandbox running. */
-  async detach(target: WorkspaceTarget) {
-    if (!target.sandbox) return;
-    this.track(target);
-    await this.manager.untrack(resourceKey(target), target.sandbox.id);
-    this.bindings.delete(resourceKey(target));
-  }
-
-  async forgetReleased(target: WorkspaceTarget) {
-    if (!target.sandbox) return;
-    const key = resourceKey(target), binding = this.bindings.get(key);
-    await this.manager.forgetReleased(key, target.sandbox.id);
-    if (this.bindings.get(key) === binding && !this.manager.peek(key)) this.bindings.delete(key);
-  }
-
-  private project(record: SandboxRecord, workingDirectory: string): SandboxState {
+  private project(target: WorkspaceTarget, info: SandboxInfo, lastActiveAt?: string): SandboxState {
+    const phase = info.metadata?.phase;
     return {
-      id: record.id, template: record.template, workingDirectory,
-      ...(record.ownerKey ? { ownerKey: record.ownerKey } : {}),
-      ...(record.mounts ? { mounts: structuredClone(record.mounts) } : {}),
-      ...(record.homeVolumeId ? { homeVolumeId: record.homeVolumeId } : {}),
-      ...(record.templateIdentity ? { image: structuredClone(record.templateIdentity) } : {}),
-      status: record.status === 'deleted' ? 'unavailable' : record.status,
-      ...(record.lastActiveAt ? { lastActiveAt: record.lastActiveAt } : {}),
-      ...(record.pausedAt ? { pausedAt: record.pausedAt } : {}),
+      id: info.sandboxId, template: target.sandbox?.template ?? this.template,
+      workingDirectory: target.settings.workingDirectory,
+      status: info.state === 'running' ? 'ready' : info.state === 'paused' ? 'paused' : 'unavailable',
+      ...(info.metadata?.ownerKey ? { ownerKey: info.metadata.ownerKey } : {}),
+      ...(info.mounts ? { mounts: structuredClone(info.mounts) } : {}),
+      ...(info.homeVolumeId ? { homeVolumeId: info.homeVolumeId } : {}),
+      ...(info.templateIdentity ? { image: structuredClone(info.templateIdentity) } : {}),
+      ...(lastActiveAt ? { lastActiveAt } : {}),
+      ...(phase ? { phase } : {}),
     };
   }
-
-  track(target: WorkspaceTarget, save?: SaveSandbox) {
-    const key = resourceKey(target);
-    const tracked = this.manager.peek(key);
-    if (!target.sandbox && tracked) {
-      throw new Error('项目已无沙箱引用，但运行时仍跟踪旧沙箱，请先完成解绑');
-    }
-    if (target.sandbox && tracked && target.sandbox.id !== tracked.id) {
-      throw new Error('项目沙箱引用不一致，请重新加载项目后重试');
-    }
-    let binding = this.bindings.get(key);
-    if (!binding) {
-      binding = {
-        workingDirectory: target.settings.workingDirectory, save,
-        // The callback identity is stable for this resource, independent of the
-        // session that happens to use it. Project/session fanout stays upstream.
-        persist: async record => {
-          const current = this.bindings.get(key)!;
-          await current.save?.(this.project(record, current.workingDirectory));
-        },
-      };
-      this.bindings.set(key, binding);
-    } else {
-      binding.save ??= save;
-      binding.workingDirectory = target.settings.workingDirectory;
-    }
-    if (target.sandbox && !tracked) {
-      const { workingDirectory: _directory, ...record } = target.sandbox;
-      const { image, ...persisted } = record;
-      const activeAt = Date.parse(record.lastActiveAt ?? target.updatedAt);
-      this.manager.track(key, {
-        ...persisted,
-        status: persisted.status === 'unknown' ? 'unavailable' : persisted.status,
-        ...(image ? { templateIdentity: structuredClone(image) } : {}),
-        lastActiveAt: new Date(Number.isFinite(activeAt) ? activeAt : Date.now()).toISOString(),
-      }, binding.persist);
-    }
-    return binding;
+  private record(state: SandboxState): SandboxRecord {
+    const { workingDirectory: _directory, image, ...record } = state;
+    return { ...record, status: state.status === 'unknown' ? 'unavailable' : state.status,
+      ...(image ? { templateIdentity: structuredClone(image) } : {}) };
   }
 
-  async acquire(target: WorkspaceTarget, options: {
-    create?: boolean;
-    save?: SaveSandbox;
-    usageId?: string;
-    signal?: AbortSignal;
-    operationKey?: string;
-  } = {}): Promise<SandboxLease> {
-    const binding = this.track(target, options.save);
-    if (options.create && target.imageSelection && !target.imageSelection.templateId) throw new Error('项目仍引用旧导入镜像，请先迁移为 Cellbox template。');
-    if (options.create && !binding.save) throw new Error('项目沙箱的持久化入口尚未配置');
-    const key = resourceKey(target);
-    const templateId = target.imageSelection?.templateId ?? this.defaultTemplateId;
-    const lease = await this.manager.acquire(key, {
-      usageId: options.usageId ?? randomUUID(),
-      purpose: options.usageId ? 'execution' : 'workspace',
-      signal: options.signal,
-      operationKey: options.operationKey,
-      persist: binding.persist,
-      ...(options.create ? { create: {
-        template: this.template,
-        metadata: {
-          ...(target.sandboxOwnerKey ? { cellboxOwnerKey: target.sandboxOwnerKey } : {}),
-          ...(target.sandboxMounts?.length ? { cellboxMounts: JSON.stringify(target.sandboxMounts) } : {}),
-          ...(templateId ? { cellboxTemplateId: templateId } : {}),
-          app: 'codex-web', sessionId: target.id, workingDirectory: target.settings.workingDirectory,
-          ...(target.projectId ? { projectId: target.projectId } : {}),
-        },
-      } } : {}),
+  async acquire(target: WorkspaceTarget, options: { create?: boolean; replaceMissing?: boolean; save?: SaveSandbox; signal?: AbortSignal } = {}): Promise<ProjectSandboxAccess> {
+    options.signal?.throwIfAborted();
+    await this.refresh(target);
+    options.signal?.throwIfAborted();
+    if (options.create && options.replaceMissing && target.sandbox) {
+      try {
+        if ((await this.provider.getInfo(target.sandbox.id)).metadata?.phase === 'deleted') target.sandbox = undefined;
+      } catch (error) {
+        if ((error as { code?: string }).code !== 'NOT_FOUND') throw error;
+        target.sandbox = undefined;
+      }
+    }
+    if (!target.sandbox && !options.create) throw new HttpError(409, '项目没有 Sandbox，请先创建');
+    if (!target.sandbox && !options.save) throw new Error('项目沙箱的持久化入口尚未配置');
+    if (!target.sandbox && target.imageSelection && !target.imageSelection.templateId)
+      throw new Error('项目仍引用旧导入镜像，请先迁移为 Cellbox template。');
+    const creating = !target.sandbox;
+    const context: SandboxLifecycleContext = { action: creating ? 'create' : 'connect', resourceKey: resourceKey(target),
+      sandboxId: target.sandbox?.id, signal: options.signal,
+      metadata: { ...(target.projectId ? { projectId: target.projectId } : {}), sessionId: target.id } };
+    return this.lifecycle.run(context, async () => {
+      let sandbox: SandboxHandle;
+      if (creating) {
+        const templateId = target.imageSelection?.templateId ?? this.defaultTemplateId;
+        sandbox = await this.provider.create(this.template, {
+          timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false },
+          metadata: { ...context.metadata, app: 'codex-web', workingDirectory: target.settings.workingDirectory,
+            ...(target.sandboxOwnerKey ? { cellboxOwnerKey: target.sandboxOwnerKey } : {}),
+            ...(target.sandboxMounts?.length ? { cellboxMounts: JSON.stringify(target.sandboxMounts) } : {}),
+            ...(templateId ? { cellboxTemplateId: templateId } : {}) },
+        });
+        context.sandboxId = sandbox.sandboxId;
+        // Record the returned identity before any further remote calls. Failures
+        // remain visible on the project and never cause a second create request.
+        const initial: SandboxState = { id: sandbox.sandboxId, template: this.template, status: 'starting',
+          workingDirectory: target.settings.workingDirectory };
+        try { await options.save!(initial); }
+        catch (error) {
+          if (error instanceof Error) Object.assign(error, { sandboxId: sandbox.sandboxId });
+          throw error;
+        }
+        target.sandbox = initial;
+      } else {
+        sandbox = await this.provider.connect(target.sandbox!.id, { timeoutMs: 120_000, signal: options.signal });
+      }
+      const info = await this.provider.getInfo(sandbox.sandboxId);
+      options.signal?.throwIfAborted();
+      const state = this.project(target, info, new Date().toISOString());
+      await options.save?.(state);
+      target.sandbox = state;
+      const record = this.record(state);
+      Object.assign(context, { sandbox, sandboxId: sandbox.sandboxId, observation: info, record,
+        metadata: { ...context.metadata, ...info.metadata } });
+      return { sandbox, info, record };
     });
-    target.sandbox = this.project(lease.record, binding.workingDirectory);
-    return lease;
   }
 
   async inspect(target: WorkspaceTarget) {
-    this.track(target);
-    return this.manager.inspect(resourceKey(target));
-  }
-
-  holdUsage(target: WorkspaceTarget, usageId: string) {
-    this.track(target);
-    this.manager.holdUsage(resourceKey(target), usageId);
+    await this.refresh(target);
+    if (!target.sandbox) throw new HttpError(409, '项目没有 Sandbox');
+    const info = await this.provider.getInfo(target.sandbox.id);
+    return { record: this.record(this.project(target, info)), info };
   }
 
   async delete(target: WorkspaceTarget) {
-    this.track(target);
-    const record = this.manager.peek(resourceKey(target));
-    if (!record) return;
-    await this.manager.destroy(resourceKey(target));
-    await this.manager.untrack(resourceKey(target), record.id);
-    this.bindings.delete(resourceKey(target));
+    await this.refresh(target);
+    if (!target.sandbox) return;
+    const sandboxId = target.sandbox.id;
+    await this.lifecycle.run({ action: 'destroy', resourceKey: resourceKey(target), sandboxId }, async () => {
+      await this.provider.kill(sandboxId);
+    });
   }
-
-  async close() { await this.manager.close(); }
 }

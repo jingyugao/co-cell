@@ -7,6 +7,7 @@ import type { Pool } from 'mysql2/promise';
 import { SecretCrypto } from './crypto.js';
 import { NativeSecretFiles } from './native-files.js';
 import { MySqlSecretRepository, type StoredSecret, type StoredVersion } from './repository.js';
+import { SecretService } from './service.js';
 
 const secretId = '123e4567-e89b-42d3-a456-426614174000';
 const currentId = '223e4567-e89b-42d3-a456-426614174000';
@@ -44,6 +45,9 @@ class FakePool {
     }
     if (sql.includes('FROM secrets s LEFT JOIN secret_tool_configs'))
       return [[...this.state.secrets.keys()].map(id => this.row(id)!), []];
+    if (sql.startsWith('SELECT c.path,s.format,s.enabled FROM secret_tool_configs')) {
+      return [[...this.state.secrets.keys()].map(id => this.row(id)!).filter(row => row.tool === values[0]), []];
+    }
     if (sql === 'SELECT id FROM secrets ORDER BY id') return [[...this.state.secrets.keys()].sort().map(id => ({ id })), []];
     if (sql.includes('FROM secret_versions WHERE secret_id=? ORDER BY created_at')) {
       return [[...this.state.versions.values()].filter(row => row.secret_id === values[0])
@@ -128,7 +132,49 @@ async function withRoot(run: (root: string, crypto: SecretCrypto) => Promise<voi
   const root = await mkdtemp(join(tmpdir(), 'cocell-native-repository-'));
   const seal = crypto(); try { await run(root, seal); } finally { await rm(root, { recursive: true, force: true }); }
 }
-function nativePath(root: string) { return join(root, secretId, '.tool/config.json'); }
+function nativePath(root: string) { return join(root, '.tool/config.json'); }
+
+test('runtime tool config metadata remains readable when its native credential file is missing', async () => {
+  await withRoot(async (root, seal) => {
+    const repository = newRepository(new FakePool(), root, seal);
+    const source = makeSecret(seal);
+    await repository.save(source, null);
+    await rm(nativePath(root));
+    assert.deepEqual(await repository.toolConfigs(source.tool!), [{ path: source.path, format: 'text', enabled: true }]);
+    assert.deepEqual(await repository.toolConfigs('another-tool'), []);
+    await assert.rejects(repository.get(secretId), { code: 'ENOENT' });
+  });
+});
+
+test('publishing a native Lark HOME tolerates a removed token without recreating it', async () => {
+  await withRoot(async (root, seal) => {
+    const home = join(root, 'runtime/debug-homes');
+    const repository = newRepository(new FakePool(), home, seal);
+    const supportFiles = [
+      { path: '.local/share/lark-cli/master.key', encoding: 'base64', content: Buffer.alloc(32, 1).toString('base64') },
+      { path: '.local/share/lark-cli/cli_fixture_ou_fixture.enc', encoding: 'base64', content: Buffer.alloc(40, 2).toString('base64') },
+    ];
+    const content = JSON.stringify({ apps: [{ appId: 'cli_fixture', appSecret: 'synthetic', defaultAs: 'user', users: [{ userOpenId: 'ou_fixture' }] }] });
+    const payload = JSON.stringify({ content, supportFiles, supportVersion: 1 });
+    const source: StoredSecret = { ...makeSecret(seal), tool: 'lark-cli', path: '.lark-cli/config.json', format: 'lark',
+      ciphertext: seal.seal(secretId, currentId, Buffer.from(payload)) };
+    await repository.save(source, null);
+    const token = join(home, supportFiles[1].path);
+    await rm(token);
+
+    const service = new SecretService(repository, seal);
+    await service.mountHomes(root);
+    await service.publishHome();
+    const files = await service.provision();
+    assert.equal(files.length, 1);
+    assert.equal(files[0].externallyManaged, true);
+    assert.equal(await readFile(join(home, '.lark-cli/config.json'), 'utf8'), content);
+    await assert.rejects(readFile(token), { code: 'ENOENT' });
+    const actual = (await repository.get(secretId))!;
+    const bundle = JSON.parse(seal.open(secretId, currentId, actual.ciphertext).toString('utf8'));
+    assert.deepEqual(bundle.supportFiles, [supportFiles[0]], 'only files still present on disk are reported');
+  });
+});
 
 test('persists only native references and empty audit bodies; repository reads live native edits', async () => {
   await withRoot(async (root, seal) => {
@@ -178,7 +224,7 @@ test('an SQL failure after native prepare restores the previous bytes and create
     assert.deepEqual(await readFile(nativePath(root)), before);
     assert.equal(pool.state.secrets.get(secretId)?.version, 1);
     assert.equal(pool.state.versions.has(editedId), false);
-    assert.deepEqual(await (await import('node:fs/promises')).readdir(join(root, secretId, '.tool')), ['config.json']);
+    assert.deepEqual(await (await import('node:fs/promises')).readdir(join(root, '.tool')), ['config.json']);
   });
 });
 

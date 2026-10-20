@@ -14,19 +14,19 @@ const supports = (): SecretSupportFile[] => [
 ];
 const input = (): SecretInput => ({ name: 'Lark user fixture', tool: 'lark-cli', path: '.lark-cli/config.json', format: 'text', mutable: true, content: config, supportFiles: supports() });
 
-test('moving a native Lark credential to its owner HOME preserves all keychain companion files', async () => {
+test('converting a native Lark credential to shared HOME preserves all CLI-managed keychain files', async () => {
   const { service, projectId } = fixture(); await service.init();
   const root = await mkdtemp(join(tmpdir(), 'cocell-lark-home-ref-')); await service.mountHomes(root);
   try {
     const secret = await service.create(input());
-    const role = await service.roles.save({ name: 'Lark owner', connections: [{ tool: 'lark-cli', secretId: secret.id }] });
-    await service.roles.assign(projectId, role.id); await service.publishHome(projectId);
-    const home = join(root, 'runtime/debug-homes', projectId), token = join(home, supports()[2].path);
+    const role = await service.roles.save({ name: 'Lark owner', permissions: [{ tool: 'lark-cli', enabled: true }] });
+    await service.roles.assign(projectId, role.id); await service.publishHome();
+    const home = join(root, 'runtime/debug-homes'), token = join(home, supports()[2].path);
     await writeFile(token, 'refreshed-lark-token');
-    await service.update(secret.id, { format: 'home', homeProjectId: projectId });
+    await service.update(secret.id, { format: 'home' });
     assert.equal(await readFile(token, 'utf8'), 'refreshed-lark-token');
     for (const file of supports().slice(0, 2)) assert.deepEqual(await readFile(join(home, file.path)), Buffer.from(file.content, 'base64'));
-    await service.publishHome(projectId); assert.equal(await readFile(token, 'utf8'), 'refreshed-lark-token');
+    await service.publishHome(); assert.equal(await readFile(token, 'utf8'), 'refreshed-lark-token');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -40,17 +40,18 @@ test('Lark user import provisions and revokes all native files while preserving 
     assert.equal(secret.supportFilePaths?.length, 3);
     assert.equal((await repository.get(secret.id))?.format, 'lark');
     assert(!(await repository.get(secret.id))!.ciphertext.includes(config));
-    const role = await service.roles.save({ name: 'Lark user', connections: [{ tool: 'lark-cli', secretId: secret.id }] });
-    await service.roles.assign(projectId, role.id); await service.publishHome(projectId);
+    const role = await service.roles.save({ name: 'Lark user', permissions: [{ tool: 'lark-cli', enabled: true }] });
+    await service.roles.assign(projectId, role.id); await service.publishHome();
     await service.registerRuntime('lark-box', projectId, 1);
     const auth = await service.authorize('lark-box', 'lark-cli', ['whoami', '--as', 'user']);
+    assert.equal(auth.home, '/home/debug');
     assert.equal(auth.path, '.lark-cli/config.json');
-    const home = join(root, 'runtime/debug-homes', projectId);
+    const home = join(root, 'runtime/debug-homes');
     assert.equal(await readFile(join(home, auth.path), 'utf8'), config);
     for (const file of supports()) assert.deepEqual(await readFile(join(home, file.path)), Buffer.from(file.content, 'base64'));
     const tokenPath = join(home, supports()[2].path);
     await writeFile(tokenPath, 'native-refreshed-token');
-    await service.publishHome(projectId);
+    await service.publishHome();
     assert.equal(await readFile(tokenPath, 'utf8'), 'native-refreshed-token');
     const content = await service.content(secret.id);
     assert.equal(content.content, config);
@@ -63,10 +64,11 @@ test('Lark user import provisions and revokes all native files while preserving 
     await service.update(secret.id, { supportFiles: supports() });
     assert.deepEqual(await readFile(tokenPath), Buffer.from(supports()[2].content, 'base64'));
     await assert.rejects(service.update(secret.id, { tool: 'other' }), /Lark/);
-    const conflict = await service.create({ name: 'Conflicting file', tool: 'other', path: '.local/share/lark-cli/custom', format: 'text', mutable: false, content: 'fixture' });
-    await assert.rejects(service.roles.save({ name: 'Conflicting role', connections: [{ tool: 'lark-cli', secretId: secret.id }, { tool: 'other', secretId: conflict.id }] }), /路径冲突/);
+    await assert.rejects(service.create({ name: 'Conflicting file', tool: 'other', path: supports()[0].path, format: 'text', mutable: false, content: 'fixture' }), /路径冲突/);
+    const companion = await service.create({ name: 'Independent file', tool: 'other', path: '.local/share/lark-cli/custom', format: 'text', mutable: false, content: 'fixture' });
+    await service.roles.save({ name: 'Shared tools', permissions: [{ tool: 'lark-cli', enabled: true }, { tool: 'other', enabled: true }] });
     await service.roles.assign(projectId, null);
-    for (const path of [auth.path, ...supports().map(file => file.path)]) await assert.rejects(readFile(join(home, path)), { code: 'ENOENT' });
+    for (const path of [auth.path, ...supports().map(file => file.path)]) await readFile(join(home, path));
     await assert.rejects(service.authorize('lark-box', 'lark-cli', ['whoami']), /未授权/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

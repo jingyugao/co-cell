@@ -187,7 +187,6 @@ export class ProjectSandboxOperations {
     const sandbox = await this.deps.runtime.release(target(project));
     this.context.getStore()!.operation.result = { sandbox };
     await this.deps.projects.releaseSandbox(id, sandbox);
-    await this.deps.runtime.forgetReleasedSandbox?.(target(project));
     await this.deps.released?.(id);
   }
 
@@ -350,7 +349,6 @@ export class ProjectSandboxOperations {
     for (const mount of project.sandboxMounts ?? sandboxMounts(project.sandbox ?? {}) ?? [])
       if (!boundVolumes.has(mount.volumeId)) await projects.rememberVolumeCleanup(id, mount.volumeId);
     await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, true, restoredProject.imageSelection, project.sandbox?.id ?? null);
-    runtime.track?.(target(projects.get(id)), sandbox => this.deps.saveSandbox(id, sandbox, false));
     await this.phase(id, '清理旧 Sandbox');
     await this.cleanup(id, false, new Set(project.sandbox ? [project.sandbox.id] : []));
   }

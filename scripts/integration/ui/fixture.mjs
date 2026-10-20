@@ -2,7 +2,7 @@ import { test as base, expect } from '@playwright/test';
 
 const now = '2026-01-01T00:00:00Z';
 const defaultRoleId = '00000000-0000-4000-8000-000000000001';
-const defaultRole = { id: defaultRoleId, name: '默认角色', connections: [], createdAt: now, updatedAt: now };
+const defaultRole = { id: defaultRoleId, name: '默认角色', permissions: [], createdAt: now, updatedAt: now };
 const workingDirectory = '/home/agent/workspace';
 const defaults = { executionMode: 'sandbox', workingDirectory, model: 'integration-model', modelReasoningEffort: 'medium', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
 const sandbox = (id, status = 'ready') => ({ id: `${id}-box`, status, template: 'default', workingDirectory });
@@ -63,6 +63,7 @@ export const test = base.extend({
       let data, status = 200;
       if (path === '/api/config') data = config;
       else if (path === '/api/tool-roles' && method === 'GET') data = { roles: [defaultRole], defaultRoleId };
+      else if (path === '/api/tools' && method === 'GET') data = [];
       else if (path === '/api/notifications') data = [];
       else if (path === '/api/images') data = [{ id: 'default', name: '系统默认镜像', category: '系统', origin: 'profile', versions: [{ id: 'default', version: '当前配置', status: 'succeeded', source: 'default', projectReady: true }] }];
       else if (path === '/api/projects' && method === 'GET') data = [...projects.values()];
@@ -75,7 +76,7 @@ export const test = base.extend({
         if (!data) { data = { error: '不存在' }; status = 404; }
         else if (path === `/api/projects/${id}/tool-role`) {
           if (method === 'PUT') projectRoles.set(id, request.postDataJSON().roleId);
-          data = { roleId: projectRoles.get(id) ?? null, connections: [] };
+          data = { roleId: projectRoles.get(id) ?? null, permissions: [] };
         }
         else if (method === 'PATCH' && path === `/api/projects/${id}`) {
           const next = request.postDataJSON();

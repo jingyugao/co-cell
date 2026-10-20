@@ -12,10 +12,13 @@ export interface StoredSecret {
   nativeHome?: string;
 }
 export interface StoredVersion extends SecretVersion { secretId: string; ciphertext: string }
+export type ToolConfig = Pick<StoredSecret, 'path' | 'format' | 'enabled'>;
 export interface SecretRepository {
   readonly roles: RoleRepository;
   init(): Promise<void>;
   list(): Promise<StoredSecret[]>; get(id: string): Promise<StoredSecret | null>;
+  /** Runtime path selection must not read native credential contents. */
+  toolConfigs(tool: ProxyTool): Promise<ToolConfig[]>;
   save(secret: StoredSecret, version: StoredVersion | null): Promise<void>;
   delete(id: string): Promise<void>;
   versions(id: string): Promise<StoredVersion[]>;
@@ -51,6 +54,10 @@ export class MySqlSecretRepository implements SecretRepository {
     return secret;
   }
   async list() { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT s.*,c.tool,c.path,c.alias FROM secrets s LEFT JOIN secret_tool_configs c ON c.secret_id=s.id ORDER BY s.updated_at DESC'); return Promise.all(rows.map(row => this.secret(row))); }
+  async toolConfigs(tool: ProxyTool): Promise<ToolConfig[]> {
+    const [rows] = await this.pool.query<RowDataPacket[]>('SELECT c.path,s.format,s.enabled FROM secret_tool_configs c JOIN secrets s ON s.id=c.secret_id WHERE c.tool=?', [tool]);
+    return rows.map(row => ({ path: row.path, format: row.format, enabled: Boolean(row.enabled) }));
+  }
   async get(id: string) { const [rows] = await this.pool.query<RowDataPacket[]>('SELECT s.*,c.tool,c.path,c.alias FROM secrets s LEFT JOIN secret_tool_configs c ON c.secret_id=s.id WHERE s.id=?', [id]); return rows[0] ? this.secret(rows[0]) : null; }
   async delete(id: string) {
     const connection = await this.pool.getConnection();

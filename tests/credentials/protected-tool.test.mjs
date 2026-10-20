@@ -1,14 +1,39 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { runProtectedTool, ToolAuthorizationError } from '../../deploy/box-wrap/protected-tool.mjs';
 
+test('an unconfigured generic CLI prints help and preserves its native authentication error and exit code', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-generic-auth-'));
+  const homeRoot = join(root, 'home'), binaryRoot = join(root, 'bin');
+  await mkdir(homeRoot); await mkdir(binaryRoot);
+  const nativeError = '{"ok":false,"error":{"type":"authentication","message":"Please run lark-cli auth login"}}\n';
+  await writeFile(join(binaryRoot, 'lark-cli'), `#!${process.execPath}
+if(process.argv.includes('--help')){process.stdout.write('Native Lark authentication help\\n');process.exit(0);}
+process.stderr.write(${JSON.stringify(nativeError)});process.exit(3);
+`, { mode: 0o755 });
+  let stdout = '', stderr = '';
+  const options = { config: { mode: 'home', boxId: 'box-one', url: 'http://broker.example.test' }, homeRoot, binaryRoot,
+    stdout: { write(value) { stdout += value; } }, stderr: { write(value) { stderr += value; } },
+    fetch: async (_url, init) => { const { tool, args } = JSON.parse(init.body); return Response.json({ tool, args, home: '/home/debug' }); },
+  };
+  try {
+    assert.equal(await runProtectedTool('lark-cli', ['auth', '--help'], options), 0);
+    assert.equal(stdout, 'Native Lark authentication help\n');
+    assert.equal(stderr, '');
+    stdout = '';
+    assert.equal(await runProtectedTool('lark-cli', ['auth', 'status'], options), 3);
+    assert.equal(stdout, '');
+    assert.equal(stderr, nativeError);
+    for (const tool of ['mysql', 'kubectl']) await assert.rejects(runProtectedTool(tool, ['--help'], options), /Invalid tool authorization/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('native HOME authorizes each call, persists CLI changes and never transports credential bytes', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-direct-home-'));
-  const projectId = randomUUID(), homeRoot = join(root, 'homes'), home = join(homeRoot, projectId), binaryRoot = join(root, 'bin');
+  const homeRoot = join(root, 'home'), home = homeRoot, binaryRoot = join(root, 'bin');
   await mkdir(join(home, '.kube'), { recursive: true }); await mkdir(binaryRoot);
   const file = join(home, '.kube/config'); await writeFile(file, 'credential-original');
   await writeFile(join(binaryRoot, 'kubectl'), `#!${process.execPath}
@@ -23,23 +48,25 @@ console.log(fs.readFileSync(process.env.KUBECONFIG,'utf8')==='credential-refresh
     assert.equal(new Headers(init.headers).has('authorization'), false);
     const body = JSON.parse(init.body); requests.push(body);
     assert.deepEqual(Object.keys(body).sort(), ['args', 'boxId', 'tool']);
-    return Response.json({ tool: body.tool, args: body.args, home: `/home/debug/${projectId}`, path: '.kube/config' });
+    return Response.json({ tool: body.tool, args: body.args, home: '/home/debug', path: '.kube/config' });
   } };
   try {
     assert.equal(await runProtectedTool('kubectl', ['refresh'], options), 0);
-    assert.equal(await runProtectedTool('kubectl', ['read'], options), 0);
+    assert.equal(await runProtectedTool('kubectl', ['read'], { ...options, config: { ...config, boxId: 'box-two' } }), 0);
     assert.deepEqual(output.trim().split('\n'), ['refreshed', 'refreshed']); assert.equal(requests.length, 2);
+    assert.deepEqual(requests.map(request => request.boxId), ['box-one', 'box-two']);
     assert.equal(await readFile(file, 'utf8'), 'credential-refreshed');
     output = '';
     await assert.rejects(runProtectedTool('kubectl', ['read'], { ...options, fetch: async () => new Response('', { status: 403 }) }), /authorization failed/);
     assert.equal(output, '');
-    await assert.rejects(runProtectedTool('kubectl', ['read'], { ...options, fetch: async () => Response.json({ tool: 'kubectl', args: [], home: `/home/debug/${projectId}`, path: '../escape' }) }), /Invalid tool authorization/);
+    await assert.rejects(runProtectedTool('kubectl', ['read'], { ...options, fetch: async () => Response.json({ tool: 'kubectl', args: [], home: '/home/debug/11111111-1111-4111-8111-111111111111', path: '.kube/config' }) }), /Invalid tool authorization/);
+    await assert.rejects(runProtectedTool('kubectl', ['read'], { ...options, fetch: async () => Response.json({ tool: 'kubectl', args: [], home: '/home/debug', path: '../escape' }) }), /Invalid tool authorization/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test('mounted HOME preserves native MySQL login paths and Kubernetes contexts against merged credential files', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-native-home-'));
-  const projectId = randomUUID(), homeRoot = join(root, 'homes'), home = join(homeRoot, projectId), binaryRoot = join(root, 'bin');
+  const homeRoot = join(root, 'home'), home = homeRoot, binaryRoot = join(root, 'bin');
   await mkdir(binaryRoot); await mkdir(join(home, '.kube'), { recursive: true });
   const credentials = {
     mysql: { path: '.mylogin.cnf', content: 'merged mysql login paths: reporting, warehouse' },
@@ -63,7 +90,7 @@ console.log(JSON.stringify({credential:fs.readFileSync(process.env.KUBECONFIG,'u
     const expectedTool = nativeSelectors[0].startsWith('--login-path=') ? 'mysql' : 'kubectl';
     assert.equal(body.tool, expectedTool);
     assert.ok(credentials[body.tool], `unexpected tool ${body.tool}`);
-    return Response.json({ tool: body.tool, args: body.args, home: `/home/debug/${projectId}`, path: credentials[body.tool].path });
+    return Response.json({ tool: body.tool, args: body.args, home: '/home/debug', path: credentials[body.tool].path });
   } };
   try {
     for (const [tool, selector, args] of [

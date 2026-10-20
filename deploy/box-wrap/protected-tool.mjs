@@ -65,20 +65,22 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   });
   if (!response.ok) throw await authorizationError(response);
   const setup = await response.json();
-  if (setup.tool !== tool || typeof setup.home !== 'string' || !/^\/home\/debug\/[a-f0-9-]{36}$/.test(setup.home) ||
-      !safePath(setup.path) || !Array.isArray(setup.args) || setup.args.length > 32 ||
+  if (setup.tool !== tool || setup.home !== '/home/debug' ||
+      (setup.path !== undefined && !safePath(setup.path)) ||
+      (['mysql', 'kubectl'].includes(tool) && !safePath(setup.path)) ||
+      !Array.isArray(setup.args) || setup.args.length > 32 ||
       setup.args.some(arg => typeof arg !== 'string' || arg.includes('\0')))
     throw new Error('Invalid tool authorization');
-  const home = options.homeRoot ? join(options.homeRoot, setup.home.slice('/home/debug/'.length)) : setup.home;
+  const home = options.homeRoot ?? setup.home;
   // Native tools may spawn each other. This PATH bypasses agent-side wrappers.
   const env = { PATH: `${options.binaryRoot ?? '/opt/cellbox/debug-bin'}:/usr/local/bin:/usr/bin:/bin`,
     HOME: home, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(home, '.config'), XDG_DATA_HOME: join(home, '.local/share'), ...decoded.env, ...options.gitEnv };
-  const credential = join(home, setup.path);
+  const credential = setup.path === undefined ? undefined : join(home, setup.path);
   if (tool === 'kubectl') env.KUBECONFIG = credential;
-  if (tool === 'glab') env.GLAB_CONFIG_DIR = dirname(credential);
-  if (tool === 'git') env.GIT_CONFIG_GLOBAL = credential;
+  if (tool === 'glab' && credential) env.GLAB_CONFIG_DIR = dirname(credential);
+  if (tool === 'git' && credential) env.GIT_CONFIG_GLOBAL = credential;
   // --no-defaults still reads the native login file. Pin its path and omit all
-  // other option files so the account comes exclusively from role-granted HOME.
+  // other option files so the account comes from the shared native config.
   if (tool === 'mysql') env.MYSQL_TEST_LOGIN_FILE = credential;
   const args = tool === 'mysql' ? ['--no-defaults', ...setup.args] : setup.args;
   const result = await execute(join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool), args, env, options.cwd ?? process.cwd());

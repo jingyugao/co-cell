@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ProjectRoleState, RoleCatalog } from '../../../protocol/secret-types';
+import type { ProjectRoleState, RoleCatalog, ToolCatalogEntry, ToolPermission } from '../../../protocol/secret-types';
 import { api, errorMessage } from '../../lib/api';
-import { toolConnectionCommand } from '../../../util/tool-connection-command';
 import '../connections/SecretManager.css';
 
 type Selection = 'none' | string;
 export default function ProjectToolGrants({ projectId, name, onClose }: { projectId: string; name: string; onClose: () => void }) {
   const roleBase = `/api/projects/${projectId}/tool-role`;
   const [state, setState] = useState<ProjectRoleState | null>(null), [catalog, setCatalog] = useState<RoleCatalog | null>(null);
+  const [tools, setTools] = useState<ToolCatalogEntry[] | null>(null);
   const [selection, setSelection] = useState<Selection>('none');
   const [loading, setLoading] = useState(true), [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false), [error, setError] = useState('');
@@ -18,11 +18,12 @@ export default function ProjectToolGrants({ projectId, name, onClose }: { projec
     void Promise.all([
       api<ProjectRoleState>(roleBase, { signal: controller.signal }),
       api<RoleCatalog>('/api/tool-roles', { signal: controller.signal }),
-    ]).then(async ([roleState, roleCatalog]) => {
+      api<ToolCatalogEntry[]>('/api/tools', { signal: controller.signal }),
+    ]).then(([roleState, roleCatalog, toolCatalog]) => {
       if (controller.signal.aborted) return;
-      setState(roleState); setCatalog(roleCatalog);
+      setState(roleState); setCatalog(roleCatalog); setTools(toolCatalog);
       setSelection(roleState.roleId ?? 'none');
-      if (!controller.signal.aborted) setLoaded(true);
+      setLoaded(true);
     }).catch(err => { if (!controller.signal.aborted) setError(errorMessage(err)); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
@@ -34,7 +35,7 @@ export default function ProjectToolGrants({ projectId, name, onClose }: { projec
   }, []);
   const role = catalog?.roles.find(item => item.id === selection);
   async function save() {
-    if (!state || !loaded) return;
+    if (!state || !catalog || !tools || !loaded) return;
     setBusy(true); setError('');
     try {
       await api<ProjectRoleState>(roleBase, { method: 'PUT', body: JSON.stringify({ roleId: selection === 'none' ? null : selection }) });
@@ -52,7 +53,7 @@ export default function ProjectToolGrants({ projectId, name, onClose }: { projec
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
       }}>
       <div className="tool-secret-heading"><h2>{name} · 工具权限</h2><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>关闭</button></div>
-      <p className="tool-secret-description">选择项目可使用的工具角色。无权限会移除项目中所有工具凭证访问。</p>
+      <p className="tool-secret-description">所有项目共用 HOME 和连接配置。角色决定可调用的工具及连接名称；调用时会按角色所选名称校验权限，保留共享配置和登录状态。</p>
       {error && <p className="connections-error" role="alert">{error}</p>}
       {loading ? <p role="status">正在读取项目工具权限…</p> : loaded && <>
         <fieldset className="project-role-options" disabled={busy}>
@@ -63,13 +64,22 @@ export default function ProjectToolGrants({ projectId, name, onClose }: { projec
           </label>)}
           <label className={`tool-secret-option${selection === 'none' ? ' is-selected' : ''}`}><input type="radio" name="project-role" checked={selection === 'none'} onChange={() => setSelection('none')} /><span>无权限</span></label>
         </fieldset>
-        {!role && selection !== 'none' ? <p className="tool-secret-note" role="status">当前项目关联的角色已不存在。请明确选择一个角色或“无权限”后保存。</p> : role && <section className="project-role-preview" aria-label={`${role.name} 连接预览`}>
-          <h3>{role.name} · 连接预览</h3>
-          {!role.connections.length ? <p className="tool-secret-note">此角色没有连接。</p> : <ul>{role.connections.map((connection, index) => <li key={`${connection.tool}-${connection.secretId}-${index}`}><strong>{connection.tool}</strong> · {connection.alias}{['mysql', 'kubectl'].includes(connection.tool) && connection.nativeNames?.map(nativeName => <code key={nativeName}>{toolConnectionCommand(connection.tool, nativeName)}</code>)}</li>)}</ul>}
+        {!role && selection !== 'none' ? <p className="tool-secret-note" role="status">当前项目关联的角色已不存在。请明确选择一个角色或“无权限”后保存。</p> : role && <section className="project-role-preview" aria-label={`${role.name} 权限预览`}>
+          <h3>{role.name} · 权限预览</h3>
+          {!role.permissions.some(permission => permission.enabled) ? <p className="tool-secret-note">此角色没有启用的工具。</p> : <ul>{role.permissions.filter(permission => permission.enabled).map(permission => <PermissionPreview key={permission.tool} permission={permission} tools={tools!} />)}</ul>}
         </section>}
       </>}
       <div className="tool-secret-actions"><button className="secondary-button" disabled={busy} onClick={onClose}>取消</button>
-        <button className="primary-button" disabled={busy || !loaded || loading} onClick={() => void save()}>{busy ? '保存中…' : '保存'}</button></div>
+        <button className="primary-button" disabled={busy || !loaded || !catalog || !tools || loading} onClick={() => void save()}>{busy ? '保存中…' : '保存'}</button></div>
     </section>
   </div>;
+}
+
+function PermissionPreview({ permission, tools }: { permission: ToolPermission; tools: ToolCatalogEntry[] }) {
+  const entry = tools.find(tool => tool.name === permission.tool);
+  const names = permission.credentials ?? [];
+  return <li><strong>{permission.tool}</strong>{names.map(name => {
+    const missing = entry?.kind === 'tool-with-credential' && !entry.credentials.includes(name);
+    return <code key={name}>{name}{missing ? ' · 已不存在' : ''}</code>;
+  })}{entry?.kind === 'tool-with-credential' && !names.length && <span>未选择连接</span>}</li>;
 }

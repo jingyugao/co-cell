@@ -40,7 +40,7 @@ test('Git cache initialization and native Go VCS builds retain the caller direct
     fetch: async (_url, init) => {
       const body = JSON.parse(init.body);
       assert(body.args.every(arg => !arg.startsWith('--cocell-')));
-      return Response.json({ tool: 'git', args: body.args, home: '/home/debug/00000000-0000-0000-0000-000000000000', path: '.gitconfig' });
+      return Response.json({ tool: 'git', args: body.args, home: '/home/debug', path: '.gitconfig' });
     },
   };
   const git = async (cwd, args) => {
@@ -68,7 +68,7 @@ test('Git cache initialization and native Go VCS builds retain the caller direct
     const proxy = `#!${process.execPath}\n` +
       `import {runProtectedTool} from ${JSON.stringify(new URL('../../deploy/box-wrap/protected-tool.mjs', import.meta.url).href)};\n` +
       `import {encodeWorkingDirectory} from ${JSON.stringify(new URL('../../util/tool-working-directory.mjs', import.meta.url).href)};\n` +
-      `process.exitCode=await runProtectedTool('git',encodeWorkingDirectory('git',process.argv.slice(2),process.cwd()),{config:${JSON.stringify(config)},agentHome:${JSON.stringify(home)},binaryRoot:${JSON.stringify(binaryRoot)},fetch:async(_url,init)=>{const body=JSON.parse(init.body);return Response.json({tool:'git',args:body.args,home:'/home/debug/00000000-0000-0000-0000-000000000000',path:'.gitconfig'});}});\n`;
+      `process.exitCode=await runProtectedTool('git',encodeWorkingDirectory('git',process.argv.slice(2),process.cwd()),{config:${JSON.stringify(config)},agentHome:${JSON.stringify(home)},binaryRoot:${JSON.stringify(binaryRoot)},fetch:async(_url,init)=>{const body=JSON.parse(init.body);return Response.json({tool:'git',args:body.args,home:'/home/debug',path:'.gitconfig'});}});\n`;
     await writeFile(join(proxies, 'git'), proxy, { mode: 0o755 });
     const goEnv = { ...process.env, PATH: proxies + ':' + process.env.PATH, GOTOOLCHAIN: 'local', GOPROXY: 'off', GOSUMDB: 'off', GOWORK: 'off' };
     // Let the selected Go binary locate its own standard library/toolchain.

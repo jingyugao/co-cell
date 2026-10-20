@@ -1,6 +1,6 @@
 import type { Pool, PoolConnection, RowDataPacket } from 'mysql2/promise';
 import { randomUUID } from 'node:crypto';
-import type { ProjectRoleAssignment, RoleCatalog, RoleConnection, ToolRole } from '../../protocol/secret-types.js';
+import type { ProjectRoleAssignment, RoleCatalog, ToolPermission, ToolRole } from '../../protocol/secret-types.js';
 import { HttpError } from '../../util/errors.js';
 
 export interface RoleRepository {
@@ -75,7 +75,7 @@ export class MySqlRoleRepository implements RoleRepository {
     const defaultRoleId = settings[0]?.default_role_id as string | null | undefined;
     if (!defaultRoleId) throw new HttpError(503, '工具角色尚未初始化，请先完成服务初始化');
     return {
-      roles: roles.map(row => ({ id: row.id, name: row.name, connections: parse<RoleConnection[]>(row.connections), createdAt: row.created_at, updatedAt: row.updated_at })),
+      roles: roles.map(row => ({ id: row.id, name: row.name, permissions: parse<ToolPermission[]>(row.connections).filter(permission => typeof permission.enabled === 'boolean'), createdAt: row.created_at, updatedAt: row.updated_at })),
       defaultRoleId,
     };
   }
@@ -88,15 +88,10 @@ export class MySqlRoleRepository implements RoleRepository {
         const [existing] = await connection.query<RowDataPacket[]>('SELECT id FROM tool_roles WHERE id=? FOR UPDATE', [role.id]);
         if (!existing.length) throw new HttpError(404, '角色不存在');
       }
-      const secretIds = [...new Set(role.connections.map(item => item.secretId))].sort();
-      for (const secretId of secretIds) {
-        const [rows] = await connection.query<RowDataPacket[]>('SELECT id FROM secrets WHERE id=? LOCK IN SHARE MODE', [secretId]);
-        if (!rows.length) throw new HttpError(400, '所选资源已删除，请刷新列表');
-      }
       if (mode === 'update') {
-        await connection.query('UPDATE tool_roles SET name=?,connections=CAST(? AS JSON),updated_at=? WHERE id=?', [role.name, JSON.stringify(role.connections), role.updatedAt, role.id]);
+        await connection.query('UPDATE tool_roles SET name=?,connections=CAST(? AS JSON),updated_at=? WHERE id=?', [role.name, JSON.stringify(role.permissions), role.updatedAt, role.id]);
       } else {
-        await connection.query('INSERT INTO tool_roles(id,name,connections,created_at,updated_at) VALUES(?,?,CAST(? AS JSON),?,?)', [role.id, role.name, JSON.stringify(role.connections), role.createdAt, role.updatedAt]);
+        await connection.query('INSERT INTO tool_roles(id,name,connections,created_at,updated_at) VALUES(?,?,CAST(? AS JSON),?,?)', [role.id, role.name, JSON.stringify(role.permissions), role.createdAt, role.updatedAt]);
       }
       await connection.commit();
     } catch (error) {
@@ -184,7 +179,6 @@ export class MemoryRoleRepository implements RoleRepository {
   private bootstrapped = false;
 
   constructor(
-    private readonly secretExists: (secretId: string) => boolean = () => false,
     private readonly projectIds: () => string[] = () => [],
   ) {}
   async init() {}
@@ -194,10 +188,10 @@ export class MemoryRoleRepository implements RoleRepository {
     if (!defaultRole) defaultRole = [...this.roles.values()].find(role => role.name === 'Default');
     if (!defaultRole) {
       const now = new Date().toISOString();
-      defaultRole = { id: randomUUID(), name: 'Default', connections: [], createdAt: now, updatedAt: now };
+      defaultRole = { id: randomUUID(), name: 'Default', permissions: [], createdAt: now, updatedAt: now };
       this.roles.set(defaultRole.id, defaultRole);
     } else {
-      defaultRole.connections = [];
+      defaultRole.permissions = [];
       defaultRole.updatedAt = new Date().toISOString();
     }
     this.defaultRoleId = defaultRole.id;
@@ -212,7 +206,6 @@ export class MemoryRoleRepository implements RoleRepository {
     const previous = this.roles.get(role.id);
     if (mode === 'update' && !previous) throw new HttpError(404, '角色不存在');
     if (mode === 'create' && previous) throw new HttpError(409, '角色已存在');
-    for (const item of role.connections) if (!this.secretExists(item.secretId)) throw new HttpError(400, '所选资源已删除，请刷新列表');
     if ([...this.roles.values()].some(existing => existing.id !== role.id && existing.name.toLowerCase() === role.name.toLowerCase())) {
       throw new HttpError(409, '角色名称已存在');
     }

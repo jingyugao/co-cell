@@ -3,28 +3,28 @@ import { chmod, lstat, mkdir, open, readFile, rename, rm } from 'node:fs/promise
 import { dirname, join } from 'node:path';
 import type { ProvisionedToolFile } from '../../protocol/secret-types.js';
 import { credentialPath } from './policy.js';
-import type { SharedCoordinator } from '../infra/storage/coordination.js';
 
 type Binding = Pick<ProvisionedToolFile, 'tool' | 'secretId' | 'path' | 'version' | 'revision' | 'externallyManaged'>;
 
-/** Native CLI files live here, rather than in the checkpoint or an API response. */
+/** One persistent debug HOME; project lifecycles never own these files. */
 export class MountedToolHomes {
-  private pending = new Map<string, Promise<void>>();
-  constructor(private root: string, private coordinator?: SharedCoordinator) {}
-  private locations(projectId: string) {
-    if (!/^[a-z0-9][a-z0-9-]{0,54}$/.test(projectId)) throw new Error('Invalid project identity');
-    return { home: join(this.root, 'runtime/debug-homes', projectId),
-      manifest: join(this.root, 'runtime/project-homes', projectId, 'home-files.json') };
+  private pending: Promise<void> = Promise.resolve();
+  constructor(private root: string) {}
+  private locations() {
+    return { home: join(this.root, 'runtime/debug-homes'),
+      manifest: join(this.root, 'runtime/debug-home-files.json') };
   }
-  async init() { await this.directory(join(this.root, 'runtime/debug-homes')); }
-  private async bindings(projectId: string): Promise<Binding[] | null> {
-    try { return JSON.parse(await readFile(this.locations(projectId).manifest, 'utf8')); }
+  async init() {
+    await this.directory(join(this.root, 'runtime'), 0o755);
+    await this.directory(join(this.root, 'runtime/debug-homes'));
+  }
+  private async bindings(): Promise<Binding[] | null> {
+    try { return JSON.parse(await readFile(this.locations().manifest, 'utf8')); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   }
-  async exists(projectId: string) { await this.pending.get(projectId); return (await this.bindings(projectId)) !== null; }
-  async hasFile(projectId: string, path: string) {
-    await this.pending.get(projectId);
-    let target = this.locations(projectId).home;
+  async hasFile(path: string) {
+    await this.pending;
+    let target = this.locations().home;
     try {
       for (const part of credentialPath(path).split('/')) {
         const parent = await lstat(target);
@@ -35,11 +35,15 @@ export class MountedToolHomes {
       return info.isFile() && !info.isSymbolicLink();
     } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
   }
-  private async directory(path: string) {
-    await mkdir(path, { recursive: true, mode: 0o700 });
+  async read(path: string) {
+    if (!await this.hasFile(path)) return undefined;
+    return readFile(join(this.locations().home, credentialPath(path)));
+  }
+  private async directory(path: string, mode = 0o700) {
+    await mkdir(path, { recursive: true, mode });
     const info = await lstat(path);
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Unsafe credential directory');
-    await chmod(path, 0o700);
+    await chmod(path, mode);
   }
   private async atomicFile(path: string, bytes: Uint8Array) {
     const temporary = join(dirname(path), `.cocell-${randomUUID()}`);
@@ -51,17 +55,13 @@ export class MountedToolHomes {
       try { await directory.sync(); } finally { await directory.close(); }
     } finally { await rm(temporary, { force: true }); }
   }
-  publish(projectId: string, resolveFiles: () => Promise<ProvisionedToolFile[]>) {
-    const previous = this.pending.get(projectId) ?? Promise.resolve();
-    const current = previous.catch(() => {}).then(() => {
-      const publish = async () => this.write(projectId, await resolveFiles());
-      return this.coordinator ? this.coordinator.run(`mounted-tool-home:${projectId}`, publish) : publish();
-    });
-    this.pending.set(projectId, current);
-    return current.finally(() => { if (this.pending.get(projectId) === current) this.pending.delete(projectId); });
+  publish(resolveFiles: () => Promise<ProvisionedToolFile[]>) {
+    const current = this.pending.catch(() => {}).then(async () => this.write(await resolveFiles()));
+    this.pending = current.catch(() => {});
+    return current;
   }
-  private async write(projectId: string, files: ProvisionedToolFile[]) {
-    const { home, manifest } = this.locations(projectId);
+  private async write(files: ProvisionedToolFile[]) {
+    const { home, manifest } = this.locations();
     const next: Binding[] = files.map(({ tool, secretId, path, version, revision, format, externallyManaged }) => {
       if (format && format !== 'text') throw new Error('Mounted HOME supports text credential files only');
       return { tool, secretId, path: credentialPath(path), version, ...(revision ? { revision } : {}), ...(externallyManaged ? { externallyManaged: true } : {}) };
@@ -72,7 +72,7 @@ export class MountedToolHomes {
       const a = next[i].path, b = next[j].path;
       if (a === b || a.startsWith(b + '/') || b.startsWith(a + '/')) throw new Error('Credential HOME paths conflict');
     }
-    const old = await this.bindings(projectId) ?? [];
+    const old = await this.bindings() ?? [];
     await this.directory(home);
     for (let i = 0; i < next.length; i++) {
       const file = next[i];
@@ -102,11 +102,13 @@ export class MountedToolHomes {
       }
       await rm(join(home, file.path), { force: true });
     }
-    await this.directory(dirname(manifest));
+    // The launcher reads runtime/config.json as the agent. Only the HOME and
+    // credential manifest are private; their shared parent must stay traversable.
+    await this.directory(dirname(manifest), 0o755);
     await this.atomicFile(manifest, Buffer.from(JSON.stringify(next)));
   }
-  async ready(projectId: string, binding: Binding) {
-    await this.pending.get(projectId);
-    return (await this.bindings(projectId))?.some(file => JSON.stringify(file) === JSON.stringify(binding)) ?? false;
+  async ready(binding: Binding) {
+    await this.pending;
+    return (await this.bindings())?.some(file => JSON.stringify(file) === JSON.stringify(binding)) ?? false;
   }
 }

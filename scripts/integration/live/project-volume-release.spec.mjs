@@ -80,3 +80,39 @@ test('release a Box and recreate it with the same independent workspace volume',
     // Fixture DELETE backs up these retained volumes before reclaiming them.
   }
 });
+
+test('two API instances use the current project binding after release and creation', async ({ environment: env }) => {
+  const urls = [process.env.COCELL_E2E_API_A_URL, process.env.COCELL_E2E_API_B_URL];
+  test.skip(urls.some(url => !url), 'Requires direct URLs for two different deployed API instances');
+  const clients = urls.map(value => {
+    const base = new URL(value);
+    assert(['http:', 'https:'].includes(base.protocol) && !base.username && !base.password && base.pathname === '/');
+    const client = Object.create(env);
+    client.config = { ...env.config, base };
+    return client;
+  });
+  const [apiA, apiB] = clients;
+  assert.notEqual(apiA.config.base.origin, apiB.config.base.origin, 'A shared service cannot prove cross-instance behavior');
+  const project = await apiA.createProject('cross-api-volume-release');
+  const marker = `cross-api-binding-${env.runId}`;
+  const filename = 'cross-api-binding-marker.txt';
+  await (await testWorkspaceWriter(env, project.id))(filename, marker);
+  const path = `/api/projects/${project.id}/files/content?path=${encodeURIComponent(`/home/agent/workspace/${filename}`)}`;
+  // Both instances must have accessed the old Box before either replaces it.
+  for (const api of clients) assert.equal((await api.request(path)).buffer.toString(), marker);
+  const released = await apiA.json(`/api/projects/${project.id}/sandbox/release`, {
+    method: 'POST', timeoutMs: env.config.operationTimeout,
+  });
+  assert.equal(released.sandbox, undefined);
+  const recreated = await apiB.json(`/api/projects/${project.id}/sandbox/create`, {
+    method: 'POST', timeoutMs: env.config.operationTimeout,
+  });
+  assert.equal(recreated.sandboxOperation.status, 'succeeded');
+  assert.notEqual(recreated.sandbox.id, project.sandbox.id);
+  assert.deepEqual(recreated.sandboxMounts, project.sandboxMounts);
+  for (const api of clients) {
+    const current = await api.json(`/api/projects/${project.id}`);
+    assert.equal(current.sandbox.id, recreated.sandbox.id);
+    assert.equal((await api.request(path)).buffer.toString(), marker);
+  }
+});

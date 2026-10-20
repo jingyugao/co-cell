@@ -115,9 +115,6 @@ export class SandboxRuntimeConfig {
           await this.options.secrets.registerRuntime(boxId, projectId, revision);
           assertActive(signal);
         }
-        assertActive(signal);
-        await this.options.secrets.publishHome(projectId);
-        assertActive(signal);
         const config: ToolHomeRuntimeConfig = { mode: 'home', boxId, url: this.options.toolBrokerUrl };
         slots = { cocell_tool_runtime: Buffer.from(JSON.stringify(config)) };
       }

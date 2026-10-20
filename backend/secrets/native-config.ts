@@ -1,67 +1,18 @@
 import { createHash } from 'node:crypto';
-import { parse } from 'yaml';
 import { HttpError } from '../../util/errors.js';
 import type { ProvisionedToolFile } from '../../protocol/secret-types.js';
 import { encodeMysqlLogin } from './mysql-login.js';
+import { credentialTool } from '../tool-access/index.js';
+import { mysqlProfiles } from '../tool-access/implementations/mysql.js';
+import { kubeConfig, type Named } from '../tool-access/implementations/kubectl.js';
+export { mysqlProfiles, kubeConfig };
 
-export const nativeContextTool = (tool: string) => tool === 'mysql' || tool === 'kubectl';
-export const nativeConfigPath = (tool: string) => tool === 'mysql' ? '.mylogin.cnf' : '.kube/config';
-export interface NativeSource { id: string; name: string; version: number; content: string }
-const validName = (value: unknown): value is string => typeof value === 'string' && !!value && value.length <= 256 && !/[\u0000-\u001f\u007f\[\]]/.test(value);
-
-/** Accept named login profiles and existing client_<name> option groups. */
-export function mysqlProfiles(content: string, name: string): Map<string, string[]> {
-  const groups = new Map<string, Map<string, string>>();
-  let group: Map<string, string> | undefined;
-  for (const original of content.replace(/^\uFEFF/, '').split(/\r?\n/)) {
-    const line = original.trim();
-    if (!line || /^[#;]/.test(line)) continue;
-    const header = line.match(/^\[([^\]]+)\]$/);
-    if (header) {
-      if (!validName(header[1]) || groups.has(header[1])) throw new HttpError(400, 'MySQL 凭证需要唯一的原生 login-path 选项组');
-      group = new Map(); groups.set(header[1], group); continue;
-    }
-    const option = line.match(/^([A-Za-z][A-Za-z0-9_-]*)(?:\s*=.*)?$/);
-    if (!group || !option) throw new HttpError(400, 'MySQL 原生选项文件无效；不支持外部 include');
-    const separator = line.indexOf('=');
-    group.set(option[1].replaceAll('_', '-'), separator < 0 ? line : `${option[1]} = ${line.slice(separator + 1).trim()}`);
-  }
-  const common = new Map([...groups.get('client') ?? [], ...groups.get('mysql') ?? []]);
-  const named = [...groups.keys()].filter(key => !['client', 'mysql'].includes(key));
-  const names = [...new Set(named.map(key => /^(?:client|mysql)_(.+)$/.exec(key)?.[1] ?? key))];
-  if (!names.length) names.push(name);
-  const profiles = new Map<string, string[]>();
-  for (const profile of names) {
-    if (!validName(profile)) throw new HttpError(400, 'MySQL 原生连接名称无效');
-    const options = new Map([...common, ...groups.get(`client_${profile}`) ?? [], ...groups.get(`mysql_${profile}`) ?? [], ...groups.get(profile) ?? []]);
-    if (!options.size) throw new HttpError(400, 'MySQL 凭证缺少原生连接选项');
-    profiles.set(profile, [...options.values()]);
-  }
-  return profiles;
-}
-
-interface Named { name: string; [key: string]: unknown }
-interface KubeConfig { clusters: Named[]; users: Named[]; contexts: Array<Named & { context: { cluster: string; user?: string; [key: string]: unknown } }>; 'current-context'?: string }
-export function kubeConfig(content: string): KubeConfig {
-  try {
-    const value = JSON.parse(JSON.stringify(parse(content, { maxAliasCount: 50 })));
-    if (!value || value.kind !== 'Config' || value.apiVersion !== 'v1') throw new Error();
-    for (const key of ['clusters', 'users', 'contexts']) {
-      if (key !== 'contexts' && value[key] == null) value[key] = [];
-      if (!Array.isArray(value[key]) || new Set(value[key].map((item: Named) => item?.name)).size !== value[key].length || value[key].some((item: Named) => !validName(item?.name))) throw new Error();
-    }
-    for (const cluster of value.clusters) if (!cluster.cluster || typeof cluster.cluster.server !== 'string') throw new Error();
-    for (const user of value.users) if (!user.user || typeof user.user !== 'object' || Array.isArray(user.user)) throw new Error();
-    if (!value.contexts.length) throw new Error();
-    for (const item of value.contexts) {
-      if (!item.context || !value.clusters.some((cluster: Named) => cluster.name === item.context.cluster) || (item.context.user && !value.users.some((user: Named) => user.name === item.context.user))) throw new Error();
-    }
-    return value;
-  } catch { throw new HttpError(400, 'Kubernetes 凭证需要有效的原生 kubeconfig 和完整的 context 引用'); }
-}
-
+export const nativeContextTool = (tool: string) => credentialTool(tool) !== undefined;
+export const nativeConfigPath = (tool: string) => { const adapter = credentialTool(tool); if (!adapter) throw new Error('Tool has no native credential config'); return adapter.configPath; };
+export type { CredentialSource as NativeSource } from '../tool-access/interfaces.js';
+import type { CredentialSource as NativeSource } from '../tool-access/interfaces.js';
 export function nativeNames(tool: string, source: NativeSource): string[] {
-  return tool === 'mysql' ? [...mysqlProfiles(source.content, source.name).keys()] : kubeConfig(source.content).contexts.map(item => item.name);
+  return [...credentialTool(tool)!.listCredentials([source]).names];
 }
 
 export function mergedBinding(tool: string, sources: Array<Pick<NativeSource, 'id' | 'name' | 'version'> & { content?: string }>) {
@@ -70,7 +21,7 @@ export function mergedBinding(tool: string, sources: Array<Pick<NativeSource, 'i
   return { tool, secretId: `native-${tool}`, path: nativeConfigPath(tool), version: 0, revision };
 }
 
-/** Only role-granted sources enter the native config. Context names remain unchanged. */
+/** Merge enabled shared sources without changing their native context names. */
 export function mergeNativeConfig(tool: string, sources: NativeSource[]): ProvisionedToolFile {
   let content: string;
   if (tool === 'mysql') {
@@ -99,7 +50,7 @@ export function mergeNativeConfig(tool: string, sources: NativeSource[]): Provis
       result.contexts.push({ ...context, context: { ...context.context, cluster: clusterName, ...(user ? { user: userName } : {}) } });
     }
     const selected = configs[0]?.config['current-context'];
-    result['current-context'] = selected && contexts.has(selected) ? selected : result.contexts[0]?.name ?? '';
+    result['current-context'] = selected && contexts.has(selected) ? selected : '';
     content = JSON.stringify(result, null, 2) + '\n';
   }
   const bytes = tool === 'mysql' ? encodeMysqlLogin(content) : Buffer.from(content);

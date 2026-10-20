@@ -6,11 +6,12 @@ import { credentialPath } from './policy.js';
 import { SecretCrypto } from './crypto.js';
 import type { StoredSecret } from './repository.js';
 import { fileBytes, validateFileBundle } from '../../util/credential-files.mjs';
+import { nativeContextTool } from './native-config.js';
 
 const prefix = 'native:v1:';
 const legacyPath = (secret: StoredSecret) => secret.format === 'json' ? 'config.json' : secret.format === 'binary' ? 'credentials.bin' : undefined;
 type Descriptor = { kind: StoredSecret['format']; files: Array<{ path: string; encoding?: 'base64' }>;
-  supportVersion?: number; homeProjectId?: string; directory?: string; adapter?: 'meegle'; identity?: { hostname: string; username: string } };
+  supportVersion?: number; directory?: string; adapter?: 'meegle'; identity?: { hostname: string; username: string } };
 
 /** Only native CLI files persist. Encryption here is transient compatibility
  * with the service's in-memory interface and reading pre-migration records. */
@@ -33,9 +34,12 @@ export class NativeSecretFiles {
     }
   }
   async init() { await this.directory(this.root, true); await chmod(this.root, 0o700); }
-  private path(id: string, relative: string) {
-    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(id)) throw new Error('Invalid credential identity');
-    return join(this.root, id, credentialPath(relative));
+  private path(secret: Pick<StoredSecret, 'id' | 'tool' | 'path'>, relative: string) {
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(secret.id)) throw new Error('Invalid credential identity');
+    // Native connection sources are merged into one shared config. Other CLIs
+    // own their normal HOME-relative files directly, including token refreshes.
+    const source = !secret.tool || !secret.path || nativeContextTool(secret.tool) ? secret.id : '';
+    return join(this.root, source, credentialPath(relative));
   }
   private async bytes(path: string): Promise<Buffer> {
     await this.directory(dirname(path), false);
@@ -71,9 +75,9 @@ export class NativeSecretFiles {
   private descriptor(secret: StoredSecret): Descriptor {
     const value = JSON.parse(secret.ciphertext.slice(prefix.length)) as Descriptor;
     if (value.kind !== secret.format || !Array.isArray(value.files) || value.files.length > 128) throw new Error('Invalid native credential registration');
-    for (const file of value.files) this.path(secret.id, file.path);
+    for (const file of value.files) this.path(secret, file.path);
     if (secret.format === 'home') {
-      if (value.files.length || !/^[a-f0-9-]{36}$/.test(value.homeProjectId ?? '')) throw new Error('Invalid HOME registration');
+      if (value.files.length) throw new Error('Invalid shared HOME registration');
     } else if (value.files[0]?.path !== (secret.path ?? legacyPath(secret)) || !value.files.length || new Set(value.files.map(file => file.path)).size !== value.files.length) {
       throw new Error('Native credential path does not match registration');
     }
@@ -82,9 +86,18 @@ export class NativeSecretFiles {
   async read(secret: StoredSecret) {
     if (!this.isNative(secret.ciphertext)) return secret.ciphertext;
     const descriptor = this.descriptor(secret);
-    const files = await Promise.all(descriptor.files.map(async file => ({ ...file, bytes: await this.bytes(this.path(secret.id, file.path)) })));
+    const present = await Promise.all(descriptor.files.map(async (file, index) => {
+      try { return { ...file, bytes: await this.bytes(this.path(secret, file.path)) }; }
+      catch (error) {
+        // Native CLIs may remove their own token/keychain files on logout.
+        // Keep reporting the actual HOME rather than requiring an old bundle.
+        if (secret.format === 'lark' && index > 0 && (error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }
+    }));
+    const files = present.filter(file => file !== null);
     let payload: string | Buffer;
-    if (secret.format === 'home') payload = JSON.stringify({ homeProjectId: descriptor.homeProjectId });
+    if (secret.format === 'home') payload = '{}';
     else if (secret.format === 'lark') payload = JSON.stringify({ content: files[0].bytes.toString('utf8'),
       supportFiles: files.slice(1).map(file => ({ path: file.path, content: file.bytes.toString('base64'), encoding: 'base64' })), supportVersion: descriptor.supportVersion });
     else if (secret.format === 'files') payload = JSON.stringify({ ...descriptor, kind: undefined,
@@ -97,7 +110,7 @@ export class NativeSecretFiles {
     const payload = original.toString('utf8');
     const descriptor: Descriptor = { kind: secret.format, files: [] };
     let files: Array<{ path: string; bytes: Buffer; encoding?: 'base64' }> = [];
-    if (secret.format === 'home') descriptor.homeProjectId = JSON.parse(payload).homeProjectId;
+    if (secret.format === 'home') { /* The shared HOME is managed directly by native CLIs. */ }
     else if (legacyPath(secret)) {
       // Historical unbound entries have no tool/path registration. Preserve
       // their exact bytes without guessing a tool or enabling tool access.
@@ -136,17 +149,17 @@ export class NativeSecretFiles {
     try {
       // Publish companions before primary configs that reference them.
       for (const file of [...files.slice(1), ...files.slice(0, 1)]) {
-        const path = this.path(secret.id, file.path);
+        const path = this.path(secret, file.path);
         let before: Buffer | null = null;
         try { before = await this.bytes(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
         if (before?.equals(file.bytes)) continue;
         previous.push({ path, before, after: file.bytes });
         await this.write(path, file.bytes);
       }
-      if (registered && this.isNative(registered.ciphertext)) {
+      if (registered && secret.format !== 'home' && this.isNative(registered.ciphertext)) {
         for (const old of this.descriptor(registered).files) {
           if (descriptor.files.some(file => file.path === old.path)) continue;
-          const path = this.path(secret.id, old.path);
+          const path = this.path(registered, old.path);
           let before: Buffer;
           try { before = await this.bytes(path); }
           catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }

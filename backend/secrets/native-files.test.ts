@@ -31,7 +31,7 @@ async function withRoot(run: (root: string, crypto: SecretCrypto) => Promise<voi
   try { await run(root, crypto); } finally { await rm(root, { recursive: true, force: true }); }
 }
 
-function fileAt(root: string, id: string, path: string) { return join(root, id, path); }
+function fileAt(root: string, id: string, path: string, shared = false) { return shared ? join(root, path) : join(root, id, path); }
 
 test('stores only native text files, returns a reference, and reads live CLI edits into memory', async () => {
   await withRoot(async (root, crypto) => {
@@ -41,16 +41,16 @@ test('stores only native text files, returns a reference, and reads live CLI edi
     const source = secret(crypto, 'text', '.my.cnf', original);
     const prepared = await first.prepare(source, versionId, source.ciphertext);
     assert.match(prepared.reference, /^native:v1:/);
-    assert.equal(await readFile(fileAt(root, secretId, '.my.cnf'), 'utf8'), original);
-    assert.deepEqual(await readdir(join(root, secretId)), ['.my.cnf']);
-    assert.equal((await lstat(fileAt(root, secretId, '.my.cnf'))).mode & 0o777, 0o600);
+    assert.equal(await readFile(fileAt(root, secretId, '.my.cnf', true), 'utf8'), original);
+    assert.deepEqual(await readdir(root), ['.my.cnf']);
+    assert.equal((await lstat(fileAt(root, secretId, '.my.cnf', true))).mode & 0o777, 0o600);
 
     const edited = '[client]\nuser=fixture\npassword=refreshed-by-cli\n';
-    await writeFile(fileAt(root, secretId, '.my.cnf'), edited);
+    await writeFile(fileAt(root, secretId, '.my.cnf', true), edited);
     const descriptor = { ...source, ciphertext: prepared.reference };
     const instanceRead = await second.read(descriptor);
     assert.equal(crypto.open(secretId, versionId, instanceRead).toString('utf8'), edited);
-    assert.equal(await readFile(fileAt(root, secretId, '.my.cnf'), 'utf8'), edited);
+    assert.equal(await readFile(fileAt(root, secretId, '.my.cnf', true), 'utf8'), edited);
   });
 });
 
@@ -60,15 +60,15 @@ test('stores Lark primary and binary companion files and reconstructs the encryp
     const payload = JSON.stringify({ content: config, supportFiles: supportFiles(), supportVersion: 1 });
     const source = secret(crypto, 'lark', '.lark-cli/config.json', payload);
     const prepared = await files.prepare(source, versionId, source.ciphertext);
-    assert.equal(await readFile(fileAt(root, secretId, '.lark-cli/config.json'), 'utf8'), config);
+    assert.equal(await readFile(fileAt(root, secretId, '.lark-cli/config.json', true), 'utf8'), config);
     for (const companion of supportFiles()) {
-      assert.deepEqual(await readFile(fileAt(root, secretId, companion.path)), Buffer.from(companion.content, 'base64'));
+      assert.deepEqual(await readFile(fileAt(root, secretId, companion.path, true)), Buffer.from(companion.content, 'base64'));
     }
     const stored = await files.read({ ...source, ciphertext: prepared.reference });
     const opened = JSON.parse(crypto.open(secretId, versionId, stored).toString('utf8'));
     assert.equal(opened.content, config);
     assert.deepEqual(opened.supportFiles, supportFiles());
-    assert.deepEqual((await readdir(join(root, secretId, '.local/share/lark-cli'))).sort(), [
+    assert.deepEqual((await readdir(join(root, '.local/share/lark-cli'))).sort(), [
       'appsecret_cli_fixture.enc', 'cli_fixture_ou_fixture.enc', 'master.key',
     ]);
   });
@@ -83,23 +83,41 @@ test('maps legacy file bundles to native paths without writing a bundle blob or 
     ] });
     const source = secret(crypto, 'files', '.tool/config.json', bundle);
     const prepared = await files.prepare(source, versionId, source.ciphertext);
-    assert.equal(await readFile(fileAt(root, secretId, '.tool/config.json'), 'utf8'), '{"token":"synthetic"}');
-    assert.deepEqual(await readFile(fileAt(root, secretId, '.tool/key.bin')), Buffer.from([0, 7, 128, 255]));
-    assert.deepEqual((await readdir(join(root, secretId, '.tool'))).sort(), ['config.json', 'key.bin']);
+    assert.equal(await readFile(fileAt(root, secretId, '.tool/config.json', true), 'utf8'), '{"token":"synthetic"}');
+    assert.deepEqual(await readFile(fileAt(root, secretId, '.tool/key.bin', true)), Buffer.from([0, 7, 128, 255]));
+    assert.deepEqual((await readdir(join(root, '.tool'))).sort(), ['config.json', 'key.bin']);
     const stored = await files.read({ ...source, ciphertext: prepared.reference });
     assert.deepEqual(JSON.parse(crypto.open(secretId, versionId, stored).toString('utf8')).files, JSON.parse(bundle).files);
   });
 });
 
-test('keeps HOME references as metadata and writes no credential body files', async () => {
+test('registers shared HOME without a project reference or credential body files', async () => {
   await withRoot(async (root, crypto) => {
     const files = new NativeSecretFiles(root, crypto); await files.init();
-    const payload = JSON.stringify({ homeProjectId: '423e4567-e89b-42d3-a456-426614174000' });
-    const source = secret(crypto, 'home', '.meegle/config.json', payload);
-    const prepared = await files.prepare(source, versionId, source.ciphertext);
-    assert.deepEqual(await readdir(root), []);
-    const stored = await files.read({ ...source, ciphertext: prepared.reference });
-    assert.deepEqual(JSON.parse(crypto.open(secretId, versionId, stored).toString('utf8')), JSON.parse(payload));
+    const textSource = secret(crypto, 'text', '.meegle/config.json', '{"token":"shared"}');
+    const textPrepared = await files.prepare(textSource, versionId, textSource.ciphertext);
+    const textBytes = await readFile(fileAt(root, secretId, '.meegle/config.json', true));
+    const textHome = secret(crypto, 'home', '.meegle/config.json', '{}', secretId, otherVersionId);
+    const textHomePrepared = await files.prepare(textHome, otherVersionId, textHome.ciphertext,
+      { ...textSource, ciphertext: textPrepared.reference });
+    assert(!textHomePrepared.reference.includes('homeProject'));
+    assert.deepEqual(await readFile(fileAt(root, secretId, '.meegle/config.json', true)), textBytes,
+      'Converting a text credential to the shared HOME registration must retain its native file');
+
+    const larkId = '823e4567-e89b-42d3-a456-426614174000';
+    const larkPayload = JSON.stringify({ content: config, supportFiles: supportFiles(), supportVersion: 1 });
+    const larkSource = secret(crypto, 'lark', '.lark-cli/config.json', larkPayload, larkId);
+    const larkPrepared = await files.prepare(larkSource, versionId, larkSource.ciphertext);
+    const larkPaths = [larkSource.path!, ...supportFiles().map(file => file.path)];
+    const larkBytes = await Promise.all(larkPaths.map(path => readFile(fileAt(root, larkId, path, true))));
+    const larkHome = secret(crypto, 'home', larkSource.path!, '{}', larkId, otherVersionId);
+    const larkHomePrepared = await files.prepare(larkHome, otherVersionId, larkHome.ciphertext,
+      { ...larkSource, ciphertext: larkPrepared.reference });
+    assert(!larkHomePrepared.reference.includes('homeProject'));
+    assert.deepEqual(await Promise.all(larkPaths.map(path => readFile(fileAt(root, larkId, path, true)))), larkBytes,
+      'Converting a Lark credential to the shared HOME registration must retain config and companion files');
+    const stored = await files.read({ ...larkHome, ciphertext: larkHomePrepared.reference });
+    assert.deepEqual(JSON.parse(crypto.open(larkId, otherVersionId, stored).toString('utf8')), {});
   });
 });
 
@@ -125,8 +143,8 @@ test('preserves unbound legacy JSON and arbitrary binary bytes without inventing
 test('rollback restores prior native bytes after a prepared content change', async () => {
   await withRoot(async (root, crypto) => {
     const files = new NativeSecretFiles(root, crypto); await files.init();
-    const path = fileAt(root, secretId, '.config/credentials.json');
-    await mkdir(join(root, secretId, '.config'), { recursive: true });
+    const path = fileAt(root, secretId, '.config/credentials.json', true);
+    await mkdir(join(root, '.config'), { recursive: true });
     await writeFile(path, 'old-native-state');
     const candidate = secret(crypto, 'text', '.config/credentials.json', 'new-native-state', secretId, otherVersionId);
     const prepared = await files.prepare(candidate, otherVersionId, candidate.ciphertext);
@@ -143,11 +161,11 @@ test('changing a registered path removes the superseded native file and rollback
     const first = await files.prepare(old, versionId, old.ciphertext);
     const next = secret(crypto, 'text', '.tool/new.conf', 'new-native-state', secretId, otherVersionId);
     const prepared = await files.prepare(next, otherVersionId, next.ciphertext, { ...old, ciphertext: first.reference });
-    await assert.rejects(readFile(fileAt(root, secretId, '.tool/old.conf')), { code: 'ENOENT' });
-    assert.equal(await readFile(fileAt(root, secretId, '.tool/new.conf'), 'utf8'), 'new-native-state');
+    await assert.rejects(readFile(fileAt(root, secretId, '.tool/old.conf', true)), { code: 'ENOENT' });
+    assert.equal(await readFile(fileAt(root, secretId, '.tool/new.conf', true), 'utf8'), 'new-native-state');
     await prepared.rollback();
-    assert.equal(await readFile(fileAt(root, secretId, '.tool/old.conf'), 'utf8'), 'old-native-state');
-    await assert.rejects(readFile(fileAt(root, secretId, '.tool/new.conf')), { code: 'ENOENT' });
+    assert.equal(await readFile(fileAt(root, secretId, '.tool/old.conf', true), 'utf8'), 'old-native-state');
+    await assert.rejects(readFile(fileAt(root, secretId, '.tool/new.conf', true)), { code: 'ENOENT' });
   });
 });
 
@@ -164,12 +182,11 @@ test('rejects traversal, malformed or mismatched descriptors, and symlinked nati
 
     const outside = join(root, 'outside'); await mkdir(outside);
     const linkedSecret = secret(crypto, 'text', '.config', 'bad', '523e4567-e89b-42d3-a456-426614174000');
-    await symlink(outside, join(root, linkedSecret.id));
+    await symlink(outside, join(root, '.config'));
     await assert.rejects(files.prepare(linkedSecret, versionId, linkedSecret.ciphertext));
 
     const nested = secret(crypto, 'text', '.linked/config.json', 'bad', '623e4567-e89b-42d3-a456-426614174000');
-    await mkdir(join(root, nested.id));
-    await symlink(outside, fileAt(root, nested.id, '.linked'));
+    await symlink(outside, fileAt(root, nested.id, '.linked', true));
     await assert.rejects(files.prepare(nested, versionId, nested.ciphertext));
   });
 });

@@ -1,52 +1,96 @@
 import { useEffect, useState } from 'react';
-import type { RoleCatalog, RoleConnection, SecretMetadata, ToolRole } from '../../../protocol/secret-types';
+import type { RoleCatalog, ToolCatalogEntry, ToolPermission, ToolRole } from '../../../protocol/secret-types';
 import { api, errorMessage } from '../../lib/api';
-import { toolConnectionCommand } from '../../../util/tool-connection-command';
 
-const STANDARD_TOOLS = ['mysql', 'kubectl', 'git', 'glab', 'meegle', 'lark-cli'];
-const repeatable = (tool: string) => tool === 'mysql' || tool === 'kubectl';
+const emptyPermission = (entry: ToolCatalogEntry): ToolPermission => entry.kind === 'tool-with-credential'
+  ? { tool: entry.name, enabled: false, credentials: [] }
+  : { tool: entry.name, enabled: false };
 
-export default function RoleManager({ secrets }: { secrets: SecretMetadata[] }) {
+function permissionSummary(permission: ToolPermission) {
+  if (!permission.enabled) return null;
+  return <li key={permission.tool}><strong>{permission.tool}</strong>{permission.credentials?.map(name => <code key={name}>{name}</code>)}</li>;
+}
+
+export default function RoleManager() {
   const [catalog, setCatalog] = useState<RoleCatalog | null>(null);
+  const [tools, setTools] = useState<ToolCatalogEntry[] | null>(null);
   const [loading, setLoading] = useState(true), [busy, setBusy] = useState(false), [error, setError] = useState('');
   const [editing, setEditing] = useState<ToolRole | 'new' | null>(null);
-  const [name, setName] = useState(''), [connections, setConnections] = useState<RoleConnection[]>([]);
+  const [name, setName] = useState(''), [permissions, setPermissions] = useState<ToolPermission[]>([]);
+
   async function refresh() { setCatalog(await api<RoleCatalog>('/api/tool-roles')); }
   useEffect(() => {
     const controller = new AbortController();
-    void api<RoleCatalog>('/api/tool-roles', { signal: controller.signal }).then(setCatalog)
-      .catch(err => { if (!controller.signal.aborted) setError(errorMessage(err)); })
+    void Promise.all([
+      api<RoleCatalog>('/api/tool-roles', { signal: controller.signal }),
+      api<ToolCatalogEntry[]>('/api/tools', { signal: controller.signal }),
+    ]).then(([roleCatalog, toolCatalog]) => {
+      if (controller.signal.aborted) return;
+      setCatalog(roleCatalog); setTools(toolCatalog);
+    }).catch(err => { if (!controller.signal.aborted) setError(errorMessage(err)); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, []);
-  const usableSecrets = secrets.filter(item => item.enabled && item.format === 'text' && !item.requiresTextImport && item.tool);
-  const tools = [...new Set([...STANDARD_TOOLS, ...secrets.flatMap(item => item.tool ? [item.tool] : []), ...connections.map(item => item.tool)])];
+
   function start(role?: ToolRole) {
-    setError(''); setName(role?.name ?? ''); setConnections(role ? role.connections.map(item => ({
-      ...item,
-      alias: secrets.find(secret => secret.id === item.secretId)?.name ?? item.alias,
-    })) : []); setEditing(role ?? 'new');
+    setError(''); setName(role?.name ?? '');
+    const current = role?.permissions ?? [];
+    setPermissions([...(tools ?? []).map(entry => current.find(permission => permission.tool === entry.name) ?? emptyPermission(entry)),
+      ...current.filter(permission => !(tools ?? []).some(entry => entry.name === permission.tool))]
+      .map(permission => ({ ...permission, ...(permission.credentials ? { credentials: [...permission.credentials] } : {}) })));
+    setEditing(role ?? 'new');
   }
-  function selectCredential(tool: string, secretId: string, selected: boolean) {
-    setConnections(current => {
-      if (!selected) return current.filter(item => item.tool !== tool || item.secretId !== secretId);
-      if (current.some(item => item.tool === tool && item.secretId === secretId)) return current;
-      const remaining = repeatable(tool) ? current : current.filter(item => item.tool !== tool);
-      if (!secretId) return remaining;
-      const secret = usableSecrets.find(item => item.id === secretId);
-      if (!secret) return current;
-      return [...remaining, { tool, secretId, alias: secret.name }];
+
+  function setSimplePermission(tool: string, enabled: boolean) {
+    setPermissions(current => {
+      const next = current.filter(permission => permission.tool !== tool);
+      return [...next, { tool, enabled }];
     });
   }
+
+  function selectCredential(tool: string, credential: string, selected: boolean) {
+    setPermissions(current => {
+      const previous = current.find(permission => permission.tool === tool);
+      const credentials = new Set(previous?.credentials ?? []);
+      if (selected) credentials.add(credential); else credentials.delete(credential);
+      const values = [...credentials];
+      return [...current.filter(permission => permission.tool !== tool), {
+        tool, enabled: values.length > 0, credentials: values,
+      }];
+    });
+  }
+
+  function normalizePermissions(current: ToolPermission[]) {
+    return [...(tools ?? []).map(entry => {
+      const permission = current.find(item => item.tool === entry.name) ?? emptyPermission(entry);
+      if (entry.kind === 'tool-with-credential') {
+        const credentials = permission.enabled ? [...new Set(permission.credentials ?? [])] : [];
+        return { tool: entry.name, enabled: credentials.length > 0, credentials };
+      }
+      return { tool: entry.name, enabled: permission.enabled };
+    }), ...current.filter(permission => permission.enabled && !(tools ?? []).some(entry => entry.name === permission.tool)).map(permission => ({
+      tool: permission.tool, enabled: permission.enabled,
+      ...(permission.enabled && permission.credentials?.length ? { credentials: [...new Set(permission.credentials)] } : {}),
+    }))];
+  }
+
   async function save(event: React.FormEvent) {
-    event.preventDefault(); setBusy(true); setError('');
+    event.preventDefault();
+    if (!catalog || !tools) { setError('工具角色或工具目录尚未加载，不能保存。'); return; }
+    const normalized = normalizePermissions(permissions);
+    if (normalized.some(permission => permission.enabled && tools.find(entry => entry.name === permission.tool)?.kind === 'tool-with-credential'
+      && !permission.credentials?.length)) {
+      setError('启用凭据工具时，至少选择一个连接名称。'); return;
+    }
+    setBusy(true); setError('');
     try {
-      const body = JSON.stringify({ name: name.trim(), connections: connections.map(({ tool, secretId }) => ({ tool, secretId })) });
+      const body = JSON.stringify({ name: name.trim(), permissions: normalized });
       const path = editing === 'new' ? '/api/tool-roles' : `/api/tool-roles/${editing?.id}`;
       await api(path, { method: editing === 'new' ? 'POST' : 'PUT', body });
       setEditing(null); await refresh();
     } catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
   }
+
   async function setDefault(roleId: string) {
     setBusy(true); setError('');
     try { setCatalog(await api<RoleCatalog>('/api/tool-roles/default', { method: 'PUT', body: JSON.stringify({ roleId }) })); }
@@ -57,48 +101,54 @@ export default function RoleManager({ secrets }: { secrets: SecretMetadata[] }) 
     try { await api(`/api/tool-roles/${role.id}`, { method: 'DELETE' }); await refresh(); }
     catch (err) { setError(errorMessage(err)); } finally { setBusy(false); }
   }
+
+  const ready = !!catalog && !!tools && !loading;
   return <section className="role-manager" aria-labelledby="tool-roles-title">
-    <div className="connections-heading"><div><h2 id="tool-roles-title">工具角色</h2><p>将多个 MySQL 或 Kubernetes 连接组合成角色，再分配给项目。历史项目已统一迁移至初始的空权限默认角色；新项目使用当前默认角色。</p></div><button className="primary-button" disabled={busy || loading || !catalog} onClick={() => start()}>新建角色</button></div>
+    <div className="connections-heading"><div><h2 id="tool-roles-title">工具角色</h2><p>所有 debug 进程共用 HOME 和连接配置。角色控制可调用哪些工具和连接名称；调用时会按角色所选名称校验权限。新项目使用当前默认角色。</p></div><button className="primary-button" disabled={busy || !ready} onClick={() => start()}>新建角色</button></div>
     {error && <p className="connections-error" role="alert">{error}</p>}
     {editing && <form className="secret-form role-form" onSubmit={event => void save(event)}>
       <h3>{editing === 'new' ? '新建角色' : `编辑 ${editing.name}`}</h3>
       <label>角色名称<input required maxLength={100} value={name} onChange={event => setName(event.target.value)} /></label>
-      <div className="role-connections-heading"><strong>工具凭证</strong><span>未选择凭证的工具不可用；仅支持原生 login-path 或 context 的工具可选多个凭证。</span></div>
-      <div className="role-tool-list">{tools.map(tool => {
-        const selected = connections.filter(item => item.tool === tool);
-        const available = usableSecrets.filter(item => item.tool === tool);
-        const unavailable = selected.filter(item => !available.some(secret => secret.id === item.secretId));
-        const secretName = (secretId: string) => secrets.find(item => item.id === secretId)?.name ?? '已删除的凭证';
-        return <fieldset className="role-tool-group" key={tool} disabled={busy}>
-          <legend>{tool}</legend>
-          <p className="role-tool-hint">{repeatable(tool) ? `可选择多个凭证，使用原生 ${tool === 'mysql' ? 'login-path' : 'context'} 名称区分。` : '最多选择一个凭证。'}</p>
-          {repeatable(tool) ? <div className="role-credential-options">
-            {!available.length && !unavailable.length && <p>暂无可用凭证，请先添加或启用此工具的文本凭证。</p>}
-            {available.map(secret => {
-              const connection = selected.find(item => item.secretId === secret.id);
-              return <div className={`role-credential-option${connection ? ' is-selected' : ''}`} key={secret.id}>
-                <label className="role-credential-check"><input type="checkbox" aria-label={`${tool} 凭证：${secret.name}`} checked={!!connection} onChange={event => selectCredential(tool, secret.id, event.target.checked)} /><span>{secret.name}</span></label>
-              </div>;
-            })}
-            {unavailable.map(connection => <label className="role-credential-check role-credential-unavailable" key={connection.secretId}><input type="checkbox" aria-label={`${tool} 凭证：${secretName(connection.secretId)}`} checked onChange={() => selectCredential(tool, connection.secretId, false)} /><span>{secretName(connection.secretId)} · 不可用，请取消选择或启用凭证</span></label>)}
-          </div> : <label>认证凭证<select aria-label={`${tool} 凭证`} value={selected[0]?.secretId ?? ''} onChange={event => selectCredential(tool, event.target.value, true)}>
-            <option value="">无权限</option>
-            {available.map(secret => <option key={secret.id} value={secret.id}>{secret.name}</option>)}
-            {unavailable.map(connection => <option key={connection.secretId} value={connection.secretId} disabled>{secretName(connection.secretId)}（不可用）</option>)}
-          </select>{!available.length && <small>暂无可用凭证，请先添加或启用此工具的文本凭证。</small>}</label>}
+      <div className="role-connections-heading"><strong>工具权限</strong><span>勾选工具或共享 HOME 中的连接名称。未选中的连接不会授权给项目。</span></div>
+      {!ready ? <p role="status">正在读取工具目录…</p> : <div className="role-tool-list">{tools!.map(entry => {
+        const permission = permissions.find(item => item.tool === entry.name) ?? emptyPermission(entry);
+        if (entry.kind === 'tool') return <fieldset className="role-tool-group" key={entry.name} disabled={busy}>
+          <legend>{entry.name}</legend>
+          <label className="role-credential-check"><input type="checkbox" aria-label={`${entry.name} 工具权限`} checked={permission.enabled}
+            onChange={event => setSimplePermission(entry.name, event.target.checked)} /><span>允许调用此工具</span></label>
         </fieldset>;
-      })}</div>
-      <div className="secret-actions"><button className="primary-button" disabled={busy}>{busy ? '保存中…' : '保存角色'}</button><button type="button" className="secondary-button" disabled={busy} onClick={() => setEditing(null)}>取消</button></div>
+        const selected = new Set(permission.credentials ?? []);
+        const unavailable = [...selected].filter(credential => !entry.credentials.includes(credential));
+        return <fieldset className="role-tool-group" key={entry.name} disabled={busy}>
+          <legend>{entry.name}</legend>
+          <p className="role-tool-hint">仅允许使用所选名称。连接配置仍由共享 HOME 管理。</p>
+          <div className="role-credential-options">
+            {!entry.credentials.length && !unavailable.length && <p>当前没有可用连接名称。</p>}
+            {entry.credentials.map(credential => <div className={`role-credential-option${selected.has(credential) ? ' is-selected' : ''}`} key={credential}>
+              <label className="role-credential-check"><input type="checkbox" aria-label={`${entry.name} 连接：${credential}`}
+                checked={selected.has(credential)} onChange={event => selectCredential(entry.name, credential, event.target.checked)} /><span>{credential}</span>
+                {entry.defaultCredential === credential && <small>默认</small>}</label>
+            </div>)}
+            {unavailable.map(credential => <div className="role-credential-check role-credential-unavailable" key={credential}>
+              <span>{credential} · 连接已不存在</span><button type="button" className="secondary-button" aria-label={`移除 ${entry.name} 连接：${credential}`}
+                disabled={busy} onClick={() => selectCredential(entry.name, credential, false)}>移除</button>
+            </div>)}
+          </div>
+          {!selected.size && <small>未选择连接名称时，此工具保持禁用。</small>}
+        </fieldset>;
+      })}
+      {permissions.filter(permission => !(tools ?? []).some(entry => entry.name === permission.tool)).map(permission => <fieldset className="role-tool-group" key={permission.tool} disabled={busy}>
+        <legend>{permission.tool} · 工具目录中不存在</legend>
+        <p className="role-tool-hint">此权限已不在工具目录中。取消选择后可从角色中移除。</p>
+        <label className="role-credential-check role-credential-unavailable"><input type="checkbox" checked={permission.enabled}
+          onChange={event => setSimplePermission(permission.tool, event.target.checked)} /><span>保留原有权限</span></label>
+      </fieldset>)}</div>}
+      <div className="secret-actions"><button className="primary-button" disabled={busy || !ready || !name.trim()}>{busy ? '保存中…' : '保存角色'}</button><button type="button" className="secondary-button" disabled={busy} onClick={() => setEditing(null)}>取消</button></div>
     </form>}
-    {loading ? <p role="status">正在读取工具角色…</p> : !catalog?.roles.length ? <div className="connections-empty">暂无工具角色。角色可包含多个 MySQL 或 Kubernetes 连接。</div> : <div className="secret-list">{catalog.roles.map(role => <article className="connection-card role-card" key={role.id}>
+    {loading ? <p role="status">正在读取工具角色…</p> : !catalog?.roles.length ? <div className="connections-empty">暂无工具角色。</div> : <div className="secret-list">{catalog.roles.map(role => <article className="connection-card role-card" key={role.id}>
       <div className="connection-profile-title"><strong>{role.name}</strong><span>{catalog.defaultRoleId === role.id ? '默认角色' : ''}</span></div>
-      {!role.connections.length ? <p>无工具连接</p> : <ul>{role.connections.map((connection, index) => {
-        const credential = secrets.find(secret => secret.id === connection.secretId);
-        const credentialName = credential?.name ?? connection.alias;
-        const nativeNames = credential?.nativeNames ?? connection.nativeNames;
-        return <li key={`${connection.tool}-${connection.secretId}-${index}`}><strong>{connection.tool}</strong> · {credentialName}{['mysql', 'kubectl'].includes(connection.tool) && nativeNames?.map(nativeName => <code key={nativeName}>{toolConnectionCommand(connection.tool, nativeName)}</code>)}</li>;
-      })}</ul>}
-      <div className="secret-actions"><button className="secondary-button" disabled={busy || catalog.defaultRoleId === role.id} onClick={() => void setDefault(role.id)}>{catalog.defaultRoleId === role.id ? '当前默认角色' : '设为默认'}</button><button className="secondary-button" aria-label={`编辑角色：${role.name}`} disabled={busy} onClick={() => start(role)}>编辑</button><button className="secondary-button" disabled={busy} onClick={() => void remove(role)}>删除</button></div>
+      {role.permissions.some(permission => permission.enabled) ? <ul>{role.permissions.map(permissionSummary)}</ul> : <p>无工具权限</p>}
+      <div className="secret-actions"><button className="secondary-button" disabled={busy || catalog.defaultRoleId === role.id} onClick={() => void setDefault(role.id)}>{catalog.defaultRoleId === role.id ? '当前默认角色' : '设为默认'}</button><button className="secondary-button" aria-label={`编辑角色：${role.name}`} disabled={busy || !ready} onClick={() => start(role)}>编辑</button><button className="secondary-button" disabled={busy} onClick={() => void remove(role)}>删除</button></div>
     </article>)}</div>}
   </section>;
 }

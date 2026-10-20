@@ -17,7 +17,7 @@ test('internal service host reaches tool authorization while preserving grant, o
     assert.equal(boxId, 'box-one');
     assert.deepEqual(args, ['version', '--client']);
     if (tool !== 'kubectl') throw new HttpError(403, '项目未授权此工具的单文件凭证');
-    return { tool, args, home: '/home/debug/11111111-1111-4111-8111-111111111111', path: '.kube/config' };
+    return { tool, args, home: '/home/debug', path: '.kube/config' };
   } };
   const app = createApp(manager as never, {} as AppConfig, ['cocell.example.test'],
     { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },

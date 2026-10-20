@@ -8,7 +8,7 @@ test('one native credential file preserves uploaded text while projects use the 
     if (path.endsWith('/content')) return route.fulfill({ json: { format: 'text', content: payload.content, requiresTextImport: false, version: 1 } });
     if (request.method() === 'POST') {
       payload = request.postDataJSON();
-      saved = { id: 'native-file', ...payload, storage: 'native', homeDirectory: '/home/debug/credential-fixture', enabled: true, version: 1, projectIds: [], requiresTextImport: false, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' };
+      saved = { id: 'native-file', ...payload, storage: 'native', homeDirectory: '/home/debug', enabled: true, version: 1, projectIds: [], requiresTextImport: false, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' };
       return route.fulfill({ status: 201, json: saved });
     }
     if (request.method() === 'PATCH') { const edit = request.postDataJSON(); edits.push(edit); saved = { ...saved, ...edit }; return route.fulfill({ json: saved }); }
@@ -27,8 +27,8 @@ test('one native credential file preserves uploaded text while projects use the 
   expect(payload.format).toBe('text'); expect(payload.content).toBe(original); expect(payload.files).toBeUndefined();
   expect(payload.path).toBe('.kube/config');
   await page.getByRole('button', { name: '编辑', exact: true }).click();
-  await expect(page.getByText('原生凭据目录：')).toContainText('/home/debug/credential-fixture');
-  await expect(page.getByText('取消登记会撤销工具访问权限，原生配置文件保留在上述目录。', { exact: true })).toBeVisible();
+  await expect(page.getByText('共享凭据目录：')).toContainText('/home/debug');
+  await expect(page.getByText('取消登记会保留原生配置文件。工具使用权限由角色单独管理。', { exact: true })).toBeVisible();
   await page.getByLabel('名称', { exact: true }).fill(name + ' 改名');
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await expect(page.getByText(name + ' 改名', { exact: true })).toBeVisible();
@@ -38,7 +38,7 @@ test('one native credential file preserves uploaded text while projects use the 
   const dialog = page.getByRole('dialog', { name: '暂停项目 工具权限', exact: true });
   const defaultRole = dialog.getByRole('radio', { name: '默认角色 默认角色', exact: true });
   await expect(defaultRole).toBeChecked();
-  await expect(dialog.getByText('此角色没有连接。', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('此角色没有启用的工具。', { exact: true })).toBeVisible();
   await expect(dialog.getByText(name + ' 改名', { exact: true })).toHaveCount(0);
   await expect(dialog.getByText('保留现有权限', { exact: true })).toHaveCount(0);
   expect(ui.calls.some(call => call.path.endsWith('/tool-permissions'))).toBe(false);
@@ -64,16 +64,15 @@ test('legacy file groups require explicit single-file import and binary uploads 
   expect(updated.format).toBe('text'); expect(updated.content).toBe('native-fixture'); expect(updated.files).toBeUndefined();
 });
 
-test('project HOME references are read-only except for rename and never show legacy import warnings', async ({ page, ui }) => {
-  const sourceProjectId = '00000000-0000-4000-8000-000000000123';
+test('shared HOME references are read-only except for rename and never show legacy import warnings', async ({ page, ui }) => {
   let saved = { id: 'home-reference', name: '项目登录', tool: 'meegle', path: '.meegle/config.json', format: 'home', mutable: true, enabled: true,
-    version: 4, projectIds: [], requiresTextImport: false, homeProjectId: sourceProjectId,
+    version: 4, projectIds: [], requiresTextImport: false, homeDirectory: '/home/debug',
     createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' };
   let patchBody;
   const nativeHomeFile = { path: '.meegle/credentials.enc', content: 'refreshed-by-project-cli' };
   await page.route('**/api/secrets**', async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
-    if (path.endsWith('/content')) return route.fulfill({ json: { format: 'home', content: '', requiresTextImport: false, version: saved.version, homeProjectId: sourceProjectId } });
+    if (path.endsWith('/content')) return route.fulfill({ json: { format: 'home', content: '', requiresTextImport: false, version: saved.version } });
     if (request.method() === 'PATCH') {
       patchBody = request.postDataJSON();
       if (patchBody.content !== undefined) nativeHomeFile.content = patchBody.content;
@@ -83,10 +82,11 @@ test('project HOME references are read-only except for rename and never show leg
     await route.fulfill({ json: [saved] });
   });
   await page.goto('/#connections');
-  await expect(page.getByText('由项目 HOME 管理 · 来源项目 ' + sourceProjectId).first()).toBeVisible();
+  await expect(page.getByText('共享 debug HOME · /home/debug · meegle · .meegle/config.json')).toBeVisible();
   await expect(page.getByText('需重新导入单文件', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: '编辑', exact: true }).click();
-  await expect(page.getByText('由项目 HOME 管理 · 来源项目 ' + sourceProjectId).first()).toBeVisible();
+  await expect(page.getByText('由共享 debug HOME 管理，所有 Sandbox 使用同一份 CLI 配置。', { exact: true })).toBeVisible();
+  await expect(page.getByText('共享凭据目录：')).toContainText('/home/debug');
   await expect(page.getByText('旧格式需要重新导入一个原生文本认证文件。', { exact: true })).toHaveCount(0);
   await expect(page.getByLabel('工具名', { exact: true })).toHaveJSProperty('readOnly', true);
   await expect(page.getByLabel('认证文件路径', { exact: true })).toHaveJSProperty('readOnly', true);

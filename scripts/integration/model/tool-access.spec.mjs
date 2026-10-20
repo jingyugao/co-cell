@@ -15,7 +15,7 @@ test('prepared image tools use project credentials in a real conversation', asyn
   env.report.projectId = project.id;
   await env.waitProject(project.id, { kind: 'create', status: 'ready' });
   const role = await env.json('/api/tool-roles', { method: 'POST', expectedStatus: 201,
-    body: { name: env.name('tool-role'), connections: selections.map(({ tool, secretId }) => ({ tool, secretId })) } });
+    body: { name: env.name('tool-role'), permissions: selections.map(({ tool, credentials }) => ({ tool, enabled: true, ...(credentials ? { credentials } : {}) })) } });
   try {
     await env.json(`/api/projects/${project.id}/tool-role`, { method: 'PUT', body: { roleId: role.id } });
     const refreshed = await env.json(`/api/projects/${project.id}/sandbox/refresh-runtime`, {

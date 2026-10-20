@@ -11,7 +11,6 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Codex, appServerArgs } from '../packages/agentcore/src/index.mjs';
 import { getRequestListener } from '@hono/node-server';
-import { SandboxManager } from '@co-cell/sandbox';
 import { CellboxSandboxProvider } from '../packages/sandbox/src/providers/cellbox/index.js';
 import { CellboxRuntimeIntegration, CELLBOX_PRODUCT_PATHS } from './sandboxes/cellbox-runtime.js';
 import { CellboxSandboxInventory } from './sandboxes/cellbox-inventory.js';
@@ -88,8 +87,8 @@ if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOK
 const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,clientId:process.env.CELLBOX_CLIENT_ID,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',templateId:process.env.CELLBOX_TEMPLATE_ID,revisionId:process.env.CELLBOX_REVISION_ID});
 await cellboxProvider.initialize();
 let manager: SessionManager;
-const secrets = new SecretService(webState.secretRepository, secretCrypto, async id => (await webState.getProject(id))?.status === 'active');
-if (sharedDirectory) await secrets.mountHomes(sharedDataRoot, coordinator);
+const secrets = new SecretService(webState.secretRepository, secretCrypto);
+if (sharedDirectory) await secrets.mountHomes(sharedDataRoot);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
   error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); }, multiApi ? 0 : undefined);
 const cellboxRuntime=new CellboxRuntimeIntegration({provider:cellboxProvider,profileId:process.env.CELLBOX_PROFILE!,appServerArgs:appServerArguments,
@@ -122,10 +121,8 @@ const models = new ModelService(webState.modelRepository, secretCrypto, { endpoi
 const modelProvider = new DirectModelProvider(models, proxyKind !== 'new-api');
 const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_MS ?? 60 * 60 * 1000);
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
-const sandboxManager = new SandboxManager({ provider, logger: runtimeLog,
-  // Project lifecycle owns idle checkpoints; disk backup is a separate operation.
-  policy: { autoCheckpointAfterMs: Number.MAX_SAFE_INTEGER }, lifecycle: cellboxRuntime.lifecycle });
-const projectSandboxes = new ProjectSandboxes(sandboxManager, sandboxImage, sandboxImageIdentity.templateId);
+const projectSandboxes = new ProjectSandboxes(provider, sandboxImage, sandboxImageIdentity.templateId, cellboxRuntime.lifecycle,
+  async id => { const project = await webState.getProject(id); return project?.removedAt ? undefined : project; });
 const systemTools = new SystemTools({ projects: () => webState.listProjects(), enter: id => manager.enterProject(id),
   execute: (id, tool, args) => cellboxProvider.client.runTool(id, tool, args, 40_000) });
 const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
@@ -223,7 +220,7 @@ let shuttingDown = false;
 // Periodic sandbox archive for active projects — every 30 minutes
 const archiveInterval = setInterval(() => { void manager.scheduledArchive().catch(() => {}); }, 60 * 1000);
 archiveInterval.unref();
-async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await previewProxy?.close(); await manager.close(); await cellboxRuntime.close(); await sandboxManager.close();
+async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await previewProxy?.close(); await manager.close(); await cellboxRuntime.close();
   clearInterval(archiveInterval);
   await coordinator?.close();
   await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); await shutdownTracing?.(); }

@@ -1,6 +1,8 @@
 import { larkCredential, type LarkCredential } from './lark-credential.js';
 import { ToolRoles } from './roles.js';
-import { mergeNativeConfig, mergedBinding, nativeContextTool, nativeNames, type NativeSource } from './native-config.js';
+import { mergeNativeConfig, nativeConfigPath, nativeContextTool, nativeNames, type NativeSource } from './native-config.js';
+import { authorizeCredential, describeTool, getTool, hasCredentials, registeredTools } from '../tool-access/index.js';
+import type { ToolCatalogEntry } from '../../protocol/secret-types.js';
 import { randomUUID } from 'node:crypto';
 import type { ProxyTool, SecretInput, SecretUpdate, SecretMetadata, SecretContent, SecretDeleteResult, ProvisionedToolFile } from '../../protocol/secret-types.js';
 import { HttpError } from '../../util/errors.js';
@@ -10,7 +12,6 @@ import type { SecretRepository, StoredSecret, StoredVersion } from './repository
 import { validateFileBundle } from '../../util/credential-files.mjs';
 import { MountedToolHomes } from './mounted-home.js';
 import type { ToolAuthorization } from '../../protocol/secret-types.js';
-import type { SharedCoordinator } from '../infra/storage/coordination.js';
 
 export const MAX_SECRET_BYTES = 64 * 1024;
 export function secretBytes(format: SecretInput['format'], content: string): Buffer {
@@ -25,12 +26,11 @@ function fileBundle(input: unknown) {
 }
 function inputBytes(input: SecretInput & { supportVersion?: number }): Buffer {
   if (input.format === 'home') {
-    if (!/^[a-f0-9-]{36}$/.test(input.homeProjectId ?? '') || input.content !== undefined || input.files || input.supportFiles || input.directory || input.adapter || input.identity)
-      throw new HttpError(400, 'HOME 凭据只需要来源项目，不接受凭据内容');
-    return Buffer.from(JSON.stringify({ homeProjectId: input.homeProjectId }));
+    if (input.content !== undefined || input.files || input.supportFiles || input.directory || input.adapter || input.identity)
+      throw new HttpError(400, '共享 HOME 凭据由 CLI 管理，不接受凭据内容');
+    return Buffer.from('{}');
   }
   if (input.format !== 'text') throw new HttpError(400, '只支持原生文本认证文件');
-  if (input.homeProjectId !== undefined) throw new HttpError(400, '来源项目只用于 HOME 引用');
   if (input.files || input.directory || input.adapter || input.identity || input.content === undefined) throw new HttpError(400, '单文件请提供 content');
   const bytes = secretBytes('text', input.content);
   return input.supportFiles ? Buffer.from(JSON.stringify(larkCredential(input.tool, input.path, input.content, input.supportFiles, input.supportVersion))) : bytes;
@@ -38,8 +38,8 @@ function inputBytes(input: SecretInput & { supportVersion?: number }): Buffer {
 export class SecretService {
   homes?: MountedToolHomes;
   readonly roles: ToolRoles;
-  constructor(readonly repository: SecretRepository, private crypto: SecretCrypto, private homeProjectAvailable: (id: string) => Promise<boolean> = async () => false) {
-    this.roles = new ToolRoles(repository, ids => this.refreshHomes(ids), secret => this.profiles(secret), secrets => this.validateSelected(secrets));
+  constructor(readonly repository: SecretRepository, private crypto: SecretCrypto) {
+    this.roles = new ToolRoles(repository, () => this.toolCatalog());
   }
   private nativeSource(secret: StoredSecret): NativeSource {
     return { id: secret.id, name: secret.name, version: secret.version, content: this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('utf8') };
@@ -48,33 +48,45 @@ export class SecretService {
     return secret.format === 'text' && nativeContextTool(secret.tool!) ? nativeNames(secret.tool!, this.nativeSource(secret)) : undefined;
   }
   private validateSelected(secrets: StoredSecret[]) {
-    for (const tool of ['mysql', 'kubectl']) {
-      const sources = secrets.filter(secret => secret.enabled && secret.tool === tool).map(secret => this.nativeSource(secret));
-      if (sources.length) mergeNativeConfig(tool, sources);
+    for (const tool of registeredTools().filter(hasCredentials)) {
+      const sources = secrets.filter(secret => secret.enabled && secret.tool === tool.name && secret.format === 'text').map(secret => this.nativeSource(secret));
+      if (sources.length) mergeNativeConfig(tool.name, sources);
+    }
+  }
+  private validateShared(secrets: StoredSecret[]) {
+    this.validateSelected(secrets);
+    const paths: string[] = secrets.filter(secret => nativeContextTool(secret.tool ?? '') && secret.enabled && secret.format === 'text')
+      .map(secret => nativeConfigPath(secret.tool!));
+    const nativePaths = [...new Set(paths)];
+    const enabledTools = new Set<string>();
+    // Disabled registrations still own their canonical files: reusing their path
+    // would overwrite the retained credential rather than create another source.
+    for (const secret of secrets) {
+      if (!secret.tool || !secret.path || nativeContextTool(secret.tool) || !['text', 'lark', 'home'].includes(secret.format)) continue;
+      if (secret.enabled) {
+        if (enabledTools.has(secret.tool)) throw new HttpError(400, `${secret.tool} 共用一份主配置，请先停用已有配置`);
+        enabledTools.add(secret.tool);
+      }
+      nativePaths.push(credentialPath(secret.path));
+      if (secret.format === 'lark') nativePaths.push(...this.lark(secret).supportFiles.map(file => credentialPath(file.path)));
+    }
+    for (let i = 0; i < nativePaths.length; i++) for (let j = i + 1; j < nativePaths.length; j++) {
+      const a = nativePaths[i], b = nativePaths[j];
+      if (a === b || a.startsWith(b + '/') || b.startsWith(a + '/')) throw new HttpError(400, '共享 HOME 中的凭据路径冲突');
     }
   }
   async init() {
     await this.repository.init();
     await this.repository.roles.bootstrap();
-    // Reconcile every existing HOME before accepting traffic. This also removes
-    // credentials left by the previous project-permission model after migration.
-    await this.refreshHomes((await this.repository.roles.assignments()).map(item => item.projectId));
+    await this.refreshHome();
   }
-  async mountHomes(root: string, coordinator?: SharedCoordinator) { this.homes = new MountedToolHomes(root, coordinator); await this.homes.init(); }
-  publishHome(projectId: string) {
+  async mountHomes(root: string) { this.homes = new MountedToolHomes(root); await this.homes.init(); }
+  publishHome() {
     if (!this.homes) throw new Error('Mounted debug HOME is not configured');
-    return this.homes.publish(projectId, () => this.provision(projectId));
+    return this.homes.publish(() => this.provision());
   }
-  private async refreshHomes(projectIds: string[]) {
-    if (!this.homes) return;
-    for (const projectId of new Set(projectIds)) {
-      if (await this.homes.exists(projectId)) await this.publishHome(projectId);
-    }
-  }
-  private async boundProjects(secretId: string) {
-    const [catalog, assignments] = await Promise.all([this.roles.catalog(), this.repository.roles.assignments()]);
-    const roles = new Set(catalog.roles.filter(role => role.connections.some(connection => connection.secretId === secretId)).map(role => role.id));
-    return assignments.filter(item => item.roleId && roles.has(item.roleId)).map(item => item.projectId);
+  private async refreshHome() {
+    if (this.homes) await this.publishHome();
   }
 
   private metadata(secret: StoredSecret, projectIds: string[] = []): SecretMetadata {
@@ -83,35 +95,46 @@ export class SecretService {
     const native = format === 'lark' ? this.lark(secret) : null;
     const nativeNames = this.profiles(secret);
     return { ...metadata, storage: secret.nativeHome ? 'native' : 'database',
-      ...(secret.nativeHome || format === 'home' ? { homeDirectory: `/home/debug/${format === 'home' ? this.homeProject(secret) : secret.nativeHome}` } : {}),
-      ...(format === 'home' ? { homeProjectId: this.homeProject(secret) } : {}), ...(nativeNames ? { nativeNames } : {}), ...(native ? { supportFilePaths: native.supportFiles.map(file => file.path) } : {}), format: format === 'files' ? 'files' : format === 'home' ? 'home' : 'text', requiresTextImport: !['text', 'lark', 'home'].includes(format), projectIds,
+      homeDirectory: '/home/debug',
+      ...(nativeNames ? { nativeNames } : {}), ...(native ? { supportFilePaths: native.supportFiles.map(file => file.path) } : {}), format: format === 'files' ? 'files' : format === 'home' ? 'home' : 'text', requiresTextImport: !['text', 'lark', 'home'].includes(format), projectIds,
       ...(bundle ? { filePaths: bundle.files.map(file => file.path), directory: bundle.directory, adapter: bundle.adapter, identity: bundle.identity } : {}) };
   }
   private lark(secret: StoredSecret): LarkCredential {
     let payload;
     try { payload = JSON.parse(this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('utf8')); } catch { throw new HttpError(400, 'Lark 凭证格式无效'); }
+    // Imported bundles must be complete; a CLI-managed HOME reflects whatever
+    // files currently exist. The native CLI reports a missing login when used.
+    if (secret.nativeHome) return payload;
     return larkCredential(secret.tool!, secret.path!, payload.content, payload.supportFiles, payload.supportVersion);
   }
   private bundle(secret: StoredSecret) { return fileBundle(JSON.parse(this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('utf8'))); }
-  private homeProject(secret: StoredSecret): string {
-    try {
-      const value = JSON.parse(this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('utf8')).homeProjectId;
-      if (!/^[a-f0-9-]{36}$/.test(value ?? '')) throw new Error();
-      return value;
-    } catch { throw new HttpError(400, 'HOME 凭据缺少有效的来源项目'); }
-  }
   async list() {
-    const [secrets, grants] = await Promise.all([this.repository.list(), this.roles.allGrants()]);
-    return secrets.map(secret => this.metadata(secret, [...new Set(grants.filter(g => g.files.some(f => f.secretId === secret.id)).map(g => g.projectId))]));
+    const [secrets, catalog, assignments] = await Promise.all([this.repository.list(), this.roles.catalog(), this.repository.roles.assignments()]);
+    return secrets.map(secret => {
+      const names = this.profiles(secret);
+      const roles = new Set(catalog.roles.filter(role => role.permissions.some(permission => permission.tool === secret.tool && permission.enabled &&
+        (!names || names.some(name => permission.credentials?.includes(name))))).map(role => role.id));
+      return this.metadata(secret, assignments.filter(item => item.roleId && roles.has(item.roleId)).map(item => item.projectId));
+    });
+  }
+  async toolCatalog(): Promise<ToolCatalogEntry[]> {
+    const secrets = await this.repository.list();
+    const names = new Set([...registeredTools().map(tool => tool.name), ...secrets.flatMap(secret => secret.tool ? [secret.tool] : [])]);
+    return Promise.all([...names].map(async name => {
+      const adapter = getTool(name);
+      const config = hasCredentials(adapter) ? await this.homes?.read(adapter.configPath) : undefined;
+      const descriptor = describeTool(adapter, secrets.filter(secret => secret.enabled && secret.tool === name && secret.format === 'text').map(secret => this.nativeSource(secret)), config);
+      if (this.homes && config === undefined && descriptor.kind === 'tool-with-credential') delete descriptor.defaultCredential;
+      return descriptor;
+    }));
   }
   private validateConfig(secret: StoredSecret) {
-    if (!['text', 'lark', 'home'].includes(secret.format)) throw new HttpError(400, '每份凭证只支持原生文本文件或项目 HOME 引用，请重新导入');
+    if (!['text', 'lark', 'home'].includes(secret.format)) throw new HttpError(400, '每份凭证只支持原生文本文件或共享 HOME，请重新导入');
     if (!secret.tool || !secret.path) throw new HttpError(400, '请填写工具名和认证文件路径');
     toolName(secret.tool);
     credentialPath(secret.path);
     if (secret.format === 'lark') this.lark(secret);
     if (secret.format === 'home') {
-      this.homeProject(secret);
       if (nativeContextTool(secret.tool!)) throw new HttpError(400, 'MySQL 和 Kubernetes 请继续使用原生连接配置');
     }
     this.profiles(secret);
@@ -120,7 +143,7 @@ export class SecretService {
   private async requireSecret(id: string) { const secret = await this.repository.get(id); if (!secret) throw new HttpError(404, 'Secret 不存在'); return secret; }
   async content(id: string): Promise<SecretContent> {
     const secret = await this.requireSecret(id), bytes = this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext);
-    if (secret.format === 'home') return { format: 'home', content: '', homeProjectId: this.homeProject(secret), requiresTextImport: false, version: secret.version };
+    if (secret.format === 'home') return { format: 'home', content: '', requiresTextImport: false, version: secret.version };
     if (secret.format === 'lark') { const value = this.lark(secret); return { format: 'text', content: value.content, supportFilePaths: value.supportFiles.map(file => file.path), requiresTextImport: false, version: secret.version }; }
     if (secret.format === 'files') return { format: 'files', content: '', ...this.bundle(secret), requiresTextImport: false, version: secret.version };
     return { format: 'text', content: secret.format === 'binary' ? '' : bytes.toString('utf8'), requiresTextImport: secret.format !== 'text', version: secret.version };
@@ -131,12 +154,14 @@ export class SecretService {
     const secret: StoredSecret = { id, name: input.name, format: input.supportFiles ? 'lark' : input.format, mutable: input.mutable, enabled: true, version: 0, currentVersionId: versionId, ciphertext, createdAt: now, updatedAt: now,
       tool: input.tool, path: input.path, alias: 'default' };
     this.validateConfig(secret);
+    this.validateShared([...(await this.repository.list()), secret]);
     await this.repository.save(secret, { id: versionId, secretId: id, ciphertext, source: 'operator', baseVersion: null, createdAt: now, projectId: null, invocationId: null, changes: ['created'] });
+    await this.refreshHome();
     return this.metadata(await this.requireSecret(id));
   }
   async update(id: string, input: SecretUpdate) {
     const secret = await this.requireSecret(id), now = new Date().toISOString();
-    const contentChanged = input.content !== undefined || input.files !== undefined || input.supportFiles !== undefined || input.homeProjectId !== undefined;
+    const contentChanged = input.content !== undefined || input.files !== undefined || input.supportFiles !== undefined || (input.format === 'home' && secret.format !== 'home');
     const previousLark = secret.format === 'lark' ? this.lark(secret) : null;
     if (!contentChanged && (input.format !== undefined || input.directory !== undefined || input.identity !== undefined || input.adapter !== undefined)) throw new HttpError(400, '更改文件格式或加密身份时请提交完整内容');
     const next: StoredSecret = { ...secret, name: input.name ?? secret.name, mutable: input.mutable ?? secret.mutable,
@@ -150,53 +175,38 @@ export class SecretService {
     const versionId = randomUUID(), ciphertext = this.crypto.seal(id, versionId, bytes);
     const candidate = { ...next, currentVersionId: versionId, ciphertext };
     this.validateConfig(candidate);
-    if (nativeContextTool(next.tool!)) {
-      const records = new Map((await this.repository.list()).map(secret => [secret.id, secret])); records.set(id, candidate);
-      for (const role of (await this.repository.roles.catalog()).roles.filter(role => role.connections.some(connection => connection.secretId === id)))
-        this.validateSelected(role.connections.flatMap(connection => records.get(connection.secretId) ?? []));
-    }
-    if (changes.some(key => ['tool', 'path'].includes(key))) {
-      const incompatible = (await this.roles.allGrants()).some(grant => grant.files.some(file => file.secretId === id
-        && (grant.tool !== next.tool || file.path !== next.path)));
-      if (incompatible) throw new HttpError(400, '密钥已被项目使用，不能更改工具或认证文件配置');
-    }
+    this.validateShared([...(await this.repository.list()).filter(secret => secret.id !== id), candidate]);
     const version: StoredVersion = { id: versionId, secretId: id, ciphertext, source: 'operator', baseVersion: secret.version, createdAt: now, projectId: null, invocationId: null, changes };
     const { content: _content, ...stored } = next as StoredSecret & { content?: string };
     await this.repository.save(stored, version);
-    await this.refreshHomes(await this.boundProjects(id));
+    await this.refreshHome();
     return this.metadata(await this.requireSecret(id));
   }
   async versions(id: string) { await this.requireSecret(id); return (await this.repository.versions(id)).map(({ ciphertext: _ciphertext, secretId: _id, ...metadata }) => metadata); }
   async delete(id: string): Promise<SecretDeleteResult> {
-    const projects = await this.boundProjects(id);
-    await this.repository.delete(id); await this.refreshHomes(projects); return { ok: true };
+    await this.repository.delete(id); await this.refreshHome(); return { ok: true };
   }
-  /** Resolve selected files at provisioning time, never on the CLI execution path. */
-  async provision(projectId: string): Promise<ProvisionedToolFile[]> {
-    const grants = (await this.roles.grants(projectId)).filter(grant => grant.enabled);
+  /** All debug processes share the enabled native connection catalog. */
+  async provision(): Promise<ProvisionedToolFile[]> {
+    const secrets = await this.repository.list();
+    this.validateShared(secrets);
     const files: ProvisionedToolFile[] = [];
     const nativeSources = new Map<string, NativeSource[]>();
-    for (const grant of grants) {
-      if (grant.files.length !== 1) continue;
-      const binding = grant.files[0], secret = await this.repository.get(binding.secretId);
-      if (!secret?.enabled || !['text', 'lark', 'home'].includes(secret.format)) continue;
-      if (secret.tool && (secret.tool !== grant.tool || secret.path !== binding.path)) continue;
-      toolName(grant.tool); credentialPath(binding.path);
-      if (secret.format === 'home') {
-        if (this.homeProject(secret) === projectId) files.push({ tool: grant.tool, secretId: secret.id, path: binding.path, content: '', mutable: true, version: secret.version, alias: grant.alias, externallyManaged: true });
+    for (const secret of secrets) {
+      if (!secret.enabled || !secret.tool || !secret.path || !['text', 'lark', 'home'].includes(secret.format)) continue;
+      toolName(secret.tool); credentialPath(secret.path);
+      if (nativeContextTool(secret.tool)) {
+        const sources = nativeSources.get(secret.tool) ?? []; sources.push(this.nativeSource(secret)); nativeSources.set(secret.tool, sources); continue;
+      }
+      if (secret.format === 'home' || secret.nativeHome) {
+        files.push({ tool: secret.tool, secretId: secret.id, path: secret.path, content: '', mutable: true, version: secret.version, alias: secret.alias ?? 'default', externallyManaged: true });
         continue;
       }
-      if (nativeContextTool(grant.tool)) {
-        const sources = nativeSources.get(grant.tool) ?? []; sources.push(this.nativeSource(secret)); nativeSources.set(grant.tool, sources); continue;
-      }
-      // Registered native files are the CLI's writable source of truth.
-      // Consumers share that credential HOME instead of receiving snapshots.
-      if (secret.nativeHome) continue;
       const native = secret.format === 'lark' ? this.lark(secret) : null;
       const content = native ? Buffer.from(native.content).toString('base64') : this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('base64');
-      files.push({ tool: grant.tool, secretId: secret.id, path: binding.path, content, mutable: secret.mutable, version: secret.version,
-        alias: grant.alias });
-      for (const file of native?.supportFiles ?? []) files.push({ tool: grant.tool, secretId: secret.id, path: file.path, content: file.content, mutable: secret.mutable, version: native!.supportVersion, alias: grant.alias });
+      files.push({ tool: secret.tool, secretId: secret.id, path: secret.path, content, mutable: secret.mutable, version: secret.version,
+        alias: secret.alias ?? 'default' });
+      for (const file of native?.supportFiles ?? []) files.push({ tool: secret.tool, secretId: secret.id, path: file.path, content: file.content, mutable: secret.mutable, version: native!.supportVersion, alias: secret.alias ?? 'default' });
     }
     for (const [tool, sources] of nativeSources) files.push(mergeNativeConfig(tool, sources));
     return files.sort((a, b) => a.tool.localeCompare(b.tool));
@@ -213,43 +223,18 @@ export class SecretService {
   /** Authorization returns a path and checked arguments, never credential bytes. */
   async authorize(boxId: string, tool: ProxyTool, args: string[]): Promise<ToolAuthorization> {
     const identity = await this.runtimeIdentity(boxId);
-    const grants = (await this.roles.grants(identity.projectId)).filter(grant => grant.enabled && grant.tool === tool);
-    if (!grants.length) throw new HttpError(403, '项目未授权此工具');
+    const adapter = getTool(tool);
+    const permission = (await this.roles.state(identity.projectId)).permissions.find(permission => permission.tool === tool);
+    adapter.authorize(permission);
     const checked = validateToolArgs(tool, args);
-    if (nativeContextTool(tool)) {
-      const secrets = await Promise.all(grants.map(async grant => this.requireSecret(grant.files[0].secretId)));
-      if (tool === 'mysql') {
-        const names = grants.flatMap(grant => grant.nativeNames ?? []);
-        const loginPath = checked.find(arg => arg.startsWith('--login-path='))?.slice('--login-path='.length);
-        if (loginPath && !names.includes(loginPath)) throw new HttpError(403, `项目未授权此 MySQL 原生连接；可用连接：${names.join(', ')}`);
-        if (!loginPath && names.length > 1 && !checked.includes('--version') && !checked.includes('--help')) throw new HttpError(400, `请用 MySQL 原生 --login-path=名称 选择连接：${names.join(', ')}`);
-      }
-      const binding = mergedBinding(tool, secrets.map(secret => this.nativeSource(secret)));
-      // Rebuild only role-selected native connections when their source files
-      // change on disk; neither database writes nor re-import are required.
-      if (secrets.some(secret => secret.nativeHome)) await this.publishHome(identity.projectId);
-      if (!this.homes || !await this.homes.ready(identity.projectId, binding)) throw new HttpError(409, '凭证尚未更新到 debug HOME，请重新保存工具选择');
-      return { tool, args: checked, home: `/home/debug/${identity.projectId}`, path: binding.path };
+    if (hasCredentials(adapter)) {
+      const authorized = authorizeCredential(adapter, permission!, checked);
+      return { tool, args: authorized, home: '/home/debug', path: adapter.configPath };
     }
-    if (grants.length !== 1) throw new HttpError(403, '此工具不支持多个原生凭证');
-    const grant = grants[0];
-    if (grant.files.length !== 1) throw new HttpError(403, '项目未授权此工具的单文件凭证');
-    const binding = grant.files[0], secret = await this.requireSecret(binding.secretId);
-    if (secret.enabled && secret.format === 'home' && secret.tool === tool && secret.path === binding.path) {
-      const projectId = this.homeProject(secret);
-      if (!await this.homeProjectAvailable(projectId)) throw new HttpError(409, '凭据来源项目不可用');
-      if (!this.homes || !await this.homes.hasFile(projectId, binding.path)) throw new HttpError(409, '凭据来源 HOME 中尚无认证文件，请先完成工具登录');
-      return { tool, args: checked, home: `/home/debug/${projectId}`, path: binding.path };
-    }
-    if (!secret.enabled || !['text', 'lark'].includes(secret.format) || (secret.tool && (secret.tool !== tool || secret.path !== binding.path)))
-      throw new HttpError(403, '工具凭证已停用或需要重新配置');
-    const path = credentialPath(binding.path);
-    if (secret.nativeHome) {
-      if (!this.homes || !await this.homes.hasFile(secret.nativeHome, path)) throw new HttpError(409, '原生凭据目录中缺少认证文件');
-      return { tool, args: checked, home: `/home/debug/${secret.nativeHome}`, path };
-    }
-    if (!this.homes || !await this.homes.ready(identity.projectId, { tool, secretId: secret.id, path, version: secret.version }))
-      throw new HttpError(409, '凭证尚未更新到 debug HOME，请重新保存工具选择');
-    return { tool, args: checked, home: `/home/debug/${identity.projectId}`, path };
+    // Generic tools own their authentication. Even help/login must work before
+    // native credential files exist; only a configured path override is needed.
+    const configs = (await this.repository.toolConfigs(tool)).filter(config => config.enabled && ['text', 'lark', 'home'].includes(config.format));
+    if (configs.length > 1) throw new HttpError(409, '此工具有多份已启用的共享主配置');
+    return { tool, args: checked, home: '/home/debug', ...(configs[0]?.path ? { path: credentialPath(configs[0].path) } : {}) };
   }
 }

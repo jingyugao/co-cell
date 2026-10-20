@@ -8,7 +8,7 @@ import type { Session } from '../../protocol/types.js';
 import { AppServerReader } from './app-server-reader.js';
 import { CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 
-test('turns reuse the read transport and keep native success when activity persistence fails', async t => {
+test('turns reuse the read transport and keep native success when remote usage cleanup fails', async t => {
   let connects = 0, releases = 0;
   t.mock.method(CodexAppServerClient.prototype, 'connect', async () => { connects++; });
   t.mock.method(CodexAppServerClient.prototype, 'request', async () => ({ thread: { id: 'thread-one' } }));
@@ -23,7 +23,7 @@ test('turns reuse the read transport and keep native success when activity persi
     paths: { root: '/workspace', runtime: '/runtime', codexHome: '/codex', node: '/node' }, prepareRemote: async () => false });
   // Keep real execution/stream/cleanup behavior; isolate provider setup.
   t.mock.method(runtime as any, 'acquire', async () => ({ metadata: { id: 'box-one' },
-    lease: { release: async () => { releases++; throw new Error('activity write failed'); } } }));
+    releaseRemote: async () => { releases++; throw new Error('remote cleanup failed'); } }));
   t.mock.method(runtime as any, 'prepareEnvironment', async () => {});
   const session = { threadId: 'thread-one', settings: { workingDirectory: '/workspace' } } as Session;
   try {
@@ -91,7 +91,7 @@ test('health verification uses a non-resuming connection and never prepares the 
   assert.equal(probes, 1);
 });
 
-test('native preview access holds its sandbox lease and releases once on close or failed acquisition', async t => {
+test('native preview access releases remote usage once on close or failed acquisition', async t => {
   let releases = 0;
   let fail = false;
   const runtime = new ContainerCodexRuntime({ provider: {} as SandboxProvider,
@@ -104,7 +104,7 @@ test('native preview access holds its sandbox lease and releases once on close o
     },
   });
   t.mock.method(runtime as any, 'acquire', async () => ({ sandbox: { sandboxId: 'preview-box' },
-    metadata: { id: 'preview-box' }, lease: { release: async () => { releases++; } } }));
+    metadata: { id: 'preview-box' }, releaseRemote: async () => { releases++; } }));
   const target = { id: 'project', updatedAt: new Date().toISOString(), settings: { workingDirectory: '/workspace' } };
   const access = await runtime.openServiceAccess(target, 8080, new AbortController().signal);
   assert.equal(releases, 0);
@@ -134,7 +134,7 @@ test('legacy service proxy preserves compression headers alongside raw compresse
     serviceAccess: async () => ({ url: `http://127.0.0.1:${port}/`, headers: {} }),
   });
   t.mock.method(runtime as any, 'acquire', async () => ({ sandbox: { sandboxId: 'preview-box' },
-    metadata: { id: 'preview-box' }, lease: { release: async () => { releases++; } } }));
+    metadata: { id: 'preview-box' }, releaseRemote: async () => { releases++; } }));
   try {
     const response = await runtime.service({ id: 'project', updatedAt: new Date().toISOString(), settings: { workingDirectory: '/workspace' } },
       port, '/gzip', new Request('https://cocell.example.test/gzip'));

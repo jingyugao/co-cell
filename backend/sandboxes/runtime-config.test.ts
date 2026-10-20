@@ -61,6 +61,7 @@ test('lifecycle publishes only native HOME descriptors and durable acknowledgeme
   assert.deepEqual(fake.batches, [['cocell_tool_runtime'], ['cocell_tool_runtime']]);
   await fake.lifecycle().run({ action: 'destroy', resourceKey: 'project:project-one', sandboxId: 'box-one' }, async () => {});
   assert.equal(fake.acknowledgements.size, 0);
+  assert.equal(fake.publications(), 0, 'Sandbox lifecycle must not rewrite shared CLI files');
 });
 
 test('runtime credentials require a Sandbox with mounted HOME support', async () => {
@@ -84,7 +85,7 @@ test('cold rebuild restores a lost native HOME descriptor while retaining its pr
   assert.equal(fake.writes.length, 2);
   assert.equal(fake.writes[1].bytes, descriptor);
   assert.equal(fake.acknowledgements.has('box-one:2'), false);
-  assert.equal(fake.publications(), 3);
+  assert.equal(fake.publications(), 0);
 });
 
 test('archive OSS slots remain independent from native HOME credentials and retry only unacknowledged slots', async () => {
@@ -173,23 +174,4 @@ test('an aborted queued runtime configuration never starts after the active one 
     assert.equal(fake.writes.length, 1);
     assert.equal(fake.acknowledgements.size, 1);
   } finally { releaseRead(); }
-});
-
-test('cancellation while publishing HOME credentials prevents delivery and acknowledgement', async () => {
-  const fake = fixture();
-  let releasePublish!: () => void, enteredPublish!: () => void;
-  const publishGate = new Promise<void>(resolve => { releasePublish = resolve; });
-  const entered = new Promise<void>(resolve => { enteredPublish = resolve; });
-  fake.options.secrets.publishHome = async () => { enteredPublish(); await publishGate; };
-  const controller = new AbortController();
-  try {
-    const lifecycle = new SandboxLifecycle([new SandboxRuntimeConfig(fake.options).extension]);
-    const configuring = lifecycle.run({ action: 'reconcile', resourceKey: 'project:project-one', sandboxId: 'box-one', signal: controller.signal }, async () => {});
-    await entered;
-    controller.abort();
-    releasePublish();
-    await assert.rejects(configuring, /runtime-config post failed/i);
-    assert.equal(fake.writes.length, 0);
-    assert.equal(fake.acknowledgements.size, 0);
-  } finally { releasePublish(); }
 });

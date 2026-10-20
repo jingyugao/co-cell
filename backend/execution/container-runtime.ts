@@ -7,7 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { AppServerEventAdapter, Codex, CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
-import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxLease, SandboxRecord, CellboxServiceAccess } from '@co-cell/sandbox';
+import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxRecord, CellboxServiceAccess } from '@co-cell/sandbox';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import { readCellboxWorkspaceFile, cellboxWorkspaceFileResponse } from '../sandboxes/cellbox-files.js';
 import { holdResponse } from '../../util/http-stream.js';
@@ -32,8 +32,6 @@ export interface SandboxRuntime {
   observe?(session: Session, turn: Turn, signal: AbortSignal): AsyncGenerator<NativeTurnObservation>;
 	remoteArchives?: import('../archives/remote.js').RemoteArchives;
   currentImageIdentity?(target?: WorkspaceTarget): Promise<SandboxImageIdentity>;
-  track?(session: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): void;
-  trackExecution?(session: Session, turn: Turn): void;
   run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
   recover(session: Session, turn: Turn, signal: AbortSignal, onSandbox: (value: SandboxState) => Promise<void>): AsyncGenerator<AgentEvent>;
   detach(turn: Turn): void;
@@ -56,7 +54,6 @@ export interface SandboxRuntime {
   resume?(target: WorkspaceTarget, signal?: AbortSignal): Promise<void>;
   checkpoint?(target: WorkspaceTarget): Promise<void>;
   release?(target: WorkspaceTarget): Promise<SandboxState>;
-  forgetReleasedSandbox?(target: WorkspaceTarget): Promise<void>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
   verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
   fenceSandbox?(sandbox: SandboxState): Promise<void>;
@@ -98,7 +95,6 @@ type Preparation = {
 type Entry = {
   sandbox: SandboxHandle;
   readonly metadata: SandboxRecord;
-  lease: SandboxLease;
   preparation: Preparation;
   releaseRemote?: () => Promise<void>;
   info?: SandboxInfo;
@@ -142,17 +138,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private get sharedDocs() { return this.codexHome + '/docs'; }
   private get node() { return this.options.paths.node; }
 
-  track(target: WorkspaceTarget, notify: SaveSandbox) { this.sandboxes.track(target, notify); }
   async currentImageIdentity(target?: WorkspaceTarget): Promise<SandboxImageIdentity> {
     if (target?.imageSelection) return { reference: target.imageSelection.image, id: target.imageSelection.image, repoDigests: [target.imageSelection.image] };
     const provider = this.options.provider as SandboxProvider & { currentImageIdentity?: () => Promise<SandboxImageIdentity> };
     if (!provider.currentImageIdentity) throw new Error('Sandbox provider does not support image switching');
     return provider.currentImageIdentity();
-  }
-  trackExecution(session: Session, turn: Turn) {
-    if (turn.codexAccepted && turn.nativeTurnId && session.threadId && session.sandbox) {
-      this.sandboxes.holdUsage(session, turn.id);
-    }
   }
   private safeError(error: unknown): Error {
     let message = error instanceof Error ? error.message : String(error);
@@ -162,32 +152,28 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     return safe;
   }
 
-  private async acquire(target: WorkspaceTarget, create: boolean, notify?: SaveSandbox, usageId?: string, signal?: AbortSignal, initialization = false): Promise<Entry> {
+  private async acquire(target: WorkspaceTarget, create: boolean, notify?: SaveSandbox, signal?: AbortSignal, initialization = false): Promise<Entry> {
     if (this.closing) throw new Error('Sandbox 运行时正在关闭');
-    const lease = await this.sandboxes.acquire(target, { create, save: notify, usageId, signal });
-    let preparation = this.runtimePreparations.get(lease.record.id);
+    const access = await this.sandboxes.acquire(target, { create, replaceMissing: initialization, save: notify, signal });
+    let preparation = this.runtimePreparations.get(access.record.id);
     if (!preparation) {
       preparation = {};
-      this.runtimePreparations.set(lease.record.id, preparation);
+      this.runtimePreparations.set(access.record.id, preparation);
     }
     let releaseRemote: (() => Promise<void>) | undefined;
     try {
-      releaseRemote = await this.options.acquireRemoteUsage?.(lease.record.id, initialization ? target.settings.workingDirectory : undefined, lease.info);
+      releaseRemote = await this.options.acquireRemoteUsage?.(access.record.id, initialization ? target.settings.workingDirectory : undefined, access.info);
       signal?.throwIfAborted();
     } catch (error) {
-      try { await releaseRemote?.(); } finally { await lease.release(); }
+      await releaseRemote?.();
       throw error;
     }
-    return { sandbox: lease.sandbox, get metadata() { return lease.record; }, lease, preparation, releaseRemote, info: lease.info };
+    return { sandbox: access.sandbox, metadata: access.record, preparation, releaseRemote, info: access.info };
   }
 
-  private async releaseEntry(entry: Entry, failed = false, detached = false) {
+  private async releaseEntry(entry: Entry, failed = false) {
     try {
-      try {
-        await entry.releaseRemote?.();
-      } finally {
-        await entry.lease.release({ detached });
-      }
+      await entry.releaseRemote?.();
     }
     catch (error) {
       void this.options.logger?.write({ event: 'sandbox.release_failed', sandboxId: entry.metadata.id, message: this.safeError(error).message });
@@ -297,7 +283,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     let detached = false;
     try {
       const modelOptions = await this.options.resolveModel?.(session);
-      entry = await this.acquire(session, true, onSandbox, turn.id, startupSignal);
+      entry = await this.acquire(session, true, onSandbox, startupSignal);
       // Publish the global AGENTS.md and shared docs before every turn.
       await this.prepareEnvironment(session, entry, startupSignal);
       observer.signal.throwIfAborted();
@@ -334,7 +320,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       await codex?.close();
       await connection?.release();
       // Native completion is authoritative; activity persistence is maintenance.
-      if (entry) await this.releaseEntry(entry, true, detached);
+      if (entry) await this.releaseEntry(entry, true);
     }
   }
 
@@ -447,7 +433,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     if (!this.options.appServer || !session.sandbox || !session.threadId || !turn.nativeTurnId || !turn.codexAccepted) {
       throw new Error('App Server turn recovery information is incomplete');
     }
-    this.sandboxes.holdUsage(session, turn.id);
     const detached = new AbortController();
     this.observers.set(turn.id, detached);
     if (this.detachRequests.has(turn.id)) detached.abort(new TurnObserverDetached());
@@ -466,7 +451,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       void interruptRequest.catch(() => {});
     };
     try {
-      entry = await this.acquire(session, false, onSandbox, turn.id, observerSignal);
+      entry = await this.acquire(session, false, onSandbox, observerSignal);
       connection = await this.reader.acquire(entry.metadata.id, observerSignal);
       client = connection.client;
       signal.addEventListener('abort', interrupt, { once: true });
@@ -516,7 +501,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       signal.removeEventListener('abort', interrupt);
       this.detachRequests.delete(turn.id);
       await connection?.release();
-      if (entry) await this.releaseEntry(entry, true, observerDetached);
+      if (entry) await this.releaseEntry(entry, true);
     }
   }
 
@@ -532,7 +517,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   async openServiceAccess(session: WorkspaceTarget, port: number, signal: AbortSignal): Promise<ServiceProxyAccess> {
     if (!this.options.serviceAccess) throw new HttpError(503, 'Sandbox 服务代理未配置');
-    const entry = await this.acquire(session, false, undefined, undefined, signal);
+    const entry = await this.acquire(session, false, undefined, signal);
     let released = false;
     const release = async () => {
       if (released) return;
@@ -548,7 +533,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   async service(session: WorkspaceTarget, port: number, path: string, request: Request): Promise<Response> {
     if (!this.options.serviceAccess) throw new HttpError(503, 'Sandbox 服务代理未配置');
-    const entry = await this.acquire(session, false, undefined, undefined, request.signal);
+    const entry = await this.acquire(session, false, undefined, request.signal);
     let released = false;
     const release = async () => {
       if (released) return;
@@ -582,7 +567,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async fileResponse(session: WorkspaceTarget, path: string, request: Request): Promise<Response> {
     if (this.closing) throw new HttpError(503, 'Sandbox 运行时正在关闭');
     let entry: Entry;
-    try { entry = await this.acquire(session, false, undefined, undefined, request.signal); }
+    try { entry = await this.acquire(session, false, undefined, request.signal); }
     catch (error) { throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) }); }
     try {
       const response = await cellboxWorkspaceFileResponse(entry.sandbox, session.settings.workingDirectory, path, request);
@@ -598,7 +583,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async file(session: WorkspaceTarget, path: string, signal?: AbortSignal): Promise<WorkspaceFileResult> {
     if (this.closing) throw new HttpError(503, 'Sandbox 运行时正在关闭');
     let entry: Entry;
-    try { entry = await this.acquire(session, false, undefined, undefined, signal); }
+    try { entry = await this.acquire(session, false, undefined, signal); }
     catch (error) { throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) }); }
     let failed = false;
     try {
@@ -607,7 +592,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     } catch (error) {
       failed = true;
       if (error instanceof HttpError) throw error;
-      if (/not found|404/i.test(String(error))) await this.sandboxes.inspect(session).catch(() => { });
       throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) });
     } finally { await this.releaseEntry(entry, failed); }
   }
@@ -732,19 +716,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   async rebuild(target: WorkspaceTarget, onSandbox: SaveSandbox) {
-    if (target.sandbox) {
-      let missing = false;
-      try { missing = (await this.options.provider.getInfo(target.sandbox.id)).metadata?.phase === 'deleted'; }
-      catch (error) {
-        if ((error as { code?: string }).code === 'NOT_FOUND') missing = true;
-        else throw error;
-      }
-      if (missing) {
-        await this.detachSandbox(target);
-        target.sandbox = undefined;
-      }
-    }
-    const entry = await this.acquire(target, true, onSandbox, undefined, undefined, true);
+    const entry = await this.acquire(target, true, onSandbox, undefined, true);
     try { await this.prepareEnvironment(target, entry, AbortSignal.timeout(300_000)); } finally { await this.releaseEntry(entry); }
   }
   async rebuildPersistent(_target: WorkspaceTarget, _requestId: string, _onSandbox: SaveSandbox): Promise<void> {
@@ -752,6 +724,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   async resume(target: WorkspaceTarget, signal?: AbortSignal): Promise<void> {
+    await this.sandboxes.refresh(target);
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
     if (!this.options.provider.resume) throw new HttpError(503, 'Sandbox 不支持恢复运行');
     await traced('sandbox.resume', { 'sandbox.id': target.sandbox.id },
@@ -759,6 +732,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   async checkpoint(target: WorkspaceTarget): Promise<void> {
+    await this.sandboxes.refresh(target);
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
     await this.reader.closeIdle(target.sandbox.id);
     await traced('sandbox.checkpoint', { 'sandbox.id': target.sandbox.id },
@@ -766,6 +740,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   async release(target: WorkspaceTarget): Promise<SandboxState> {
+    await this.sandboxes.refresh(target);
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
     if (!this.options.provider.release) throw new HttpError(503, 'Sandbox 不支持保留磁盘的释放操作');
     await this.reader.closeIdle(target.sandbox.id);
@@ -774,10 +749,6 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     return this.sandboxObservation(target.sandbox, info);
   }
 
-  async forgetReleasedSandbox(target: WorkspaceTarget) {
-    await this.sandboxes.forgetReleased(target);
-    if (target.sandbox) this.runtimePreparations.delete(target.sandbox.id);
-  }
 
   async verifySandbox(sandbox: SandboxState, timeoutMs?: number) {
     return this.verifySandboxOnce(sandbox, timeoutMs ?? 30_000);
@@ -824,7 +795,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const provider = this.options.provider as SandboxProvider & { stop?: (id: string) => Promise<void> };
     try {
       if (!provider.stop && (await provider.getInfo(sandbox.id)).state === 'paused') return;
-      await this.sandboxes.manager.lifecycle.run({ action: 'pause', resourceKey: `sandbox:${sandbox.id}`, sandboxId: sandbox.id }, async () => {
+      await this.sandboxes.lifecycle.run({ action: 'pause', resourceKey: `sandbox:${sandbox.id}`, sandboxId: sandbox.id }, async () => {
         if (provider.stop) await provider.stop(sandbox.id);
         else await provider.pause(sandbox.id);
       });
@@ -837,12 +808,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   async detachSandbox(target: WorkspaceTarget) {
     const sandboxId = target.sandbox?.id;
-    await this.sandboxes.detach(target);
     if (sandboxId) this.runtimePreparations.delete(sandboxId);
   }
 
   async pauseDanglingSandbox(sandboxId: string) {
-    await this.sandboxes.manager.lifecycle.run({ action: 'pause', resourceKey: `sandbox:${sandboxId}`, sandboxId }, async () => {
+    await this.sandboxes.lifecycle.run({ action: 'pause', resourceKey: `sandbox:${sandboxId}`, sandboxId }, async () => {
       await this.options.provider.pause(sandboxId).catch(error => {
         if (!/not found|no such container/i.test(String(error))) throw this.safeError(error);
       });
@@ -850,7 +820,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   async deleteDanglingSandbox(sandboxId: string) {
-    await this.sandboxes.manager.lifecycle.run({ action: 'destroy', resourceKey: `sandbox:${sandboxId}`, sandboxId }, async () => {
+    await this.sandboxes.lifecycle.run({ action: 'destroy', resourceKey: `sandbox:${sandboxId}`, sandboxId }, async () => {
       await this.options.provider.kill(sandboxId).catch(error => {
         if (!/not found|no such container/i.test(String(error))) throw this.safeError(error);
       });
@@ -869,6 +839,5 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async close() {
     this.closing = true;
     await this.reader.close();
-    await this.sandboxes.close();
   }
 }

@@ -29,6 +29,11 @@ export interface ServiceProxyAccess {
 }
 
 export interface SandboxRuntime {
+  /** Native connections own transports only. App Server owns turn execution. */
+  prepareNativeSession?(session: Session, signal: AbortSignal, onSandbox: SaveSandbox): Promise<{ threadId: string | null; threadOptions: Record<string, unknown>; turnOptions: { model?: string; effort?: string } }>;
+  openNativeConnection?(session: Session, signal: AbortSignal): Promise<AppServerEndpoint & { release(): Promise<void> }>;
+  nativeRequest?(session: Session, method: string, params: unknown): Promise<any>;
+  uploadNativeImage?(session: Session, path: string): Promise<string>;
   observe?(session: Session, turn: Turn, signal: AbortSignal): AsyncGenerator<NativeTurnObservation>;
 	remoteArchives?: import('../archives/remote.js').RemoteArchives;
   currentImageIdentity?(target?: WorkspaceTarget): Promise<SandboxImageIdentity>;
@@ -326,6 +331,72 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   async *run(session: Session, turn: Turn, signal: AbortSignal, onSandbox: SaveSandbox, onInputRequest?: InputRequestHook): AsyncGenerator<AgentEvent> {
     yield* this.runAppServer(session, turn, signal, onSandbox, onInputRequest);
+  }
+
+  async prepareNativeSession(session: Session, signal: AbortSignal, onSandbox: SaveSandbox) {
+    const entry = await this.acquire(session, true, onSandbox, signal);
+    try {
+      await this.prepareEnvironment(session, entry, signal);
+      const model = await this.options.resolveModel?.(session);
+      const threadOptions = { cwd: session.settings.workingDirectory, approvalPolicy: 'never', sandbox: 'danger-full-access',
+        ...(session.settings.model ? { model: session.settings.model } : {}),
+        ...(model?.model ? { model: model.model } : {}), ...(model?.modelProvider ? { modelProvider: model.modelProvider } : {}),
+        config: { web_search: session.settings.webSearchMode,
+          'sandbox_workspace_write.network_access': true } };
+      const threadId = await this.reader.read(entry.metadata.id, async client => {
+        // Provider definitions belong in native configuration. The browser only
+        // needs the provider name, never a channel credential.
+        const edits = Object.entries(model?.providerConfig ?? {}).map(([keyPath, value]) => ({ keyPath, value, mergeStrategy: 'replace' }));
+        if (edits.length) await client.request('config/batchWrite', { edits });
+        // Create an initial thread on the browser's own socket, immediately
+        // before its first turn. Empty paginated threads cannot be cold-resumed.
+        if (!session.threadId) return null;
+        let response;
+        try { response = await client.request('thread/resume', { ...threadOptions, threadId: session.threadId, excludeTurns: true }); }
+        catch (error) {
+          const noAcceptedInput = !session.turnCount && !session.turns.some(turn => turn.codexAccepted);
+          if (noAcceptedInput && error instanceof Error && /no rollout found|missing source rollout/.test(error.message)) return null;
+          throw error;
+        }
+        if (session.threadId && model?.modelProvider && response.modelProvider && response.modelProvider !== model.modelProvider) {
+          const forked = await client.request('thread/fork', { ...threadOptions, threadId: session.threadId });
+          return forked.thread.id as string;
+        }
+        return response.thread.id as string;
+      }, signal);
+      return { threadId, threadOptions, turnOptions: { ...(model?.model || session.settings.model ? { model: model?.model || session.settings.model } : {}),
+        effort: session.settings.modelReasoningEffort } };
+    } finally { await this.releaseEntry(entry, true); }
+  }
+
+  async openNativeConnection(session: Session, signal: AbortSignal) {
+    if (!this.options.appServer || !session.sandbox) throw new HttpError(409, '项目 Sandbox 尚未准备好');
+    const entry = await this.acquire(session, false, undefined, signal);
+    try {
+      const endpoint = await this.options.appServer(entry.metadata.id);
+      signal.throwIfAborted();
+      return { ...endpoint, release: () => this.releaseEntry(entry, true) };
+    } catch (error) { await this.releaseEntry(entry, true); throw error; }
+  }
+
+  async nativeRequest(session: Session, method: string, params: unknown) {
+    if (!session.sandbox) throw new HttpError(409, '项目没有 Sandbox');
+    return this.reader.read(session.sandbox.id, async client => {
+      if (!['thread/start', 'thread/read'].includes(method) && session.threadId
+        && (session.turnCount || session.turns.some(turn => turn.codexAccepted)))
+        await client.threadResume({ threadId: session.threadId, excludeTurns: true });
+      return client.request(method, params);
+    });
+  }
+
+  async uploadNativeImage(session: Session, path: string) {
+    const entry = await this.acquire(session, false);
+    try {
+      const destination = `${this.root}/images/${session.id}-${basename(path)}`;
+      await entry.sandbox.commands.run(`mkdir -p ${quote(`${this.root}/images`)}`, { user: 'agent', timeoutMs: 30_000 });
+      await entry.sandbox.files.write(destination, new Uint8Array(await readFile(path)), { user: 'agent' });
+      return destination;
+    } finally { await this.releaseEntry(entry, true); }
   }
 
   /** Observe an accepted turn without acquiring usage, sending input, or interrupting it. */

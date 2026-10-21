@@ -1,6 +1,6 @@
 import type { ModelService } from '../models/service.js';
 import { traced, traceEvent } from '@co-cell/sandbox';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
@@ -30,6 +30,8 @@ import type { SharedCoordinator, SharedLease } from '../infra/storage/coordinati
 import { applyTurnEvent } from '../../util/session-events.js';
 import type { InputRequestRecord, InputRequestType } from '../../protocol/input-request-types.js';
 import type { InputRequestHook } from '../../packages/agentcore/src/index.mjs';
+import type { NativeSessionConnection } from '../../protocol/native-app-server.js';
+import type { NativeRelayEvent } from '../execution/native-relay.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -96,6 +98,9 @@ export class SessionManager {
   private autoCheckpointAfterMs: number;
   private mutations = new Map<string, number>();
   private subscriptionPolls = new Map<string, SubscriptionWatch>();
+  private nativeWrites = new RecordWriteQueue();
+  private nativeObservation?: Promise<void>;
+  private nativeObservationTimer?: ReturnType<typeof setInterval>;
 
   constructor(
     private client: CodexClient,
@@ -160,6 +165,8 @@ export class SessionManager {
   setImageCatalog(catalog: ImageCatalog) { this.imageCatalog = catalog; }
 
   get sharedStateEnabled() { return Boolean(this.coordinator); }
+  get nativeWebSocketEnabled() { return Boolean(this.sandbox?.prepareNativeSession && this.sandbox.openNativeConnection); }
+  private isNativeSession(session: Session) { return this.nativeWebSocketEnabled && session.settings.executionMode === 'sandbox'; }
 
   async refreshSharedState(): Promise<void> {
     if (!this.coordinator || this.closing) return;
@@ -249,6 +256,7 @@ export class SessionManager {
       await this.refreshSharedState();
       for (const candidate of [...this.sessions.values()]) {
         if (this.closing || this.active.has(candidate.id)) continue;
+        if (this.isNativeSession(candidate)) continue;
         const queued = (await this.state.listInputRequests?.(candidate.id) ?? [])
           .some(input => input.type === 'question_reply' && input.status === 'queued');
         if (!queued && !candidate.turns.some(turn => turn.status === 'running')) continue;
@@ -341,7 +349,13 @@ export class SessionManager {
         changed = true;
       }
       for (const turn of session.turns) {
-        if (!this.coordinator && turn.status === 'running' && !this.canRecover(session, turn)) {
+        if (this.isNativeSession(session) && turn.status === 'running' && !turn.codexAccepted && !turn.nativeTurnId) {
+          turn.status = 'cancelled';
+          turn.error = '旧提交未确认，执行状态以 App Server 为准；未自动重发。';
+          turn.completedAt = new Date().toISOString();
+          changed = true;
+        }
+        if (!this.coordinator && !this.isNativeSession(session) && turn.status === 'running' && !this.canRecover(session, turn)) {
           turn.status = 'cancelled';
           turn.error = '服务重启时发现本轮没有可恢复的执行任务，已标记为已停止。';
           turn.completedAt = new Date().toISOString();
@@ -361,7 +375,9 @@ export class SessionManager {
           changed = true;
         }
       }
-      if (!this.coordinator && (session.status === 'running' || session.turns.some(turn => turn.status === 'running' || this.canRecover(session, turn)))) {
+      if (this.isNativeSession(session) && changed)
+        session.status = session.turns.some(turn => turn.status === 'running') ? 'running' : session.turns.at(-1)?.status ?? 'idle';
+      if (!this.coordinator && !this.isNativeSession(session) && (session.status === 'running' || session.turns.some(turn => turn.status === 'running' || this.canRecover(session, turn)))) {
         changed = true;
         for (const turn of session.turns.filter(t => t.status === 'running' || this.canRecover(session, t))) {
           if (this.canRecover(session, turn)) {
@@ -381,16 +397,25 @@ export class SessionManager {
       this.sessions.set(session.id, session);
     }
     const recoverable = [...this.sessions.values()].flatMap(session => {
+      if (this.isNativeSession(session)) return [];
       const turn = session.turns.find(turn => this.canRecover(session, turn));
       return turn ? [{ session, turn }] : [];
     });
     if (!this.coordinator) for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
     for (const session of this.sessions.values()) {
-      if (!this.coordinator && !this.active.has(session.id)
+      if (!this.coordinator && !this.isNativeSession(session) && !this.active.has(session.id)
         && (await this.state.listInputRequests?.(session.id) ?? []).some(input => input.type === 'question_reply' && input.status === 'queued'))
         void this.startQueuedUserInput(session.id).catch(error => console.error('Queued input recovery failed:', error));
     }
     this.lifecycle?.start();
+    if (this.nativeWebSocketEnabled) {
+      // Reconcile projections only: never submit input, interrupt, or claim an execution.
+      await this.observeNativeSessions(true);
+      this.nativeObservationTimer = setInterval(() => {
+        void this.observeNativeSessions().catch(error => console.error('Native observation failed:', error.message));
+      }, 5000);
+      this.nativeObservationTimer.unref();
+    }
     if (this.coordinator) {
       await this.recoverSharedExecutions();
       this.recoveryTimer = setInterval(() => {
@@ -404,6 +429,186 @@ export class SessionManager {
     if (!this.sandbox || session.settings.executionMode !== 'sandbox' || !session.sandbox) return false;
     return turn.status === 'running' && turn.codexAccepted === true
       && Boolean(session.threadId && turn.nativeTurnId);
+  }
+
+  /** Serialize bootstrap/binding metadata, never the lifetime of a native turn. */
+  private async nativeControl<T>(id: string, action: () => Promise<T>): Promise<T> {
+    let result!: T;
+    await this.writer.run(`native-control:${id}`, async () => { result = await this.sessionMutation(id, action); });
+    return result;
+  }
+
+  async nativeConnection(id: string, signal = new AbortController().signal): Promise<NativeSessionConnection> {
+    return this.nativeControl(id, async () => {
+      if (this.closing) throw new HttpError(503, '服务正在关闭');
+      let session = await this.refreshSessionSandbox(this.lookup(id));
+      if (!this.isNativeSession(session)) throw new HttpError(409, '此会话不支持原生 WebSocket');
+      if (session.archivedAt || (session.projectId && this.projects.get(session.projectId).status !== 'active'))
+        throw new HttpError(409, '请先恢复项目和会话再继续对话');
+      if (session.projectId) await this.ensureProjectSandbox(session.projectId);
+      session = this.lookup(id);
+      const prepared = await this.sandbox!.prepareNativeSession!(structuredClone(session), signal,
+        value => this.updateSandbox(session.projectId, id, value));
+      session.threadId = prepared.threadId;
+      await this.save(session);
+      return { session: this.get(id), threadId: prepared.threadId, threadOptions: prepared.threadOptions, turnOptions: prepared.turnOptions,
+        websocketPath: `/api/sessions/${encodeURIComponent(id)}/app-server` };
+    });
+  }
+
+  async openNativeConnection(id: string, signal: AbortSignal) {
+    await this.refreshSharedState();
+    const session = await this.refreshSessionSandbox(this.lookup(id));
+    if (this.closing || !this.isNativeSession(session))
+      throw new HttpError(409, '请先连接原生会话');
+    if (session.archivedAt || (session.projectId && this.projects.get(session.projectId).status !== 'active'))
+      throw new HttpError(409, '项目或会话已归档');
+    return this.sandbox!.openNativeConnection!(structuredClone(session), signal);
+  }
+
+  async bindNativeThread(id: string, threadId: string): Promise<Session> {
+    return this.nativeControl(id, async () => {
+      const session = await this.refreshSessionSandbox(this.lookup(id));
+      if (this.closing || !this.isNativeSession(session) || session.archivedAt
+        || (session.projectId && this.projects.get(session.projectId).status !== 'active'))
+        throw new HttpError(409, '当前会话不可连接');
+      if (session.threadId && session.threadId !== threadId)
+        throw new HttpError(409, '会话已有原生对话，请刷新后继续');
+      const metadata = await this.sandbox!.nativeRequest!(session, 'thread/read', { threadId, includeTurns: false });
+      if (metadata.thread?.id !== threadId) throw new HttpError(409, '原生会话不存在');
+      session.threadId = threadId;
+      await this.save(session);
+      return this.get(id);
+    });
+  }
+
+  /** An asynchronous projection of native control boundaries, never an executor. */
+  observeNativeMessage(event: NativeRelayEvent): Promise<void> {
+    const message = event.message;
+    const request = event.request;
+    if (event.direction !== 'server' || message.error) return Promise.resolve();
+    const raw = message.method === 'turn/started' || message.method === 'turn/completed'
+      ? message.params?.turn : request?.method === 'turn/start' ? message.result?.turn : undefined;
+    const isReply = request?.method === 'turn/steer' && message.result;
+    const usage = message.method === 'thread/tokenUsage/updated' ? message.params?.tokenUsage?.last : undefined;
+    const question = ['item/started', 'item/completed'].includes(message.method)
+      && message.params?.item?.type === 'agentMessage' && message.params.item.delivery === 'async'
+      && message.params.item.questions?.length ? message.params : undefined;
+    if (!raw && !isReply && !question && !usage) return Promise.resolve();
+    const threadId = message.params?.threadId ?? request?.params?.threadId;
+    return this.nativeWrites.run(event.sessionId, () => this.sessionMutation(event.sessionId, async () => {
+      const session = this.lookup(event.sessionId);
+      if (!this.isNativeSession(session) || session.threadId !== threadId) return;
+      const nativeId = raw?.id ?? message.params?.turnId ?? message.result?.turnId ?? request?.params?.expectedTurnId;
+      if (typeof nativeId !== 'string' || !nativeId) return;
+      const input = request?.params?.input as Array<{ type: string; text?: string; path?: string }> | undefined;
+      const prompt = Array.isArray(input) ? input.filter(part => part.type === 'text').map(part => part.text ?? '').join('\n') : '';
+      const images = Array.isArray(input) ? input.filter(part => part.type === 'localImage' && part.path).map(part => part.path!) : [];
+      let turn = session.turns.find(turn => turn.nativeTurnId === nativeId || turn.id === nativeId);
+      const previousStatus = turn?.status;
+      if (!turn) {
+        const digest = createHash('sha256').update(`${session.id}:${nativeId}`).digest('hex');
+        const id = /^[0-9a-f-]{36}$/i.test(nativeId) ? nativeId
+          : `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
+        turn = { id, nativeTurnId: nativeId, prompt: '', images: [], items: [], status: 'running',
+          codexAccepted: true, type: 'message', startedAt: new Date(event.receivedAt).toISOString() };
+        session.turns.push(turn);
+        if (event.connectionId !== 'history') session.turnCount = (session.turnCount ?? 0) + 1;
+      }
+      if (raw) {
+        // A delayed start from another subscriber must not resurrect a terminal turn.
+        const status = raw.status === 'completed' ? 'completed'
+          : ['interrupted', 'cancelled', 'canceled', 'aborted'].includes(raw.status) ? 'cancelled'
+            : raw.status === 'failed' ? 'failed' : 'running';
+        if (status !== 'running' || !previousStatus || previousStatus === 'running') turn.status = status;
+        turn.codexAccepted = true;
+        if (raw.startedAt) turn.startedAt = new Date(raw.startedAt * 1000).toISOString();
+        if (turn.status !== 'running') turn.completedAt = raw.completedAt
+          ? new Date(raw.completedAt * 1000).toISOString() : new Date(event.receivedAt).toISOString();
+        if (turn.status !== 'running') { delete turn.phase; delete turn.retry; }
+        if (raw.error?.message) turn.error = raw.error.message;
+        if (typeof raw.prompt === 'string' && !turn.prompt) turn.prompt = raw.prompt;
+        if (request?.method === 'turn/start') { turn.prompt = prompt; turn.images = images; }
+      }
+      if (question) {
+        const item = question.item;
+        turn.userInputRequests ??= [];
+        if (!turn.userInputRequests.some(value => value.id === item.id)) turn.userInputRequests.push({
+          id: item.id, questions: structuredClone(item.questions), status: 'pending',
+          createdAt: new Date(event.receivedAt).toISOString(),
+        });
+      }
+      if (usage && [usage.inputTokens, usage.cachedInputTokens, usage.outputTokens, usage.reasoningOutputTokens].every(Number.isFinite)) {
+        turn.sdkUsage = { input_tokens: usage.inputTokens, cached_input_tokens: usage.cachedInputTokens,
+          output_tokens: usage.outputTokens, reasoning_output_tokens: usage.reasoningOutputTokens,
+          cache_write_input_tokens: usage.cacheWriteInputTokens ?? 0 };
+        session.contextUsage = { inputTokens: usage.inputTokens, cachedInputTokens: usage.cachedInputTokens,
+          outputTokens: usage.outputTokens, model: session.settings.model, observedAt: new Date(event.receivedAt).toISOString(), source: 'rollout' };
+      }
+      if (request && ['turn/start', 'turn/steer'].includes(request.method)) {
+        const digest = createHash('sha256').update(`${event.connectionId}:${request.id}`).digest('hex');
+        const inputId = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
+        const recorded = (await this.state.listInputRequests?.(session.id) ?? []).some(value => value.id === inputId);
+        if (!recorded) {
+          if (request.method === 'turn/steer') turn.additionalUserInputs = [...(turn.additionalUserInputs ?? []), prompt];
+          const reply = /<send_user_message_question_reply>\s*([\s\S]+?)\s*<\/send_user_message_question_reply>/.exec(prompt);
+          let requestId: string | undefined;
+          if (reply) {
+            try { requestId = JSON.parse(JSON.parse(reply[1])[0].questionItemId)[1]; } catch { /* Ordinary input is not a question reply. */ }
+          }
+          await this.state.saveInputRequest?.({ id: inputId, sessionId: session.id, turnId: turn.id,
+            type: requestId ? 'question_reply' : request.method === 'turn/start' ? 'message' : 'steer',
+            method: request.method as 'turn/start' | 'turn/steer', params: structuredClone(request.params),
+            input: prompt, images, requestId, nativeTurnId: nativeId, status: 'accepted',
+            createdAt: new Date(event.receivedAt).toISOString(), acceptedAt: new Date(event.receivedAt).toISOString() });
+        }
+      }
+      const answers: NativeUserInputAnswers = new Map();
+      session.turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+      collectNativeUserInputAnswers(session.turns, answers);
+      session.turns = session.turns.map(value => withNativeUserInput(value, answers));
+      session.status = session.turns.some(value => value.status === 'running') ? 'running' : session.turns.at(-1)?.status ?? 'idle';
+      session.updatedAt = new Date(event.receivedAt).toISOString();
+      if (session.title === '新任务' && prompt) session.title = prompt.slice(0, 60);
+      await this.save(session);
+      this.publish(session.id, { type: 'state', session: this.get(session.id) });
+      if (previousStatus === 'running' && turn.status !== 'running') await this.notifyNativeCompletion(session, turn);
+    }));
+  }
+
+  private async notifyNativeCompletion(session: Session, turn: Turn) {
+    if (!this.notifications) return;
+    const type = turn.status === 'completed' ? 'turn_completed' : turn.status === 'cancelled' ? 'turn_cancelled' : 'turn_failed';
+    const label = turn.status === 'completed' ? '执行完成' : turn.status === 'cancelled' ? '已停止' : '执行失败';
+    const projectName = session.projectId ? this.projects.find(session.projectId)?.name : undefined;
+    await this.notifications.add({ type, title: `【${projectName ?? '无项目'}】${label}: ${session.title}`,
+      body: turn.prompt.slice(0, 100), sessionId: session.id, sessionTitle: session.title, projectName, turnId: turn.id });
+  }
+
+  private async observeNativeSessions(initial = false) {
+    if (this.closing || this.nativeObservation) return this.nativeObservation;
+    this.nativeObservation = (async () => {
+      await this.refreshSharedState();
+      for (const session of [...this.sessions.values()]) {
+        if (this.closing) return;
+        if (!this.isNativeSession(session) || !session.threadId || !session.sandbox || (!initial && session.status !== 'running')) continue;
+        try {
+          const page = await this.sandbox!.history(structuredClone(session), { limit: initial ? 20 : 1 });
+          for (const turn of page.turns) {
+            const previous = this.lookup(session.id).turns.find(value => value.nativeTurnId === turn.id || value.id === turn.id);
+            if (previous?.status === turn.status && previous.codexAccepted && (previous.prompt || !turn.prompt)) continue;
+            await this.observeNativeMessage({ sessionId: session.id, connectionId: 'history', direction: 'server',
+              receivedAt: Date.now(), message: { method: turn.status === 'running' ? 'turn/started' : 'turn/completed',
+                params: { threadId: session.threadId, turn: { id: turn.id,
+                  status: turn.status === 'running' ? 'inProgress' : turn.status === 'cancelled' ? 'interrupted' : turn.status,
+                  prompt: turn.prompt,
+                  startedAt: Date.parse(turn.startedAt) / 1000, completedAt: turn.completedAt ? Date.parse(turn.completedAt) / 1000 : undefined,
+                  ...(turn.error ? { error: { message: turn.error } } : {}) } } } });
+          }
+        } catch (error) { void this.logger?.write({ event: 'session.native_projection_failed', sessionId: session.id, error }); }
+      }
+    })();
+    try { await this.nativeObservation; } finally { this.nativeObservation = undefined; }
   }
 
   private reserveTurn(session: Session, lease?: SharedLease): ActiveExecution {
@@ -536,6 +741,20 @@ export class SessionManager {
   }
 
   async answerUserInput(id: string, turnId: string, requestId: string, answer: string, answers?: string[]): Promise<Session> {
+    if (this.isNativeSession(this.lookup(id))) {
+      const session = await this.read(id);
+      const request = session.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId)
+        ?.userInputRequests?.find(value => value.id === requestId);
+      if (!request) throw new HttpError(404, '问题不存在');
+      if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
+      const values = answers ?? [answer];
+      if (values.length !== request.questions.length) throw new HttpError(400, '请回答所有问题');
+      const prompt = '<send_user_message_question_reply>\n' + JSON.stringify(request.questions.map((question, index) => ({
+        answer: values[index], question: question.title, questionItemId: JSON.stringify(['request_user_input_async', request.id, index]),
+      }))) + '\n</send_user_message_question_reply>';
+      await this.startNativeTurn(id, prompt);
+      return this.read(id);
+    }
     return this.sessionMutation(id, () => this.answerUserInputLocal(id, turnId, requestId, answer, answers));
   }
 
@@ -728,6 +947,7 @@ export class SessionManager {
         const turns = page.turns.map(native => {
           const current = session.turns.find(turn => turn.nativeTurnId === native.id || turn.id === native.id);
           return withNativeUserInput(current ? { ...native, ...current, nativeTurnId: native.id,
+            ...(this.isNativeSession(session) ? { status: native.status, completedAt: native.completedAt, error: native.error, phase: undefined, retry: undefined } : {}),
             additionalUserInputs: native.additionalUserInputs ?? current.additionalUserInputs,
             prompt: current.prompt || native.prompt, items: native.items.map(item => ({ ...current.items.find(old => old.id === item.id), ...item })).concat(current.items.filter(item => !native.items.some(other => other.id === item.id))),
             ...(current.userInputRequests ? { userInputRequests: current.userInputRequests } : {}) } : native);
@@ -735,7 +955,9 @@ export class SessionManager {
         const live = session.turns.filter(turn => turn.status === 'running');
         for (const turn of live) if (!turns.some(candidate => candidate.id === turn.id)) turns.push(turn);
         turns.sort((left, right) => left.startedAt.localeCompare(right.startedAt));
-        const result = { ...snapshot, turns: this.withUserInputHistory(session, turns), historyNextCursor: page.nextCursor ?? null, historyError: undefined };
+        const result = { ...snapshot,
+          ...(this.isNativeSession(session) ? { status: turns.some(turn => turn.status === 'running') ? 'running' as const : turns.at(-1)?.status ?? 'idle' as const } : {}),
+          turns: this.withUserInputHistory(session, turns), historyNextCursor: page.nextCursor ?? null, historyError: undefined };
         await this.applyRecordedReplies(result);
         return result;
       } catch (error) {
@@ -1161,6 +1383,21 @@ export class SessionManager {
       if (idle(project) && !['running', 'failed', 'unknown'].includes(project.sandboxOperation?.status ?? '')) {
         const observed = await this.liveProject(project, true);
         if (observed.sandbox?.status === 'ready') {
+          // Observations are asynchronous and may be dropped under pressure.
+          // Check the execution authority before an automatic lifecycle action.
+          let nativeBusy = false;
+          for (const session of this.sessions.values()) {
+            if (session.projectId !== project.id || !this.isNativeSession(session) || !session.threadId) continue;
+            try {
+              const page = await this.sandbox!.history(structuredClone(session), { limit: 1 });
+              if (page.turns.some(turn => turn.status === 'running')) { nativeBusy = true; break; }
+            } catch (error) {
+              nativeBusy = true;
+              void this.logger?.write({ event: 'sandbox.auto_checkpoint_observation_failed', projectId: project.id, error });
+              break;
+            }
+          }
+          if (nativeBusy) continue;
           await this.startProjectOperation(project.id, () => this.sandboxOperations!.start(project.id, 'checkpoint'),
             current => current.sandbox?.id === project.sandbox?.id && idle(current)).catch(() => {});
           continue;
@@ -1254,6 +1491,9 @@ export class SessionManager {
     clearInterval(this.subscriptionPolls.get(id)?.timer);
     this.subscriptionPolls.delete(id);
     this.writer.forget(id);
+    this.writer.forget(`native-input:${id}`);
+    this.writer.forget(`native-control:${id}`);
+    this.nativeWrites.forget(id);
   }
 
   private async updateSandbox(projectId: string | undefined, sessionId: string, sandbox: NonNullable<Session['sandbox']>, restoreProject = false, restoreImage?: ProjectImageSelection, expectedSandboxId?: string | null) {
@@ -1402,7 +1642,7 @@ export class SessionManager {
     this.subscribers.set(id, subscribers);
     subscribers.add(callback);
     callback({ type: 'snapshot', session: this.get(id) });
-    if (this.coordinator && !this.subscriptionPolls.has(id)) {
+    if ((this.coordinator || this.nativeWebSocketEnabled) && !this.subscriptionPolls.has(id)) {
       const poll: SubscriptionWatch = {
         timer: setInterval(() => {
           if (this.closing || poll.pending) return;
@@ -1540,6 +1780,10 @@ export class SessionManager {
       await mkdir(directory, { recursive: true, mode: 0o700 });
       const path = join(directory, `${randomUUID()}.${extension}`);
       await writeFile(path, content, { mode: 0o600 });
+      if (this.isNativeSession(session)) {
+        if (session.projectId) await this.ensureProjectSandbox(session.projectId);
+        return this.sandbox!.uploadNativeImage!(this.lookup(id), path);
+      }
       return path;
     })();
     uploads.add(operation);
@@ -1550,7 +1794,39 @@ export class SessionManager {
     }
   }
 
+  /** REST compatibility is a single native RPC, with no background execution owner. */
+  private async startNativeTurn(id: string, prompt: string, images: string[] = []): Promise<string> {
+    let result!: string;
+    const submit = () => this.writer.run(`native-input:${id}`, async () => { result = await this.submitNativeTurn(id, prompt, images); });
+    if (this.coordinator) await this.coordinator.run(`session-input:${id}`, submit);
+    else await submit();
+    return result;
+  }
+
+  private async submitNativeTurn(id: string, prompt: string, images: string[]): Promise<string> {
+    const prepared = await this.nativeConnection(id);
+    let session = this.lookup(id);
+    if (!prepared.threadId) {
+      const result = await this.sandbox!.nativeRequest!(session, 'thread/start', prepared.threadOptions);
+      await this.bindNativeThread(id, result.thread.id);
+      session = this.lookup(id);
+    }
+    const page = prepared.threadId ? await this.sandbox!.history(structuredClone(session), { limit: 1 }) : { turns: [] };
+    const running = page.turns.find(turn => turn.status === 'running');
+    if (running && images.length) throw new HttpError(409, '任务执行中只能追加文字消息');
+    const input = [{ type: 'text', text: prompt, text_elements: [] }, ...images.map(path => ({ type: 'localImage', path }))];
+    const method = running ? 'turn/steer' : 'turn/start';
+    const params = { threadId: session.threadId, input, ...(running ? { expectedTurnId: running.id } : prepared.turnOptions) };
+    const result = await this.sandbox!.nativeRequest!(session, method, params);
+    const nativeId = result.turn?.id ?? result.turnId ?? running?.id;
+    if (!nativeId) throw new HttpError(502, 'App Server 未返回执行标识，接收状态未知，请检查会话');
+    await this.observeNativeMessage({ sessionId: id, connectionId: `http:${randomUUID()}`, direction: 'server',
+      receivedAt: Date.now(), request: { id: 1, method, params }, message: { id: 1, result } });
+    return this.lookup(id).turns.find(turn => turn.nativeTurnId === nativeId)?.id ?? nativeId;
+  }
+
   async startTurn(id: string, prompt: string, images: string[] = []): Promise<string> {
+    if (this.isNativeSession(this.lookup(id))) return this.startNativeTurn(id, prompt, images);
     const deadline = Date.now() + 10_000;
     while (true) {
       if (!images.length) await this.waitForNativeTurnAcceptance(id, deadline);
@@ -1669,6 +1945,13 @@ export class SessionManager {
   }
 
   async stop(id: string) {
+    const session = this.lookup(id);
+    if (this.isNativeSession(session)) {
+      const page = await this.sandbox!.history(structuredClone(session), { limit: 1 });
+      const turn = page.turns.find(value => value.status === 'running');
+      if (turn) await this.sandbox!.nativeRequest!(session, 'turn/interrupt', { threadId: session.threadId, turnId: turn.id });
+      return;
+    }
     return this.sessionMutation(id, () => this.stopLocal(id), false);
   }
 
@@ -1821,6 +2104,9 @@ export class SessionManager {
 
   async close() {
     this.closing = true;
+    clearInterval(this.nativeObservationTimer);
+    await this.nativeObservation;
+    await this.nativeWrites.drain();
     clearInterval(this.recoveryTimer);
     for (const poll of this.subscriptionPolls.values()) { clearInterval(poll.timer); poll.observation?.controller.abort(); }
     await Promise.allSettled([...this.subscriptionPolls.values()].map(poll => poll.pending));

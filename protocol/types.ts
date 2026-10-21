@@ -335,7 +335,7 @@ export interface AppConfig {
   codexVersion: string;
   auth: 'api-key' | 'local-codex';
   approvalPolicy: 'never';
-  capabilities: { interactiveApprovals: false; tokenDeltas: false; sandboxPreviews?: boolean };
+  capabilities: { interactiveApprovals: false; tokenDeltas: false; sandboxPreviews?: boolean; nativeWebSocket?: boolean };
 }
 export type StreamMessage =
   | { type: 'snapshot'; session: Session }

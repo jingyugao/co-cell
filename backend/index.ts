@@ -21,6 +21,7 @@ import { createApp } from './app.js';
 import { SessionManager } from './sessions/manager.js';
 import { ContainerCodexRuntime } from './execution/container-runtime.js';
 import { AppServerReader } from './execution/app-server-reader.js';
+import { createNativeRelay } from './execution/native-relay.js';
 import { ProjectSandboxes } from './sandboxes/project-sandboxes.js';
 import { RuntimeLog } from './infra/diagnostics/runtime-log.js';
 import { installProductionStatic } from './infra/http/static-files.js';
@@ -185,7 +186,7 @@ manager.setImageCatalog(imageCatalog);
 const config: AppConfig = { models: availableModels, sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
   ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}),
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
-  localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true } };
+  localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true, nativeWebSocket: true } };
 const publicUrl=cocellPublicUrl;
 const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;
@@ -203,6 +204,20 @@ const previewProxy = previewSubdomains ? createPreviewProxy({ publicUrl, token: 
   access: (projectId, port, method, signal) => manager.projectServiceAccess(projectId, port, method, signal),
   onError: error => { void runtimeLog.write({ event: 'preview.proxy_failed', error }); },
 }) : undefined;
+const nativeRelay = createNativeRelay({ publicUrl, token: process.env.COCELL_ACCESS_TOKEN!,
+  open: (id, signal) => manager.openNativeConnection(id, signal),
+  observers: [{ name: 'runtime-log', observe: async event => {
+    // Only metadata goes to logs. Native prompt/config bodies stay on the transport.
+    if (event.direction === 'server' && (event.request || event.message.method?.startsWith('turn/')
+      || event.message.method === 'thread/tokenUsage/updated')) {
+      await runtimeLog.write({ event: 'app_server.message', sessionId: event.sessionId, connectionId: event.connectionId,
+        method: event.message.method ?? event.request?.method, requestId: event.message.id,
+        outcome: event.message.error ? 'error' : 'received',
+        ...(event.message.method === 'thread/tokenUsage/updated' ? { usage: event.message.params?.tokenUsage?.last } : {}) });
+    }
+  } }, { name: 'session-projection', observe: event => manager.observeNativeMessage(event) }],
+  onError: error => { void runtimeLog.write({ event: 'app_server.observer_or_transport_failed', error }); },
+});
 const server = createServer((request, response) => {
   void (async () => {
     if (previewProxy && await previewProxy.handle(request, response)) return;
@@ -213,6 +228,10 @@ const server = createServer((request, response) => {
   })().catch(error => { void runtimeLog.write({ event: 'preview.request_failed', error }); response.destroy(); });
 });
 server.on('upgrade', (request, socket, head) => {
+  if (nativeRelay.matches(request)) {
+    void nativeRelay.upgrade(request, socket as import('node:net').Socket, head).catch(() => socket.destroy());
+    return;
+  }
   if (!previewProxy) { socket.destroy(); return; }
   void previewProxy.upgrade(request, socket as import('node:net').Socket, head).catch(() => socket.destroy());
 });
@@ -224,7 +243,7 @@ let shuttingDown = false;
 // Periodic sandbox archive for active projects — every 30 minutes
 const archiveInterval = setInterval(() => { void manager.scheduledArchive().catch(() => {}); }, 60 * 1000);
 archiveInterval.unref();
-async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await previewProxy?.close(); await manager.close(); await cellboxRuntime.close();
+async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await nativeRelay.close(); await previewProxy?.close(); await manager.close(); await cellboxRuntime.close();
   clearInterval(archiveInterval);
   await coordinator?.close();
   await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); await shutdownTracing?.(); }

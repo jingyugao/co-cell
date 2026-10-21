@@ -10,7 +10,7 @@ import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 
-import { HttpError } from '../../util/errors.js';
+import { HttpError, redactCredentials } from '../../util/errors.js';
 import { holdResponse } from '../../util/http-stream.js';
 import { ProjectService, type ProjectInput, type ProjectUpdate } from '../projects/service.js';
 import { RecordWriteQueue } from '../infra/storage/record-write-queue.js';
@@ -223,6 +223,13 @@ export class SessionManager {
   }
 
   private async sessionMutation<T>(id: string, action: () => Promise<T>, projectAdmission = true): Promise<T> {
+    if (projectAdmission) {
+      const session = this.sessions.get(id) ?? await this.state.getSession(id);
+      if (session?.projectId) {
+        await this.projects.refreshOne(session.projectId);
+        this.projects.assertAvailable(session.projectId);
+      }
+    }
     if (!this.coordinator) return action();
     const session = await this.state.getSession(id);
     if (!session) throw new HttpError(404, '会话不存在');
@@ -1328,10 +1335,12 @@ export class SessionManager {
   private async submitProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'], options: { imageVersionId?: string } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-    await this.projects.refreshOne(id);
-    await traced('project.operation', { 'project.id': id, 'sandbox.operation.kind': kind }, async () => {
-      const accepted = await this.sandboxOperations!.start(id, kind, options);
-      await accepted.done;
+    await this.withProjectOperation(id, async () => {
+      await this.projects.refreshOne(id);
+      await traced('project.operation', { 'project.id': id, 'sandbox.operation.kind': kind }, async () => {
+        const accepted = await this.sandboxOperations!.start(id, kind, options);
+        await accepted.done;
+      });
     });
   }
 
@@ -1349,17 +1358,21 @@ export class SessionManager {
     options: { useExistingBackup?: boolean } = {}, eligible?: (project: Project) => boolean) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-    const { done } = await this.startProjectOperation(id, () => this.sandboxOperations!.start(id, kind, options), eligible);
-    await done;
+    await this.withProjectOperation(id, async () => {
+      await this.projects.refreshOne(id);
+      if (eligible && !eligible(this.projects.get(id))) return;
+      const { done } = await this.sandboxOperations!.start(id, kind, options);
+      await done;
+    });
   }
 
-  private async startProjectOperation(id: string, action: () => Promise<{ done: Promise<void> }>, eligible?: (project: Project) => boolean) {
-    await this.projects.refreshOne(id);
-    if (eligible) {
-      const current = this.projects.find(id);
-      if (!current || !eligible(current)) return { done: Promise.resolve() };
-    }
-    return action();
+  private async withProjectOperation(id: string, action: () => Promise<void>): Promise<void> {
+    // These queues only serialize live requests. Retrying after restart reads
+    // the durable deletion intent and Cellbox resources from the beginning.
+    await this.writer.run(`project-operation:${id}`, async () => {
+      if (this.coordinator) await this.coordinator.run(`project-operation:${id}`, action);
+      else await action();
+    });
   }
 
   async scheduledArchive() {
@@ -1402,7 +1415,7 @@ export class SessionManager {
             }
           }
           if (nativeBusy) continue;
-          await this.startProjectOperation(project.id, () => this.sandboxOperations!.start(project.id, 'checkpoint'),
+          await this.runProjectSandboxOperation(project.id, 'checkpoint', {},
             current => current.sandbox?.id === project.sandbox?.id && idle(current)).catch(() => {});
           continue;
         }
@@ -1421,6 +1434,7 @@ export class SessionManager {
 
   private async ensureProjectSandbox(id: string): Promise<void> {
     await this.refreshSharedState();
+    this.projects.assertAvailable(id);
     const project = await this.liveProject(this.projects.get(id));
     if (project.status === 'archived') {
       throw new HttpError(409, '项目已归档，请先点击“恢复项目”');
@@ -1450,21 +1464,41 @@ export class SessionManager {
   }
 
   async deleteProject(id: string) {
-    await this.projects.refreshOne(id);
-    return this.deleteProjectLocal(id);
+    if (this.closing) throw new HttpError(503, '服务正在关闭');
+    await this.withProjectOperation(id, async () => {
+      await this.projects.refreshOne(id);
+      await this.deleteProjectLocal(id);
+    });
   }
 
   private async deleteProjectLocal(id: string) {
     const current = this.projects.get(id);
-    if (current.removedAt) throw new HttpError(404, '项目不存在');
+    if (current.removedAt) return;
     if (current.executionMode === 'sandbox') {
       if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-      await this.sandboxOperations.run(id, 'delete');
-      for (const session of [...this.sessions.values()].filter(session => session.projectId === id)) {
-        await Promise.allSettled([...(this.uploads.get(session.id) ?? [])]);
-        await this.removeSession(session.id);
+      await this.projects.markDeleting(id);
+      // Capture every durable session, including those created on another API,
+      // before collecting backup thread IDs. New sessions are fenced in storage.
+      for (const session of await this.state.listProjectSessions(id)) {
+        const local = this.sessions.get(session.id);
+        if (local) local.threadId = session.threadId;
+        else this.sessions.set(session.id, session);
       }
-      await this.projects.markRemoved(id);
+      await this.sandboxOperations.run(id, 'delete');
+      const operation = this.projects.get(id).sandboxOperation!;
+      try {
+        await this.projects.updateSandboxOperation(id, { ...operation, status: 'running', phase: '清理会话', updatedAt: new Date().toISOString() }, operation.id);
+        for (const session of await this.state.listProjectSessions(id)) {
+          await Promise.allSettled([...(this.uploads.get(session.id) ?? [])]);
+          await this.removeSession(session.id);
+        }
+        await this.projects.updateSandboxOperation(id, { ...operation, status: 'succeeded', phase: '完成', updatedAt: new Date().toISOString() }, operation.id);
+        await this.projects.markRemoved(id);
+      } catch (error) {
+        await this.projects.updateSandboxOperation(id, { ...operation, status: 'failed', phase: '清理会话',
+          error: redactCredentials(error instanceof Error ? error.message : '项目清理未完成'), updatedAt: new Date().toISOString() }, operation.id).catch(() => {});
+        throw error;
+      }
       return;
     }
     await this.projects.delete(id, async project => {
@@ -1596,6 +1630,11 @@ export class SessionManager {
   }
 
   private async updateLocal(id: string, input: { title?: string; settings?: Partial<Settings>; archived?: boolean }): Promise<Session> {
+    const projectId = this.lookup(id).projectId;
+    if (projectId) {
+      await this.projects.refreshOne(projectId);
+      this.projects.assertAvailable(projectId);
+    }
     const session = this.lookup(id);
     if (this.active.has(id) || session.status === 'running') throw new HttpError(409, '请先停止当前任务再修改会话');
     if (input.archived && session.turns.some(turn => turn.status === 'running')) {

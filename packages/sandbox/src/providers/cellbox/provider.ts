@@ -274,6 +274,38 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
         ...(box.revisionId ? { revisionId: box.revisionId } : {}),
         ...(box.templateVersion ? { version: box.templateVersion } : {}) } };
   }
+  private async releaseObservation(id: string, signal?: AbortSignal): Promise<SandboxInfo | undefined> {
+    const box = await this.box(id, signal);
+    if (box.phase === 'deleted') return this.boxInfo(box);
+    if (!box.operationId) return undefined;
+
+    const operation = await this.client.getOperation(box.operationId, signal).catch(error => {
+      if (error instanceof CellboxError && error.code === 'NOT_FOUND')
+        throw new CellboxError('UNKNOWN_OUTCOME', `Destroy operation ${box.operationId} is unavailable while Box ${id} still exists`);
+      throw error;
+    });
+    if (operation.id !== box.operationId || operation.kind !== 'destroy' || operation.targetId !== id)
+      throw new CellboxError('BUSY', `Box ${id} has another active lifecycle operation`);
+    const completed = await this.wait(operation, this.maxWaitMs, signal).catch(error => {
+      if (error instanceof CellboxError && error.code === 'NOT_FOUND')
+        throw new CellboxError('UNKNOWN_OUTCOME', `Destroy operation ${operation.id} is unavailable`);
+      throw error;
+    });
+    if (completed.box) {
+      if (completed.box.id !== id || completed.box.phase !== 'deleted') throw new CellboxError('PROTOCOL', 'Cellbox destroy returned an unexpected Box state');
+      return this.boxInfo(completed.box);
+    }
+    const current = await this.box(id, signal);
+    if (current.phase !== 'deleted')
+      throw new CellboxError('CONFLICT', `Cellbox destroy for Box ${id} completed while it is ${current.phase}`);
+    return this.boxInfo(current);
+  }
+  private async confirmReleased(id: string, signal?: AbortSignal): Promise<SandboxInfo> {
+    const box = await this.box(id, signal);
+    if (box.phase !== 'deleted')
+      throw new CellboxError('CONFLICT', `Cellbox destroy for Box ${id} completed while it is ${box.phase}`);
+    return this.boxInfo(box);
+  }
   async pause(id: string) {
     await this.act(id, 'suspend');
     return true;
@@ -300,6 +332,50 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   /** Explicit cold restart preserves the Box-owned HOME; never creates or restores a Box. */
   async rebuildPersistent(_id: string, _key: string) {
     throw new CellboxError('UNSUPPORTED_CAPABILITY', 'Cellbox does not support rebuilding a persistent Box');
+  }
+  async ensureDeleted(id: string): Promise<SandboxInfo> {
+    const observed = await this.releaseObservation(id);
+    if (observed) return observed;
+
+    // Older Cellbox destroys HOME with the Box. This is a protocol check, not
+    // a phase preflight; never submit that destructive API as a retained release.
+    this.volumeAPI ??= this.client.listVolumes().then(() => {}, error => {
+      this.volumeAPI = undefined;
+      if (error instanceof CellboxError && error.code === 'NOT_FOUND')
+        throw new CellboxError('UNSUPPORTED_CAPABILITY', 'Cellbox must support independent volumes before releasing a Sandbox');
+      throw error;
+    });
+    await this.volumeAPI;
+    let operation: CellboxOperation;
+    try {
+      const current = await this.box(id);
+      if (current.phase === 'deleted') return this.boxInfo(current);
+      if (current.operationId) {
+        const joined = await this.releaseObservation(id);
+        if (joined) return joined;
+        throw new CellboxError('BUSY', `Box ${id} has another active lifecycle operation`);
+      }
+      operation = await this.client.actBox(id, 'destroy', undefined, {
+        ...(Number.isSafeInteger(current.generation) && current.generation > 0 ? { expectedGeneration: current.generation } : {}),
+      });
+    } catch (error) {
+      if (!(error instanceof CellboxError) || !['BUSY', 'CONFLICT', 'STALE_GENERATION'].includes(error.code)) throw error;
+      const raced = await this.releaseObservation(id);
+      if (raced) return raced;
+      throw error;
+    }
+    if (operation.kind !== 'destroy' || operation.targetId !== id)
+      throw new CellboxError('PROTOCOL', `Cellbox returned ${operation.kind} for another destroy request`);
+    const completed = await this.wait(operation).catch(error => {
+      if (error instanceof CellboxError && error.code === 'NOT_FOUND')
+        throw new CellboxError('UNKNOWN_OUTCOME', `Destroy operation ${operation.id} is unavailable`);
+      throw error;
+    });
+    if (completed.box) {
+      if (completed.box.id !== id || completed.box.phase !== 'deleted') throw new CellboxError('PROTOCOL', 'Cellbox destroy returned an unexpected Box state');
+      return this.boxInfo(completed.box);
+    }
+    return this.confirmReleased(id);
   }
   async release(id: string): Promise<SandboxInfo> {
     // Older Cellbox destroys HOME with the Box. This is a protocol check, not

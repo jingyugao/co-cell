@@ -822,10 +822,15 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     const info = await this.sandboxes.lifecycle.run({ action: 'pause',
       resourceKey: target.projectId ? `project:${target.projectId}` : `session:${target.id}`, sandboxId }, async () => {
       await this.reader.closeIdle(sandboxId);
+      const provider = this.options.provider;
       return traced('sandbox.release', { 'sandbox.id': sandboxId },
-        () => this.options.provider.release!(sandboxId));
+        () => provider.ensureDeleted ? provider.ensureDeleted(sandboxId) : provider.release!(sandboxId));
+    }).catch(error => {
+      if (['NOT_FOUND', 'not_found'].includes((error as { code?: string }).code ?? '')) return undefined;
+      throw error;
     });
-    return this.sandboxObservation(target.sandbox, info);
+    return info ? this.sandboxObservation(target.sandbox, info)
+      : { ...target.sandbox, status: 'unavailable', phase: 'deleted', operationId: undefined };
   }
 
 
@@ -900,7 +905,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
 
   async deleteDanglingSandbox(sandboxId: string) {
     await this.sandboxes.lifecycle.run({ action: 'destroy', resourceKey: `sandbox:${sandboxId}`, sandboxId }, async () => {
-      await this.options.provider.kill(sandboxId).catch(error => {
+      const provider = this.options.provider;
+      await (provider.ensureDeleted ? provider.ensureDeleted(sandboxId) : provider.kill(sandboxId)).catch(error => {
+        if (['NOT_FOUND', 'not_found'].includes((error as { code?: string }).code ?? '')) return;
         if (!/not found|no such container/i.test(String(error))) throw this.safeError(error);
       });
     });

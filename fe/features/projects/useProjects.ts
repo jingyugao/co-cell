@@ -47,20 +47,30 @@ export function useProjects() {
   const deleteProject = useCallback(async (id: string) => {
     sequence.current++;
     const operation: ProjectSandboxOperation = { kind: 'delete', phase: '提交删除请求', status: 'running', updatedAt: new Date().toISOString() };
-    setProjects(current => current.map(project => project.id === id ? { ...project, sandboxOperation: operation } : project));
+    setProjects(current => current.map(project => project.id === id ? { ...project, status: 'deleting', sandboxOperation: operation } : project));
     try {
       await api<{ ok: true }>(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
       sequence.current++;
       setProjects(current => current.filter(project => project.id !== id));
     } catch (error) {
-      setProjects(current => current.map(project => project.id === id ? { ...project, sandboxOperation: {
-        ...operation, status: !(error instanceof ApiError) || ['UNKNOWN_OUTCOME', 'TRANSPORT'].includes(error.code ?? '') ? 'unknown' : 'failed',
-        errorCode: error instanceof ApiError ? error.code : undefined,
-        error: error instanceof Error ? error.message : '删除结果未知，请刷新状态后决定下一步。',
-      } } : project));
+      let refreshed: ProjectSummary | undefined;
+      try { refreshed = await refreshProject(id); }
+      catch (refreshError) {
+        if (refreshError instanceof ApiError && refreshError.status === 404) {
+          sequence.current++;
+          setProjects(current => current.filter(project => project.id !== id));
+        }
+      }
+      if (!refreshed?.sandboxOperation || refreshed.sandboxOperation.kind !== 'delete') {
+        setProjects(current => current.map(project => project.id === id ? { ...project, sandboxOperation: {
+          ...operation, status: !(error instanceof ApiError) || ['UNKNOWN_OUTCOME', 'TRANSPORT'].includes(error.code ?? '') ? 'unknown' : 'failed',
+          errorCode: error instanceof ApiError ? error.code : undefined,
+          error: error instanceof Error ? error.message : '删除结果未知，请刷新状态后决定下一步。',
+        } } : project));
+      }
       throw error;
     }
-  }, []);
+  }, [refreshProject]);
   const runSandboxOperation = useCallback(async (id: string, kind: ProjectSandboxOperation['kind'], request: () => Promise<ProjectSummary>) => {
     sequence.current++;
     const operation: ProjectSandboxOperation = { kind, phase: '提交请求', status: 'running', updatedAt: new Date().toISOString() };

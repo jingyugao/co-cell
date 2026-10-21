@@ -95,7 +95,12 @@ export class ProjectService {
     return [...this.records.values()].filter(project => options.includeRemoved || !project.removedAt).map(project => structuredClone(project));
   }
   find(id: string): Project | undefined { return structuredClone(this.records.get(id)); }
-  isDeleting(id: string): boolean { return this.deleting.has(id); }
+  isDeleting(id: string): boolean { return this.deleting.has(id) || this.records.get(id)?.status === 'deleting'; }
+  assertAvailable(id: string): void {
+    const project = this.get(id);
+    if (project.removedAt) throw new HttpError(404, '项目不存在');
+    if (this.isDeleting(id)) throw new HttpError(409, '项目正在删除，请完成或重试删除');
+  }
   activeSessionId(id: string): string | null { return this.activeSessions.get(id)?.values().next().value ?? null; }
 
   get(id: string): Project {
@@ -113,19 +118,19 @@ export class ProjectService {
   }
 
   acquire(id?: string): () => void {
-    if (id) this.get(id);
+    if (id) this.assertAvailable(id);
     return () => {};
   }
 
   /** Request-local cancellation; lifecycle operations do not invalidate readers. */
   beginRead(id?: string) {
-    if (id) this.get(id);
+    if (id) this.assertAvailable(id);
     return { signal: new AbortController().signal, release: () => {} };
   }
 
   startSession(projectId: string | undefined, sessionId: string): () => void {
     if (!projectId) return () => {};
-    this.get(projectId);
+    this.assertAvailable(projectId);
     const sessions = this.activeSessions.get(projectId) ?? new Set<string>();
     sessions.add(sessionId);
     this.activeSessions.set(projectId, sessions);
@@ -147,7 +152,8 @@ export class ProjectService {
       project.sandboxReclaimedAt = at;
       if (cleanupPending) delete project.sandboxArtifactsCleanedAt;
       else project.sandboxArtifactsCleanedAt = at;
-      project.status = 'archived'; project.completedAt = null; project.archivedAt = at;
+      if (project.status !== 'deleting') project.status = 'archived';
+      project.completedAt = null; project.archivedAt = at;
       project.lifecycleHistory = [...(project.lifecycleHistory ?? []), { id: randomUUID(), action: 'archived', at, ...(sourceId ? { sandboxId: sourceId } : {}) }];
     }, true);
   }
@@ -204,12 +210,20 @@ export class ProjectService {
     await this.mutateSandboxMetadata(id, project => {
       if (project.sandbox || project.sandboxMounts?.length || project.pendingSandboxCleanup?.length || project.pendingVolumeCleanup?.length)
         throw new HttpError(409, '仍有磁盘或运行环境待清理，项目记录已保留');
-      project.removedAt = new Date().toISOString();
+      project.status = 'archived';
+      project.removedAt ??= new Date().toISOString();
+    });
+  }
+  async markDeleting(id: string) {
+    await this.mutateSandboxMetadata(id, project => {
+      if (!project.removedAt) project.status = 'deleting';
     });
   }
   async updateSandboxOperation(id: string, operation: Project['sandboxOperation'], expectedId?: string) {
     let applied = false;
     await this.mutateSandboxMetadata(id, project => {
+      if (project.status === 'deleting' && operation?.kind !== 'delete')
+        throw new HttpError(409, '项目正在删除，请完成或重试删除');
       if (expectedId !== undefined && project.sandboxOperation?.id !== expectedId) return;
       // An older task may finish after a new request has been recorded.
       if (operation?.status !== 'running' && project.sandboxOperation?.id !== operation?.id) return;
@@ -255,7 +269,7 @@ export class ProjectService {
 
   async markArchivedArtifactsCleaned(id: string) {
     await this.mutateSandboxMetadata(id, project => {
-      if (project.status !== 'archived') throw new HttpError(409, '项目未归档');
+      if (project.status !== 'archived' && project.status !== 'deleting') throw new HttpError(409, '项目未归档');
       delete project.pendingSandboxCleanup;
       delete project.archiveCleanupSourceId;
       project.sandboxArtifactsCleanedAt = new Date().toISOString();
@@ -326,6 +340,7 @@ export class ProjectService {
     this.validate(input);
     await this.writer.run(id, async () => {
       const next = await this.state.mutateProject(id, project => {
+        if (project.status === 'deleting' || project.removedAt) throw new HttpError(409, '项目正在删除或已删除');
         if (input.requirementUrl !== undefined) {
           if (project.type === 2 && !input.requirementUrl?.trim()) throw new HttpError(400, '飞书项目必须绑定飞书需求');
           if (project.type !== 2 && input.requirementUrl) throw new HttpError(400, '只有飞书项目可以绑定飞书需求');
@@ -356,9 +371,10 @@ export class ProjectService {
 
   async updateSandbox(id: string, sandbox: NonNullable<Project['sandbox']>, restoreProject = false, restoreImage?: ProjectImageSelection, expectedSandboxId?: string | null): Promise<boolean> {
     const project = this.records.get(id);
-    if (!project || this.deleting.has(id)) return false;
+    if (!project || this.isDeleting(id)) return false;
     let applied = false;
     await this.mutateSandboxMetadata(id, next => {
+      if (next.status === 'deleting' || (next.removedAt && !restoreProject)) return;
       // Compare only our binding inside the record transaction; no remote lock.
       const expected = expectedSandboxId === undefined ? sandbox.id : expectedSandboxId;
       if (expectedSandboxId !== undefined && (next.sandbox?.id ?? null) !== expected && next.sandbox?.id !== sandbox.id) return;
@@ -397,11 +413,12 @@ export class ProjectService {
         }];
       }
     }, restoreProject);
-    return applied && !this.deleting.has(id);
+    return applied && !this.isDeleting(id);
   }
 
   /** Keep the deletion guard until dependent sessions and the sandbox have been removed. */
   async delete(id: string, removeDependents: (project: Project) => Promise<void>): Promise<void> {
+    await this.markDeleting(id);
     const project = this.get(id);
     this.deleting.add(id);
     try {

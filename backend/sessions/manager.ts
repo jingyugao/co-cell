@@ -445,6 +445,8 @@ export class SessionManager {
       if (!this.isNativeSession(session)) throw new HttpError(409, '此会话不支持原生 WebSocket');
       if (session.archivedAt || (session.projectId && this.projects.get(session.projectId).status !== 'active'))
         throw new HttpError(409, '请先恢复项目和会话再继续对话');
+      if (session.projectId && this.projects.get(session.projectId).sandboxOperation?.status === 'running')
+        throw new HttpError(409, '项目环境操作进行中，请稍后再连接');
       if (session.projectId) await this.ensureProjectSandbox(session.projectId);
       session = this.lookup(id);
       const prepared = await this.sandbox!.prepareNativeSession!(structuredClone(session), signal,
@@ -463,7 +465,9 @@ export class SessionManager {
       throw new HttpError(409, '请先连接原生会话');
     if (session.archivedAt || (session.projectId && this.projects.get(session.projectId).status !== 'active'))
       throw new HttpError(409, '项目或会话已归档');
-    return this.sandbox!.openNativeConnection!(structuredClone(session), signal);
+    if (session.projectId && this.projects.get(session.projectId).sandboxOperation?.status === 'running')
+      throw new HttpError(409, '项目环境操作进行中，请稍后再连接');
+    return { ...await this.sandbox!.openNativeConnection!(structuredClone(session), signal), sandboxId: session.sandbox?.id };
   }
 
   async bindNativeThread(id: string, threadId: string): Promise<Session> {

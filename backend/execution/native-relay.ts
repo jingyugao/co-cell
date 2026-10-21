@@ -8,6 +8,7 @@ import { createMessageObservers, type MessageObservation } from './message-obser
 export type NativeRelayEvent = MessageObservation;
 
 export type NativeRelayOpen = {
+  sandboxId?: string;
   url: string;
   headers?: Record<string, string>;
   release(): Promise<void>;
@@ -44,6 +45,7 @@ type PendingRequest = {
 type RelayConnection = {
   id: string;
   sessionId: string;
+  sandboxId?: string;
   client: WebSocket;
   upstream: WebSocket;
   release(): Promise<void>;
@@ -53,6 +55,12 @@ type RelayConnection = {
   closing: boolean;
   closeTimer?: ReturnType<typeof setTimeout>;
   released: boolean;
+  releaseTask?: Promise<void>;
+};
+
+type PendingSetup = {
+  controller: AbortController;
+  sandboxId?: string;
 };
 
 function safeOnError(onError: NativeRelayOptions['onError'], error: unknown) {
@@ -98,8 +106,10 @@ function writeRejection(socket: Socket, status: number, message: string) {
 export function createNativeRelay(options: NativeRelayOptions) {
   const publicUrl = new URL(options.publicUrl);
   const publicHost = publicUrl.host.toLowerCase();
-  const pending = new Set<AbortController>();
+  const pending = new Map<AbortController, PendingSetup>();
   const connections = new Set<RelayConnection>();
+  const drainingSandboxes = new Map<string, number>();
+  const sandboxReleases = new Map<string, Set<Promise<void>>>();
   const observerPlugins = [...(options.observers ?? []), ...(options.observe ? [{ name: 'observe', observe: options.observe }] : [])];
   const observers = observerPlugins.map(plugin => ({
     name: plugin.name,
@@ -181,13 +191,28 @@ export function createNativeRelay(options: NativeRelayOptions) {
     connection.pendingRequestBytes += requestBytes;
   }
 
-  async function releaseConnection(connection: RelayConnection) {
-    if (connection.released) return;
+  function trackSandboxRelease(sandboxId: string | undefined, task: Promise<void>) {
+    if (!sandboxId) return;
+    const tasks = sandboxReleases.get(sandboxId) ?? new Set<Promise<void>>();
+    tasks.add(task);
+    sandboxReleases.set(sandboxId, tasks);
+    const remove = () => {
+      tasks.delete(task);
+      if (!tasks.size) sandboxReleases.delete(sandboxId);
+    };
+    void task.then(remove, remove);
+  }
+
+  function releaseConnection(connection: RelayConnection): Promise<void> {
+    if (connection.releaseTask) return connection.releaseTask;
     connection.released = true;
     if (connection.closeTimer) clearTimeout(connection.closeTimer);
     connections.delete(connection);
-    try { await connection.release(); }
-    catch (error) { safeOnError(options.onError, error); }
+    connection.releaseTask = (async () => {
+      try { await connection.release(); }
+      catch (error) { safeOnError(options.onError, error); }
+    })();
+    return connection.releaseTask;
   }
 
   function terminatePair(connection: RelayConnection, code = 1011, reason = 'Relay closed') {
@@ -290,20 +315,25 @@ export function createNativeRelay(options: NativeRelayOptions) {
     }
 
     const controller = new AbortController();
-    pending.add(controller);
+    const pendingSetup: PendingSetup = { controller };
+    pending.set(controller, pendingSetup);
     const abortOnDisconnect = () => controller.abort(new Error('Browser disconnected during relay setup'));
     socket.once('close', abortOnDisconnect);
     socket.once('error', abortOnDisconnect);
     let opened: NativeRelayOpen | undefined;
     let upstream: WebSocket | undefined;
     let releaseStarted = false;
+    let releasePromise: Promise<void> | undefined;
     let connectionOwned = false;
     let abandonedOpen = false;
     let setupTimer: ReturnType<typeof setTimeout> | undefined;
     const releaseOpened = async () => {
-      if (!opened || releaseStarted) return;
+      if (!opened) return;
+      if (releaseStarted) return releasePromise;
       releaseStarted = true;
-      await opened.release();
+      releasePromise = Promise.resolve().then(() => opened!.release());
+      trackSandboxRelease(opened.sandboxId, releasePromise);
+      await releasePromise;
     };
     const earlyMessages: Array<{ data: WebSocket.RawData; isBinary: boolean }> = [];
     let earlyBytes = 0;
@@ -328,7 +358,14 @@ export function createNativeRelay(options: NativeRelayOptions) {
       setupTimer.unref?.();
       const opening = options.open(sessionId, controller.signal);
       void opening.then(value => {
-        if (abandonedOpen) void value.release().catch(error => safeOnError(options.onError, error));
+        pendingSetup.sandboxId = value.sandboxId;
+        if (value.sandboxId && drainingSandboxes.has(value.sandboxId))
+          controller.abort(new Error('Sandbox is draining'));
+        if (abandonedOpen) {
+          const lateRelease = Promise.resolve().then(() => value.release());
+          trackSandboxRelease(value.sandboxId, lateRelease);
+          void lateRelease.catch(error => safeOnError(options.onError, error));
+        }
       }, error => { if (abandonedOpen) safeOnError(options.onError, error); });
       let removeAbortListener = () => {};
       const abortPromise = new Promise<never>((_resolve, reject) => {
@@ -342,8 +379,10 @@ export function createNativeRelay(options: NativeRelayOptions) {
       try { opened = await Promise.race([opening, abortPromise]); }
       catch (error) { abandonedOpen = true; throw error; }
       finally { removeAbortListener(); }
+      pendingSetup.sandboxId = opened.sandboxId;
       controller.signal.throwIfAborted();
-      if (closing) throw new Error('Relay is closing');
+      if (closing || (opened.sandboxId && drainingSandboxes.has(opened.sandboxId)))
+        throw new Error(closing ? 'Relay is closing' : 'Sandbox is draining');
       const protocols = protocolList(request);
       upstream = new WebSocket(opened.url, protocols, { headers: opened.headers, maxPayload: MAX_PAYLOAD_BYTES,
         handshakeTimeout: UPSTREAM_HANDSHAKE_TIMEOUT_MS, perMessageDeflate: false });
@@ -376,7 +415,7 @@ export function createNativeRelay(options: NativeRelayOptions) {
         upstream?.off('message', onEarlyMessage);
         upstream?.off('error', onEarlyError);
         upstream?.off('close', onEarlyClose);
-        if (closing) {
+        if (closing || (opened?.sandboxId && drainingSandboxes.has(opened.sandboxId))) {
           client.terminate(); upstream?.terminate();
           void releaseOpened().catch(error => safeOnError(options.onError, error));
           return;
@@ -386,7 +425,7 @@ export function createNativeRelay(options: NativeRelayOptions) {
           void releaseOpened().catch(error => safeOnError(options.onError, error));
           return;
         }
-        const relay: RelayConnection = { id: randomUUID(), sessionId, client, upstream, release: releaseOpened,
+        const relay: RelayConnection = { id: randomUUID(), sessionId, sandboxId: pendingSetup.sandboxId, client, upstream, release: releaseOpened,
           requests: new Map(), pendingRequestCount: 0, pendingRequestBytes: 0, closing: false, released: false };
         connectionOwned = true;
         connections.add(relay);
@@ -399,7 +438,12 @@ export function createNativeRelay(options: NativeRelayOptions) {
       upstream?.off('message', onEarlyMessage);
       upstream?.off('error', onEarlyError);
       upstream?.off('close', onEarlyClose);
-      if (upstream && upstream.readyState !== WebSocket.CLOSED) upstream.terminate();
+      if (upstream && upstream.readyState !== WebSocket.CLOSED) {
+        // ws emits an error when a connecting socket is terminated. Keep a
+        // listener installed until its close event even after setup cleanup.
+        upstream.on('error', onEarlyError);
+        upstream.terminate();
+      }
       if (!socket.destroyed) writeRejection(socket, closing ? 503 : 502, closing ? 'Relay is closing' : 'Unable to connect to App Server');
       if (!connectionOwned && opened) {
         try { await releaseOpened(); } catch (releaseError) { safeOnError(options.onError, releaseError); }
@@ -411,10 +455,47 @@ export function createNativeRelay(options: NativeRelayOptions) {
     }
   }
 
+  async function closeSandbox(sandboxId: string): Promise<void> {
+    if (!sandboxId) return;
+    drainingSandboxes.set(sandboxId, (drainingSandboxes.get(sandboxId) ?? 0) + 1);
+    const deadline = Date.now() + SOCKET_CLOSE_MS + OBSERVATION_DRAIN_MS;
+    try {
+      for (const setup of pending.values()) {
+        if (setup.sandboxId === sandboxId)
+          setup.controller.abort(new Error('Sandbox is draining'));
+      }
+      const matching = () => [...connections].filter(connection => connection.sandboxId === sandboxId);
+      for (const connection of matching()) terminatePair(connection, 1001, 'Sandbox is pausing');
+      while (Date.now() < deadline) {
+        const remaining = matching();
+        const pendingMatching = [...pending.values()].some(setup => setup.sandboxId === sandboxId);
+        if (!remaining.length && !pendingMatching && !sandboxReleases.has(sandboxId)) break;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      const remaining = matching();
+      const releases = remaining.map(connection => {
+        connection.client.terminate();
+        connection.upstream.terminate();
+        return releaseConnection(connection);
+      });
+      releases.push(...(sandboxReleases.get(sandboxId) ?? []));
+      const stillPending = [...pending.values()].filter(setup => setup.sandboxId === sandboxId);
+      for (const setup of stillPending) setup.controller.abort(new Error('Sandbox is draining'));
+      const timeLeft = Math.max(0, deadline - Date.now());
+      if (releases.length && timeLeft > 0) {
+        await Promise.race([Promise.all(releases), new Promise(resolve => setTimeout(resolve, timeLeft))]);
+      }
+    } finally {
+      const activeDrains = (drainingSandboxes.get(sandboxId) ?? 1) - 1;
+      if (activeDrains > 0) drainingSandboxes.set(sandboxId, activeDrains);
+      else drainingSandboxes.delete(sandboxId);
+    }
+  }
+
   async function close(): Promise<void> {
     if (closing) return;
     closing = true;
-    for (const controller of pending) controller.abort(new Error('Relay is closing'));
+    for (const controller of pending.keys()) controller.abort(new Error('Relay is closing'));
     for (const connection of connections) terminatePair(connection, 1001, 'Relay is shutting down');
     const deadline = Date.now() + SOCKET_CLOSE_MS + OBSERVATION_DRAIN_MS;
     while ((pending.size || connections.size) && Date.now() < deadline) {
@@ -427,5 +508,5 @@ export function createNativeRelay(options: NativeRelayOptions) {
     await new Promise<void>(resolve => wss.close(() => resolve()));
   }
 
-  return { matches, upgrade, close };
+  return { matches, upgrade, close, closeSandbox };
 }

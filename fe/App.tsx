@@ -153,7 +153,7 @@ export default function App() {
   const entry = useProjectEntry(entryProjectId, entryProjectId ?? '', enterProject);
   const historyReady = !project || (isProjectSandboxReady(project) && !entry.pending);
   const nativeEnabled = Boolean(config?.capabilities.nativeWebSocket && sessions.find(item => item.id === selected)?.settings.executionMode === 'sandbox');
-  const nativeConnectEnabled = nativeEnabled && !sessions.find(item => item.id === selected)?.archivedAt && !projectReadOnly;
+  const nativeConnectEnabled = nativeEnabled && page === 'chat' && !sessions.find(item => item.id === selected)?.archivedAt && !projectReadOnly;
   const nativeHistoryManaged = nativeConnectEnabled && historyReady;
   const { session, setSession, connected: streamConnected, loadOlder, loadingOlder, loadingHistory } = useSessionStream({
     selected, enabled: !loading, historyReady, native: nativeEnabled, nativeHistoryManaged, onState: refreshWorkspace, onError: setError,

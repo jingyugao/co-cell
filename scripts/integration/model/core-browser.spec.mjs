@@ -9,6 +9,8 @@ test('core: real browser creates a project, sends commands and reloads an active
   const marker = randomUUID(), filename = `browser-${marker}.txt`;
   const submitted = [], streams = [];
   const nativeTurns = new EventEmitter();
+  const nativeCommandStarts = [];
+  const nativeCommandEvents = new EventEmitter();
   page.on('websocket', socket => {
     const sessionId = /^\/api\/sessions\/([^/]+)\/app-server$/.exec(new URL(socket.url()).pathname)?.[1];
     if (!sessionId) return;
@@ -21,6 +23,11 @@ test('core: real browser creates a project, sends commands and reloads an active
       const message = JSON.parse(String(frame.payload));
       if (message.method === 'turn/started' && message.params?.turn?.id)
         nativeTurns.emit('started', { sessionId, turnId: message.params.turn.id });
+      if (message.method === 'item/started' && message.params?.item?.type === 'commandExecution') {
+        const event = { sessionId, turnId: message.params.turnId, item: message.params.item };
+        nativeCommandStarts.push(event);
+        nativeCommandEvents.emit('started', event);
+      }
     });
   });
   page.on('request', request => {
@@ -39,6 +46,26 @@ test('core: real browser creates a project, sends commands and reloads an active
   const send = page.getByRole('button', { name: '发送任务', exact: true });
   const appConfig = await env.json('/api/config');
   const native = appConfig.capabilities.nativeWebSocket === true;
+  const waitNativeCommandStart = (sessionId, turnId) => {
+    const find = () => nativeCommandStarts.find(event => event.sessionId === sessionId
+      && event.turnId === turnId && event.item.command?.includes(marker));
+    const existing = find();
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        nativeCommandEvents.off('started', onStarted);
+        reject(new Error(`Timed out waiting for native commandExecution start for turn ${turnId}`));
+      }, env.config.operationTimeout);
+      const onStarted = () => {
+        const event = find();
+        if (!event) return;
+        clearTimeout(timeout);
+        nativeCommandEvents.off('started', onStarted);
+        resolve(event);
+      };
+      nativeCommandEvents.on('started', onStarted);
+    });
+  };
   const nextAcceptedTurn = () => native
     ? once(nativeTurns, 'started', { signal: AbortSignal.timeout(env.config.operationTimeout) }).then(([turn]) => turn)
     : page.waitForResponse(response => response.status() === 202 && response.request().method() === 'POST'
@@ -61,7 +88,8 @@ test('core: real browser creates a project, sends commands and reloads an active
   const { sessionId, turnId } = await accepted;
   const session = await env.json(`/api/sessions/${sessionId}`);
   await env.step('Reload after the agent command starts; preserve the active native turn', async () => {
-    await waitCommandStart(env, session, marker);
+    if (native) await waitNativeCommandStart(sessionId, turnId);
+    else await waitCommandStart(env, session, marker);
     const running = await env.json(`/api/sessions/${sessionId}`);
     assert.equal(running.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId)?.status, 'running');
     await page.reload();

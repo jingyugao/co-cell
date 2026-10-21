@@ -92,12 +92,16 @@ if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOK
 const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,clientId:process.env.CELLBOX_CLIENT_ID,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',templateId:process.env.CELLBOX_TEMPLATE_ID,revisionId:process.env.CELLBOX_REVISION_ID});
 await cellboxProvider.initialize();
 let manager: SessionManager;
+let closeNativeSandboxConnections = async (_id: string): Promise<void> => {};
 const secrets = new SecretService(webState.secretRepository, secretCrypto);
 if (sharedDirectory) await secrets.mountHomes(sharedDataRoot);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
   error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); }, multiApi ? 0 : undefined);
 const cellboxRuntime=new CellboxRuntimeIntegration({provider:cellboxProvider,profileId:process.env.CELLBOX_PROFILE!,appServerArgs:appServerArguments,
-  extensions: [appServerReader.extension],
+  extensions: [{ name: 'native-app-server-connections', pre: async context => {
+    if (context.sandboxId && ['pause', 'checkpoint', 'destroy'].includes(context.action))
+      await closeNativeSandboxConnections(context.sandboxId);
+  } }, appServerReader.extension],
   env:appServerEnv, sharedDirectory, ...(sharedDirectory ? { sharedDataRoot } : {}),
   secrets, toolBrokerUrl, logger: runtimeLog,
 });
@@ -218,6 +222,7 @@ const nativeRelay = createNativeRelay({ publicUrl, token: process.env.COCELL_ACC
   } }, { name: 'session-projection', observe: event => manager.observeNativeMessage(event) }],
   onError: error => { void runtimeLog.write({ event: 'app_server.observer_or_transport_failed', error }); },
 });
+closeNativeSandboxConnections = id => nativeRelay.closeSandbox(id);
 const server = createServer((request, response) => {
   void (async () => {
     if (previewProxy && await previewProxy.handle(request, response)) return;

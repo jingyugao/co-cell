@@ -8,6 +8,18 @@ export interface NotificationRepository {
   importLegacy(notifications: AppNotification[]): Promise<void>;
 }
 
+/** Reuse the caller's transaction when a notification belongs to a business update. */
+export async function saveNotificationsInTransaction(connection: Pick<PoolConnection, 'query'>, notifications: AppNotification[]) {
+  if (!notifications.length) return;
+  await connection.query('SELECT id FROM notification_store_state WHERE id=1 FOR UPDATE');
+  for (const notification of notifications) {
+    await connection.query(`INSERT INTO notifications (id,created_at,read_at,document) VALUES (?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE read_at=COALESCE(read_at,VALUES(read_at))`,
+      [notification.id, new Date(notification.createdAt).toISOString().slice(0, 23).replace('T', ' '),
+        notification.readAt ? new Date(notification.readAt).toISOString().slice(0, 23).replace('T', ' ') : null, JSON.stringify(notification)]);
+  }
+  await connection.query(`DELETE FROM notifications WHERE id NOT IN (SELECT id FROM (SELECT id FROM notifications ORDER BY created_at DESC,id DESC LIMIT 500) retained)`);
+}
+
 /** Uses the web-state pool. Every read and write uses durable MySQL state. */
 export class MySqlNotificationRepository implements NotificationRepository {
   constructor(private readonly pool: Pool) {}
@@ -39,20 +51,12 @@ export class MySqlNotificationRepository implements NotificationRepository {
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
-      await connection.query('SELECT id FROM notification_store_state WHERE id=1 FOR UPDATE');
-      for (const notification of notifications) await this.insert(connection, notification);
-      await connection.query(`DELETE FROM notifications WHERE id NOT IN (SELECT id FROM (SELECT id FROM notifications ORDER BY created_at DESC,id DESC LIMIT 500) retained)`);
+      await saveNotificationsInTransaction(connection, notifications);
       await connection.commit();
     } catch (error) {
       await connection.rollback();
       throw error;
     } finally { connection.release(); }
-  }
-
-  private async insert(connection: PoolConnection, notification: AppNotification) {
-    // Re-importing a legacy file preserves existing database content/read state.
-    await connection.query(`INSERT INTO notifications (id,created_at,read_at,document) VALUES (?,?,?,CAST(? AS JSON)) ON DUPLICATE KEY UPDATE read_at=COALESCE(read_at,VALUES(read_at))`,
-      [notification.id, this.date(notification.createdAt), notification.readAt ? this.date(notification.readAt) : null, JSON.stringify(notification)]);
   }
 
   private date(value: string) { return new Date(value).toISOString().slice(0, 23).replace('T', ' '); }

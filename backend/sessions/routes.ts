@@ -22,7 +22,7 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   };
   app.get('/api/sessions', async c => {
     c.header('Cache-Control', 'no-store');
-    return c.json(manager.list());
+    return c.json(await manager.listStored());
   });
   app.post('/api/sessions', async c => {
     const input = z.object({
@@ -46,17 +46,17 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   });
   app.get('/api/sessions/:id/billing', async c => c.json(await manager.billing(c.req.param('id'))));
   app.post('/api/sessions/:id/connection', async c => {
-    requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);
+    requireAllowedExecution((await manager.readMetadata(c.req.param('id'))).settings.executionMode);
     return c.json(await manager.nativeConnection(c.req.param('id'), c.req.raw.signal));
   });
   app.post('/api/sessions/:id/thread', async c => {
     const { threadId } = z.object({ threadId: z.string().min(1).max(191) }).strict().parse(await c.req.json());
-    requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);
+    requireAllowedExecution((await manager.readMetadata(c.req.param('id'))).settings.executionMode);
     return c.json(await manager.bindNativeThread(c.req.param('id'), threadId));
   });
   app.patch('/api/sessions/:id', async c => {
     const input = z.object({ title: z.string().trim().min(1).max(100).optional(), settings: settingsSchema.optional(), archived: z.boolean().optional() }).strict().parse(await c.req.json());
-    requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);
+    requireAllowedExecution((await manager.readMetadata(c.req.param('id'))).settings.executionMode);
     if (input.settings?.executionMode) requireAllowedExecution(input.settings.executionMode);
     return c.json(await manager.update(c.req.param('id'), input));
   });
@@ -66,7 +66,7 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   });
   app.post('/api/sessions/:id/turns', async c => {
     const input = z.object({ prompt: z.string().trim().min(1).max(200_000), images: z.array(z.string().max(4096)).max(5).default([]) }).strict().parse(await c.req.json());
-    requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);
+    requireAllowedExecution((await manager.readMetadata(c.req.param('id'))).settings.executionMode);
     const turnId = await manager.startTurn(c.req.param('id'), input.prompt, input.images);
     return c.json({ turnId } satisfies SubmitTurnResponse, 202);
   });
@@ -76,12 +76,12 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   });
   app.post('/api/sessions/:id/turns/:turnId/user-input/:requestId', async c => {
     const { answer, answers } = z.object({ answer: z.string().trim().min(1).max(20_000), answers: z.array(z.string().trim().min(1).max(20_000)).min(1).max(10).optional() }).strict().parse(await c.req.json());
-    requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);
+    requireAllowedExecution((await manager.readMetadata(c.req.param('id'))).settings.executionMode);
     return c.json(await manager.answerUserInput(c.req.param('id'), c.req.param('turnId'), c.req.param('requestId'), answer, answers));
   });
   app.get('/api/sessions/:id/events', async c => {
     const id = c.req.param('id');
-    manager.get(id);
+    await manager.readMetadata(id);
     return streamSSE(c, async stream => {
       let queue: Promise<void> = Promise.resolve();
       let closed = false;
@@ -104,7 +104,7 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
     });
   });
   app.post('/api/sessions/:id/images', async c => {
-    requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);
+    requireAllowedExecution((await manager.readMetadata(c.req.param('id'))).settings.executionMode);
     const form = await c.req.formData();
     const image = form.get('image');
     if (!(image instanceof File)) throw new HttpError(400, '请选择图片文件');

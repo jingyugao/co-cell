@@ -7,10 +7,12 @@ import type { Project, Session, Turn } from '../../../protocol/types.js';
 import type { InputRequestRecord } from '../../../protocol/input-request-types.js';
 import type { NativeSecretFiles } from '../../secrets/native-files.js';
 import { MySqlSecretRepository } from '../../secrets/repository.js';
-import { MySqlNotificationRepository } from '../../notifications/repository.js';
+import { MySqlNotificationRepository, saveNotificationsInTransaction } from '../../notifications/repository.js';
+import { applyNativeEvent, type NativeBusinessEvent } from '../../sessions/native-events.js';
+import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../../util/user-input.js';
 import { HttpError } from '../../../util/errors.js';
 import { mergeRecord } from './record-merge.js';
-import { date, inputRequestFromRow, mainTurnValues, projectFromRow, projectValues, PROJECT_COLUMNS, requestTurnValues, SESSION_COLUMNS, sessionFromRow, sessionValues, turnFromRow, type SessionTurnRow } from './relational-records.js';
+import { date, fromJson, iso, inputRequestFromRow, mainTurnValues, projectFromRow, projectValues, PROJECT_COLUMNS, requestTurnValues, SESSION_COLUMNS, sessionFromRow, sessionValues, turnFromRow, type SessionTurnRow } from './relational-records.js';
 
 export interface WebStateStore {
   init(): Promise<void>; listProjects(): Promise<Project[]>; listSessions(): Promise<Session[]>;
@@ -18,8 +20,10 @@ export interface WebStateStore {
   getProject(id: string): Promise<Project | undefined>; getSession(id: string): Promise<Session | undefined>;
   /** The synchronous mutation runs against the latest project in a short transaction. */
   mutateProject(id: string, mutate: (current: Project) => void): Promise<Project>;
-  saveProject(project: Project, previous?: Project): Promise<void>; saveSession(session: Session, previous?: Session): Promise<void>;
+  saveProject(project: Project, previous?: Project): Promise<void>; saveSession(session: Session, previous?: Session, metadataOnly?: boolean): Promise<void>;
   saveInputRequest?(request: InputRequestRecord): Promise<void>; listInputRequests?(sessionId: string): Promise<InputRequestRecord[]>;
+  /** Deduplication, projection, notifications and result reads share one transaction. */
+  consumeNativeEvents?(events: NativeBusinessEvent[]): Promise<Session | undefined>;
   deleteProject(id: string): Promise<void>; deleteSession(id: string): Promise<void>; close(): Promise<void>;
 }
 
@@ -91,6 +95,13 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       archived_at DATETIME(3) NULL,created_at DATETIME(3) NOT NULL,updated_at DATETIME(3) NOT NULL,
       UNIQUE KEY projects_current_box (current_box_id),INDEX projects_status_updated(status,updated_at),INDEX projects_type_week(type,week_of)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS app_server_events (
+      event_key CHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+      session_id CHAR(36) NOT NULL,thread_id VARCHAR(191) NOT NULL,turn_id VARCHAR(200) NOT NULL,
+      kind ENUM('turn','input','usage','question') NOT NULL,payload_json JSON NOT NULL,
+      event_at DATETIME(3) NOT NULL,received_at DATETIME(3) NOT NULL,
+      INDEX app_server_events_session(session_id,kind),INDEX app_server_events_turn(session_id,thread_id,turn_id,kind,event_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     const [projectStatus] = await this.pool.query<Array<RowDataPacket & { COLUMN_TYPE: string }>>(
       "SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='projects' AND COLUMN_NAME='status'");
     if (projectStatus.length && !projectStatus[0].COLUMN_TYPE.includes("'deleting'"))
@@ -148,18 +159,18 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   }
   async listSessions(): Promise<Session[]> {
     const [rows] = await this.pool.query<Array<RowDataPacket & Record<string, unknown>>>(`SELECT ${SESSION_COLUMNS} FROM sessions`);
-    return this.hydrateSessions(rows);
+    return this.hydrateSessions(rows, this.pool, false);
   }
   async listProjectSessions(projectId: string): Promise<Session[]> {
     const [rows] = await this.pool.query<Array<RowDataPacket & Record<string, unknown>>>(
       `SELECT ${SESSION_COLUMNS} FROM sessions WHERE project_id = ?`, [projectId]);
-    return this.hydrateSessions(rows);
+    return this.hydrateSessions(rows, this.pool, false);
   }
-  private async hydrateSessions(rows: Array<Record<string, unknown>>): Promise<Session[]> {
+  private async hydrateSessions(rows: Array<Record<string, unknown>>, executor: Pick<Pool, 'query'> = this.pool, nativeMetadata = true): Promise<Session[]> {
     if (!rows.length) return [];
     const ids = rows.map(row => String(row.id));
     const placeholders = ids.map(() => '?').join(',');
-    const [turnRows] = await this.pool.query<Array<RowDataPacket & SessionTurnRow>>(
+    const [turnRows] = await executor.query<Array<RowDataPacket & SessionTurnRow>>(
       `SELECT id,session_id,target_turn_id,type,input_text,images_json,native_turn_id,codex_accepted,turn_status,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,sdk_input_tokens,sdk_cached_input_tokens,sdk_cache_write_input_tokens,sdk_output_tokens,sdk_reasoning_output_tokens,started_at,completed_at,error
        FROM session_turns st WHERE st.session_id IN (${placeholders}) AND st.id=st.target_turn_id AND
        (st.turn_status='running' OR st.id=(SELECT st2.id FROM session_turns st2 WHERE st2.session_id=st.session_id AND st2.id=st2.target_turn_id
@@ -169,17 +180,119 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     const projects = new Map<string, Project>();
     const projectIds = [...new Set(rows.map(r => r.project_id).filter((v): v is string => typeof v === 'string'))];
     if (projectIds.length) {
-      const [projectRows] = await this.pool.query<Array<RowDataPacket & Record<string, unknown>>>(
+      const [projectRows] = await executor.query<Array<RowDataPacket & Record<string, unknown>>>(
         `SELECT ${PROJECT_COLUMNS} FROM projects WHERE id IN (${projectIds.map(() => '?').join(',')})`, projectIds);
       for (const row of projectRows) projects.set(String(row.id), projectFromRow(row));
     }
-    return rows.map(row => {
+    const sessions = rows.map(row => {
       const session = sessionFromRow(row); session.turns = bySession.get(session.id) ?? [];
       const project = session.projectId ? projects.get(session.projectId) : undefined;
       if (project?.sandbox) session.sandbox = project.sandbox;
       if (project?.imageSelection) session.imageSelection = project.imageSelection;
       return session;
-    }).filter((value): value is Session => !!value);
+    });
+    if (nativeMetadata) await this.hydrateNativeMetadata(sessions, executor);
+    return sessions;
+  }
+
+  private async hydrateNativeMetadata(sessions: Session[], executor: Pick<Pool, 'query'>) {
+    const native = sessions.filter(session => session.settings.executionMode === 'sandbox' && session.threadId);
+    if (!native.length) return;
+    const ids = native.map(session => session.id);
+    const placeholders = ids.map(() => '?').join(',');
+    const [inputs] = await executor.query<Array<RowDataPacket & SessionTurnRow>>(
+      `SELECT * FROM session_turns WHERE session_id IN (${placeholders}) AND id<>target_turn_id
+       AND type IN ('steer','question_reply') AND delivery_status='accepted' ORDER BY started_at,id`, ids);
+    const [questions] = await executor.query<Array<RowDataPacket & { session_id: string; thread_id: string; turn_id: string; payload_json: unknown }>>(
+      `SELECT session_id,thread_id,turn_id,payload_json FROM app_server_events WHERE session_id IN (${placeholders}) AND kind='question' ORDER BY received_at,event_key`, ids);
+    for (const session of native) {
+      for (const turn of session.turns) {
+        turn.additionalUserInputs = inputs.filter(input => input.session_id === session.id && input.target_turn_id === turn.id).map(input => input.input_text);
+        for (const row of questions) {
+          if (row.session_id !== session.id || row.thread_id !== session.threadId || row.turn_id !== turn.nativeTurnId) continue;
+          const question = fromJson<NativeBusinessEvent['payload']>(row.payload_json, {}).question;
+          if (!question) continue;
+          turn.userInputRequests ??= [];
+          const previous = turn.userInputRequests.find(value => value.id === question.id);
+          if (previous) Object.assign(previous, question, { createdAt: previous.createdAt });
+          else turn.userInputRequests.push(question);
+        }
+      }
+      const answers: NativeUserInputAnswers = new Map();
+      collectNativeUserInputAnswers(session.turns, answers);
+      session.turns = session.turns.map(turn => withNativeUserInput(turn, answers));
+    }
+  }
+
+  async consumeNativeEvents(events: NativeBusinessEvent[]): Promise<Session | undefined> {
+    if (!events.length) return undefined;
+    const { sessionId, threadId } = events[0];
+    if (events.some(event => event.sessionId !== sessionId || event.threadId !== threadId))
+      throw new Error('A native transaction must belong to one session and thread');
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      // The same session row also fences deletion and concurrent metadata edits.
+      const [rows] = await connection.query<Array<RowDataPacket & Record<string, unknown>>>(
+        `SELECT ${SESSION_COLUMNS} FROM sessions WHERE id=? FOR UPDATE`, [sessionId]);
+      if (!rows[0] || rows[0].thread_id !== threadId || rows[0].execution_mode !== 'sandbox') {
+        await connection.commit();
+        return undefined;
+      }
+      let session = sessionFromRow(rows[0]);
+      const [turnRows] = await connection.query<Array<RowDataPacket & SessionTurnRow>>(
+        'SELECT * FROM session_turns WHERE session_id=? ORDER BY started_at,id FOR UPDATE', [sessionId]);
+      session.turns = turnRows.filter(row => row.id === row.target_turn_id).map(turnFromRow);
+      await this.hydrateNativeMetadata([session], connection);
+      const project = session.projectId ? await this.projectInTransaction(connection, session.projectId) : undefined;
+      if (project?.removedAt || project?.status === 'deleting') { await connection.commit(); return undefined; }
+      const notifications = [];
+      let changed = false;
+      for (const event of events) {
+        const [seen] = await connection.query<RowDataPacket[]>('SELECT event_key FROM app_server_events WHERE event_key=?', [event.key]);
+        if (seen.length) continue;
+        changed = true;
+        let usageObservedAt: string | undefined;
+        let usageTotalTokens: number | undefined;
+        if (event.kind === 'usage') {
+          const [usage] = await connection.query<Array<RowDataPacket & { observed_at: unknown; total_tokens: number | string | null }>>(
+            `SELECT MAX(CASE WHEN JSON_EXTRACT(payload_json,'$.usage.sourceAt') IS NOT NULL THEN event_at END) AS observed_at,
+             MAX(CAST(JSON_UNQUOTE(JSON_EXTRACT(payload_json,'$.usage.totalTokens')) AS UNSIGNED)) AS total_tokens
+             FROM app_server_events WHERE session_id=? AND thread_id=? AND turn_id=? AND kind='usage'`,
+            [sessionId, threadId, event.turnId]);
+          usageObservedAt = iso(usage[0]?.observed_at) ?? undefined;
+          if (usage[0]?.total_tokens != null) usageTotalTokens = Number(usage[0].total_tokens);
+        }
+        await connection.query(`INSERT INTO app_server_events (event_key,session_id,thread_id,turn_id,kind,payload_json,event_at,received_at)
+          VALUES (?,?,?,?,?,CAST(? AS JSON),?,?)`, [event.key, sessionId, threadId, event.turnId, event.kind, JSON.stringify(event.payload),
+          date(event.payload.usage?.observedAt ?? event.receivedAt), date(event.receivedAt)]);
+        const result = applyNativeEvent(session, event, { projectName: project?.name, usageObservedAt, usageTotalTokens,
+          inputExists: !!event.payload.input && turnRows.some(row => row.id === event.payload.input!.id) });
+        session = result.session;
+        await this.upsertMainTurn(connection, sessionId, result.turn);
+        if (result.input) {
+          result.input.turnId = result.turn.id;
+          await this.upsertInputRequest(connection, result.input);
+        }
+        if (result.notification) notifications.push(result.notification);
+      }
+      if (changed) await this.saveSessionRow(connection, session);
+      await saveNotificationsInTransaction(connection, notifications);
+      // Read the canonical projection inside this transaction and return only after commit.
+      const [finalRows] = await connection.query<Array<RowDataPacket & Record<string, unknown>>>(
+        `SELECT ${SESSION_COLUMNS} FROM sessions WHERE id=?`, [sessionId]);
+      const result = finalRows[0] ? (await this.hydrateSessions(finalRows, connection))[0] : undefined;
+      await connection.commit();
+      return result;
+    } catch (error) {
+      await connection.rollback().catch(() => undefined);
+      throw error;
+    } finally { connection.release(); }
+  }
+
+  private async projectInTransaction(connection: Pick<Pool, 'query'>, id: string) {
+    const [rows] = await connection.query<Array<RowDataPacket & Record<string, unknown>>>(`SELECT ${PROJECT_COLUMNS} FROM projects WHERE id=?`, [id]);
+    return rows[0] ? projectFromRow(rows[0]) : undefined;
   }
   async mutateProject(id: string, mutate: (current: Project) => void): Promise<Project> {
     const connection = await this.pool.getConnection();
@@ -213,9 +326,9 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     if (previous && previous.id !== project.id) return Promise.reject(new HttpError(409, '不能将记录基线用于其他记录'));
     return previous ? this.mergeProject(project, previous) : this.saveProjectWith(this.pool, project);
   }
-  saveSession(session: Session, previous?: Session): Promise<void> {
+  saveSession(session: Session, previous?: Session, metadataOnly = false): Promise<void> {
     if (previous && previous.id !== session.id) return Promise.reject(new HttpError(409, '不能将记录基线用于其他记录'));
-    return this.saveSessionRelational(session, previous);
+    return this.saveSessionRelational(session, previous, metadataOnly);
   }
   async saveInputRequest(request: InputRequestRecord): Promise<void> {
     const connection = await this.pool.getConnection();
@@ -302,6 +415,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       await connection.beginTransaction();
       await connection.query('SELECT id FROM sessions WHERE id=? FOR UPDATE', [id]);
       await connection.query('DELETE FROM session_turns WHERE session_id=?', [id]);
+      await connection.query('DELETE FROM app_server_events WHERE session_id=?', [id]);
       await connection.query('DELETE FROM sessions WHERE id=?', [id]);
       await connection.commit();
     } catch (error) { await connection.rollback().catch(() => undefined); throw error; }
@@ -328,7 +442,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     } catch (error) { await connection.rollback().catch(() => undefined); throw error; }
     finally { connection.release(); }
   }
-  private async saveSessionRelational(session: Session, previous?: Session) {
+  private async saveSessionRelational(session: Session, previous?: Session, metadataOnly = false) {
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
@@ -346,12 +460,16 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
         const latest = sessionFromRow(found[0]);
         effective = { ...mergeRecord(this.sessionMergeShape(previous), this.sessionMergeShape(session), this.sessionMergeShape(latest)), turns: session.turns } as Session;
       }
+      if (metadataOnly && found[0]) {
+        const latest = sessionFromRow(found[0]);
+        effective = { ...effective, status: latest.status, turnCount: latest.turnCount, contextUsage: latest.contextUsage };
+      }
       await this.saveSessionRow(connection, effective);
       // Save only the active/control turns already present in the web session. Native history
       // loaded for display is never imported; existing rows remain untouched when omitted.
       const turns = effective.turns ?? [];
       const active = turns.filter(turn => !!turn.type);
-      for (const turn of active) await this.upsertMainTurn(connection, effective.id, turn);
+      if (!metadataOnly) for (const turn of active) await this.upsertMainTurn(connection, effective.id, turn);
       await connection.commit();
     } catch (error) { await connection.rollback().catch(() => undefined); throw error; }
     finally { connection.release(); }

@@ -237,8 +237,9 @@ export interface ProjectSummary extends Project { sessionCount: number; activeSe
 
 export const PROJECT_OPERATION_WAIT_MS = 10_000;
 
-/** GET /api/projects/:id remains read-only. Optional query parameters wait for
- * this durable operation to finish (success or failure), then return its latest
+/** GET /api/projects/:id remains read-only and queries storage on every request.
+ * Optional query parameters poll storage until the durable operation finishes
+ * (success or failure), then return its latest
  * persisted view. An operation replaced before completion returns the current
  * view; a timeout returns the current view. Disconnecting cancels only this wait. */
 export interface ProjectReadOptions {

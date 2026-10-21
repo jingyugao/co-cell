@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type Project, type ProjectSummary, type Session, type SessionSummary, type SessionTurnPage, type Settings, type StreamMessage, type SubagentConversation, type Turn } from '../../protocol/types.js';
 import type { SandboxRuntime, ServiceProxyAccess } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
@@ -818,53 +819,33 @@ export class SessionManager {
   }
 
   async readProject(id: string, options: ProjectReadOptions = {}, signal?: AbortSignal): Promise<ProjectSummary> {
-    await this.projects.refreshOne(id);
-    if (this.projects.get(id).removedAt) throw new HttpError(404, '项目不存在');
-    if (options.waitForOperation) {
-      await traced('project.wait', { 'operation.id': options.waitForOperation }, async () => {
-        await this.waitForProjectOperation(id, options.waitForOperation!, options.waitMs ?? PROJECT_OPERATION_WAIT_MS, signal);
-      });
-      traceEvent('project.wait.finished');
-    }
     signal?.throwIfAborted();
-    if (options.waitForOperation) await this.projects.refreshOne(id);
+    const project = options.waitForOperation
+      ? await traced('project.wait', { 'operation.id': options.waitForOperation },
+        () => this.waitForProjectOperation(id, options.waitForOperation!, options.waitMs ?? PROJECT_OPERATION_WAIT_MS, signal))
+      : await this.state.getProject(id);
+    signal?.throwIfAborted();
+    if (!project || project.removedAt) throw new HttpError(404, '项目不存在');
+    if (options.waitForOperation) traceEvent('project.wait.finished');
     // Operation results and the current Cellbox observation are independent.
-    return this.projectSummary(await this.liveProject(this.projects.get(id), true));
+    return this.projectSummary(await this.liveProject(project, true));
   }
 
   private async waitForProjectOperation(id: string, operationId: string, waitMs: number,
     signal?: AbortSignal): Promise<Project | undefined> {
     const deadline = Date.now() + Math.max(0, waitMs);
-    let localWaitFailed = false;
     while (true) {
       signal?.throwIfAborted();
       if (this.closing) throw new HttpError(503, '服务正在关闭');
       const project = await this.state.getProject(id);
-      if (!project || project.sandboxOperation?.id !== operationId || project.sandboxOperation.status !== 'running') return project;
+      if (!project || project.removedAt || project.sandboxOperation?.id !== operationId || project.sandboxOperation.status !== 'running') return project;
       const remaining = deadline - Date.now();
       if (remaining <= 0) return project;
 
-      // The operation owner wakes local resume waiters after its durable commit.
-      // Other replicas have no in-memory waiter, so they check the authoritative
-      // document at a bounded cadence instead of spinning on an absent Promise.
-      if (!localWaitFailed && this.sandboxOperations?.hasResume(id, operationId)) {
-        try { await this.sandboxOperations.wait(id, operationId, Math.min(1_000, remaining), signal); }
-        catch (error) {
-          signal?.throwIfAborted();
-          if (this.closing) throw error;
-          // Local task rejection is not the persisted operation's terminal
-          // outcome. Fall back to bounded durable polling after re-reading it.
-          localWaitFailed = true;
-        }
-      } else {
-        await new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(done, Math.min(100, remaining));
-          const abort = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); reject(signal?.reason); };
-          function done() { signal?.removeEventListener('abort', abort); resolve(); }
-          signal?.addEventListener('abort', abort, { once: true });
-          if (signal?.aborted) abort();
-        });
-      }
+      await delay(Math.min(250, remaining), undefined, { signal }).catch(error => {
+        signal?.throwIfAborted();
+        throw error;
+      });
     }
   }
 
@@ -1145,8 +1126,8 @@ export class SessionManager {
   }
 
   async listProjectsWithArchives(): Promise<ProjectSummary[]> {
-    await this.projects.refresh();
-    const summaries = this.listProjects();
+    const summaries = (await this.state.listProjects()).filter(project => !project.removedAt)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(project => this.projectSummary(project));
     let backupPolicy: ProjectSummary['backupPolicy'];
     let backupPolicyError: string | undefined;
     if (this.remoteArchives?.policy) {
@@ -1280,8 +1261,7 @@ export class SessionManager {
     await this.withProjectOperation(id, async () => {
       await this.projects.refreshOne(id);
       await traced('project.operation', { 'project.id': id, 'sandbox.operation.kind': kind }, async () => {
-        const accepted = await this.sandboxOperations!.start(id, kind, options);
-        await accepted.done;
+        await this.sandboxOperations!.run(id, kind, options);
       });
     });
   }
@@ -1303,8 +1283,7 @@ export class SessionManager {
     await this.withProjectOperation(id, async () => {
       await this.projects.refreshOne(id);
       if (eligible && !eligible(this.projects.get(id))) return;
-      const { done } = await this.sandboxOperations!.start(id, kind, options);
-      await done;
+      await this.sandboxOperations!.run(id, kind, options);
     });
   }
 

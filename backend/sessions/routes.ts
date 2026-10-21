@@ -45,6 +45,15 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
     return c.json(await manager.olderTurns(c.req.param('id'), cursor));
   });
   app.get('/api/sessions/:id/billing', async c => c.json(await manager.billing(c.req.param('id'))));
+  app.post('/api/sessions/:id/connection', async c => {
+    requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);
+    return c.json(await manager.nativeConnection(c.req.param('id'), c.req.raw.signal));
+  });
+  app.post('/api/sessions/:id/thread', async c => {
+    const { threadId } = z.object({ threadId: z.string().min(1).max(191) }).strict().parse(await c.req.json());
+    requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);
+    return c.json(await manager.bindNativeThread(c.req.param('id'), threadId));
+  });
   app.patch('/api/sessions/:id', async c => {
     const input = z.object({ title: z.string().trim().min(1).max(100).optional(), settings: settingsSchema.optional(), archived: z.boolean().optional() }).strict().parse(await c.req.json());
     requireAllowedExecution(manager.get(c.req.param('id')).settings.executionMode);

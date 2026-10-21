@@ -58,10 +58,13 @@ export function mergeSession(current: Session | null, incoming: Session): Sessio
   return preserveClientFailures(merged, current);
 }
 
-export function useSessionStream({ selected, enabled, historyReady = true, onState, onError }: {
+export function useSessionStream({ selected, enabled, historyReady = true, native = false, nativeHistoryManaged = false, onState, onError }: {
   selected: string | null;
   enabled: boolean;
   historyReady?: boolean;
+  native?: boolean;
+  /** The native WebSocket hook owns the quiet-boundary bootstrap history read. */
+  nativeHistoryManaged?: boolean;
   onState: () => Promise<void>;
   onError: (error: string) => void;
 }) {
@@ -91,6 +94,8 @@ export function useSessionStream({ selected, enabled, historyReady = true, onSta
     setLoadingHistory(Boolean(selected));
     if (!selected) { localStorage.removeItem('codex-session'); return; }
     localStorage.setItem('codex-session', selected);
+    if (nativeHistoryManaged) { setLoadingHistory(false); return; }
+    if (native) return;
     let alive = true;
     let revision = 0;
     let historyKey: string | null = null;
@@ -136,12 +141,12 @@ export function useSessionStream({ selected, enabled, historyReady = true, onSta
       } catch { onErrorRef.current('会话事件解析失败，请刷新页面重试。'); }
     };
     return () => { alive = false; source.close(); };
-  }, [selected, enabled]);
+  }, [selected, enabled, native, nativeHistoryManaged]);
 
   // Open the conversation immediately through SSE, but defer native history
   // reads while the project's runtime is still being created or resumed.
   useEffect(() => {
-    if (!enabled || !selected || !historyReady) return;
+    if (!enabled || !selected || !historyReady || nativeHistoryManaged) return;
     let alive = true;
     setLoadingHistory(true);
     api<Session>(`/api/sessions/${selected}`)
@@ -149,7 +154,7 @@ export function useSessionStream({ selected, enabled, historyReady = true, onSta
       .catch(error => { if (alive) onErrorRef.current(errorMessage(error)); })
       .finally(() => { if (alive) setLoadingHistory(false); });
     return () => { alive = false; };
-  }, [selected, enabled, historyReady]);
+  }, [selected, enabled, historyReady, nativeHistoryManaged]);
 
   const loadOlder = async (beforeMerge?: () => void) => {
     const cursor = session?.historyNextCursor;
@@ -160,6 +165,7 @@ export function useSessionStream({ selected, enabled, historyReady = true, onSta
     try {
       const page = await api<SessionTurnPage>(
         `/api/sessions/${encodeURIComponent(id)}/turns?cursor=${encodeURIComponent(cursor)}`);
+      if (native) page.turns = page.turns.map(turn => turn.nativeTurnId ? { ...turn, id: turn.nativeTurnId } : turn);
       if (selectedRef.current !== id) return false;
       beforeMerge?.();
       setSession(current => {

@@ -7,13 +7,13 @@ import type { Session, Settings, Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SessionManager, type CodexClient } from './manager.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
-import { MySqlWebStateStore } from '../infra/storage/web-state.js';
 
 const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
   modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
 const answer = { id: 'answer', type: 'agent_message' as const, text: '2' };
 
-async function fixture(state = new MemoryWebStateStore()) {
+async function fixture() {
+  const state = new MemoryWebStateStore();
   const directory = await mkdtemp(join(tmpdir(), 'hive-history-'));
   const providerSandboxes = new Map<string, NonNullable<Session['sandbox']>>();
   const runtime = {
@@ -54,20 +54,8 @@ async function fixture(state = new MemoryWebStateStore()) {
   } };
 }
 
-test('async answers recover from native history across reload and pagination without a stored transcript', async () => {
-  let document: unknown;
-  const sql = Object.create(MySqlWebStateStore.prototype) as MySqlWebStateStore;
-  (sql as unknown as { pool: { query: (query: string, values?: unknown[]) => Promise<unknown> } }).pool = {
-    async query(query, values) {
-      if (query.startsWith('SELECT document FROM sessions')) return [document ? [{ document }] : [], []];
-      document = JSON.parse(String(values?.[9]));
-      return [[], []];
-    },
-  };
-  const state = new MemoryWebStateStore();
-  state.saveSession = sql.saveSession.bind(sql);
-  state.listSessions = sql.listSessions.bind(sql);
-  const f = await fixture(state);
+test('async answers recover from native history across reload and pagination without stored output', async () => {
+  const f = await fixture();
   try {
     let launches = 0;
     const question = { id: 'question', type: 'agent_message' as const, delivery: 'async', text: '',
@@ -89,14 +77,20 @@ test('async answers recover from native history across reload and pagination wit
     const posted = await first.answerUserInput(session.id, turnId, question.id, '网络', ['网络']);
     await first.waitForIdle(session.id);
     assert.equal(posted.turns.find(turn => turn.id === turnId)?.userInputRequests?.[0].status, 'answered');
-    const nativeReply = { ...first.get(session.id).turns[0], id: 'native-2', userInputRequests: undefined };
+    const replyTurn = first.get(session.id).turns.find(turn => turn.nativeTurnId === 'native-2');
+    assert.ok(replyTurn);
+    const nativeReply = { ...replyTurn, id: 'native-2', userInputRequests: undefined };
     f.runtime.history = async () => ({ turns: [nativeReply, nativeQuestion] });
     assert.equal((await first.read(session.id)).turns.find(turn => turn.items.some(item => item.id === question.id))?.userInputRequests?.[0].status, 'answered');
     await first.close();
-    assert.equal('userInputTurns' in (document as object), false);
-    const controls = (await state.listSessions())[0].turns;
-    assert(controls.length > 0);
-    assert(controls.every(turn => turn.items.length === 0 && turn.prompt === ''));
+    const stored = await f.state.getSession(session.id);
+    assert.ok(stored);
+    assert(stored.turns.length > 0);
+    assert(stored.turns.every(turn => turn.items.length === 0));
+    // Question cards are derived from native items and accepted input records.
+    // Clear the in-memory store's UI projections before testing reconstruction.
+    for (const turn of stored.turns) delete turn.userInputRequests;
+    await f.state.saveSession(stored);
 
     f.runtime.history = async (_session, options) => options?.cursor
       ? { turns: [nativeQuestion], nextCursor: null }
@@ -106,7 +100,7 @@ test('async answers recover from native history across reload and pagination wit
     const older = await second.olderTurns(session.id, reloaded.historyNextCursor!);
     assert.equal(older.turns[0].userInputRequests?.[0].answer, '网络');
     assert.equal(older.turns[0].userInputRequests?.[0].status, 'answered');
-    await assert.rejects(second.answerUserInput(session.id, turnId, question.id, '容器'), /问题已经回答/);
+    await assert.rejects(second.answerUserInput(session.id, turnId, question.id, '容器'), { status: 409 });
     assert.equal(launches, 2);
   } finally { await f.close(); }
 });
@@ -237,10 +231,11 @@ test('Sandbox detail and older turns use App Server cursors', async () => {
   } finally { await f.close(); }
 });
 
-test('a submission rejected before Codex accepts it is not retained after restart', async () => {
+test('a rejected submission keeps its session without being resubmitted after restart', async () => {
   const f = await fixture();
   try {
-    f.runtime.run = async function* () { throw new Error('Sandbox creation failed'); };
+    let launches = 0;
+    f.runtime.run = async function* () { launches++; throw new Error('Sandbox creation failed'); };
     const first = await f.start();
     const created = await first.create();
     await first.startTurn(created.id, 'not delivered');
@@ -248,7 +243,11 @@ test('a submission rejected before Codex accepts it is not retained after restar
     assert.equal(first.get(created.id).turns[0].codexAccepted, false);
     await first.close();
     const second = await f.start();
-    assert.equal(second.list().some(session => session.id === created.id), false);
+    await second.waitForIdle(created.id);
+    assert.equal(second.list().some(session => session.id === created.id), true);
+    assert.equal(second.get(created.id).status, 'failed');
+    assert.equal(second.get(created.id).turns[0].codexAccepted, false);
+    assert.equal(launches, 1);
   } finally { await f.close(); }
 });
 

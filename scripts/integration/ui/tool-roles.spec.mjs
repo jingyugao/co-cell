@@ -74,7 +74,7 @@ test('roles configure generic tool switches and named credentials from the catal
   expect(ui.calls.some(call => call.path.endsWith('/tool-permissions'))).toBe(false);
 });
 
-test('editing removes vanished credentials explicitly and disables a credential tool when selection is empty', async ({ page }) => {
+test('editing removes vanished credentials explicitly and disables a credential tool when selection is empty', async ({ page, ui }) => {
   const tools = [tool('mysql', ['reporting', 'warehouse']), tool('git', null), tool('vault-cli', ['team-a'])];
   const existingRole = { id: 'data-ops', name: '数据运维', permissions: [
     { tool: 'mysql', enabled: true, credentials: ['reporting', 'retired-db'] },

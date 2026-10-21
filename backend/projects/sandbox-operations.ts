@@ -22,10 +22,9 @@ const target = (project: Project): WorkspaceTarget => ({ id: project.id, project
   sandboxMounts: project.sandboxMounts, sandboxOwnerKey: project.sandboxOwnerKey, updatedAt: project.updatedAt });
 
 export class ProjectSandboxOperations {
-  private tasks = new Set<Promise<void>>();
-  private context = new AsyncLocalStorage<{ operation: ProjectSandboxOperation; project: Project }>();
-  private pending = new Map<string, { operationId: string; waiters: Set<() => void>; done?: Promise<void> }>();
-  private timings = new Map<string, { operationId: string; kind: string; started: number; phaseStarted: number; phase: string }>();
+  private activeOperations = new Set<Promise<void>>();
+  private context = new AsyncLocalStorage<{ operation: ProjectSandboxOperation; project: Project;
+    timing: { started: number; phaseStarted: number; phase: string } }>();
   constructor(private deps: {
     projects: ProjectService;
     runtime: SandboxRuntime;
@@ -47,17 +46,16 @@ export class ProjectSandboxOperations {
   }
 
   private recordTiming(id: string, status: string, nextPhase?: string) {
-    const operationId = this.context.getStore()?.operation.id;
-    const timing = operationId ? this.timings.get(operationId) : undefined;
-    if (!timing) return;
+    const scoped = this.context.getStore();
+    if (!scoped) return;
+    const { operation, timing } = scoped;
     const now = Date.now();
     void this.deps.logger?.write({ event: 'sandbox.operation_phase', projectId: id,
-      operationId: timing.operationId, operation: timing.kind, phase: timing.phase, status,
+      operationId: operation.id, operation: operation.kind, phase: timing.phase, status,
       startedAt: new Date(timing.phaseStarted).toISOString(), finishedAt: new Date(now).toISOString(),
       durationMs: now - timing.phaseStarted, totalDurationMs: now - timing.started,
       sandboxId: this.deps.projects.get(id).sandbox?.id });
     if (nextPhase) { timing.phase = nextPhase; timing.phaseStarted = now; }
-    else this.timings.delete(operationId!);
   }
 
   private operationKey(id: string, step: 'capture' | 'restore'): string {
@@ -88,36 +86,17 @@ export class ProjectSandboxOperations {
     await done;
   }
 
-  async wait(id: string, operationId: string, waitMs: number, signal?: AbortSignal): Promise<void> {
-    signal?.throwIfAborted();
-    const pending = this.pending.get(id);
-    if (!pending || pending.operationId !== operationId || waitMs <= 0) return;
-    await new Promise<void>((resolve, reject) => {
-      const finish = () => { cleanup(); resolve(); };
-      const abort = () => { cleanup(); reject(signal!.reason); };
-      const timer = setTimeout(finish, waitMs);
-      const cleanup = () => {
-        clearTimeout(timer);
-        pending.waiters.delete(finish);
-        signal?.removeEventListener('abort', abort);
-      };
-      pending.waiters.add(finish);
-      signal?.addEventListener('abort', abort, { once: true });
-      if (signal?.aborted) abort();
-    });
+  /** Callers serialize project operations; each remote step is submitted once. */
+  async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
+    const done = this.execute(id, kind, options);
+    this.activeOperations.add(done);
+    void done.finally(() => this.activeOperations.delete(done)).catch(() => {});
+    return { done };
   }
 
-  /** One user request submits each remote step once; no task takeover or replay. */
-  async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
-    if (kind === 'delete') {
-      const local = this.pending.get(id);
-      if (local?.done) {
-        if (this.deps.projects.get(id).sandboxOperation?.kind !== 'delete')
-          throw new HttpError(409, '项目环境操作正在执行，请稍后重试删除');
-        return { done: local.done };
-      }
-      await this.deps.projects.markDeleting(id);
-    } else if (!(kind === 'restore' && this.deps.projects.get(id).removedAt)) this.deps.projects.assertAvailable(id);
+  private async execute(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions): Promise<void> {
+    if (kind === 'delete') await this.deps.projects.markDeleting(id);
+    else if (!(kind === 'restore' && this.deps.projects.get(id).removedAt)) this.deps.projects.assertAvailable(id);
     const project = this.deps.projects.get(id);
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
     const selection = kind === 'restore' && this.deps.selectRestoreImage
@@ -127,10 +106,8 @@ export class ProjectSandboxOperations {
       error: undefined, errorCode: undefined, cleanupError: undefined,
       ...(selection?.selection ? { imageSelection: selection.selection } : {}), updatedAt: new Date().toISOString() };
     await this.deps.projects.updateSandboxOperation(id, operation);
-    const pending = { operationId: operation.id!, waiters: new Set<() => void>(), done: undefined as Promise<void> | undefined };
-    this.pending.set(id, pending);
-    this.timings.set(operation.id!, { operationId: operation.id!, kind, started: Date.now(), phaseStarted: Date.now(), phase: operation.phase });
-    const execute = async () => {
+    const started = Date.now();
+    const perform = async () => {
       try {
         if (kind === 'create') await this.create(id);
         else if (kind === 'resume') await this.resume(id);
@@ -154,20 +131,12 @@ export class ProjectSandboxOperations {
       } finally {
         this.recordTiming(id, operation.status);
         await selection?.release();
-        if (this.pending.get(id) === pending) this.pending.delete(id);
-        for (const finish of pending.waiters) finish();
       }
     };
-    const task = this.context.run({ operation, project }, () => Promise.resolve().then(() => traced('project.sandbox.' + kind,
-      { 'project.id': id, 'operation.id': operation.id!, 'sandbox.id': project.sandbox?.id }, execute)));
-    pending.done = task;
-    this.tasks.add(task);
-    void task.finally(() => this.tasks.delete(task)).catch(() => {});
-    return { done: task };
+    await this.context.run({ operation, project, timing: { started, phaseStarted: started, phase: operation.phase } },
+      () => Promise.resolve().then(() => traced('project.sandbox.' + kind,
+        { 'project.id': id, 'operation.id': operation.id!, 'sandbox.id': project.sandbox?.id }, perform)));
   }
-
-  hasResume(id: string, operationId: string): boolean { return this.pending.get(id)?.operationId === operationId; }
-  hasBackup(id: string, backupId: string): boolean { return this.pending.get(id)?.operationId === backupId; }
 
   private async resume(id: string) {
     const project = this.context.getStore()!.project;
@@ -459,7 +428,7 @@ export class ProjectSandboxOperations {
     await this.cleanupArchived(id, target(project));
   }
 
-  async close() { await Promise.allSettled(this.tasks); }
+  async close() { await Promise.allSettled(this.activeOperations); }
 }
 
 function operationError(error: unknown): { code?: string; message: string; unknown: boolean } {

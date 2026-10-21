@@ -805,18 +805,26 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async checkpoint(target: WorkspaceTarget): Promise<void> {
     await this.sandboxes.refresh(target);
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
-    await this.reader.closeIdle(target.sandbox.id);
-    await traced('sandbox.checkpoint', { 'sandbox.id': target.sandbox.id },
-      () => this.options.provider.pause(target.sandbox!.id));
+    const sandboxId = target.sandbox.id;
+    await this.sandboxes.lifecycle.run({ action: 'checkpoint',
+      resourceKey: target.projectId ? `project:${target.projectId}` : `session:${target.id}`, sandboxId }, async () => {
+      await this.reader.closeIdle(sandboxId);
+      await traced('sandbox.checkpoint', { 'sandbox.id': sandboxId },
+        () => this.options.provider.pause(sandboxId));
+    });
   }
 
   async release(target: WorkspaceTarget): Promise<SandboxState> {
     await this.sandboxes.refresh(target);
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
     if (!this.options.provider.release) throw new HttpError(503, 'Sandbox 不支持保留磁盘的释放操作');
-    await this.reader.closeIdle(target.sandbox.id);
-    const info = await traced('sandbox.release', { 'sandbox.id': target.sandbox.id },
-      () => this.options.provider.release!(target.sandbox!.id));
+    const sandboxId = target.sandbox.id;
+    const info = await this.sandboxes.lifecycle.run({ action: 'pause',
+      resourceKey: target.projectId ? `project:${target.projectId}` : `session:${target.id}`, sandboxId }, async () => {
+      await this.reader.closeIdle(sandboxId);
+      return traced('sandbox.release', { 'sandbox.id': sandboxId },
+        () => this.options.provider.release!(sandboxId));
+    });
     return this.sandboxObservation(target.sandbox, info);
   }
 

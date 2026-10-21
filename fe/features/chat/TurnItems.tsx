@@ -15,6 +15,7 @@ export default function TurnItems({ turn, highlightedItemIds, subagents = [], ..
   highlightedItemIds?: string[];
   subagents?: SubagentConversation[];
   sessionId?: string;
+  readOnly?: boolean;
   onUserInputAnswered?: (session: Session) => void;
   onNativeAnswer?: (request: import('../../../protocol/user-input-types').UserInputRequest, answer: string, answers: string[]) => Promise<void>;
 } & MarkdownResources) {
@@ -37,11 +38,11 @@ export default function TurnItems({ turn, highlightedItemIds, subagents = [], ..
         ? <ReasoningSummary pending={turn.status === 'running' && index + group.items.length === turn.items.length} entries={group.items.map(item => ({ item, timestamp: turn.itemTimestamps?.[item.id] || turn.startedAt, anchorId: `turn-${turn.id}-item-${item.id}`, highlighted: highlightedItemIds?.includes(item.id) }))} {...resources} />
         : group.type === 'tools' ? <ToolCallGroup turnStatus={turn.status} entries={group.items.map(item => ({ item, timestamp: turn.itemTimestamps?.[item.id] || turn.startedAt, anchorId: `turn-${turn.id}-item-${item.id}`, highlighted: highlightedItemIds?.includes(item.id) }))} {...resources} />
         : <div id={`turn-${turn.id}-item-${group.item.id}`} className={highlightedItemIds?.includes(group.item.id) ? 'billing-item-selected' : undefined}>{resources.sessionId && turn.userInputRequests?.some(request => request.id === group.item.id)
-          ? <UserInputCard request={turn.userInputRequests.find(request => request.id === group.item.id)!} sessionId={resources.sessionId} turnId={turn.id} onAnswered={resources.onUserInputAnswered ?? (() => {})} onNativeAnswer={resources.onNativeAnswer} />
+          ? <UserInputCard request={turn.userInputRequests.find(request => request.id === group.item.id)!} sessionId={resources.sessionId} turnId={turn.id} readOnly={resources.readOnly} onAnswered={resources.onUserInputAnswered ?? (() => {})} onNativeAnswer={resources.onNativeAnswer} />
           : <ItemView item={group.item} turnStatus={turn.status} timestamp={turn.itemTimestamps?.[group.item.id] || turn.startedAt} {...resources} />}</div>}</Fragment>;
     })}
     {turn.compactions?.filter(boundary => boundary.beforeItemIndex >= turn.items.length).map(boundary => <div key={boundary.segment} className="compact-divider" role="separator">上下文已压缩 · 第 {boundary.segment + 1} 段对话 · 后续重新计费</div>)}
     {subagentIndex < 0 && <SubagentConversations agents={subagents} {...resources} />}
-    {resources.sessionId && turn.userInputRequests?.filter(request => !turn.items.some(item => item.id === request.id)).map(request => <UserInputCard key={request.id} request={request} sessionId={resources.sessionId!} turnId={turn.id} onAnswered={resources.onUserInputAnswered ?? (() => {})} onNativeAnswer={resources.onNativeAnswer} />)}
+    {resources.sessionId && turn.userInputRequests?.filter(request => !turn.items.some(item => item.id === request.id)).map(request => <UserInputCard key={request.id} request={request} sessionId={resources.sessionId!} turnId={turn.id} readOnly={resources.readOnly} onAnswered={resources.onUserInputAnswered ?? (() => {})} onNativeAnswer={resources.onNativeAnswer} />)}
   </>;
 }

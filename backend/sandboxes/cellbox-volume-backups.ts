@@ -1,5 +1,5 @@
 import type { SandboxLifecycle, SandboxLifecycleContext } from '@co-cell/sandbox';
-import { CellboxError, type CellboxSandboxProvider, type CellboxVolumeBackup } from '../../packages/sandbox/src/providers/cellbox/index.js';
+import { CellboxError, type CellboxSandboxProvider, type CellboxOperation, type CellboxVolumeBackup } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import type { CellboxVolumeBackupRef, RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import type { SandboxMount, SandboxState } from '../../protocol/sandbox-types.js';
 import { sandboxMounts } from '../../util/sandbox-mounts.js';
@@ -57,7 +57,29 @@ export function createCellboxVolumeBackups(provider: CellboxSandboxProvider, pro
       if (!ids.length) throw new HttpError(409, '项目没有可备份的独立磁盘');
       if (ids.length !== 1) throw new HttpError(422, '项目挂载了多个独立磁盘；当前项目备份只支持单个磁盘，尚未提交备份。');
       const volumeId = ids[0];
-      const operation = await provider.client.createVolumeBackup(volumeId);
+      let operation: CellboxOperation | undefined;
+      if (options?.recovery) {
+        const snapshots = await provider.client.listVolumeBackups(volumeId);
+        const baseline = options.recovery.snapshotIds;
+        const recovered = baseline && snapshots.filter(snapshot => !baseline.includes(snapshot.id))
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+        if (recovered) {
+          const { threadIds: _threads, ...metadata } = reference(recovered, mounts);
+          return { ...metadata, ...(target.sandbox ? { sourceSandboxId: target.sandbox.id } : {}) };
+        }
+        if (!baseline) await options.onSnapshotBaseline?.(volumeId, snapshots.map(snapshot => snapshot.id));
+        const volume = await provider.client.getVolume(volumeId);
+        const operationId = volume.operationId ?? options.recovery.operationId;
+        if (operationId) {
+          const observed = await provider.client.getOperation(operationId);
+          if (observed.kind !== 'volume-backup' || observed.targetId !== volumeId)
+            throw new CellboxError('BUSY', '磁盘正在执行其他操作，请稍后重试删除');
+          // A known failed operation can be explicitly retried. An accepted
+          // operation is joined even if the original HTTP response was lost.
+          if (observed.status !== 'failed') operation = observed;
+        }
+      }
+      operation ??= await provider.client.createVolumeBackup(volumeId);
       await options?.onOperation?.(operation.id, volumeId);
       const completed = await provider.waitForOperation(operation);
       const snapshotId = completed.result?.backupId;
@@ -103,7 +125,28 @@ export function createCellboxVolumeBackups(provider: CellboxSandboxProvider, pro
       });
     },
     async removeVolume(volumeId: string) {
-      await provider.waitForOperation(await provider.client.deleteVolume(volumeId));
+      const read = () => provider.client.getVolume(volumeId).catch(error => {
+        if (error instanceof CellboxError && error.code === 'NOT_FOUND') return undefined;
+        throw error;
+      });
+      const volume = await read();
+      if (!volume || volume.phase === 'deleted') return;
+      if (volume.operationId) {
+        const operation = await provider.client.getOperation(volume.operationId);
+        if (operation.kind !== 'volume-delete' || operation.targetId !== volumeId)
+          throw new CellboxError('BUSY', '磁盘正在执行其他操作，请稍后重试删除');
+        await provider.waitForOperation(operation);
+        return;
+      }
+      try {
+        await provider.waitForOperation(await provider.client.deleteVolume(volumeId));
+      } catch (error) {
+        if (error instanceof CellboxError && ['NOT_FOUND', 'CONFLICT', 'BUSY'].includes(error.code)) {
+          const current = await read();
+          if (!current || current.phase === 'deleted') return;
+        }
+        throw error;
+      }
     },
   };
 }

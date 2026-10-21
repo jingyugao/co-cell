@@ -97,6 +97,23 @@ function ProjectForm({ busy, onSubmit, onCancel }: {
   </form>;
 }
 
+function DeletingProjectRow({ project, onRetry }: { project: ProjectSummary; onRetry: (id: string) => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const operation = project.sandboxOperation?.kind === 'delete' ? project.sandboxOperation : undefined;
+  const detail = operation?.status === 'running' ? operation.phase
+    : operation?.status === 'failed' ? operation.error || '删除失败，可以重试。'
+      : operation?.status === 'unknown' ? operation.error || '删除结果待确认，可以重试。'
+        : '正在删除项目…';
+  return <div className="project-deleting-row" aria-label={`${projectDisplayName(project)}，删除中`}>
+    <div><strong>{projectDisplayName(project)}</strong><span role={operation?.status === 'failed' ? 'alert' : 'status'}>{detail}</span></div>
+    <button className="secondary-button" disabled={busy} onClick={async () => {
+      setBusy(true);
+      try { await onRetry(project.id); } catch { /* The refreshed project row displays the delete failure. */ }
+      finally { setBusy(false); }
+    }}>{busy ? '重试中…' : '重试删除'}</button>
+  </div>;
+}
+
 function ProjectCard({ project, config, onRefresh, onUpdate, onDelete, onCreateSandbox, onRestoreSandbox, onReleaseSandbox, onResumeSandbox, onCheckpointSandbox, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onStatus }: Pick<Props, 'config' | 'onRefresh' | 'onUpdate' | 'onDelete' | 'onCreateSandbox' | 'onRestoreSandbox' | 'onReleaseSandbox' | 'onResumeSandbox' | 'onCheckpointSandbox' | 'onBackupSandbox' | 'onArchiveProject' | 'onOpenProject' | 'onViewBackup'> & {
   project: ProjectSummary;
   onStatus: (name: string, status: 'active' | 'completed') => void;
@@ -281,6 +298,9 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
   const [error, setError] = useState('');
   const createButton = useRef<HTMLButtonElement>(null);
   const projectStatus = (project: ProjectSummary) => project.status ?? (project.archivedAt ? 'archived' : 'active');
+  const isDeleting = (project: ProjectSummary) => project.status === 'deleting';
+  const deletingProjects = projects.filter(isDeleting);
+  const visibleDeletingProjects = deletingProjects.filter(project => `${project.id} ${project.name} ${project.requirementUrl ?? ''}`.toLowerCase().includes(query.trim().toLowerCase()));
   const activeCount = projects.filter(project => projectStatus(project) === 'active').length;
   const completedCount = projects.filter(project => projectStatus(project) === 'completed').length;
   const archivedCount = projects.filter(project => projectStatus(project) === 'archived').length;
@@ -290,7 +310,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
   const canCreate = config?.sandbox?.enabled === true;
   const stopCreating = () => { setCreating(false); setTimeout(() => createButton.current?.focus(), 0); };
   useEffect(() => {
-    if (!projects.some(project => project.sandboxOperation?.status === 'running' || project.sandboxBackup?.status === 'running' || project.sandbox?.status === 'starting')) return;
+    if (!projects.some(project => isDeleting(project) || project.sandboxOperation?.status === 'running' || project.sandboxBackup?.status === 'running' || project.sandbox?.status === 'starting')) return;
     const timer = window.setInterval(() => { void onRefresh().catch(err => setError(err instanceof Error ? err.message : '状态读取失败，请刷新重试。')); }, 3_000);
     return () => window.clearInterval(timer);
   }, [projects, onRefresh]);
@@ -317,6 +337,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
         finally { setBusy(false); }
       }} /></section>}
       <div className="projects-toolbar"><div className="project-tabs" role="group" aria-label="项目状态"><button ref={activeTab} className={view === 'active' ? 'selected' : ''} aria-pressed={view === 'active'} onClick={() => setView('active')}>使用中 <span>{activeCount}</span></button><button className={view === 'completed' ? 'selected' : ''} aria-pressed={view === 'completed'} onClick={() => setView('completed')}>已完成 <span>{completedCount}</span></button><button ref={archivedTab} className={view === 'archived' ? 'selected' : ''} aria-pressed={view === 'archived'} onClick={() => setView('archived')}>归档 <span>{archivedCount}</span></button></div><div><input aria-label="搜索项目" placeholder="搜索名称、项目 ID 或 Sandbox" value={query} onChange={event => setQuery(event.target.value)} /><button className="secondary-button" disabled={loading} onClick={async () => { setError(''); try { await onRefresh(); } catch (err) { setError(err instanceof Error ? err.message : '刷新失败，请重试。'); } }}>{loading ? '刷新中…' : '刷新'}</button></div></div>
+      {deletingProjects.length > 0 && <section className="project-deleting-section" aria-label="删除中项目"><h2>删除中 <span>{deletingProjects.length}</span></h2>{visibleDeletingProjects.length ? visibleDeletingProjects.map(project => <DeletingProjectRow key={project.id} project={project} onRetry={onDelete} />) : <p className="project-deleting-empty">没有匹配的删除中项目。</p>}</section>}
       <p className="projects-archive-hint">{view === 'archived' ? '按归档日期每周一组。恢复会创建新的 Sandbox。' : view === 'completed' ? '已完成项目必须恢复为使用中，才能继续对话。' : '可将项目标记为已完成；满 1 天后系统会尝试归档，运行中的环境须先暂停。'}</p>
       {!projects.length && loading ? <section className="project-grid" aria-busy="true"><div className="projects-empty" role="status"><span className="spinner" /> 正在读取项目…</div></section>
         : !visible.length ? <section className="project-grid">{empty}</section>

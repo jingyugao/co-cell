@@ -101,7 +101,7 @@ export interface Turn {
   retry?: RetryState;
   userInputRequests?: UserInputRequest[];
 }
-export type ProjectStatus = 'active' | 'completed' | 'archived';
+export type ProjectStatus = 'active' | 'completed' | 'archived' | 'deleting';
 export interface ProjectSandboxOperation {
   /** Local request identifier for observation; never used for remote replay. */
   id?: string;
@@ -142,6 +142,8 @@ export interface ProjectSandboxBackup {
   sandboxId?: string;
   volumeId?: string;
   remoteOperationId?: string;
+  /** Snapshots present before a deletion backup was submitted, for lost-response reconciliation. */
+  captureBaseline?: string[];
   snapshotId?: string;
   retentionError?: string;
   catalogError?: string;

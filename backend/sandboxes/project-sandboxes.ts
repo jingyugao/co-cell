@@ -116,7 +116,12 @@ export class ProjectSandboxes {
     if (!target.sandbox) return;
     const sandboxId = target.sandbox.id;
     await this.lifecycle.run({ action: 'destroy', resourceKey: resourceKey(target), sandboxId }, async () => {
-      await this.provider.kill(sandboxId);
+      try {
+        if (this.provider.ensureDeleted) await this.provider.ensureDeleted(sandboxId);
+        else await this.provider.kill(sandboxId);
+      } catch (error) {
+        if (!['NOT_FOUND', 'not_found'].includes((error as { code?: string }).code ?? '')) throw error;
+      }
     });
   }
 }

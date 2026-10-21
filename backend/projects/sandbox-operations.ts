@@ -109,11 +109,22 @@ export class ProjectSandboxOperations {
 
   /** One user request submits each remote step once; no task takeover or replay. */
   async start(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions = {}): Promise<{ done: Promise<void> }> {
+    if (kind === 'delete') {
+      const local = this.pending.get(id);
+      if (local?.done) {
+        if (this.deps.projects.get(id).sandboxOperation?.kind !== 'delete')
+          throw new HttpError(409, '项目环境操作正在执行，请稍后重试删除');
+        return { done: local.done };
+      }
+      await this.deps.projects.markDeleting(id);
+    } else if (!(kind === 'restore' && this.deps.projects.get(id).removedAt)) this.deps.projects.assertAvailable(id);
     const project = this.deps.projects.get(id);
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
     const selection = kind === 'restore' && this.deps.selectRestoreImage
       ? await this.deps.selectRestoreImage(project, options.imageVersionId) : undefined;
-    const operation: ProjectSandboxOperation = { id: randomUUID(), kind, phase: '提交操作', status: 'running',
+    const previous = kind === 'delete' && project.sandboxOperation?.kind === 'delete' ? project.sandboxOperation : undefined;
+    const operation: ProjectSandboxOperation = { ...previous, id: previous?.id ?? randomUUID(), kind, phase: '提交操作', status: 'running',
+      error: undefined, errorCode: undefined, cleanupError: undefined,
       ...(selection?.selection ? { imageSelection: selection.selection } : {}), updatedAt: new Date().toISOString() };
     await this.deps.projects.updateSandboxOperation(id, operation);
     const pending = { operationId: operation.id!, waiters: new Set<() => void>(), done: undefined as Promise<void> | undefined };
@@ -209,7 +220,8 @@ export class ProjectSandboxOperations {
     const remote = this.deps.runtime.remoteArchives;
     if (!remote) throw new HttpError(503, 'Cellbox 备份不可用');
     const operation = this.context.getStore()!.operation;
-    let backup: NonNullable<Project['sandboxBackup']> = { id: operation.id!,
+    const previous = operation.kind === 'delete' && project.sandboxBackup?.id === operation.id ? project.sandboxBackup : undefined;
+    let backup: NonNullable<Project['sandboxBackup']> = { ...previous, id: operation.id!,
       ...(project.sandbox ? { sandboxId: project.sandbox.id } : {}), status: 'running',
       phase: '提交磁盘备份', updatedAt: new Date().toISOString() };
     await this.deps.projects.updateSandboxBackup(id, backup);
@@ -218,6 +230,13 @@ export class ProjectSandboxOperations {
     try {
       await this.phase(id, backup.phase);
       const captured = await remote.capture(target(project), this.operationKey(id, 'capture'), {
+        ...(operation.kind === 'delete' ? {
+          recovery: { operationId: previous?.remoteOperationId, snapshotIds: previous?.captureBaseline },
+          onSnapshotBaseline: async (volumeId: string, snapshotIds: string[]) => {
+            backup = { ...backup, volumeId, captureBaseline: snapshotIds };
+            await this.deps.projects.updateSandboxBackup(id, backup, operation.id);
+          },
+        } : {}),
         onOperation: async (remoteOperationId, volumeId) => {
           Object.assign(operation, { remoteOperationId, volumeId });
           backup = { ...backup, remoteOperationId, volumeId, phase: 'Cellbox 备份中', updatedAt: new Date().toISOString() };
@@ -423,7 +442,17 @@ export class ProjectSandboxOperations {
       project = projects.get(id);
       this.context.getStore()!.project = project;
     }
-    if (project.sandboxMounts?.length) await this.backup(id);
+    if (project.sandboxMounts?.length) {
+      const operation = this.context.getStore()!.operation;
+      const saved = project.sandboxBackup;
+      const captured = saved && saved.id === operation.id && saved.status === 'succeeded' && saved.volumeId && saved.snapshotId
+        ? project.remoteArchives?.find(ref => ref.storageType === 'cellbox-volume'
+          && ref.volumeId === saved.volumeId && ref.snapshotId === saved.snapshotId) : undefined;
+      if (captured) {
+        if (!this.deps.runtime.remoteArchives) throw new HttpError(503, 'Cellbox 备份不可用');
+        await this.deps.runtime.remoteArchives.inspect(captured);
+      } else await this.backup(id);
+    }
     else if (project.remoteArchives?.length) await this.latestRemote(id);
     for (const mount of project.sandboxMounts ?? []) await projects.rememberVolumeCleanup(id, mount.volumeId);
     await projects.archiveAndDetachSandbox(id, null, true);

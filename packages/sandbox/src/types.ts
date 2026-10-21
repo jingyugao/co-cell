@@ -130,6 +130,8 @@ export interface SandboxProvider {
   resume?(sandboxId: string, options?: { signal?: AbortSignal }): Promise<void>;
   /** End a Box, retaining its volumes and returning the terminal metadata. */
   release?(sandboxId: string): Promise<SandboxInfo>;
+  /** Query and join existing destruction before submitting a new delete request. */
+  ensureDeleted?(sandboxId: string): Promise<SandboxInfo>;
   pause(sandboxId: string): Promise<boolean>;
   kill(sandboxId: string): Promise<boolean>;
 }

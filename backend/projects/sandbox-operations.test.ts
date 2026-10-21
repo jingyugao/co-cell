@@ -311,7 +311,8 @@ test('delete releases the Box, records a native backup, then deletes the retaine
     await f.operations.run('project-one', 'delete');
     assert.deepEqual(f.calls.filter(call => ['release', 'capture', 'delete-volume'].includes(call)), ['release', 'capture', 'delete-volume']);
     const project = f.projects.get('project-one');
-    assert.equal(project.status, 'archived');
+    assert.equal(project.status, 'deleting');
+    assert.equal((await f.store.getProject('project-one'))?.status, 'deleting');
     assert.equal(project.sandbox, undefined);
     assert.equal(project.pendingVolumeCleanup?.includes('volume-one'), false);
     assert.ok(project.sandboxArtifactsCleanedAt);

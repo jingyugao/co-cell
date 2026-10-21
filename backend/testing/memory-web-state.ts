@@ -35,6 +35,10 @@ export class MemoryWebStateStore implements WebStateStore {
   }
   async saveSession(session: Session, previous?: Session) {
     const latest = this.sessions.get(session.id);
+    const project = session.projectId ? this.projects.get(session.projectId) : undefined;
+    if (project?.removedAt) throw new HttpError(409, '项目已删除，不能保存会话');
+    if (!latest && project?.status === 'deleting')
+      throw new HttpError(409, '项目正在删除，不能创建会话');
     if (previous && !latest) throw new HttpError(409, '会话已删除');
     this.sessions.set(session.id, structuredClone(previous ? mergeRecord(previous, session, latest!) : session));
   }

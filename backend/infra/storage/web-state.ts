@@ -78,7 +78,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS projects (
       id CHAR(36) PRIMARY KEY,name VARCHAR(100) NOT NULL,type TINYINT UNSIGNED NOT NULL DEFAULT 1,week_of DATE NULL,
       requirement_url TEXT NULL,requirement_status VARCHAR(255) NULL,execution_mode ENUM('sandbox','local') NOT NULL,
-      working_directory TEXT NOT NULL,status ENUM('active','completed','archived') NOT NULL DEFAULT 'active',current_box_id VARCHAR(200) NULL,
+      working_directory TEXT NOT NULL,status ENUM('active','completed','archived','deleting') NOT NULL DEFAULT 'active',current_box_id VARCHAR(200) NULL,
       sandbox_owner_key VARCHAR(255) NULL,sandbox_template VARCHAR(200) NULL,sandbox_working_directory TEXT NULL,mounts_json JSON NULL,
       sandbox_image_reference TEXT NULL,sandbox_image_id TEXT NULL,sandbox_image_repo_digests_json JSON NULL,sandbox_image_version VARCHAR(255) NULL,
       sandbox_image_template_id VARCHAR(200) NULL,sandbox_image_revision_id VARCHAR(200) NULL,home_volume_id VARCHAR(200) NULL,
@@ -91,6 +91,10 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       archived_at DATETIME(3) NULL,created_at DATETIME(3) NOT NULL,updated_at DATETIME(3) NOT NULL,
       UNIQUE KEY projects_current_box (current_box_id),INDEX projects_status_updated(status,updated_at),INDEX projects_type_week(type,week_of)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
+    const [projectStatus] = await this.pool.query<Array<RowDataPacket & { COLUMN_TYPE: string }>>(
+      "SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='projects' AND COLUMN_NAME='status'");
+    if (projectStatus.length && !projectStatus[0].COLUMN_TYPE.includes("'deleting'"))
+      await this.pool.query("ALTER TABLE projects MODIFY COLUMN status ENUM('active','completed','archived','deleting') NOT NULL DEFAULT 'active'");
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sessions (
       id CHAR(36) PRIMARY KEY,project_id CHAR(36) NULL,thread_id VARCHAR(191) NULL,native_history_path TEXT NULL,title VARCHAR(255) NOT NULL,
       execution_mode ENUM('sandbox','local') NOT NULL,working_directory TEXT NOT NULL,model VARCHAR(200) NOT NULL,model_entry_id VARCHAR(200) NULL,
@@ -328,11 +332,14 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
+      let deletingProject = false;
       if (session.projectId) {
-        const [projects] = await connection.query<RowDataPacket[]>('SELECT id FROM projects WHERE id=? AND removed_at IS NULL FOR UPDATE', [session.projectId]);
+        const [projects] = await connection.query<RowDataPacket[]>('SELECT id,status FROM projects WHERE id=? AND removed_at IS NULL FOR UPDATE', [session.projectId]);
         if (!projects.length) throw new HttpError(409, '项目已删除，不能保存会话');
+        deletingProject = projects[0].status === 'deleting';
       }
       const [found] = await connection.query<Array<RowDataPacket & Record<string, unknown>>>(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE id=? FOR UPDATE`, [session.id]);
+      if (!found[0] && deletingProject) throw new HttpError(409, '项目正在删除，不能创建会话');
       let effective = session;
       if (previous && !found[0]) throw new HttpError(409, '记录已被删除，请刷新后重试');
       if (found[0] && previous) {

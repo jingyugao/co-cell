@@ -11,7 +11,12 @@ export interface RemoteArchives {
   list?(target: WorkspaceTarget, references: readonly RemoteArchiveRef[]): Promise<RemoteArchiveRef[]>;
   /** Submit capture once and return native metadata; request ID is only for correlation. */
   capture(target: WorkspaceTarget, requestId: string,
-    options?: { onOperation?: (operationId: string, volumeId: string) => Promise<void> }): Promise<RemoteArchiveMetadata>;
+    options?: {
+      onOperation?: (operationId: string, volumeId: string) => Promise<void>;
+      /** Reconcile an explicit deletion retry against native operations and snapshots. */
+      recovery?: { operationId?: string; snapshotIds?: string[] };
+      onSnapshotBaseline?: (volumeId: string, snapshotIds: string[]) => Promise<void>;
+    }): Promise<RemoteArchiveMetadata>;
   /** Verify that the specific owned archive still exists and matches its saved metadata. */
   inspect(reference: RemoteArchiveRef): Promise<RemoteArchiveMetadata>;
   /** Restore into a staged box. Notify about its ID before subsequent setup can fail. */

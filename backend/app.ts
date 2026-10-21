@@ -39,11 +39,12 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   if (manager.sharedStateEnabled) app.use('/api/*', async (c, next) => {
     const pathname = new URL(c.req.url).pathname;
     // These project-scoped routes refresh their own project from durable state.
-    // Keep the full multi-API reconciliation for every other route until it has
-    // an explicit scoped refresh contract of its own.
+    // Session reads and controls also load their own durable record.
     const projectScoped = c.req.method === 'GET' && /^\/api\/projects\/[^/]+$/.test(pathname)
       || c.req.method === 'POST' && /^\/api\/projects\/[^/]+\/(?:open|sandbox\/resume)$/.test(pathname);
-    if (pathname.startsWith('/api/tool-runtime/') || projectScoped) return next();
+    const sessionScoped = c.req.method === 'GET' && pathname === '/api/sessions'
+      || /^\/api\/sessions\/[^/]+(?:\/|$)/.test(pathname);
+    if (pathname.startsWith('/api/tool-runtime/') || projectScoped || sessionScoped) return next();
     await manager.refreshSharedState();
     await next();
   });

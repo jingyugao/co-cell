@@ -64,6 +64,7 @@ export const test = base.extend({
       if (path === '/api/config') data = config;
       else if (path === '/api/tool-roles' && method === 'GET') data = { roles: [defaultRole], defaultRoleId };
       else if (path === '/api/tools' && method === 'GET') data = [];
+      else if (['/api/tool-definitions', '/api/tool-scripts'].includes(path) && method === 'GET') data = [];
       else if (path === '/api/notifications') data = [];
       else if (path === '/api/images') data = [{ id: 'default', name: '系统默认镜像', category: '系统', origin: 'profile', versions: [{ id: 'default', version: '当前配置', status: 'succeeded', source: 'default', projectReady: true }] }];
       else if (path === '/api/projects' && method === 'GET') data = [...projects.values()];

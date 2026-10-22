@@ -1,3 +1,4 @@
+import type { DynamicToolExecution } from './tool-types.js';
 export type SecretFormat = 'text' | 'files' | 'home';
 /** Native encrypted Linux Lark keychain files accompanying its primary config. */
 export interface SecretSupportFile { path: string; content: string; encoding: 'base64' }
@@ -45,7 +46,11 @@ export interface ProvisionedToolFile {
 /** Stable across resume; carries no credential content or authentication token. */
 export interface ToolHomeRuntimeConfig { mode: 'home'; boxId: string; url: string }
 /** Generic tools use their native HOME defaults when no path override is configured. */
-export interface ToolAuthorization { tool: ProxyTool; args: string[]; home: string; path?: string }
+export interface ToolAuthorization {
+  tool: ProxyTool; args: string[]; home: string; path?: string; execution?: DynamicToolExecution;
+  /** Native CLI writes retain the mounted HOME owner's access to these roots. */
+  credentialPaths?: string[];
+}
 export interface SecretVersion {
   id: string; source: 'operator' | 'tool'; baseVersion: number | null;
   createdAt: string; projectId: string | null; invocationId: string | null;

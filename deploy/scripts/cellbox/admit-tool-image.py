@@ -39,6 +39,13 @@ for name in names:
     if not any(tool['id'] == tool_id for tool in tools):
         tools.append({'id': tool_id, 'executable': '/opt/cellbox/tools/cocell-proxy', 'args': [name, '-'],
                       'passThroughArgs': True, 'credentialEnv': {'COCELL_TOOL_RUNTIME': 'cocell_tool_runtime'}})
+dispatcher = next((tool for tool in tools if tool['id'] == 'cocell_tool'), None)
+if dispatcher is None:
+    dispatcher = {'id': 'cocell_tool'}
+    tools.append(dispatcher)
+dispatcher.update({'executable': '/opt/cellbox/tools/cocell-proxy', 'args': ['--dynamic', '-'],
+                   'passThroughArgs': True, 'credentialEnv': {'COCELL_TOOL_RUNTIME': 'cocell_tool_runtime'},
+                   'workspaceRead': True, 'workspaceWrite': False})
 for tool in tools:
     if tool['id'] in ('cocell_git', 'cocell_glab'):
         tool['workspaceRead'] = True

@@ -1,3 +1,7 @@
+// Cellbox execution Pods retain this UTS hostname across warm-pool restores.
+// Meegle's native key derivation uses it together with the tool's explicit USER.
+export const TOOL_CREDENTIAL_IDENTITY = Object.freeze({ hostname: 'recoverable', username: 'unknown' });
+
 /** Runtime identity is a routing key, not an authentication credential. */
 export function toolRuntimeBoxId(value) {
   if (typeof value !== 'string') return undefined;

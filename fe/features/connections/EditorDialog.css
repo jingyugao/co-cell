@@ -1,0 +1,12 @@
+.connection-editor-dialog{box-sizing:border-box;width:min(900px,calc(100% - 32px));max-width:none;max-height:calc(100dvh - 32px);padding:0;margin:auto;border:1px solid #dce5cf;border-radius:12px;background:#fff;color:#485f36;box-shadow:0 20px 80px #17220e33;overflow:hidden}
+.connection-editor-dialog[open]{display:flex;flex-direction:column}
+.connection-editor-dialog::backdrop{background:#17220e66}
+.connection-editor-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 22px;border-bottom:1px solid #e6ebde;flex-shrink:0}
+.connection-editor-heading h2{min-width:0;margin:0;font-size:18px;font-weight:550;overflow-wrap:anywhere}
+.connection-editor-heading button{flex-shrink:0;font-size:22px}
+.connection-editor-body{min-height:0;padding:0 22px 22px;overflow:auto;overscroll-behavior:contain}
+.connection-editor-content{min-width:0;margin:0;padding:0;border:0}
+.connection-editor-dialog .secret-form{margin:0;padding:0;border:0;border-radius:0;background:transparent}
+.connection-editor-dialog .secret-form>.secret-actions{position:sticky;bottom:-22px;margin-top:20px;padding:14px 0 0;background:#fff;border-top:1px solid #e6ebde}
+.connection-editor-dialog button:focus-visible{outline:2px solid #a8b991;outline-offset:2px}
+@media(max-width:600px){.connection-editor-dialog{width:calc(100% - 16px);max-height:calc(100dvh - 16px);border-radius:9px}.connection-editor-heading{padding:14px 16px}.connection-editor-heading h2{font-size:16px}.connection-editor-body{padding:0 16px 16px}.connection-editor-dialog .secret-form>.secret-actions{bottom:-16px}}

@@ -8,6 +8,7 @@ const sources = [
   'util/tool-working-directory.mjs',
   'util/gitlab-tool-host.mjs',
   'util/tool-runtime-identity.mjs',
+  'util/dynamic-tool-config.mjs',
 ];
 
 async function readToolWrapperAssets() {

@@ -31,6 +31,7 @@ import { MySqlCoordinator } from './infra/storage/coordination.js';
 import { SecretCrypto } from './secrets/crypto.js';
 import { NativeSecretFiles } from './secrets/native-files.js';
 import { SecretService } from './secrets/service.js';
+import { DynamicTools } from './tools/service.js';
 import { SharedFiles } from './shared-files/service.js';
 import { publishSharedDirectory } from './shared-files/mount.js';
 import { publishToolWrappers } from './shared-files/tool-wrappers.js';
@@ -92,7 +93,8 @@ const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_AP
 await cellboxProvider.initialize();
 let manager: SessionManager;
 let closeNativeSandboxConnections = async (_id: string): Promise<void> => {};
-const secrets = new SecretService(webState.secretRepository, secretCrypto);
+const tools = new DynamicTools(webState.toolRepository, sharedDataRoot, coordinator);
+const secrets = new SecretService(webState.secretRepository, secretCrypto, tools);
 if (sharedDirectory) await secrets.mountHomes(sharedDataRoot);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
   error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); }, multiApi ? 0 : undefined);
@@ -157,7 +159,7 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
   }, notifications, coordinator);
 manager.setModelService(models);
 // Project tables must exist before the Secret schema's foreign keys are created.
-const initializeSchemas = async () => { await webState.init(); await notifications.init(); await secrets.init(); await models.init(); };
+const initializeSchemas = async () => { await webState.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); };
 if (coordinator) await coordinator.run('cocell-schema-init', initializeSchemas);
 else await initializeSchemas();
 await manager.init();

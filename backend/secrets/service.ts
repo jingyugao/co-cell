@@ -1,9 +1,9 @@
 import { larkCredential, type LarkCredential } from './lark-credential.js';
 import { ToolRoles } from './roles.js';
-import { mergeNativeConfig, nativeConfigPath, nativeContextTool, nativeNames, type NativeSource } from './native-config.js';
+import { mergedBinding, mergeNativeConfig, nativeConfigPath, nativeContextTool, nativeNames, type NativeSource } from './native-config.js';
 import { authorizeCredential, describeTool, getTool, hasCredentials, registeredTools } from '../tool-access/index.js';
 import type { ToolCatalogEntry } from '../../protocol/secret-types.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { ProxyTool, SecretInput, SecretUpdate, SecretMetadata, SecretContent, SecretDeleteResult, ProvisionedToolFile } from '../../protocol/secret-types.js';
 import { HttpError } from '../../util/errors.js';
 import { SecretCrypto } from './crypto.js';
@@ -12,6 +12,13 @@ import type { SecretRepository, StoredSecret, StoredVersion } from './repository
 import { validateFileBundle } from '../../util/credential-files.mjs';
 import { MountedToolHomes } from './mounted-home.js';
 import type { ToolAuthorization } from '../../protocol/secret-types.js';
+import type { DynamicTools } from '../tools/service.js';
+import { isDynamicBuiltin } from '../tools/defaults.js';
+import { ToolScripts } from '../tools/scripts.js';
+import { ToolCredentialFiles } from '../tools/credentials.js';
+import type { ToolCredentialRegistration } from '../../protocol/tool-credential-types.js';
+import { join } from 'node:path';
+import { TOOL_CREDENTIAL_IDENTITY } from '../../util/tool-runtime-identity.mjs';
 
 export const MAX_SECRET_BYTES = 64 * 1024;
 export function secretBytes(format: SecretInput['format'], content: string): Buffer {
@@ -37,9 +44,12 @@ function inputBytes(input: SecretInput & { supportVersion?: number }): Buffer {
 }
 export class SecretService {
   homes?: MountedToolHomes;
+  credentialFiles?: ToolCredentialFiles;
   readonly roles: ToolRoles;
-  constructor(readonly repository: SecretRepository, private crypto: SecretCrypto) {
-    this.roles = new ToolRoles(repository, () => this.toolCatalog());
+  readonly scripts: ToolScripts;
+  constructor(readonly repository: SecretRepository, private crypto: SecretCrypto, readonly tools?: DynamicTools) {
+    this.roles = new ToolRoles(repository, () => this.toolCatalog(), tools ? action => tools.coordinate(action) : undefined);
+    this.scripts = new ToolScripts(tools?.repository.scripts, tools ? action => tools.coordinate(action) : undefined);
   }
   private nativeSource(secret: StoredSecret): NativeSource {
     return { id: secret.id, name: secret.name, version: secret.version, content: this.crypto.open(secret.id, secret.currentVersionId, secret.ciphertext).toString('utf8') };
@@ -80,10 +90,49 @@ export class SecretService {
     await this.repository.roles.bootstrap();
     await this.refreshHome();
   }
-  async mountHomes(root: string) { this.homes = new MountedToolHomes(root); await this.homes.init(); }
+  async mountHomes(root: string) {
+    this.homes = new MountedToolHomes(root); await this.homes.init();
+    this.scripts.configureCache(join(root, 'tools/npm-cache'));
+    this.credentialFiles = new ToolCredentialFiles(root, name => this.credentialConfiguration(name),
+      action => this.tools ? this.tools.coordinate(action) : action(), paths => this.homes!.preserve(paths));
+  }
   publishHome() {
     if (!this.homes) throw new Error('Mounted debug HOME is not configured');
-    return this.homes.publish(() => this.provision());
+    const publish = () => this.homes!.publish(() => this.provision());
+    return this.tools ? this.tools.coordinate(publish) : publish();
+  }
+  private async credentialConfiguration(name: string) {
+    toolName(name);
+    const definition = await this.tools?.get(name), secrets = (await this.repository.list()).filter(secret => secret.tool === name);
+    const adapter = getTool(name);
+    if (!definition && !registeredTools().some(tool => tool.name === name) && !secrets.length) throw new HttpError(404, '工具不存在');
+    const registrations: ToolCredentialRegistration[] = secrets.map(secret => {
+      const files = hasCredentials(adapter) ? [adapter.configPath] : secret.format === 'lark'
+        ? [secret.path!, ...this.lark(secret).supportFiles.map(file => file.path)]
+        : secret.format === 'files' ? this.bundle(secret).files.map(file => file.path) : secret.path ? [secret.path] : [];
+      return { id: secret.id, name: secret.name, path: secret.path, enabled: secret.enabled, format: secret.format, version: secret.version, files };
+    });
+    const paths = definition?.credentialPaths?.length ? definition.credentialPaths
+      : hasCredentials(adapter) ? [adapter.configPath] : [...registrations.flatMap(item => item.files), ...(definition?.credentialPath ? [definition.credentialPath] : [])];
+    const unique = [...new Set(paths.map(credentialPath))];
+    const roots = unique.filter(path => !unique.some(parent => parent !== path && path.startsWith(parent + '/'))).sort();
+    const [load, save] = await Promise.all([definition?.credentialParseScriptId ? this.scripts.get(definition.credentialParseScriptId) : undefined,
+      definition?.credentialSaveScriptId ? this.scripts.get(definition.credentialSaveScriptId) : undefined]);
+    const primaryPath = hasCredentials(adapter) ? adapter.configPath
+      : secrets.find(secret => secret.enabled && ['text', 'lark', 'home'].includes(secret.format))?.path ?? definition?.credentialPath;
+    const source = name === 'meegle' ? secrets.filter(secret => secret.format === 'files').map(secret => this.bundle(secret)).find(bundle => bundle.adapter === 'meegle')?.identity : undefined;
+    const targetIdentity = name === 'meegle' ? { ...TOOL_CREDENTIAL_IDENTITY,
+      username: (definition?.env.USER ?? TOOL_CREDENTIAL_IDENTITY.username).replaceAll('${HOME}', '/home/debug').replaceAll('${CREDENTIAL}', primaryPath ? `/home/debug/${primaryPath}` : '') || TOOL_CREDENTIAL_IDENTITY.username } : undefined;
+    const context = { tool: name, ...(primaryPath ? { primaryPath } : {}),
+      ...(targetIdentity ? { identity: source ?? targetIdentity, targetIdentity } : {}) };
+    const excludedPaths = name === 'meegle' ? ['.meegle/cache'] : [];
+    const revision = JSON.stringify([definition?.version ?? 0, roots, excludedPaths, registrations.map(item => [item.id, item.version, item.path]), context, load?.id, load?.version, save?.id, save?.version]);
+    const validate = (path: string, bytes: Buffer) => {
+      if (!hasCredentials(adapter) || path !== adapter.configPath) return;
+      try { adapter.listCredentials([], bytes); }
+      catch { throw new HttpError(400, '保存结果不是有效的原生凭据配置'); }
+    };
+    return { roots, excludedPaths, registrations, context, load, save, validate, scriptVersion: parseInt(createHash('sha256').update(revision).digest('hex').slice(0, 12), 16) };
   }
   private async refreshHome() {
     if (this.homes) await this.publishHome();
@@ -119,7 +168,9 @@ export class SecretService {
   }
   async toolCatalog(): Promise<ToolCatalogEntry[]> {
     const secrets = await this.repository.list();
-    const names = new Set([...registeredTools().map(tool => tool.name), ...secrets.flatMap(secret => secret.tool ? [secret.tool] : [])]);
+    const dynamic = await this.tools?.list() ?? [];
+    const names = new Set([...registeredTools().filter(tool => !this.tools || !isDynamicBuiltin(tool.name)).map(tool => tool.name), ...dynamic.map(tool => tool.name),
+      ...(this.tools ? [] : secrets.flatMap(secret => secret.tool ? [secret.tool] : []))]);
     return Promise.all([...names].map(async name => {
       const adapter = getTool(name);
       const config = hasCredentials(adapter) ? await this.homes?.read(adapter.configPath) : undefined;
@@ -208,7 +259,11 @@ export class SecretService {
         alias: secret.alias ?? 'default' });
       for (const file of native?.supportFiles ?? []) files.push({ tool: secret.tool, secretId: secret.id, path: file.path, content: file.content, mutable: secret.mutable, version: native!.supportVersion, alias: secret.alias ?? 'default' });
     }
-    for (const [tool, sources] of nativeSources) files.push(mergeNativeConfig(tool, sources));
+    for (const [tool, sources] of nativeSources) {
+      files.push(await this.homes?.externallyManaged(nativeConfigPath(tool))
+        ? { ...mergedBinding(tool, sources), content: '', mutable: true, alias: '', externallyManaged: true }
+        : mergeNativeConfig(tool, sources));
+    }
     return files.sort((a, b) => a.tool.localeCompare(b.tool));
   }
   async registerRuntime(boxId: string, projectId: string, generation: number) {
@@ -223,18 +278,29 @@ export class SecretService {
   /** Authorization returns a path and checked arguments, never credential bytes. */
   async authorize(boxId: string, tool: ProxyTool, args: string[]): Promise<ToolAuthorization> {
     const identity = await this.runtimeIdentity(boxId);
+    const definition = await this.tools?.get(tool);
+    if (definition && !definition.enabled) throw new HttpError(403, '此工具已停用');
+    if (this.tools && !definition && (isDynamicBuiltin(tool) || !registeredTools().some(registered => registered.name === tool)))
+      throw new HttpError(404, '工具未注册或已删除');
     const adapter = getTool(tool);
     const permission = (await this.roles.state(identity.projectId)).permissions.find(permission => permission.tool === tool);
     adapter.authorize(permission);
     const checked = validateToolArgs(tool, args);
+    const allowed = hasCredentials(adapter) ? authorizeCredential(adapter, permission!, checked) : checked;
+    await this.scripts.checkPermission(definition, { tool, args: allowed, boxId, projectId: identity.projectId, permission: permission! });
+    const execution = definition ? await this.tools!.execution(definition) : undefined;
+    const credentialRoots = (path: string | undefined) => execution
+      ? { credentialPaths: definition?.credentialPaths?.length ? definition.credentialPaths : path ? [path] : [] } : {};
     if (hasCredentials(adapter)) {
-      const authorized = authorizeCredential(adapter, permission!, checked);
-      return { tool, args: authorized, home: '/home/debug', path: adapter.configPath };
+      return { tool, args: allowed, home: '/home/debug', path: adapter.configPath, ...(execution ? { execution } : {}), ...credentialRoots(adapter.configPath) };
     }
     // Generic tools own their authentication. Even help/login must work before
     // native credential files exist; only a configured path override is needed.
     const configs = (await this.repository.toolConfigs(tool)).filter(config => config.enabled && ['text', 'lark', 'home'].includes(config.format));
     if (configs.length > 1) throw new HttpError(409, '此工具有多份已启用的共享主配置');
-    return { tool, args: checked, home: '/home/debug', ...(configs[0]?.path ? { path: credentialPath(configs[0].path) } : {}) };
+    const path = configs[0]?.path ?? definition?.credentialPath;
+    if (!path && execution && Object.values(execution.env).some(value => value.includes('${CREDENTIAL}')))
+      throw new HttpError(409, '请先配置认证文件路径或添加工具 Secret');
+    return { tool, args: checked, home: '/home/debug', ...(path ? { path: credentialPath(path) } : {}), ...(execution ? { execution } : {}), ...credentialRoots(path ?? undefined) };
   }
 }

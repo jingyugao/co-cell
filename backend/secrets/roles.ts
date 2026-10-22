@@ -6,9 +6,11 @@ import { toolName } from './policy.js';
 
 /** Roles contain access switches and native credential names, never Secret IDs. */
 export class ToolRoles {
-  constructor(private repository: SecretRepository, private tools: () => Promise<ToolCatalogEntry[]>) {}
+  constructor(private repository: SecretRepository, private tools: () => Promise<ToolCatalogEntry[]>,
+    private coordinate: <T>(action: () => Promise<T>) => Promise<T> = action => action()) {}
   catalog() { return this.repository.roles.catalog(); }
-  async save(input: ToolRoleInput, id?: string) {
+  save(input: ToolRoleInput, id?: string) { return this.coordinate(() => this.saveRole(input, id)); }
+  private async saveRole(input: ToolRoleInput, id?: string) {
     const catalog = await this.catalog();
     const previous = id ? catalog.roles.find(role => role.id === id) : undefined;
     if (id && !previous) throw new HttpError(404, '角色不存在');

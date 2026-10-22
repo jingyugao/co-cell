@@ -1,6 +1,7 @@
 import { HttpError } from '../../../util/errors.js';
 import type { CredentialCatalog, CredentialSource, ToolWithCredential } from '../interfaces.js';
 import { BasicTool, credentialOption } from './tool.js';
+import { decodeMysqlLogin } from '../../secrets/mysql-login.js';
 
 const validName = (value: unknown): value is string => typeof value === 'string' && !!value && value.length <= 256 && !/[\u0000-\u001f\u007f\[\]]/.test(value);
 
@@ -40,7 +41,12 @@ export class MysqlTool extends BasicTool implements ToolWithCredential {
   readonly configPath = '.mylogin.cnf';
   readonly credentialOption = '--login-path';
   constructor() { super('mysql'); }
-  listCredentials(sources: readonly CredentialSource[]): CredentialCatalog {
+  listCredentials(sources: readonly CredentialSource[], mountedConfig?: Buffer): CredentialCatalog {
+    if (mountedConfig) {
+      const content = decodeMysqlLogin(mountedConfig);
+      const names = content.trim() ? [...mysqlProfiles(content, 'default').keys()] : [];
+      return { names, ...(names.length === 1 ? { defaultName: names[0] } : {}) };
+    }
     const names: string[] = [];
     for (const source of sources) for (const name of mysqlProfiles(source.content, source.name).keys()) {
       if (names.includes(name)) throw new HttpError(400, `MySQL 原生连接名称重复：${name}`);

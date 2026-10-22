@@ -141,8 +141,20 @@ else
 fi
 
 image="${image_repository}:${image_tag}"
+dockerfile="${COCELL_WEB_DOCKERFILE:-$repo_root/deploy/web/Dockerfile}"
+if [[ ! -f "$dockerfile" ]]; then echo "CoCell Dockerfile not found: $dockerfile" >&2; exit 2; fi
+build_args=()
+if [[ -n "${COCELL_DOCKER_BUILD_NETWORK:-}" ]]; then
+  case "$COCELL_DOCKER_BUILD_NETWORK" in
+    default|host|none) build_args+=(--network "$COCELL_DOCKER_BUILD_NETWORK") ;;
+    *) echo "COCELL_DOCKER_BUILD_NETWORK must be default, host, or none" >&2; exit 2 ;;
+  esac
+fi
+for proxy in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+  if [[ -n "${!proxy:-}" ]]; then build_args+=(--build-arg "$proxy"); fi
+done
 echo "Building ${image} for linux/amd64 with the local Docker cache"
-docker build --platform linux/amd64 --file "$repo_root/deploy/web/Dockerfile" --tag "$image" .
+docker build --platform linux/amd64 "${build_args[@]}" --file "$dockerfile" --tag "$image" .
 echo "Publishing ${image} to ${registry_endpoint}"
 docker push "$image"
 

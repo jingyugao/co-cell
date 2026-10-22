@@ -6,6 +6,11 @@ const tool = (name, credentials, defaultCredential) => credentials
   ? { name, kind: 'tool-with-credential', credentials, ...(defaultCredential ? { defaultCredential } : {}) }
   : { name, kind: 'tool' };
 
+async function openRoles(page) {
+  await page.goto('/#connections');
+  await page.getByRole('tab', { name: '工具角色', exact: true }).click();
+}
+
 test('roles configure generic tool switches and named credentials from the catalog', async ({ page, ui }) => {
   const tools = [
     tool('mysql', ['reporting', "warehouse's"], 'reporting'),
@@ -14,7 +19,6 @@ test('roles configure generic tool switches and named credentials from the catal
     tool('vault-cli', ['team-a']),
   ];
   let catalog = { roles: [defaultRole], defaultRoleId: defaultRole.id }, roleSave, savedRole, projectSave;
-  await page.route('**/api/secrets', route => route.fulfill({ json: [] }));
   await page.route('**/api/tools', route => route.fulfill({ json: tools }));
   await page.route('**/api/tool-roles**', async route => {
     const request = route.request(), path = new URL(request.url()).pathname;
@@ -34,9 +38,9 @@ test('roles configure generic tool switches and named credentials from the catal
     if (route.request().method() === 'PUT') { projectSave = route.request().postDataJSON(); return route.fulfill({ json: { roleId: projectSave.roleId, permissions: savedRole.permissions } }); }
     await route.fulfill({ json: { roleId: defaultRole.id, permissions: [] } });
   });
-  await page.goto('/#connections');
+  await openRoles(page);
   await page.getByRole('button', { name: '新建角色', exact: true }).click();
-  const form = page.locator('.role-form');
+  const form = page.getByRole('dialog', { name: '新建角色', exact: true }).locator('form');
   await form.getByLabel('角色名称', { exact: true }).fill('数据运维');
   await expect(form.locator('.role-connections-heading')).toContainText(/共享 HOME/);
   await expect(page.locator('.role-manager>.connections-heading')).toContainText(/调用时会按角色所选名称校验权限/);
@@ -84,7 +88,6 @@ test('editing removes vanished credentials explicitly and disables a credential 
   ], createdAt: stamp, updatedAt: stamp };
   let roleSave;
   let catalog = { roles: [defaultRole, existingRole], defaultRoleId: defaultRole.id };
-  await page.route('**/api/secrets', route => route.fulfill({ json: [] }));
   await page.route('**/api/tools', route => route.fulfill({ json: tools }));
   await page.route('**/api/tool-roles**', async route => {
     if (route.request().method() === 'PUT') {
@@ -95,10 +98,10 @@ test('editing removes vanished credentials explicitly and disables a credential 
     }
     await route.fulfill({ json: catalog });
   });
-  await page.goto('/#connections');
+  await openRoles(page);
   const card = page.getByRole('article').filter({ hasText: '数据运维' });
   await card.getByRole('button', { name: '编辑角色：数据运维', exact: true }).click();
-  const form = page.locator('.role-form');
+  const form = page.getByRole('dialog', { name: '编辑角色：数据运维', exact: true }).locator('form');
   await expect(form.getByLabel('mysql 连接：reporting')).toBeChecked();
   await expect(form.getByText('retired-db · 连接已不存在', { exact: true })).toBeVisible();
   await expect(form.getByLabel('vault-cli 连接：team-a')).toBeChecked();
@@ -118,7 +121,6 @@ test('editing removes vanished credentials explicitly and disables a credential 
 
 test('role and tool catalog failures block saves in both role and project permission editors', async ({ page, ui }) => {
   let failRoleCatalog = false, failToolCatalog = true, saveCalls = 0;
-  await page.route('**/api/secrets', route => route.fulfill({ json: [] }));
   await page.route('**/api/tools', route => failToolCatalog
     ? route.fulfill({ status: 500, json: { error: '工具目录读取失败' } })
     : route.fulfill({ json: [tool('git', null)] }));
@@ -133,13 +135,13 @@ test('role and tool catalog failures block saves in both role and project permis
     if (route.request().method() === 'PUT') saveCalls++;
     await route.fulfill({ status: 200, json: { roleId: defaultRole.id, permissions: [] } });
   });
-  await page.goto('/#connections');
+  await openRoles(page);
   await expect(page.getByRole('alert')).toHaveText('工具目录读取失败');
   await expect(page.getByRole('button', { name: '新建角色', exact: true })).toBeDisabled();
   expect(saveCalls).toBe(0);
 
   failToolCatalog = false; failRoleCatalog = true;
-  await page.goto('/#connections');
+  await openRoles(page);
   await expect(page.getByRole('alert')).toHaveText('角色读取失败');
   await expect(page.getByRole('button', { name: '新建角色', exact: true })).toBeDisabled();
   expect(saveCalls).toBe(0);

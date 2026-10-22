@@ -1,102 +1,139 @@
 import { test, expect } from './fixture.mjs';
 
-test('one native credential file preserves uploaded text while projects use the empty default role', async ({ page, ui }) => {
-  const name = '原生认证文件', original = '\uFEFFapiVersion: v1\r\ncurrent-context: fixture\r\n';
-  let saved, payload, edits = [];
-  await page.route('**/api/secrets**', async route => {
-    const request = route.request(), path = new URL(request.url()).pathname;
-    if (path.endsWith('/content')) return route.fulfill({ json: { format: 'text', content: payload.content, requiresTextImport: false, version: 1 } });
-    if (request.method() === 'POST') {
-      payload = request.postDataJSON();
-      saved = { id: 'native-file', ...payload, storage: 'native', homeDirectory: '/home/debug', enabled: true, version: 1, projectIds: [], requiresTextImport: false, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' };
-      return route.fulfill({ status: 201, json: saved });
-    }
-    if (request.method() === 'PATCH') { const edit = request.postDataJSON(); edits.push(edit); saved = { ...saved, ...edit }; return route.fulfill({ json: saved }); }
-    await route.fulfill({ json: saved ? [saved] : [] });
+const stamp = '2026-01-01T00:00:00Z';
+const version = 'a'.repeat(64);
+const nativeFile = (path, content, encoding = 'utf8', scriptVersion = 0) => ({
+  path, content, encoding, scriptVersion, version, size: Buffer.byteLength(content), editable: true,
+});
+
+async function credentialEditor(page, { name, roots, files, hooks = false, onSave }) {
+  const state = new Map(files.map(file => [file.path, { ...file }]));
+  const reads = [], writes = [];
+  const scripts = hooks ? ['load', 'save'].map((kind, index) => ({
+    id: `00000000-0000-4000-8000-00000000000${index + 1}`, name: `Fixture ${kind} hook`,
+    language: 'typescript', source: 'return input.content;', version: 1, createdAt: stamp, updatedAt: stamp,
+  })) : [];
+  const definition = {
+    name, enabled: true, description: '', instructions: '', executable: name, args: [], env: {},
+    credentialPath: files[0].path, credentialPaths: roots, timeoutMs: 20000, version: 1,
+    ...(hooks ? { credentialParseScriptId: scripts[0].id, credentialSaveScriptId: scripts[1].id } : {}),
+    createdAt: stamp, updatedAt: stamp,
+  };
+  await page.route('**/api/tool-definitions', route => route.request().method() === 'GET'
+    ? route.fulfill({ json: [definition] }) : route.fallback());
+  await page.route('**/api/tool-scripts', route => route.fulfill({ json: scripts }));
+  await page.route('**/api/tools', route => route.fulfill({ json: [name === 'kubectl'
+    ? { name, kind: 'tool-with-credential', credentials: ['fixture'] } : { name, kind: 'tool' }] }));
+  await page.route(`**/api/tools/${name}/credentials**`, async route => {
+    const request = route.request(), url = new URL(request.url());
+    if (!url.pathname.endsWith('/file')) return route.fulfill({ json: {
+      tool: name, home: '/home/debug', roots, registrations: [], entries: [
+        ...roots.filter(root => files.some(file => file.path.startsWith(root + '/'))).map(path => ({ path, type: 'directory' })),
+        ...[...state.values()].map(file => ({ path: file.path, type: 'file', size: file.size })),
+      ],
+    } });
+    const path = url.searchParams.get('path');
+    if (!state.has(path)) return route.fulfill({ status: 404, json: { error: '文件不存在' } });
+    if (request.method() === 'PUT') {
+      const body = request.postDataJSON(); writes.push(body);
+      const response = await onSave?.(body, state, writes);
+      if (response) return route.fulfill(response);
+      state.set(path, { ...state.get(path), ...body, version: 'b'.repeat(64) });
+    } else reads.push(path);
+    return route.fulfill({ json: state.get(path) });
   });
   await page.goto('/#connections');
-  await page.getByRole('button', { name: '新建 Secret', exact: true }).click();
-  await page.getByLabel('名称', { exact: true }).fill(name);
-  await page.getByLabel('工具名', { exact: true }).fill('kubectl');
-  await page.getByLabel('认证文件路径', { exact: true }).fill('.kube/config');
-  await page.getByLabel('上传文件', { exact: true }).setInputFiles({ name: 'config', mimeType: 'text/yaml', buffer: Buffer.from(original) });
-  await expect(page.getByRole('textbox', { name: '认证内容', exact: true })).toHaveValue(original.replaceAll('\r\n', '\n'));
-  await expect(page.getByRole('combobox', { name: '认证方式', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: '保存', exact: true }).click();
-  await expect(page.getByText(name, { exact: true })).toBeVisible();
-  expect(payload.format).toBe('text'); expect(payload.content).toBe(original); expect(payload.files).toBeUndefined();
-  expect(payload.path).toBe('.kube/config');
-  await page.getByRole('button', { name: '编辑', exact: true }).click();
-  await expect(page.getByText('共享凭据目录：')).toContainText('/home/debug');
-  await expect(page.getByText('取消登记会保留原生配置文件。工具使用权限由角色单独管理。', { exact: true })).toBeVisible();
-  await page.getByLabel('名称', { exact: true }).fill(name + ' 改名');
-  await page.getByRole('button', { name: '保存', exact: true }).click();
-  await expect(page.getByText(name + ' 改名', { exact: true })).toBeVisible();
-  expect(edits[0].content).toBeUndefined(); expect(edits[0].format).toBeUndefined();
+  await page.locator('.tool-definition-list article').filter({ hasText: name }).getByRole('button', { name: '编辑', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: `编辑工具：${name}`, exact: true });
+  await dialog.getByText('凭据配置', { exact: true }).click();
+  const browser = dialog.getByRole('region', { name: `${name} 凭据文件`, exact: true });
+  await expect(browser).toBeVisible();
+  const select = path => browser.locator('.tool-credential-tree').getByTitle(path, { exact: true }).click();
+  return { dialog, browser, state, reads, writes, select };
+}
+
+// The removed Secret upload/import UI is replaced by editing native files under each tool.
+test('native multi-file credentials load on selection and save only the selected raw text without granting project access', async ({ page, ui }) => {
+  const path = '.kube/config', certificate = '.kube/client.crt';
+  const original = '# retain comments\napiVersion: v1\ncurrent-context: fixture\n';
+  const fixture = await credentialEditor(page, { name: 'kubectl', roots: ['.kube'], files: [
+    nativeFile(path, original), nativeFile(certificate, 'synthetic-certificate'),
+  ] });
+  const { browser, reads, writes, select, state } = fixture;
+  await expect(browser.locator('.tool-credential-tree').getByTitle(certificate, { exact: true })).toBeVisible();
+  expect(reads).toEqual([]);
+  await select(path);
+  const editor = browser.getByRole('textbox', { name: `${path} 文件内容`, exact: true });
+  await expect(editor).toHaveValue(original);
+  const edited = original.replace('fixture', 'reporting');
+  await editor.fill(edited);
+  await browser.getByRole('button', { name: '保存文件', exact: true }).click();
+  await expect(browser.getByRole('status')).toHaveText('凭据文件已保存。');
+  expect(writes).toEqual([{ path, content: edited, encoding: 'utf8', version, scriptVersion: 0 }]);
+  expect(reads).toEqual([path]);
+  expect(state.get(certificate).content).toBe('synthetic-certificate');
+  await fixture.dialog.getByRole('button', { name: '关闭编辑窗口', exact: true }).click();
   await page.goto('/#projects');
   await page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('button', { name: '工具权限', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '暂停项目 工具权限', exact: true });
-  const defaultRole = dialog.getByRole('radio', { name: '默认角色 默认角色', exact: true });
-  await expect(defaultRole).toBeChecked();
+  await expect(dialog.getByRole('radio', { name: '默认角色 默认角色', exact: true })).toBeChecked();
   await expect(dialog.getByText('此角色没有启用的工具。', { exact: true })).toBeVisible();
-  await expect(dialog.getByText(name + ' 改名', { exact: true })).toHaveCount(0);
-  await expect(dialog.getByText('保留现有权限', { exact: true })).toHaveCount(0);
   expect(ui.calls.some(call => call.path.endsWith('/tool-permissions'))).toBe(false);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
-test('legacy file groups require explicit single-file import and binary uploads are rejected', async ({ page, ui }) => {
-  const old = { id: 'legacy-group', name: '旧文件组', tool: 'custom.cli', path: 'auth.txt', format: 'files', mutable: true, enabled: true, version: 1, projectIds: [], requiresTextImport: true, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' };
-  let updated;
-  await page.route('**/api/secrets**', async route => {
-    if (new URL(route.request().url()).pathname.endsWith('/content')) return route.fulfill({ json: { format: 'files', content: '', files: [{ path: 'auth.txt', content: 'legacy-fixture' }], requiresTextImport: true, version: 1 } });
-    if (route.request().method() === 'PATCH') { updated = route.request().postDataJSON(); return route.fulfill({ json: { ...old, ...updated } }); }
-    await route.fulfill({ json: [{ ...old, ...updated }] });
-  });
-  await page.goto('/#connections');
-  await page.getByRole('button', { name: '编辑', exact: true }).click();
-  await expect(page.getByText('旧格式需要重新导入一个原生文本认证文件。', { exact: true })).toBeVisible();
-  await page.getByLabel('上传文件', { exact: true }).setInputFiles({ name: 'binary', mimeType: 'application/octet-stream', buffer: Buffer.from([0xff, 0x80]) });
-  await expect(page.getByRole('alert')).toHaveText('请上传 UTF-8 编码的原始文本文件');
-  await page.getByLabel('上传文件', { exact: true }).setInputFiles({ name: 'auth.txt', mimeType: 'text/plain', buffer: Buffer.from('native-fixture') });
-  await page.getByRole('button', { name: '保存', exact: true }).click();
-  await expect(page.getByRole('textbox', { name: '认证内容', exact: true })).toHaveCount(0);
-  expect(updated.format).toBe('text'); expect(updated.content).toBe('native-fixture'); expect(updated.files).toBeUndefined();
+test('encrypted credential editing sends parsed content and hook version while preserving companion files', async ({ page, ui }) => {
+  const path = '.meegle/credentials.enc', key = '.meegle/.machine-key';
+  const original = JSON.stringify({ access_token: 'synthetic-old-token', extra: 'preserve' }, null, 2);
+  const fixture = await credentialEditor(page, { name: 'meegle', roots: ['.meegle'], hooks: true, files: [
+    nativeFile('.meegle/config.json', '{"current_profile":"default"}'),
+    nativeFile(path, original, 'parsed', 7), nativeFile(key, 'synthetic-machine-key'),
+  ] });
+  await expect(fixture.dialog.getByRole('combobox', { name: 'Load hook', exact: true })).toHaveValue('00000000-0000-4000-8000-000000000001');
+  await expect(fixture.dialog.getByRole('combobox', { name: 'Save hook', exact: true })).toHaveValue('00000000-0000-4000-8000-000000000002');
+  await fixture.select(path);
+  const editor = fixture.browser.getByRole('textbox', { name: `${path} 文件内容`, exact: true });
+  await expect(editor).toHaveValue(original);
+  const edited = original.replace('synthetic-old-token', 'synthetic-new-token');
+  await editor.fill(edited);
+  await fixture.browser.getByRole('button', { name: '保存文件', exact: true }).click();
+  await expect(fixture.browser.getByRole('status')).toHaveText('凭据文件已保存。');
+  expect(fixture.writes).toEqual([{ path, content: edited, encoding: 'parsed', version, scriptVersion: 7 }]);
+  expect(fixture.reads).toEqual([path]);
+  expect(fixture.state.get(key).content).toBe('synthetic-machine-key');
+  expect(fixture.state.get('.meegle/config.json').content).toBe('{"current_profile":"default"}');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
-test('shared HOME references are read-only except for rename and never show legacy import warnings', async ({ page, ui }) => {
-  let saved = { id: 'home-reference', name: '项目登录', tool: 'meegle', path: '.meegle/config.json', format: 'home', mutable: true, enabled: true,
-    version: 4, projectIds: [], requiresTextImport: false, homeDirectory: '/home/debug',
-    createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' };
-  let patchBody;
-  const nativeHomeFile = { path: '.meegle/credentials.enc', content: 'refreshed-by-project-cli' };
-  await page.route('**/api/secrets**', async route => {
-    const request = route.request(), path = new URL(request.url()).pathname;
-    if (path.endsWith('/content')) return route.fulfill({ json: { format: 'home', content: '', requiresTextImport: false, version: saved.version } });
-    if (request.method() === 'PATCH') {
-      patchBody = request.postDataJSON();
-      if (patchBody.content !== undefined) nativeHomeFile.content = patchBody.content;
-      saved = { ...saved, ...patchBody };
-      return route.fulfill({ json: saved });
-    }
-    await route.fulfill({ json: [saved] });
+test('credential save conflicts retain the draft until an explicit reload and use the refreshed file and hook versions', async ({ page, ui }) => {
+  const path = '.gitconfig', refreshed = '[user]\nname = CLI refresh\n';
+  const fixture = await credentialEditor(page, { name: 'git', roots: [path], files: [nativeFile(path, '[user]\nname = Original\n')],
+    onSave(body, state, writes) {
+      if (writes.length !== 1) return;
+      state.set(path, { ...state.get(path), content: refreshed, version: 'c'.repeat(64), scriptVersion: 4 });
+      return { status: 409, json: { error: '文件或脚本已更新，请重新打开' } };
+    },
   });
-  await page.goto('/#connections');
-  await expect(page.getByText('共享 debug HOME · /home/debug · meegle · .meegle/config.json')).toBeVisible();
-  await expect(page.getByText('需重新导入单文件', { exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: '编辑', exact: true }).click();
-  await expect(page.getByText('由共享 debug HOME 管理，所有 Sandbox 使用同一份 CLI 配置。', { exact: true })).toBeVisible();
-  await expect(page.getByText('共享凭据目录：')).toContainText('/home/debug');
-  await expect(page.getByText('旧格式需要重新导入一个原生文本认证文件。', { exact: true })).toHaveCount(0);
-  await expect(page.getByLabel('工具名', { exact: true })).toHaveJSProperty('readOnly', true);
-  await expect(page.getByLabel('认证文件路径', { exact: true })).toHaveJSProperty('readOnly', true);
-  await expect(page.getByRole('textbox', { name: '认证内容', exact: true })).toHaveCount(0);
-  await expect(page.getByLabel('上传文件', { exact: true })).toHaveCount(0);
-  await page.getByLabel('名称', { exact: true }).fill('项目登录改名');
-  await page.getByRole('button', { name: '保存', exact: true }).click();
-  await expect(page.getByText('项目登录改名', { exact: true })).toBeVisible();
-  expect(patchBody).toEqual({ name: '项目登录改名' });
-  expect(nativeHomeFile).toEqual({ path: '.meegle/credentials.enc', content: 'refreshed-by-project-cli' });
-  await expect(page.getByText('需重新导入单文件', { exact: true })).toHaveCount(0);
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await fixture.select(path);
+  const editor = fixture.browser.getByRole('textbox', { name: `${path} 文件内容`, exact: true });
+  const draft = '[user]\nname = Unsaved draft\n';
+  await editor.fill(draft);
+  await fixture.browser.getByRole('button', { name: '保存文件', exact: true }).click();
+  await expect(fixture.browser.getByRole('alert')).toContainText('当前草稿已保留');
+  await expect(editor).toHaveValue(draft);
+  expect(fixture.writes).toHaveLength(1);
+  expect(fixture.state.get(path).content).toBe(refreshed);
+  await fixture.browser.getByRole('button', { name: '刷新', exact: true }).click();
+  await expect(editor).toHaveValue(draft);
+  page.once('dialog', dialog => dialog.accept());
+  await fixture.select(path);
+  await expect(editor).toHaveValue(refreshed);
+  const edited = '[user]\nname = Updated after refresh\n';
+  await editor.fill(edited);
+  await fixture.browser.getByRole('button', { name: '保存文件', exact: true }).click();
+  await expect(fixture.browser.getByRole('status')).toHaveText('凭据文件已保存。');
+  expect(fixture.writes).toEqual([
+    { path, content: draft, encoding: 'utf8', version, scriptVersion: 0 },
+    { path, content: edited, encoding: 'utf8', version: 'c'.repeat(64), scriptVersion: 4 },
+  ]);
 });

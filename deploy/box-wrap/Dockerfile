@@ -18,7 +18,7 @@ RUN --network=none --mount=type=bind,source=deploy/box-wrap/artifacts,target=/op
 ARG COCELL_PROXY_TOOLS=""
 COPY deploy/box-wrap/proxy-tools.json /opt/product/cocell/
 RUN mkdir -p /opt/cellbox/debug-bin \
-  && proxy_ids='' \
+  && proxy_ids='cocell_tool' \
   && for tool in ${COCELL_PROXY_TOOLS:-$(node -p 'JSON.parse(require("fs").readFileSync("/opt/product/cocell/proxy-tools.json")).join(" ")')}; do \
        binary="$(command -v "$tool" || true)"; \
        if test -z "$binary"; then continue; fi; \
@@ -31,6 +31,8 @@ RUN mkdir -p /opt/cellbox/debug-bin \
        chmod 0755 "/usr/local/bin/$tool"; \
        proxy_ids="$proxy_ids $tool_id"; \
      done \
+  && printf '#!/bin/sh\nexec /usr/local/bin/node /opt/product/cocell/tool-client.mjs --dynamic "$@"\n' > /usr/local/bin/cocell \
+  && chmod 0755 /usr/local/bin/cocell \
   && node -e 'require("fs").writeFileSync("/opt/product/cocell/proxy-tool-ids.json",JSON.stringify(process.argv.slice(1)))' $proxy_ids
 COPY --chmod=0755 deploy/box-wrap/launcher.mjs deploy/box-wrap/oss-archive-restore.mjs /opt/product/cocell/
 # Node resolves each entry to its immutable shared version before importing dependencies.

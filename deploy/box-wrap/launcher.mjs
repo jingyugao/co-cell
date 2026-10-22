@@ -147,7 +147,7 @@ function delay(ms, signal) {
   });
 }
 
-async function runCodex(config, { workspace, agentHome, codex, codexHome, signal, log }) {
+async function runCodex(config, { workspace, agentHome, codex, codexHome, sharedDirectory, signal, log }) {
   // Keep image-provided language environments (PATH, VIRTUAL_ENV, etc.) while
   // withholding Cellbox control variables and Node process injection options.
   const imageEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
@@ -162,6 +162,9 @@ async function runCodex(config, { workspace, agentHome, codex, codexHome, signal
     PATH: paths.join(':'), HOME: agentHome, LANG: imageEnv.LANG || 'C.UTF-8',
     CODEX_HOME: codexHome, ...config.env,
   };
+  // parseConfig rejects PATH overrides; keep the shared tools path at the
+  // front as a final guard if this function receives config from another caller.
+  if (sharedDirectory) env.PATH = [join(sharedDirectory, 'tools/current/bin'), env.PATH].filter(Boolean).join(':');
   // Cellbox is the Sandbox boundary; Codex must not start its nested Linux sandbox.
   const args = ['app-server', ...config.appServerArgs, '-c', 'sandbox_mode="danger-full-access"',
     '--listen', 'ws://127.0.0.1:4500'];
@@ -225,7 +228,7 @@ export async function startLauncher({ workspace = DEFAULT_WORKSPACE, codex = DEF
   log(sharedDirectory ? 'reading shared startup config' : 'waiting for provisioning config');
   while (!signal.aborted) {
     const config = await takeConfig(configPath, Boolean(sharedDirectory));
-    if (config) return runCodex(config, { workspace, agentHome, codex, codexHome, signal, log });
+    if (config) return runCodex(config, { workspace, agentHome, codex, codexHome, sharedDirectory, signal, log });
     await delay(pollMs, signal);
   }
   return 0;

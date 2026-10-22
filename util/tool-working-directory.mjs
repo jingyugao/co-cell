@@ -11,18 +11,19 @@ function validate(path) {
 }
 
 // Cellbox carries argv but not the invoking process's cwd.
-export function encodeWorkingDirectory(tool, args, cwd) {
-  return supported(tool) ? [PREFIX + validate(cwd), ...args] : args;
+export function encodeWorkingDirectory(tool, args, cwd, dynamic = false) {
+  return supported(tool) || dynamic ? [PREFIX + validate(cwd), ...args] : args;
 }
 
-export async function decodeWorkingDirectory(tool, inputArgs, agentHome = '/home/agent') {
-  if (!supported(tool) || !inputArgs[0]?.startsWith(PREFIX)) return { args: inputArgs };
+export async function decodeWorkingDirectory(tool, inputArgs, agentHome = '/home/agent', dynamic = false) {
+  if ((!supported(tool) && !dynamic) || !inputArgs[0]?.startsWith(PREFIX)) return { args: inputArgs };
   const requested = validate(inputArgs[0].slice(PREFIX.length));
   const root = await realpath(agentHome);
   const cwd = await realpath(requested);
   const path = relative(root, cwd);
   if (path === '..' || path.startsWith('..' + sep) || isAbsolute(path) || !(await stat(cwd)).isDirectory())
     throw new Error('Tool working directory is outside the agent HOME');
+  if (!supported(tool)) return { args: inputArgs.slice(1), cwd };
   // The protected CLI runs as debug while the repository belongs to agent.
   // Trust only this invocation's repository, never all repositories globally.
   let repository = cwd;

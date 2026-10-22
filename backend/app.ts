@@ -25,6 +25,7 @@ import { installOperatorAccess, type OperatorAccessOptions } from './access/oper
 import { proxyProjectService } from './projects/routes.js';
 import type { SecretService } from './secrets/service.js';
 import { installSecretRoutes } from './secrets/routes.js';
+import { installToolRoutes } from './tools/routes.js';
 import { installPwaAssets } from './infra/http/pwa.js';
 
 export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService) {
@@ -64,7 +65,10 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
     c.header('X-Content-Type-Options', 'nosniff');
     await next();
   });
-  app.use('/api/*', bodyLimit({ maxSize: 12 * 1024 * 1024, onError: c => c.json({ error: '请求过大，图片最大 10 MB' }, 413) }));
+  const regularBodyLimit = bodyLimit({ maxSize: 12 * 1024 * 1024, onError: c => c.json({ error: '请求过大，图片最大 10 MB' }, 413) });
+  const packageBodyLimit = bodyLimit({ maxSize: 48 * 1024 * 1024, onError: c => c.json({ error: '工具包请求过大，文件总量最大 32 MiB' }, 413) });
+  app.use('/api/*', (c, next) => c.req.method === 'POST' && c.req.path === '/api/tool-packages'
+    ? packageBodyLimit(c, next) : regularBodyLimit(c, next));
   app.onError((error, c) => {
     const detail = providerError(error);
     if (detail) return c.json({ error: detail.message, code: detail.code, ...(detail.upstreamStatus ? { upstreamStatus: detail.upstreamStatus } : {}) }, detail.status as 400);
@@ -86,6 +90,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   installSandboxesRoutes(app, sandboxes, manager);
   installConnectionsRoutes(app, connections);
   if (secrets) installSecretRoutes(app, secrets, id => manager.listProjects().some(project => project.id === id));
+  if (secrets?.tools) installToolRoutes(app, secrets.tools, secrets);
   installImageRoutes(app, images);
   installSharedFilesRoutes(app, sharedFiles);
   app.all('/api/*', c => c.json({ error: '接口不存在' }, 404));

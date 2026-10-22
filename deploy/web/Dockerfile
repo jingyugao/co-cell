@@ -3,7 +3,7 @@ FROM node:22.18.0-bookworm-slim
 WORKDIR /app
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PATH
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tar \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git tar \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable
 RUN npm install --global @lark-project/meegle@1.0.20

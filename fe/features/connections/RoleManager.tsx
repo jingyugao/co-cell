@@ -1,6 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { RoleCatalog, ToolCatalogEntry, ToolPermission, ToolRole } from '../../../protocol/secret-types';
 import { api, errorMessage } from '../../lib/api';
+import EditorDialog from './EditorDialog';
+import { useDraftStatus } from './DraftGuard';
 
 const emptyPermission = (entry: ToolCatalogEntry): ToolPermission => entry.kind === 'tool-with-credential'
   ? { tool: entry.name, enabled: false, credentials: [] }
@@ -17,8 +19,16 @@ export default function RoleManager() {
   const [loading, setLoading] = useState(true), [busy, setBusy] = useState(false), [error, setError] = useState('');
   const [editing, setEditing] = useState<ToolRole | 'new' | null>(null);
   const [name, setName] = useState(''), [permissions, setPermissions] = useState<ToolPermission[]>([]);
+  const editorBaseline = useRef('');
+  const editorDirty = editing !== null && JSON.stringify({ name, permissions }) !== editorBaseline.current;
+  const draftGuard = useDraftStatus('role-editor', editorDirty, busy && editing !== null);
 
-  async function refresh() { setCatalog(await api<RoleCatalog>('/api/tool-roles')); }
+  async function refresh() {
+    const [roleCatalog, toolCatalog] = await Promise.all([
+      api<RoleCatalog>('/api/tool-roles'), api<ToolCatalogEntry[]>('/api/tools'),
+    ]);
+    setCatalog(roleCatalog); setTools(toolCatalog);
+  }
   useEffect(() => {
     const controller = new AbortController();
     void Promise.all([
@@ -32,13 +42,25 @@ export default function RoleManager() {
     return () => controller.abort();
   }, []);
 
+  useEffect(() => {
+    const reload = () => { void refresh().catch(err => setError(errorMessage(err))); };
+    window.addEventListener('cocell:tool-catalog-changed', reload);
+    return () => window.removeEventListener('cocell:tool-catalog-changed', reload);
+  }, []);
+
   function start(role?: ToolRole) {
     setError(''); setName(role?.name ?? '');
     const current = role?.permissions ?? [];
-    setPermissions([...(tools ?? []).map(entry => current.find(permission => permission.tool === entry.name) ?? emptyPermission(entry)),
+    const nextPermissions = [...(tools ?? []).map(entry => current.find(permission => permission.tool === entry.name) ?? emptyPermission(entry)),
       ...current.filter(permission => !(tools ?? []).some(entry => entry.name === permission.tool))]
-      .map(permission => ({ ...permission, ...(permission.credentials ? { credentials: [...permission.credentials] } : {}) })));
+      .map(permission => ({ ...permission, ...(permission.credentials ? { credentials: [...permission.credentials] } : {}) }));
+    editorBaseline.current = JSON.stringify({ name: role?.name ?? '', permissions: nextPermissions });
+    setPermissions(nextPermissions);
     setEditing(role ?? 'new');
+  }
+
+  function closeEditor() {
+    if (!busy && (!draftGuard || draftGuard.canLeave(['role-editor']))) setEditing(null);
   }
 
   function setSimplePermission(tool: string, enabled: boolean) {
@@ -105,9 +127,9 @@ export default function RoleManager() {
   const ready = !!catalog && !!tools && !loading;
   return <section className="role-manager" aria-labelledby="tool-roles-title">
     <div className="connections-heading"><div><h2 id="tool-roles-title">工具角色</h2><p>所有 debug 进程共用 HOME 和连接配置。角色控制可调用哪些工具和连接名称；调用时会按角色所选名称校验权限。新项目使用当前默认角色。</p></div><button className="primary-button" disabled={busy || !ready} onClick={() => start()}>新建角色</button></div>
-    {error && <p className="connections-error" role="alert">{error}</p>}
-    {editing && <form className="secret-form role-form" onSubmit={event => void save(event)}>
-      <h3>{editing === 'new' ? '新建角色' : `编辑 ${editing.name}`}</h3>
+    {error && !editing && <p className="connections-error" role="alert">{error}</p>}
+    {editing && <EditorDialog title={editing === 'new' ? '新建角色' : `编辑角色：${editing.name}`} busy={busy} error={error} onClose={closeEditor}>
+      <form className="secret-form role-form" onSubmit={event => void save(event)}>
       <label>角色名称<input required maxLength={100} value={name} onChange={event => setName(event.target.value)} /></label>
       <div className="role-connections-heading"><strong>工具权限</strong><span>勾选工具或共享 HOME 中的连接名称。未选中的连接不会授权给项目。</span></div>
       {!ready ? <p role="status">正在读取工具目录…</p> : <div className="role-tool-list">{tools!.map(entry => {
@@ -143,8 +165,9 @@ export default function RoleManager() {
         <label className="role-credential-check role-credential-unavailable"><input type="checkbox" checked={permission.enabled}
           onChange={event => setSimplePermission(permission.tool, event.target.checked)} /><span>保留原有权限</span></label>
       </fieldset>)}</div>}
-      <div className="secret-actions"><button className="primary-button" disabled={busy || !ready || !name.trim()}>{busy ? '保存中…' : '保存角色'}</button><button type="button" className="secondary-button" disabled={busy} onClick={() => setEditing(null)}>取消</button></div>
-    </form>}
+      <div className="secret-actions"><button className="primary-button" disabled={busy || !ready || !name.trim()}>{busy ? '保存中…' : '保存角色'}</button><button type="button" className="secondary-button" disabled={busy} onClick={closeEditor}>取消</button></div>
+      </form>
+    </EditorDialog>}
     {loading ? <p role="status">正在读取工具角色…</p> : !catalog?.roles.length ? <div className="connections-empty">暂无工具角色。</div> : <div className="secret-list">{catalog.roles.map(role => <article className="connection-card role-card" key={role.id}>
       <div className="connection-profile-title"><strong>{role.name}</strong><span>{catalog.defaultRoleId === role.id ? '默认角色' : ''}</span></div>
       {role.permissions.some(permission => permission.enabled) ? <ul>{role.permissions.map(permissionSummary)}</ul> : <p>无工具权限</p>}

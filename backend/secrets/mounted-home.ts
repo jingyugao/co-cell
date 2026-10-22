@@ -39,6 +39,22 @@ export class MountedToolHomes {
     if (!await this.hasFile(path)) return undefined;
     return readFile(join(this.locations().home, credentialPath(path)));
   }
+  async externallyManaged(path: string) {
+    return (await this.bindings())?.some(file => file.path === path && file.externallyManaged) ?? false;
+  }
+  preserve(paths: string[]) {
+    const current = this.pending.catch(() => {}).then(async () => {
+      const bindings = await this.bindings() ?? [];
+      for (const path of paths.map(credentialPath)) {
+        const prior = bindings.find(file => file.path === path);
+        if (prior) prior.externallyManaged = true;
+        else bindings.push({ tool: 'file-editor', secretId: 'file-editor', path, version: 0, externallyManaged: true });
+      }
+      await this.atomicFile(this.locations().manifest, Buffer.from(JSON.stringify(bindings)));
+    });
+    this.pending = current.catch(() => {});
+    return current;
+  }
   private async directory(path: string, mode = 0o700) {
     await mkdir(path, { recursive: true, mode });
     const info = await lstat(path);
@@ -73,6 +89,7 @@ export class MountedToolHomes {
       if (a === b || a.startsWith(b + '/') || b.startsWith(a + '/')) throw new Error('Credential HOME paths conflict');
     }
     const old = await this.bindings() ?? [];
+    for (const file of next) if (old.some(previous => previous.path === file.path && previous.externallyManaged)) file.externallyManaged = true;
     await this.directory(home);
     for (let i = 0; i < next.length; i++) {
       const file = next[i];
@@ -105,7 +122,7 @@ export class MountedToolHomes {
     // The launcher reads runtime/config.json as the agent. Only the HOME and
     // credential manifest are private; their shared parent must stay traversable.
     await this.directory(dirname(manifest), 0o755);
-    await this.atomicFile(manifest, Buffer.from(JSON.stringify(next)));
+    await this.atomicFile(manifest, Buffer.from(JSON.stringify([...next, ...old.filter(file => file.externallyManaged && !next.some(value => value.path === file.path))])));
   }
   async ready(binding: Binding) {
     await this.pending;

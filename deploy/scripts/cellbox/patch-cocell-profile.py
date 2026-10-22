@@ -61,6 +61,15 @@ for name in names:
     if not any(tool["id"] == tool_id for tool in tools):
         tools.append({"id": tool_id, "executable": "/opt/cellbox/tools/cocell-proxy", "args": [name, "-"],
                       "passThroughArgs": True, "credentialEnv": {"COCELL_TOOL_RUNTIME": "cocell_tool_runtime"}})
+# Dynamic tools share one statically admitted Cellbox entry. The tool name and
+# arguments travel as passthrough argv; authorization still happens per call.
+dispatcher = next((tool for tool in tools if tool["id"] == "cocell_tool"), None)
+if dispatcher is None:
+    dispatcher = {"id": "cocell_tool"}
+    tools.append(dispatcher)
+dispatcher.update({"executable": "/opt/cellbox/tools/cocell-proxy", "args": ["--dynamic", "-"],
+                   "passThroughArgs": True, "credentialEnv": {"COCELL_TOOL_RUNTIME": "cocell_tool_runtime"},
+                   "workspaceRead": True, "workspaceWrite": False})
 profile["image"] = image
 # CoCell's internal profile inherits tools and managed HOME for each new import.
 profile["autoTrustImportedImages"] = True

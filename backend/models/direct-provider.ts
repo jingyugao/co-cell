@@ -11,15 +11,17 @@ export class DirectModelProvider {
     const selected = await this.models.selection(session.settings);
     if (!selected) return {};
     const endpoint = selected.endpoint.replace(/\/+$/, '');
+    const retryConfig = selected.channelId === 'legacy-default' && this.disableLegacyRetries
+      ? { request_max_retries: 0, stream_max_retries: 0 } : {};
     // Loaded native threads retain their provider. Give each channel configuration
-    // an immutable identity so endpoint/key changes adopt it through a history fork.
-    const revision = createHash('sha256').update(JSON.stringify([selected.channelId, endpoint, selected.apiKey])).digest('hex');
+    // an immutable identity so endpoint/key/retry changes adopt it through a history fork.
+    const revision = createHash('sha256').update(JSON.stringify([selected.channelId, endpoint, selected.apiKey, retryConfig])).digest('hex');
     const provider = `cocell_direct_${revision}`;
     return { model: selected.model, modelProvider: provider, providerConfig: {
       [`model_providers.${provider}`]: { name: provider, base_url: endpoint,
         wire_api: 'responses', supports_websockets: false, requires_openai_auth: false,
         ...(selected.apiKey ? { experimental_bearer_token: selected.apiKey } : {}),
-        ...(selected.channelId === 'legacy-default' && this.disableLegacyRetries ? { request_max_retries: 0, stream_max_retries: 0 } : {}) },
+        ...retryConfig },
     } };
   }
 }

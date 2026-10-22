@@ -1,6 +1,6 @@
 export type ModelProxyKind = 'new-api' | 'cliproxyapi' | 'litellm';
 
-/** Keep the existing New API retry policy unless another proxy is selected. */
+/** Validate the selected model proxy and its required connection settings. */
 export function modelProxyKind(env: NodeJS.ProcessEnv = process.env): ModelProxyKind {
   const kind = env.CODEX_PROXY_KIND || 'new-api';
   if (kind !== 'new-api' && kind !== 'cliproxyapi' && kind !== 'litellm') {

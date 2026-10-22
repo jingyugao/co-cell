@@ -46,12 +46,11 @@ const coordinator = multiApi ? new MySqlCoordinator(mysqlUrl) : undefined;
 const port = Number(process.env.PORT || 3000);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be between 1 and 65535');
 const apiKey = process.env.CODEX_API_KEY || process.env.OPENAI_API_KEY;
-const proxyKind = modelProxyKind();
+modelProxyKind();
 const sdkConfig = process.env.CODEX_CONFIG_JSON ? JSON.parse(process.env.CODEX_CONFIG_JSON) : {};
 const proxyConfig = process.env.OPENAI_BASE_URL ? { model_provider: 'codex_web_proxy', model_providers: { codex_web_proxy: {
   name: 'Codex Web proxy', base_url: process.env.OPENAI_BASE_URL, wire_api: 'responses', supports_websockets: false,
   ...(apiKey ? { env_key: 'CODEX_API_KEY' } : { requires_openai_auth: true }),
-  ...(proxyKind === 'cliproxyapi' || proxyKind === 'litellm' ? { request_max_retries: 0, stream_max_retries: 0 } : {}),
 } } } : {};
 const modelConfig = { ...proxyConfig, ...sdkConfig, model_providers: { ...proxyConfig.model_providers, ...sdkConfig.model_providers } };
 const configOverrides = process.env.CODEX_CONFIG_OVERRIDES_JSON ? JSON.parse(process.env.CODEX_CONFIG_OVERRIDES_JSON) : undefined;
@@ -127,7 +126,7 @@ if (process.env.OPENAI_BASE_URL) {
   } catch (error) { runtimeLog.write({ event: 'models.discovery_failed', error }); }
 }
 const models = new ModelService(webState.modelRepository, secretCrypto, { endpoint: process.env.OPENAI_BASE_URL, apiKey, model: defaults.model, models: availableModels });
-const modelProvider = new DirectModelProvider(models, proxyKind !== 'new-api');
+const modelProvider = new DirectModelProvider(models);
 const autoCheckpointAfterMs = Number(process.env.SANDBOX_AUTO_CHECKPOINT_AFTER_MS ?? 60 * 60 * 1000);
 if (!Number.isFinite(autoCheckpointAfterMs) || autoCheckpointAfterMs <= 0) throw new Error('SANDBOX_AUTO_CHECKPOINT_AFTER_MS must be positive');
 const projectSandboxes = new ProjectSandboxes(provider, sandboxImage, sandboxImageIdentity.templateId, cellboxRuntime.lifecycle,

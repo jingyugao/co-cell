@@ -17,6 +17,8 @@ try {
   const environment = new LiveEnvironment(config, { journal });
   environment.runId = saved.runId; environment.prefix = saved.prefix; environment.report = saved;
   environment.projects = new Map(saved.projects); environment.sessions = new Set(saved.sessions); environment.boxes = new Set(saved.boxes);
+  environment.roles = new Map(saved.roles ?? []);
+  for (const name of environment.roles.values()) assert(name.startsWith(`${saved.prefix} `), 'Journal contains an unowned role');
   for (const name of environment.projects.values()) assert(name.startsWith(`${saved.prefix} `), 'Journal contains an unowned project');
   await environment.cleanup();
   console.log(`Cleaned integration run ${saved.runId}; journal: ${journal}`);

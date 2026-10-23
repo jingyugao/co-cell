@@ -2,9 +2,8 @@ import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { open, readdir } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { dirname, join, normalize } from 'node:path';
+import { join, normalize } from 'node:path';
 import { decodeWorkingDirectory } from '../../util/tool-working-directory.mjs';
-import { decodeGitlabHost } from '../../util/gitlab-tool-host.mjs';
 import { toolRuntimeBoxId } from '../../util/tool-runtime-identity.mjs';
 import { validateDynamicToolExecution } from '../../util/dynamic-tool-config.mjs';
 
@@ -98,12 +97,11 @@ function executionDetails(execution, home, credential) {
 /** Authorize access, then execute against native files in the mounted HOME. */
 export async function runProtectedTool(tool, inputArgs, options = {}) {
   if (!/^[A-Za-z][A-Za-z0-9_.\-]{0,63}$/.test(tool)) throw new Error('Invalid protected tool name');
-  const invocation = await decodeWorkingDirectory(tool, inputArgs, options.agentHome, options.dynamic === true);
+  const invocation = await decodeWorkingDirectory(inputArgs, options.agentHome);
   inputArgs = invocation.args;
-  options = { ...options, ...(invocation.cwd ? { cwd: invocation.cwd, gitEnv: invocation.gitEnv } : {}) };
+  options = { ...options, ...(invocation.cwd ? { cwd: invocation.cwd } : {}) };
   const config = options.config ?? JSON.parse(await readFile(process.env.COCELL_TOOL_RUNTIME, 'utf8'));
   if (config?.mode !== 'home') throw new Error(`Unsupported tool runtime mode '${String(config?.mode)}'; rebuild the Sandbox with mounted HOME credentials`);
-  const decoded = decodeGitlabHost(tool, inputArgs);
   const boxId = toolRuntimeBoxId(config.boxId);
   if (!boxId) throw new Error('Invalid Box identity');
   const base = new URL(config.url);
@@ -111,35 +109,23 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
     throw new Error('Invalid broker origin');
   const response = await (options.fetch ?? fetch)(new URL('/api/tool-runtime/authorize', base), {
     method: 'POST', redirect: 'error', signal: AbortSignal.timeout(4000),
-    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ boxId, tool, args: decoded.args }),
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ boxId, tool, args: inputArgs }),
   });
   if (!response.ok) throw await authorizationError(response);
   const setup = await response.json();
-  if (options.dynamic && setup.execution === undefined) throw new Error('Dynamic tool is no longer configured');
   if (setup.tool !== tool || setup.home !== '/home/debug' ||
       (setup.path !== undefined && !safePath(setup.path)) ||
-      (['mysql', 'kubectl'].includes(tool) && !safePath(setup.path)) ||
       !Array.isArray(setup.args) || setup.args.length > 32 ||
       setup.args.some(arg => typeof arg !== 'string' || arg.includes('\0')))
     throw new Error('Invalid tool authorization');
   const home = options.homeRoot ?? setup.home;
   // Native tools may spawn each other. This PATH bypasses agent-side wrappers.
   const env = { PATH: `${options.binaryRoot ?? '/opt/cellbox/debug-bin'}:/usr/local/bin:/usr/bin:/bin`,
-    HOME: home, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(home, '.config'), XDG_DATA_HOME: join(home, '.local/share'), ...decoded.env, ...options.gitEnv };
+    HOME: home, LANG: 'C.UTF-8', XDG_CONFIG_HOME: join(home, '.config'), XDG_DATA_HOME: join(home, '.local/share') };
   const credential = setup.path === undefined ? undefined : join(home, setup.path);
-  const dynamicExecution = executionDetails(setup.execution, home, credential);
-  if (setup.execution !== undefined && !dynamicExecution) throw new Error('Invalid dynamic tool execution');
-  if (tool === 'kubectl') env.KUBECONFIG = credential;
-  if (tool === 'glab' && credential) env.GLAB_CONFIG_DIR = dirname(credential);
-  if (tool === 'git' && credential) env.GIT_CONFIG_GLOBAL = credential;
-  // --no-defaults still reads the native login file. Pin its path and omit all
-  // other option files so the account comes from the shared native config.
-  if (tool === 'mysql' && !dynamicExecution) env.MYSQL_TEST_LOGIN_FILE = credential;
-  const args = tool === 'mysql' && !dynamicExecution ? ['--no-defaults', ...setup.args] : setup.args;
-  const executionEnv = dynamicExecution ? { ...env, ...dynamicExecution.env } : env;
-  const executable = dynamicExecution?.executable ?? join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool);
-  const executionArgs = dynamicExecution ? [...dynamicExecution.args, ...args] : args;
-  const result = await execute(executable, executionArgs, executionEnv, options.cwd ?? process.cwd(), dynamicExecution?.timeoutMs ?? 20000);
+  const execution = executionDetails(setup.execution, home, credential);
+  if (!execution) throw new Error('Dynamic tool is no longer configured');
+  const result = await execute(execution.executable, [...execution.args, ...setup.args], { ...env, ...execution.env }, options.cwd ?? process.cwd(), execution.timeoutMs);
   await restoreCredentialOwnership(home, setup.credentialPaths);
   (options.stdout ?? process.stdout).write(result.stdout);
   (options.stderr ?? process.stderr).write(result.stderr);

@@ -22,5 +22,5 @@ try {
   const localBase = `cocell-offline-base:${info.Id.slice(7)}`;
   await run(['tag', info.Id, localBase]);
   await run(['build', '--pull=false', '--network=none', '--platform=linux/amd64', '--file=deploy/box-wrap/Dockerfile',
-    '--build-arg', `COCELL_USER_BASE_IMAGE=${localBase}`, '--build-arg', `COCELL_PROXY_TOOLS=${process.env.COCELL_PROXY_TOOLS || ''}`, '--tag', tag, '.']);
+    '--build-arg', `COCELL_USER_BASE_IMAGE=${localBase}`, '--tag', tag, '.']);
 } catch (error) { console.error(error.message); process.exitCode = 1; }

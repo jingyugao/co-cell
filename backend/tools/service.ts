@@ -5,12 +5,9 @@ import type { DynamicToolCreateInput, DynamicToolExecution, DynamicToolInput } f
 import { validateDynamicToolExecution } from '../../util/dynamic-tool-config.mjs';
 import { HttpError } from '../../util/errors.js';
 import { credentialPath, toolName } from '../secrets/policy.js';
-import { registeredTools } from '../tool-access/index.js';
 import type { SharedCoordinator } from '../infra/storage/coordination.js';
 import type { ToolRepository } from './repository.js';
 import { ToolPackages, toolDirectory } from './packages.js';
-import { isDynamicBuiltin, builtinToolDefault } from './defaults.js';
-import { validatePermissionScript } from './permission-script.js';
 
 export class DynamicTools {
   readonly packages: ToolPackages;
@@ -36,37 +33,46 @@ export class DynamicTools {
   list() { return this.repository.list(); }
   get(name: string) { return this.repository.get(toolName(name)); }
   create(input: DynamicToolCreateInput) {
-    const builtin = builtinToolDefault(input.name);
     const definition: DynamicToolInput = {
-      name: input.name,
-      description: input.description ?? builtin?.description ?? '',
-      instructions: input.instructions ?? builtin?.instructions ?? '',
-      enabled: input.enabled ?? builtin?.enabled ?? true,
-      executable: input.executable ?? builtin?.executable ?? input.name,
-      ...(input.packageVersion ? { packageVersion: input.packageVersion } : {}),
-      args: input.args ?? builtin?.args ?? [],
-      env: input.env ?? builtin?.env ?? {},
-      ...(input.credentialPath ?? builtin?.credentialPath ? { credentialPath: input.credentialPath ?? builtin?.credentialPath } : {}),
-      ...(input.credentialPaths ?? builtin?.credentialPaths ? { credentialPaths: input.credentialPaths ?? builtin?.credentialPaths } : {}),
-      ...(input.permissionScript ?? builtin?.permissionScript ? { permissionScript: input.permissionScript ?? builtin?.permissionScript } : {}),
-      ...(input.permissionScriptId ?? builtin?.permissionScriptId
-        ? { permissionScriptId: input.permissionScriptId ?? builtin?.permissionScriptId } : {}),
-      ...(input.credentialParseScriptId ?? builtin?.credentialParseScriptId
-        ? { credentialParseScriptId: input.credentialParseScriptId ?? builtin?.credentialParseScriptId } : {}),
-      ...(input.credentialSaveScriptId ?? builtin?.credentialSaveScriptId
-        ? { credentialSaveScriptId: input.credentialSaveScriptId ?? builtin?.credentialSaveScriptId } : {}),
-      timeoutMs: input.timeoutMs ?? builtin?.timeoutMs ?? 20000,
+      ...input, name: input.name, description: input.description ?? '', instructions: input.instructions ?? '',
+      enabled: input.enabled ?? true, executable: input.executable ?? input.name,
+      args: input.args ?? [], env: input.env ?? {}, timeoutMs: input.timeoutMs ?? 20000,
     };
     return this.save(definition);
   }
   private async validate(input: DynamicToolInput) {
     toolName(input.name);
-    if (['cocell', 'help', 'list', 'cellbox-container-agent', ...registeredTools().filter(tool => !isDynamicBuiltin(tool.name)).map(tool => tool.name)].includes(input.name))
+    if (['cocell', 'help', 'list', 'cellbox-container-agent'].includes(input.name))
       throw new HttpError(400, '此名称由内置工具保留，请使用其他工具名');
     if (input.credentialPath) credentialPath(input.credentialPath);
+    if (input.credentialMode !== undefined && !['shared', 'named'].includes(input.credentialMode))
+      throw new HttpError(400, '凭据模式无效');
+    if (input.credentialMode === 'named') {
+      if (!input.credentialPath || !input.credentialParseScriptId || !input.permissionScriptId)
+        throw new HttpError(400, '多凭据模式需要主配置路径、Load hook 和权限脚本');
+      if (!this.repository.scripts) throw new HttpError(503, '脚本目录尚未初始化');
+    }
     const roots = input.credentialPaths ?? [];
     if (roots.length > 16) throw new HttpError(400, '认证文件根目录最多支持 16 个');
     const checkedRoots = roots.map(credentialPath);
+    const excluded = input.credentialExcludedPaths ?? [];
+    if (excluded.length > 16) throw new HttpError(400, '凭据排除路径最多支持 16 个');
+    for (const path of excluded) {
+      credentialPath(path);
+      if (!checkedRoots.some(root => path === root || path.startsWith(root + '/')))
+        throw new HttpError(400, '排除路径必须位于凭据目录内');
+      if (input.credentialPath && (path === input.credentialPath || input.credentialPath.startsWith(path + '/')))
+        throw new HttpError(400, '不能排除主凭据文件');
+    }
+    for (const identity of Object.values(input.credentialContext ?? {})) {
+      if (!identity || ['hostname', 'username'].some(key => {
+        const value = identity[key as keyof typeof identity];
+        return typeof value !== 'string' || !value || value.length > 253 || /[\u0000-\u001f\u007f]/.test(value);
+      })) throw new HttpError(400, '凭据身份上下文无效');
+    }
+    if (input.credentialMode === 'named' && checkedRoots.length && !checkedRoots.some(root =>
+      input.credentialPath === root || input.credentialPath!.startsWith(root + '/')))
+      throw new HttpError(400, '主凭据文件必须位于配置的凭据目录内');
     if (new Set(checkedRoots).size !== checkedRoots.length) throw new HttpError(400, '认证文件根目录不能重复');
     for (let i = 0; i < checkedRoots.length; i++) {
       for (let j = i + 1; j < checkedRoots.length; j++) {
@@ -74,9 +80,6 @@ export class DynamicTools {
           throw new HttpError(400, '认证文件根目录不能互相包含');
       }
     }
-    if (input.name === 'mysql' && input.credentialPath !== '.mylogin.cnf')
-      throw new HttpError(400, 'MySQL 使用固定的原生 .mylogin.cnf 配置文件');
-    validatePermissionScript(input.permissionScript);
     for (const id of [input.permissionScriptId, input.credentialParseScriptId, input.credentialSaveScriptId]) {
       if (id && this.repository.scripts && !await this.repository.scripts.get(id)) throw new HttpError(400, '工具引用的脚本不存在');
     }
@@ -91,22 +94,7 @@ export class DynamicTools {
   save(input: DynamicToolInput, version?: number) {
     return this.serial(async () => {
       await this.validate(input);
-      let definition = input;
-      let createdScript: { id: string; version: number } | undefined;
-      if (input.permissionScript !== undefined && this.repository.scripts) {
-        const current = await this.repository.get(input.name);
-        if (version === undefined ? current !== undefined : current?.version !== version) throw new HttpError(409, '工具已被修改或删除，请重新加载');
-        const script = await this.repository.scripts.save({ name: `${input.name} permission ${randomUUID().slice(0, 8)}`, language: 'typescript', source: input.permissionScript });
-        createdScript = script;
-        const { permissionScript: _inline, ...rest } = input;
-        definition = { ...rest, permissionScriptId: script.id };
-      }
-      let saved;
-      try { saved = await this.repository.save(definition, version); }
-      catch (error) {
-        if (createdScript) await this.repository.scripts!.delete(createdScript.id, createdScript.version).catch(() => {});
-        throw error;
-      }
+      const saved = await this.repository.save(input, version);
       await this.publish();
       return saved;
     });

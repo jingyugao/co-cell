@@ -38,6 +38,7 @@ export class LiveEnvironment {
     this.runId = randomUUID();
     this.prefix = `integration-${this.runId}`;
     this.projects = new Map();
+    this.roles = new Map();
     this.sessions = new Set();
     this.boxes = new Set();
     this.transports = [];
@@ -68,7 +69,7 @@ export class LiveEnvironment {
   name(label) { return `${this.prefix} ${label}`; }
   async persist() {
     if (!this.journal) return;
-    const data = this.redact(JSON.stringify({ ...this.report, projects: [...this.projects], sessions: [...this.sessions], boxes: [...this.boxes] }, null, 2));
+    const data = this.redact(JSON.stringify({ ...this.report, projects: [...this.projects], roles: [...this.roles], sessions: [...this.sessions], boxes: [...this.boxes] }, null, 2));
     this.pendingWrite = this.pendingWrite.then(async () => {
       await mkdir(dirname(this.journal), { recursive: true });
       await writeFile(`${this.journal}.next`, data, { mode: 0o600 });
@@ -97,6 +98,15 @@ export class LiveEnvironment {
     if (['GET', 'HEAD', 'OPTIONS'].includes(method)) return;
     if (path === '/api/projects' && method === 'POST') {
       assert(body?.name?.startsWith(`${this.prefix} `), 'Test projects must use the current run prefix');
+      return;
+    }
+    if (path === '/api/tool-roles' && method === 'POST') {
+      assert(body?.name?.startsWith(`${this.prefix} `), 'Test roles must use the current run prefix');
+      return;
+    }
+    const role = /^\/api\/tool-roles\/([0-9a-f-]{36})$/.exec(path)?.[1];
+    if (role && method === 'DELETE') {
+      assert(this.roles.has(role), 'Cannot delete an unowned role');
       return;
     }
     if (path === '/api/sessions' && method === 'POST') {
@@ -142,6 +152,12 @@ export class LiveEnvironment {
       const text = buffer.toString('utf8');
       const data = method !== 'HEAD' && text && response.headers.get('content-type')?.includes('application/json') ? JSON.parse(text) : text;
       const createdProject = method === 'POST' && path === '/api/projects' && response.status === 201 && data?.id;
+      if (method === 'POST' && path === '/api/tool-roles' && response.status === 201 && data?.id) {
+        this.roles.set(data.id, options.body.name); await this.persist();
+      }
+      if (method === 'DELETE' && path.startsWith('/api/tool-roles/') && response.ok) {
+        this.roles.delete(path.split('/').at(-1)); await this.persist();
+      }
       if (createdProject) {
         this.projects.set(data.id, options.body.name); await this.persist();
       }
@@ -281,6 +297,20 @@ export class LiveEnvironment {
       try {
         const sessions = await this.json('/api/sessions', { signal });
         assert(!sessions.some(session => this.sessions.has(session.id)), 'A test session remains after project deletion');
+      } catch (error) { errors.push(this.redact(error.message)); }
+    }
+    if (!this.config.keepProjects) {
+      try {
+        const catalog = await this.json('/api/tool-roles', { signal });
+        for (const role of catalog.roles) {
+          if (!role.name.startsWith(`${this.prefix} `)) continue;
+          assert(role.id !== catalog.defaultRoleId, 'Refusing to delete the installation default role');
+          const expectedName = this.roles.get(role.id);
+          if (expectedName) assert.equal(role.name, expectedName, 'Role ownership changed; refusing cleanup');
+          this.roles.set(role.id, role.name);
+          await this.json(`/api/tool-roles/${role.id}`, { method: 'DELETE', signal });
+          this.report.cleanup.push({ roleId: role.id, status: 'deleted' });
+        }
       } catch (error) { errors.push(this.redact(error.message)); }
     }
     this.report.finishedAt = new Date().toISOString();

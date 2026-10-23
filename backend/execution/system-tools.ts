@@ -21,7 +21,7 @@ export class SystemTools {
     const boxId = project.sandbox.id;
     return await action((tool, args) => {
         toolName(tool);
-        return this.options.execute(boxId, `cocell_${tool.replaceAll('-', '_')}`, args);
+        return this.options.execute(boxId, 'cocell_tool', [tool, ...args]);
     });
   }
 }

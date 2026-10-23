@@ -4,7 +4,6 @@
 from copy import deepcopy
 import json
 import os
-from pathlib import Path
 import re
 import sys
 
@@ -55,12 +54,7 @@ tools = guest.setdefault("tools", [])
 # Disk backups are owned by Cellbox; CoCell no longer ships this tool.
 # Preserve restore and operator-managed tools.
 tools[:] = [tool for tool in tools if tool.get("id") != "cocell_archive_backup"]
-names = json.loads(Path(sample_path).with_name("proxy-tools.json").read_text())
-for name in names:
-    tool_id = "cocell_" + name.replace("-", "_")
-    if not any(tool["id"] == tool_id for tool in tools):
-        tools.append({"id": tool_id, "executable": "/opt/cellbox/tools/cocell-proxy", "args": [name, "-"],
-                      "passThroughArgs": True, "credentialEnv": {"COCELL_TOOL_RUNTIME": "cocell_tool_runtime"}})
+tools[:] = [tool for tool in tools if tool.get("executable") != "/opt/cellbox/tools/cocell-proxy" or tool.get("id") == "cocell_tool"]
 # Dynamic tools share one statically admitted Cellbox entry. The tool name and
 # arguments travel as passthrough argv; authorization still happens per call.
 dispatcher = next((tool for tool in tools if tool["id"] == "cocell_tool"), None)
@@ -87,8 +81,4 @@ if os.environ.get("COCELL_DEBUG_HOME_VERSION") == "1":
     homes = profile.setdefault("debugHomeImages", [])
     if image not in homes:
         homes.append(image)
-for tool in guest["tools"]:
-    if tool["id"] in ("cocell_git", "cocell_glab"):
-        tool["workspaceRead"] = True
-        tool["workspaceWrite"] = True
 json.dump({} if profile == before else {"api": {"config": config}}, sys.stdout)

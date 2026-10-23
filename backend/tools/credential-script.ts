@@ -7,6 +7,7 @@ import { Worker } from 'node:worker_threads';
 import ts from 'typescript';
 import { HttpError } from '../../util/errors.js';
 import type { ToolCredentialHookContext } from '../../protocol/tool-credential-types.js';
+import type { ToolPermissionDecision } from '../../protocol/tool-types.js';
 
 const maxCredentialBytes = 1024 * 1024;
 const maxCredentialBundleBytes = 4 * maxCredentialBytes;
@@ -214,12 +215,14 @@ async function runBashRaw(source: string, input: unknown, options: ScriptOptions
   }
 }
 
-function permissionResult(value: unknown): value is boolean | { allow: boolean; reason?: string } {
+function permissionResult(value: unknown): value is boolean | ToolPermissionDecision {
   if (typeof value === 'boolean') return true;
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const result = value as Record<string, unknown>;
-  return Object.keys(result).every(key => key === 'allow' || key === 'reason') &&
+  return Object.keys(result).every(key => key === 'allow' || key === 'reason' || key === 'credential') &&
     typeof result.allow === 'boolean' &&
+    (result.credential === undefined || (typeof result.credential === 'string' && !!result.credential &&
+      Buffer.byteLength(result.credential) <= 256 && !/[\u0000-\u001f\u007f]/.test(result.credential))) &&
     (result.reason === undefined || (typeof result.reason === 'string' && Buffer.byteLength(result.reason) <= 1000));
 }
 
@@ -228,7 +231,7 @@ export async function runToolScript(
   source: string,
   input: unknown,
   options: ScriptOptions = {},
-): Promise<boolean | { allow: boolean; reason?: string }> {
+): Promise<boolean | ToolPermissionDecision> {
   const language = options.language ?? 'typescript';
   const timeoutMs = boundedTimeout(options.timeoutMs, language === 'bash' ? 5000 : 1000);
   validateCredentialScript(source, language);

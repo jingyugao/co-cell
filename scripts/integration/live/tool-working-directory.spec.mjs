@@ -31,10 +31,8 @@ test('deployed Git proxy preserves nested repository and Go module-cache directo
     body: { name: env.name('tool-cwd'), type: 1, imageId: image.id, imageVersionId: image.defaultVersionId } });
   ownedProjectId = created.id;
   const project = await env.waitProject(created.id, { kind: 'create', status: 'ready' });
-  const secretId = process.env.COCELL_E2E_TOOL_GIT_SECRET_ID;
-  const secrets = (await env.json('/api/secrets')).filter(secret => secret.tool === 'git' && secret.enabled && secret.format === 'text');
-  const secret = secretId ? secrets.find(item => item.id === secretId) : secrets.length === 1 ? secrets[0] : undefined;
-  assert(secret, 'Configure one enabled Git credential, or select it with COCELL_E2E_TOOL_GIT_SECRET_ID');
+  const git = (await env.json('/api/tool-definitions')).find(tool => tool.name === 'git' && tool.enabled);
+  assert(git, 'Configure an enabled dynamic Git tool');
   const role = await env.json('/api/tool-roles', { method: 'POST', expectedStatus: 201, body: { name: env.name('git-cwd-role'),
     permissions: [{ tool: 'git', enabled: true }] } });
   ownedRoleId = role.id;
@@ -49,7 +47,7 @@ test('deployed Git proxy preserves nested repository and Go module-cache directo
 const fs=require('node:fs'),{spawnSync}=require('node:child_process');
 const root='/home/agent/workspace/tool-cwd-regression',repo=root+'/repo';
 fs.mkdirSync(repo,{recursive:true});fs.chownSync(root,11000,11000);fs.chownSync(repo,11000,11000);
-function run(cmd,args,cwd=repo){const r=spawnSync(cmd,args,{cwd,uid:11000,gid:11000,encoding:'utf8',timeout:240000,env:{HOME:'/home/agent',PATH:'/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin',GOTOOLCHAIN:'local',GOPROXY:'off',GOSUMDB:'off'}});if(r.status!==0)throw new Error(cmd+' '+args.join(' ')+': '+r.stderr);return r.stdout.trim();}
+function run(cmd,args,cwd=repo){const r=spawnSync(cmd,args,{cwd,uid:11000,gid:11000,encoding:'utf8',timeout:240000,env:{HOME:'/home/agent',PATH:'/var/lib/cellbox/shared/tools/current/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin',GOTOOLCHAIN:'local',GOPROXY:'off',GOSUMDB:'off'}});if(r.status!==0)throw new Error(cmd+' '+args.join(' ')+': '+r.stderr);return r.stdout.trim();}
 for(const name of ['cache-one','cache-two']){const cwd=root+'/'+name;fs.mkdirSync(cwd);fs.chownSync(cwd,11000,11000);run('git',['init','--bare'],cwd);run('git',['remote','add','origin','https://example.invalid/'+name],cwd);if(run('git',['remote','get-url','origin'],cwd)!=='https://example.invalid/'+name)throw new Error('Wrong cache directory');}
 fs.writeFileSync(repo+'/go.mod','module example.test/cwd\\ngo 1.22\\n');fs.writeFileSync(repo+'/main.go','package main\\nfunc main() {}\\n');
 for(const name of ['go.mod','main.go'])fs.chownSync(repo+'/'+name,11000,11000);

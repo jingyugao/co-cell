@@ -92,8 +92,6 @@ export default function ToolCredentialBrowser({ tool, onClose, embedded = false 
     <header className="tool-credential-browser-heading"><div><h3>{tool} · 凭据</h3><p>共享目录 {tree?.home ?? '读取中…'}</p></div>
       <div><button type="button" className="secondary-button" disabled={busy} onClick={() => void refresh()}>刷新</button>{!embedded && <button type="button" className="secondary-button" disabled={busy} onClick={close}>关闭</button>}</div></header>
     {error && <p className="connections-error" role="alert">{error}</p>}{message && <p className="connections-message" role="status">{message}</p>}
-    {tree?.registrations.length ? <div className="tool-credential-registrations"><strong>已登记的连接</strong>{tree.registrations.map(item =>
-      <span key={item.id}>{item.name} · {item.enabled ? '启用' : '停用'} · {item.format} · {item.path ?? '目录级凭据'} · {item.files.length ? item.files.join(', ') : '无文件'} · v{item.version}</span>)}</div> : null}
     <div className="tool-credential-layout">
       <div className="tool-credential-tree" aria-label="凭据目录树">
         <strong>文件</strong>

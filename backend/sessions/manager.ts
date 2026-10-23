@@ -12,6 +12,7 @@ import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 
 import { HttpError, redactCredentials } from '../../util/errors.js';
+import { workspaceFileResult } from '../workspaces/files.js';
 import { holdResponse } from '../../util/http-stream.js';
 import { ProjectService, type ProjectInput, type ProjectUpdate } from '../projects/service.js';
 import { RecordWriteQueue } from '../infra/storage/record-write-queue.js';
@@ -163,6 +164,8 @@ export class SessionManager {
 	get remoteArchives() { return this.sandbox?.remoteArchives; }
   private models?: ModelService;
   setModelService(models: ModelService) { this.models = models; }
+  private projectFileReader?: import('../workspaces/project-file-reader.js').ProjectFileReader;
+  setProjectFileReader(reader: import('../workspaces/project-file-reader.js').ProjectFileReader) { this.projectFileReader = reader; }
   setImageCatalog(catalog: ImageCatalog) { this.imageCatalog = catalog; }
 
   get sharedStateEnabled() { return Boolean(this.coordinator); }
@@ -2036,6 +2039,19 @@ export class SessionManager {
 
   async projectFileResponse(projectId: string, path: string, request: Request): Promise<Response> {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
+    if (this.projectFileReader) {
+      await this.projects.refreshOne(projectId);
+      this.projects.assertAvailable(projectId);
+      const project = this.projects.get(projectId);
+      if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox 沙箱');
+      const read = this.projects.beginRead(project.id);
+      const signal = AbortSignal.any([request.signal, read.signal]);
+      try {
+        const response = await this.projectFileReader(project, path, new Request(request, { signal }));
+        signal.throwIfAborted();
+        return holdResponse(response, read.release, signal);
+      } catch (error) { read.release(); read.signal.throwIfAborted(); throw error; }
+    }
     await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
     if (!project.sandbox || !this.sandbox?.fileResponse) throw new HttpError(503, 'Sandbox 文件流接口未配置');
@@ -2050,6 +2066,10 @@ export class SessionManager {
 
   async projectFile(projectId: string, path: string) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
+    if (this.projectFileReader) {
+      const response = await this.projectFileResponse(projectId, path, new Request('http://localhost/file'));
+      return workspaceFileResult(path, new Uint8Array(await response.arrayBuffer()));
+    }
     await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
     if (project.executionMode !== 'sandbox' || !this.sandbox) throw new HttpError(400, '此项目不使用 Sandbox 沙箱');

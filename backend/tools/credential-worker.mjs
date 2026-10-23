@@ -1,6 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { TextDecoder } from 'node:util';
-import { decodeMysqlLogin, encodeMysqlLogin } from '../../util/mysql-login-codec.mjs';
 import { parse as parseYaml } from 'yaml';
 
 const MAX_BYTES = 1024 * 1024;
@@ -17,15 +16,13 @@ function codecCall(raw) {
     if (typeof raw !== 'string' || raw.length > 8 * 1024 * 1024) return '{"ok":false}';
     const { op, value } = JSON.parse(raw);
     let result;
-    if (op === 'utf8.decode' || op === 'mysql.decode') {
+    if (op === 'utf8.decode') {
       const bytes = validBase64(value);
       if (!bytes) return '{"ok":false}';
-      if (op === 'mysql.decode') result = decodeMysqlLogin(bytes);
-      else result = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    } else if (op === 'utf8.encode' || op === 'mysql.encode') {
+      result = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    } else if (op === 'utf8.encode') {
       if (typeof value !== 'string' || Buffer.byteLength(value) > MAX_BYTES) return '{"ok":false}';
-      if (op === 'mysql.encode') result = encodeMysqlLogin(value).toString('base64');
-      else result = Buffer.from(value, 'utf8').toString('base64');
+      result = Buffer.from(value, 'utf8').toString('base64');
     } else if (op === 'yaml.parse') {
       if (typeof value !== 'string' || Buffer.byteLength(value) > MAX_BYTES) return '{"ok":false}';
       result = parseYaml(value, { maxAliasCount: 50 });
@@ -67,7 +64,6 @@ try {
     return Object.freeze({
       utf8: Object.freeze({decode: method('utf8.decode'), encode: method('utf8.encode')}),
       base64: Object.freeze({decode: method('base64.decode'), encode: method('base64.encode')}),
-      mysql: Object.freeze({decode: method('mysql.decode'), encode: method('mysql.encode')}),
       yaml: Object.freeze({parse: method('yaml.parse')}),
     });
   })()`);

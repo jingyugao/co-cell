@@ -12,7 +12,7 @@ test('system tools use the active project without acquiring a remote usage lease
     enter: async id => { assert.equal(id, 'current'); events.push('enter'); return { sandbox: { id: 'box-current', status: 'ready' } } as ProjectSummary; },
     acquireUsage: async () => { events.push('acquire'); throw new Error('remote lease must not be acquired'); },
     execute: async (boxId, tool, args) => {
-      assert.equal(boxId, 'box-current'); assert.equal(tool, 'cocell_meegle'); assert.deepEqual(args, ['auth', 'status']);
+      assert.equal(boxId, 'box-current'); assert.equal(tool, 'cocell_tool'); assert.deepEqual(args, ['meegle', 'auth', 'status']);
       events.push('execute'); return { stdout: '{}', stderr: '', exitCode: 0 };
     },
   });

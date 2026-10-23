@@ -13,22 +13,13 @@ export interface ToolCredentialEntry {
   updatedAt?: string;
 }
 
-export interface ToolCredentialRegistration {
-  id: string;
-  name: string;
-  path: string | null;
-  enabled: boolean;
-  format: string;
-  version: number;
-  files: string[];
-}
-
 export interface ToolCredentialTree {
   tool: string;
   home: string;
   roots: string[];
   entries: ToolCredentialEntry[];
-  registrations: ToolCredentialRegistration[];
+  /** Inventory revision used by create-only installation. */
+  version: string;
 }
 
 export interface ToolCredentialFile {
@@ -49,4 +40,15 @@ export interface ToolCredentialWrite {
   encoding: 'utf8' | 'base64' | 'parsed';
   version: string;
   scriptVersion: number;
+}
+
+/** Operator installation adds missing files without replacing existing credentials. */
+export interface ToolCredentialInitialize {
+  version: string;
+  directories: string[];
+  files: Array<{ path: string; content: string; encoding: 'utf8' | 'base64' }>;
+}
+export interface ToolCredentialInitialization {
+  created: string[];
+  skipped: string[];
 }

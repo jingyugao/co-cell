@@ -6,8 +6,13 @@ import { LiveEnvironment, liveConfig } from './environment.mjs';
 test('cleanup recovers a lost create response and never deletes an existing project', async ({}, testInfo) => {
   const projects = new Map([['existing', { id: 'existing', name: 'Existing user project' }]]);
   const deleted = [];
+  const existingRole = '00000000-0000-4000-8000-000000000001', ownedRole = '00000000-0000-4000-8000-000000000002';
+  const roles = new Map([[existingRole, { id: existingRole, name: 'Existing operator role' }]]);
+  const deletedRoles = [];
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/tool-roles') { res.end(JSON.stringify({ roles: [...roles.values()], defaultRoleId: existingRole })); return; }
+    if (req.url.startsWith('/api/tool-roles/') && req.method === 'DELETE') { const id = req.url.split('/').at(-1); deletedRoles.push(id); roles.delete(id); res.end('{"ok":true}'); return; }
     if (req.url === '/api/projects') { res.end(JSON.stringify([...projects.values()])); return; }
     if (req.url === '/api/archives') { res.end('[]'); return; }
     const id = req.url.split('/').at(-1);
@@ -17,11 +22,16 @@ test('cleanup recovers a lost create response and never deletes an existing proj
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const env = new LiveEnvironment(liveConfig({ COCELL_E2E_BASE_URL: `http://127.0.0.1:${server.address().port}`, COCELL_E2E_ACCESS_TOKEN: 'test-only-token' }), { journal: testInfo.outputPath('resources.json') });
   try {
+    roles.set(ownedRole, { id: ownedRole, name: env.name('lost-role-create-response') });
+    await expect(env.json('/api/tool-roles', { method: 'POST', body: { name: 'Operator role' } })).rejects.toThrow('current run prefix');
+    await expect(env.json(`/api/tool-roles/${existingRole}`, { method: 'DELETE' })).rejects.toThrow('unowned role');
+    await expect(env.json('/api/tool-roles/default', { method: 'PUT', body: { roleId: ownedRole } })).rejects.toThrow('unowned resource');
     projects.set('owned', { id: 'owned', name: env.name('accepted-but-response-lost') });
     await expect(env.json('/api/projects/existing', { method: 'DELETE' })).rejects.toThrow('unowned resource');
     await env.cleanup();
     expect(deleted).toEqual(['owned']); expect(projects.has('existing')).toBe(true);
-    expect(JSON.parse(await readFile(env.journal, 'utf8')).cleanup).toEqual([{ projectId: 'owned', status: 'deleted_retained_backups', retainedSnapshots: [] }]);
+    expect(deletedRoles).toEqual([ownedRole]); expect(roles.has(existingRole)).toBe(true);
+    expect(JSON.parse(await readFile(env.journal, 'utf8')).cleanup).toEqual([{ projectId: 'owned', status: 'deleted_retained_backups', retainedSnapshots: [] }, { roleId: ownedRole, status: 'deleted' }]);
   } finally { await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }); }
 });
 
@@ -32,6 +42,7 @@ test('cleanup DELETEs a test-owned project after a lost create response', async 
   let env;
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/tool-roles') { res.end('{"roles":[]}'); return; }
     if (req.method === 'POST' && req.url === '/api/projects') {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
@@ -66,6 +77,7 @@ test('backup wait can include asynchronous disk archive completion', async ({}, 
   let reads = 0;
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/tool-roles') { res.end('{"roles":[]}'); return; }
     reads++;
     res.end(JSON.stringify({ id: 'project', sandbox: { id: 'box', status: reads === 1 ? 'unavailable' : 'paused' },
       sandboxOperation: { id: 'backup', kind: 'backup', status: 'succeeded' },
@@ -95,6 +107,7 @@ test('cleanup DELETEs once, retains volume recovery metadata, and verifies resou
   const retained = [{ key: 'volume-backup-key', storageType: 'cellbox-volume', volumeId: 'volume-1', snapshotId: 'a'.repeat(64) }];
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/tool-roles') { res.end('{"roles":[]}'); return; }
     if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify(removed ? [] : [project])); return; }
     if (req.url === '/api/sessions') { res.end('[]'); return; }
     if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[]}'); return; }
@@ -128,6 +141,7 @@ test('cleanup leaves an unknown backup operation untouched instead of retrying o
     sandboxBackup: { id: 'backup-op', sandboxId: 'box', status: 'unknown', error: 'response lost' } };
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/tool-roles') { res.end('{"roles":[]}'); return; }
     if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify([project])); return; }
     if (req.url === '/api/sessions') { res.end('[]'); return; }
     if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[{"id":"box"}]}'); return; }
@@ -153,6 +167,7 @@ test('cleanup leaves an unknown prior sandbox operation untouched instead of del
     sandboxOperation: { id: 'checkpoint-op', kind: 'checkpoint', status: 'unknown', error: 'response lost' } };
   const server = createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/tool-roles') { res.end('{"roles":[]}'); return; }
     if (req.url === '/api/projects' && req.method === 'GET') { res.end(JSON.stringify([project])); return; }
     if (req.url === '/api/sessions') { res.end('[]'); return; }
     if (req.url === '/api/sandboxes') { res.end('{"sandboxes":[{"id":"box"}]}'); return; }
@@ -176,6 +191,7 @@ test('cleanup failures fail the suite and redact the operator token in evidence'
   let env;
   const server = createServer((req, res) => {
     res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/tool-roles') { res.end('{"roles":[]}'); return; }
     const project = { id: 'owned', name: env.name('failure') };
     if (req.url === '/api/projects') { res.end(JSON.stringify([project])); return; }
     if (req.method === 'DELETE') { res.statusCode = 503; res.end(JSON.stringify({ error: token })); return; }

@@ -3,7 +3,6 @@ import type { ToolScriptInput } from '../../protocol/tool-script-types.js';
 import { HttpError } from '../../util/errors.js';
 import type { ToolScriptRepository } from './script-repository.js';
 import { runToolScript, validateCredentialScript } from './credential-script.js';
-import { checkToolPermission } from './permission-script.js';
 
 /** One operator-owned script catalog for every tool hook. */
 export class ToolScripts {
@@ -28,7 +27,7 @@ export class ToolScripts {
     return this.coordinate(async () => { await this.repository!.delete(id, version); return { ok: true as const }; });
   }
   async checkPermission(tool: DynamicToolInput | undefined, input: ToolPermissionCheckInput) {
-    if (!tool?.permissionScriptId) return checkToolPermission(tool?.permissionScript, input);
+    if (!tool?.permissionScriptId) return;
     const script = await this.get(tool.permissionScriptId);
     let result;
     try { result = await runToolScript(script.source, input, { language: script.language, npmCache: this.npmCache }); }
@@ -36,7 +35,8 @@ export class ToolScripts {
       if (error instanceof HttpError && error.status === 503) throw error;
       throw new HttpError(403, '工具权限检查未通过');
     }
-    if (result === true || typeof result === 'object' && result.allow) return;
+    if (result === true) return;
+    if (typeof result === 'object' && result.allow) return result;
     const reason = typeof result === 'object' ? result.reason : undefined;
     throw new HttpError(403, reason?.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 1000) || '工具权限检查未通过');
   }

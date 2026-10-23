@@ -15,10 +15,8 @@ import { SessionManager } from './sessions/manager.js';
 import { HttpError, providerError } from '../util/errors.js';
 import type { SandboxInventoryReader } from './sandboxes/inventory.js';
 import { SharedFiles } from './shared-files/service.js';
-import type { ConnectionStore } from './connections/store.js';
 
 import { installProjectsRoutes } from './projects/routes.js';
-import { installConnectionsRoutes } from './connections/routes.js';
 import { installSharedFilesRoutes } from './shared-files/routes.js';
 import { installSandboxesRoutes } from './sandboxes/routes.js';
 import { installSessionsRoutes } from './sessions/routes.js';
@@ -31,8 +29,10 @@ import type { SecretService } from './secrets/service.js';
 import { installSecretRoutes } from './secrets/routes.js';
 import { installToolRoutes } from './tools/routes.js';
 import { installPwaAssets } from './infra/http/pwa.js';
+import { installFileFavoriteRoutes } from './file-favorites/routes.js';
+import type { FileFavoriteRepository } from './file-favorites/repository.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, knowledge?: KnowledgeService) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository, knowledge?: KnowledgeService) {
   const app = new Hono();
   app.get('/healthz', c => c.text('ok'));
   app.use('/api/*', traceHttpRequest);
@@ -88,13 +88,13 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   if (models) installModelRoutes(app, models);
   installMemoryRoutes(app, memory);
   installKnowledgeRoutes(app, knowledge);
+  installFileFavoriteRoutes(app, manager, fileFavorites);
   installProjectsRoutes(app, manager, operatorAccess?.previewSubdomains
     ? { publicUrl: operatorAccess.publicUrl, token: operatorAccess.token } : undefined, images);
   installSessionsRoutes(app, manager, config);
   installNotificationRoutes(app, notifications);
   installArchiveRoutes(app, manager);
   installSandboxesRoutes(app, sandboxes, manager);
-  installConnectionsRoutes(app, connections);
   if (secrets) installSecretRoutes(app, secrets, id => manager.listProjects().some(project => project.id === id));
   if (secrets?.tools) installToolRoutes(app, secrets.tools, secrets);
   installImageRoutes(app, images);

@@ -2,12 +2,12 @@ import { MySqlPreviewGrantStore } from '../../access/preview-grants.js';
 import { MySqlModelRepository } from '../../models/repository.js';
 import { MySqlMemoryRepository } from '../../memory/repository.js';
 import { MySqlKnowledgeRepository } from '../../knowledge/repository.js';
+import { MySqlFileFavoriteRepository } from '../../file-favorites/repository.js';
 import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
 import type { DefaultImageSelection } from '../../../protocol/image-types.js';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import type { Project, Session, Turn } from '../../../protocol/types.js';
 import type { InputRequestRecord } from '../../../protocol/input-request-types.js';
-import type { NativeSecretFiles } from '../../secrets/native-files.js';
 import { MySqlSecretRepository } from '../../secrets/repository.js';
 import { MySqlToolRepository } from '../../tools/repository.js';
 import { MySqlNotificationRepository, saveNotificationsInTransaction } from '../../notifications/repository.js';
@@ -47,16 +47,18 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   readonly modelRepository: MySqlModelRepository;
   readonly memoryRepository: MySqlMemoryRepository;
   readonly knowledgeRepository: MySqlKnowledgeRepository;
+  readonly fileFavoriteRepository: MySqlFileFavoriteRepository;
   readonly secretRepository: MySqlSecretRepository;
   readonly toolRepository: MySqlToolRepository;
   readonly notificationRepository: MySqlNotificationRepository;
-  constructor(url: string, secretFiles?: NativeSecretFiles) {
+  constructor(url: string) {
     this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' });
     this.previewGrants = new MySqlPreviewGrantStore(this.pool);
     this.modelRepository = new MySqlModelRepository(this.pool);
     this.memoryRepository = new MySqlMemoryRepository(this.pool);
     this.knowledgeRepository = new MySqlKnowledgeRepository(this.pool);
-    this.secretRepository = new MySqlSecretRepository(this.pool, secretFiles);
+    this.fileFavoriteRepository = new MySqlFileFavoriteRepository(this.pool);
+    this.secretRepository = new MySqlSecretRepository(this.pool);
     this.toolRepository = new MySqlToolRepository(this.pool);
     this.notificationRepository = new MySqlNotificationRepository(this.pool);
   }
@@ -518,6 +520,6 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   private mysqlDate(value: string | null | undefined): string | null { return date(value); }
 }
 
-export function createWebStateStore(mysqlUrl?: string, secretFiles?: NativeSecretFiles) {
-  return new MySqlWebStateStore(requireMySqlUrl(mysqlUrl), secretFiles);
+export function createWebStateStore(mysqlUrl?: string) {
+  return new MySqlWebStateStore(requireMySqlUrl(mysqlUrl));
 }

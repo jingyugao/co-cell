@@ -13,13 +13,20 @@ export interface DynamicToolInput {
   credentialPath?: string;
   /** Files or directories relative to the tool's debug HOME. */
   credentialPaths?: string[];
+  /** Named mode discovers names through the Load hook and requires a selected name from the permission hook. */
+  credentialMode?: 'shared' | 'named';
+  /** Relative paths excluded from credential snapshots, such as CLI caches. */
+  credentialExcludedPaths?: string[];
+  /** Operator-declared metadata for native credential hooks; never passed to permission hooks. */
+  credentialContext?: {
+    identity?: { hostname: string; username: string };
+    targetIdentity?: { hostname: string; username: string };
+  };
   permissionScriptId?: string;
   /** Load hook: receives the credential path and Base64 file contents. */
   credentialParseScriptId?: string;
   /** Save hook: runs for every content save, regardless of editor encoding. */
   credentialSaveScriptId?: string;
-  /** @deprecated Migrate inline bodies to ToolScript records and store the ID. */
-  permissionScript?: string;
   timeoutMs: number;
 }
 /** A new definition may rely on server defaults for fields hidden by the UI. */
@@ -33,6 +40,12 @@ export interface ToolPermissionCheckInput {
   projectId: string;
   boxId: string;
   permission: { tool: string; enabled: boolean; credentials?: string[] };
+}
+export interface ToolPermissionDecision {
+  allow: boolean;
+  reason?: string;
+  /** Required by named dynamic tools; the server checks this against role grants. */
+  credential?: string;
 }
 export interface DynamicTool extends DynamicToolInput {
   version: number;

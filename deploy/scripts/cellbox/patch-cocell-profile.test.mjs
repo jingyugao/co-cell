@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-test('CoCell profile enables automatic import trust and registers all proxy tools without changing other profiles', async () => {
+test('CoCell profile enables automatic import trust and migrates native tools to one dispatcher', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-auto-trust-'));
   try {
     const mounts = join(root, 'mounts.json');
@@ -15,6 +15,9 @@ test('CoCell profile enables automatic import trust and registers all proxy tool
       { id: 'cocell', provider: 'resumable-k8s-pod', nodeName: 'test-node', image: `registry.example/old@sha256:${'a'.repeat(64)}`,
         guest: { tools: [
           { id: 'operator-backup', executable: '/operator/backup' },
+          { id: 'cocell_git', executable: '/opt/cellbox/tools/cocell-proxy', args: ['git', '-'] },
+          { id: 'cocell_mysql', executable: '/opt/cellbox/tools/cocell-proxy', args: ['mysql', '-'] },
+          { id: 'cocell_tool', executable: '/old/proxy', args: ['old'] },
           { id: 'cocell_archive_backup', executable: '/opt/cellbox/tools/cocell-archive-backup', args: ['legacy'] },
           { id: 'cocell_archive_restore', executable: '/opt/cellbox/tools/cocell-archive-restore', args: ['restore'] },
           { id: 'other-archive-tool', executable: '/operator/archive' },
@@ -28,12 +31,13 @@ test('CoCell profile enables automatic import trust and registers all proxy tool
     assert.equal(profile.autoTrustImportedImages, true);
     assert.equal(profile.debugReadWriteHostPath, '/operator/shared/runtime/debug-homes');
     assert.deepEqual(patched.api.config.profiles[1], peer);
-    for (const id of ['git', 'glab', 'kubectl', 'mysql', 'meegle', 'lark_cli']) {
-      const tool = profile.guest.tools.find(tool => tool.id === 'cocell_' + id);
-      assert(tool, `Missing protected entry for ${id}`);
-      assert.equal(tool.credentialEnv.COCELL_TOOL_RUNTIME, 'cocell_tool_runtime');
-      assert.equal(tool.passThroughArgs, true);
-    }
+    const dispatchers = profile.guest.tools.filter(tool => tool.executable === '/opt/cellbox/tools/cocell-proxy');
+    assert.deepEqual(dispatchers.map(tool => tool.id), ['cocell_tool']);
+    assert.deepEqual(dispatchers[0].args, ['--dynamic', '-']);
+    assert.equal(dispatchers[0].credentialEnv.COCELL_TOOL_RUNTIME, 'cocell_tool_runtime');
+    assert.equal(dispatchers[0].passThroughArgs, true);
+    assert.equal(dispatchers[0].workspaceRead, true);
+    assert.equal(dispatchers[0].workspaceWrite, false);
     assert(profile.guest.tools.some(tool => tool.id === 'operator-backup'));
     assert(profile.guest.tools.some(tool => tool.id === 'cocell_archive_restore'), 'Cellbox archive restore must remain registered');
     assert(profile.guest.tools.some(tool => tool.id === 'other-archive-tool'), 'unrelated tools must remain registered');

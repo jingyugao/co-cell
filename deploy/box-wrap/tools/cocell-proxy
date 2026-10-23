@@ -1,12 +1,12 @@
 #!/usr/local/bin/node
 import { runProtectedTool, ToolAuthorizationError } from '/opt/product/cocell/protected-tool.mjs';
 
-const dynamic = process.argv[2] === '--dynamic';
 const forwarded = process.argv.slice(4);
-const tool = dynamic ? forwarded.shift() : process.argv[2];
+const tool = forwarded.shift();
 try {
-  if (dynamic && !/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(tool ?? '')) throw new Error('Invalid dynamic tool name');
-  process.exitCode = await runProtectedTool(tool, forwarded, { dynamic });
+  if (process.argv[2] !== '--dynamic') throw new Error('Invalid dynamic tool invocation');
+  if (!/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(tool ?? '')) throw new Error('Invalid dynamic tool name');
+  process.exitCode = await runProtectedTool(tool, forwarded);
 }
 catch (error) {
   console.error(error instanceof ToolAuthorizationError

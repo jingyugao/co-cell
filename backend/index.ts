@@ -5,6 +5,7 @@ import { ModelService } from './models/service.js';
 import { MemoryService } from './memory/service.js';
 import { KnowledgeService } from './knowledge/service.js';
 import { HindsightClient } from './knowledge/client.js';
+import { createProjectFileReader } from './workspaces/project-file-reader.js';
 import { DirectModelProvider } from './models/direct-provider.js';
 import { initializeTracing } from './infra/diagnostics/tracing.js';
 import { ImageCatalog } from './images/service.js';
@@ -32,7 +33,6 @@ import { modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
 import { MySqlCoordinator } from './infra/storage/coordination.js';
 import { SecretCrypto } from './secrets/crypto.js';
-import { NativeSecretFiles } from './secrets/native-files.js';
 import { SecretService } from './secrets/service.js';
 import { DynamicTools } from './tools/service.js';
 import { SharedFiles } from './shared-files/service.js';
@@ -81,7 +81,7 @@ const appServerEnv = {...(apiKey ? {CODEX_API_KEY:apiKey} : {}),
 const sharedDirectory = await loadSharedMountConfig();
 if (!sharedDirectory) throw new Error('CoCell tool wrappers require the shared persistent directory');
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
-const webState = createWebStateStore(mysqlUrl, new NativeSecretFiles(resolve(sharedDataRoot, 'runtime/debug-homes'), secretCrypto));
+const webState = createWebStateStore(mysqlUrl);
 if (sharedDirectory) {
   const publish = async () => {
     await publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
@@ -97,7 +97,7 @@ await cellboxProvider.initialize();
 let manager: SessionManager;
 let closeNativeSandboxConnections = async (_id: string): Promise<void> => {};
 const tools = new DynamicTools(webState.toolRepository, sharedDataRoot, coordinator);
-const secrets = new SecretService(webState.secretRepository, secretCrypto, tools);
+const secrets = new SecretService(webState.secretRepository, tools);
 if (sharedDirectory) await secrets.mountHomes(sharedDataRoot);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
   error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); }, multiApi ? 0 : undefined);
@@ -161,6 +161,9 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   }, notifications, coordinator);
 manager.setModelService(models);
+manager.setProjectFileReader(createProjectFileReader(cellboxProvider.client, (project, path, request) =>
+  runtime.fileResponse({ id: project.id, projectId: project.id, settings: { workingDirectory: project.workingDirectory },
+    sandbox: project.sandbox, sandboxMounts: project.sandboxMounts, updatedAt: project.updatedAt }, path, request)));
 const memory = new MemoryService({ repository: webState.memoryRepository, state: webState,
   client: cellboxProvider.client, directory: resolve(sharedDataRoot, 'runtime/memory'), coordinator, logger: runtimeLog });
 const knowledge = new KnowledgeService({ repository: webState.knowledgeRepository, materials: webState.memoryRepository,
@@ -168,7 +171,7 @@ const knowledge = new KnowledgeService({ repository: webState.knowledgeRepositor
   ...(process.env.HINDSIGHT_API_URL?.trim() ? { client: new HindsightClient({ url: process.env.HINDSIGHT_API_URL.trim(),
     bankId: process.env.HINDSIGHT_BANK_ID?.trim() || 'cocell', apiKey: process.env.HINDSIGHT_API_KEY }) } : {}) });
 // Project tables must exist before the Secret schema's foreign keys are created.
-const initializeSchemas = async () => { await webState.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); await webState.knowledgeRepository.init(); };
+const initializeSchemas = async () => { await webState.init(); await webState.fileFavoriteRepository.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); await webState.knowledgeRepository.init(); };
 if (coordinator) await coordinator.run('cocell-schema-init', initializeSchemas);
 else await initializeSchemas();
 await manager.init();
@@ -208,8 +211,8 @@ const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
-  inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), undefined, notifications,
-  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, knowledge);
+  inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), notifications,
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }

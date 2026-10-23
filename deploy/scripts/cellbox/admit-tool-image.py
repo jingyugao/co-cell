@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """Explicitly admit an inspected immutable tool image to the operator's profile."""
-import json
-from pathlib import Path
 import re
 import sys
 
@@ -33,12 +31,7 @@ if len(sys.argv) == 5:
     if sys.argv[3] not in homes:
         homes.append(sys.argv[3])
 tools = profile['guest'].setdefault('tools', [])
-names = json.loads((Path(__file__).resolve().parents[2] / 'box-wrap/proxy-tools.json').read_text())
-for name in names:
-    tool_id = 'cocell_' + name.replace('-', '_')
-    if not any(tool['id'] == tool_id for tool in tools):
-        tools.append({'id': tool_id, 'executable': '/opt/cellbox/tools/cocell-proxy', 'args': [name, '-'],
-                      'passThroughArgs': True, 'credentialEnv': {'COCELL_TOOL_RUNTIME': 'cocell_tool_runtime'}})
+tools[:] = [tool for tool in tools if tool.get('executable') != '/opt/cellbox/tools/cocell-proxy' or tool.get('id') == 'cocell_tool']
 dispatcher = next((tool for tool in tools if tool['id'] == 'cocell_tool'), None)
 if dispatcher is None:
     dispatcher = {'id': 'cocell_tool'}
@@ -46,10 +39,6 @@ if dispatcher is None:
 dispatcher.update({'executable': '/opt/cellbox/tools/cocell-proxy', 'args': ['--dynamic', '-'],
                    'passThroughArgs': True, 'credentialEnv': {'COCELL_TOOL_RUNTIME': 'cocell_tool_runtime'},
                    'workspaceRead': True, 'workspaceWrite': False})
-for tool in tools:
-    if tool['id'] in ('cocell_git', 'cocell_glab'):
-        tool['workspaceRead'] = True
-        tool['workspaceWrite'] = True
 release.check_lifecycle_operations()
 release.upgrade({'api': {'config': config}})
 print('Admitted inspected image:', sys.argv[3])

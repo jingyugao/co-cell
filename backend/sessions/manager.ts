@@ -27,6 +27,7 @@ import type { ImageCatalog } from '../images/service.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
 import { sandboxMounts } from '../../util/sandbox-mounts.js';
+import { projectWeekOf } from '../../util/project-types.js';
 import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../util/user-input.js';
 import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 import { applyTurnEvent } from '../../util/session-events.js';
@@ -1311,8 +1312,10 @@ export class SessionManager {
     if (this.closing) return;
     await this.refreshSharedState();
     const now = Date.now();
+    const currentWeek = projectWeekOf(new Date(now));
     const idle = (project: Project) => {
       if (project.name === 'system' || project.status !== 'active' || !project.sandbox) return false;
+      if (project.type === 3 && project.weekOf === currentWeek) return false;
       const sessions = [...this.sessions.values()].filter(session => session.projectId === project.id);
       const lastActivity = Math.max(Date.parse(project.sandbox.lastActiveAt ?? project.createdAt),
         project.sandboxOperation?.kind === 'resume' && project.sandboxOperation.status === 'succeeded'

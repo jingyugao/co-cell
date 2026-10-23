@@ -3,7 +3,7 @@ import { constants } from 'node:fs';
 import { mkdir, mkdtemp, open, readdir, realpath, rename, rm } from 'node:fs/promises';
 import { join, posix, sep } from 'node:path';
 import type { MemoryDetail, MemoryFileContent } from '../../protocol/memory-types.js';
-import type { CellboxClient } from '../../packages/sandbox/src/providers/cellbox/client.js';
+import { CellboxError, type CellboxClient } from '../../packages/sandbox/src/providers/cellbox/client.js';
 import { HttpError, redactCredentials } from '../../util/errors.js';
 import { sandboxMounts } from '../../util/sandbox-mounts.js';
 import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
@@ -116,8 +116,16 @@ export class MemoryService {
         await this.enqueue(signal);
         this.lastScan = Date.now();
       }
-      for (const record of await this.deps.repository.pending()) {
+      const pending = await this.deps.repository.pending();
+      // Sessions in one Box share a volume. Finish existing exports before starting another.
+      const busyBoxes = new Set(pending.filter(record => record.status !== 'queued' || record.exportOperationId || record.exportId)
+        .map(record => record.sourceBoxId));
+      for (const record of pending) {
         assertActive();
+        if (record.status === 'queued' && !record.exportOperationId && !record.exportId) {
+          if (busyBoxes.has(record.sourceBoxId)) continue;
+          busyBoxes.add(record.sourceBoxId);
+        }
         try {
           if (terminal.has(record.status) || record.status === 'queued' && (record.exportOperationId || record.exportId)) {
             await this.cleanup(record, signal, lease ?? undefined);
@@ -188,8 +196,15 @@ export class MemoryService {
     record.exportRequestedAt = new Date().toISOString();
     assertActive();
     await this.deps.repository.save(record);
-    const operation = await this.deps.client.createVolumeExport(record.volumeId, record.volumePath, signal);
-    record.exportOperationId = operation.id;
+    try {
+      const operation = await this.deps.client.createVolumeExport(record.volumeId, record.volumePath, signal);
+      record.exportOperationId = operation.id;
+    } catch (error) {
+      // A definite rejection is safe to defer; an unknown submission outcome is not.
+      if (!(error instanceof CellboxError) || error.code !== 'BUSY') throw error;
+      record.status = 'queued';
+      delete record.exportRequestedAt;
+    }
     assertActive();
     await this.deps.repository.save(record);
   }

@@ -52,6 +52,40 @@ async function credentialEditor(page, { name, roots, files, hooks = false, onSav
   return { dialog, browser, state, reads, writes, select };
 }
 
+const scriptId = '00000000-0000-4000-8000-000000000091';
+const sharedScript = { id: scriptId, name: 'Shared authorization hook', language: 'typescript',
+  source: 'return { allow: true, credential: input.args[0] };', version: 3, createdAt: stamp, updatedAt: stamp };
+const dynamicTool = (name, fields = {}) => ({ name, description: '', instructions: '', enabled: true, executable: name,
+  args: [], env: {}, timeoutMs: 20000, version: 1, createdAt: stamp, updatedAt: stamp, ...fields });
+
+async function toolScriptPage(page, { tools, scripts = [sharedScript], definitionsStatus = 200, onDefinitionWrite } = {}) {
+  const requests = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith('/api/')) requests.push({ path: url.pathname, method: request.method() });
+  });
+  await page.route('**/api/tool-definitions', route => route.request().method() === 'GET'
+    ? route.fulfill({ status: definitionsStatus, json: definitionsStatus === 200 ? tools : { error: 'tool reference unavailable' } })
+    : route.fallback());
+  await page.route('**/api/tool-definitions/**', async route => {
+    const request = route.request();
+    if (request.method() === 'PUT') {
+      const body = request.postDataJSON();
+      await onDefinitionWrite?.(body);
+      return route.fulfill({ json: { ...tools.find(tool => tool.name === decodeURIComponent(new URL(request.url()).pathname.split('/').at(-1))), ...body } });
+    }
+    return route.fallback();
+  });
+  await page.route('**/api/tool-scripts', route => route.request().method() === 'GET'
+    ? route.fulfill({ json: scripts }) : route.fallback());
+  await page.route('**/api/tools', route => route.request().method() === 'GET' ? route.fulfill({ json: [] }) : route.fallback());
+  for (const tool of tools) await page.route(`**/api/tools/${tool.name}/credentials**`, route => route.fulfill({ json: {
+    tool: tool.name, home: '/home/debug', roots: tool.credentialPaths ?? [], entries: [], version,
+  } }));
+  await page.goto('/#connections');
+  return requests;
+}
+
 // The removed Secret upload/import UI is replaced by editing native files under each tool.
 test('native multi-file credentials load on selection and save only the selected raw text without granting project access', async ({ page, ui }) => {
   const path = '.kube/config', certificate = '.kube/client.crt';
@@ -136,4 +170,99 @@ test('credential save conflicts retain the draft until an explicit reload and us
     { path, content: draft, encoding: 'utf8', version, scriptVersion: 0 },
     { path, content: edited, encoding: 'utf8', version: 'c'.repeat(64), scriptVersion: 4 },
   ]);
+});
+
+test('tool script preview shows the source and permission context without mutating tool or script definitions', async ({ page, ui }) => {
+  const tool = dynamicTool('fixture-tool', { permissionScriptId: scriptId });
+  const requests = await toolScriptPage(page, { tools: [tool] });
+  const card = page.getByRole('article', { name: tool.name, exact: true });
+  const summary = card.getByRole('region', { name: `${tool.name} 脚本`, exact: true });
+  await summary.getByRole('button', { name: sharedScript.name, exact: true }).click();
+
+  const preview = page.getByRole('dialog', { name: `查看脚本：${sharedScript.name}`, exact: true });
+  await expect(preview.getByRole('region', { name: '当前脚本用途', exact: true })).toContainText('fixture-tool · 权限检查');
+  await expect(preview.getByText('每次调用工具时', { exact: true })).toBeVisible();
+  await expect(preview.getByRole('region', { name: '脚本引用关系', exact: true })).toContainText('fixture-tool');
+  await expect(preview.getByRole('region', { name: '脚本源码', exact: true })).toHaveText(sharedScript.source);
+  await page.screenshot({ path: test.info().outputPath('tool-script-source-preview.png'), fullPage: true });
+  await preview.getByRole('button', { name: '关闭预览', exact: true }).click();
+  expect(requests.filter(request => request.method !== 'GET')).toEqual([]);
+  expect(ui.calls.filter(request => request.method !== 'GET')).toEqual([]);
+});
+
+test('opening and closing a script preview from the tool editor preserves the unsaved tool draft', async ({ page, ui }) => {
+  const tool = dynamicTool('fixture-tool', { permissionScriptId: scriptId, credentialPath: '.fixture/config' });
+  const saved = [];
+  await toolScriptPage(page, { tools: [tool], onDefinitionWrite: body => saved.push(body) });
+  await page.getByRole('article', { name: tool.name, exact: true }).getByRole('button', { name: '编辑', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: `编辑工具：${tool.name}`, exact: true });
+  const draftArgs = '["--draft-option"]';
+  await editor.getByRole('textbox', { name: '启动参数（JSON 字符串数组）', exact: true }).fill(draftArgs);
+  await editor.getByRole('textbox', { name: '主凭据文件路径', exact: true }).fill('.fixture/draft-config');
+  await editor.getByRole('button', { name: '查看权限检查脚本', exact: true }).click();
+
+  const preview = page.getByRole('dialog', { name: `查看脚本：${sharedScript.name}`, exact: true });
+  await expect(preview.getByRole('region', { name: '脚本源码', exact: true })).toHaveText(sharedScript.source);
+  await preview.getByRole('button', { name: '关闭预览', exact: true }).click();
+  await expect(editor.getByRole('textbox', { name: '启动参数（JSON 字符串数组）', exact: true })).toHaveValue(draftArgs);
+  await expect(editor.getByRole('textbox', { name: '主凭据文件路径', exact: true })).toHaveValue('.fixture/draft-config');
+  await editor.getByRole('button', { name: '保存工具', exact: true }).click();
+  await expect.poll(() => saved.length).toBe(1);
+  expect(saved[0].args).toEqual(['--draft-option']);
+  expect(saved[0].credentialPath).toBe('.fixture/draft-config');
+});
+
+test('shared script usage lists each referencing tool and hook purpose', async ({ page, ui }) => {
+  const tools = [
+    dynamicTool('tool-alpha', { permissionScriptId: scriptId }),
+    dynamicTool('tool-beta', { credentialParseScriptId: scriptId }),
+  ];
+  await toolScriptPage(page, { tools });
+  await page.getByRole('tab', { name: '脚本管理', exact: true }).click();
+  const card = page.getByRole('article', { name: sharedScript.name, exact: true });
+  await expect(card.getByText('tool-alpha · 权限检查', { exact: true })).toBeVisible();
+  await expect(card.getByText('tool-beta · 凭据读取', { exact: true })).toBeVisible();
+  await page.screenshot({ path: test.info().outputPath('script-usage-list.png'), fullPage: true });
+  await card.getByRole('button', { name: '编辑', exact: true }).click();
+
+  const impact = page.getByRole('region', { name: '脚本修改影响', exact: true });
+  const rows = impact.locator('li');
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0)).toContainText('tool-alpha');
+  await expect(rows.nth(0)).toContainText('权限检查');
+  await expect(rows.nth(1)).toContainText('tool-beta');
+  await expect(rows.nth(1)).toContainText('凭据读取');
+});
+
+test('failed tool-reference lookup stays unknown instead of labeling a shared script unused', async ({ page, ui }) => {
+  await toolScriptPage(page, { tools: [], definitionsStatus: 503 });
+  await page.getByRole('tab', { name: '脚本管理', exact: true }).click();
+
+  const card = page.getByRole('article', { name: sharedScript.name, exact: true });
+  await expect(card.locator('.script-usage-unknown')).toContainText('引用信息未加载');
+  await expect(card.getByText('未被工具引用', { exact: true })).toHaveCount(0);
+  await expect(card.getByRole('button', { name: '删除', exact: true })).toBeDisabled();
+  await expect(page.getByRole('status')).toContainText('工具引用加载失败');
+  await card.getByRole('button', { name: '查看脚本', exact: true }).click();
+  const preview = page.getByRole('dialog', { name: `查看脚本：${sharedScript.name}`, exact: true });
+  await expect(preview.getByRole('region', { name: '脚本源码', exact: true })).toHaveText(sharedScript.source);
+  await expect(preview.getByRole('region', { name: '脚本引用关系', exact: true })).toContainText('引用关系尚未加载');
+});
+
+
+test('missing tool scripts stay distinct from optional unconfigured hooks', async ({ page, ui }) => {
+  const missingId = '00000000-0000-4000-8000-000000000099';
+  const tool = dynamicTool('named-fixture', { credentialMode: 'named', credentialPath: '.fixture/config',
+    permissionScriptId: missingId, credentialParseScriptId: scriptId });
+  const requests = await toolScriptPage(page, { tools: [tool] });
+  const card = page.getByRole('article', { name: tool.name, exact: true });
+  const summary = card.getByRole('region', { name: `${tool.name} 脚本`, exact: true });
+  await expect(summary.getByText('引用的脚本不存在', { exact: true })).toBeVisible();
+  await expect(summary.getByText('未配置 · 直接保存原始文本或二进制', { exact: true })).toBeVisible();
+  await expect(summary.getByText('缺少必需脚本', { exact: true })).toHaveCount(0);
+  await card.getByRole('button', { name: '编辑', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: `编辑工具：${tool.name}`, exact: true });
+  await expect(editor.getByRole('combobox', { name: '权限检查脚本', exact: true })).toHaveValue(missingId);
+  await expect(editor.getByRole('button', { name: '查看权限检查脚本', exact: true })).toBeDisabled();
+  expect(requests.filter(request => request.method !== 'GET')).toEqual([]);
 });

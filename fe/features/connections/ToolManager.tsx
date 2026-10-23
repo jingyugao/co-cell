@@ -7,6 +7,9 @@ import { TOOL_NAME_PATTERN } from '../../../util/tool-secrets';
 import { api, errorMessage } from '../../lib/api';
 import ToolCredentialBrowser from './ToolCredentialBrowser';
 import EditorDialog from './EditorDialog';
+import ScriptPreview from './ScriptPreview';
+import { SCRIPT_BINDINGS } from './tool-script-context';
+import type { ScriptBinding } from './tool-script-context';
 import { useDraftStatus } from './DraftGuard';
 import './ToolManager.css';
 
@@ -24,6 +27,21 @@ function readJson<T>(value: string, expected: string): T {
   catch { throw new Error(`${expected} 必须是有效 JSON`); }
 }
 
+function ScriptSelector({ label, binding, value, scripts, required, onChange, onPreview }: {
+  label: string; binding: ScriptBinding; value: string; scripts: ToolScript[]; required?: boolean;
+  onChange: (value: string) => void; onPreview: (script: ToolScript) => void;
+}) {
+  const selected = scripts.find(script => script.id === value);
+  return <div className="tool-script-selector">
+    <label>{label}<select aria-label={label} required={required} value={value} onChange={event => onChange(event.target.value)}>
+      <option value="">不使用{label}</option>{value && !selected && <option value={value}>引用的脚本不存在（清除引用）</option>}
+      {scripts.map(script => <option key={script.id} value={script.id}>{script.name} · {script.language === 'bash' ? 'Bash' : 'TypeScript'}</option>)}
+    </select></label>
+    <button type="button" className="secondary-button" disabled={!selected} onClick={() => selected && onPreview(selected)} aria-label={`查看${label}${label.endsWith('脚本') ? '' : '脚本'}`}>查看脚本</button>
+    <p className="tool-script-selector-help">{binding.trigger} · {selected ? `${selected.language === 'bash' ? 'Bash' : 'TypeScript'} · v${selected.version}` : value ? '引用的脚本不存在，请重新选择。' : binding.fallback}</p>
+  </div>;
+}
+
 export default function ToolManager() {
   const [items, setItems] = useState<DynamicTool[]>([]);
   const [catalog, setCatalog] = useState<ToolCatalogEntry[]>([]);
@@ -34,6 +52,8 @@ export default function ToolManager() {
   const [argsText, setArgsText] = useState('[]');
   const [credentialPathsText, setCredentialPathsText] = useState('');
   const [embeddedCredentialOpen, setEmbeddedCredentialOpen] = useState(false);
+  const [preview, setPreview] = useState<{ id: string; binding: ScriptBinding; toolName: string } | null>(null);
+  const previewScript = scripts.find(script => script.id === preview?.id);
   const [browsing, setBrowsing] = useState<string | null>(null);
   const editorBaseline = useRef('');
   const editorDirty = editing !== null && JSON.stringify({ draft, argsText, credentialPathsText }) !== editorBaseline.current;
@@ -52,7 +72,7 @@ export default function ToolManager() {
     }).catch(err => { if (!controller.signal.aborted) setError(errorMessage(err)); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     const scriptListChanged = () => {
-      void api<ToolScript[]>('/api/tool-scripts').then(setScripts).catch(err => setError(errorMessage(err)));
+      void api<ToolScript[]>('/api/tool-scripts', { signal: controller.signal }).then(values => { if (!controller.signal.aborted) setScripts(values); }).catch(err => { if (!controller.signal.aborted) setError(errorMessage(err)); });
     };
     const toolListChanged = () => {
       void api<ToolCatalogEntry[]>('/api/tools', { signal: controller.signal }).then(setCatalog)
@@ -66,7 +86,8 @@ export default function ToolManager() {
   async function reload() {
     setBusy(true); setError(''); setMessage('');
     try {
-      const [definitions, entries] = await Promise.all([api<DynamicTool[]>('/api/tool-definitions'), api<ToolCatalogEntry[]>('/api/tools')]);
+      const [definitions, entries, availableScripts] = await Promise.all([api<DynamicTool[]>('/api/tool-definitions'), api<ToolCatalogEntry[]>('/api/tools'), api<ToolScript[]>('/api/tool-scripts')]);
+      setScripts(availableScripts);
       setItems(definitions); setCatalog(entries);
       if (editing && editing !== 'new') {
         const latest = definitions.find(item => item.name === editing.name);
@@ -185,22 +206,16 @@ export default function ToolManager() {
         <option value="shared">共享凭据</option><option value="named">命名凭据</option>
       </select></label>
       <label>主凭据文件路径<input aria-label="主凭据文件路径" value={draft.credentialPath} required={draft.credentialMode === 'named'} onChange={event => setField('credentialPath', event.target.value)} placeholder="例如 .ssh/config" /></label>
-      <label>权限检查脚本<select aria-label="权限检查脚本" required={draft.credentialMode === 'named'} value={draft.permissionScriptId ?? ''} onChange={event => setField('permissionScriptId', event.target.value)}>
-        <option value="">不使用权限脚本</option>{draft.permissionScriptId && !scripts.some(script => script.id === draft.permissionScriptId) && <option value={draft.permissionScriptId}>已删除的脚本（清除引用）</option>}
-        {scripts.map(script => <option key={script.id} value={script.id}>{script.name} · {script.language === 'bash' ? 'Bash' : 'TypeScript'}</option>)}
-      </select></label>
+      <ScriptSelector label="权限检查脚本" binding={SCRIPT_BINDINGS[0]} value={draft.permissionScriptId ?? ''} scripts={scripts} required={draft.credentialMode === 'named'}
+        onChange={value => setField('permissionScriptId', value)} onPreview={script => setPreview({ id: script.id, binding: SCRIPT_BINDINGS[0], toolName: draft.name })} />
       <p className="tool-permission-help">权限脚本读取 input.args 和 input.permission，返回允许或拒绝结果；项目角色授权始终生效。命名凭据模式还需返回 {'{allow: true, credential: "名称"}'}。</p>
       <details className="tool-credential-settings">
         <summary>凭据配置</summary>
         <label>凭据文件或目录（相对 debug HOME，每行一个）<textarea aria-label="凭据文件或目录" rows={3} spellCheck={false} value={credentialPathsText} onChange={event => setCredentialPathsText(event.target.value)} placeholder="例如 .mylogin.cnf 或 .config/tool" /></label>
-        <label>Load hook<select aria-label="Load hook" required={draft.credentialMode === 'named'} value={draft.credentialParseScriptId ?? ''} onChange={event => setField('credentialParseScriptId', event.target.value)}>
-          <option value="">不使用 Load hook</option>{draft.credentialParseScriptId && !scripts.some(script => script.id === draft.credentialParseScriptId) && <option value={draft.credentialParseScriptId}>已删除的脚本（清除引用）</option>}
-          {scripts.map(script => <option key={script.id} value={script.id}>{script.name} · {script.language === 'bash' ? 'Bash' : 'TypeScript'}</option>)}
-        </select></label>
-        <label>Save hook<select aria-label="Save hook" value={draft.credentialSaveScriptId ?? ''} onChange={event => setField('credentialSaveScriptId', event.target.value)}>
-          <option value="">不使用 Save hook</option>{draft.credentialSaveScriptId && !scripts.some(script => script.id === draft.credentialSaveScriptId) && <option value={draft.credentialSaveScriptId}>已删除的脚本（清除引用）</option>}
-          {scripts.map(script => <option key={script.id} value={script.id}>{script.name} · {script.language === 'bash' ? 'Bash' : 'TypeScript'}</option>)}
-        </select></label>
+        <ScriptSelector label="Load hook" binding={SCRIPT_BINDINGS[1]} value={draft.credentialParseScriptId ?? ''} scripts={scripts} required={draft.credentialMode === 'named'}
+          onChange={value => setField('credentialParseScriptId', value)} onPreview={script => setPreview({ id: script.id, binding: SCRIPT_BINDINGS[1], toolName: draft.name })} />
+        <ScriptSelector label="Save hook" binding={SCRIPT_BINDINGS[2]} value={draft.credentialSaveScriptId ?? ''} scripts={scripts}
+          onChange={value => setField('credentialSaveScriptId', value)} onPreview={script => setPreview({ id: script.id, binding: SCRIPT_BINDINGS[2], toolName: draft.name })} />
         <p className="tool-permission-help">Load hook 读取 path、content（原文件 Base64）和 files，可返回文本或 {'{content, encoding, names}'}；encoding 可为 utf8、base64 或 parsed（默认 parsed）。命名凭据模式用 names 提供可授权的名称。</p>
         <p className="tool-permission-help">凭据 hook 还可读取 tool、primaryPath；加密工具可读取 identity 和 targetIdentity。TypeScript 可用 codec.yaml.parse 解析 YAML。</p>
         <p className="tool-permission-help">Save hook 配置后每次保存都会运行，输入 path、编辑后的 content、encoding、original（原文件 Base64）和 files。TypeScript 返回规范文件 Base64；Bash 可将原始字节写到 stdout，或更新临时 HOME 中的暂存文件。</p>
@@ -212,13 +227,24 @@ export default function ToolManager() {
     {loading ? <p role="status">正在读取工具目录…</p> : !tools.length ? <div className="connections-empty">工具目录为空。</div> : <div className="secret-list tool-definition-list">{tools.map(name => {
       const item = items.find(value => value.name === name);
       const entry = catalog.find(value => value.name === name);
-      return <article className="connection-card" key={name}>
-        <div className="connection-profile-title"><strong>{name}</strong><span>{item ? (item.enabled ? '启用' : '停用') : '内置工具'}</span></div>
+      return <article className="connection-card" key={name} aria-label={name}>
+        <div className="connection-profile-title"><strong>{name}</strong><span>{item ? (item.enabled ? '启用' : '停用') : '未找到工具定义'}</span></div>
         {entry?.kind === 'tool-with-credential' && <p className="tool-credential-summary">连接：{entry.credentials.length ? entry.credentials.join('、') : '暂无已登记连接'}</p>}
+        {item && <section className="tool-script-summary" aria-label={`${name} 脚本`}>
+          <h3>脚本与用途</h3><ul>{SCRIPT_BINDINGS.map(binding => {
+            const id = item[binding.field], script = scripts.find(value => value.id === id);
+            const required = item.credentialMode === 'named' && binding.field !== 'credentialSaveScriptId';
+            return <li key={binding.field}><span className="tool-script-purpose">{binding.label}</span>
+              {script ? <button type="button" className="tool-script-link" onClick={() => setPreview({ id: script.id, binding, toolName: name })}>{script.name}</button>
+                : <span className={id || required ? 'tool-script-missing' : 'tool-script-fallback'}>{id ? '引用的脚本不存在' : required ? '缺少必需脚本' : binding.fallback}</span>}
+            </li>;
+          })}</ul>
+        </section>}
         <div className="secret-actions"><button className="secondary-button" disabled={busy || !item} onClick={() => item && start(item)}>编辑</button>{item && <button className="secondary-button" disabled={busy} onClick={() => void remove(item)}>删除</button>}
           <button className="secondary-button" disabled={busy} onClick={() => toggleBrowser(name)}>{browsing === name ? '收起凭据' : '查看凭据'}</button></div>
         {browsing === name && <ToolCredentialBrowser key={name} tool={name} onClose={() => setBrowsing(null)} />}
       </article>;
     })}</div>}
+    {preview && previewScript && <ScriptPreview key={previewScript.id} script={previewScript} tools={items} context={preview.binding} toolName={preview.toolName} onClose={() => setPreview(null)} />}
   </section>;
 }

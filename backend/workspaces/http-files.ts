@@ -3,7 +3,7 @@ import { posix } from 'node:path';
 /** Serve untrusted workspace bytes without permitting active same-origin content. */
 export function workspaceFileResponse(upstream: Response, path: string, download = false): Response {
   const headers = new Headers();
-  for (const name of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
+  for (const name of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified', 'x-cocell-file-source', 'x-cocell-backup-created-at']) {
     const value = upstream.headers.get(name);
     if (value !== null) headers.set(name, value);
   }

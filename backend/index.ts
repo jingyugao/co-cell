@@ -3,6 +3,7 @@ import { readSystemRequirementInfo } from './projects/requirements.js';
 import { SystemTools } from './execution/system-tools.js';
 import { ModelService } from './models/service.js';
 import { MemoryService } from './memory/service.js';
+import { createProjectFileReader } from './workspaces/project-file-reader.js';
 import { DirectModelProvider } from './models/direct-provider.js';
 import { initializeTracing } from './infra/diagnostics/tracing.js';
 import { ImageCatalog } from './images/service.js';
@@ -159,10 +160,13 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   }, notifications, coordinator);
 manager.setModelService(models);
+manager.setProjectFileReader(createProjectFileReader(cellboxProvider.client, (project, path, request) =>
+  runtime.fileResponse({ id: project.id, projectId: project.id, settings: { workingDirectory: project.workingDirectory },
+    sandbox: project.sandbox, sandboxMounts: project.sandboxMounts, updatedAt: project.updatedAt }, path, request)));
 const memory = new MemoryService({ repository: webState.memoryRepository, state: webState,
   client: cellboxProvider.client, directory: resolve(sharedDataRoot, 'runtime/memory'), coordinator, logger: runtimeLog });
 // Project tables must exist before the Secret schema's foreign keys are created.
-const initializeSchemas = async () => { await webState.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); };
+const initializeSchemas = async () => { await webState.init(); await webState.fileFavoriteRepository.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); };
 if (coordinator) await coordinator.run('cocell-schema-init', initializeSchemas);
 else await initializeSchemas();
 await manager.init();
@@ -202,7 +206,7 @@ const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
   inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), undefined, notifications,
-  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory);
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }

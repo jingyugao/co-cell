@@ -29,8 +29,10 @@ import type { SecretService } from './secrets/service.js';
 import { installSecretRoutes } from './secrets/routes.js';
 import { installToolRoutes } from './tools/routes.js';
 import { installPwaAssets } from './infra/http/pwa.js';
+import { installFileFavoriteRoutes } from './file-favorites/routes.js';
+import type { FileFavoriteRepository } from './file-favorites/repository.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository) {
   const app = new Hono();
   app.get('/healthz', c => c.text('ok'));
   app.use('/api/*', traceHttpRequest);
@@ -85,6 +87,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
     defaults: { ...config.defaults, ...await models.defaultSelection() } } : config));
   if (models) installModelRoutes(app, models);
   installMemoryRoutes(app, memory);
+  installFileFavoriteRoutes(app, manager, fileFavorites);
   installProjectsRoutes(app, manager, operatorAccess?.previewSubdomains
     ? { publicUrl: operatorAccess.publicUrl, token: operatorAccess.token } : undefined, images);
   installSessionsRoutes(app, manager, config);

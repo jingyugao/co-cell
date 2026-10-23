@@ -14,4 +14,6 @@ export interface WorkspaceFile {
  */
 export interface WorkspaceFilePreview extends WorkspaceFile {
   truncated?: boolean;
+  source?: 'live' | 'volume' | 'backup';
+  backupCreatedAt?: string;
 }

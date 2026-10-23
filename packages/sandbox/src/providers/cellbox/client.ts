@@ -397,16 +397,29 @@ export class CellboxClient {
   }
   getExec(id: string, signal?: AbortSignal) { return this.request<CellboxExecution>('GET', `/v1/execs/${this.id(id)}`, { signal }); }
   async fileResponse(id: string, path: string, options: { method?: 'GET' | 'HEAD'; headers?: Headers; signal?: AbortSignal } = {}): Promise<Response> {
+    return this.fileResourceResponse(`/v1/boxes/${this.id(id)}/files?path=${encodeURIComponent(path)}`, options);
+  }
+  /** Reads a stopped volume without connecting to its Box. */
+  volumeFileResponse(volumeId: string, path: string, options: { method?: 'GET' | 'HEAD'; headers?: Headers; signal?: AbortSignal } = {}) {
+    return this.fileResourceResponse(`/v1/volumes/${this.id(volumeId)}/files?path=${encodeURIComponent(path)}`, options, 120_000);
+  }
+  /** Explicit snapshot identity keeps archived reads stable throughout the request. */
+  backupFileResponse(volumeId: string, snapshotId: string, path: string,
+    options: { method?: 'GET' | 'HEAD'; headers?: Headers; signal?: AbortSignal } = {}) {
+    if (!/^[a-f0-9]{64}$/i.test(snapshotId)) throw new CellboxError('INVALID_REQUEST', 'A full snapshot ID is required');
+    return this.fileResourceResponse(`/v1/volumes/${this.id(volumeId)}/backups/${this.id(snapshotId)}/files?path=${encodeURIComponent(path)}`, options, 120_000);
+  }
+  private async fileResourceResponse(resource: string, options: { method?: 'GET' | 'HEAD'; headers?: Headers; signal?: AbortSignal }, timeoutMs = this.requestTimeoutMs): Promise<Response> {
     const headers = new Headers({ ...this.clientHeaders(), 'Accept-Encoding': 'identity' });
     for (const name of ['range', 'if-range', 'if-match', 'if-unmodified-since', 'if-none-match', 'if-modified-since']) {
       const value = options.headers?.get(name);
       if (value !== undefined && value !== null) headers.set(name, value);
     }
     const timeout = new AbortController();
-    const timer = setTimeout(() => timeout.abort(), this.requestTimeoutMs);
+    const timer = setTimeout(() => timeout.abort(), timeoutMs);
     let response: Response;
     try {
-      response = await this.fetchImpl(`${this.baseUrl}/v1/boxes/${this.id(id)}/files?path=${encodeURIComponent(path)}`, {
+      response = await this.fetchImpl(`${this.baseUrl}${resource}`, {
         method: options.method ?? 'GET', headers, redirect: 'error',
         signal: options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal,
       });

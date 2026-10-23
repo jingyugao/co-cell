@@ -26,7 +26,7 @@ export async function cellboxWorkspaceFileResponse(sandbox: SandboxHandle, worki
   } catch (error) { throw fileError(error); }
 }
 
-function workspaceFilePath(workingDirectory: string, absolutePath: string): string {
+export function workspaceFilePath(workingDirectory: string, absolutePath: string): string {
   if (!absolutePath || absolutePath.length > 4096 || !posix.isAbsolute(absolutePath)
       || /[\x00-\x1f\x7f]/.test(absolutePath) || absolutePath.split('/').includes('..')) {
     throw new HttpError(400, '文件地址必须是工作区内的绝对路径');

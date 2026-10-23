@@ -7,6 +7,10 @@
 .workspace-file-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; padding: 12px 24px; border-bottom: 1px solid #e6e9df; font-size: 12px; }
 .workspace-file-toolbar a, .workspace-file-toolbar button { color: #547545; background: transparent; border: 0; padding: 0; text-decoration: none; cursor: pointer; font: inherit; }
 .workspace-file-toolbar a:hover, .workspace-file-toolbar button:hover { text-decoration: underline; }
+.workspace-file-toolbar .workspace-file-favorite { display:flex; align-items:center; gap:5px; padding:5px 8px; border:1px solid #dfe5d3; border-radius:5px; color:#60764e; }
+.workspace-file-toolbar .workspace-file-favorite.selected { color:#fff; background:#71865b; border-color:#71865b; }
+.workspace-file-toolbar .workspace-file-favorite:disabled { opacity:.6; cursor:wait; }
+.workspace-file-favorite-error { padding:8px 24px; color:#a56955; background:#fbf0eb; font-size:11px; overflow-wrap:anywhere; }
 .workspace-file-toolbar span { color: #7b8473; margin-left: auto; }
 .workspace-file-body { flex: 1; min-height: 0; overflow: auto; padding: 24px; }
 .workspace-file-body > [role=status] { display: flex; align-items: center; gap: 10px; font-size: 13px; }

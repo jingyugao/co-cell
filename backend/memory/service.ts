@@ -76,7 +76,8 @@ export class MemoryService {
 
   async retry(id: string, updatedAt: string) {
     const record = await this.requireRecord(id);
-    if (record.status !== 'failed' || record.updatedAt !== updatedAt) throw new HttpError(409, '任务已变化，请刷新后重试');
+    if (!['failed', 'ready'].includes(record.status) || record.updatedAt !== updatedAt)
+      throw new HttpError(409, '任务已变化，请刷新后重试');
     record.status = 'queued';
     delete record.error;
     // A known export is observed and removed before another attempt starts.

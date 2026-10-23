@@ -36,6 +36,11 @@ export interface MemoryDetail {
   files: MemoryFile[];
 }
 
+/** Explicit retry/regeneration of a failed or ready record; updatedAt guards against stale actions. */
+export interface MemoryRetryInput {
+  updatedAt: string;
+}
+
 /** UTF-8 byte offsets; complete code points are kept together across pages. */
 export interface MemoryFileContent {
   content: string;

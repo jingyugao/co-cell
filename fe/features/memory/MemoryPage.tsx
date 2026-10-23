@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { MemoryDetail, MemoryFile, MemoryFileContent, MemoryList, MemoryRecord } from '../../../protocol/memory-types';
+import type { MemoryDetail, MemoryFile, MemoryFileContent, MemoryList, MemoryRecord, MemoryRetryInput } from '../../../protocol/memory-types';
 import { api, errorMessage } from '../../lib/api';
 import { Icon } from '../../components/Icon';
 import './MemoryPage.css';
@@ -133,11 +133,11 @@ export default function MemoryPage({ onMenu, onBack }: { onMenu: () => void; onB
   }, [detail?.record.id, selectedFile?.id, readContent]);
 
   async function retry() {
-    if (!detail || detail.record.status !== 'failed' || retrying) return;
+    if (!detail || !['failed', 'ready'].includes(detail.record.status) || retrying) return;
     setRetrying(true); setRetryError('');
     try {
       await api<{ ok: true }>(`/api/memory/${encodeURIComponent(detail.record.id)}/retry`, {
-        method: 'POST', body: JSON.stringify({ updatedAt: detail.record.updatedAt }),
+        method: 'POST', body: JSON.stringify({ updatedAt: detail.record.updatedAt } satisfies MemoryRetryInput),
       });
       await Promise.all([fetchDetail(detail.record.id, false), refreshList(false)]);
     } catch (error) {
@@ -185,7 +185,7 @@ export default function MemoryPage({ onMenu, onBack }: { onMenu: () => void; onB
         <div className="memory-detail-heading"><button className="memory-back-inline" onClick={closeDetail}>← 返回记忆列表</button><span className="memory-eyebrow">对话记忆</span><h1>{detail.record.projectName}</h1><p>{detail.record.firstMessage.trim() || detail.record.sessionTitle || '未命名对话'}</p></div>
         <div className="memory-detail-meta"><span>对话更新时间 <time>{dateLabel(detail.record.sourceUpdatedAt)}</time></span><span>整理时间 <time>{dateLabel(detail.record.cleanedAt)}</time></span><span className={`memory-status status-${detail.record.status}`}>{statusLabel[detail.record.status]}</span><span>{detail.record.fileCount} 个文件</span></div>
         {detail.record.error && <div className="memory-error" role="alert">{detail.record.error}</div>}
-        {detail.record.status === 'failed' && <div className="memory-retry-row"><span>可以重新尝试整理这条记忆。</span><button className="primary-button" onClick={() => void retry()} disabled={retrying}>{retrying ? '正在重试…' : '重试'}</button></div>}
+        {['failed', 'ready'].includes(detail.record.status) && <div className="memory-retry-row"><span>{detail.record.status === 'ready' ? '使用当前规则重新整理这条记忆。' : '可以重新尝试整理这条记忆。'}</span><button className="primary-button" onClick={() => void retry()} disabled={retrying}>{retrying ? '正在提交…' : detail.record.status === 'ready' ? '重新整理' : '重试'}</button></div>}
         {retryError && <div className="memory-error" role="alert">{retryError}</div>}
         {detailError && <div className="memory-error" role="alert"><span>{detailError}</span><button className="secondary-button" onClick={() => void fetchDetail(detail.record.id)}>重试读取</button></div>}
         {detailLoading ? <div className="memory-state" role="status">正在加载详情…</div> : <div className="memory-detail-layout">

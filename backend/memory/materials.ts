@@ -7,6 +7,7 @@ import { once } from 'node:events';
 import { finished } from 'node:stream/promises';
 import type { MemoryFile } from '../../protocol/memory-types.js';
 import { extractMemoryArchive, listMemoryArchiveFiles, readMemoryJsonl } from './archive.js';
+import { materialValue, questionReply, structuredValue } from './markdown.js';
 
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 const MAX_COMPRESSED_BYTES = 18 * 1024 ** 3;
@@ -78,11 +79,11 @@ function cleanText(value: string): CleanResult {
 function cleanValue(value: unknown, parseJson = false): CleanResult {
   if (typeof value === 'string') {
     if (parseJson) {
-      let parsed: unknown;
-      try { parsed = JSON.parse(value); } catch { /* Tool input can also be free-form text. */ }
+      const parsed = structuredValue(value);
       if (parsed && typeof parsed === 'object') {
         const cleaned = cleanValue(parsed, true);
-        return { value: JSON.stringify(cleaned.value), encrypted: cleaned.encrypted };
+        // Keep source JSON distinguishable from transport objects when rendering output.
+        return { value: JSON.stringify(cleaned.value, null, 2), encrypted: cleaned.encrypted };
       }
     }
     return cleanText(value);
@@ -102,7 +103,8 @@ function cleanValue(value: unknown, parseJson = false): CleanResult {
   for (const [key, item] of Object.entries(value)) {
     if (runtimeKey.test(key)) continue;
     if (sensitiveKey.test(key)) { output[key] = '[凭据已隐藏]'; continue; }
-    const cleaned = cleanValue(item, parseJson); output[key] = cleaned.value; encrypted += cleaned.encrypted;
+    const cleaned = cleanValue(item, parseJson && !/^(?:cmd|command|code|patch|diff)$/.test(key));
+    output[key] = cleaned.value; encrypted += cleaned.encrypted;
   }
   return { value: output, encrypted };
 }
@@ -590,29 +592,21 @@ function markdownValue(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
-function codeFence(value: unknown, language = 'text'): string {
-  const text = markdownValue(value);
-  let width = 3;
-  for (const match of text.matchAll(/`+/g)) width = Math.max(width, match[0].length + 1);
-  const marker = '`'.repeat(width);
-  return `${marker}${language}\n${text}\n${marker}`;
-}
-
 function eventMarkdown(kind: EventKind, role: string | null, data: Record<string, unknown>): string {
-  if (kind === 'message') return `## ${role === 'user' ? '用户' : '助手'}\n\n${markdownValue(data.text)}`;
+  if (kind === 'message') return `## ${role === 'user' ? '用户' : '助手'}\n\n${questionReply(markdownValue(data.text))}`;
   if (kind === 'question') {
     const questions = Array.isArray(data.questions) ? data.questions : [];
-    return `## 助手向用户提问\n\n${markdownValue(data.prompt)}${questions.length ? `\n\n${markdownValue(questions)}` : ''}`;
+    return `## 助手向用户提问\n\n${markdownValue(data.prompt)}${questions.length ? `\n\n${materialValue(questions)}` : ''}`;
   }
   if (kind === 'collaboration') return `## Agent 消息\n\n${markdownValue(data.text)}`;
-  if (kind === 'tool_call') return `## 工具：${markdownValue(data.name)}\n\n### 输入\n\n${codeFence(data.input)}` +
-    `${data.output !== undefined ? `\n\n### 结果\n\n${codeFence(data.output)}` : ''}` +
-    `${data.nativeExecutions !== undefined ? `\n\n### 原生执行记录\n\n${codeFence(data.nativeExecutions)}` : ''}` +
-    `${data.nativeChanges !== undefined ? `\n\n### 文件变更\n\n${codeFence(data.nativeChanges)}` : ''}` +
+  if (kind === 'tool_call') return `## 工具：${markdownValue(data.name)}\n\n### 输入\n\n${materialValue(typeof data.input === 'string' ? structuredValue(data.input) : data.input) || '（无内容）'}` +
+    `${data.output !== undefined ? `\n\n### 结果\n\n${materialValue(data.output) || '（无内容）'}` : ''}` +
+    `${data.nativeExecutions !== undefined ? `\n\n### 原生执行记录\n\n${materialValue(data.nativeExecutions)}` : ''}` +
+    `${data.nativeChanges !== undefined ? `\n\n### 文件变更\n\n${materialValue(data.nativeChanges)}` : ''}` +
     `${data.resultStatus !== undefined ? `\n\n结果状态：${markdownValue(data.resultStatus)}` : ''}` +
     `${data.status !== undefined ? `\n\n状态：${markdownValue(data.status)}` : ''}` +
     `${data.exitCode !== undefined ? `\n\n退出码：${markdownValue(data.exitCode)}` : ''}`;
-  if (kind === 'tool_result') return `## 工具结果\n\n${codeFence(data.output)}${data.status !== undefined ? `\n\n状态：${markdownValue(data.status)}` : ''}`;
+  if (kind === 'tool_result') return `## 工具结果\n\n${materialValue(data.output) || '（无内容）'}${data.status !== undefined ? `\n\n状态：${markdownValue(data.status)}` : ''}`;
   return '';
 }
 

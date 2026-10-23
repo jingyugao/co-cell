@@ -35,7 +35,10 @@ export function parseNativeHistory(source, includeBlocks = false) {
     if (lastUserMessages.get(turn.id) === signature) return false;
     const original = !confirmed.has(turn.id);
     if (original) turn.prompt = message;
-    else (turn.additionalUserInputs ??= []).push(message);
+    else {
+      (turn.additionalUserInputs ??= []).push(message);
+      (turn.additionalUserInputPositions ??= []).push({ beforeItemIndex: turn.items.length });
+    }
     confirmed.add(turn.id);
     lastUserMessages.set(turn.id, signature);
     return original;

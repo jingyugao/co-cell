@@ -484,6 +484,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
           hasOriginalPrompt = true;
         } else {
           (turn.additionalUserInputs ??= []).push(text);
+          (turn.additionalUserInputPositions ??= []).push({ beforeItemIndex: turn.items.length });
         }
         continue;
       }

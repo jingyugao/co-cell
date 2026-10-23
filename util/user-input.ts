@@ -82,3 +82,12 @@ export function withNativeUserInput(turn: Turn, answers?: NativeUserInputAnswers
       answeredAt: latest.answeredAt, answerTurnId: latest.answerTurnId };
   }) } : turn;
 }
+
+/** Capture the message boundary when a live steer is accepted. */
+export function appendAdditionalUserInput(turn: Turn, text: string): Turn {
+  const inputs = turn.additionalUserInputs ?? [];
+  const positions = inputs.map((_, index) => turn.additionalUserInputPositions?.[index]
+    ?? { beforeItemIndex: turn.items.length });
+  return { ...turn, additionalUserInputs: [...inputs, text],
+    additionalUserInputPositions: [...positions, { beforeItemIndex: turn.items.length }] };
+}

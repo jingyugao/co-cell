@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { NativeSessionConnection } from '../../../protocol/native-app-server';
 import type { Session, Turn } from '../../../protocol/types';
 import { applySdkEvent } from '../../../util/session-events';
-import { withNativeUserInput } from '../../../util/user-input';
+import { appendAdditionalUserInput, withNativeUserInput } from '../../../util/user-input';
 import { api, errorMessage } from '../../lib/api';
 import { NativeAppServerClient, nativeWebSocketUrl, readQuietSnapshot } from '../../lib/native-app-server';
 import { NativeAppServerEventAdapter } from '../../lib/native-app-server-adapter';
@@ -236,7 +236,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
       if (!expectedTurnId) throw new Error('无法确认当前运行中的 turn，请刷新状态。');
       await client.request('turn/steer', { threadId, expectedTurnId, input: [{ type: 'text', text: prompt, text_elements: [] }] });
       assertCurrentConnection();
-      setSessionRef.current(value => value?.id === current.id ? { ...value, turns: value.turns.map(turn => turn.id === expectedTurnId || turn.nativeTurnId === expectedTurnId ? { ...turn, additionalUserInputs: [...(turn.additionalUserInputs ?? []), prompt] } : turn) } : value);
+      setSessionRef.current(value => value?.id === current.id ? { ...value, turns: value.turns.map(turn => turn.id === expectedTurnId || turn.nativeTurnId === expectedTurnId ? appendAdditionalUserInput(turn, prompt) : turn) } : value);
       return;
     }
     pendingStart.current = { prompt, images };

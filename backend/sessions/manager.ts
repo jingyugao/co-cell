@@ -28,7 +28,7 @@ import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
 import { sandboxMounts } from '../../util/sandbox-mounts.js';
 import { projectWeekOf } from '../../util/project-types.js';
-import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../util/user-input.js';
+import { appendAdditionalUserInput, collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../util/user-input.js';
 import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 import { applyTurnEvent } from '../../util/session-events.js';
 import type { InputRequestRecord, InputRequestType } from '../../protocol/input-request-types.js';
@@ -887,6 +887,7 @@ export class SessionManager {
           return withNativeUserInput(current ? { ...native, ...current, nativeTurnId: native.id,
             ...(this.isNativeSession(session) ? { status: native.status, completedAt: native.completedAt, error: native.error, phase: undefined, retry: undefined } : {}),
             additionalUserInputs: native.additionalUserInputs ?? current.additionalUserInputs,
+            additionalUserInputPositions: native.additionalUserInputs ? native.additionalUserInputPositions : current.additionalUserInputPositions,
             prompt: current.prompt || native.prompt, items: native.items.map(item => ({ ...current.items.find(old => old.id === item.id), ...item })).concat(current.items.filter(item => !native.items.some(other => other.id === item.id))),
             ...(current.userInputRequests ? { userInputRequests: current.userInputRequests } : {}) } : native);
         });
@@ -1858,8 +1859,7 @@ export class SessionManager {
           throw new HttpError(502, '追加消息的接收状态不确定，请检查会话后再继续');
         }
         if (!accepted) throw new NativeTurnNotReceiving();
-        if (submission?.type !== 'question_reply')
-          current.additionalUserInputs = [...(current.additionalUserInputs ?? []), prompt];
+        if (submission?.type !== 'question_reply') Object.assign(current, appendAdditionalUserInput(current, prompt));
         session.updatedAt = new Date().toISOString();
         await this.save(session);
         this.publish(id, { type: 'state', session: this.get(id) });

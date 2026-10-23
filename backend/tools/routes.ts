@@ -8,12 +8,19 @@ import type { SecretService } from '../secrets/service.js';
 const name = z.string().regex(TOOL_NAME_PATTERN);
 const version = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const scriptId = z.string().uuid().nullish().transform(value => value ?? undefined);
+const identity = z.object({
+  hostname: z.string().min(1).max(253).regex(/^[^\u0000-\u001f\u007f]+$/),
+  username: z.string().min(1).max(253).regex(/^[^\u0000-\u001f\u007f]+$/),
+}).strict();
 const input = z.object({
   name, description: z.string().max(1000), instructions: z.string().max(16000), enabled: z.boolean(),
   executable: z.string().min(1).max(1024), packageVersion: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   args: z.array(z.string().max(8192)).max(32), env: z.record(z.string().max(128), z.string().max(8192)).refine(value => Object.keys(value).length <= 64, '环境变量最多 64 项'),
-  credentialPath: z.string().min(1).max(256).optional(), permissionScript: z.string().min(1).max(16000).optional(),
+  credentialPath: z.string().min(1).max(256).nullish().transform(value => value ?? undefined),
   credentialPaths: z.array(z.string().min(1).max(256)).max(16).optional(),
+  credentialMode: z.enum(['shared', 'named']).optional(),
+  credentialExcludedPaths: z.array(z.string().min(1).max(256)).max(16).optional(),
+  credentialContext: z.object({ identity: identity.optional(), targetIdentity: identity.optional() }).strict().optional(),
   permissionScriptId: scriptId, credentialParseScriptId: scriptId, credentialSaveScriptId: scriptId,
   timeoutMs: z.number().int().min(100).max(20000),
 }).strict();
@@ -51,6 +58,12 @@ export function installToolRoutes(app: Hono, tools: DynamicTools, secrets?: Secr
   const files = () => { if (!secrets.credentialFiles) throw new HttpError(503, '凭据目录尚未初始化'); return secrets.credentialFiles; };
   const path = z.string().min(1).max(256);
   app.get('/api/tools/:name/credentials', async c => c.json(await files().tree(name.parse(c.req.param('name')))));
+  app.post('/api/tools/:name/credentials/initialize', async c => {
+    const body = z.object({ version: z.string().regex(/^[a-f0-9]{64}$/), directories: z.array(path).max(32),
+      files: z.array(z.object({ path, content: z.string().max(1500000), encoding: z.enum(['utf8', 'base64']) }).strict()).max(128),
+    }).strict().parse(await c.req.json());
+    return c.json(await files().initialize(name.parse(c.req.param('name')), body));
+  });
   app.get('/api/tools/:name/credentials/file', async c => c.json(await files().read(name.parse(c.req.param('name')), path.parse(c.req.query('path')))));
   app.put('/api/tools/:name/credentials/file', async c => {
     const body = z.object({ path, content: z.string().max(1500000), encoding: z.enum(['utf8', 'base64', 'parsed']),

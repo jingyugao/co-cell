@@ -21,13 +21,17 @@ test('internal service host reaches tool authorization while preserving grant, o
   } };
   const app = createApp(manager as never, {} as AppConfig, ['cocell.example.test'],
     { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },
-    undefined, undefined, undefined, { token, publicUrl, projects: () => [] }, undefined, secrets as never);
+    undefined, undefined, { token, publicUrl, projects: () => [] }, undefined, secrets as never);
   const authorize = (tool = 'kubectl', headers = {}, boxId = 'box-one') => app.request(`${brokerUrl}/api/tool-runtime/authorize`, {
     method: 'POST', headers: { host: new URL(brokerUrl).host, 'content-type': 'application/json', ...headers },
     body: JSON.stringify({ boxId, tool, args: ['version', '--client'] }),
   });
   const allowed = await authorize();
   assert.equal(allowed.status, 200);
+  for (const path of ['/api/secrets', '/api/connections']) {
+    const retired = await app.request(`${publicUrl}${path}`, { headers: { host: new URL(publicUrl).host, authorization: `Bearer ${token}` } });
+    assert.equal(retired.status, 404, 'retired credential APIs must not remain available');
+  }
   assert.equal((await allowed.json()).path, '.kube/config');
   const denied = await authorize('mysql');
   assert.equal(denied.status, 403);
@@ -48,7 +52,7 @@ test('Cellbox mode protects existing API routes, accepts its HTTPS origin, and d
     listProjects: () => [] };
   const app = createApp(manager as never, { sandbox: { enabled: true } } as AppConfig,
     ['localhost:3000', 'cocell.example.test'], { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },
-    undefined, undefined, undefined, {
+    undefined, undefined, {
       token, publicUrl, projects: () => [],
 
     });
@@ -114,7 +118,7 @@ test('Cellbox service preview requires operator access and isolates sandbox head
   };
   const app = createApp(manager as never, { sandbox: { enabled: true } } as AppConfig,
     ['cocell.example.test'], { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },
-    undefined, undefined, undefined, {
+    undefined, undefined, {
       token, publicUrl, projects: () => [],
 
     });
@@ -151,7 +155,7 @@ test('preview authorization automatically exchanges a one-use host-bound challen
   };
   const app = createApp(manager as never, { sandbox: { enabled: true } } as AppConfig,
     ['cocell.example.test'], { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },
-    undefined, undefined, undefined, { token, publicUrl, previewSubdomains: true,
+    undefined, undefined, { token, publicUrl, previewSubdomains: true,
       projects: () => [{ id: projectId, executionMode: 'sandbox', sandbox: { id: 'box-1' }, status: 'active' }],
 
     });
@@ -250,4 +254,29 @@ test('preview grants cross API instances and discover projects created on anothe
   const cookie = finish.headers.getSetCookie().find(value => value.startsWith('__Host-cocell_preview='))!.split(';')[0];
   assert.equal(isAuthenticatedPreviewRequest(new Headers({ cookie }), host, token), true);
   assert.equal((await appA.request(grant.headers.get('location')!, { headers: { cookie: challenge } })).status, 403);
+});
+
+test('credential initialization is operator-only and returns paths without credential contents', async () => {
+  let calls = 0;
+  const body = { version: 'a'.repeat(64), directories: ['.fixture'],
+    files: [{ path: '.fixture/key', content: 'private-key-fixture', encoding: 'utf8' }] };
+  const secrets = { tools: {}, credentialFiles: { async initialize(name: string, input: unknown) {
+    calls++; assert.equal(name, 'fixture'); assert.deepEqual(input, body);
+    return { created: ['.fixture', '.fixture/key'], skipped: [] };
+  } } };
+  const app = createApp({ dataDirectory: '/tmp/cocell-access-test', listProjects: () => [] } as never,
+    {} as AppConfig, ['cocell.example.test'], { read: async () => ({ enabled: true, fetchedAt: '', sandboxes: [] }) },
+    undefined, undefined, { token, publicUrl, projects: () => [] }, undefined, secrets as never);
+  const path = '/api/tools/fixture/credentials/initialize';
+  const request = (headers = {}, value: unknown = body, base = publicUrl) => app.request(base + path, {
+    method: 'POST', headers: { host: new URL(base).host, 'content-type': 'application/json', ...headers }, body: JSON.stringify(value),
+  });
+  assert.equal((await request()).status, 401);
+  assert.equal((await request({ authorization: `Bearer ${token}`, origin: 'https://foreign.example.test' })).status, 403);
+  assert.equal((await request({ authorization: `Bearer ${token}` }, body, 'http://co-cell.co-cell.svc.cluster.local.:3001')).status, 403);
+  const allowed = await request({ authorization: `Bearer ${token}`, origin: publicUrl });
+  assert.equal(allowed.status, 200);
+  assert.deepEqual(await allowed.json(), { created: ['.fixture', '.fixture/key'], skipped: [] });
+  assert.equal((await request({ authorization: `Bearer ${token}` }, { ...body, overwrite: true })).status, 400);
+  assert.equal(calls, 1);
 });

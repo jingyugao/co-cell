@@ -6,7 +6,6 @@ import type { DefaultImageSelection } from '../../../protocol/image-types.js';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
 import type { Project, Session, Turn } from '../../../protocol/types.js';
 import type { InputRequestRecord } from '../../../protocol/input-request-types.js';
-import type { NativeSecretFiles } from '../../secrets/native-files.js';
 import { MySqlSecretRepository } from '../../secrets/repository.js';
 import { MySqlToolRepository } from '../../tools/repository.js';
 import { MySqlNotificationRepository, saveNotificationsInTransaction } from '../../notifications/repository.js';
@@ -48,12 +47,12 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   readonly secretRepository: MySqlSecretRepository;
   readonly toolRepository: MySqlToolRepository;
   readonly notificationRepository: MySqlNotificationRepository;
-  constructor(url: string, secretFiles?: NativeSecretFiles) {
+  constructor(url: string) {
     this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' });
     this.previewGrants = new MySqlPreviewGrantStore(this.pool);
     this.modelRepository = new MySqlModelRepository(this.pool);
     this.memoryRepository = new MySqlMemoryRepository(this.pool);
-    this.secretRepository = new MySqlSecretRepository(this.pool, secretFiles);
+    this.secretRepository = new MySqlSecretRepository(this.pool);
     this.toolRepository = new MySqlToolRepository(this.pool);
     this.notificationRepository = new MySqlNotificationRepository(this.pool);
   }
@@ -515,6 +514,6 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   private mysqlDate(value: string | null | undefined): string | null { return date(value); }
 }
 
-export function createWebStateStore(mysqlUrl?: string, secretFiles?: NativeSecretFiles) {
-  return new MySqlWebStateStore(requireMySqlUrl(mysqlUrl), secretFiles);
+export function createWebStateStore(mysqlUrl?: string) {
+  return new MySqlWebStateStore(requireMySqlUrl(mysqlUrl));
 }

@@ -6,7 +6,6 @@ const sources = [
   'deploy/box-wrap/tool-client.mjs',
   'deploy/box-wrap/protected-tool.mjs',
   'util/tool-working-directory.mjs',
-  'util/gitlab-tool-host.mjs',
   'util/tool-runtime-identity.mjs',
   'util/dynamic-tool-config.mjs',
 ];

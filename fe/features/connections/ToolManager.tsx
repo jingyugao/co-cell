@@ -11,9 +11,12 @@ import { useDraftStatus } from './DraftGuard';
 import './ToolManager.css';
 
 type Editor = DynamicTool | 'new' | null;
-type Draft = Pick<DynamicToolInput, 'name' | 'enabled' | 'permissionScriptId' | 'credentialParseScriptId' | 'credentialSaveScriptId'>;
+type Draft = Pick<DynamicToolInput, 'name' | 'enabled' | 'permissionScriptId' | 'credentialParseScriptId' | 'credentialSaveScriptId'> & {
+  credentialMode: 'shared' | 'named';
+  credentialPath: string;
+};
 
-const blank: Draft = { name: '', enabled: true, permissionScriptId: '', credentialParseScriptId: '', credentialSaveScriptId: '' };
+const blank: Draft = { name: '', enabled: true, credentialMode: 'shared', credentialPath: '', permissionScriptId: '', credentialParseScriptId: '', credentialSaveScriptId: '' };
 const catalogChanged = () => window.dispatchEvent(new Event('cocell:tool-catalog-changed'));
 
 function readJson<T>(value: string, expected: string): T {
@@ -81,7 +84,7 @@ export default function ToolManager() {
     if (draftGuard && !draftGuard.canLeave(['tool-editor', 'credential-browser'])) return;
     setBrowsing(null);
     setEmbeddedCredentialOpen(Boolean(item));
-    const nextDraft = item ? { name: item.name, enabled: item.enabled, permissionScriptId: item.permissionScriptId ?? '', credentialParseScriptId: item.credentialParseScriptId ?? '', credentialSaveScriptId: item.credentialSaveScriptId ?? '' } : { ...blank };
+    const nextDraft = item ? { name: item.name, enabled: item.enabled, credentialMode: item.credentialMode ?? 'shared', credentialPath: item.credentialPath ?? '', permissionScriptId: item.permissionScriptId ?? '', credentialParseScriptId: item.credentialParseScriptId ?? '', credentialSaveScriptId: item.credentialSaveScriptId ?? '' } : { ...blank };
     const nextArgs = JSON.stringify(item?.args ?? [], null, 2);
     const nextPaths = (item?.credentialPaths ?? []).join('\n');
     editorBaseline.current = JSON.stringify({ draft: nextDraft, argsText: nextArgs, credentialPathsText: nextPaths });
@@ -113,8 +116,18 @@ export default function ToolManager() {
       const credentialPaths = credentialPathsText.split(/\r?\n/).map(path => path.trim()).filter(Boolean);
       if (!editing) return;
       const creating = editing === 'new';
+      const credentialPath = draft.credentialPath.trim();
+      if (draft.credentialMode === 'named') {
+        if (!credentialPath) throw new Error('命名凭据模式需要填写主凭据文件路径');
+        if (!draft.credentialParseScriptId) throw new Error('命名凭据模式需要配置 Load hook');
+        if (!draft.permissionScriptId) throw new Error('命名凭据模式需要配置权限检查脚本');
+      }
+      const savedMode = draft.credentialMode === 'named' || (!creating && editing.credentialMode === 'named')
+        ? { credentialMode: draft.credentialMode } : {};
       const changes: DynamicToolCreateInput = {
         name: draft.name.trim(), enabled: draft.enabled,
+        ...savedMode,
+        ...(credentialPath ? { credentialPath } : {}),
         ...(!creating || args.length ? { args } : {}),
         ...(credentialPaths.length ? { credentialPaths } : {}),
         ...(draft.permissionScriptId ? { permissionScriptId: draft.permissionScriptId } : {}),
@@ -123,8 +136,9 @@ export default function ToolManager() {
       };
       let body: object = changes;
       if (!creating) {
-        const { version, createdAt: _createdAt, updatedAt: _updatedAt, permissionScript: _legacyPermissionScript, ...settings } = editing as DynamicTool;
+        const { version, createdAt: _createdAt, updatedAt: _updatedAt, ...settings } = editing as DynamicTool;
         body = { ...settings, ...changes,
+          credentialPath: credentialPath || null,
           credentialPaths,
           permissionScriptId: draft.permissionScriptId || null,
           credentialParseScriptId: draft.credentialParseScriptId || null,
@@ -167,15 +181,19 @@ export default function ToolManager() {
         <label className="tool-enabled"><input type="checkbox" checked={draft.enabled} onChange={event => setField('enabled', event.target.checked)} />启用</label>
       </div>
       <label>启动参数（JSON 字符串数组）<textarea aria-label="启动参数（JSON 字符串数组）" className="tool-json" rows={3} spellCheck={false} value={argsText} onChange={event => setArgsText(event.target.value)} /></label>
-      <label>权限检查脚本<select aria-label="权限检查脚本" value={draft.permissionScriptId ?? ''} onChange={event => setField('permissionScriptId', event.target.value)}>
+      <label>凭据模式<select aria-label="凭据模式" value={draft.credentialMode} onChange={event => setField('credentialMode', event.target.value as Draft['credentialMode'])}>
+        <option value="shared">共享凭据</option><option value="named">命名凭据</option>
+      </select></label>
+      <label>主凭据文件路径<input aria-label="主凭据文件路径" value={draft.credentialPath} required={draft.credentialMode === 'named'} onChange={event => setField('credentialPath', event.target.value)} placeholder="例如 .ssh/config" /></label>
+      <label>权限检查脚本<select aria-label="权限检查脚本" required={draft.credentialMode === 'named'} value={draft.permissionScriptId ?? ''} onChange={event => setField('permissionScriptId', event.target.value)}>
         <option value="">不使用权限脚本</option>{draft.permissionScriptId && !scripts.some(script => script.id === draft.permissionScriptId) && <option value={draft.permissionScriptId}>已删除的脚本（清除引用）</option>}
         {scripts.map(script => <option key={script.id} value={script.id}>{script.name} · {script.language === 'bash' ? 'Bash' : 'TypeScript'}</option>)}
       </select></label>
-      <p className="tool-permission-help">权限脚本读取 input.args 和 input.permission，返回允许或拒绝结果；项目角色授权始终生效。</p>
+      <p className="tool-permission-help">权限脚本读取 input.args 和 input.permission，返回允许或拒绝结果；项目角色授权始终生效。命名凭据模式还需返回 {'{allow: true, credential: "名称"}'}。</p>
       <details className="tool-credential-settings">
         <summary>凭据配置</summary>
         <label>凭据文件或目录（相对 debug HOME，每行一个）<textarea aria-label="凭据文件或目录" rows={3} spellCheck={false} value={credentialPathsText} onChange={event => setCredentialPathsText(event.target.value)} placeholder="例如 .mylogin.cnf 或 .config/tool" /></label>
-        <label>Load hook<select aria-label="Load hook" value={draft.credentialParseScriptId ?? ''} onChange={event => setField('credentialParseScriptId', event.target.value)}>
+        <label>Load hook<select aria-label="Load hook" required={draft.credentialMode === 'named'} value={draft.credentialParseScriptId ?? ''} onChange={event => setField('credentialParseScriptId', event.target.value)}>
           <option value="">不使用 Load hook</option>{draft.credentialParseScriptId && !scripts.some(script => script.id === draft.credentialParseScriptId) && <option value={draft.credentialParseScriptId}>已删除的脚本（清除引用）</option>}
           {scripts.map(script => <option key={script.id} value={script.id}>{script.name} · {script.language === 'bash' ? 'Bash' : 'TypeScript'}</option>)}
         </select></label>
@@ -183,7 +201,7 @@ export default function ToolManager() {
           <option value="">不使用 Save hook</option>{draft.credentialSaveScriptId && !scripts.some(script => script.id === draft.credentialSaveScriptId) && <option value={draft.credentialSaveScriptId}>已删除的脚本（清除引用）</option>}
           {scripts.map(script => <option key={script.id} value={script.id}>{script.name} · {script.language === 'bash' ? 'Bash' : 'TypeScript'}</option>)}
         </select></label>
-        <p className="tool-permission-help">Load hook 读取 path、content（原文件 Base64）和 files，可返回文本或 {'{content, encoding, names}'}；encoding 可为 utf8、base64 或 parsed（默认 parsed）。</p>
+        <p className="tool-permission-help">Load hook 读取 path、content（原文件 Base64）和 files，可返回文本或 {'{content, encoding, names}'}；encoding 可为 utf8、base64 或 parsed（默认 parsed）。命名凭据模式用 names 提供可授权的名称。</p>
         <p className="tool-permission-help">凭据 hook 还可读取 tool、primaryPath；加密工具可读取 identity 和 targetIdentity。TypeScript 可用 codec.yaml.parse 解析 YAML。</p>
         <p className="tool-permission-help">Save hook 配置后每次保存都会运行，输入 path、编辑后的 content、encoding、original（原文件 Base64）和 files。TypeScript 返回规范文件 Base64；Bash 可将原始字节写到 stdout，或更新临时 HOME 中的暂存文件。</p>
         {editing === 'new' ? <p className="tool-permission-help">保存工具后，可在这里浏览并编辑其凭据文件。</p> : embeddedCredentialOpen && editing && <ToolCredentialBrowser key={`editor-${editing.name}`} tool={editing.name} embedded onClose={() => setEmbeddedCredentialOpen(false)} />}

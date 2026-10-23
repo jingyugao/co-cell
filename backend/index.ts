@@ -30,7 +30,6 @@ import { modelProxyKind } from './execution/model-proxy.js';
 import { createWebStateStore } from './infra/storage/web-state.js';
 import { MySqlCoordinator } from './infra/storage/coordination.js';
 import { SecretCrypto } from './secrets/crypto.js';
-import { NativeSecretFiles } from './secrets/native-files.js';
 import { SecretService } from './secrets/service.js';
 import { DynamicTools } from './tools/service.js';
 import { SharedFiles } from './shared-files/service.js';
@@ -79,7 +78,7 @@ const appServerEnv = {...(apiKey ? {CODEX_API_KEY:apiKey} : {}),
 const sharedDirectory = await loadSharedMountConfig();
 if (!sharedDirectory) throw new Error('CoCell tool wrappers require the shared persistent directory');
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
-const webState = createWebStateStore(mysqlUrl, new NativeSecretFiles(resolve(sharedDataRoot, 'runtime/debug-homes'), secretCrypto));
+const webState = createWebStateStore(mysqlUrl);
 if (sharedDirectory) {
   const publish = async () => {
     await publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
@@ -95,7 +94,7 @@ await cellboxProvider.initialize();
 let manager: SessionManager;
 let closeNativeSandboxConnections = async (_id: string): Promise<void> => {};
 const tools = new DynamicTools(webState.toolRepository, sharedDataRoot, coordinator);
-const secrets = new SecretService(webState.secretRepository, secretCrypto, tools);
+const secrets = new SecretService(webState.secretRepository, tools);
 if (sharedDirectory) await secrets.mountHomes(sharedDataRoot);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
   error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); }, multiApi ? 0 : undefined);
@@ -201,7 +200,7 @@ const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
-  inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), undefined, notifications,
+  inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), notifications,
   { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);

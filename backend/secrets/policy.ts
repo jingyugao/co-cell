@@ -1,5 +1,4 @@
 import { posix } from 'node:path';
-import { getTool } from '../tool-access/index.js';
 import type { ProxyTool } from '../../protocol/secret-types.js';
 import { HttpError } from '../../util/errors.js';
 import { TOOL_NAME_PATTERN } from '../../util/tool-secrets.js';
@@ -18,5 +17,5 @@ export function validateToolArgs(tool: ProxyTool, args: string[]): string[] {
   toolName(tool);
   if (args.length > 32 || args.some(arg => arg.includes('\0')) || args.reduce((n, arg) => n + Buffer.byteLength(arg), 0) > 8192)
     throw new HttpError(400, '工具参数超出限制');
-  return getTool(tool).validateArgs(args);
+  return [...args];
 }

@@ -62,17 +62,14 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
   ownedProjectIds.add(created.id);
   const project = await env.waitProject(created.id, { kind: 'create', status: 'ready' });
   ownedBoxIds.add(project.sandbox.id);
-  const credentialId = process.env.COCELL_E2E_TOOL_HOME_SECRET_ID;
-  const secrets = await env.json('/api/secrets');
-  const candidates = secrets.filter(secret => secret.tool === 'kubectl' && secret.enabled && secret.format === 'text');
-  const credential = credentialId ? candidates.find(secret => secret.id === credentialId) : candidates.length === 1 ? candidates[0] : undefined;
-  assert(credential?.path, 'Configure one enabled kubectl file, or select it with COCELL_E2E_TOOL_HOME_SECRET_ID');
-  const mysqlId = process.env.COCELL_E2E_TOOL_HOME_MYSQL_SECRET_ID;
-  const mysqlCandidates = secrets.filter(secret => secret.tool === 'mysql' && secret.enabled && secret.format === 'text');
-  const mysqlCredential = mysqlId ? mysqlCandidates.find(secret => secret.id === mysqlId) : mysqlCandidates.length === 1 ? mysqlCandidates[0] : undefined;
-  assert(mysqlCredential?.path, 'Configure one enabled MySQL file, or select it with COCELL_E2E_TOOL_HOME_MYSQL_SECRET_ID');
+  const [definitions, toolCatalog] = await Promise.all([env.json('/api/tool-definitions'), env.json('/api/tools')]);
+  const kubeDefinition = definitions.find(tool => tool.name === 'kubectl' && tool.enabled);
+  const credential = toolCatalog.find(tool => tool.name === 'kubectl' && tool.kind === 'tool-with-credential');
+  const mysqlCredential = toolCatalog.find(tool => tool.name === 'mysql' && tool.kind === 'tool-with-credential');
+  assert(kubeDefinition?.credentialPath && credential?.credentials.length, 'Configure a named kubectl tool with native contexts');
+  assert(mysqlCredential?.credentials.length, 'Configure a named MySQL tool with native login paths');
   const role = await env.json('/api/tool-roles', { method: 'POST', expectedStatus: 201, body: { name: env.name('native-home-role'), permissions: [
-    { tool: 'kubectl', enabled: true, credentials: credential.nativeNames }, { tool: 'mysql', enabled: true, credentials: mysqlCredential.nativeNames },
+    { tool: 'kubectl', enabled: true, credentials: credential.credentials }, { tool: 'mysql', enabled: true, credentials: mysqlCredential.credentials },
   ] } });
   ownedRoleId = role.id;
   await env.json(`/api/projects/${project.id}/tool-role`, { method: 'PUT', body: { roleId: role.id } });
@@ -87,14 +84,14 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
   };
   const findPod = async boxId => (await findWorkload(boxId)).status.podName;
   const guest = async (targetPod, code) => JSON.parse(await kubectl(['exec', targetPod, '--', '/usr/local/bin/node', '-e', code]));
-  const cli = (args, targetPod = pod) => guest(targetPod, `const {spawnSync}=require('node:child_process');const r=spawnSync('/usr/local/bin/kubectl',${JSON.stringify(args)},{uid:11000,gid:11000,cwd:'/home/agent/workspace',env:{HOME:'/home/agent',PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:25000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.message}));`);
+  const cli = (args, targetPod = pod) => guest(targetPod, `const {spawnSync}=require('node:child_process');const r=spawnSync('/usr/local/bin/cocell',${JSON.stringify(['kubectl', ...args])},{uid:11000,gid:11000,cwd:'/home/agent/workspace',env:{HOME:'/home/agent',PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:25000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.message}));`);
   const home = '/home/debug';
-  const kubectlPath = '.kube/config';
-  assert(credential.nativeNames?.length && mysqlCredential.nativeNames?.length, 'Native context/profile metadata is required');
-  const kubeContext = process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? credential.nativeNames[0], mysqlProfile = mysqlCredential.nativeNames[0];
+  const kubectlPath = kubeDefinition.credentialPath;
+  assert(credential.credentials?.length && mysqlCredential.credentials?.length, 'Native context/profile metadata is required');
+  const kubeContext = process.env.COCELL_E2E_TOOL_KUBE_CONTEXT ?? credential.credentials[0], mysqlProfile = process.env.COCELL_E2E_TOOL_MYSQL_PROFILE ?? mysqlCredential.credentials[0];
   const fileState = (targetPod = pod) => guest(targetPod, `const fs=require('node:fs'),crypto=require('node:crypto');const p=${JSON.stringify(home + '/' + kubectlPath)};console.log(JSON.stringify(fs.existsSync(p)?{exists:true,sha256:crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')}:{exists:false}));`);
   const fileHash = (targetPod, path) => guest(targetPod, `const fs=require('node:fs'),crypto=require('node:crypto');const p=${JSON.stringify(path)};console.log(JSON.stringify(fs.existsSync(p)?{exists:true,sha256:crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')}:{exists:false}));`);
-  const nativeKubectl = (targetPod, args) => guest(targetPod, `const {spawnSync}=require('node:child_process');const r=spawnSync('/opt/cellbox/debug-bin/kubectl',${JSON.stringify(args)},{cwd:'/home/agent/workspace',env:{HOME:'/home/debug',KUBECONFIG:${JSON.stringify(ownedTemporaryHomeFile)},PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:25000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.message}));`);
+  const nativeKubectl = (targetPod, args) => guest(targetPod, `const fs=require('node:fs'),{spawnSync}=require('node:child_process');const native=['/opt/cellbox/debug-bin/kubectl','/usr/local/bin/kubectl','/usr/bin/kubectl'].find(path=>fs.existsSync(path));const r=spawnSync(native,${JSON.stringify(args)},{cwd:'/home/agent/workspace',env:{HOME:'/home/debug',KUBECONFIG:${JSON.stringify(ownedTemporaryHomeFile)},PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:25000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.message}));`);
   const dialog = page.getByRole('dialog', { name: `${env.name('native-home')} 工具权限`, exact: true });
   const catalog = await env.json('/api/tool-roles');
   const defaultRole = catalog.roles.find(item => item.id === catalog.defaultRoleId);
@@ -242,7 +239,7 @@ test('native tool HOME: deployed permission UI, revocation, checkpoint continuit
     assert.equal(resources.status, 0, resources.stderr);
     assert.match(resources.stdout, /^pod\//m);
     const args = [`--login-path=${mysqlProfile}`, '-e', 'SELECT 1'];
-    const mysql = await guest(pod, `const {spawnSync}=require('node:child_process');const r=spawnSync('/usr/local/bin/mysql',${JSON.stringify(args)},{uid:11000,gid:11000,cwd:'/home/agent/workspace',env:{HOME:'/home/agent',PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:20000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.code}));`);
+    const mysql = await guest(pod, `const {spawnSync}=require('node:child_process');const r=spawnSync('/usr/local/bin/cocell',${JSON.stringify(['mysql', ...args])},{uid:11000,gid:11000,cwd:'/home/agent/workspace',env:{HOME:'/home/agent',PATH:'/usr/local/bin:/usr/bin:/bin'},encoding:'utf8',timeout:20000});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error?.code}));`);
     assert.equal(mysql.status, 0, mysql.stderr || mysql.error);
     assert.equal(mysql.stdout.trim().split('\n').at(-1), '1');
     return { sandboxId: ready.sandbox.id, pod, credentialPreserved: true, kubectl: 'passed', mysql: 'passed' };

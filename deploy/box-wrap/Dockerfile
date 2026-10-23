@@ -14,26 +14,12 @@ RUN --network=none --mount=type=bind,source=deploy/box-wrap/artifacts,target=/op
     node /opt/product/cocell/deploy/scripts/cellbox/runtime-artifacts.mjs /opt/cocell-artifacts \
     && sh /opt/product/cocell/deploy/scripts/cellbox/install-offline-runtime.sh
 
-# Preserve configured user CLIs before their proxy wrappers take those names.
-ARG COCELL_PROXY_TOOLS=""
-COPY deploy/box-wrap/proxy-tools.json /opt/product/cocell/
+# Keep native CLI binaries intact. Dynamic tools enter through one dispatcher.
 RUN mkdir -p /opt/cellbox/debug-bin \
-  && proxy_ids='cocell_tool' \
-  && for tool in ${COCELL_PROXY_TOOLS:-$(node -p 'JSON.parse(require("fs").readFileSync("/opt/product/cocell/proxy-tools.json")).join(" ")')}; do \
-       binary="$(command -v "$tool" || true)"; \
-       if test -z "$binary"; then continue; fi; \
-       if test -x "/opt/cellbox/debug-bin/$tool"; then :; \
-       elif test -L "$binary"; then ln -s "$(readlink -f "$binary")" "/opt/cellbox/debug-bin/$tool"; \
-       else cp -L "$binary" "/opt/cellbox/debug-bin/$tool"; fi; \
-       tool_id="cocell_$(echo "$tool" | tr '-' '_')"; \
-       rm -f "/usr/local/bin/$tool"; \
-       printf '#!/bin/sh\nexec /usr/local/bin/node /opt/product/cocell/tool-client.mjs %s "$@"\n' "$tool_id" > "/usr/local/bin/$tool"; \
-       chmod 0755 "/usr/local/bin/$tool"; \
-       proxy_ids="$proxy_ids $tool_id"; \
-     done \
   && printf '#!/bin/sh\nexec /usr/local/bin/node /opt/product/cocell/tool-client.mjs --dynamic "$@"\n' > /usr/local/bin/cocell \
   && chmod 0755 /usr/local/bin/cocell \
-  && node -e 'require("fs").writeFileSync("/opt/product/cocell/proxy-tool-ids.json",JSON.stringify(process.argv.slice(1)))' $proxy_ids
+  && node -e 'require("fs").writeFileSync("/opt/product/cocell/proxy-tool-ids.json",JSON.stringify(["cocell_tool"]))'
+COPY --chmod=0644 deploy/box-wrap/tool-path.sh /etc/profile.d/cocell-tools.sh
 COPY --chmod=0755 deploy/box-wrap/launcher.mjs deploy/box-wrap/oss-archive-restore.mjs /opt/product/cocell/
 # Node resolves each entry to its immutable shared version before importing dependencies.
 RUN ln -sfn /var/lib/cellbox/shared/tool-wrap/current/deploy/box-wrap/protected-tool.mjs /opt/product/cocell/protected-tool.mjs \

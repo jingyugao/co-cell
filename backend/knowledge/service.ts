@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { KnowledgePage, KnowledgeSettings, KnowledgeSettingsInput, KnowledgeView } from '../../protocol/knowledge-types.js';
+import type { KnowledgeCategory, KnowledgePage, KnowledgeSettings, KnowledgeSettingsInput, KnowledgeView } from '../../protocol/knowledge-types.js';
 import { MemoryCoordinator, type SharedCoordinator } from '../infra/storage/coordination.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import type { MemoryRepository, StoredMemory } from '../memory/repository.js';
@@ -70,7 +70,7 @@ export class KnowledgeService {
           return { ...empty, status: model.last_refresh_failed_at ? 'failed' : model.last_refreshed_at ? 'ready' : 'pending',
             body: model.last_refreshed_at ? model.content ?? '' : '', updatedAt: model.last_refreshed_at ?? undefined,
             isStale: Boolean(model.is_stale), sourceCount: Object.values(model.reflect_response?.based_on ?? {}).reduce((sum, items) => sum + items.length, 0),
-            ...(model.last_refresh_failed_at ? { error: 'Hindsight 页面生成失败，请检查服务状态后重新保存提示词' } : {}) } as KnowledgePage;
+            ...(model.last_refresh_failed_at ? { error: 'Hindsight 页面生成失败，请检查服务状态后点击“重新生成”' } : {}) } as KnowledgePage;
         } catch (error) { return { ...empty, status: 'failed' as const, error: errorText(error) }; }
       }));
     } catch (error) { view.error = errorText(error); }
@@ -80,6 +80,31 @@ export class KnowledgeService {
   async retry(id: string, updatedAt: string) {
     const result = await this.coordinator.tryRun('knowledge:worker', () => this.retryJob(id, updatedAt));
     if (!result) throw new HttpError(409, '同步任务正在处理，请稍后刷新重试');
+  }
+
+  async refreshPage(category: KnowledgeCategory) {
+    const client = this.deps.client;
+    if (!client) throw new HttpError(400, '请先在服务端配置 HINDSIGHT_API_URL');
+    const lease = await this.coordinator.tryAcquire('knowledge:worker');
+    if (!lease) throw new HttpError(409, '知识整理任务正在处理，请稍后重试');
+    const signal = AbortSignal.any([this.controller.signal, lease.signal]);
+    try {
+      const tree = await client.request<{ roots: KnowledgeNode[] }>('knowledge-base/tree', { signal });
+      const name = categories.find(item => item.key === category)!.name;
+      const modelId = tree.roots.find(node => node.kind === 'page' && node.name === name)?.mental_model_id;
+      if (!modelId) throw new HttpError(409, '知识页尚未创建，请启用自动同步并等待初始化');
+      // Recover a submitted refresh after a lost response before scheduling another.
+      for (const status of ['pending', 'processing']) {
+        for (let offset = 0; ; offset += 100) {
+          const { operations } = await client.request<{ operations: Array<{ mental_model_id?: string }> }>(
+            `operations?type=refresh_mental_model&status=${status}&limit=100&offset=${offset}`, { signal });
+          if (operations.some(operation => operation.mental_model_id === modelId)) return;
+          if (operations.length < 100) break;
+        }
+      }
+      signal.throwIfAborted(); lease.assertHeld();
+      await client.request(`mental-models/${encodeURIComponent(modelId)}/refresh`, { method: 'POST', signal });
+    } finally { await lease.release(); }
   }
 
   private async retryJob(id: string, updatedAt: string) {

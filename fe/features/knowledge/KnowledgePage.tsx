@@ -29,6 +29,7 @@ export default function KnowledgePage({ onMenu, onBack, onDirtyChange }: {
   const [selected, setSelected] = useState<KnowledgeCategory>('business');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [refreshingPage, setRefreshingPage] = useState(false);
   const [retrying, setRetrying] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -109,6 +110,17 @@ export default function KnowledgePage({ onMenu, onBack, onDirtyChange }: {
     finally { setRetrying(null); }
   }
 
+  async function regeneratePage() {
+    if (!view?.configured || !selectedPage || dirty || saving || refreshingPage) return;
+    setRefreshingPage(true); setError(''); setNotice('');
+    try {
+      await api<{ ok: true }>(`/api/knowledge/pages/${encodeURIComponent(selected)}/refresh`, { method: 'POST' });
+      setNotice(`已提交“${promptLabel[selected]}”知识页重新生成。`);
+      await refresh(false);
+    } catch (cause) { const message = errorMessage(cause); await refresh(false); setError(message); }
+    finally { setRefreshingPage(false); }
+  }
+
   return <main className="main-pane knowledge-page">
     <header className="topbar">
       <button className="icon-button mobile-only" aria-label="打开导航" onClick={onMenu}><Icon name="menu" /></button>
@@ -148,10 +160,11 @@ export default function KnowledgePage({ onMenu, onBack, onDirtyChange }: {
           </div>
           <article className="knowledge-document">
             {selectedPage ? <>
-              <header><div><span>{promptLabel[selected]}</span><h3>{selectedPage.name || promptLabel[selected]}</h3></div><div className="knowledge-document-meta"><span>{selectedPage.sourceCount} 份来源</span><span>{dateLabel(selectedPage.updatedAt)}</span><span className={`knowledge-page-status status-${selectedPage.status}`}>{pageStatus[selectedPage.status]}</span></div></header>
+              <header><div><span>{promptLabel[selected]}</span><h3>{selectedPage.name || promptLabel[selected]}</h3></div><div className="knowledge-document-actions"><div className="knowledge-document-meta"><span>{selectedPage.sourceCount} 份来源</span><span>{dateLabel(selectedPage.updatedAt)}</span><span className={`knowledge-page-status status-${selectedPage.status}`}>{pageStatus[selectedPage.status]}</span></div><button className="secondary-button" onClick={() => void regeneratePage()} disabled={!view.configured || !selectedPage || dirty || saving || refreshingPage} title={dirty ? '请先保存提示词修改' : !view.configured ? '请先配置 Hindsight' : undefined}>{refreshingPage ? '正在提交…' : '重新生成'}</button></div></header>
+              {dirty && <div className="knowledge-stale" role="status">请先保存提示词修改，再重新生成知识页。</div>}
               {selectedPage.isStale && <div className="knowledge-stale" role="status">新材料尚未合并到本页，稍后会继续更新。</div>}
               {selectedPage.error && <div className="knowledge-error" role="alert">{selectedPage.error}</div>}
-              {selectedPage.status === 'ready' && selectedPage.body ? <Markdown text={selectedPage.body} /> : <div className="knowledge-state">{selectedPage.status === 'failed' ? '知识页生成失败，请查看错误信息。' : '还没有生成内容；同步对话材料后会自动生成。'}</div>}
+              {selectedPage.status === 'ready' && selectedPage.body ? <Markdown text={selectedPage.body} /> : <div className="knowledge-state">{selectedPage.status === 'failed' ? '知识页生成失败，请点击“重新生成”重试。' : '还没有生成内容；同步对话材料后会自动生成。'}</div>}
             </> : <div className="knowledge-state">暂无此类别的知识页。</div>}
           </article>
         </section>

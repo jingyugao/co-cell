@@ -20,4 +20,8 @@ export function installKnowledgeRoutes(app: Hono, service?: KnowledgeService) {
     await knowledge().retry(z.string().uuid().parse(c.req.param('id')), updatedAt);
     return c.json({ ok: true }, 202);
   });
+  app.post('/api/knowledge/pages/:category/refresh', async c => {
+    await knowledge().refreshPage(z.enum(['business', 'repositories', 'components', 'workflows']).parse(c.req.param('category')));
+    return c.json({ ok: true }, 202);
+  });
 }

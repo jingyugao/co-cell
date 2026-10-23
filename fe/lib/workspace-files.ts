@@ -3,6 +3,14 @@ import { fileContentUrl } from './resource-links';
 
 const MAX_PREVIEW_BYTES = 1024 * 1024;
 
+function sourceMetadata(response: Response): Pick<WorkspaceFilePreview, 'source' | 'backupCreatedAt'> {
+  const source = response.headers.get('X-CoCell-File-Source');
+  return {
+    ...(source === 'live' || source === 'volume' || source === 'backup' ? { source } : {}),
+    ...(response.headers.get('X-CoCell-Backup-Created-At') ? { backupCreatedAt: response.headers.get('X-CoCell-Backup-Created-At')! } : {}),
+  };
+}
+
 async function check(response: Response) {
   if (response.ok) return;
   const body = await response.json().catch(() => ({}));
@@ -16,13 +24,14 @@ export async function loadWorkspaceFile(projectId: string, path: string, signal:
   await check(head);
   const mimeType = head.headers.get('content-type') ?? 'application/octet-stream';
   const file: WorkspaceFilePreview = { path, name: path.split('/').pop() || 'download',
-    size: Number(head.headers.get('content-length') ?? 0), mimeType, kind: 'binary' };
+    size: Number(head.headers.get('content-length') ?? 0), mimeType, kind: 'binary', ...sourceMetadata(head) };
   if (/^image\/(?:png|jpeg|gif|webp)(?:;|$)/i.test(mimeType)) { file.kind = 'image'; return file; }
   if (!mimeType.startsWith('text/')) return file;
   // Empty files have no satisfiable byte range.
   const response = await fetch(url, { signal, cache: 'no-cache',
     headers: file.size === 0 ? {} : { Range: `bytes=0-${MAX_PREVIEW_BYTES - 1}` } });
   await check(response);
+  Object.assign(file, sourceMetadata(response));
   const total = response.headers.get('content-range')?.match(/\/(\d+)$/)?.[1];
   if (total) file.size = Number(total);
   else if (response.headers.has('content-length')) file.size = Number(response.headers.get('content-length'));

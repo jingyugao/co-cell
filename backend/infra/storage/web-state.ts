@@ -1,6 +1,7 @@
 import { MySqlPreviewGrantStore } from '../../access/preview-grants.js';
 import { MySqlModelRepository } from '../../models/repository.js';
 import { MySqlMemoryRepository } from '../../memory/repository.js';
+import { MySqlFileFavoriteRepository } from '../../file-favorites/repository.js';
 import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
 import type { DefaultImageSelection } from '../../../protocol/image-types.js';
 import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
@@ -44,6 +45,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   readonly previewGrants: MySqlPreviewGrantStore;
   readonly modelRepository: MySqlModelRepository;
   readonly memoryRepository: MySqlMemoryRepository;
+  readonly fileFavoriteRepository: MySqlFileFavoriteRepository;
   readonly secretRepository: MySqlSecretRepository;
   readonly toolRepository: MySqlToolRepository;
   readonly notificationRepository: MySqlNotificationRepository;
@@ -52,6 +54,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     this.previewGrants = new MySqlPreviewGrantStore(this.pool);
     this.modelRepository = new MySqlModelRepository(this.pool);
     this.memoryRepository = new MySqlMemoryRepository(this.pool);
+    this.fileFavoriteRepository = new MySqlFileFavoriteRepository(this.pool);
     this.secretRepository = new MySqlSecretRepository(this.pool);
     this.toolRepository = new MySqlToolRepository(this.pool);
     this.notificationRepository = new MySqlNotificationRepository(this.pool);

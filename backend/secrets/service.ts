@@ -186,7 +186,7 @@ export class SecretService {
     credentialPath(secret.path);
     if (secret.format === 'lark') this.lark(secret);
     if (secret.format === 'home') {
-      if (nativeContextTool(secret.tool!)) throw new HttpError(400, 'MySQL 和 Kubernetes 请继续使用原生连接配置');
+      if (nativeContextTool(secret.tool!)) throw new HttpError(400, '此工具请使用原生连接配置');
     }
     this.profiles(secret);
   }

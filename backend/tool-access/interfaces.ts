@@ -11,11 +11,12 @@ export interface Tool {
   validateArgs(args: readonly string[]): string[];
 }
 
-/** MySQL/kubectl also understand the native credential selected by a call. */
+/** Tools that understand the native credential selected by a call. */
 export interface ToolWithCredential extends Tool {
   readonly kind: 'tool-with-credential';
   readonly configPath: string;
-  readonly credentialOption: string;
+  /** Absent when the native selector is positional, as in ssh HOST. */
+  readonly credentialOption?: string;
   listCredentials(sources: readonly CredentialSource[], mountedConfig?: Buffer): CredentialCatalog;
   /** Resolve only the command's selector; native files are not an authorization source. */
   resolveCredential(args: readonly string[]): string | undefined;

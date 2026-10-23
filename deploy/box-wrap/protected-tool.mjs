@@ -118,7 +118,7 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   if (options.dynamic && setup.execution === undefined) throw new Error('Dynamic tool is no longer configured');
   if (setup.tool !== tool || setup.home !== '/home/debug' ||
       (setup.path !== undefined && !safePath(setup.path)) ||
-      (['mysql', 'kubectl'].includes(tool) && !safePath(setup.path)) ||
+      (['mysql', 'kubectl', 'ssh'].includes(tool) && !safePath(setup.path)) ||
       !Array.isArray(setup.args) || setup.args.length > 32 ||
       setup.args.some(arg => typeof arg !== 'string' || arg.includes('\0')))
     throw new Error('Invalid tool authorization');
@@ -139,6 +139,13 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   const executionEnv = dynamicExecution ? { ...env, ...dynamicExecution.env } : env;
   const executable = dynamicExecution?.executable ?? join(options.binaryRoot ?? '/opt/cellbox/debug-bin', tool);
   const executionArgs = dynamicExecution ? [...dynamicExecution.args, ...args] : args;
+  if (tool === 'ssh') {
+    // OpenSSH resolves its default HOME via getpwuid(), ignoring env.HOME.
+    // Pin config and host trust to the mounted HOME even in root debug execs.
+    executionArgs.unshift('-F', credential, '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'IdentityFile=none',
+      '-o', 'IdentityAgent=none', '-o', `UserKnownHostsFile=${join(home, '.ssh/known_hosts')}`,
+      '-o', 'StrictHostKeyChecking=yes');
+  }
   const result = await execute(executable, executionArgs, executionEnv, options.cwd ?? process.cwd(), dynamicExecution?.timeoutMs ?? 20000);
   await restoreCredentialOwnership(home, setup.credentialPaths);
   (options.stdout ?? process.stdout).write(result.stdout);

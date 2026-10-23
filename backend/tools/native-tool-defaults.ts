@@ -24,6 +24,12 @@ const definition = (name: string, path: string, roots: string[], env: Record<str
   ...(scripts.permission ? { permissionScriptId: scripts.permission.id } : {}),
 });
 export const additionalToolDefaults = [
+  {
+    ...definition('ssh', '.ssh/config', ['.ssh']),
+    executable: '/usr/bin/ssh',
+    description: 'SSH 原生 Host 别名与多私钥连接',
+    instructions: 'ssh <Host别名> [远程命令]；使用项目角色授权的 .ssh/config Host 别名。每个 Host 可配置不同的 HostName、User、Port 和 IdentityFile。IdentityFile 使用 /home/debug/.ssh/ 下的绝对路径；不要使用 ~ 或相对路径。凭据目录为 /home/debug/.ssh，私钥权限为 0600。预先在 known_hosts 中添加可信主机密钥。仅支持非交互式密钥认证；连接选项在配置文件中设置。可使用 -v、-vv、-vvv、-q、-T、-n、-G，以及 ssh -V。',
+  },
   definition('git', '.gitconfig', ['.gitconfig', '.git-credentials'], { GIT_CONFIG_GLOBAL: '${CREDENTIAL}' }),
   definition('glab', '.config/glab-cli/config.yml', ['.config/glab-cli']),
   definition('kubectl', '.kube/config', ['.kube/config'], { KUBECONFIG: '${CREDENTIAL}' }, { permission: kubePermission }),

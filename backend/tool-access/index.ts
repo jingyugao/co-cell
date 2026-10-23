@@ -4,9 +4,10 @@ import type { CredentialSource, Tool, ToolWithCredential } from './interfaces.js
 import { BasicTool } from './implementations/tool.js';
 import { MysqlTool } from './implementations/mysql.js';
 import { KubectlTool } from './implementations/kubectl.js';
+import { SshTool } from './implementations/ssh.js';
 
 export type { Tool, ToolWithCredential, CredentialCatalog, CredentialSource } from './interfaces.js';
-const implementations: Tool[] = [new MysqlTool(), new KubectlTool(),
+const implementations: Tool[] = [new MysqlTool(), new KubectlTool(), new SshTool(),
   ...['git', 'glab', 'meegle', 'lark-cli'].map(name => new BasicTool(name))];
 const tools = new Map(implementations.map(tool => [tool.name, tool]));
 
@@ -26,6 +27,7 @@ export function authorizeCredential(tool: ToolWithCredential, permission: ToolPe
   const name = tool.resolveCredential(args);
   if (name === undefined) return [...args];
   if (!Array.isArray(permission.credentials) || !permission.credentials.includes(name)) throw new HttpError(403, `项目未授权 ${tool.name} 凭据：${name}`);
+  if (!tool.credentialOption) return [...args];
   // Pass the explicitly authorized name to the native CLI unchanged in meaning.
   const checked: string[] = [];
   for (let i = 0; i < args.length; i++) {

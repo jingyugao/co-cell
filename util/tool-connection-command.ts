@@ -6,5 +6,6 @@ function shellQuote(value: string): string {
 export function toolConnectionCommand(tool: string, nativeName: string): string {
   if (tool === 'mysql') return `mysql --login-path=${shellQuote(nativeName)}`;
   if (tool === 'kubectl') return `kubectl --context=${shellQuote(nativeName)}`;
+  if (tool === 'ssh') return `ssh ${shellQuote(nativeName)}`;
   return tool;
 }

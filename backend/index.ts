@@ -2,6 +2,7 @@ import { createPreviewProxy } from './projects/preview-proxy.js';
 import { readSystemRequirementInfo } from './projects/requirements.js';
 import { SystemTools } from './execution/system-tools.js';
 import { ModelService } from './models/service.js';
+import { MemoryService } from './memory/service.js';
 import { DirectModelProvider } from './models/direct-provider.js';
 import { initializeTracing } from './infra/diagnostics/tracing.js';
 import { ImageCatalog } from './images/service.js';
@@ -158,11 +159,14 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   }, notifications, coordinator);
 manager.setModelService(models);
+const memory = new MemoryService({ repository: webState.memoryRepository, state: webState,
+  client: cellboxProvider.client, directory: resolve(sharedDataRoot, 'runtime/memory'), coordinator, logger: runtimeLog });
 // Project tables must exist before the Secret schema's foreign keys are created.
-const initializeSchemas = async () => { await webState.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); };
+const initializeSchemas = async () => { await webState.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); };
 if (coordinator) await coordinator.run('cocell-schema-init', initializeSchemas);
 else await initializeSchemas();
 await manager.init();
+memory.start();
 // Paused instances are configured on resume. Running instances survive a web
 // service restart; compare their durable acknowledgements before writing slots.
 const reconcileProjects = async () => {
@@ -198,7 +202,7 @@ const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
   inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), undefined, notifications,
-  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models);
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }
@@ -249,7 +253,7 @@ let shuttingDown = false;
 // Periodic sandbox archive for active projects — every 30 minutes
 const archiveInterval = setInterval(() => { void manager.scheduledArchive().catch(() => {}); }, 60 * 1000);
 archiveInterval.unref();
-async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await nativeRelay.close(); await previewProxy?.close(); await manager.close(); await cellboxRuntime.close();
+async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await nativeRelay.close(); await previewProxy?.close(); await memory.close(); await manager.close(); await cellboxRuntime.close();
   clearInterval(archiveInterval);
   await coordinator?.close();
   await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); await shutdownTracing?.(); }

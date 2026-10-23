@@ -1,8 +1,15 @@
 import { injectTraceHeaders, traced } from '../../tracing.js';
 import { SpanKind } from '@opentelemetry/api';
+import { createWriteStream } from 'node:fs';
+import { mkdir, rename, rm } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { dirname } from 'node:path';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 const cellboxVolumeIdPattern = /^[a-z0-9]([-a-z0-9]{0,53}[a-z0-9])?$/;
 const cellboxBackupIdPattern = /^[0-9a-f]{64}$/;
+const cellboxExportIdPattern = /^exp-[0-9a-f]{32}$/;
 /** The internal Cellbox REST contract. Calls require no Cellbox credential. */
 export interface CellboxCapabilities {
   exec: boolean; files: boolean; http: boolean; websocket: boolean;
@@ -54,6 +61,10 @@ export interface CellboxBackupPolicy {
 export interface CellboxVolumeBackup {
   id: string; createdAt: string; volumeId: string; ownerKey: string; profileId: string;
   sizeBytes?: number; addedBytes?: number;
+}
+export interface CellboxVolumeExport {
+  id: string; volumeId: string; path: string; format: 'tar.gz'; sizeBytes: number; sha256: string;
+  createdAt: string; expiresAt: string;
 }
 export interface CellboxBox {
   mounts?: CellboxMount[];
@@ -155,7 +166,7 @@ export class CellboxClient {
       || endpoint === '/v1/volumes' || endpoint === '/v1/volumes:restore'
       || /^\/v1\/boxes\/[^/]+:(?:suspend|resume|destroy|activate)$/.test(endpoint)
       || /^\/v1\/boxes\/[^/]+\/execs$/.test(endpoint)
-      || /^\/v1\/volumes\/[^/]+\/backups$/.test(endpoint))
+      || /^\/v1\/volumes\/[^/]+\/(?:backups|exports)$/.test(endpoint))
       || method === 'DELETE' && /^\/v1\/volumes\/[^/]+$/.test(endpoint);
     if (!coreMutation) return this.requestImpl<T>(method, path, options);
     return traced('cellbox.http.client', { 'http.request.method': method, 'url.path': path.split('?')[0],
@@ -282,6 +293,71 @@ export class CellboxClient {
     if (!cellboxBackupIdPattern.test(backupId))
       throw new CellboxError('INVALID_REQUEST', 'A full 64-character backup ID is required');
     return this.request<CellboxVolumeBackup>('GET', `/v1/volumes/${this.id(volumeId)}/backups/${this.id(backupId)}`, { signal });
+  }
+  createVolumeExport(volumeId: string, path: string, signal?: AbortSignal) {
+    const segments = typeof path === 'string' ? path.split('/') : [];
+    if (!cellboxVolumeIdPattern.test(volumeId) || typeof path !== 'string' || Buffer.byteLength(path, 'utf8') > 4096 ||
+      path.startsWith('/') || path.includes('\\') || (path !== '.' && path !== '' && segments.some(segment => !segment || segment === '.' || segment === '..')) ||
+      segments.length > 64 || /[\u0000-\u001f\u007f]/.test(path))
+      throw new CellboxError('INVALID_REQUEST', 'A valid volume ID and clean volume-relative export path are required');
+    return this.request<CellboxOperation>('POST', `/v1/volumes/${this.id(volumeId)}/exports`, { body: { path: path || '.' }, signal });
+  }
+  getVolumeExport(volumeId: string, exportId: string, signal?: AbortSignal) {
+    this.validateVolumeExportId(volumeId, exportId);
+    return this.request<CellboxVolumeExport>('GET', `/v1/volumes/${this.id(volumeId)}/exports/${this.id(exportId)}`, { signal });
+  }
+  async downloadVolumeExport(volumeId: string, exportId: string, destination: string,
+    expected: { sizeBytes: number; sha256: string }, signal?: AbortSignal): Promise<void> {
+    this.validateVolumeExportId(volumeId, exportId);
+    if (!Number.isSafeInteger(expected.sizeBytes) || expected.sizeBytes < 0 || !/^[0-9a-f]{64}$/.test(expected.sha256))
+      throw new CellboxError('INVALID_REQUEST', 'Expected export size and SHA-256 are invalid');
+    if (signal?.aborted) throw new CellboxError('TRANSPORT', 'Cellbox export download was cancelled before submission');
+    const outgoing = this.clientHeaders();
+    injectTraceHeaders(outgoing);
+    const headers = new Headers({ ...outgoing, 'Accept-Encoding': 'identity' });
+    const requestTimeout = AbortSignal.timeout(15 * 60_000);
+    const requestSignal = signal ? AbortSignal.any([signal, requestTimeout]) : requestTimeout;
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}/v1/volumes/${this.id(volumeId)}/exports/${this.id(exportId)}/content`,
+        { method: 'GET', headers, signal: requestSignal, redirect: 'error' });
+    } catch (cause) { throw new CellboxError('TRANSPORT', 'Cellbox export download failed', undefined, { cause }); }
+    if (!response.ok) {
+      let error: { code?: string; message?: string } | undefined;
+      try { error = (JSON.parse(Buffer.from(await this.readBounded(response, 1024 * 1024)).toString()) as { error?: { code?: string; message?: string } }).error; }
+      catch { /* Preserve HTTP status. */ }
+      throw new CellboxError(error?.code ?? statusCode(response.status), error?.message ?? `Cellbox HTTP ${response.status}`, response.status);
+    }
+    if (!response.body) throw new CellboxError('PROTOCOL', 'Cellbox returned an empty export body');
+    const partPath = `${destination}.part-${randomUUID()}`;
+    let size = 0;
+    const hash = createHash('sha256');
+    const verify = new Transform({ transform(chunk: Buffer, _encoding, callback) {
+      size += chunk.length;
+      if (size > expected.sizeBytes) return callback(new CellboxError('PROTOCOL', 'Cellbox export exceeds its declared size'));
+      hash.update(chunk);
+      callback(null, chunk);
+    } });
+    try {
+      await mkdir(dirname(destination), { recursive: true });
+      await pipeline(Readable.fromWeb(response.body as unknown as import('node:stream/web').ReadableStream<Uint8Array>),
+        verify, createWriteStream(partPath, { flags: 'wx', mode: 0o600 }), { signal: requestSignal });
+      if (size !== expected.sizeBytes || hash.digest('hex') !== expected.sha256)
+        throw new CellboxError('PROTOCOL', 'Cellbox export size or SHA-256 does not match its metadata');
+      await rename(partPath, destination);
+    } catch (cause) {
+      await rm(partPath, { force: true }).catch(() => undefined);
+      if (cause instanceof CellboxError) throw cause;
+      throw new CellboxError('TRANSPORT', 'Cellbox export could not be downloaded and verified', undefined, { cause });
+    }
+  }
+  async deleteVolumeExport(volumeId: string, exportId: string, signal?: AbortSignal) {
+    this.validateVolumeExportId(volumeId, exportId);
+    await this.request<void>('DELETE', `/v1/volumes/${this.id(volumeId)}/exports/${this.id(exportId)}`, { response: 'empty', signal });
+  }
+  private validateVolumeExportId(volumeId: string, exportId: string) {
+    if (!cellboxVolumeIdPattern.test(volumeId) || !cellboxExportIdPattern.test(exportId))
+      throw new CellboxError('INVALID_REQUEST', 'Valid Cellbox volume and export IDs are required');
   }
   restoreVolume(input: { sourceVolumeId: string; backupId: string; ownerKey: string; id?: string }) {
     if (!cellboxVolumeIdPattern.test(input.sourceVolumeId) || !cellboxBackupIdPattern.test(input.backupId) ||

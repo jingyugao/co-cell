@@ -213,7 +213,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     const placeholders = ids.map(() => '?').join(',');
     const [inputs] = await executor.query<Array<RowDataPacket & SessionTurnRow>>(
       `SELECT * FROM session_turns WHERE session_id IN (${placeholders}) AND id<>target_turn_id
-       AND type IN ('steer','question_reply') AND delivery_status='accepted' ORDER BY started_at,id`, ids);
+       AND method='turn/steer' AND delivery_status='accepted' ORDER BY started_at,id`, ids);
     const [questions] = await executor.query<Array<RowDataPacket & { session_id: string; thread_id: string; turn_id: string; payload_json: unknown }>>(
       `SELECT session_id,thread_id,turn_id,payload_json FROM app_server_events WHERE session_id IN (${placeholders}) AND kind='question' ORDER BY received_at,event_key`, ids);
     for (const session of native) {

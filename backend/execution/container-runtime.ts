@@ -481,10 +481,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         const text = (item.content ?? []).filter((part: any) => part.type === 'text').map((part: any) => part.text ?? '').join('');
         if (!hasOriginalPrompt) {
           turn.prompt = text;
+          turn.userInputItemId = item.id;
           hasOriginalPrompt = true;
         } else {
           (turn.additionalUserInputs ??= []).push(text);
-          (turn.additionalUserInputPositions ??= []).push({ beforeItemIndex: turn.items.length });
+          (turn.additionalUserInputPositions ??= []).push({ beforeItemIndex: turn.items.length, itemId: item.id });
         }
         continue;
       }

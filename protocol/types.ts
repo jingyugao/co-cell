@@ -79,7 +79,9 @@ export interface Turn {
   /** User messages injected into an accepted native turn after its original prompt. */
   additionalUserInputs?: string[];
   /** Presentation boundaries from native history or live acceptance, aligned with additionalUserInputs. */
-  additionalUserInputPositions?: Array<{ beforeItemIndex: number }>;
+  additionalUserInputPositions?: Array<{ beforeItemIndex: number; itemId?: string }>;
+  /** Native identity of the initial user message, used to reconcile live input events. */
+  userInputItemId?: string;
   /** Confirmed by the App Server turn.started event, not by saving a web submission. */
   codexAccepted?: boolean;
   /** Browser-only failure observed by the currently open page. Never persisted. */

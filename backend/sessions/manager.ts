@@ -882,12 +882,15 @@ export class SessionManager {
       try {
         const page = await this.readSandboxHistory(session, { limit: 20 });
         this.historyErrors.delete(id);
+        const nativeSession = this.isNativeSession(session);
         const turns = page.turns.map(native => {
           const current = session.turns.find(turn => turn.nativeTurnId === native.id || turn.id === native.id);
           return withNativeUserInput(current ? { ...native, ...current, nativeTurnId: native.id,
-            ...(this.isNativeSession(session) ? { status: native.status, completedAt: native.completedAt, error: native.error, phase: undefined, retry: undefined } : {}),
-            additionalUserInputs: native.additionalUserInputs ?? current.additionalUserInputs,
-            additionalUserInputPositions: native.additionalUserInputs ? native.additionalUserInputPositions : current.additionalUserInputPositions,
+            ...(nativeSession ? { status: native.status, completedAt: native.completedAt, error: native.error, phase: undefined, retry: undefined } : {}),
+            // Native history owns message order, including the absence of steers.
+            // Accepted request rows can describe the prompt that started this turn.
+            additionalUserInputs: nativeSession ? native.additionalUserInputs : native.additionalUserInputs ?? current.additionalUserInputs,
+            additionalUserInputPositions: nativeSession || native.additionalUserInputs ? native.additionalUserInputPositions : current.additionalUserInputPositions,
             prompt: current.prompt || native.prompt, items: native.items.map(item => ({ ...current.items.find(old => old.id === item.id), ...item })).concat(current.items.filter(item => !native.items.some(other => other.id === item.id))),
             ...(current.userInputRequests ? { userInputRequests: current.userInputRequests } : {}) } : native);
         });

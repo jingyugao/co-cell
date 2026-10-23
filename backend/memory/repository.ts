@@ -19,6 +19,7 @@ export interface MemoryRepository {
   list(offset: number, limit: number): Promise<MemoryList>;
   get(id: string): Promise<StoredMemory | undefined>;
   pending(): Promise<StoredMemory[]>;
+  latestReady(): Promise<StoredMemory[]>;
   enqueue(input: Pick<StoredMemory, 'projectId' | 'projectName' | 'sessionId' | 'sessionTitle' | 'sourceUpdatedAt' | 'sourceThreadId' | 'sourceBoxId'>): Promise<void>;
   save(record: StoredMemory): Promise<void>;
 }
@@ -86,6 +87,14 @@ export class MySqlMemoryRepository implements MemoryRepository {
     const [rows] = await this.pool.query<RowDataPacket[]>(`SELECT * FROM memory_records
       WHERE status IN ('queued','exporting','cleaning') OR export_operation_id IS NOT NULL OR export_id IS NOT NULL
       ORDER BY created_at,id`);
+    return rows.map(fromRow);
+  }
+
+  async latestReady() {
+    const [rows] = await this.pool.query<RowDataPacket[]>(`SELECT m.* FROM memory_records m WHERE m.status='ready'
+      AND NOT EXISTS (SELECT 1 FROM memory_records newer WHERE newer.session_id=m.session_id
+        AND newer.status='ready' AND newer.source_updated_at>m.source_updated_at)
+      ORDER BY m.source_updated_at,m.id`);
     return rows.map(fromRow);
   }
 

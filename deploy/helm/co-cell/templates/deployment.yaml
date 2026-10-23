@@ -146,7 +146,7 @@ spec:
                   key: COCELL_SECRET_MASTER_KEY
             - name: COCELL_TOOL_BROKER_URL
               value: {{ default (printf "http://%s.%s.svc.cluster.local.:%v" (include "co-cell.fullname" .) .Release.Namespace .Values.service.port) .Values.config.toolBrokerUrl | quote }}
-            {{- range $key := list "CODEX_API_KEY" "OPENAI_API_KEY" "OSS_ACCESS_KEY" "OSS_SECRET_KEY" }}
+            {{- range $key := list "CODEX_API_KEY" "OPENAI_API_KEY" "OSS_ACCESS_KEY" "OSS_SECRET_KEY" "HINDSIGHT_API_KEY" }}
             - name: {{ $key }}
               valueFrom:
                 secretKeyRef:
@@ -161,6 +161,12 @@ spec:
             {{- with .Values.config.openaiBaseUrl }}
             - name: OPENAI_BASE_URL
               value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.config.hindsightApiUrl }}
+            - name: HINDSIGHT_API_URL
+              value: {{ . | quote }}
+            - name: HINDSIGHT_BANK_ID
+              value: {{ $.Values.config.hindsightBankId | quote }}
             {{- end }}
             {{- with .Values.config.codexProxyKind }}
             - name: CODEX_PROXY_KIND

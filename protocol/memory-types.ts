@@ -19,6 +19,8 @@ export interface MemoryRecord {
 
 export interface MemoryFile {
   id: string;
+  /** Native identity; older material versions use their stable relative path. */
+  threadId?: string;
   path: string;
   agentName: string;
   contextIndex: number;

@@ -67,6 +67,13 @@ fi
 preview_args=()
 mount_args=()
 multi_api_args=()
+hindsight_args=()
+if [[ -n "${HINDSIGHT_API_URL+x}" ]]; then
+  hindsight_args+=(--set-string "config.hindsightApiUrl=${HINDSIGHT_API_URL}")
+fi
+if [[ -n "${HINDSIGHT_BANK_ID:-}" ]]; then
+  hindsight_args+=(--set-string "config.hindsightBankId=${HINDSIGHT_BANK_ID}")
+fi
 if [[ -n "${COCELL_MULTI_API:-}" ]]; then
   case "$COCELL_MULTI_API" in
     0)
@@ -167,6 +174,7 @@ helm upgrade "$release" "$chart" \
   "${multi_api_args[@]}" \
   "${mount_args[@]}" \
   "${cellbox_args[@]}" \
+  "${hindsight_args[@]}" \
   --set-string "image.repository=${image_repository}" \
   --set-string "image.tag=${image_tag}" \
   --set-string image.digest= \

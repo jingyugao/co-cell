@@ -2,6 +2,8 @@ import { installModelRoutes } from './models/routes.js';
 import type { ModelService } from './models/service.js';
 import { installMemoryRoutes } from './memory/routes.js';
 import type { MemoryService } from './memory/service.js';
+import { installKnowledgeRoutes } from './knowledge/routes.js';
+import type { KnowledgeService } from './knowledge/service.js';
 import { installImageRoutes } from './images/routes.js';
 import type { ImageCatalog } from './images/service.js';
 import { traceHttpRequest } from './infra/diagnostics/tracing.js';
@@ -30,7 +32,7 @@ import { installSecretRoutes } from './secrets/routes.js';
 import { installToolRoutes } from './tools/routes.js';
 import { installPwaAssets } from './infra/http/pwa.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), connections?: ConnectionStore, notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, knowledge?: KnowledgeService) {
   const app = new Hono();
   app.get('/healthz', c => c.text('ok'));
   app.use('/api/*', traceHttpRequest);
@@ -85,6 +87,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
     defaults: { ...config.defaults, ...await models.defaultSelection() } } : config));
   if (models) installModelRoutes(app, models);
   installMemoryRoutes(app, memory);
+  installKnowledgeRoutes(app, knowledge);
   installProjectsRoutes(app, manager, operatorAccess?.previewSubdomains
     ? { publicUrl: operatorAccess.publicUrl, token: operatorAccess.token } : undefined, images);
   installSessionsRoutes(app, manager, config);

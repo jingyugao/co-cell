@@ -633,7 +633,7 @@ async function openMaterial(outputDirectory: string, thread: Thread, contextInde
       if (failure.error) throw failure.error;
     } catch (error) { output.destroy(); await completion; throw error; }
   }
-  return { file: { path: relativePath, agentName: thread.name, contextIndex, byteLength: bytes, sha256: '' },
+  return { file: { path: relativePath, threadId: thread.id, agentName: thread.name, contextIndex, byteLength: bytes, sha256: '' },
     stream: output, hash, bytes, completion, failure };
 }
 

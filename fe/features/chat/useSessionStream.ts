@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { Session, SessionTurnPage, StreamMessage, Turn } from '../../../protocol/types';
 import { applySdkEvent } from '../../../util/session-events';
 import { api, errorMessage } from '../../lib/api';
+import { markPageLoad, pageLoadFailure } from '../../lib/page-load';
 
 function applyStream(current: Session | null, data: StreamMessage): Session | null {
   if (data.type === 'snapshot' || data.type === 'state') return data.session;
@@ -152,8 +153,8 @@ export function useSessionStream({ selected, enabled, historyReady = true, nativ
     let alive = true;
     setLoadingHistory(true);
     api<Session>(`/api/sessions/${selected}`)
-      .then(value => { if (alive) { canonicalHistory.current = selected; setSession(current => mergeSession(current, value)); } })
-      .catch(error => { if (alive) onErrorRef.current(errorMessage(error)); })
+      .then(value => { if (alive) { markPageLoad('historyReadyMs', selected); canonicalHistory.current = selected; setSession(current => mergeSession(current, value)); } })
+      .catch(error => { if (alive) { pageLoadFailure('history', 'failed', selected); onErrorRef.current(errorMessage(error)); } })
       .finally(() => { if (alive) setLoadingHistory(false); });
     return () => { alive = false; };
   }, [selected, enabled, historyReady, nativeHistoryManaged]);

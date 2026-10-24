@@ -212,7 +212,7 @@ const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
   inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), notifications,
-  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge);
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge, runtimeLog);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }

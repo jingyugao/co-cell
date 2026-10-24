@@ -16,6 +16,7 @@ import { projectDisplayName } from '../util/project-types';
 import { userInputReplyDisplayText } from '../util/user-input';
 import { Icon, Mark } from './components/Icon';
 import { api, errorMessage as message } from './lib/api';
+import { completePageLoad, markPageLoad, pageLoadFailure, setPageLoadSession } from './lib/page-load';
 import { readRoute, resolveSelection, routeUrl, type Page, type Selection } from './lib/navigation';
 import TurnProgress from './features/chat/TurnProgress';
 import TurnItems from './features/chat/TurnItems';
@@ -206,6 +207,23 @@ export default function App() {
   // Native failed turns are execution history rather than user-visible chat.
   // `clientFailure` is injected below only for this browser page's failed POST.
   const conversationTurns = session?.turns ?? [];
+  useEffect(() => {
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => markPageLoad('shellPaintMs'));
+    });
+    return () => cancelAnimationFrame(frame);
+  }, []);
+  useEffect(() => {
+    if (loading || !selected || session?.id !== selected || loadingHistory || !historyReady
+      || (nativeHistoryManaged && !native.connected && !conversationTurns.length)) return;
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        markPageLoad('historyPaintMs', selected);
+        if (!nativeConnectEnabled || native.connected) completePageLoad(selected);
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [loading, selected, session?.id, loadingHistory, historyReady, nativeHistoryManaged, nativeConnectEnabled, native.connected, conversationTurns.length]);
   const archivedSession = Boolean(session && isArchived(session));
   const sandbox = settings?.executionMode === 'sandbox';
   const localReadOnly = Boolean(config?.sandbox?.enabled && settings && !sandbox);
@@ -245,10 +263,13 @@ export default function App() {
 
   useEffect(() => {
     let alive = true;
+    markPageLoad('bootstrapStartedMs');
     Promise.all([api<AppConfig>('/api/config'), api<SessionSummary[]>('/api/sessions'), refreshProjects()]).then(([nextConfig, list, projectList]) => {
       if (!alive) return; setConfig(nextConfig); setSessions(list); setError('');
       const route = readRoute();
       const target = resolveSelection(route, list, projectList);
+      setPageLoadSession(target.sessionId);
+      markPageLoad('bootstrapReadyMs');
       applySelection(target); setError(target.error ?? '');
       const nextPage = !target.projectId && route.page === 'chat' ? 'projects' : route.page;
       currentPage.current = nextPage; setPage(nextPage);
@@ -256,7 +277,7 @@ export default function App() {
         const url = routeUrl(nextPage, target);
         window.history.replaceState(null, '', url); currentUrl.current = url;
       }
-    }).catch(err => { if (alive) setError(message(err)); }).finally(() => { if (alive) setLoading(false); });
+    }).catch(err => { if (alive) { pageLoadFailure('bootstrap', 'failed'); setError(message(err)); } }).finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
   }, []);
   useEffect(() => { if (!loading) followOutput.current = true; }, [selected, loading]);

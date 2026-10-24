@@ -185,7 +185,12 @@ export class KnowledgeService {
       await client.request('', { method: 'PUT', body: { name: 'CoCell' }, signal });
       current = await client.request('config', { signal });
     }
-    const updates = { enable_auto_consolidation: true, retain_mission: retainMission, observations_mission: observationsMission };
+    const updates = {
+      enable_auto_consolidation: true,
+      retain_chunk_size: 24_000,
+      retain_mission: retainMission,
+      observations_mission: observationsMission,
+    };
     if (Object.entries(updates).some(([key, value]) => current.config[key] !== value)) {
       assertActive();
       await client.request('config', { method: 'PATCH', body: { updates }, signal });

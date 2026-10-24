@@ -13,8 +13,56 @@ const MAX_BILLING_TEXT_BYTES = 1 * 1024 * 1024;
 const text = content => typeof content === 'string' ? content : (Array.isArray(content) ? content.map(part => part.text ?? '').join('\n') : '');
 const usage = value => Object.fromEntries(['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'].map(key => [key, Number(value?.[key] ?? 0)]));
 
+function compactionSummary(payload) {
+  const value = [payload.message, payload.summary].find(value => typeof value === 'string' && value.trim());
+  // Remote compaction can retain only an opaque encrypted item. Replayed user
+  // messages in replacement_history are not the generated summary.
+  return value && !/^gAAAAA[\w+/=-]+$/.test(value.trim()) ? value : null;
+}
+
+/** Match the persisted compacted record to its following native completion item. */
+function nativeCompactions(source) {
+  const compactions = [];
+  let turnId, pending;
+  const lines = source.split('\n');
+  for (const [index, line] of lines.entries()) {
+    if (!line.trim()) continue;
+    // A live rollout may end with a record that is still being written.
+    let record;
+    try { record = JSON.parse(line); } catch {
+      if (index === lines.length - 1 && !source.endsWith('\n')) break;
+      throw new Error(`Codex 会话记录第 ${index + 1} 行损坏`);
+    }
+    const p = record.payload ?? {};
+    if (record.type === 'event_msg' && p.type === 'task_started') turnId = p.turn_id;
+    if (record.type === 'compacted') {
+      pending = { segment: compactions.length + 1, timestamp: record.timestamp ?? '', summary: compactionSummary(p),
+        turnId: p.turn_id ?? turnId, itemId: p.compaction_id ?? p.item_id ?? p.id };
+      compactions.push(pending);
+      continue;
+    }
+    const item = record.type === 'response_item' ? p : record.type === 'event_msg' && p.type === 'item_completed' ? p.item : undefined;
+    const completed = item && String(item.type).replaceAll('_', '').toLowerCase() === 'contextcompaction'
+      && (record.type !== 'response_item' || item.status === undefined || item.status === 'completed');
+    if (completed && pending && (!p.turn_id || !pending.turnId || p.turn_id === pending.turnId)) {
+      pending.itemId ??= item.id;
+      pending = undefined;
+    } else if (record.type !== 'session_meta' && !['turn_context', 'world_state'].includes(record.type)
+      && !(record.type === 'event_msg' && ['token_count', 'token_usage_record', 'thread_settings_applied'].includes(p.type))) {
+      pending = undefined;
+    }
+  }
+  return compactions;
+}
+
+export function parseNativeCompaction(source, selector) {
+  const found = nativeCompactions(source).find(value => selector.itemId ? value.itemId === selector.itemId : value.segment === selector.segment);
+  return found ? { ...(found.itemId ? { itemId: found.itemId } : {}), segment: found.segment, timestamp: found.timestamp, summary: found.summary } : undefined;
+}
+
 /** Project only Codex's persisted events; platform submissions are never inputs. */
 export function parseNativeHistory(source, includeBlocks = false) {
+  const compactionIds = new Map(nativeCompactions(source).map(value => [value.segment, value.itemId]));
   const turns = [], byId = new Map(), confirmed = new Set(), responses = new Set();
   const lastUserMessages = new Map();
   let current, model;
@@ -63,7 +111,8 @@ export function parseNativeHistory(source, includeBlocks = false) {
       }
       if (current) {
         current.compactions ??= [];
-        current.compactions.push({ segment, timestamp, beforeItemIndex: current.items.length });
+        current.compactions.push({ segment, timestamp, beforeItemIndex: current.items.length,
+          ...(compactionIds.get(segment) ? { itemId: compactionIds.get(segment) } : {}), summary: compactionSummary(p) });
       }
       continue;
     }
@@ -183,7 +232,7 @@ export function parseNativeHistory(source, includeBlocks = false) {
   return turns.filter(turn => turn.prompt || confirmed.has(turn.id));
 }
 
-export async function readNativeHistory(threadId, codexHome = process.env.CODEX_HOME || join(homedir(), '.codex'), includeBlocks = false, startedAt, knownPath) {
+export async function readNativeHistory(threadId, codexHome = process.env.CODEX_HOME || join(homedir(), '.codex'), includeBlocks = false, startedAt, knownPath, compactionSelector) {
   if (!threadId) return { turns: [] };
   if (!/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(threadId)) throw new Error('Codex thread ID 格式错误');
   let visited = 0;
@@ -220,7 +269,8 @@ export async function readNativeHistory(threadId, codexHome = process.env.CODEX_
       const source = buffer.subarray(0, end + 1).toString('utf8');
       const metadata = JSON.parse(source.slice(0, source.indexOf('\n')));
       if (metadata.type !== 'session_meta' || metadata.payload?.id !== threadId) throw new Error('Codex 会话记录与 thread 不匹配');
-      return { turns: parseNativeHistory(source, includeBlocks), path: relative(home, resolved) };
+      return { turns: compactionSelector ? [] : parseNativeHistory(source, includeBlocks), path: relative(home, resolved),
+        ...(compactionSelector ? { compaction: parseNativeCompaction(source, compactionSelector) } : {}) };
     } finally { await file.close(); }
   }
   if (knownPath && !isAbsolute(knownPath) && normalize(knownPath) === knownPath && !knownPath.startsWith(`..${sep}`)) {

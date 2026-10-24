@@ -36,6 +36,7 @@ import type { InputRequestHook } from '../../packages/agentcore/src/index.mjs';
 import type { NativeSessionConnection } from '../../protocol/native-app-server.js';
 import type { NativeRelayEvent } from '../execution/native-relay.js';
 import { normalizeNativeEvents } from './native-events.js';
+import type { CompactionContent, CompactionSelector } from '../../protocol/types.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -935,6 +936,31 @@ export class SessionManager {
     // this derived index in memory; App Server history owns the durable state.
     collectNativeUserInputAnswers(turns, cached.answers);
     return turns.map(turn => withNativeUserInput(turn, cached.answers));
+  }
+
+  async compaction(id: string, selector: CompactionSelector, threadId?: string, signal?: AbortSignal): Promise<CompactionContent> {
+    const session = await this.refreshSessionSandbox(await this.readMetadata(id));
+    if (!session.threadId) throw new HttpError(404, '会话没有原生线程');
+    const read = this.projects.beginRead(session.projectId);
+    const waiting = signal ? AbortSignal.any([signal, read.signal]) : read.signal;
+    try {
+      let result: CompactionContent | undefined;
+      if (session.settings.executionMode === 'sandbox') {
+        if (!this.sandbox?.compaction) throw new HttpError(503, '当前运行环境不支持读取压缩内容');
+        result = await this.sandbox.compaction(session, selector, threadId, waiting);
+      } else {
+        const childThread = threadId && threadId !== session.threadId;
+        if (childThread) {
+          const children = await readSubagentConversations(session.threadId, process.env.CODEX_HOME || join(homedir(), '.codex'));
+          if (!children.some(child => child.threadId === threadId)) throw new HttpError(404, '此线程不属于当前会话');
+        }
+        result = (await readNativeHistory(threadId ?? session.threadId, undefined, false, childThread ? undefined : session.startedAt,
+          childThread ? undefined : session.nativeHistoryPath, selector)).compaction;
+      }
+      waiting.throwIfAborted();
+      if (!result) throw new HttpError(404, '压缩内容尚未保存或已不可用，请稍后重试');
+      return result;
+    } finally { read.release(); }
   }
 
   async subagents(id: string): Promise<SubagentConversation[]> {

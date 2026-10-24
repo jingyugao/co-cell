@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import type { SubagentConversation } from '../../../protocol/types';
 import { Icon } from '../../components/Icon';
 import { api } from '../../lib/api';
@@ -8,6 +8,7 @@ import './SubagentConversations.css';
 import ReasoningSummary, { groupThreadItems } from './ReasoningSummary';
 import ToolCallGroup from './ToolCallGroup';
 import { useMobileLayout } from './useMobileViewport';
+import { CompactionBoundaries, isCompactionBoundaryItem } from './CompactionMessage';
 
 export function useSubagentConversations(sessionId: string | null, running: boolean) {
   const [agents, setAgents] = useState<SubagentConversation[]>([]);
@@ -41,18 +42,24 @@ const stateLabel = (agent: SubagentConversation) => {
   return state === 'completed' ? '已完成' : state === 'failed' ? '失败' : state === 'cancelled' ? '已停止' : '执行中';
 };
 
-export default function SubagentConversations({ agents, ...resources }: { agents: SubagentConversation[] } & MarkdownResources) {
+export default function SubagentConversations({ agents, ...resources }: { agents: SubagentConversation[]; sessionId?: string } & MarkdownResources) {
   const mobile = useMobileLayout();
   if (!agents.length) return null;
   return <section className="subagent-group" aria-label="子代理对话">
     <div className="subagent-group-title"><Icon name="chat" size={15} /><strong>子代理对话</strong><span>{agents.length}</span></div>
     {agents.map(agent => <details key={agent.threadId} className="subagent-card">
       <summary><span className="subagent-avatar">{agent.path.split('/').at(-1)?.slice(0, 1).toUpperCase() || 'A'}</span><span className="subagent-identity"><strong>{agent.path.split('/').at(-1)}</strong><small>{agent.nickname ? `${agent.nickname} · ` : ''}{agent.path}</small></span><span className={`subagent-status ${agent.turns.at(-1)?.status ?? 'running'}`}>{stateLabel(agent)}</span><Icon name="chevron" size={14} /></summary>
-      <div className="subagent-transcript">{agent.turns.flatMap(turn => groupThreadItems(turn.items, new Set(turn.compactions?.map(boundary => boundary.beforeItemIndex)), mobile).map(group => ({ turn, group }))).map(({ turn, group }) => group.type === 'reasoning'
-        ? <ReasoningSummary key={`${turn.id}:${group.items[0].id}`} pending={turn.status === 'running' && group.startIndex + group.items.length === turn.items.length} entries={group.items.map(item => ({ item, timestamp: turn.itemTimestamps?.[item.id] ?? turn.startedAt }))} {...resources} />
-        : group.type === 'tools' ? <ToolCallGroup key={`${turn.id}:${group.items[0].id}`} turnStatus={turn.status} entries={group.items.map(item => ({ item, timestamp: turn.itemTimestamps?.[item.id] ?? turn.startedAt }))} {...resources} />
-        : <ItemView key={`${turn.id}:${group.item.id}`} item={group.item} turnStatus={turn.status} timestamp={turn.itemTimestamps?.[group.item.id] ?? turn.startedAt} {...resources} />)}
-        {!agent.turns.some(turn => turn.items.length) && <p className="subagent-empty">等待子代理输出…</p>}
+      <div className="subagent-transcript">{agent.turns.map(turn => <Fragment key={turn.id}>
+        {groupThreadItems(turn.items, new Set(turn.compactions?.map(boundary => boundary.beforeItemIndex)), mobile).map(group => <Fragment key={group.type === 'item' ? group.item.id : group.items[0].id}>
+          <CompactionBoundaries turn={turn} index={group.startIndex} threadId={agent.threadId} {...resources} />
+          {group.type === 'reasoning'
+            ? <ReasoningSummary pending={turn.status === 'running' && group.startIndex + group.items.length === turn.items.length} entries={group.items.map(item => ({ item, timestamp: turn.itemTimestamps?.[item.id] ?? turn.startedAt }))} {...resources} />
+            : group.type === 'tools' ? <ToolCallGroup turnStatus={turn.status} entries={group.items.map(item => ({ item, timestamp: turn.itemTimestamps?.[item.id] ?? turn.startedAt }))} {...resources} />
+              : isCompactionBoundaryItem(turn, group.startIndex) ? null : <ItemView item={group.item} turnStatus={turn.status} timestamp={turn.itemTimestamps?.[group.item.id] ?? turn.startedAt} threadId={agent.threadId} {...resources} />}
+        </Fragment>)}
+        <CompactionBoundaries turn={turn} index={turn.items.length} threadId={agent.threadId} {...resources} />
+      </Fragment>)}
+        {!agent.turns.some(turn => turn.items.length || turn.compactions?.length) && <p className="subagent-empty">等待子代理输出…</p>}
       </div>
     </details>)}
   </section>;

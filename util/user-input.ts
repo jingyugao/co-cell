@@ -82,3 +82,29 @@ export function withNativeUserInput(turn: Turn, answers?: NativeUserInputAnswers
       answeredAt: latest.answeredAt, answerTurnId: latest.answerTurnId };
   }) } : turn;
 }
+
+/** Capture the message boundary when a live steer is accepted. */
+export function appendAdditionalUserInput(turn: Turn, text: string): Turn {
+  const inputs = turn.additionalUserInputs ?? [];
+  const positions = inputs.map((_, index) => turn.additionalUserInputPositions?.[index]
+    ?? { beforeItemIndex: turn.items.length });
+  return { ...turn, additionalUserInputs: [...inputs, text],
+    additionalUserInputPositions: [...positions, { beforeItemIndex: turn.items.length }] };
+}
+
+/** Reconcile started/completed user-message events with an accepted steer. */
+export function recordNativeUserInput(turn: Turn, itemId: string, text: string): Turn {
+  if (turn.userInputItemId === itemId || turn.additionalUserInputPositions?.some(position => position.itemId === itemId)) return turn;
+  if (!turn.userInputItemId && (!turn.prompt || (turn.prompt === text && !turn.additionalUserInputs?.length))) {
+    return { ...turn, prompt: text, userInputItemId: itemId };
+  }
+  // The RPC response may arrive before the user-message event. Attach its
+  // native identity and actual insertion boundary to that accepted input.
+  const inputs = turn.additionalUserInputs ?? [];
+  const pending = inputs.findIndex((input, index) => input === text && !turn.additionalUserInputPositions?.[index]?.itemId);
+  const next = pending < 0 ? appendAdditionalUserInput(turn, text) : turn;
+  const index = pending < 0 ? inputs.length : pending;
+  return { ...next, additionalUserInputPositions: (next.additionalUserInputs ?? []).map((_, position) => position === index
+    ? { beforeItemIndex: turn.items.length, itemId }
+    : next.additionalUserInputPositions?.[position] ?? { beforeItemIndex: turn.items.length }) };
+}

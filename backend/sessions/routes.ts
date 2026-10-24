@@ -40,6 +40,13 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
     return c.json(await manager.read(c.req.param('id')));
   });
   app.get('/api/sessions/:id/subagents', async c => c.json(await manager.subagents(c.req.param('id'))));
+  app.get('/api/sessions/:id/compaction', async c => {
+    const input = z.object({ itemId: z.string().min(1).max(191).optional(), segment: z.coerce.number().int().positive().optional(),
+      threadId: z.string().uuid().optional() }).strict().refine(value => Boolean(value.itemId) !== Boolean(value.segment), '指定一个压缩事件或段号')
+      .parse(c.req.query());
+    c.header('Cache-Control', 'no-store');
+    return c.json(await manager.compaction(c.req.param('id'), { itemId: input.itemId, segment: input.segment }, input.threadId, c.req.raw.signal));
+  });
   app.get('/api/sessions/:id/turns', async c => {
     const cursor = z.string().min(1).max(4096).parse(c.req.query('cursor'));
     return c.json(await manager.olderTurns(c.req.param('id'), cursor));

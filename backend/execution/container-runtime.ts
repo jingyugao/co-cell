@@ -13,8 +13,8 @@ import { readCellboxWorkspaceFile, cellboxWorkspaceFileResponse } from '../sandb
 import { holdResponse } from '../../util/http-stream.js';
 import type { InputRequestHook, ThreadOptions } from '../../packages/agentcore/src/index.mjs';
 import type { AgentEvent } from '../../protocol/types.js';
-import type { Session, SubagentConversation, Turn } from '../../protocol/types.js';
-import type { NativeHistory } from './native-history.mjs';
+import type { CompactionContent, CompactionSelector, Session, SubagentConversation, Turn } from '../../protocol/types.js';
+import { parseNativeCompaction, type NativeHistory } from './native-history.mjs';
 import { AppServerReader, type AppServerEndpoint } from './app-server-reader.js';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
@@ -33,6 +33,7 @@ export interface SandboxRuntime {
   prepareNativeSession?(session: Session, signal: AbortSignal, onSandbox: SaveSandbox): Promise<{ threadId: string | null; threadOptions: Record<string, unknown>; turnOptions: { model?: string; effort?: string } }>;
   openNativeConnection?(session: Session, signal: AbortSignal): Promise<AppServerEndpoint & { release(): Promise<void> }>;
   nativeRequest?(session: Session, method: string, params: unknown): Promise<any>;
+  compaction?(session: Session, selector: CompactionSelector, threadId?: string, signal?: AbortSignal): Promise<CompactionContent | undefined>;
   uploadNativeImage?(session: Session, path: string): Promise<string>;
   observe?(session: Session, turn: Turn, signal: AbortSignal): AsyncGenerator<NativeTurnObservation>;
 	remoteArchives?: import('../archives/remote.js').RemoteArchives;
@@ -481,9 +482,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         const text = (item.content ?? []).filter((part: any) => part.type === 'text').map((part: any) => part.text ?? '').join('');
         if (!hasOriginalPrompt) {
           turn.prompt = text;
+          turn.userInputItemId = item.id;
           hasOriginalPrompt = true;
         } else {
           (turn.additionalUserInputs ??= []).push(text);
+          (turn.additionalUserInputPositions ??= []).push({ beforeItemIndex: turn.items.length, itemId: item.id });
         }
         continue;
       }
@@ -665,6 +668,41 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       if (error instanceof HttpError) throw error;
       throw Object.assign(new HttpError(502, this.safeError(error).message), { cause: this.safeError(error) });
     } finally { await this.releaseEntry(entry, failed); }
+  }
+
+  async compaction(session: Session, selector: CompactionSelector, threadId = session.threadId!, signal?: AbortSignal): Promise<CompactionContent | undefined> {
+    if (!session.sandbox || !session.threadId) throw new HttpError(404, '会话没有可读取的原生记录');
+    return this.reader.read(session.sandbox.id, async client => {
+      let current = threadId;
+      let path: string | undefined;
+      const seen = new Set<string>();
+      for (;;) {
+        if (seen.has(current) || seen.size >= 32) throw new HttpError(404, '找不到此会话的子线程');
+        seen.add(current);
+        const { thread } = await client.request('thread/read', { threadId: current, includeTurns: false });
+        if (thread?.id !== current) throw new HttpError(404, '原生线程不匹配');
+        if (current === threadId) path = thread.path;
+        if (current === session.threadId) break;
+        current = thread.source?.subAgent?.thread_spawn?.parent_thread_id;
+        if (!current) throw new HttpError(404, '此线程不属于当前会话');
+      }
+      // The path comes from verified thread metadata, never from an HTTP caller.
+      if (!path || !posix.isAbsolute(path) || !posix.basename(path).endsWith(`${threadId}.jsonl`))
+        throw new HttpError(404, '原生线程没有可读取的会话文件');
+      const result = await client.request('fs/readFile', { path });
+      const maxBytes = 64 * 1024 * 1024;
+      if (typeof result.dataBase64 !== 'string' || result.dataBase64.length > Math.ceil(maxBytes / 3) * 4)
+        throw new HttpError(413, 'Codex 会话记录超过 64 MB 读取限制');
+      const bytes = Buffer.from(result.dataBase64, 'base64');
+      if (bytes.length > maxBytes) throw new HttpError(413, 'Codex 会话记录超过 64 MB 读取限制');
+      const source = bytes.toString('utf8');
+      let metadata;
+      try { metadata = JSON.parse(source.slice(0, source.indexOf('\n'))); }
+      catch { throw new HttpError(409, 'Codex 会话记录尚未写入完成，请稍后重试'); }
+      if (metadata.type !== 'session_meta' || metadata.payload?.id !== threadId)
+        throw new HttpError(409, 'Codex 会话记录与线程不匹配');
+      return parseNativeCompaction(source, selector);
+    }, signal).catch(error => { throw error instanceof HttpError ? error : this.safeError(error); });
   }
 
   async history(session: Session, options: { cursor?: string; limit?: number; signal?: AbortSignal } = {}): Promise<NativeHistory> {

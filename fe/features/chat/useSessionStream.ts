@@ -48,6 +48,8 @@ export function mergeSession(current: Session | null, incoming: Session): Sessio
     const merged = previous ? { ...previous, ...turn,
       prompt: turn.prompt || previous.prompt,
       additionalUserInputs,
+      additionalUserInputPositions: additionalUserInputs === incomingInputs
+        ? turn.additionalUserInputPositions ?? previous.additionalUserInputPositions : previous.additionalUserInputPositions,
       items: turn.items.length ? turn.items : previous.items } : turn;
     if (previousKey !== undefined) turns.delete(previousKey);
     turns.set(key(merged), merged);

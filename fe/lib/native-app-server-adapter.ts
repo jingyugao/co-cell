@@ -15,6 +15,7 @@ export class NativeAppServerEventAdapter {
   private convert(item: any): ThreadItem | undefined {
     const previous = this.items.get(item.id);
     switch (item.type) {
+      case 'contextCompaction': return { id: item.id, type: 'context_compaction', status: 'completed' };
       case 'agentMessage': return { id: item.id, type: 'agent_message', text: item.text ?? (previous?.type === 'agent_message' ? previous.text : ''), ...(item.delivery ? { delivery: item.delivery } : {}), ...(item.questions ? { questions: item.questions } : {}) };
       case 'reasoning': return { id: item.id, type: 'reasoning', text: (item.summary?.length ? item.summary : item.content)?.join('\n') || (previous?.type === 'reasoning' ? previous.text : '') };
       case 'commandExecution': return { id: item.id, type: 'command_execution', command: item.command ?? '', aggregated_output: item.aggregatedOutput ?? (previous?.type === 'command_execution' ? previous.aggregated_output : ''), ...(item.exitCode != null ? { exit_code: item.exitCode } : {}), status: status(item.status) };

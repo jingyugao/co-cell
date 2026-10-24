@@ -27,7 +27,8 @@ import type { ImageCatalog } from '../images/service.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
 import { sandboxMounts } from '../../util/sandbox-mounts.js';
-import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../util/user-input.js';
+import { projectWeekOf } from '../../util/project-types.js';
+import { appendAdditionalUserInput, collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../util/user-input.js';
 import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 import { applyTurnEvent } from '../../util/session-events.js';
 import type { InputRequestRecord, InputRequestType } from '../../protocol/input-request-types.js';
@@ -35,6 +36,7 @@ import type { InputRequestHook } from '../../packages/agentcore/src/index.mjs';
 import type { NativeSessionConnection } from '../../protocol/native-app-server.js';
 import type { NativeRelayEvent } from '../execution/native-relay.js';
 import { normalizeNativeEvents } from './native-events.js';
+import type { CompactionContent, CompactionSelector } from '../../protocol/types.js';
 
 export type { CodexClient } from '../execution/runner.js';
 type Subscriber = (message: StreamMessage) => void;
@@ -881,11 +883,15 @@ export class SessionManager {
       try {
         const page = await this.readSandboxHistory(session, { limit: 20 });
         this.historyErrors.delete(id);
+        const nativeSession = this.isNativeSession(session);
         const turns = page.turns.map(native => {
           const current = session.turns.find(turn => turn.nativeTurnId === native.id || turn.id === native.id);
           return withNativeUserInput(current ? { ...native, ...current, nativeTurnId: native.id,
-            ...(this.isNativeSession(session) ? { status: native.status, completedAt: native.completedAt, error: native.error, phase: undefined, retry: undefined } : {}),
-            additionalUserInputs: native.additionalUserInputs ?? current.additionalUserInputs,
+            ...(nativeSession ? { status: native.status, completedAt: native.completedAt, error: native.error, phase: undefined, retry: undefined } : {}),
+            // Native history owns message order, including the absence of steers.
+            // Accepted request rows can describe the prompt that started this turn.
+            additionalUserInputs: nativeSession ? native.additionalUserInputs : native.additionalUserInputs ?? current.additionalUserInputs,
+            additionalUserInputPositions: nativeSession || native.additionalUserInputs ? native.additionalUserInputPositions : current.additionalUserInputPositions,
             prompt: current.prompt || native.prompt, items: native.items.map(item => ({ ...current.items.find(old => old.id === item.id), ...item })).concat(current.items.filter(item => !native.items.some(other => other.id === item.id))),
             ...(current.userInputRequests ? { userInputRequests: current.userInputRequests } : {}) } : native);
         });
@@ -930,6 +936,31 @@ export class SessionManager {
     // this derived index in memory; App Server history owns the durable state.
     collectNativeUserInputAnswers(turns, cached.answers);
     return turns.map(turn => withNativeUserInput(turn, cached.answers));
+  }
+
+  async compaction(id: string, selector: CompactionSelector, threadId?: string, signal?: AbortSignal): Promise<CompactionContent> {
+    const session = await this.refreshSessionSandbox(await this.readMetadata(id));
+    if (!session.threadId) throw new HttpError(404, '会话没有原生线程');
+    const read = this.projects.beginRead(session.projectId);
+    const waiting = signal ? AbortSignal.any([signal, read.signal]) : read.signal;
+    try {
+      let result: CompactionContent | undefined;
+      if (session.settings.executionMode === 'sandbox') {
+        if (!this.sandbox?.compaction) throw new HttpError(503, '当前运行环境不支持读取压缩内容');
+        result = await this.sandbox.compaction(session, selector, threadId, waiting);
+      } else {
+        const childThread = threadId && threadId !== session.threadId;
+        if (childThread) {
+          const children = await readSubagentConversations(session.threadId, process.env.CODEX_HOME || join(homedir(), '.codex'));
+          if (!children.some(child => child.threadId === threadId)) throw new HttpError(404, '此线程不属于当前会话');
+        }
+        result = (await readNativeHistory(threadId ?? session.threadId, undefined, false, childThread ? undefined : session.startedAt,
+          childThread ? undefined : session.nativeHistoryPath, selector)).compaction;
+      }
+      waiting.throwIfAborted();
+      if (!result) throw new HttpError(404, '压缩内容尚未保存或已不可用，请稍后重试');
+      return result;
+    } finally { read.release(); }
   }
 
   async subagents(id: string): Promise<SubagentConversation[]> {
@@ -1311,8 +1342,10 @@ export class SessionManager {
     if (this.closing) return;
     await this.refreshSharedState();
     const now = Date.now();
+    const currentWeek = projectWeekOf(new Date(now));
     const idle = (project: Project) => {
       if (project.name === 'system' || project.status !== 'active' || !project.sandbox) return false;
+      if (project.type === 3 && project.weekOf === currentWeek) return false;
       const sessions = [...this.sessions.values()].filter(session => session.projectId === project.id);
       const lastActivity = Math.max(Date.parse(project.sandbox.lastActiveAt ?? project.createdAt),
         project.sandboxOperation?.kind === 'resume' && project.sandboxOperation.status === 'succeeded'
@@ -1855,8 +1888,7 @@ export class SessionManager {
           throw new HttpError(502, '追加消息的接收状态不确定，请检查会话后再继续');
         }
         if (!accepted) throw new NativeTurnNotReceiving();
-        if (submission?.type !== 'question_reply')
-          current.additionalUserInputs = [...(current.additionalUserInputs ?? []), prompt];
+        if (submission?.type !== 'question_reply') Object.assign(current, appendAdditionalUserInput(current, prompt));
         session.updatedAt = new Date().toISOString();
         await this.save(session);
         this.publish(id, { type: 'state', session: this.get(id) });

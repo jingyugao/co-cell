@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { NativeSessionConnection } from '../../../protocol/native-app-server';
 import type { Session, Turn } from '../../../protocol/types';
 import { applySdkEvent } from '../../../util/session-events';
-import { withNativeUserInput } from '../../../util/user-input';
+import { appendAdditionalUserInput, recordNativeUserInput, withNativeUserInput } from '../../../util/user-input';
 import { api, errorMessage } from '../../lib/api';
 import { NativeAppServerClient, nativeWebSocketUrl, readQuietSnapshot } from '../../lib/native-app-server';
 import { NativeAppServerEventAdapter } from '../../lib/native-app-server-adapter';
@@ -33,6 +33,8 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   const refreshConnectionRef = useRef<(() => Promise<void>) | null>(null);
   const liveTurnIds = useRef(new Set<string>());
   const pendingStart = useRef<Submission | null>(null);
+  const pendingSteers = useRef<Array<{ turnId: string; text: string; accepted: boolean; observed: boolean }>>([]);
+  const observedUserItems = useRef(new Set<string>());
   const optionsRef = useRef<Connection['turnOptions']>({});
   const threadOptionsRef = useRef<Connection['threadOptions']>({});
   const connectionRef = useRef<Connection | null>(null);
@@ -64,8 +66,31 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   const applyEvent = useCallback((message: { method?: string; params?: Record<string, any> }) => {
     const method = message.method ?? ''; const params = message.params ?? {};
     if (params.threadId && params.threadId !== threadRef.current) return;
-    const events = adapterRef.current.accept({ method, params });
     const eventTurnId = String(params.turnId ?? params.turn?.id ?? '');
+    if ((method === 'item/started' || method === 'item/completed') && params.item?.type === 'userMessage' && params.item.id && eventTurnId) {
+      const text = (params.item.content ?? []).filter((part: any) => part.type === 'text').map((part: any) => part.text ?? '').join('');
+      liveTurnIds.current.add(eventTurnId);
+      if (!observedUserItems.current.has(params.item.id)) {
+        observedUserItems.current.add(params.item.id);
+        const turn = sessionRef.current?.turns.find(turn => turn.id === eventTurnId || turn.nativeTurnId === eventTurnId);
+        const original = turn && !turn.userInputItemId && turn.prompt === text && !turn.additionalUserInputs?.length;
+        const known = turn?.userInputItemId === params.item.id || turn?.additionalUserInputPositions?.some(position => position.itemId === params.item.id);
+        if (!original && !known) {
+          const pending = pendingSteers.current.find(input => input.turnId === eventTurnId && input.text === text && !input.observed);
+          if (pending) {
+            pending.observed = true;
+            if (pending.accepted) pendingSteers.current = pendingSteers.current.filter(input => input !== pending);
+          }
+        }
+      }
+      setSessionRef.current(current => {
+        if (!current || current.id !== selectedRef.current) return current;
+        return { ...current, turns: current.turns.map(turn => turn.id === eventTurnId || turn.nativeTurnId === eventTurnId
+          ? recordNativeUserInput(turn, params.item.id, text) : turn) };
+      });
+      return;
+    }
+    const events = adapterRef.current.accept({ method, params });
     for (const event of events) {
       if (event.type === 'error') { errorRef.current(event.message); continue; }
       if (event.type === 'turn.started') {
@@ -120,6 +145,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
 
   useEffect(() => {
     if (!enabled || !selected) { markConnected(false); return; }
+    pendingSteers.current = []; observedUserItems.current.clear();
     const id = selected; threadRef.current = ''; threadBoundRef.current = false; connectionRef.current = null; liveTurnIds.current.clear(); activeTurnId.current = null; pendingStart.current = null; terminalTurnIds.current.clear(); let alive = true; let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let retryDelay = 500; let generation = 0;
     let client: NativeAppServerClient | undefined;
@@ -234,9 +260,17 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
     if (options.expectedTurnId || (!options.forceStart && current.status === 'running')) {
       const expectedTurnId = options.expectedTurnId ?? activeTurnId.current ?? current.turns.at(-1)?.nativeTurnId ?? current.turns.at(-1)?.id;
       if (!expectedTurnId) throw new Error('无法确认当前运行中的 turn，请刷新状态。');
-      await client.request('turn/steer', { threadId, expectedTurnId, input: [{ type: 'text', text: prompt, text_elements: [] }] });
-      assertCurrentConnection();
-      setSessionRef.current(value => value?.id === current.id ? { ...value, turns: value.turns.map(turn => turn.id === expectedTurnId || turn.nativeTurnId === expectedTurnId ? { ...turn, additionalUserInputs: [...(turn.additionalUserInputs ?? []), prompt] } : turn) } : value);
+      const pending = { turnId: expectedTurnId, text: prompt, accepted: false, observed: false };
+      pendingSteers.current.push(pending);
+      try {
+        await client.request('turn/steer', { threadId, expectedTurnId, input: [{ type: 'text', text: prompt, text_elements: [] }] });
+        assertCurrentConnection();
+        pending.accepted = true;
+        setSessionRef.current(value => value?.id === current.id ? { ...value, turns: value.turns.map(turn => turn.id === expectedTurnId || turn.nativeTurnId === expectedTurnId
+          ? (pending.observed ? turn : appendAdditionalUserInput(turn, prompt)) : turn) } : value);
+      } finally {
+        if (pending.observed || !pending.accepted) pendingSteers.current = pendingSteers.current.filter(input => input !== pending);
+      }
       return;
     }
     pendingStart.current = { prompt, images };

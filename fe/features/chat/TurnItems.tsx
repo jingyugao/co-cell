@@ -9,6 +9,7 @@ import type { Session } from '../../../protocol/types';
 import ToolCallGroup from './ToolCallGroup';
 import { useMobileLayout } from './useMobileViewport';
 import { userInputReplyDisplayText } from '../../../util/user-input';
+import { CompactionBoundaries, isCompactionBoundaryItem } from './CompactionMessage';
 
 /** Place decisions at their tool call, so later execution and replies stay below them. */
 export default function TurnItems({ turn, highlightedItemIds, subagents = [], ...resources }: {
@@ -43,15 +44,15 @@ export default function TurnItems({ turn, highlightedItemIds, subagents = [], ..
     {groupThreadItems(turn.items, boundaries, mobile).map(group => {
       const index = group.startIndex;
       const first = group.type === 'item' ? group.item : group.items[0];
-      return <Fragment key={first.id}>{renderInputs(index)}{index === subagentIndex && <SubagentConversations agents={subagents} {...resources} />}{turn.compactions?.filter(boundary => boundary.beforeItemIndex === index).map(boundary => <div key={boundary.segment} className="compact-divider" role="separator">上下文已压缩 · 第 {boundary.segment + 1} 段对话 · 后续重新计费</div>)}{group.type === 'reasoning'
+      return <Fragment key={first.id}>{renderInputs(index)}{index === subagentIndex && <SubagentConversations agents={subagents} {...resources} />}<CompactionBoundaries turn={turn} index={index} {...resources} />{group.type === 'reasoning'
         ? <ReasoningSummary pending={turn.status === 'running' && index + group.items.length === turn.items.length} entries={group.items.map(item => ({ item, timestamp: turn.itemTimestamps?.[item.id] || turn.startedAt, anchorId: `turn-${turn.id}-item-${item.id}`, highlighted: highlightedItemIds?.includes(item.id) }))} {...resources} />
         : group.type === 'tools' ? <ToolCallGroup turnStatus={turn.status} entries={group.items.map(item => ({ item, timestamp: turn.itemTimestamps?.[item.id] || turn.startedAt, anchorId: `turn-${turn.id}-item-${item.id}`, highlighted: highlightedItemIds?.includes(item.id) }))} {...resources} />
-        : <div id={`turn-${turn.id}-item-${group.item.id}`} className={highlightedItemIds?.includes(group.item.id) ? 'billing-item-selected' : undefined}>{resources.sessionId && turn.userInputRequests?.some(request => request.id === group.item.id)
+        : isCompactionBoundaryItem(turn, index) ? null : <div id={`turn-${turn.id}-item-${group.item.id}`} className={highlightedItemIds?.includes(group.item.id) ? 'billing-item-selected' : undefined}>{resources.sessionId && turn.userInputRequests?.some(request => request.id === group.item.id)
           ? <UserInputCard request={turn.userInputRequests.find(request => request.id === group.item.id)!} sessionId={resources.sessionId} turnId={turn.id} readOnly={resources.readOnly} onAnswered={resources.onUserInputAnswered ?? (() => {})} onNativeAnswer={resources.onNativeAnswer} />
           : <ItemView item={group.item} turnStatus={turn.status} timestamp={turn.itemTimestamps?.[group.item.id] || turn.startedAt} {...resources} />}</div>}</Fragment>;
     })}
     {renderInputs(turn.items.length)}
-    {turn.compactions?.filter(boundary => boundary.beforeItemIndex >= turn.items.length).map(boundary => <div key={boundary.segment} className="compact-divider" role="separator">上下文已压缩 · 第 {boundary.segment + 1} 段对话 · 后续重新计费</div>)}
+    <CompactionBoundaries turn={turn} index={turn.items.length} {...resources} />
     {subagentIndex < 0 && <SubagentConversations agents={subagents} {...resources} />}
     {resources.sessionId && turn.userInputRequests?.filter(request => !turn.items.some(item => item.id === request.id)).map(request => <UserInputCard key={request.id} request={request} sessionId={resources.sessionId!} turnId={turn.id} readOnly={resources.readOnly} onAnswered={resources.onUserInputAnswered ?? (() => {})} onNativeAnswer={resources.onNativeAnswer} />)}
   </>;

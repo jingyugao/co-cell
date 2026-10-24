@@ -70,11 +70,14 @@ export interface Settings {
  * with text-only input. An accepted steer returns that existing turn's ID.
  * An uncertain RPC outcome must not be automatically resubmitted. */
 export interface SubmitTurnResponse { turnId: string }
+export interface CompactionSelector { itemId?: string; segment?: number }
+/** GET /api/sessions/:id/compaction; an optional threadId must belong to this session's agent tree. */
+export interface CompactionContent { itemId?: string; segment: number; timestamp: string; summary: string | null }
 export interface Turn {
   /** Kind of the submission that started this native execution. */
   type?: InputRequestType;
   segment?: number;
-  compactions?: Array<{ segment: number; timestamp: string; beforeItemIndex: number }>;
+  compactions?: Array<{ segment: number; timestamp: string; beforeItemIndex: number; itemId?: string; summary?: string | null }>;
   nativeTurnId?: string;
   /** User messages injected into an accepted native turn after its original prompt. */
   additionalUserInputs?: string[];

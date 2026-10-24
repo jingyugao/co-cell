@@ -208,6 +208,7 @@ export class AppServerEventAdapter {
   constructor() { this.items = new Map(); this.usage = emptyUsage(); }
   seed(items) { this.items = new Map(items.map(item => [item.id, structuredClone(item)])); }
   convert(item) {
+    if (item.type === 'contextCompaction') return { id: item.id, type: 'context_compaction', status: 'completed' };
     const previous = this.items.get(item.id);
     switch (item.type) {
       case 'agentMessage': return { id: item.id, type: 'agent_message', text: item.text ?? previous?.text ?? '', ...(item.delivery ? { delivery: item.delivery } : {}), ...(item.questions ? { questions: item.questions } : {}) };

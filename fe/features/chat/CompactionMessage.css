@@ -1,0 +1,11 @@
+.compaction-message { margin: 10px 0; min-width: 0; }
+.compaction-message .compact-divider { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px; }
+.compaction-link { padding: 2px 0; border: 0; background: none; color: #64754b; font: inherit; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.compaction-link:focus-visible { outline: 2px solid #8a9c70; outline-offset: 3px; border-radius: 2px; }
+.compaction-content { margin-top: 10px; padding: 14px 18px; max-height: 65vh; overflow: auto; border: 1px solid #dce3d3; border-radius: 10px; background: #f7f9f3; overflow-wrap: anywhere; }
+.compaction-content .markdown { margin: 0; }
+.compaction-content > p { margin: 0; font-size: 12px; }
+@media (max-width: 700px) {
+  .compaction-link { min-height: 44px; }
+  .compaction-content { padding: 12px; }
+}

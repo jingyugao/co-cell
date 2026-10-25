@@ -2,7 +2,7 @@ import ImagesPage from './features/images/ImagesPage';
 import TurnContextStatus from './features/chat/TurnContextStatus';
 import BillingRail from './features/chat/LazyBillingRail';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { AppConfig, Session, SessionSummary, Settings } from '../protocol/types';
+import type { AppConfig, ProjectSummary, Session, SessionSummary, Settings } from '../protocol/types';
 import { useProjects } from './features/projects/useProjects';
 import { useProjectEntry } from './features/projects/useProjectEntry';
 import './features/projects/ProjectEntry.css';
@@ -119,7 +119,7 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const refreshConfig = useCallback(() => { void api<AppConfig>('/api/config').then(setConfig).catch(() => {}); }, []);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const { projects, refreshProjects, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject } = useProjects();
+  const { projects, hasProjectIndex, refreshProjects, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject } = useProjects();
   const [selectedProject, setSelectedProject] = useState<string | null>(() => readRoute().explicit ? readRoute().projectId : localStorage.getItem('codex-project'));
   const [selected, setSelected] = useState<string | null>(() => readRoute().explicit ? readRoute().sessionId : localStorage.getItem('codex-session'));
   const archivedProjectAccess = useRef<string | null>(null);
@@ -131,6 +131,8 @@ export default function App() {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const scopedBootstrap = useRef(false);
+  const bootstrapProject = useRef<ProjectSummary | null>(null);
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [openFile, setOpenFile] = useState<ProjectFileSelection | null>(null);
@@ -172,7 +174,7 @@ export default function App() {
   const projectReadOnly = Boolean(project && !canEnterProject(project));
   const projectDeleting = project?.status === 'deleting';
   const entryProjectId = !loading && page === 'chat' && project && canEnterProject(project) ? project.id : null;
-  const entry = useProjectEntry(entryProjectId, entryProjectId ?? '', enterProject);
+  const entry = useProjectEntry(entryProjectId, entryProjectId ?? '', enterProject, bootstrapProject.current);
   const historyReady = !project || (isProjectSandboxReady(project) && !entry.pending);
   const nativeEnabled = Boolean(config?.capabilities.nativeWebSocket && sessions.find(item => item.id === selected)?.settings.executionMode === 'sandbox');
   const nativeConnectEnabled = nativeEnabled && page === 'chat' && !sessions.find(item => item.id === selected)?.archivedAt && !projectReadOnly;
@@ -235,14 +237,20 @@ export default function App() {
     setSelected(target.sessionId); setSelectedProject(target.projectId); setError('');
   }
   useEffect(() => {
-    const update = () => {
+    const update = async () => {
       const url = window.location.pathname + window.location.search + window.location.hash;
       if (url === currentUrl.current) return;
       const route = readRoute();
       if (!allowNavigation(route.page)) { window.history.replaceState(null, '', currentUrl.current); return; }
       currentUrl.current = url; currentPage.current = route.page; setPage(route.page); setSidebar(false);
       if (loading) return; // Bootstrap resolves the latest URL after loading project/session records.
-      const target = resolveSelection(route, sessions, projects);
+      let projectList = projects;
+      if (!hasProjectIndex) {
+        try { projectList = await refreshProjects(); }
+        catch (error) { if (currentUrl.current === url) setError(message(error)); return; }
+        if (currentUrl.current !== url || window.location.pathname + window.location.search + window.location.hash !== url) return;
+      }
+      const target = resolveSelection(route, sessions, projectList);
       applySelection(target); setError(target.error ?? '');
       if (target.error && route.page === 'chat') navigate('projects', { sessionId: null, projectId: null }, true);
       if (!target.error) {
@@ -252,7 +260,7 @@ export default function App() {
     };
     window.addEventListener('popstate', update); window.addEventListener('hashchange', update);
     return () => { window.removeEventListener('popstate', update); window.removeEventListener('hashchange', update); };
-  }, [loading, sessions, projects]);
+  }, [loading, sessions, projects, hasProjectIndex, refreshProjects]);
   useEffect(() => {
     if (selectedProject) localStorage.setItem('codex-project', selectedProject); else localStorage.removeItem('codex-project');
   }, [selectedProject]);
@@ -263,8 +271,40 @@ export default function App() {
 
   useEffect(() => {
     let alive = true;
+    const controller = new AbortController();
+    let scopedRoute: string | undefined;
+    scopedBootstrap.current = false;
     markPageLoad('bootstrapStartedMs');
-    Promise.all([api<AppConfig>('/api/config'), api<SessionSummary[]>('/api/sessions'), refreshProjects()]).then(([nextConfig, list, projectList]) => {
+    const configRequest = api<AppConfig>('/api/config', { signal: controller.signal });
+    const sessionsRequest = api<SessionSummary[]>('/api/sessions', { signal: controller.signal });
+    const projectRequest = sessionsRequest.then(async list => {
+      const route = readRoute();
+      const savedSessionId = !route.explicit ? localStorage.getItem('codex-session') : null;
+      const preferredSession = list.find(item => item.id === (route.sessionId ?? savedSessionId));
+      const projectId = route.projectId ?? preferredSession?.projectId
+        ?? (!route.explicit ? localStorage.getItem('codex-project') : null);
+      if (route.page === 'chat' && !route.invalid && projectId) {
+        try {
+          const project = await enterProject(projectId, controller.signal);
+          // Validate the target without waiting for unrelated Sandbox observations.
+          // A changed URL or an invalid saved project still uses full selection.
+          if ((route.explicit || canEnterProject(project)) && JSON.stringify(readRoute()) === JSON.stringify(route)) {
+            scopedBootstrap.current = true;
+            bootstrapProject.current = project;
+            scopedRoute = JSON.stringify(route);
+            return [project];
+          }
+        } catch (error) { if (controller.signal.aborted) throw error; }
+      }
+      return refreshProjects();
+    });
+    Promise.all([configRequest, sessionsRequest, projectRequest]).then(async ([nextConfig, list, projectList]) => {
+      if (!alive) return;
+      if (scopedRoute && scopedRoute !== JSON.stringify(readRoute())) {
+        scopedBootstrap.current = false;
+        bootstrapProject.current = null;
+        projectList = await refreshProjects();
+      }
       if (!alive) return; setConfig(nextConfig); setSessions(list); setError('');
       const route = readRoute();
       const target = resolveSelection(route, list, projectList);
@@ -278,8 +318,13 @@ export default function App() {
         window.history.replaceState(null, '', url); currentUrl.current = url;
       }
     }).catch(err => { if (alive) { pageLoadFailure('bootstrap', 'failed'); setError(message(err)); } }).finally(() => { if (alive) setLoading(false); });
-    return () => { alive = false; };
+    return () => { alive = false; controller.abort(); };
   }, []);
+  useEffect(() => {
+    if (loading || entry.pending || !scopedBootstrap.current) return;
+    scopedBootstrap.current = false;
+    void refreshProjects().catch(() => {});
+  }, [loading, entry.pending, refreshProjects]);
   useEffect(() => { if (!loading) followOutput.current = true; }, [selected, loading]);
   useLayoutEffect(() => {
     const previous = olderScrollPosition.current;

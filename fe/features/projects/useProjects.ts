@@ -7,13 +7,14 @@ export type ProjectUpdate = Partial<Omit<ProjectValues, 'imageId' | 'imageVersio
 
 export function useProjects() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [hasProjectIndex, setHasProjectIndex] = useState(false);
   const sequence = useRef(0);
   const refreshing = useRef<Promise<ProjectSummary[]> | null>(null);
   const refreshProjects = useCallback(() => {
     if (refreshing.current) return refreshing.current;
     const current = ++sequence.current;
     const request = api<ProjectSummary[]>('/api/projects').then(list => {
-      if (current === sequence.current) setProjects(list);
+      if (current === sequence.current) { setProjects(list); setHasProjectIndex(true); }
       return list;
     }).finally(() => { if (refreshing.current === request) refreshing.current = null; });
     refreshing.current = request;
@@ -105,5 +106,5 @@ export function useProjects() {
   const archiveProject = useCallback((id: string, options: { useExistingBackup?: boolean } = {}) => runSandboxOperation(id, 'archive', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify(options) }),
   ), [runSandboxOperation]);
-  return { projects, refreshProjects, refreshProject, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
+  return { projects, hasProjectIndex, refreshProjects, refreshProject, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
 }

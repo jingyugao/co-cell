@@ -20,6 +20,11 @@ export class ReportRunner {
       const session = await this.deps.manager.read(call.sessionId);
       if (session.historyError || session.turns.some(turn => turn.status === 'running'))
         throw new HttpError(409, '生成会话仍在运行或状态无法确认，请先查看生成过程');
+      if (call.status === 'failed' && call.turnId && session.turns.some(turn => turn.status === 'completed'
+        && (turn.nativeTurnId === call.turnId || turn.id === call.turnId))) {
+        call.status = 'running';
+        delete call.error;
+      }
     }
   }
 
@@ -75,12 +80,19 @@ export class ReportRunner {
     call.turnId = turn.nativeTurnId ?? turn.id;
     call.status = 'running';
     if (turn.status === 'running' || turn.status === 'idle') {
+      delete call.cancelledAt;
       if (call.startedAt && Date.now() - Date.parse(call.startedAt) > 30 * 60_000) {
         await this.deps.manager.stop(call.sessionId);
         throw new Error('报告生成超过 30 分钟，已停止本任务的生成会话');
       }
       await save();
       return undefined;
+    }
+    // Native history can briefly expose an interrupted snapshot before the final
+    // completed snapshot becomes visible. Only observe; never repeat the model call.
+    if (turn.status === 'cancelled' && !turn.error) {
+      call.cancelledAt ??= new Date().toISOString();
+      if (Date.now() - Date.parse(call.cancelledAt) < 10_000) { await save(); return undefined; }
     }
     const usage = turn.usage;
     const validTokens = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
@@ -103,6 +115,7 @@ export class ReportRunner {
       await save();
       throw new Error(call.error);
     }
+    delete call.cancelledAt;
     delete call.error;
     return result;
   }

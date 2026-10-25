@@ -7,6 +7,8 @@ export interface ReportCall {
   turnId?: string;
   usage?: ReportUsage;
   startedAt?: string;
+  /** Allow a briefly stale interrupted snapshot to settle without resubmitting input. */
+  cancelledAt?: string;
   error?: string;
 }
 

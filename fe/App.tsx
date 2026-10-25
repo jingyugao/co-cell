@@ -1,6 +1,6 @@
 import ImagesPage from './features/images/ImagesPage';
 import TurnContextStatus from './features/chat/TurnContextStatus';
-import BillingRail from './features/chat/BillingRail';
+import BillingRail from './features/chat/LazyBillingRail';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { AppConfig, Session, SessionSummary, Settings } from '../protocol/types';
 import { useProjects } from './features/projects/useProjects';

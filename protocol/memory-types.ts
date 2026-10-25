@@ -1,3 +1,5 @@
+import type { ConversationMaterialFile } from './conversation-materials-types.js';
+
 export type MemoryStatus = 'queued' | 'exporting' | 'cleaning' | 'ready' | 'failed' | 'skipped';
 
 export interface MemoryRecord {
@@ -17,15 +19,10 @@ export interface MemoryRecord {
   updatedAt: string;
 }
 
-export interface MemoryFile {
+export interface MemoryFile extends ConversationMaterialFile {
   id: string;
-  /** Native identity; older material versions use their stable relative path. */
-  threadId?: string;
-  path: string;
-  agentName: string;
-  contextIndex: number;
-  byteLength: number;
-  sha256: string;
+  /** Shared material cache; absent on legacy memory artifacts. */
+  materialId?: string;
 }
 
 export interface MemoryList {

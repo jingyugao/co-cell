@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { constants } from 'node:fs';
-import { mkdir, mkdtemp, open, readdir, realpath, rename, rm } from 'node:fs/promises';
-import { join, posix, sep } from 'node:path';
+import { mkdir, mkdtemp, readdir, rename, rm } from 'node:fs/promises';
+import { join, posix } from 'node:path';
 import type { MemoryDetail, MemoryFileContent } from '../../protocol/memory-types.js';
 import { CellboxError, type CellboxClient } from '../../packages/sandbox/src/providers/cellbox/client.js';
 import { HttpError, redactCredentials } from '../../util/errors.js';
@@ -9,6 +8,9 @@ import { sandboxMounts } from '../../util/sandbox-mounts.js';
 import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import { prepareMaterials } from './materials.js';
+import { readMaterialContent } from '../conversation-materials/content.js';
+import type { ConversationMaterials } from '../../protocol/conversation-materials-types.js';
+import type { ConversationMaterialsService } from '../conversation-materials/service.js';
 import { memoryRecord, type MemoryRepository, type StoredMemory } from './repository.js';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -25,6 +27,7 @@ interface Dependencies {
   coordinator?: SharedCoordinator;
   logger?: { write(event: Record<string, unknown>): void };
   prepare?: typeof prepareMaterials;
+  materials?: ConversationMaterialsService;
 }
 
 /** The worker only exports suspended disks. It never starts an agent or resumes a Box. */
@@ -47,31 +50,10 @@ export class MemoryService {
     const record = await this.requireRecord(id);
     const file = record.status === 'ready' && record.files.find(file => file.id === fileId);
     if (!file) throw new HttpError(404, '材料文件不存在');
+    if (file.materialId && this.deps.materials) return this.deps.materials.content(file.materialId, file.path, offset);
     if (!/^(?:main|agent-[1-9]\d*)\/\d{3,}\.md$/.test(file.path)) throw new Error('Invalid memory file metadata');
     if (!record.artifactId || !/^[a-f\d-]{36}$/i.test(record.artifactId)) throw new Error('Invalid memory artifact metadata');
-    const root = await realpath(join(this.directory(record), 'artifacts', record.artifactId)).catch(error => {
-      if (missing(error)) throw new HttpError(404, '材料文件已不存在');
-      throw error;
-    });
-    const path = await realpath(join(root, file.path)).catch(error => {
-      if (missing(error)) throw new HttpError(404, '材料文件已不存在');
-      throw error;
-    });
-    if (!path.startsWith(root + sep)) throw new HttpError(404, '材料文件不存在');
-    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    try {
-      const info = await handle.stat();
-      if (!info.isFile() || info.size !== file.byteLength) throw new HttpError(409, '材料文件已变化');
-      if (offset > info.size) throw new HttpError(400, '文件读取位置超出范围');
-      const limit = 256 * 1024;
-      const buffer = Buffer.alloc(Math.min(limit + 3, info.size - offset));
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
-      if (bytesRead && (buffer[0] & 0xc0) === 0x80) throw new HttpError(400, '文件读取位置不在字符边界');
-      let end = Math.min(limit, bytesRead);
-      while (end < bytesRead && (buffer[end] & 0xc0) === 0x80) end++;
-      const content = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, end));
-      return { content, nextOffset: offset + end < info.size ? offset + end : null, totalBytes: info.size };
-    } finally { await handle.close(); }
+    return readMaterialContent(join(this.directory(record), 'artifacts', record.artifactId), file.path, offset, file.byteLength);
   }
 
   async retry(id: string, updatedAt: string) {
@@ -187,6 +169,13 @@ export class MemoryService {
     if (!await this.source(record)) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
     const box = await this.deps.client.getBox(record.sourceBoxId, signal);
     if (box.phase !== 'suspended' || box.operationId) return;
+    const cached = await this.deps.materials?.cached({ sessionId: record.sessionId, threadId: record.sourceThreadId,
+      sourceUpdatedAt: record.sourceUpdatedAt, boxId: record.sourceBoxId });
+    if (cached) {
+      assertActive();
+      if (!await this.source(record)) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
+      await this.publishMaterial(record, cached); return;
+    }
     const home = '/home/agent/workspace/.cocell/codex';
     const mount = (sandboxMounts(box) ?? []).filter(m => home === m.mountPath || home.startsWith(m.mountPath.replace(/\/$/, '') + '/'))
       .sort((a, b) => b.mountPath.length - a.mountPath.length)[0];
@@ -232,6 +221,15 @@ export class MemoryService {
       const info = await this.deps.client.getVolumeExport(record.volumeId, record.exportId, signal);
       if (info.sizeBytes > 18 * 1024 ** 3) throw new Error('对话导出超过 18 GiB 限制');
       await this.deps.client.downloadVolumeExport(record.volumeId, record.exportId, archive, info, signal);
+      if (this.deps.materials) {
+        const material = await this.deps.materials.archive({ sessionId: record.sessionId, threadId: record.sourceThreadId,
+          sourceUpdatedAt: record.sourceUpdatedAt, boxId: record.sourceBoxId }, archive, signal,
+        async () => { if (!await this.source(record)) throw new HttpError(409, '对话已变化，未发布旧版本材料'); });
+        assertActive();
+        if (!await this.source(record)) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
+        await this.publishMaterial(record, material);
+        return;
+      }
       const prepared = await (this.deps.prepare ?? prepareMaterials)(archive, join(work, 'files'), record.sourceThreadId, signal);
       assertActive();
       if (!await this.source(record)) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
@@ -282,6 +280,17 @@ export class MemoryService {
   }
 
   private directory(record: StoredMemory) { return join(this.deps.directory, record.id); }
+  private async publishMaterial(record: StoredMemory, material: ConversationMaterials) {
+    record.artifactId = material.id;
+    record.files = material.files.map(file => ({ ...file, id: randomUUID(), materialId: material.id }));
+    record.firstMessage = material.firstMessage;
+    record.fileCount = record.files.length;
+    record.encryptedCount = material.encryptedCount;
+    record.cleanedAt = new Date().toISOString();
+    record.status = 'ready';
+    delete record.error;
+    await this.deps.repository.save(record);
+  }
   private async requireRecord(id: string) {
     const record = await this.deps.repository.get(id);
     if (!record) throw new HttpError(404, '记忆材料不存在');

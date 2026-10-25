@@ -11,7 +11,7 @@ import type { ReportCall } from './types.js';
 export class ReportRunner {
   constructor(private deps: {
     state: Pick<WebStateStore, 'listProjects'>;
-    manager: Pick<SessionManager, 'create' | 'startTurn' | 'read' | 'stop'>;
+    manager: Pick<SessionManager, 'create' | 'startTurn' | 'read' | 'readProject' | 'stop'>;
     models: Pick<ModelService, 'catalog'>;
   }) {}
 
@@ -28,7 +28,11 @@ export class ReportRunner {
     if (!call.sessionId) {
       const projects = (await this.deps.state.listProjects()).filter(project => project.name.trim().toLowerCase() === 'system'
         && project.status === 'active' && !project.removedAt);
-      if (projects.length !== 1 || !projects[0].sandbox || projects[0].sandbox.status !== 'ready')
+      if (projects.length !== 1 || !projects[0].sandbox)
+        throw new HttpError(409, '请先准备一个可用的 system 项目；报告任务不会创建或恢复 Sandbox');
+      // Persistent metadata deliberately stores status=unknown. Observe Cellbox through the read path.
+      const project = await this.deps.manager.readProject(projects[0].id);
+      if (project.sandbox?.id !== projects[0].sandbox.id || project.sandbox.status !== 'ready')
         throw new HttpError(409, '请先准备一个可用的 system 项目；报告任务不会创建或恢复 Sandbox');
       const catalog = await this.deps.models.catalog();
       const entry = catalog.channels.filter(channel => channel.enabled).flatMap(channel => channel.models)
@@ -39,7 +43,6 @@ export class ReportRunner {
           sandboxMode: 'read-only', webSearchMode: 'disabled', networkAccessEnabled: false } });
       call.sessionId = session.id;
       await save();
-      if (session.sandbox?.status !== 'ready') throw new Error('system 项目的 Sandbox 尚未就绪');
     }
     if (call.status === 'pending') {
       call.status = 'submitting';

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { markPageLoad, pageLoadFailure } from '../../lib/page-load';
 import type { NativeSessionConnection } from '../../../protocol/native-app-server';
 import type { Session, Turn } from '../../../protocol/types';
 import { applySdkEvent } from '../../../util/session-events';
@@ -186,7 +187,9 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
         }, error => errorRef.current(error.message));
         client = attemptClient;
         clientRef.current = attemptClient;
+        markPageLoad('websocketStartedMs', id);
         await attemptClient.connect(connection.threadId);
+        markPageLoad('websocketConnectedMs', id);
         if (!alive || attempt !== generation || client !== attemptClient) { attemptClient.close(); return; }
         const { value: history, quiet } = connection.threadId === null
           ? { value: nativeIds(connection.session), quiet: true }
@@ -196,6 +199,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
             return { value: mergeHistory(id, snapshot.value), quiet: snapshot.quiet };
           })();
         if (!alive || attempt !== generation || client !== attemptClient || clientRef.current !== attemptClient) return;
+        markPageLoad('historyReadyMs', id);
         if (!quiet) errorRef.current('会话历史在初始化期间持续变化；已显示最近读取的历史，请稍后刷新。');
         const currentTurn = [...history.turns].reverse().find(turn => turn.status === 'running');
         adapterRef.current.seed(currentTurn?.items ?? []);
@@ -207,6 +211,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
         retryDelay = 500; markConnected(true);
       } catch (error) {
         if (!alive || attempt !== generation) return;
+        pageLoadFailure('native_connection', 'failed', id);
         generation++;
         const previousClient = client;
         client = undefined;

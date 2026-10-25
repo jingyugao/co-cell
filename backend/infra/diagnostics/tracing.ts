@@ -46,6 +46,11 @@ function isProjectLifecycleRequest(method: string, path: string) {
   return method === 'POST' && /^\/api\/projects\/[^/]+\/(?:open|sandbox\/resume)$/.test(path);
 }
 
+function clientPageViewId(headers: Headers): string | undefined {
+  const value = headers.get('X-CoCell-Page-View')?.trim();
+  return value && /^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(value) ? value : undefined;
+}
+
 /** Export only traces. Export failure never blocks an application operation. */
 export function initializeTracing(): (() => Promise<void>) | undefined {
   if (process.env.OTEL_SDK_DISABLED === 'true' ||
@@ -66,7 +71,12 @@ export const traceHttpRequest: MiddlewareHandler = async (c, next) => {
   const parent = propagation.extract(context.active(), Object.fromEntries(c.req.raw.headers));
   return context.with(parent, async () => {
     const tracer = trace.getTracer('co-cell.http');
-    const attributes = { 'http.request.method': c.req.method, 'url.path': c.req.path };
+    const pageViewId = clientPageViewId(c.req.raw.headers);
+    const attributes = {
+      'http.request.method': c.req.method,
+      'url.path': c.req.path,
+      ...(pageViewId ? { 'client.page_view_id': pageViewId } : {}),
+    };
     if (!isProjectLifecycleRequest(c.req.method, c.req.path)) {
       return tracer.startActiveSpan('http.request', { kind: SpanKind.SERVER, attributes }, async span => {
         try {

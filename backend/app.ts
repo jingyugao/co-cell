@@ -7,6 +7,7 @@ import type { KnowledgeService } from './knowledge/service.js';
 import { installImageRoutes } from './images/routes.js';
 import type { ImageCatalog } from './images/service.js';
 import { traceHttpRequest } from './infra/diagnostics/tracing.js';
+import { pageLoadReportSchema, recordPageLoad, type PageLoadLogWriter } from './infra/diagnostics/page-load.js';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
@@ -32,7 +33,7 @@ import { installPwaAssets } from './infra/http/pwa.js';
 import { installFileFavoriteRoutes } from './file-favorites/routes.js';
 import type { FileFavoriteRepository } from './file-favorites/repository.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository, knowledge?: KnowledgeService) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository, knowledge?: KnowledgeService, runtimeLog?: PageLoadLogWriter) {
   const app = new Hono();
   app.get('/healthz', c => c.text('ok'));
   app.use('/api/*', traceHttpRequest);
@@ -49,7 +50,8 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
       || c.req.method === 'POST' && /^\/api\/projects\/[^/]+\/(?:open|sandbox\/resume)$/.test(pathname);
     const sessionScoped = c.req.method === 'GET' && pathname === '/api/sessions'
       || /^\/api\/sessions\/[^/]+(?:\/|$)/.test(pathname);
-    if (pathname.startsWith('/api/tool-runtime/') || projectScoped || sessionScoped) return next();
+    if (pathname === '/api/diagnostics/page-load' && c.req.method === 'POST'
+      || pathname.startsWith('/api/tool-runtime/') || projectScoped || sessionScoped) return next();
     await manager.refreshSharedState();
     await next();
   });
@@ -70,9 +72,12 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
     await next();
   });
   const regularBodyLimit = bodyLimit({ maxSize: 12 * 1024 * 1024, onError: c => c.json({ error: '请求过大，图片最大 10 MB' }, 413) });
+  const pageLoadBodyLimit = bodyLimit({ maxSize: 48 * 1024, onError: c => c.json({ error: '请求过大' }, 413) });
   const packageBodyLimit = bodyLimit({ maxSize: 48 * 1024 * 1024, onError: c => c.json({ error: '工具包请求过大，文件总量最大 32 MiB' }, 413) });
   app.use('/api/*', (c, next) => c.req.method === 'POST' && c.req.path === '/api/tool-packages'
-    ? packageBodyLimit(c, next) : regularBodyLimit(c, next));
+    ? packageBodyLimit(c, next)
+    : c.req.method === 'POST' && c.req.path === '/api/diagnostics/page-load'
+      ? pageLoadBodyLimit(c, next) : regularBodyLimit(c, next));
   app.onError((error, c) => {
     const detail = providerError(error);
     if (detail) return c.json({ error: detail.message, code: detail.code, ...(detail.upstreamStatus ? { upstreamStatus: detail.upstreamStatus } : {}) }, detail.status as 400);
@@ -85,6 +90,15 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
 
   app.get('/api/config', async c => c.json(models ? { ...config, modelOptions: await models.options(),
     defaults: { ...config.defaults, ...await models.defaultSelection() } } : config));
+  app.post('/api/diagnostics/page-load', async c => {
+    let payload: unknown;
+    try { payload = await c.req.json(); }
+    catch { return c.json({ error: '请求 JSON 格式错误' }, 400); }
+    const parsed = pageLoadReportSchema.safeParse(payload);
+    if (!parsed.success) return c.json({ error: '诊断数据格式错误' }, 400);
+    recordPageLoad(runtimeLog, parsed.data, c.req.header('user-agent'));
+    return c.body(null, 204);
+  });
   if (models) installModelRoutes(app, models);
   installMemoryRoutes(app, memory);
   installKnowledgeRoutes(app, knowledge);

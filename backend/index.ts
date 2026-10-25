@@ -3,6 +3,11 @@ import { readSystemRequirementInfo } from './projects/requirements.js';
 import { SystemTools } from './execution/system-tools.js';
 import { ModelService } from './models/service.js';
 import { MemoryService } from './memory/service.js';
+import { ConversationMaterialsService } from './conversation-materials/service.js';
+import { ConversationMaterialCollector } from './conversation-materials/collector.js';
+import { readLiveMaterialThreads } from './conversation-materials/live-reader.js';
+import { ReportService } from './reports/service.js';
+import { ReportRunner } from './reports/runner.js';
 import { KnowledgeService } from './knowledge/service.js';
 import { HindsightClient } from './knowledge/client.js';
 import { createProjectFileReader } from './workspaces/project-file-reader.js';
@@ -164,19 +169,27 @@ manager.setModelService(models);
 manager.setProjectFileReader(createProjectFileReader(cellboxProvider.client, (project, path, request) =>
   runtime.fileResponse({ id: project.id, projectId: project.id, settings: { workingDirectory: project.workingDirectory },
     sandbox: project.sandbox, sandboxMounts: project.sandboxMounts, updatedAt: project.updatedAt }, path, request)));
-const memory = new MemoryService({ repository: webState.memoryRepository, state: webState,
+const materials = new ConversationMaterialsService({ repository: webState.materialsRepository,
+  directory: resolve(sharedDataRoot, 'runtime/conversation-materials'), coordinator });
+const materialCollector = new ConversationMaterialCollector({ state: webState, client: cellboxProvider.client, materials,
+  live: (session, signal) => readLiveMaterialThreads(appServerReader, session, signal),
+  directory: resolve(sharedDataRoot, 'runtime/conversation-exports'), logger: runtimeLog });
+const memory = new MemoryService({ repository: webState.memoryRepository, state: webState, materials,
   client: cellboxProvider.client, directory: resolve(sharedDataRoot, 'runtime/memory'), coordinator, logger: runtimeLog });
+const reports = new ReportService({ repository: webState.reportRepository, state: webState, materials, collector: materialCollector,
+  runner: new ReportRunner({ state: webState, manager, models }), directory: resolve(sharedDataRoot, 'runtime/reports'), coordinator, logger: runtimeLog });
 const knowledge = new KnowledgeService({ repository: webState.knowledgeRepository, materials: webState.memoryRepository,
   memory, state: webState, directory: resolve(sharedDataRoot, 'runtime/knowledge'), coordinator, logger: runtimeLog,
   ...(process.env.HINDSIGHT_API_URL?.trim() ? { client: new HindsightClient({ url: process.env.HINDSIGHT_API_URL.trim(),
     bankId: process.env.HINDSIGHT_BANK_ID?.trim() || 'cocell', apiKey: process.env.HINDSIGHT_API_KEY }) } : {}) });
 // Project tables must exist before the Secret schema's foreign keys are created.
-const initializeSchemas = async () => { await webState.init(); await webState.fileFavoriteRepository.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); await webState.knowledgeRepository.init(); };
+const initializeSchemas = async () => { await webState.init(); await webState.fileFavoriteRepository.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); await webState.knowledgeRepository.init(); await webState.materialsRepository.init(); await webState.reportRepository.init(); };
 if (coordinator) await coordinator.run('cocell-schema-init', initializeSchemas);
 else await initializeSchemas();
 await manager.init();
 memory.start();
 knowledge.start();
+reports.start();
 // Paused instances are configured on resume. Running instances survive a web
 // service restart; compare their durable acknowledgements before writing slots.
 const reconcileProjects = async () => {
@@ -212,7 +225,7 @@ const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
   inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), notifications,
-  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge, runtimeLog);
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge, runtimeLog, reports);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }
@@ -263,7 +276,7 @@ let shuttingDown = false;
 // Periodic sandbox archive for active projects — every 30 minutes
 const archiveInterval = setInterval(() => { void manager.scheduledArchive().catch(() => {}); }, 60 * 1000);
 archiveInterval.unref();
-async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await nativeRelay.close(); await previewProxy?.close(); await knowledge.close(); await memory.close(); await manager.close(); await cellboxRuntime.close();
+async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await nativeRelay.close(); await previewProxy?.close(); await reports.close(); await knowledge.close(); await memory.close(); await manager.close(); await cellboxRuntime.close();
   clearInterval(archiveInterval);
   await coordinator?.close();
   await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); await shutdownTracing?.(); }

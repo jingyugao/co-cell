@@ -6,6 +6,7 @@ export interface ModelTokenRates {
 
 /** Standard short-context API prices, in USD per million tokens. */
 export const MODEL_TOKEN_RATES: Readonly<Record<string, ModelTokenRates>> = {
+  'gpt-6-luna': { inputUsdPerMillion: 0.1, cachedInputUsdPerMillion: 0.01, outputUsdPerMillion: 0.5 },
   'gpt-6-astra': { inputUsdPerMillion: 10, cachedInputUsdPerMillion: 1, outputUsdPerMillion: 50 },
   'gpt-5.6-sol': { inputUsdPerMillion: 4, cachedInputUsdPerMillion: 0.4, outputUsdPerMillion: 20 },
   'gpt-5.6-terra': { inputUsdPerMillion: 2, cachedInputUsdPerMillion: 0.2, outputUsdPerMillion: 12 },

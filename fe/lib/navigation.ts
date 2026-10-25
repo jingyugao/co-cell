@@ -1,10 +1,10 @@
 import type { ProjectSummary, SessionSummary } from '../../protocol/types';
 import { canEnterProject } from '../../util/project-sandbox';
 
-export type Page = 'chat' | 'sandboxes' | 'projects' | 'files' | 'favorites' | 'connections' | 'images' | 'models' | 'memory' | 'knowledge';
+export type Page = 'chat' | 'sandboxes' | 'projects' | 'files' | 'favorites' | 'connections' | 'images' | 'models' | 'memory' | 'knowledge' | 'reports';
 export type Selection = { sessionId: string | null; projectId: string | null };
 const isActiveProject = (project: ProjectSummary) => (project.status ?? (project.archivedAt ? 'archived' : 'active')) === 'active';
-const pages: Page[] = ['sandboxes', 'projects', 'files', 'favorites', 'connections', 'images', 'models', 'memory', 'knowledge'];
+const pages: Page[] = ['sandboxes', 'projects', 'files', 'favorites', 'connections', 'images', 'models', 'memory', 'knowledge', 'reports'];
 
 export function readRoute(location = window.location) {
   const page: Page = pages.includes(location.hash.slice(1) as Page) ? location.hash.slice(1) as Page : 'chat';

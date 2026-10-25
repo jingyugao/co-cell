@@ -1,6 +1,8 @@
 import { MySqlPreviewGrantStore } from '../../access/preview-grants.js';
 import { MySqlModelRepository } from '../../models/repository.js';
 import { MySqlMemoryRepository } from '../../memory/repository.js';
+import { MySqlMaterialsRepository } from '../../conversation-materials/repository.js';
+import { MySqlReportRepository } from '../../reports/repository.js';
 import { MySqlKnowledgeRepository } from '../../knowledge/repository.js';
 import { MySqlFileFavoriteRepository } from '../../file-favorites/repository.js';
 import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
@@ -46,6 +48,8 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   readonly previewGrants: MySqlPreviewGrantStore;
   readonly modelRepository: MySqlModelRepository;
   readonly memoryRepository: MySqlMemoryRepository;
+  readonly materialsRepository: MySqlMaterialsRepository;
+  readonly reportRepository: MySqlReportRepository;
   readonly knowledgeRepository: MySqlKnowledgeRepository;
   readonly fileFavoriteRepository: MySqlFileFavoriteRepository;
   readonly secretRepository: MySqlSecretRepository;
@@ -56,6 +60,8 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     this.previewGrants = new MySqlPreviewGrantStore(this.pool);
     this.modelRepository = new MySqlModelRepository(this.pool);
     this.memoryRepository = new MySqlMemoryRepository(this.pool);
+    this.materialsRepository = new MySqlMaterialsRepository(this.pool);
+    this.reportRepository = new MySqlReportRepository(this.pool);
     this.knowledgeRepository = new MySqlKnowledgeRepository(this.pool);
     this.fileFavoriteRepository = new MySqlFileFavoriteRepository(this.pool);
     this.secretRepository = new MySqlSecretRepository(this.pool);

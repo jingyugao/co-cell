@@ -21,6 +21,8 @@ const message = (error: unknown) => redactCredentials(error instanceof Error ? e
 const localDate = (now: Date) => new Date(now.getTime() + 8 * 3_600_000).toISOString().slice(0, 10);
 const instant = (date: string) => new Date(`${date}T00:00:00+08:00`);
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+const periodDescription = (report: StoredWorkReport) => `${report.periodStart} 至 ${report.periodEnd}（不含结束日，北京时间）`
+  + (report.asOf ? `；这是本周进展快照，只统计截至 ${report.asOf} 的内容，本周尚未结束` : '');
 
 /** Split only when necessary, prefer whole Markdown messages, and never drop an oversized message. */
 export function reportChunks(text: string): string[] {
@@ -79,10 +81,13 @@ export class ReportService {
   }
   async generate(kind: ReportKind, date: string) {
     const period = reportPeriod(kind, date);
-    if (period.periodEnd > localDate(this.now())) throw new HttpError(400, '请选择已经结束的完整自然日或自然周');
     const now = this.now().toISOString();
+    const today = localDate(new Date(now));
+    const preview = kind === 'weekly' && period.periodStart <= today && period.periodEnd > today;
+    if (period.periodEnd > today && !preview) throw new HttpError(400, '请选择已结束的自然日、本周或已经结束的自然周');
     const settings = await this.settings();
     return publicReport(await this.deps.repository.insert({ ...period, id: randomUUID(), runId: randomUUID(), kind,
+      ...(preview ? { asOf: now } : {}),
       status: 'queued', model: settings.model, settings, sources: [], calls: [], sourceCount: 0, missingCount: 0,
       sessionIds: [], usage: emptyUsage(), createdAt: now, updatedAt: now }));
   }
@@ -192,7 +197,8 @@ export class ReportService {
       for (let at = instant(report.periodStart).getTime(); at < instant(report.periodEnd).getTime(); at += DAY) {
         const date = localDate(new Date(at));
         const daily = await this.deps.repository.find('daily', date);
-        if (daily?.status !== 'ready' || daily.missingCount || daily.snapshotCount) continue;
+        if (daily?.status !== 'ready' || daily.missingCount || daily.snapshotCount
+          || report.asOf && instant(daily.periodEnd).getTime() > Date.parse(report.asOf)) continue;
         const body = await this.read(join(this.directory(daily), 'report.md'));
         if (!body) continue;
         readyDays.add(date); report.dailyReportIds.push(daily.id);
@@ -228,9 +234,11 @@ export class ReportService {
         const parts: string[] = [];
         let bytes = 0;
         for (let at = instant(report.periodStart).getTime(); at < instant(report.periodEnd).getTime(); at += DAY) {
+          const until = Math.min(at + DAY, report.asOf ? Date.parse(report.asOf) : Infinity);
+          if (at >= until) break;
           const date = localDate(new Date(at));
           if (readyDays.has(date)) continue;
-          const selected = await this.deps.materials.period(material.id, new Date(at), new Date(at + DAY), signal);
+          const selected = await this.deps.materials.period(material.id, new Date(at), new Date(until), signal);
           for (const part of selected) {
             const content = `# ${date} · ${part.path}\n\n${part.content}`;
             bytes += Buffer.byteLength(content);
@@ -269,7 +277,7 @@ export class ReportService {
       const chunks = reportChunks(input);
       const summaries: string[] = [];
       for (let index = 0; index < chunks.length; index++) {
-        const prompt = `${reportRules}\n\n${summaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n统计期间：${report.periodStart} 至 ${report.periodEnd}（不含结束日，北京时间）。\n`
+        const prompt = `${reportRules}\n\n${summaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n统计期间：${periodDescription(report)}。\n`
           + `项目：${source.projectName}\n对话：${source.sessionTitle}\n来源：[原始对话](/sessions/${source.sessionId})\n`
           + (source.isSnapshot ? `此来源含进行中轮次，采集于${source.collectedAt}。只描述快照中可证实的进展，不能推断最终完成。\n` : '')
           + `材料分段：${index + 1}/${chunks.length}\n\n<工作材料>\n${chunks[index]}\n</工作材料>`;
@@ -298,7 +306,7 @@ export class ReportService {
     if (folded === undefined) return;
     report.status = 'generating'; await save();
     const gaps = missing.length ? `\n材料缺失：${missing.map(source => `${source.projectName} / ${source.sessionTitle}`).join('；')}。报告必须注明覆盖不完整，不可推断这些事项没有进展。` : '';
-    const prompt = `${reportRules}\n\n${report.settings.prompts[report.kind]}\n\n统计期间：${report.periodStart} 至 ${report.periodEnd}（不含结束日，北京时间）。${gaps}\n控制在 800—1500 个汉字左右。\n\n<业务进展材料>\n${folded}\n</业务进展材料>`;
+    const prompt = `${reportRules}\n\n${report.settings.prompts[report.kind]}\n\n统计期间：${periodDescription(report)}。${gaps}\n控制在 800—1500 个汉字左右。\n\n<业务进展材料>\n${folded}\n</业务进展材料>`;
     const body = await this.call(report, prompt, `${report.kind === 'daily' ? '工作日报' : '工作周报'} · ${report.periodStart}`, false, save);
     if (body === undefined) return;
     await this.complete(report, body + (missing.length ? `\n\n> 本报告有 ${missing.length} 条对话材料未能读取，覆盖不完整。` : ''), save);
@@ -311,7 +319,7 @@ export class ReportService {
       const results: string[] = [];
       for (const chunk of reportChunks(current)) {
         const result = await this.call(report, `${reportRules}\n\n将下列业务进展摘要归并为不超过 1200 个汉字的中间摘要。`
-          + `保留业务事项、进展、状态变化、验证边界和来源。报告期间：${report.periodStart} 至 ${report.periodEnd}（不含结束日）。\n\n${chunk}`,
+          + `保留业务事项、进展、状态变化、验证边界和来源。报告期间：${periodDescription(report)}。\n\n${chunk}`,
         '业务进展归并', true, save);
         if (result === undefined) return;
         results.push(result);
@@ -354,6 +362,7 @@ export class ReportService {
   }
 
   private async complete(report: StoredWorkReport, body: string, save: () => Promise<void>) {
+    if (report.asOf) body = `> 本周进展快照，统计截至 ${new Date(report.asOf).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）。本周尚未结束，正式周报另行生成。\n\n${body}`;
     await this.write(join(this.directory(report), 'report.md'), body);
     report.status = 'ready'; report.generatedAt = this.now().toISOString(); delete report.error;
     await save();

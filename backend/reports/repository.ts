@@ -44,7 +44,7 @@ export class MySqlReportRepository implements ReportRepository {
       scanned_at DATETIME(3) NOT NULL,CHECK(id=1)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS work_reports (
-      id CHAR(36) PRIMARY KEY,kind ENUM('daily','weekly') NOT NULL,period_start DATE NOT NULL,
+      id CHAR(36) PRIMARY KEY,kind ENUM('daily','weekly','weekly-preview') NOT NULL,period_start DATE NOT NULL,
       document JSON NOT NULL,status ENUM('queued','collecting','summarizing','generating','ready','failed') NOT NULL,
       created_at DATETIME(3) NOT NULL,updated_at DATETIME(3) NOT NULL,
       UNIQUE KEY work_report_period(kind,period_start),INDEX work_report_pending(status,created_at),
@@ -122,11 +122,13 @@ export class MySqlReportRepository implements ReportRepository {
 
   async insert(record: StoredWorkReport) {
     const safe = withoutSourceSummaries(record);
+    // A current-week snapshot must never occupy the complete weekly report's deduplication key.
+    const kind = safe.asOf ? 'weekly-preview' : safe.kind;
     await this.pool.query(`INSERT IGNORE INTO work_reports(id,kind,period_start,document,status,created_at,updated_at)
-      VALUES(?,?,?,CAST(? AS JSON),?,?,?)`, [safe.id, safe.kind, safe.periodStart, document(safe), safe.status,
+      VALUES(?,?,?,CAST(? AS JSON),?,?,?)`, [safe.id, kind, safe.periodStart, document(safe), safe.status,
       new Date(safe.createdAt), new Date(safe.updatedAt)]);
-    const stored = await this.find(safe.kind, safe.periodStart);
-    if (!stored) throw new Error('日报记录插入后未能读取');
+    const stored = await this.one('kind=? AND period_start=?', [kind, safe.periodStart]);
+    if (!stored) throw new Error('报告记录插入后未能读取');
     return stored;
   }
 

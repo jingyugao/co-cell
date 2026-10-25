@@ -17,19 +17,20 @@ const addDays = (date: string, days: number) => {
   return value.toISOString().slice(0, 10);
 };
 const beijingToday = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
-const previousWeekMonday = (today: string) => {
-  const weekday = new Date(`${today}T00:00:00Z`).getUTCDay() || 7;
-  return addDays(today, -weekday - 6);
+const mondayOf = (date: string) => {
+  const weekday = new Date(`${date}T00:00:00Z`).getUTCDay() || 7;
+  return addDays(date, 1 - weekday);
 };
 const dateLimit = (kind: ReportKind, today = beijingToday()) => kind === 'daily'
   ? addDays(today, -1)
-  : addDays(previousWeekMonday(today), 6);
+  : today;
 const defaultDate = (kind: ReportKind, today = beijingToday()) => kind === 'daily'
   ? addDays(today, -1)
-  : previousWeekMonday(today);
-const dateRange = (kind: ReportKind, date: string) => kind === 'daily'
+  : mondayOf(today);
+const dateRange = (kind: ReportKind, date: string, today = beijingToday()) => kind === 'daily'
   ? date
-  : `${addDays(date, -(new Date(`${date}T00:00:00Z`).getUTCDay() || 7) + 1)} 至 ${addDays(date, 7 - (new Date(`${date}T00:00:00Z`).getUTCDay() || 7))}`;
+  : mondayOf(date) === mondayOf(today) ? `${mondayOf(date)} 至现在（本周快照，北京时间）`
+    : `${mondayOf(date)} 至 ${addDays(mondayOf(date), 6)}`;
 const feeLabel = (value: number | null, unknownCalls: number) => value === null ? '本次新增预估费用未知'
   : unknownCalls > 0 ? `本次新增预估费用（文本估算） $${value.toFixed(4)}（实际以渠道账单为准）`
     : `本次新增预估费用 $${value.toFixed(4)}`;
@@ -40,6 +41,10 @@ const lastIncludedDay = (exclusiveEnd: string) => {
 };
 const range = (start: string, exclusiveEnd: string) => `${dateOnly(start)} 至 ${lastIncludedDay(exclusiveEnd)}`;
 const period = (report: WorkReport) => range(report.periodStart, report.periodEnd);
+const reportAsOf = (report: WorkReport) => report.asOf;
+const reportPeriod = (report: WorkReport) => reportAsOf(report)
+  ? `${dateOnly(report.periodStart)} 至 ${dateLabel(reportAsOf(report))}（本周快照）`
+  : period(report);
 type SourceMaterial = { content?: string; nextOffset: number | null; totalBytes: number; loading: boolean; error?: string; open: boolean };
 const sourceFingerprint = (source?: ReportDetail['sources'][number]) => source ? `${source.materialId ?? ''}|${source.sourceUpdatedAt}|${source.status}` : undefined;
 const resetInterruptedLoads = (materials: Record<string, SourceMaterial>) => Object.fromEntries(Object.entries(materials).map(([key, material]) => [key, material.loading
@@ -192,7 +197,7 @@ export default function ReportsPage({ onMenu, onBack }: { onMenu: () => void; on
     setGenerating(true); setError(''); setNotice('');
     try {
       const report = await api<WorkReport>('/api/reports', { method: 'POST', body: JSON.stringify({ kind: selectedKind, date: selectedDate }) });
-      setNotice(`${kinds[report.kind]}已提交，统计范围：${period(report)}。`);
+      setNotice(`${kinds[report.kind]}已提交，统计范围：${reportPeriod(report)}。`);
       await refresh(); await loadDetail(report.id);
     } catch (cause) { setError(errorMessage(cause)); }
     finally { setGenerating(false); }
@@ -225,11 +230,11 @@ export default function ReportsPage({ onMenu, onBack }: { onMenu: () => void; on
             <section className="report-schedule"><div className="report-schedule-title"><label><input type="checkbox" checked={draft.weekly.enabled} onChange={event => patchSettings({ weekly: { ...draftRef.current!.weekly, enabled: event.target.checked } })} />周报</label><div className="report-weekly-time"><select aria-label="周报生成星期" value={draft.weekly.weekday} onChange={event => patchSettings({ weekly: { ...draftRef.current!.weekly, weekday: Number(event.target.value) } })}>{['周一','周二','周三','周四','周五','周六','周日'].map((label, index) => <option key={label} value={index + 1}>{label}</option>)}</select><input aria-label="周报生成时间" type="time" value={draft.weekly.time} onChange={event => patchSettings({ weekly: { ...draftRef.current!.weekly, time: event.target.value } })} /></div></div><p>{view?.nextRuns.find(run => run.kind === 'weekly') ? `下次 ${dateLabel(view.nextRuns.find(run => run.kind === 'weekly')!.scheduledAt)} · 统计 ${range(view.nextRuns.find(run => run.kind === 'weekly')!.periodStart, view.nextRuns.find(run => run.kind === 'weekly')!.periodEnd)}` : '定时生成已关闭；范围为上一完整自然周'}</p><textarea aria-label="周报提示词" value={draft.prompts.weekly} onChange={event => patchSettings({ prompts: { ...draftRef.current!.prompts, weekly: event.target.value } })} rows={5} /></section>
           </div>
         </section>}
-        <section className="reports-manual"><div><h2>手动生成</h2><p>统计范围：{dateRange(selectedKind, selectedDate)}（北京时间）。{selectedKind === 'weekly' ? '周报按所选日期归入自然周。' : '日报按自然日统计。'}</p></div><select aria-label="报告类型" value={selectedKind} onChange={event => { const kind = event.target.value as ReportKind; setSelectedKind(kind); setSelectedDate(defaultDate(kind)); }}><option value="daily">日报</option><option value="weekly">周报</option></select><input aria-label="报告日期" type="date" value={selectedDate} max={dateLimit(selectedKind)} onChange={event => setSelectedDate(event.target.value)} /><button className="primary-button" disabled={generating || !selectedDate || selectedDate > dateLimit(selectedKind)} onClick={() => void generate()}>{generating ? '提交中…' : '生成报告'}</button></section>
-        <section className="reports-records"><div className="reports-section-title"><div><h2>历史报告</h2><p>列表显示已记录的来源数量及生成费用信息。</p></div></div>{loading && !view ? <div className="reports-state">正在加载报告…</div> : !view?.reports.length ? <div className="reports-state">暂无报告</div> : <><div className="reports-table-head"><span>类型与日期</span><span>状态</span><span>来源</span><span>费用</span></div>{view.reports.map(report => <button className="reports-row" key={report.id} onClick={() => void loadDetail(report.id)}><span><strong>{kinds[report.kind]} · {period(report)}</strong><small>生成于 {dateLabel(report.generatedAt || report.createdAt)}</small></span><span className={`report-status report-${report.status}`}>{statusLabels[report.status]}</span><span>{report.sourceCount} 条来源{report.missingCount > 0 && <small className="report-missing"> · 缺失 {report.missingCount}</small>}</span><span>{feeLabel(report.usage.estimatedCostUsd, report.usage.unknownCalls)}</span></button>)}</>}
+        <section className="reports-manual"><div><h2>手动生成</h2><p>统计范围：{dateRange(selectedKind, selectedDate)}（北京时间）。{selectedKind === 'weekly' ? '当前周生成截至现在的快照，历史周统计完整自然周。' : '日报按自然日统计。'}</p></div><select aria-label="报告类型" value={selectedKind} onChange={event => { const kind = event.target.value as ReportKind; setSelectedKind(kind); setSelectedDate(defaultDate(kind)); }}><option value="daily">日报</option><option value="weekly">周报</option></select><input aria-label="报告日期" type="date" value={selectedDate} max={dateLimit(selectedKind)} onChange={event => setSelectedDate(event.target.value)} /><button className="primary-button" disabled={generating || !selectedDate || selectedDate > dateLimit(selectedKind)} onClick={() => void generate()}>{generating ? '提交中…' : '生成报告'}</button></section>
+        <section className="reports-records"><div className="reports-section-title"><div><h2>历史报告</h2><p>列表显示已记录的来源数量及生成费用信息。</p></div></div>{loading && !view ? <div className="reports-state">正在加载报告…</div> : !view?.reports.length ? <div className="reports-state">暂无报告</div> : <><div className="reports-table-head"><span>类型与日期</span><span>状态</span><span>来源</span><span>费用</span></div>{view.reports.map(report => <button className="reports-row" key={report.id} onClick={() => void loadDetail(report.id)}><span><strong>{kinds[report.kind]} · {reportPeriod(report)}</strong><small>{reportAsOf(report) ? `本周快照 · 截至 ${dateLabel(reportAsOf(report))} · ` : ''}生成于 {dateLabel(report.generatedAt || report.createdAt)}</small></span><span className={`report-status report-${report.status}`}>{statusLabels[report.status]}</span><span>{report.sourceCount} 条来源{report.missingCount > 0 && <small className="report-missing"> · 缺失 {report.missingCount}</small>}</span><span>{feeLabel(report.usage.estimatedCostUsd, report.usage.unknownCalls)}</span></button>)}</>}
         </section>
       </>}
-      {detail && <section className="report-detail"><button className="report-back-inline" onClick={closeDetail}>← 返回报告列表</button><div className="report-detail-heading"><div><span className="reports-eyebrow">{kinds[detail.report.kind]} · {period(detail.report)}</span><h1>{statusLabels[detail.report.status]}</h1><p>模型 {detail.report.model} · 生成于 {dateLabel(detail.report.generatedAt || detail.report.createdAt)}</p></div>{detail.report.status === 'failed' && <button className="primary-button" disabled={retrying} onClick={() => void retry()}>{retrying ? '提交中…' : '重试'}</button>}</div>
+      {detail && <section className="report-detail"><button className="report-back-inline" onClick={closeDetail}>← 返回报告列表</button><div className="report-detail-heading"><div><span className="reports-eyebrow">{kinds[detail.report.kind]} · {reportPeriod(detail.report)}</span><h1>{statusLabels[detail.report.status]}</h1><p>{reportAsOf(detail.report) ? `本周快照 · 截至 ${dateLabel(reportAsOf(detail.report))} · ` : ''}模型 {detail.report.model} · 生成于 {dateLabel(detail.report.generatedAt || detail.report.createdAt)}</p></div>{detail.report.status === 'failed' && <button className="primary-button" disabled={retrying} onClick={() => void retry()}>{retrying ? '提交中…' : '重试'}</button>}</div>
         {detail.report.error && <div className="reports-error">{detail.report.error}</div>}
         <div className="report-usage"><span>来源 {detail.report.sourceCount} 条 · 缺失 {detail.report.missingCount} 条{(detail.report.snapshotCount ?? 0) > 0 && ` · ${detail.report.snapshotCount} 条进行中快照`}</span><span>输入 {detail.report.usage.inputTokens.toLocaleString()} tokens · 缓存输入 {detail.report.usage.cachedInputTokens.toLocaleString()} tokens · 输出 {detail.report.usage.outputTokens.toLocaleString()} tokens</span><span>{feeLabel(detail.report.usage.estimatedCostUsd, detail.report.usage.unknownCalls)}{detail.report.usage.unknownCalls > 0 && ` · ${detail.report.usage.unknownCalls} 次调用用量未知`}</span><small>费用按本次实际发起的调用估算；缓存复用不重复计入历史费用。</small></div>
         <div className="report-body">{detail.body ? <Markdown text={detail.body} /> : <div className="reports-state">{active.has(detail.report.status) ? '报告生成中…' : '暂无报告正文'}</div>}</div>

@@ -1,5 +1,5 @@
 #!/usr/local/bin/node
-import { runProtectedTool, ToolAuthorizationError } from '/opt/product/cocell/protected-tool.mjs';
+import { runProtectedTool } from '/opt/product/cocell/protected-tool.mjs';
 
 const forwarded = process.argv.slice(4);
 const tool = forwarded.shift();
@@ -9,7 +9,6 @@ try {
   process.exitCode = await runProtectedTool(tool, forwarded);
 }
 catch (error) {
-  console.error(error instanceof ToolAuthorizationError
-    ? error.message : 'Tool failed; check project authorization and its credential file');
+  console.error(error);
   process.exitCode = 1;
 }

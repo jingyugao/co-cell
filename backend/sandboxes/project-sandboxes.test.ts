@@ -370,16 +370,22 @@ test('independent adapters refresh stale targets from the shared project row aft
   assert.equal(counts.create, 1, 'connecting through another adapter does not replay create');
 });
 
-test('creation selects the project template stable revision and reuses retained mounts and owner', async () => {
-  const { provider, projects, target, sandbox } = fixture();
+test('latest creation re-resolves the revision and reuses retained mounts and owner', async () => {
+  const { provider, target, sandbox } = fixture();
   const selection = { imageId: 'python', imageName: 'Python', category: '开发', versionId: 'v1', version: 'v1',
-    templateId: 'python-template', revisionId: 'python-r1', image: 'registry/python@sha256:pinned' };
+    templateId: 'python-template', revisionId: 'python-r1', image: 'registry/python@sha256:pinned', selectionPolicy: 'latest' as const };
+  let resolutions = 0;
+  const projects = new ProjectSandboxes(provider, 'base', undefined, undefined, undefined, async current => {
+    resolutions++;
+    assert.equal(current.imageSelection?.selectionPolicy, 'latest');
+    return { ...selection, versionId: 'python-r2', revisionId: 'python-r2', version: 'v2', image: 'registry/python@sha256:latest' };
+  });
   target.imageSelection = selection;
   target.sandboxOwnerKey = 'project:restored-owner';
   target.sandboxMounts = [{ volumeId: 'retained-volume', mountPath: '/home/agent' }];
   provider.create = async (_template, options) => {
-    assert.equal(options.metadata?.cellboxTemplateId, selection.templateId);
-    assert.equal(options.metadata?.cellboxRevisionId, undefined, 'an old project revision must not pin a new Box');
+    assert.equal(options.metadata?.cellboxTemplateId, undefined);
+    assert.equal(options.metadata?.cellboxRevisionId, 'python-r2', 'the form-time snapshot must not pin a new Box');
     assert.equal(options.metadata?.cellboxOwnerKey, target.sandboxOwnerKey);
     assert.deepEqual(JSON.parse(options.metadata!.cellboxMounts), target.sandboxMounts);
     return sandbox;
@@ -389,10 +395,12 @@ test('creation selects the project template stable revision and reuses retained 
   provider.getInfo = async () => ({ sandboxId: sandbox.sandboxId, state: 'running', startedAt: new Date(),
     metadata: { ownerKey: target.sandboxOwnerKey! }, mounts: target.sandboxMounts, templateIdentity: actualImage });
   const acquired = await projects.acquire(target, { create: true, save: async () => {} });
-  assert.deepEqual(target.sandbox?.image, actualImage, 'record the actual stable revision returned by Cellbox');
+  assert.deepEqual(target.sandbox?.image, actualImage, 'record the concrete revision returned by Cellbox');
   assert.deepEqual(target.sandbox?.mounts, target.sandboxMounts);
   assert.equal(target.sandbox?.ownerKey, target.sandboxOwnerKey);
   assert.equal(acquired.record.id, sandbox.sandboxId);
+  await projects.acquire(target, { save: async () => {} });
+  assert.equal(resolutions, 1, 'connecting an existing Box must not resolve latest again');
 });
 
 test('creation without a saved image selection uses the configured template rather than its pinned bootstrap revision', async () => {

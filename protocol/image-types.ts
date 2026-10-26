@@ -51,9 +51,12 @@ export interface ManagedImage {
   error?: string;
 }
 export interface ImageVersionUsage { deletable: boolean; blockers: string[]; manifestShared: boolean }
-/** Ordinary creation uses the template's current stable revision. Version fields
- * retain the selection snapshot and are refreshed from the actual Box. */
+/** New projects follow the selected template's latest successful active revision.
+ * Creation also accepts imageVersionId='latest' to defer version selection.
+ * Version fields retain the selection snapshot and are refreshed from the actual Box. */
 export interface ProjectImageSelection {
+  /** Resolve again when creating a Box; existing Boxes keep their concrete revision. */
+  selectionPolicy?: 'latest';
   imageId: string;
   imageName: string;
   category: string;

@@ -54,6 +54,7 @@ function projectImageLabel(project: ProjectSummary) {
   const actual = project.sandbox?.image;
   if (actual) return [actual.version ?? actual.reference, actual.revisionId ? `revision ${actual.revisionId}` : undefined].filter(Boolean).join(' · ');
   if (project.imageSelection?.migrationRequired) return `${project.imageSelection.imageName} · 需要迁移`;
+  if (project.imageSelection?.selectionPolicy === 'latest') return `${project.imageSelection.imageName} · latest`;
   if (project.sandbox) return project.imageSelection ? `${project.imageSelection.imageName} · template` : '系统默认 template';
   return project.imageSelection ? `${project.imageSelection.imageName} · Cellbox stable` : '系统默认 template · Cellbox stable';
 }

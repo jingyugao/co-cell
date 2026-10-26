@@ -116,7 +116,9 @@ export class ImageCatalog {
           version: revision.version, userVersion: revision.userVersion, source: revision.resolvedBaseImage, image: revision.image,
           status: 'succeeded', createdAt: revision.createdAt,
           deprecatedAt: revision.status === 'retired' ? local?.deprecatedAt ?? revision.updatedAt : undefined,
-          projectReady: Boolean(owner) || selected?.revisionId === revision.id,
+          projectReady: Boolean(owner) || selected?.revisionId === revision.id
+            || ((selected?.templateId ?? this.options.defaultTemplateId) === template.id
+              && Boolean(revision.runCommand?.includes('/opt/product/cocell/launcher.mjs'))),
           buildCommand: revision.buildCommand, runCommand: revision.runCommand,
           isDefault: selected?.templateId === template.id && selected.revisionId === revision.id,
         };
@@ -246,7 +248,21 @@ export class ImageCatalog {
       version: version.version, templateId: remote.templateId, revisionId: remote.id, image: remote.image };
   }
   async acquireSelection(imageId: string, versionId: string) {
+    if (versionId === 'latest') return this.acquireLatestSelection(imageId);
     return { selection: await this.resolve(imageId, versionId), release: async () => {} };
+  }
+  /** Resolve latest at use time; the saved default identifies a template, not a version pin. */
+  async acquireLatestSelection(imageId?: string) {
+    const selected = imageId ? undefined : await this.defaultSelection();
+    const templateId = selected?.templateId ?? this.options.defaultTemplateId;
+    const image = (await this.list()).find(value => imageId ? value.id === imageId : value.templateId === templateId);
+    if (!image) throw new HttpError(imageId ? 404 : 503, imageId ? '镜像仓库不存在' : '未配置系统默认 Cellbox template');
+    const latest = image.versions.filter(version => version.status === 'succeeded' && version.revisionId && version.templateId
+      && !version.deprecatedAt && !version.cleanup && !version.migrationRequired && version.projectReady !== false)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)
+        || b.version.localeCompare(a.version, 'en', { numeric: true }) || b.id.localeCompare(a.id))[0];
+    if (!latest) throw new HttpError(409, '此镜像仓库暂无可用的成功构建版本');
+    return { selection: { ...await this.resolveVersion(image, latest), selectionPolicy: 'latest' as const }, release: async () => {} };
   }
   async acquireDefaultSelection() {
     const selected = await this.defaultSelection();

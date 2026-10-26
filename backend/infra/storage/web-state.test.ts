@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Project } from '../../../protocol/types.js';
 import { createWebStateStore, MySqlWebStateStore } from './web-state.js';
+import { projectFromRow } from './relational-records.js';
 
 test('metadata storage requires MYSQL_URL and rejects invalid URLs without exposing credentials', () => {
   for (const value of [undefined, '', ' \t\n']) {
@@ -43,12 +44,16 @@ function rowFromProjectWrite(sql: string, values: unknown[] = []): Record<string
   return Object.fromEntries(columns.map((column, index) => [column, values[index]]));
 }
 
-test('baseline project writes lock and merge the latest relational row before updating it', async () => {
+test('baseline project writes merge the latest row and retain the latest image selector across reloads', async () => {
   const baseline: Project = { id: 'merge-project', name: 'before', type: 1, status: 'active', requirementUrl: null,
-    executionMode: 'sandbox', workingDirectory: '/workspace', createdAt: now, updatedAt: now };
+    executionMode: 'sandbox', workingDirectory: '/workspace', createdAt: now, updatedAt: now,
+    imageSelection: { selectionPolicy: 'latest', imageId: 'mybox', imageName: 'mybox', category: 'development',
+      versionId: 'revision-1', version: '1.0.4-r1', templateId: 'template-1', revisionId: 'revision-1', image: 'mybox@sha256:built' } };
   let stored: Record<string, unknown> = { id: baseline.id, name: baseline.name, type: 1, status: 'active',
     requirement_url: null, requirement_status: 'written by another instance', execution_mode: 'sandbox',
-    working_directory: '/workspace', created_at: now, updated_at: now };
+    working_directory: '/workspace', created_at: now, updated_at: now,
+    image_catalog_id: 'mybox', image_name: 'mybox', image_category: 'development', image_version_id: 'latest',
+    image_version: '1.0.4-r1', template_id: 'template-1', revision_id: 'revision-1', image_reference: 'mybox@sha256:built' };
   const statements: string[] = [];
   const connection = {
     async beginTransaction() { statements.push('begin'); },
@@ -71,6 +76,10 @@ test('baseline project writes lock and merge the latest relational row before up
   await store.saveProject({ ...baseline, name: 'after' }, baseline);
   assert.equal(stored.name, 'after');
   assert.equal(stored.requirement_status, 'written by another instance');
+  assert.equal(stored.image_version_id, 'latest');
+  assert.equal(stored.revision_id, 'revision-1');
+  assert.deepEqual(projectFromRow(stored).imageSelection, baseline.imageSelection);
+  assert.equal(projectFromRow({ ...stored, image_version_id: 'revision-1' }).imageSelection?.selectionPolicy, undefined);
   assert.equal(statements[0], 'begin');
   assert.deepEqual(statements.slice(-2), ['commit', 'release']);
 });

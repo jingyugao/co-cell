@@ -61,7 +61,7 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onDefau
   const visibleVersions = image.versions.filter(version => lifecycle === 'all' || (lifecycle === 'deprecated') === Boolean(version.deprecatedAt));
   const visibleTags = tags.filter(tag => tag.toLowerCase().includes(query.toLowerCase()));
   return <div className="repository-details">
-    <div className="projects-heading"><div><span className="projects-eyebrow">CELLBOX TEMPLATE</span><h1>{image.name}</h1><p>{image.repository ?? image.templateId ?? '系统默认 template'}</p><p className="project-form-hint">CoCell 默认 revision、Cellbox stable revision 和每个 revision 的 warmSlots 分别管理。修改 CoCell 默认不会修改 Cellbox 配置。</p></div><button className="secondary-button" disabled={busy} onClick={onBack}>返回仓库列表</button></div>
+    <div className="projects-heading"><div><span className="projects-eyebrow">CELLBOX TEMPLATE</span><h1>{image.name}</h1><p>{image.repository ?? image.templateId ?? '系统默认 template'}</p><p className="project-form-hint">新项目自动使用默认镜像的最新成功版本，无需逐个版本设置默认。仓库默认版本仍用于归档恢复。</p></div><button className="secondary-button" disabled={busy} onClick={onBack}>返回仓库列表</button></div>
     {image.migrationRequired && <p className="project-error" role="status">此记录仍使用旧 importedImage，需迁移到 Cellbox template/revision 后才能用于新项目。</p>}
     {image.templateStatus && image.templateStatus !== 'ready' && <p className="project-error" role="status">Template 状态：{image.templateStatus === 'unknown' ? '创建结果未知' : image.templateStatus === 'failed' ? '创建失败' : '提交中'}{image.error ? ` · ${image.error}` : ''}</p>}
     {managed && <>
@@ -89,7 +89,7 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onDefau
     <section className="image-card"><header><h2>Cellbox revisions</h2><select aria-label="筛选版本生效状态" value={lifecycle} onChange={event => setLifecycle(event.target.value)}><option value="active">生效中</option><option value="deprecated">已退休</option><option value="all">全部</option></select><span className="image-count">{visibleVersions.length} 个 revision</span></header>
       {!image.versions.length && <p className="project-form-hint">暂无 revision。</p>}
       {visibleVersions.map(version => <section className="image-version" key={version.id}>
-        <div className="image-version-heading"><strong>{version.version}</strong>{version.isDefault && <span className="project-type-badge image-global-default">CoCell 默认</span>}{version.deprecatedAt && <span className="project-type-badge">已退休</span>}{image.defaultVersionId === version.id && <span className="project-type-badge">仓库默认 · 归档恢复</span>}<span className={`image-status ${version.status}`}>{version.migrationRequired ? '需要迁移' : statusLabels[version.status]}</span>{version.createdAt && <time>{new Date(version.createdAt).toLocaleString('zh-CN', { hour12: false })}</time>}</div>
+        <div className="image-version-heading"><strong>{version.version}</strong>{version.isDefault && <span className="project-type-badge image-global-default">默认镜像参考版本</span>}{version.deprecatedAt && <span className="project-type-badge">已退休</span>}{image.defaultVersionId === version.id && <span className="project-type-badge">仓库默认 · 归档恢复</span>}<span className={`image-status ${version.status}`}>{version.migrationRequired ? '需要迁移' : statusLabels[version.status]}</span>{version.createdAt && <time>{new Date(version.createdAt).toLocaleString('zh-CN', { hour12: false })}</time>}</div>
         {version.revisionId && <div className="image-reference"><span>Revision ID</span><code>{version.revisionId}</code></div>}
         {version.source && <div className="image-reference"><span>基础镜像</span><code>{version.source}</code></div>}
         {version.image && <div className="image-reference"><span>固定镜像</span><code>{version.image}</code></div>}
@@ -97,7 +97,7 @@ export default function RepositoryDetails({ image, busy, onBack, onSync, onDefau
         {version.error && <p className="project-error">{version.error}</p>}
         {version.migrationRequired && <p className="project-form-hint">旧 importedImage ID 只用于识别旧记录，不代表 Cellbox revision。</p>}
         {image.origin !== 'profile' && version.revisionId && <div className="project-form-actions">
-          {version.status === 'succeeded' && !version.deprecatedAt && !version.isDefault && <button className="secondary-button" disabled={blocked} onClick={() => void action(() => onDefault(version.id), 'CoCell 默认 revision 已更新；Cellbox stable 和 warmSlots 未修改。')}>设为 CoCell 默认</button>}
+          {version.status === 'succeeded' && !version.deprecatedAt && !version.isDefault && <button className="secondary-button" disabled={blocked} onClick={() => void action(() => onDefault(version.id), '默认镜像已更新；新项目自动使用该镜像的 latest。')}>设为 CoCell 默认</button>}
           {!version.deprecatedAt && <button className="secondary-button" disabled={blocked || version.isDefault} title={version.isDefault ? '请先切换 CoCell 默认 revision' : undefined} onClick={() => void action(async () => {
             if (!window.confirm(`退休 ${version.version}？Cellbox 会阻止后续选择此 revision，已有 sandbox 不受影响。`)) return;
             await onDeprecated(version.id, true);

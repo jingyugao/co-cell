@@ -137,7 +137,7 @@ test('CoCell default selection is local and does not change Cellbox stable or wa
   assert.deepEqual(f.templateUpdates, []);
 });
 
-test('repository restore default follows Cellbox stable while CoCell global default remains independent', async () => {
+test('restore follows stable while latest follows new builds without updating the default', async () => {
   const f = fixture();
   const catalog = f.catalog();
   const repository = await catalog.addRepository({ name: 'Node', category: '开发', repository: 'team/node' });
@@ -162,6 +162,16 @@ test('repository restore default follows Cellbox stable while CoCell global defa
 
   const globalDefault = await catalog.acquireDefaultSelection();
   assert.equal(globalDefault.selection.revisionId, 'revision-1');
+  const latest = await catalog.acquireLatestSelection();
+  assert.equal(latest.selection.revisionId, 'revision-2');
+  assert.equal(latest.selection.selectionPolicy, 'latest');
+  const third = await catalog.sync(repository.id, { tag: 'v3' });
+  f.completeBuild(third.versions[0].operationId!);
+  assert.equal((await catalog.acquireLatestSelection()).selection.revisionId, 'revision-3');
+  await catalog.setDeprecated(repository.id, 'revision-3', true);
+  assert.equal((await catalog.acquireLatestSelection()).selection.revisionId, 'revision-2');
+  assert.equal((await catalog.acquireRestoreSelection({ id: 'project-one', imageSelection: originalSelection } as Project)).selection.revisionId, 'revision-2');
+  assert.equal(f.defaultWrites.length, 1, 'new publications must not require updating the saved default');
   assert.deepEqual(f.defaultWrites.at(-1), { templateId: repository.templateId, revisionId: 'revision-1' });
   assert.deepEqual(f.templateUpdates, []);
 });

@@ -1,5 +1,6 @@
 import { SandboxLifecycle, type SandboxHandle, type SandboxInfo, type SandboxLifecycleContext, type SandboxProvider, type SandboxRecord } from '@co-cell/sandbox';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
+import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import type { WorkspaceTarget } from './types.js';
 import { HttpError } from '../../util/errors.js';
 
@@ -15,7 +16,8 @@ const resourceKey = (target: WorkspaceTarget) => target.projectId ? `project:${t
 /** Reads the durable project reference for each operation; never retains bindings or handles. */
 export class ProjectSandboxes {
   constructor(private provider: SandboxProvider, private template: string, private defaultTemplateId?: string,
-    readonly lifecycle = new SandboxLifecycle(), private readProject?: (id: string) => Promise<ProjectReference | undefined>) {}
+    readonly lifecycle = new SandboxLifecycle(), private readProject?: (id: string) => Promise<ProjectReference | undefined>,
+    private latestImage?: (target: WorkspaceTarget) => Promise<ProjectImageSelection | undefined>) {}
 
   get templateReference() { return this.template; }
 
@@ -70,13 +72,16 @@ export class ProjectSandboxes {
     return this.lifecycle.run(context, async () => {
       let sandbox: SandboxHandle;
       if (creating) {
+        const selection = await this.latestImage?.(target);
+        if (selection && (!selection.templateId || !selection.revisionId)) throw new Error('最新镜像缺少 Cellbox revision');
         const templateId = target.imageSelection?.templateId ?? this.defaultTemplateId;
         sandbox = await this.provider.create(this.template, {
           timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false },
           metadata: { ...context.metadata, app: 'codex-web', workingDirectory: target.settings.workingDirectory,
             ...(target.sandboxOwnerKey ? { cellboxOwnerKey: target.sandboxOwnerKey } : {}),
             ...(target.sandboxMounts?.length ? { cellboxMounts: JSON.stringify(target.sandboxMounts) } : {}),
-            ...(templateId ? { cellboxTemplateId: templateId } : {}) },
+            ...(selection ? { cellboxRevisionId: selection.revisionId! }
+              : templateId ? { cellboxTemplateId: templateId } : {}) },
         });
         context.sandboxId = sandbox.sandboxId;
         // Record the returned identity before any further remote calls. Failures

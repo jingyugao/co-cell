@@ -41,11 +41,14 @@ export const PROJECT_COLUMNS = `id,name,type,week_of,requirement_url,requirement
  sandbox_operation_json,sandbox_backup_json,latest_backup_json,remote_archives_json,pending_sandbox_cleanup_json,
  pending_volume_cleanup_json,archive_cleanup_source_id,lifecycle_history_json,removed_at,completed_at,archived_at,created_at,updated_at`;
 export function projectValues(project: Project): unknown[] {
+  // image_version_id retains the selector; revision_id stores its concrete resolved revision.
   return [project.id, project.name, project.type ?? 1, project.weekOf ?? null, project.requirementUrl,
     project.requirementStatus ?? null, project.executionMode, project.workingDirectory,
     project.status ?? (project.archivedAt ? 'archived' : project.completedAt ? 'completed' : 'active'),
     ...sandboxColumns(project), project.imageSelection?.imageId ?? null, project.imageSelection?.imageName ?? null,
-    project.imageSelection?.category ?? null, project.imageSelection?.versionId ?? null, project.imageSelection?.version ?? null, project.imageSelection?.templateId ?? null,
+    project.imageSelection?.category ?? null,
+    project.imageSelection?.selectionPolicy === 'latest' ? 'latest' : project.imageSelection?.versionId ?? null,
+    project.imageSelection?.version ?? null, project.imageSelection?.templateId ?? null,
     project.imageSelection?.revisionId ?? null, project.imageSelection?.image ?? null, project.imageSelection?.migrationRequired ? 1 : 0,
     json(project.sandboxOperation), json(project.sandboxBackup),
     json(project.latestBackup), json(project.remoteArchives), json((project.pendingSandboxCleanup ?? []).map(s => ({
@@ -82,7 +85,10 @@ export function projectFromRow(row: Record<string, unknown>): Project {
     status: String(row.status) as Project['status'], ...(iso(row.removed_at) ? { removedAt: iso(row.removed_at)! } : {}),
     completedAt: iso(row.completed_at), archivedAt,
     ...(row.image_catalog_id ? { imageSelection: { imageId: String(row.image_catalog_id), imageName: String(row.image_name ?? ''),
-      category: String(row.image_category ?? ''), versionId: String(row.image_version_id ?? ''), version: String(row.image_version ?? ''),
+      ...(row.image_version_id === 'latest' ? { selectionPolicy: 'latest' as const } : {}),
+      category: String(row.image_category ?? ''),
+      versionId: String(row.image_version_id === 'latest' ? row.revision_id ?? 'latest' : row.image_version_id ?? ''),
+      version: String(row.image_version ?? ''),
       ...(row.template_id ? { templateId: String(row.template_id) } : {}), ...(row.revision_id ? { revisionId: String(row.revision_id) } : {}),
       image: String(row.image_reference ?? ''), ...(row.image_migration_required ? { migrationRequired: true } : {}) } } : {}),
     ...(sandbox ? { sandbox } : {}), sandboxMounts: mounts,

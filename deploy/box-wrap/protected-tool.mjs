@@ -72,14 +72,14 @@ export async function restoreCredentialOwnership(home, roots = []) {
   } finally { await root.close(); }
 }
 async function execute(executable, args, env, cwd, timeoutMs = 20000) {
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     const child = spawn(executable, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     let stdout = '', stderr = '', size = 0;
     const collect = target => chunk => { size += chunk.length; if (size <= 1024 * 1024) { if (target === 'out') stdout += chunk; else stderr += chunk; } };
     child.stdout.on('data', collect('out')); child.stderr.on('data', collect('err'));
     const timer = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* Already exited. */ } }, timeoutMs);
-    child.once('error', () => { clearTimeout(timer); resolve({ exitCode: 1, stdout: '', stderr: 'Tool executable is unavailable\n' }); });
+    child.once('error', error => { clearTimeout(timer); reject(error); });
     child.once('close', (code, signal) => { clearTimeout(timer); resolve({ exitCode: signal ? 124 : code ?? 1, stdout, stderr }); });
   });
 }
@@ -126,8 +126,8 @@ export async function runProtectedTool(tool, inputArgs, options = {}) {
   const execution = executionDetails(setup.execution, home, credential);
   if (!execution) throw new Error('Dynamic tool is no longer configured');
   const result = await execute(execution.executable, [...execution.args, ...setup.args], { ...env, ...execution.env }, options.cwd ?? process.cwd(), execution.timeoutMs);
-  await restoreCredentialOwnership(home, setup.credentialPaths);
   (options.stdout ?? process.stdout).write(result.stdout);
   (options.stderr ?? process.stderr).write(result.stderr);
+  await restoreCredentialOwnership(home, setup.credentialPaths);
   return result.exitCode;
 }

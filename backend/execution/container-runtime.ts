@@ -17,6 +17,7 @@ import type { CompactionContent, CompactionSelector, Session, SubagentConversati
 import { parseNativeCompaction, type NativeHistory } from './native-history.mjs';
 import { AppServerReader, type AppServerEndpoint } from './app-server-reader.js';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
+import { INITIALIZE_PROJECT_FOLLOWUP, PROJECT_FOLLOWUP_FILE, projectFollowupDocument, type FollowupProject } from '../projects/followup.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 import { HttpError } from '../../util/errors.js';
 import { abortable } from '../../util/abortable.js';
@@ -84,6 +85,7 @@ export interface ContainerRuntimeOptions {
   baseUrl?: string;
   modelConfig?: Record<string, unknown>;
   resolveModel?: (session: Session) => Promise<Pick<ThreadOptions, 'model' | 'modelProvider' | 'providerConfig'>>;
+  resolveProject?: (id: string) => Promise<FollowupProject | undefined>;
   configOverrides?: string[];
   sharedDataDirectory?: URL;
   sharedFilesMounted?: (sandboxId: string) => boolean;
@@ -230,6 +232,13 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   private async prepareEnvironment(target: WorkspaceTarget, entry: Entry, executionSignal: AbortSignal) {
     return this.prepare(entry, executionSignal, async () => {
       const fresh = await this.options.prepareRemote(entry.sandbox, target, executionSignal, entry.info);
+      const project = await this.options.resolveProject?.(target.projectId ?? target.id);
+      if (project) {
+        const path = posix.join(project.workingDirectory, PROJECT_FOLLOWUP_FILE);
+        const result = await this.command(entry,
+          `${quote(this.node)} -e ${quote(INITIALIZE_PROJECT_FOLLOWUP)} ${quote(path)} ${quote(projectFollowupDocument(project))}`, executionSignal);
+        if (result.exitCode !== 0) throw new Error('无法初始化项目跟进文件');
+      }
       if (this.options.sharedFilesMounted?.(entry.sandbox.sandboxId)) return;
       // Older instances without the directory mount still receive snapshots.
       const sharedData = this.options.sharedDataDirectory ?? SHARED_DATA;

@@ -108,6 +108,12 @@ try {
   if (typeof result !== 'string') throw new Error('invalid credential script output');
   if (Buffer.byteLength(result) > maxOutputBytes) throw new Error('credential script output is too large');
   parentPort.postMessage(result);
-} catch {
-  parentPort.postMessage(null);
+} catch (error) {
+  // Permission hook input holds no credentials, so its original error is safe to report.
+  if (workerData.resultMode !== 'general') parentPort.postMessage(null);
+  else {
+    let message;
+    try { message = typeof error?.message === 'string' ? error.message : String(error); } catch { message = 'unknown error'; }
+    parentPort.postMessage({ error: message.slice(0, 1000) });
+  }
 }

@@ -106,7 +106,7 @@ async function runTypescriptCredentialScript(source: string, input: unknown, res
     const inputJson = JSON.stringify(input);
     if (inputJson === undefined) throw new HttpError(400, '凭证脚本输入无效');
     if (Buffer.byteLength(inputJson) > maxScriptInputBytes) throw new HttpError(400, '凭证脚本输入过大');
-    const response = await new Promise<unknown>(resolve => {
+    const outcome = await new Promise<{ response: unknown } | { failure: string }>(resolve => {
       worker = new Worker(new URL('./credential-worker.mjs', import.meta.url), {
         execArgv: [], env: {}, stdout: true, stderr: true,
         resourceLimits: { maxOldGenerationSizeMb: 48, maxYoungGenerationSizeMb: 8, stackSizeMb: 1 },
@@ -114,16 +114,21 @@ async function runTypescriptCredentialScript(source: string, input: unknown, res
       });
       worker.stdout?.resume();
       worker.stderr?.resume();
-      worker.once('message', value => resolve(value));
-      worker.once('error', () => resolve(undefined));
-      worker.once('exit', () => resolve(undefined));
-      timer = setTimeout(() => resolve(undefined), timeoutMs);
+      worker.once('message', value => resolve(value && typeof value === 'object' && typeof value.error === 'string'
+        ? { failure: value.error } : { response: value }));
+      worker.once('error', error => resolve({ failure: `worker 异常：${error.message}` }));
+      worker.once('exit', code => resolve({ failure: `worker 已退出（code ${code}）` }));
+      timer = setTimeout(() => resolve({ failure: `执行超时（${timeoutMs}ms）` }), timeoutMs);
     });
+    // Credential hook errors may echo credential content, so only permission hooks report details.
+    const failed = (detail: string) => new HttpError(400, resultMode === 'general'
+      ? `权限脚本执行失败：${detail.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 1000)}` : '凭证脚本执行失败或输出无效');
+    if ('failure' in outcome) throw failed(outcome.failure);
+    const { response } = outcome;
     const maxResponseBytes = resultMode === 'general' ? 4096 : resultMode === 'credential-save' ? Math.ceil(maxCredentialBytes / 3) * 4 + 16 : 8 * 1024 * 1024;
-    if (typeof response !== 'string' || Buffer.byteLength(response) > maxResponseBytes)
-      throw new HttpError(400, '凭证脚本执行失败或输出无效');
+    if (typeof response !== 'string' || Buffer.byteLength(response) > maxResponseBytes) throw failed('输出无效或超过大小限制');
     try { return JSON.parse(response); }
-    catch { throw new HttpError(400, '凭证脚本执行失败或输出无效'); }
+    catch { throw failed('输出不是有效 JSON'); }
   } finally {
     clearTimeout(timer);
     try { if (worker) await worker.terminate(); }
@@ -200,13 +205,15 @@ async function runBashRaw(source: string, input: unknown, options: ScriptOptions
     const outputPromise = boundedOutput(child, maxOutputBytes);
     child.stdin?.on('error', () => {});
     child.stdin?.end(inputJson);
-    timer = setTimeout(() => { if (child?.pid) { try { globalThis.process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* exited */ } } } }, timeoutMs);
+    let timedOut = false;
+    timer = setTimeout(() => { timedOut = true; if (child?.pid) { try { globalThis.process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* exited */ } } } }, timeoutMs);
     const result = await outputPromise;
-    if (result.code !== 0) throw new HttpError(400, '凭证脚本执行失败');
+    if (timedOut) throw new HttpError(400, `权限脚本执行失败：执行超时（${timeoutMs}ms）`);
+    if (result.code !== 0) throw new HttpError(400, `权限脚本执行失败：退出码 ${result.code}`);
     return result.stdout;
   } catch (error) {
     if (error instanceof HttpError) throw error;
-    throw new HttpError(400, '凭证脚本执行失败');
+    throw new HttpError(400, `权限脚本执行失败：${error instanceof Error ? error.message : String(error)}`.slice(0, 1000));
   } finally {
     clearTimeout(timer);
     if (child?.pid) { try { globalThis.process.kill(-child.pid, 'SIGKILL'); } catch { if (child.exitCode === null) child.kill('SIGKILL'); } }
@@ -240,10 +247,11 @@ export async function runToolScript(
     const stdout = await runBashRaw(source, input, options, timeoutMs, 4096);
     let parsed: unknown;
     try { parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(stdout)); }
-    catch { throw new HttpError(403, '工具权限检查未通过'); }
+    catch { throw new HttpError(400, '权限脚本执行失败：输出不是有效 JSON'); }
     output = parsed;
   } else output = await runTypescriptCredentialScript(source, input, 'general', timeoutMs);
-  if (!permissionResult(output)) throw new HttpError(403, '工具权限检查未通过');
+  if (!permissionResult(output))
+    throw new HttpError(400, '权限脚本执行失败：返回值必须是 boolean 或 {allow, reason?, credential?}');
   return output;
 }
 

@@ -29,12 +29,8 @@ export class ToolScripts {
   async checkPermission(tool: DynamicToolInput | undefined, input: ToolPermissionCheckInput) {
     if (!tool?.permissionScriptId) return;
     const script = await this.get(tool.permissionScriptId);
-    let result;
-    try { result = await runToolScript(script.source, input, { language: script.language, npmCache: this.npmCache }); }
-    catch (error) {
-      if (error instanceof HttpError && error.status === 503) throw error;
-      throw new HttpError(403, '工具权限检查未通过');
-    }
+    // Only an explicit deny is a 403; script failures keep their own status and message.
+    const result = await runToolScript(script.source, input, { language: script.language, npmCache: this.npmCache });
     if (result === true) return;
     if (typeof result === 'object' && result.allow) return result;
     const reason = typeof result === 'object' ? result.reason : undefined;

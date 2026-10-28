@@ -20,7 +20,7 @@ export interface StoredWorkReport extends WorkReport {
   runId: string;
   inputsReady?: boolean;
   /** Absent on legacy runs, whose submitted prompt hashes must remain stable. */
-  materialVersion?: 2;
+  materialVersion?: 2 | 3;
   dailyReportIds?: string[];
   rawSourceIds?: string[];
   previousUsage?: ReportUsage;

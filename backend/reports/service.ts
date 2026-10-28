@@ -4,18 +4,21 @@ import { join } from 'node:path';
 import type { ReportDetail, ReportKind, ReportSettings, ReportSource, ReportSourceContent, ReportUsage, ReportsView } from '../../protocol/report-types.js';
 import { dueReportSchedules, reportPeriod, reportSchedule } from '../../util/report-periods.js';
 import { HttpError, redactCredentials } from '../../util/errors.js';
+import { countTokens } from '../../util/tokenizer.js';
 import { MemoryCoordinator, type SharedCoordinator } from '../infra/storage/coordination.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import type { ConversationMaterialsService } from '../conversation-materials/service.js';
 import type { ConversationMaterialCollector } from '../conversation-materials/collector.js';
 import { readMaterialContent } from '../conversation-materials/content.js';
-import { defaultReportSettings, legacyReportRules, reportRules, summaryPrompt } from './prompts.js';
+import { defaultReportSettings, hierarchicalReportRules, legacyReportRules, projectSummaryPrompt, reportRules, summaryPrompt } from './prompts.js';
 import type { ReportRepository } from './repository.js';
 import type { ReportRunner } from './runner.js';
 import { publicReport, type StoredWorkReport } from './types.js';
 
 const DAY = 86_400_000;
 const MAX_CHARS = 48_000;
+// Leave room for the agent's own instructions, tools, reasoning, and output in a 256k context.
+const MAX_REPORT_INPUT_TOKENS = 224_000;
 const emptyUsage = (): ReportUsage => ({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, unknownCalls: 0, estimatedCostUsd: 0 });
 const message = (error: unknown) => redactCredentials(error instanceof Error ? error.message : String(error)).slice(0, 1500);
 const localDate = (now: Date) => new Date(now.getTime() + 8 * 3_600_000).toISOString().slice(0, 10);
@@ -184,7 +187,7 @@ export class ReportService {
   }
 
   private async collect(report: StoredWorkReport, signal: AbortSignal, save: () => Promise<void>) {
-    report.materialVersion = 2;
+    report.materialVersion = 3;
     report.status = 'collecting'; await save();
     const directory = this.directory(report);
     await rm(join(directory, 'sources'), { recursive: true, force: true });
@@ -247,18 +250,16 @@ export class ReportService {
         source.collectedAt = material.createdAt;
         const parts: string[] = [];
         let bytes = 0;
-        for (let at = instant(report.periodStart).getTime(); at < instant(report.periodEnd).getTime(); at += DAY) {
-          const until = Math.min(at + DAY, report.asOf ? Date.parse(report.asOf) : Infinity);
-          if (at >= until) break;
-          const date = localDate(new Date(at));
-          if (readyDays.has(date)) continue;
-          const selected = await this.deps.materials.period(material.id, new Date(at), new Date(until), signal);
+        const start = instant(report.periodStart);
+        const end = new Date(Math.min(instant(report.periodEnd).getTime(), report.asOf ? Date.parse(report.asOf) : Infinity));
+        if (start < end) {
+          const selected = await this.deps.materials.latestContext(material.id, start, end, signal);
           for (const part of selected) {
             if (part.coverageIncomplete) {
               source.coverageIncomplete = true;
-              source.error = '部分压缩记录没有可读摘要及本期原文，已保留其他可读材料，覆盖不完整';
+              source.error = '最后一个上下文段的段首压缩摘要不可读，历史背景覆盖不完整';
             }
-            const content = `# ${date} · ${part.path}\n\n${part.content}`;
+            const content = `# ${report.periodStart} 至 ${report.periodEnd} · ${part.path}\n\n${part.content}`;
             bytes += Buffer.byteLength(content);
             if (bytes > 64 * 1024 ** 2) throw new Error('单条会话的报告材料超过 64 MiB，未截断或提交');
             parts.push(content);
@@ -285,6 +286,7 @@ export class ReportService {
   }
 
   private async summarize(report: StoredWorkReport, signal: AbortSignal, save: () => Promise<void>) {
+    if (report.materialVersion === 3) return this.summarizeHierarchy(report, signal, save);
     const directory = this.directory(report);
     const previousDaily = await this.read(join(directory, 'previous-daily.md'));
     const baseline = previousDaily ? `\n\n<昨日日报背景>\n${previousDaily}\n</昨日日报背景>` : '';
@@ -330,6 +332,72 @@ export class ReportService {
     const body = await this.call(report, prompt, `${report.kind === 'daily' ? '工作日报' : '工作周报'} · ${report.periodStart}`, false, save);
     if (body === undefined) return;
     await this.complete(report, body + (missing.length ? `\n\n> 本报告有 ${missing.length} 条对话的全部或部分材料未能读取，覆盖不完整。` : ''), save);
+  }
+
+  private async summarizeHierarchy(report: StoredWorkReport, signal: AbortSignal, save: () => Promise<void>) {
+    const directory = this.directory(report);
+    const previousDaily = await this.read(join(directory, 'previous-daily.md'));
+    const baseline = previousDaily ? `\n\n<昨日日报背景>\n${previousDaily}\n</昨日日报背景>` : '';
+    const included = report.sources.filter(source => source.status === 'included');
+    const projects = new Map<string, { name: string; summaries: string[] }>();
+    for (const source of included) {
+      signal.throwIfAborted();
+      const output = join(directory, 'sources', `${source.sessionId}.summary.md`);
+      let summary = await this.read(output);
+      if (!summary) {
+        const input = await this.read(join(directory, 'sources', `${source.sessionId}.input.md`));
+        if (!input) throw new Error('报告来源材料丢失，未生成不完整摘要');
+        const prompt = `${hierarchicalReportRules}\n\n${summaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n统计期间：${periodDescription(report)}。\n`
+          + `项目：${source.projectName}\n对话：${source.sessionTitle}\n来源：[原始对话](/sessions/${source.sessionId})\n`
+          + (source.isSnapshot ? `此来源含进行中轮次，采集于${source.collectedAt}。不能推断最终完成。\n` : '')
+          + `${baseline}\n\n<工作材料>\n${input}\n</工作材料>`;
+        const result = await this.hierarchicalCall(report, prompt, `${source.projectName} · 对话摘要`, true, save);
+        if (result === undefined) return;
+        summary = `## ${source.projectName} · ${source.sessionTitle}\n\n来源：[原始对话](/sessions/${source.sessionId})\n\n${result}`;
+        await this.write(output, summary);
+      }
+      const project = projects.get(source.projectId) ?? { name: source.projectName, summaries: [] };
+      project.summaries.push(summary);
+      projects.set(source.projectId, project);
+    }
+    const projectSummaries: string[] = [];
+    for (const [projectId, project] of projects) {
+      signal.throwIfAborted();
+      const output = join(directory, 'projects', `${hash(projectId)}.summary.md`);
+      let summary = await this.read(output);
+      if (!summary) {
+        const prompt = `${hierarchicalReportRules}\n\n${projectSummaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n`
+          + `统计期间：${periodDescription(report)}。\n项目：${project.name}${baseline}\n\n<对话摘要>\n${project.summaries.join('\n\n')}\n</对话摘要>`;
+        const result = await this.hierarchicalCall(report, prompt, `${project.name} · 项目摘要`, true, save);
+        if (result === undefined) return;
+        summary = `# ${project.name}\n\n${result}`;
+        await this.write(output, summary);
+      }
+      projectSummaries.push(summary);
+    }
+    // Daily bodies preserve cross-project decisions when the weekly report reuses ready days.
+    const dailyInput = await this.read(join(directory, 'daily-input.md'));
+    const combined = [projectSummaries.join('\n\n'), dailyInput ? `# 已有日报（与项目摘要去重）\n\n${dailyInput}` : ''].filter(Boolean).join('\n\n');
+    const missing = report.sources.filter(source => source.status === 'failed' || source.coverageIncomplete);
+    if (!combined.trim()) {
+      if (missing.length) throw new Error(`有 ${missing.length} 条对话材料读取失败，无法判断本期业务进展`);
+      await this.complete(report, '# 工作报告\n\n本期选取的主对话材料中没有可报告的新进展。', save);
+      return;
+    }
+    report.status = 'generating'; await save();
+    const gaps = missing.length ? `\n材料缺失：${missing.map(source => `${source.projectName} / ${source.sessionTitle}`).join('；')}。必须注明覆盖不完整。` : '';
+    const prompt = `${hierarchicalReportRules}\n\n${report.settings.prompts[report.kind]}\n\n统计期间：${periodDescription(report)}。${gaps}\n`
+      + `控制在 800—1500 个汉字左右。${baseline}\n\n<项目进展材料>\n${combined}\n</项目进展材料>`;
+    const body = await this.hierarchicalCall(report, prompt, `${report.kind === 'daily' ? '工作日报' : '工作周报'} · ${report.periodStart}`, false, save);
+    if (body === undefined) return;
+    await this.complete(report, body + (missing.length ? `\n\n> 本报告有 ${missing.length} 条对话的全部或部分材料未能读取，覆盖不完整。` : ''), save);
+  }
+
+  private async hierarchicalCall(report: StoredWorkReport, prompt: string, title: string, cacheable: boolean, save: () => Promise<void>) {
+    const tokens = countTokens(prompt);
+    if (tokens > MAX_REPORT_INPUT_TOKENS)
+      throw new Error(`${title}的输入约 ${tokens} token，超过单次报告输入预算 ${MAX_REPORT_INPUT_TOKENS}；未截断或拆分提交`);
+    return this.call(report, prompt, title, cacheable, save);
   }
 
   private async fold(report: StoredWorkReport, text: string, save: () => Promise<void>): Promise<string | undefined> {

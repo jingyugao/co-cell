@@ -15,6 +15,12 @@ export const reportRules = `你在整理历史工作材料。只阅读提供的�
 export const summaryPrompt = `提炼本段对话在指定期间内的业务进展，控制在 500 个汉字左右。写明业务事项、本期变化、当前状态、证据、阻塞及材料中明确的后续安排。
 若本段只有背景、重复内容或无业务变化，明确写无新增业务进展。保留具体业务名和有证据支持的变化；不要把工具安装、调试命令或代码片段单独当作成果。`;
 
+export const hierarchicalReportRules = `${reportRules}
+按对话、项目、最终报告逐层汇总。对话材料仅保留主对话最后一段上下文；段首压缩摘要与期间外消息是背景，不据此认定为本期新成果。没有出现在选取材料中的早期工作不可推断为没有进展。`;
+
+export const projectSummaryPrompt = `将同一项目的对话摘要归并为项目进展，控制在 800 个汉字左右。
+合并重复事项，依据明确时间保留最新状态，区分已完成、进行中、阻塞与待验证。保留来源链接和覆盖限制，不增加材料没有支持的事实。`;
+
 export const defaultReportSettings: ReportSettings = {
   revision: 0, timezone: 'Asia/Shanghai', model: 'gpt-6-luna',
   daily: { enabled: false, time: '08:30' },

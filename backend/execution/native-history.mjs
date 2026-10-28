@@ -170,6 +170,7 @@ export function parseNativeHistory(source, includeBlocks = false) {
         lastUserMessages.delete(turn.id);
         upsert(turn, { id, type: 'agent_message', text: text(item.content), ...(item.delivery ? { delivery: item.delivery } : {}), ...(item.questions ? { questions: item.questions } : {}) }, timestamp);
       }
+      else if (item.type === 'Plan') upsert(turn, { id, type: 'plan', text: item.text ?? text(item.content) }, timestamp);
       else if (item.type === 'Reasoning') {
         const summary = item.summary_text ?? item.summary ?? item.content;
         const summaryText = Array.isArray(summary) && summary.every(part => typeof part === 'string') ? summary.join('\n') : text(summary);
@@ -191,7 +192,7 @@ export function parseNativeHistory(source, includeBlocks = false) {
         }, timestamp);
       }
       else if (item.type === 'McpToolCall') upsert(turn, { ...item, type: 'mcp_tool_call' }, timestamp);
-      else if (['agent_message', 'reasoning', 'command_execution', 'mcp_tool_call', 'file_change', 'web_search', 'todo_list', 'error'].includes(item.type)) upsert(turn, item, timestamp);
+      else if (['plan', 'agent_message', 'reasoning', 'command_execution', 'mcp_tool_call', 'file_change', 'web_search', 'todo_list', 'error'].includes(item.type)) upsert(turn, item, timestamp);
     }
     if (record.type === 'event_msg' && p.type === 'user_message') recordUserMessage(turn, p.message ?? '');
     if (record.type === 'token_usage_record' && p.usage && !responses.has(p.response_id ?? `usage-${index}`)) {

@@ -107,13 +107,14 @@ export function projectFromRow(row: Record<string, unknown>): Project {
 }
 
 export const SESSION_COLUMNS = `id,project_id,thread_id,native_history_path,title,execution_mode,working_directory,model,model_entry_id,
- model_reasoning_effort,sandbox_mode,web_search_mode,network_access_enabled,status,turn_count,context_input_tokens,
+ model_reasoning_effort,collaboration_mode,fast_mode,sandbox_mode,web_search_mode,network_access_enabled,status,turn_count,context_input_tokens,
  context_cached_input_tokens,context_output_tokens,context_model,context_observed_at,context_source,archived_at,started_at,created_at,updated_at`;
 export function sessionValues(session: Session): unknown[] {
   const usage = session.contextUsage;
   return [session.id, session.projectId ?? null, session.threadId, session.nativeHistoryPath ?? null, session.title,
     session.settings.executionMode ?? 'local', session.settings.workingDirectory, session.settings.model,
-    session.settings.modelEntryId ?? null, session.settings.modelReasoningEffort, session.settings.sandboxMode,
+    session.settings.modelEntryId ?? null, session.settings.modelReasoningEffort,
+    session.settings.collaborationMode ?? 'default', session.settings.fastMode ? 1 : 0, session.settings.sandboxMode,
     session.settings.webSearchMode, session.settings.networkAccessEnabled ? 1 : 0, session.status,
     session.turnCount ?? session.turns.filter(t => t.codexAccepted || t.nativeTurnId).length,
     usage?.inputTokens ?? null, usage?.cachedInputTokens ?? null, usage?.outputTokens ?? null, usage?.model ?? null,
@@ -129,6 +130,7 @@ export function sessionFromRow(row: Record<string, unknown>): Session {
     settings: { executionMode, workingDirectory: String(row.working_directory), model: String(row.model),
       ...(row.model_entry_id ? { modelEntryId: String(row.model_entry_id) } : {}),
       modelReasoningEffort: String(row.model_reasoning_effort) as Session['settings']['modelReasoningEffort'],
+      collaborationMode: row.collaboration_mode === 'plan' ? 'plan' : 'default', fastMode: Boolean(row.fast_mode),
       sandboxMode: String(row.sandbox_mode) as Session['settings']['sandboxMode'],
       webSearchMode: String(row.web_search_mode) as Session['settings']['webSearchMode'], networkAccessEnabled: Boolean(row.network_access_enabled) },
     status: String(row.status) as Session['status'], startedAt: iso(row.started_at)!, archivedAt: iso(row.archived_at),

@@ -126,6 +126,12 @@ export class AppServerReader {
     const client = new CodexAppServerClient({ url: endpoint.url,
       headers: endpoint.headers,
       requestTimeoutMs: 30_000 });
+    client.on('request', message => {
+      // Resuming also replays pending questions. Readers leave these for the
+      // interactive client; rejecting one would resolve it for every client.
+      if (message.method !== 'item/tool/requestUserInput')
+        client.respondError(message.id, { code: -32601, message: `Unhandled server request: ${message.method}` });
+    });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await abortable(Promise.race([client.connect(), new Promise<never>((_, reject) => {

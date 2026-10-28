@@ -4,7 +4,7 @@ import { withNativeUserInput } from '../../util/user-input.js';
 import type { SandboxImageIdentity, SandboxState } from '../../protocol/sandbox-types.js';
 import type { WorkspaceTarget } from '../sandboxes/types.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { AppServerEventAdapter, Codex, CodexAppServerClient } from '../../packages/agentcore/src/index.mjs';
+import { AppServerEventAdapter, Codex, CodexAppServerClient, nativeTurnOptions } from '../../packages/agentcore/src/index.mjs';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
 import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxRecord, CellboxServiceAccess } from '@co-cell/sandbox';
@@ -14,6 +14,7 @@ import { holdResponse } from '../../util/http-stream.js';
 import type { InputRequestHook, ThreadOptions } from '../../packages/agentcore/src/index.mjs';
 import type { AgentEvent } from '../../protocol/types.js';
 import type { CompactionContent, CompactionSelector, Session, SubagentConversation, Turn } from '../../protocol/types.js';
+import type { NativeSessionConnection } from '../../protocol/native-app-server.js';
 import { parseNativeCompaction, type NativeHistory } from './native-history.mjs';
 import { AppServerReader, type AppServerEndpoint } from './app-server-reader.js';
 import { loadAgentDocs } from '../shared-files/agent-docs.js';
@@ -31,7 +32,7 @@ export interface ServiceProxyAccess {
 
 export interface SandboxRuntime {
   /** Native connections own transports only. App Server owns turn execution. */
-  prepareNativeSession?(session: Session, signal: AbortSignal, onSandbox: SaveSandbox): Promise<{ threadId: string | null; threadOptions: Record<string, unknown>; turnOptions: { model?: string; effort?: string } }>;
+  prepareNativeSession?(session: Session, signal: AbortSignal, onSandbox: SaveSandbox): Promise<Pick<NativeSessionConnection, 'threadId' | 'threadOptions' | 'turnOptions'>>;
   openNativeConnection?(session: Session, signal: AbortSignal): Promise<AppServerEndpoint & { release(): Promise<void> }>;
   nativeRequest?(session: Session, method: string, params: unknown): Promise<any>;
   compaction?(session: Session, selector: CompactionSelector, threadId?: string, signal?: AbortSignal): Promise<CompactionContent | undefined>;
@@ -317,7 +318,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       this.appServerObservers.set(turn.id, codex);
       observer.signal.throwIfAborted();
       const options = { workingDirectory: session.settings.workingDirectory, ...(session.settings.model ? { model: session.settings.model } : {}), ...modelOptions,
-        modelReasoningEffort: session.settings.modelReasoningEffort, sandboxMode: 'danger-full-access' as const,
+        modelReasoningEffort: session.settings.modelReasoningEffort, collaborationMode: session.settings.collaborationMode,
+        fastMode: session.settings.fastMode, sandboxMode: 'danger-full-access' as const,
         webSearchMode: session.settings.webSearchMode, networkAccessEnabled: true, approvalPolicy: 'never' as const, skipGitRepoCheck: true, onInputRequest };
       const thread = session.threadId ? codex.resumeThread(session.threadId, options) : codex.startThread(options);
       const input = images.length ? [{ type: 'text' as const, text: turn.prompt }, ...images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
@@ -348,16 +350,23 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     try {
       await this.prepareEnvironment(session, entry, signal);
       const model = await this.options.resolveModel?.(session);
+      let effectiveModel = model?.model || session.settings.model;
       const threadOptions = { cwd: session.settings.workingDirectory, approvalPolicy: 'never', sandbox: 'danger-full-access',
+        serviceTier: session.settings.fastMode ? 'fast' : 'default',
         ...(session.settings.model ? { model: session.settings.model } : {}),
         ...(model?.model ? { model: model.model } : {}), ...(model?.modelProvider ? { modelProvider: model.modelProvider } : {}),
-        config: { web_search: session.settings.webSearchMode,
+        config: { web_search: session.settings.webSearchMode, 'features.fast_mode': true,
           'sandbox_workspace_write.network_access': true } };
       const threadId = await this.reader.read(entry.metadata.id, async client => {
         // Provider definitions belong in native configuration. The browser only
         // needs the provider name, never a channel credential.
         const edits = Object.entries(model?.providerConfig ?? {}).map(([keyPath, value]) => ({ keyPath, value, mergeStrategy: 'replace' }));
         if (edits.length) await client.request('config/batchWrite', { edits });
+        if (!effectiveModel) {
+          const models = await client.request('model/list', {});
+          effectiveModel = models.data?.find((candidate: { isDefault?: boolean }) => candidate.isDefault)?.model;
+          if (!effectiveModel) throw new HttpError(409, '请先选择模型，再使用会话模式');
+        }
         // Create an initial thread on the browser's own socket, immediately
         // before its first turn. Empty paginated threads cannot be cold-resumed.
         if (!session.threadId) return null;
@@ -374,8 +383,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         }
         return response.thread.id as string;
       }, signal);
-      return { threadId, threadOptions, turnOptions: { ...(model?.model || session.settings.model ? { model: model?.model || session.settings.model } : {}),
-        effort: session.settings.modelReasoningEffort } };
+      return { threadId, threadOptions, turnOptions: nativeTurnOptions(session.settings, effectiveModel) };
     } finally { await this.releaseEntry(entry, true); }
   }
 

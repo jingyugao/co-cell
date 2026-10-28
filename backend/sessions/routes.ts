@@ -11,6 +11,8 @@ const settingsSchema = z.object({
   model: z.string().trim().max(200),
   modelEntryId: z.string().trim().min(1).max(100),
   modelReasoningEffort: z.enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent']),
+  collaborationMode: z.enum(['default', 'plan']),
+  fastMode: z.boolean(),
   sandboxMode: z.enum(['read-only', 'workspace-write', 'danger-full-access']),
   webSearchMode: z.enum(['disabled', 'cached', 'live']),
   networkAccessEnabled: z.boolean(),

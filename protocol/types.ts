@@ -62,6 +62,8 @@ export interface Settings {
   /** Stable channel-model identity; absent on legacy sessions. */
   modelEntryId?: string;
   modelReasoningEffort: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'persistent';
+  collaborationMode?: 'default' | 'plan';
+  fastMode?: boolean;
   sandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access';
   webSearchMode: 'disabled' | 'cached' | 'live';
   networkAccessEnabled: boolean;

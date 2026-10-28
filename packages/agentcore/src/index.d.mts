@@ -30,9 +30,17 @@ export interface CodexOptions { appServerClient?: CodexAppServerClient; codexPat
 export interface ThreadOptions {
  model?: string; modelProvider?: string; providerConfig?: Record<string, unknown>; workingDirectory?: string; sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
  modelReasoningEffort?: string; webSearchMode?: 'disabled' | 'cached' | 'live'; networkAccessEnabled?: boolean;
+ collaborationMode?: 'default' | 'plan'; fastMode?: boolean;
  approvalPolicy?: 'never' | 'on-request' | 'on-failure' | 'untrusted'; additionalDirectories?: string[]; skipGitRepoCheck?: boolean;
  onInputRequest?: InputRequestHook;
 }
+export interface NativeTurnOptions {
+ model?: string;
+ effort?: string;
+ serviceTier?: 'fast' | 'default';
+ collaborationMode?: { mode: 'default' | 'plan'; settings: { model: string; reasoning_effort: string | null; developer_instructions: null } };
+}
+export function nativeTurnOptions(options: Pick<ThreadOptions, 'model' | 'modelReasoningEffort' | 'collaborationMode' | 'fastMode'>, model?: string): NativeTurnOptions;
 export class Codex { constructor(options?: CodexOptions); startThread(options?: ThreadOptions): Thread; resumeThread(id: string, options?: ThreadOptions): Thread; close(): Promise<void>; }
 export class Thread { readonly id: string | null; steer(text: string, onInputRequest?: InputRequestHook): Promise<boolean>; runStreamed(input: Input, options?: { signal?: AbortSignal; outputSchema?: unknown; onInputRequest?: InputRequestHook }): Promise<{ events: AsyncGenerator<AgentEvent> }>; }
 export function appServerArgs(config?: Record<string, unknown>, configOverrides?: string[]): string[];

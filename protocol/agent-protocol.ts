@@ -11,6 +11,7 @@ export interface Usage {
 }
 
 export type ThreadItem =
+  | { id: string; type: 'plan'; text: string }
   | { id: string; type: 'agent_message'; text: string; delivery?: string; questions?: Array<{ title: string; options?: string[] }> }
   | { id: string; type: 'reasoning'; text: string }
   | { id: string; type: 'command_execution'; command: string; aggregated_output: string; exit_code?: number; status: ItemStatus }

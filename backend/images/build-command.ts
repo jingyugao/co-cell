@@ -6,7 +6,8 @@ const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 /** No downloads: the source or user's command supplies Node.js, Codex and project tools. */
 export async function prepareImageRequest(url: string, userCommand?: string) {
   const sources = [
-    ['deploy/box-wrap/tool-path.sh', '/etc/profile.d/cocell-tools.sh'],
+    ['deploy/box-wrap/profile-loader.sh', '/etc/profile.d/cocell-tools.sh'],
+    ['deploy/box-wrap/tool-path.sh', '/opt/product/cocell/tool-path.sh'],
     ['deploy/box-wrap/login-path.mjs', '/opt/product/cocell/login-path.mjs'],
     ['deploy/box-wrap/tools/cocell-proxy', '/opt/cellbox/tools/cocell-proxy'],
     ['deploy/box-wrap/oss-archive-restore.mjs', '/opt/product/cocell/oss-archive-restore.mjs'],

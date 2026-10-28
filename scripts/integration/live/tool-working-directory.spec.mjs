@@ -60,6 +60,10 @@ console.log(JSON.stringify({repository:repo,metadata}));`;
   const shellPath = (await exec('kubectl', ['--context', context, '-n', namespace, 'exec', pod, '--', '/usr/local/bin/node', '-e', loginPath], { timeout: 40_000 })).stdout.trim().split(':');
   assert.equal(shellPath[0], '/var/lib/cellbox/shared/tools/current/bin');
   assert(shellPath.includes('/cocell-e2e-inherited') && shellPath.includes('/usr/local/go/bin'), `Login shell dropped inherited PATH: ${shellPath.join(':')}`);
+  // Shell setup must come from the server-published copy so it updates without an image rebuild.
+  const sharedProfile = `const fs=require('node:fs');const shared='/var/lib/cellbox/shared/tool-wrap/current/deploy/box-wrap/tool-path.sh';console.log(JSON.stringify({loader:fs.readFileSync('/etc/profile.d/cocell-tools.sh','utf8').includes(shared),shared:fs.existsSync(shared)}));`;
+  assert.deepEqual(JSON.parse((await exec('kubectl', ['--context', context, '-n', namespace, 'exec', pod, '--', '/usr/local/bin/node', '-e', sharedProfile], { timeout: 40_000 })).stdout),
+    { loader: true, shared: true });
   try {
     const result = await exec('kubectl', ['--context', context, '-n', namespace, 'exec', pod, '--', '/usr/local/bin/node', '-e', code], { timeout: 500_000, maxBuffer: 1024 * 1024 });
     const evidence = JSON.parse(result.stdout);

@@ -27,7 +27,7 @@ export interface WorkReport {
   /** Local dates, with an exclusive end. */
   periodStart: string;
   periodEnd: string;
-  /** Manual snapshot of the current week, separate from its eventual complete report. */
+  /** Material cutoff for a same-day daily report or a manual current-week snapshot. */
   asOf?: string;
   status: ReportStatus;
   sourceCount: number;

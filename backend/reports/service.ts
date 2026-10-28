@@ -25,7 +25,9 @@ const localDate = (now: Date) => new Date(now.getTime() + 8 * 3_600_000).toISOSt
 const instant = (date: string) => new Date(`${date}T00:00:00+08:00`);
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const periodDescription = (report: StoredWorkReport) => `${report.periodStart} 至 ${report.periodEnd}（不含结束日，北京时间）`
-  + (report.asOf ? `；这是本周进展快照，只统计截至 ${report.asOf} 的内容，本周尚未结束` : '');
+  + (report.asOf ? report.kind === 'daily'
+    ? `；这是当日进展快照，只统计截至 ${report.asOf} 的内容`
+    : `；这是本周进展快照，只统计截至 ${report.asOf} 的内容，本周尚未结束` : '');
 
 /** Split only when necessary, prefer whole Markdown messages, and never drop an oversized message. */
 export function reportChunks(text: string): string[] {
@@ -457,7 +459,7 @@ export class ReportService {
   }
 
   private async complete(report: StoredWorkReport, body: string, save: () => Promise<void>) {
-    if (report.asOf) body = `> 本周进展快照，统计截至 ${new Date(report.asOf).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）。本周尚未结束，正式周报另行生成。\n\n${body}`;
+    if (report.asOf) body = `> ${report.kind === 'daily' ? '当日' : '本周'}进展快照，统计截至 ${new Date(report.asOf).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）。${report.kind === 'weekly' ? '本周尚未结束，正式周报另行生成。' : ''}\n\n${body}`;
     await this.write(join(this.directory(report), 'report.md'), body);
     report.status = 'ready'; report.generatedAt = this.now().toISOString(); delete report.error;
     await save();

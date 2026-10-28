@@ -52,6 +52,7 @@ export interface IndexedMaterialEvent {
   role?: string;
   text: string;
   summary?: string;
+  summarySource?: 'message' | 'replacement_history_fallback' | 'none';
   timePrecision?: 'turn';
 }
 
@@ -88,6 +89,7 @@ async function writeEventIndex(directory: string, threads: Thread[], db: Databas
           atMs: Number(row.at_ms), contextIndex, kind, ...(row.role ? { role: String(row.role) } : {}),
           text: eventMarkdown(kind, row.role ? String(row.role) : null, data),
           ...(kind === 'compaction' && typeof data.summary === 'string' ? { summary: data.summary } : {}),
+          ...(kind === 'compaction' ? { summarySource: data.summarySource as IndexedMaterialEvent['summarySource'] } : {}),
           ...(data.timePrecision === 'turn' ? { timePrecision: 'turn' as const } : {}) };
         await handle.writeFile(JSON.stringify(entry) + '\n');
         if (kind === 'compaction') contextIndex++;
@@ -316,8 +318,7 @@ function threadFiles(dbPaths: string[], rootId: string): { threads: Thread[]; re
 }
 
 function compactionInfo(payload: Record<string, unknown>, atMs: number, order: number, itemId?: string, source = 'rollout'): MaterialEvent {
-  const rawSummary = typeof payload.message === 'string' ? payload.message
-    : typeof payload.summary === 'string' ? payload.summary : '';
+  const rawSummary = [payload.message, payload.summary].find((value): value is string => typeof value === 'string' && Boolean(value.trim())) ?? '';
   let summary = rawSummary;
   let encryptedCount = 0;
   if (!summary && Array.isArray(payload.replacement_history)) {
@@ -336,7 +337,8 @@ function compactionInfo(payload: Record<string, unknown>, atMs: number, order: n
   const externalId = [payload.compaction_id, payload.item_id, payload.id, itemId].find(value => typeof value === 'string' && value) as string | undefined;
   return { threadId: '', ...(externalId ? { eventId: externalId } : {}), order, tieOrder: order, atMs,
     kind: 'compaction', encryptedCount,
-    data: { summary: cleaned.value, source, summarySource: rawSummary ? 'message' : summary ? 'replacement_history_fallback' : 'none' } };
+    data: { summary: cleaned.value, source, summarySource: rawSummary.trim() && !cleaned.encrypted ? 'message'
+      : !rawSummary && summary ? 'replacement_history_fallback' : 'none' } };
 }
 
 function messageEvent(threadId: string, item: Record<string, unknown>, itemType: string,
@@ -476,6 +478,7 @@ async function collectRollout(path: string, thread: Thread, db: DatabaseSync, si
       const marker = compactionInfo(completedMarker, atMs, order, String(completedMarker.id ?? ''), 'rollout_marker');
       marker.threadId = thread.id;
       if (pendingCompaction && turn && turn === pendingCompaction.turn) {
+        marker.atMs = pendingCompaction.event.atMs;
         marker.data.summary = pendingCompaction.event.data.summary || marker.data.summary;
         marker.data.summarySource = pendingCompaction.event.data.summarySource || marker.data.summarySource;
         marker.encryptedCount = Math.max(marker.encryptedCount ?? 0, pendingCompaction.event.encryptedCount ?? 0);
@@ -800,7 +803,9 @@ export async function prepareLiveMaterials(threads: MaterialThread[], outputDire
           order++;
           if (type.toLowerCase().replaceAll('_', '') === 'contextcompaction') {
             if (item.status && item.status !== 'completed') continue;
-            const event = compactionInfo(item, atMs, order, id, 'live');
+            const compactionAt = nativeTime(item.compactionTimestamp);
+            const event = compactionInfo(item, compactionAt || atMs, order, id, 'live');
+            if (!compactionAt && !exactAt) event.data.timePrecision = 'turn';
             event.threadId = thread.id; addEvent(db, event); continue;
           }
           const parsed = messageEvent(thread.id, item, type, id, order, atMs, 'live');

@@ -55,9 +55,14 @@ function nativeCompactions(source) {
   return compactions;
 }
 
+export function parseNativeCompactions(source) {
+  return nativeCompactions(source).map(({ itemId, segment, timestamp, summary }) => ({
+    ...(itemId ? { itemId } : {}), segment, timestamp, summary,
+  }));
+}
+
 export function parseNativeCompaction(source, selector) {
-  const found = nativeCompactions(source).find(value => selector.itemId ? value.itemId === selector.itemId : value.segment === selector.segment);
-  return found ? { ...(found.itemId ? { itemId: found.itemId } : {}), segment: found.segment, timestamp: found.timestamp, summary: found.summary } : undefined;
+  return parseNativeCompactions(source).find(value => selector.itemId ? value.itemId === selector.itemId : value.segment === selector.segment);
 }
 
 /** Project only Codex's persisted events; platform submissions are never inputs. */

@@ -51,6 +51,8 @@ export interface ReportSource {
   sourceUpdatedAt: string;
   status: 'included' | 'empty' | 'failed';
   materialId?: string;
+  /** Some context segments have neither a readable compaction nor in-period raw text. */
+  coverageIncomplete?: boolean;
   isSnapshot?: boolean;
   collectedAt?: string;
   summary?: string;

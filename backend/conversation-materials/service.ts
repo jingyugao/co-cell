@@ -11,9 +11,9 @@ import { prepareMaterials, prepareLiveMaterials, type IndexedMaterialEvent, type
 import type { MaterialsRepository } from './repository.js';
 import { readMaterialContent } from './content.js';
 
-const VERSION = 1;
+const VERSION = 2;
 export interface MaterialSource { sessionId: string; threadId: string; sourceUpdatedAt: string; boxId: string }
-export interface PeriodMaterial { path: string; content: string }
+export interface PeriodMaterial { path: string; content: string; coverageIncomplete?: boolean }
 
 async function fileHash(path: string) {
   const hash = createHash('sha256');
@@ -99,7 +99,7 @@ export class ConversationMaterialsService {
     return readMaterialContent(this.directory(id), path, offset, file.byteLength);
   }
 
-  /** A compact summary is background, never a new accomplishment. Keep a task anchor across midnight. */
+  /** Replace each closed context with its in-period readable compaction; retain the unfinished tail. */
   async period(id: string, start: Date, end: Date, signal?: AbortSignal): Promise<PeriodMaterial[]> {
     const material = await this.deps.repository.get(id);
     if (!material) throw new HttpError(404, '对话材料不存在');
@@ -107,53 +107,61 @@ export class ConversationMaterialsService {
     const digest = createHash('sha256');
     input.on('data', chunk => digest.update(chunk));
     const lines = createInterface({ input, crlfDelay: Infinity });
-    const background = new Map<string, { summary?: string; task?: string; prompt?: string; answer?: string }>();
-    const parts = new Map<string, { heading: string; background: string; events: string[]; coarse: boolean }>();
+    const previousPrompt = new Map<string, string>();
+    const parts = new Map<string, { heading: string; background: string; events: string[]; coarse: boolean; note?: string; coverageIncomplete?: boolean }>();
     let bytes = 0;
+    const checkSize = () => {
+      if (bytes > 64 * 1024 ** 2) throw new Error('单条对话的期间材料超过 64 MiB，未截断或提交');
+    };
     try {
       for await (const line of lines) {
         signal?.throwIfAborted();
         const event = JSON.parse(line) as IndexedMaterialEvent;
-        if ((!Number.isFinite(event.atMs) || event.atMs <= 0) && event.text.trim())
+        if ((!Number.isFinite(event.atMs) || event.atMs <= 0) && (event.text.trim() || event.kind === 'compaction'))
           throw new Error('对话包含缺少有效时间的记录，无法可靠归入报告期间');
-        const previous = background.get(event.threadId) ?? {};
         if (event.atMs > 0 && event.atMs < start.getTime()) {
-          if (event.kind === 'compaction' && event.summary) previous.summary = event.summary;
-          if (event.kind === 'message' && event.role === 'user') {
-            previous.task ??= event.text;
-            previous.prompt = event.text;
-          }
-          if (event.kind === 'message' && event.role === 'assistant') previous.answer = event.text;
-          background.set(event.threadId, previous);
+          if (event.kind === 'message' && event.role === 'user') previousPrompt.set(event.threadId, event.text);
           continue;
         }
         if (event.atMs < start.getTime() || event.atMs >= end.getTime() || !event.atMs) continue;
-        if (event.kind === 'compaction') { if (event.summary) previous.summary = event.summary; background.set(event.threadId, previous); continue; }
-        if (!event.text.trim()) continue;
+        if (event.kind !== 'compaction' && !event.text.trim()) continue;
         const key = `${event.threadId}/${event.contextIndex}`;
         let part = parts.get(key);
         if (!part) {
           part = { heading: `# ${event.agentName} · 上下文 ${event.contextIndex}`,
-            background: [...new Set([previous.summary, previous.task, previous.prompt, previous.answer].filter(Boolean))]
-              .map(text => text!.slice(0, 4000)).join('\n\n'), events: [], coarse: false };
+            background: (previousPrompt.get(event.threadId) ?? '').slice(0, 4000), events: [], coarse: false };
           parts.set(key, part);
         }
+        if (event.kind === 'compaction') {
+          const at = new Date(event.atMs).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+          if (event.summarySource === 'message' && event.summary?.trim()) {
+            for (const text of part.events) bytes -= Buffer.byteLength(text);
+            const summary = `## 压缩摘要\n\n压缩记录时间：${at}（北京时间）。${event.timePrecision === 'turn' ? '此时间按轮次归属，精确压缩时间不可用。' : ''}\n`
+              + '摘要可能包含此前背景；压缩发生在本期不代表其中所有工作都发生在本期。请结合昨日日报和明确日期判断新增进展。\n\n'
+              + event.summary;
+            part.events = [summary]; part.background = ''; part.coarse = false;
+            bytes += Buffer.byteLength(summary); checkSize();
+          } else {
+            part.coverageIncomplete = !part.events.length;
+            part.note = `压缩记录时间：${at}（北京时间）；未取得可读压缩摘要，`
+              + (part.coverageIncomplete ? '该段也没有本期原文，压缩前的覆盖范围无法确认，报告需注明此缺口。'
+                : '保留下方本期原文，未将保留消息或加密状态当作摘要。');
+          }
+          continue;
+        }
         const text = `时间：${new Date(event.atMs).toISOString()}\n\n${event.text}`;
-        bytes += Buffer.byteLength(text);
-        if (bytes > 64 * 1024 ** 2) throw new Error('单条对话的期间材料超过 64 MiB，未截断或提交');
+        bytes += Buffer.byteLength(text); checkSize();
         part.events.push(text);
         part.coarse ||= event.timePrecision === 'turn';
-        if (event.kind === 'message' && event.role === 'user') {
-          previous.task ??= event.text;
-          previous.prompt = event.text;
-        }
-        if (event.kind === 'message' && event.role === 'assistant') previous.answer = event.text;
-        background.set(event.threadId, previous);
+        if (event.kind === 'message' && event.role === 'user') previousPrompt.set(event.threadId, event.text);
       }
     } finally { lines.close(); input.destroy(); }
     if (digest.digest('hex') !== material.indexSha256) throw new Error('对话时间索引校验失败，未使用已变化的材料');
-    return [...parts].map(([path, part]) => ({ path: `${path}.md`, content: [part.heading,
+    if (parts.size && ![...parts.values()].some(part => part.events.length))
+      throw new Error('本期压缩记录缺少可读摘要及原文，无法确认报告覆盖范围');
+    return [...parts].map(([path, part]) => ({ path: `${path}.md`, ...(part.coverageIncomplete ? { coverageIncomplete: true } : {}), content: [part.heading,
       part.coarse ? '部分消息缺少独立时间：任务发起按轮次开始时间，执行结果按轮次完成时间；进行中结果按采集时间归属，不据此认定已完成。' : '',
-      part.background ? `## 此前背景（不计入本期成果）\n\n${part.background}` : '', ...part.events].filter(Boolean).join('\n\n') }));
+      part.note ?? '', part.background ? `## 前序任务背景（不计入本期新增成果）\n\n${part.background}` : '',
+      ...part.events].filter(Boolean).join('\n\n') }));
   }
 }

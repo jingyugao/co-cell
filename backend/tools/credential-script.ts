@@ -16,6 +16,7 @@ const maxScriptBytes = 16000;
 const maxConcurrentWorkers = 4;
 const workerTimeoutMs = 2000;
 const bashTimeoutMs = 30_000;
+const maxStderrBytes = 64 * 1024;
 const bashPath = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 let activeWorkers = 0;
 
@@ -106,7 +107,7 @@ async function runTypescriptCredentialScript(source: string, input: unknown, res
     const inputJson = JSON.stringify(input);
     if (inputJson === undefined) throw new HttpError(400, '凭证脚本输入无效');
     if (Buffer.byteLength(inputJson) > maxScriptInputBytes) throw new HttpError(400, '凭证脚本输入过大');
-    const response = await new Promise<unknown>(resolve => {
+    const outcome = await new Promise<{ response: unknown } | { failure: string }>(resolve => {
       worker = new Worker(new URL('./credential-worker.mjs', import.meta.url), {
         execArgv: [], env: {}, stdout: true, stderr: true,
         resourceLimits: { maxOldGenerationSizeMb: 48, maxYoungGenerationSizeMb: 8, stackSizeMb: 1 },
@@ -114,16 +115,18 @@ async function runTypescriptCredentialScript(source: string, input: unknown, res
       });
       worker.stdout?.resume();
       worker.stderr?.resume();
-      worker.once('message', value => resolve(value));
-      worker.once('error', () => resolve(undefined));
-      worker.once('exit', () => resolve(undefined));
-      timer = setTimeout(() => resolve(undefined), timeoutMs);
+      worker.once('message', value => resolve(value && typeof value === 'object' && typeof value.error === 'string'
+        ? { failure: value.error } : { response: value }));
+      worker.once('error', error => resolve({ failure: error.message }));
+      worker.once('exit', code => resolve({ failure: `脚本 worker 已退出（code ${code}）` }));
+      timer = setTimeout(() => resolve({ failure: `脚本执行超时（${timeoutMs}ms）` }), timeoutMs);
     });
+    if ('failure' in outcome) throw new HttpError(400, outcome.failure);
+    const { response } = outcome;
     const maxResponseBytes = resultMode === 'general' ? 4096 : resultMode === 'credential-save' ? Math.ceil(maxCredentialBytes / 3) * 4 + 16 : 8 * 1024 * 1024;
-    if (typeof response !== 'string' || Buffer.byteLength(response) > maxResponseBytes)
-      throw new HttpError(400, '凭证脚本执行失败或输出无效');
+    if (typeof response !== 'string' || Buffer.byteLength(response) > maxResponseBytes) throw new HttpError(400, '脚本输出无效或超过大小限制');
     try { return JSON.parse(response); }
-    catch { throw new HttpError(400, '凭证脚本执行失败或输出无效'); }
+    catch (error) { throw new HttpError(400, (error as Error).message); }
   } finally {
     clearTimeout(timer);
     try { if (worker) await worker.terminate(); }
@@ -131,10 +134,12 @@ async function runTypescriptCredentialScript(source: string, input: unknown, res
   }
 }
 
-function boundedOutput(child: ReturnType<typeof spawn>, maxBytes: number): Promise<{ code: number | null; stdout: Buffer }> {
+function boundedOutput(child: ReturnType<typeof spawn>, maxBytes: number): Promise<{ code: number | null; stdout: Buffer; stderr: string }> {
   return new Promise((resolveOutput, rejectOutput) => {
     const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
     let size = 0;
+    let errorSize = 0;
     let settled = false;
     const terminate = () => { if (child.pid) { try { globalThis.process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* exited */ } } } };
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -143,13 +148,22 @@ function boundedOutput(child: ReturnType<typeof spawn>, maxBytes: number): Promi
         if (!settled) { settled = true; terminate(); rejectOutput(new HttpError(400, '凭证脚本输出超过 1 MiB')); }
       } else chunks.push(Buffer.from(chunk));
     });
-    child.once('error', () => {
-      if (!settled) { settled = true; rejectOutput(new HttpError(400, '凭证脚本执行失败')); }
+    child.stderr?.on('data', (chunk: Buffer) => {
+      if (errorSize < maxStderrBytes) { errors.push(Buffer.from(chunk)); errorSize += chunk.length; }
+    });
+    child.once('error', error => {
+      if (!settled) { settled = true; rejectOutput(new HttpError(400, error.message)); }
     });
     child.once('close', code => {
-      if (!settled) { settled = true; resolveOutput({ code, stdout: Buffer.concat(chunks, size) }); }
+      if (!settled) { settled = true; resolveOutput({ code, stdout: Buffer.concat(chunks, size), stderr: Buffer.concat(errors).subarray(0, maxStderrBytes).toString('utf8') }); }
     });
   });
+}
+
+/** Report a failed Bash hook with its own stderr. */
+function bashFailure(result: { code: number | null; stderr: string }, timedOut: boolean, timeoutMs: number) {
+  if (timedOut) throw new HttpError(400, `脚本执行超时（${timeoutMs}ms）${result.stderr.trim() ? `：${result.stderr.trim()}` : ''}`);
+  if (result.code !== 0) throw new HttpError(400, result.stderr.trim() || `脚本退出码 ${result.code}`);
 }
 
 async function readStagedFile(path: string): Promise<Buffer> {
@@ -195,18 +209,19 @@ async function runBashRaw(source: string, input: unknown, options: ScriptOptions
         HOME: home, PATH: bashPath, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8',
         ...(options.npmCache ? { npm_config_cache: resolve(options.npmCache) } : {}),
       },
-      detached: true, stdio: ['pipe', 'pipe', 'ignore'],
+      detached: true, stdio: ['pipe', 'pipe', 'pipe'],
     });
     const outputPromise = boundedOutput(child, maxOutputBytes);
     child.stdin?.on('error', () => {});
     child.stdin?.end(inputJson);
-    timer = setTimeout(() => { if (child?.pid) { try { globalThis.process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* exited */ } } } }, timeoutMs);
+    let timedOut = false;
+    timer = setTimeout(() => { timedOut = true; if (child?.pid) { try { globalThis.process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* exited */ } } } }, timeoutMs);
     const result = await outputPromise;
-    if (result.code !== 0) throw new HttpError(400, '凭证脚本执行失败');
+    bashFailure(result, timedOut, timeoutMs);
     return result.stdout;
   } catch (error) {
     if (error instanceof HttpError) throw error;
-    throw new HttpError(400, '凭证脚本执行失败');
+    throw new HttpError(400, error instanceof Error ? error.message : String(error));
   } finally {
     clearTimeout(timer);
     if (child?.pid) { try { globalThis.process.kill(-child.pid, 'SIGKILL'); } catch { if (child.exitCode === null) child.kill('SIGKILL'); } }
@@ -240,10 +255,11 @@ export async function runToolScript(
     const stdout = await runBashRaw(source, input, options, timeoutMs, 4096);
     let parsed: unknown;
     try { parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(stdout)); }
-    catch { throw new HttpError(403, '工具权限检查未通过'); }
+    catch (error) { throw new HttpError(400, (error as Error).message); }
     output = parsed;
   } else output = await runTypescriptCredentialScript(source, input, 'general', timeoutMs);
-  if (!permissionResult(output)) throw new HttpError(403, '工具权限检查未通过');
+  if (!permissionResult(output))
+    throw new HttpError(400, '权限脚本返回值必须是 boolean 或 {allow, reason?, credential?}');
   return output;
 }
 
@@ -292,19 +308,21 @@ async function runBashCredentialScript(source: string, input: object, options: C
         COCELL_CREDENTIAL_PATH: selected,
         COCELL_CREDENTIAL_FILE: selected,
       },
-      detached: true, stdio: ['pipe', 'pipe', 'ignore'],
+      detached: true, stdio: ['pipe', 'pipe', 'pipe'],
     });
     const outputPromise = boundedOutput(child, maxOutputBytes);
     child.stdin?.on('error', () => {});
     child.stdin?.end(inputJson);
-    timer = setTimeout(() => { if (child?.pid) { try { globalThis.process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* exited */ } } } }, boundedTimeout(options.timeoutMs, bashTimeoutMs));
+    const timeoutMs = boundedTimeout(options.timeoutMs, bashTimeoutMs);
+    let timedOut = false;
+    timer = setTimeout(() => { timedOut = true; if (child?.pid) { try { globalThis.process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* exited */ } } } }, timeoutMs);
     const result = await outputPromise;
-    if (result.code !== 0) throw new HttpError(400, '凭证脚本执行失败');
+    bashFailure(result, timedOut, timeoutMs);
     const current = await readStagedFile(selected);
     return { stdout: result.stdout, ...(current.equals(selectedOriginal) ? {} : { selected: current }) };
   } catch (error) {
     if (error instanceof HttpError) throw error;
-    throw new HttpError(400, '凭证脚本执行失败');
+    throw new HttpError(400, error instanceof Error ? error.message : String(error));
   } finally {
     clearTimeout(timer);
     if (child?.pid) { try { globalThis.process.kill(-child.pid, 'SIGKILL'); } catch { if (child.exitCode === null) child.kill('SIGKILL'); } }

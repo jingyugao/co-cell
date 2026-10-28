@@ -99,7 +99,7 @@ export class ConversationMaterialsService {
     return readMaterialContent(this.directory(id), path, offset, file.byteLength);
   }
 
-  /** Replace each closed context with its in-period readable compaction; retain the unfinished tail. */
+  /** Report input uses only the root conversation's compactions and unfinished tail. */
   async period(id: string, start: Date, end: Date, signal?: AbortSignal): Promise<PeriodMaterial[]> {
     const material = await this.deps.repository.get(id);
     if (!material) throw new HttpError(404, '对话材料不存在');
@@ -117,6 +117,9 @@ export class ConversationMaterialsService {
       for await (const line of lines) {
         signal?.throwIfAborted();
         const event = JSON.parse(line) as IndexedMaterialEvent;
+        // Shared material also serves memory extraction, which retains child threads.
+        // Reports use only the root thread, including when reading older cached material.
+        if (event.threadId !== material.threadId) continue;
         if ((!Number.isFinite(event.atMs) || event.atMs <= 0) && (event.text.trim() || event.kind === 'compaction'))
           throw new Error('对话包含缺少有效时间的记录，无法可靠归入报告期间');
         if (event.atMs > 0 && event.atMs < start.getTime()) {

@@ -1,4 +1,5 @@
 import type { Session } from './types.js';
+import type { NativeTurnOptions } from '../packages/agentcore/src/index.mjs';
 
 /** Prepare a native thread without starting or taking ownership of a turn.
  * Connect to websocketPath and initialize. Resume an existing threadId; when it
@@ -10,7 +11,7 @@ export interface NativeSessionConnection {
   threadId: string | null;
   /** Non-sensitive native thread/start options; provider credentials stay in the Sandbox. */
   threadOptions: Record<string, unknown>;
-  turnOptions: { model?: string; effort?: string };
+  turnOptions: NativeTurnOptions;
 }
 
 /** Persist the native identity before submitting the first turn. Safe to repeat. */

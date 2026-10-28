@@ -9,10 +9,11 @@ export class NativeAppServerClient {
   private opening?: Promise<void>;
   private failOpening?: (error: Error) => void;
   constructor(private readonly url: string, private readonly notification: (message: RpcMessage) => void,
-    private readonly onClose: (error?: Error) => void, private readonly onError: (error: Error) => void = () => {}) {}
+    private readonly onClose: (error?: Error) => void, private readonly onError: (error: Error) => void = () => {},
+    private readonly serverRequest?: (message: RpcMessage) => boolean) {}
   async connect(threadId: string | null) {
     await this.open();
-    await this.request('initialize', { clientInfo: { name: 'cocell', title: 'CoCell', version: '1.0.0' }, capabilities: {} });
+    await this.request('initialize', { clientInfo: { name: 'cocell', title: 'CoCell', version: '1.0.0' }, capabilities: { experimentalApi: true } });
     this.notify('initialized', {});
     if (threadId) await this.request('thread/resume', { threadId, excludeTurns: true });
   }
@@ -47,6 +48,7 @@ export class NativeAppServerClient {
     // to a browser request with the same JSON-RPC id.
     if (typeof message.method === 'string') {
       if (message.id !== undefined && this.socket?.readyState === WebSocket.OPEN) {
+        if (this.serverRequest?.(message)) return;
         this.socket.send(JSON.stringify({ id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } }));
       } else this.notification(message);
       return;
@@ -75,6 +77,10 @@ export class NativeAppServerClient {
   notify(method: string, params: Record<string, unknown>) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error('Codex App Server 尚未连接');
     this.socket.send(JSON.stringify({ method, params }));
+  }
+  respond(id: string | number, result: unknown) {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error('Codex App Server 尚未连接');
+    this.socket.send(JSON.stringify({ id, result }));
   }
   close() {
     this.closed = true;

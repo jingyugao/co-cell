@@ -8,16 +8,29 @@ export class AppServerRpcError extends Error {
 
 const safeThreadRequest = (method, params) => {
   const safeParams = {};
-  for (const key of ['threadId', 'model', 'modelProvider', 'cwd', 'approvalPolicy', 'sandbox']) {
+  for (const key of ['threadId', 'model', 'modelProvider', 'cwd', 'approvalPolicy', 'sandbox', 'serviceTier']) {
     if (params[key] !== undefined) safeParams[key] = params[key];
   }
   const safeConfig = {};
-  for (const key of ['web_search', 'sandbox_workspace_write.network_access', 'sandbox_workspace_write.writable_roots']) {
+  for (const key of ['web_search', 'features.fast_mode', 'sandbox_workspace_write.network_access', 'sandbox_workspace_write.writable_roots']) {
     if (params.config?.[key] !== undefined) safeConfig[key] = params.config[key];
   }
   if (Object.keys(safeConfig).length) safeParams.config = safeConfig;
   return { method, params: safeParams };
 };
+
+/** Use native mode instructions and explicitly reset sticky thread settings. */
+export function nativeTurnOptions(options, model = options.model) {
+  return {
+    ...(model ? { model } : {}),
+    ...(options.modelReasoningEffort ? { effort: options.modelReasoningEffort } : {}),
+    serviceTier: options.fastMode ? 'fast' : 'default',
+    ...(model ? { collaborationMode: {
+      mode: options.collaborationMode ?? 'default',
+      settings: { model, reasoning_effort: options.modelReasoningEffort ?? null, developer_instructions: null },
+    } } : {}),
+  };
+}
 
 async function sendInputRequest(client, method, params, hook, threadRequest, nativeTurnId) {
   if (hook) await hook({ phase: 'sending', method, params: structuredClone(params), ...(threadRequest ? { threadRequest: structuredClone(threadRequest) } : {}) });
@@ -212,6 +225,7 @@ export class AppServerEventAdapter {
     const previous = this.items.get(item.id);
     switch (item.type) {
       case 'agentMessage': return { id: item.id, type: 'agent_message', text: item.text ?? previous?.text ?? '', ...(item.delivery ? { delivery: item.delivery } : {}), ...(item.questions ? { questions: item.questions } : {}) };
+      case 'plan': return { id: item.id, type: 'plan', text: item.text ?? previous?.text ?? '' };
       case 'reasoning': return { id: item.id, type: 'reasoning', text: (item.summary?.length ? item.summary : item.content)?.join('\n') || previous?.text || '' };
       case 'commandExecution': return { id: item.id, type: 'command_execution', command: item.command, aggregated_output: item.aggregatedOutput ?? previous?.aggregated_output ?? '', ...(item.exitCode != null ? { exit_code: item.exitCode } : {}), status: status(item.status) };
       case 'fileChange': return { id: item.id, type: 'file_change', changes: item.changes.map(change => ({ path: change.path, kind: typeof change.kind === 'string' ? change.kind : change.kind.type })), status: item.status === 'failed' || item.status === 'declined' ? 'failed' : 'completed' };
@@ -244,7 +258,7 @@ export class AppServerEventAdapter {
     }
     const item = this.items.get(p.itemId);
     if (!item) return [];
-    if (method === 'item/agentMessage/delta' || method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') item.text += p.delta;
+    if (method === 'item/agentMessage/delta' || method === 'item/plan/delta' || method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') item.text += p.delta;
     else if (method === 'item/reasoning/summaryPartAdded') { if (item.text) item.text += '\n'; }
     else if (method === 'item/commandExecution/outputDelta') item.aggregated_output += p.delta;
     else return [];
@@ -310,12 +324,14 @@ export class Thread {
       const opts = this.options;
       const threadConfig = {
         ...(opts.providerConfig ?? {}),
+        'features.fast_mode': true,
         ...(opts.webSearchMode ? { web_search: opts.webSearchMode } : {}),
         ...(opts.networkAccessEnabled !== undefined ? { 'sandbox_workspace_write.network_access': opts.networkAccessEnabled } : {}),
         ...(opts.additionalDirectories?.length ? { 'sandbox_workspace_write.writable_roots': opts.additionalDirectories } : {}),
       };
       const params = { ...(opts.model ? { model: opts.model } : {}), ...(opts.modelProvider ? { modelProvider: opts.modelProvider } : {}), cwd: opts.workingDirectory,
-        approvalPolicy: opts.approvalPolicy ?? 'never', sandbox: opts.sandboxMode ?? 'workspace-write', config: threadConfig };
+        approvalPolicy: opts.approvalPolicy ?? 'never', sandbox: opts.sandboxMode ?? 'workspace-write',
+        serviceTier: opts.fastMode ? 'fast' : 'default', config: threadConfig };
       let threadRequest = safeThreadRequest(this.id ? 'thread/resume' : 'thread/start', { ...params, ...(this.id ? { threadId: this.id } : {}) });
       let response = await client.request(this.id ? 'thread/resume' : 'thread/start', { ...params, ...(this.id ? { threadId: this.id } : {}) });
       // Loaded App Server threads retain their original provider on resume.
@@ -333,8 +349,7 @@ export class Thread {
       if (this.codex.closed) throw new Error('Codex observer is closed');
       const userInput = typeof input === 'string' ? [{ type: 'text', text: input }] : input;
       const turnParams = { threadId: this.id, input: userInput.map(part => part.type === 'local_image' ? { type: 'localImage', path: part.path } : { type: 'text', text: part.text, text_elements: [] }),
-        ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.modelReasoningEffort ? { effort: opts.modelReasoningEffort } : {}), ...(outputSchema ? { outputSchema } : {}) };
+        ...nativeTurnOptions(opts, opts.model || response.model), ...(outputSchema ? { outputSchema } : {}) };
       const result = await client.turnStart(turnParams, onInputRequest, threadRequest);
       turnId = result.turn.id;
       this.activeClient = client; this.activeTurnId = turnId;

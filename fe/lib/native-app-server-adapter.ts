@@ -17,6 +17,7 @@ export class NativeAppServerEventAdapter {
     switch (item.type) {
       case 'contextCompaction': return { id: item.id, type: 'context_compaction', status: 'completed' };
       case 'agentMessage': return { id: item.id, type: 'agent_message', text: item.text ?? (previous?.type === 'agent_message' ? previous.text : ''), ...(item.delivery ? { delivery: item.delivery } : {}), ...(item.questions ? { questions: item.questions } : {}) };
+      case 'plan': return { id: item.id, type: 'plan', text: item.text ?? (previous?.type === 'plan' ? previous.text : '') };
       case 'reasoning': return { id: item.id, type: 'reasoning', text: (item.summary?.length ? item.summary : item.content)?.join('\n') || (previous?.type === 'reasoning' ? previous.text : '') };
       case 'commandExecution': return { id: item.id, type: 'command_execution', command: item.command ?? '', aggregated_output: item.aggregatedOutput ?? (previous?.type === 'command_execution' ? previous.aggregated_output : ''), ...(item.exitCode != null ? { exit_code: item.exitCode } : {}), status: status(item.status) };
       case 'fileChange': return { id: item.id, type: 'file_change', changes: (item.changes ?? []).map((change: any) => ({ path: change.path, kind: typeof change.kind === 'string' ? change.kind : change.kind?.type })), status: item.status === 'failed' || item.status === 'declined' ? 'failed' : 'completed' };
@@ -49,6 +50,7 @@ export class NativeAppServerEventAdapter {
     const item = this.items.get(String(p.itemId));
     if (!item) return [];
     if (method === 'item/agentMessage/delta' && item.type === 'agent_message') item.text += String(p.delta ?? '');
+    else if (method === 'item/plan/delta' && item.type === 'plan') item.text += String(p.delta ?? '');
     else if ((method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') && item.type === 'reasoning') item.text += String(p.delta ?? '');
     else if (method === 'item/reasoning/summaryPartAdded' && item.type === 'reasoning') { if (item.text) item.text += '\n'; }
     else if (method === 'item/commandExecution/outputDelta' && item.type === 'command_execution') item.aggregated_output += String(p.delta ?? '');

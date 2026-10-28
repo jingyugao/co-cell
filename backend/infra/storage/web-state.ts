@@ -127,6 +127,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       id CHAR(36) PRIMARY KEY,project_id CHAR(36) NULL,thread_id VARCHAR(191) NULL,native_history_path TEXT NULL,title VARCHAR(255) NOT NULL,
       execution_mode ENUM('sandbox','local') NOT NULL,working_directory TEXT NOT NULL,model VARCHAR(200) NOT NULL,model_entry_id VARCHAR(200) NULL,
       model_reasoning_effort VARCHAR(20) NOT NULL,sandbox_mode VARCHAR(32) NOT NULL,web_search_mode VARCHAR(16) NOT NULL,
+      collaboration_mode VARCHAR(16) NOT NULL DEFAULT 'default',fast_mode BOOLEAN NOT NULL DEFAULT FALSE,
       network_access_enabled BOOLEAN NOT NULL,status ENUM('idle','running','completed','failed','cancelled') NOT NULL,
       turn_count BIGINT UNSIGNED NOT NULL DEFAULT 0,context_input_tokens BIGINT UNSIGNED NULL,context_cached_input_tokens BIGINT UNSIGNED NULL,
       context_output_tokens BIGINT UNSIGNED NULL,context_model VARCHAR(200) NULL,context_observed_at DATETIME(3) NULL,
@@ -134,6 +135,19 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       created_at DATETIME(3) NOT NULL,updated_at DATETIME(3) NOT NULL,INDEX sessions_project_updated(project_id,updated_at),
       INDEX sessions_status(status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
+    const [modeColumns] = await this.pool.query<Array<RowDataPacket & { COLUMN_NAME: string }>>(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sessions' AND COLUMN_NAME IN ('collaboration_mode','fast_mode')");
+    for (const [column, definition] of [
+      ['collaboration_mode', "VARCHAR(16) NOT NULL DEFAULT 'default'"],
+      ['fast_mode', 'BOOLEAN NOT NULL DEFAULT FALSE'],
+    ]) {
+      if (modeColumns.some(row => row.COLUMN_NAME === column)) continue;
+      try { await this.pool.query(`ALTER TABLE sessions ADD COLUMN ${column} ${definition}`); }
+      catch (error) {
+        // Multiple API instances may initialize the same schema concurrently.
+        if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ER_DUP_FIELDNAME')) throw error;
+      }
+    }
     await this.pool.query(`CREATE TABLE IF NOT EXISTS session_turns (
       id CHAR(36) PRIMARY KEY,session_id CHAR(36) NOT NULL,target_turn_id CHAR(36) NOT NULL,type ENUM('message','steer','question_reply') NOT NULL,
       method VARCHAR(32) NULL,params_json JSON NULL,thread_request_json JSON NULL,input_text MEDIUMTEXT NOT NULL,images_json JSON NULL,

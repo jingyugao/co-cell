@@ -103,7 +103,8 @@ export type TodoListItem = {
 };
 /** Canonical union of thread items and their type-specific payloads. */
 export type ContextCompactionItem = { id: string; type: 'context_compaction'; status: 'in_progress' | 'completed' | 'failed' };
-export type ThreadItem = ContextCompactionItem | AgentMessageItem | ReasoningItem | CommandExecutionItem | FileChangeItem | McpToolCallItem | WebSearchItem | TodoListItem | ErrorItem;
+export type PlanItem = { id: string; type: 'plan'; text: string };
+export type ThreadItem = PlanItem | ContextCompactionItem | AgentMessageItem | ReasoningItem | CommandExecutionItem | FileChangeItem | McpToolCallItem | WebSearchItem | TodoListItem | ErrorItem;
 
 /** Emitted when a new thread is started as the first event. */
 export type ThreadStartedEvent = {

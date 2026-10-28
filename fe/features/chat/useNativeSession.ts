@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { markPageLoad, pageLoadFailure } from '../../lib/page-load';
 import type { NativeSessionConnection } from '../../../protocol/native-app-server';
 import type { Session, Turn } from '../../../protocol/types';
+import type { UserInputRequest } from '../../../protocol/user-input-types';
 import { applySdkEvent } from '../../../util/session-events';
 import { appendAdditionalUserInput, recordNativeUserInput, withNativeUserInput } from '../../../util/user-input';
 import { api, errorMessage } from '../../lib/api';
@@ -11,6 +12,8 @@ import { mergeSession } from './useSessionStream';
 
 type Connection = NativeSessionConnection;
 type Submission = { prompt: string; images: string[] };
+type NativeQuestion = { sessionId: string; turnId: string; rpcId: string | number; questionIds: string[];
+  client: NativeAppServerClient; request: UserInputRequest };
 const nativeIds = (session: Session): Session => ({ ...session, turns: session.turns.map(turn => turn.nativeTurnId ? { ...turn, id: turn.nativeTurnId } : turn) });
 const toRpcError = (error: unknown) => error instanceof Error ? error : new Error(String(error));
 
@@ -42,13 +45,38 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   const threadRef = useRef('');
   const threadBoundRef = useRef(false);
   const selectedRef = useRef(selected); selectedRef.current = selected;
+  const nativeQuestions = useRef(new Map<string, NativeQuestion>());
+
+  const withNativeQuestions = useCallback((current: Session): Session => ({ ...current, turns: current.turns.map(turn => {
+    const questions = [...nativeQuestions.current.values()].filter(question => question.sessionId === current.id
+      && question.turnId === (turn.nativeTurnId ?? turn.id));
+    if (!questions.length) return turn;
+    return { ...turn, userInputRequests: [...(turn.userInputRequests ?? []).filter(request => !questions.some(question => question.request.id === request.id)),
+      ...questions.filter(question => question.request.status !== 'pending'
+        || (question.client === clientRef.current && turn.status === 'running')).map(question => question.request)] };
+  }) }), []);
+
+  const acceptServerRequest = useCallback((message: { id?: string | number; method?: string; params?: Record<string, any> }) => {
+    const params = message.params;
+    const client = clientRef.current;
+    if (message.method !== 'item/tool/requestUserInput' || message.id === undefined || !client
+      || params?.threadId !== threadRef.current || !params.turnId || !Array.isArray(params.questions) || !params.questions.length) return false;
+    const id = `request_user_input:${message.id}`;
+    nativeQuestions.current.set(id, { sessionId: selectedRef.current!, turnId: params.turnId, rpcId: message.id,
+      client, questionIds: params.questions.map((question: any) => question.id),
+      request: { id, status: 'pending', createdAt: new Date().toISOString(), questions: params.questions.map((question: any) => ({
+        title: question.question, ...(question.options ? { options: question.options.map((option: any) => option.label) } : {}),
+      })) } });
+    setSessionRef.current(current => current ? withNativeQuestions(current) : current);
+    return true;
+  }, [withNativeQuestions]);
 
   const mergeHistory = useCallback((id: string, latest: Session) => {
     const normalized = nativeIds(latest);
     if (selectedRef.current === id) setSessionRef.current(current => {
       if (!current) return normalized;
       const merged = mergeSession(current, normalized);
-      if (!liveTurnIds.current.size) return merged;
+      if (!liveTurnIds.current.size) return withNativeQuestions(merged);
       const local = new Map(current.turns.map(turn => [turn.nativeTurnId ?? turn.id, turn]));
       const turns = merged.turns.map(turn => liveTurnIds.current.has(turn.nativeTurnId ?? turn.id)
         ? { ...turn, ...local.get(turn.nativeTurnId ?? turn.id) } : turn);
@@ -56,10 +84,10 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
         .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
       const keepTerminalStatus = latestLocal && latestLocal.status !== 'running'
         && turns.some(turn => turn.id === latestLocal.id && turn.status !== 'running');
-      return { ...merged, ...(keepTerminalStatus ? { status: current.status } : {}), turns };
+      return withNativeQuestions({ ...merged, ...(keepTerminalStatus ? { status: current.status } : {}), turns });
     });
     return normalized;
-  }, []);
+  }, [withNativeQuestions]);
 
   const refreshHistory = useCallback(async (id: string) =>
     mergeHistory(id, await api<Session>(`/api/sessions/${encodeURIComponent(id)}`)), [mergeHistory]);
@@ -67,6 +95,13 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   const applyEvent = useCallback((message: { method?: string; params?: Record<string, any> }) => {
     const method = message.method ?? ''; const params = message.params ?? {};
     if (params.threadId && params.threadId !== threadRef.current) return;
+    if (method === 'serverRequest/resolved' || method === 'turn/completed') {
+      for (const question of nativeQuestions.current.values()) {
+        if (question.request.status === 'pending' && (method === 'serverRequest/resolved'
+          ? question.rpcId === params.requestId : question.turnId === params.turn?.id)) question.request = { ...question.request, status: 'answered' };
+      }
+      setSessionRef.current(current => current ? withNativeQuestions(current) : current);
+    }
     const eventTurnId = String(params.turnId ?? params.turn?.id ?? '');
     if ((method === 'item/started' || method === 'item/completed') && params.item?.type === 'userMessage' && params.item.id && eventTurnId) {
       const text = (params.item.content ?? []).filter((part: any) => part.type === 'text').map((part: any) => part.text ?? '').join('');
@@ -122,7 +157,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
           completedAt: turn.completedAt ?? new Date().toISOString() } : withInputs;
         const turns = updated.turns.map(item => item.id === turn!.id ? finalTurn : item);
         const status = event.type === 'turn.started' ? 'running' : event.type === 'turn.completed' ? 'completed' : event.type === 'turn.failed' ? (event.cancelled ? 'cancelled' : 'failed') : updated.status;
-        return { ...updated, status, turns };
+        return withNativeQuestions({ ...updated, status, turns });
       });
       if (event.type === 'turn.completed' || event.type === 'turn.failed') {
         terminalTurnIds.current.add(nativeId);
@@ -130,14 +165,14 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
         const selectedId = selectedRef.current; if (selectedId) void refreshHistory(selectedId).catch(() => {});
       }
     }
-  }, [refreshHistory]);
+  }, [refreshHistory, withNativeQuestions]);
 
   const acceptEvent = useCallback((message: { method?: string; params?: Record<string, any> }) => {
     if (bufferingEvents.current) {
       const params = message.params ?? {};
       if (params.threadId && params.threadId !== threadRef.current) return;
-      if (message.method === 'thread/tokenUsage/updated') { applyEvent(message); return; }
-      if (/^(turn\/(started|completed|plan\/updated)|item\/(started|completed|agentMessage\/delta|reasoning\/.*Delta|reasoning\/summaryPartAdded|commandExecution\/outputDelta))$/.test(message.method ?? ''))
+      if (message.method === 'thread/tokenUsage/updated' || message.method === 'serverRequest/resolved') { applyEvent(message); return; }
+      if (/^(turn\/(started|completed|plan\/updated)|item\/(started|completed|agentMessage\/delta|plan\/delta|reasoning\/.*Delta|reasoning\/summaryPartAdded|commandExecution\/outputDelta))$/.test(message.method ?? ''))
         threadChangeVersion.current++;
       return;
     }
@@ -147,6 +182,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   useEffect(() => {
     if (!enabled || !selected) { markConnected(false); return; }
     pendingSteers.current = []; observedUserItems.current.clear();
+    for (const [key, question] of nativeQuestions.current) if (question.sessionId !== selected) nativeQuestions.current.delete(key);
     const id = selected; threadRef.current = ''; threadBoundRef.current = false; connectionRef.current = null; liveTurnIds.current.clear(); activeTurnId.current = null; pendingStart.current = null; terminalTurnIds.current.clear(); let alive = true; let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let retryDelay = 500; let generation = 0;
     let client: NativeAppServerClient | undefined;
@@ -182,9 +218,10 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
           if (!alive || attempt !== generation || client !== attemptClient) return;
           client = undefined;
           if (clientRef.current === attemptClient) clientRef.current = null;
+          setSessionRef.current(current => current ? withNativeQuestions(current) : current);
           markConnected(false);
           scheduleRetry();
-        }, error => errorRef.current(error.message));
+        }, error => errorRef.current(error.message), acceptServerRequest);
         client = attemptClient;
         clientRef.current = attemptClient;
         markPageLoad('websocketStartedMs', id);
@@ -232,7 +269,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
     };
     void connect().catch(() => {});
     return () => { alive = false; generation++; refreshConnectionRef.current = null; bufferingEvents.current = false; if (retryTimer) clearTimeout(retryTimer); client?.close(); if (clientRef.current === client) clientRef.current = null; if (connectionRef.current?.session.id === id) connectionRef.current = null; markConnected(false); };
-  }, [selected, enabled, acceptEvent, mergeHistory, refreshHistory]);
+  }, [selected, enabled, acceptEvent, acceptServerRequest, mergeHistory, refreshHistory, withNativeQuestions]);
 
   const send = useCallback(async (prompt: string, images: string[] = [], options: { expectedTurnId?: string; forceStart?: boolean } = {}) => {
     const client = clientRef.current; const current = sessionRef.current;
@@ -320,6 +357,16 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
 
   const answer = useCallback(async (requestId: string, questions: Array<{ title: string }>, answers: string[]) => {
     if (answers.length !== questions.length || answers.some(value => !value.trim())) throw new Error('请回答所有问题');
+    const native = nativeQuestions.current.get(requestId);
+    if (!native && requestId.startsWith('request_user_input:')) throw new Error('问题连接已更新，请等待重新连接后重试。');
+    if (native) {
+      if (native.client !== clientRef.current || native.sessionId !== selectedRef.current || native.request.status !== 'pending')
+        throw new Error('问题连接已更新，请等待重新连接后重试。');
+      native.client.respond(native.rpcId, { answers: Object.fromEntries(native.questionIds.map((id, index) => [id, { answers: [answers[index]] }])) });
+      native.request = { ...native.request, status: 'answered', answers, answer: answers.join('\n\n'), answeredAt: new Date().toISOString() };
+      setSessionRef.current(current => current ? withNativeQuestions(current) : current);
+      return;
+    }
     const current = sessionRef.current;
     const ownerTurn = current?.turns.find(turn => turn.userInputRequests?.some(item => item.id === requestId));
     const request = ownerTurn?.userInputRequests?.find(item => item.id === requestId);
@@ -332,7 +379,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
     else await send(prompt, [], { forceStart: true });
     const answer = answers.length === 1 ? answers[0] : answers.map((value, index) => `${index + 1}. ${questions[index].title}\n${value}`).join('\n\n');
     setSessionRef.current(current => current ? { ...current, turns: current.turns.map(turn => ({ ...turn, userInputRequests: turn.userInputRequests?.map(item => item.id === requestId ? { ...item, status: 'answered', answer, answers, answeredAt: new Date().toISOString() } : item) })) } : current);
-  }, [send]);
+  }, [send, withNativeQuestions]);
 
   const refreshConnection = useCallback(async () => {
     const refresh = refreshConnectionRef.current;

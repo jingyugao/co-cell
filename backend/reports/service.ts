@@ -112,25 +112,32 @@ export class ReportService {
     });
     return readMaterialContent(directory, exists ? input : `${sessionId}.summary.md`, offset);
   }
-  async retry(id: string, updatedAt: string) {
+  async retry(id: string, updatedAt: string, regenerate = false) {
     const result = await this.coordinator.tryRun('reports:worker', async () => {
       const report = await this.require(id);
       if (report.status !== 'failed' || report.updatedAt !== updatedAt) throw new HttpError(409, '报告状态已变化，请刷新后重试');
       await this.deps.runner.assertRetryable(report.calls);
       // In-flight calls are resumed by identity, never blindly submitted a second time.
       const unknown = report.calls.find(call => call.status === 'running' || call.status === 'submitting');
-      if (unknown) {
+      if (unknown && !regenerate) {
         report.status = report.inputsReady ? 'summarizing' : 'collecting';
         delete report.error;
         await this.save(report);
         return;
       }
+      await this.write(join(this.directory(report), 'run-record.json'), JSON.stringify(report));
       report.previousUsage = report.usage;
       report.runId = randomUUID();
       report.settings = await this.settings();
       report.model = report.settings.model;
-      report.calls = []; report.sources = []; report.sourceCount = 0; report.missingCount = 0;
+      report.calls = []; report.sources = []; report.sessionIds = []; report.sourceCount = 0; report.missingCount = 0;
       delete report.inputsReady; delete report.dailyReportIds; delete report.rawSourceIds; delete report.generatedAt; delete report.error;
+      delete report.materialVersion;
+      if (regenerate) {
+        const now = this.now();
+        if (report.periodStart <= localDate(now) && report.periodEnd > localDate(now)) report.asOf = now.toISOString();
+        else delete report.asOf;
+      }
       report.status = 'queued';
       await this.save(report);
     });

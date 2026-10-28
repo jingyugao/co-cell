@@ -66,6 +66,12 @@ export interface ReportDetail {
   prompt: string;
 }
 
+export interface ReportRetryInput {
+  updatedAt: string;
+  /** Start a fresh run with current materials/settings after verifying all earlier calls stopped. */
+  regenerate?: boolean;
+}
+
 export interface ReportSourceContent {
   content: string;
   nextOffset: number | null;

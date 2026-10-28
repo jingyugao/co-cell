@@ -48,7 +48,8 @@ const fs=require('node:fs'),{spawnSync}=require('node:child_process');
 const root='/home/agent/workspace/tool-cwd-regression',repo=root+'/repo';
 fs.mkdirSync(repo,{recursive:true});fs.chownSync(root,11000,11000);fs.chownSync(repo,11000,11000);
 function run(cmd,args,cwd=repo){const r=spawnSync(cmd,args,{cwd,uid:11000,gid:11000,encoding:'utf8',timeout:240000,env:{HOME:'/home/agent',PATH:'/var/lib/cellbox/shared/tools/current/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin',GOTOOLCHAIN:'local',GOPROXY:'off',GOSUMDB:'off'}});if(r.status!==0)throw new Error(cmd+' '+args.join(' ')+': '+r.stderr);return r.stdout.trim();}
-for(const name of ['cache-one','cache-two']){const cwd=root+'/'+name;fs.mkdirSync(cwd);fs.chownSync(cwd,11000,11000);run('git',['init','--bare'],cwd);run('git',['remote','add','origin','https://example.invalid/'+name],cwd);if(run('git',['remote','get-url','origin'],cwd)!=='https://example.invalid/'+name)throw new Error('Wrong cache directory');}
+for(const name of ['cache-one','cache-two']){const cwd=root+'/'+name;fs.mkdirSync(cwd);fs.chownSync(cwd,11000,11000);run('git',['init','--bare'],cwd);run('git',['remote','add','origin','https://example.invalid/'+name],cwd);if(run('git',['remote','get-url','origin'],cwd)!=='https://example.invalid/'+name)throw new Error('Wrong cache directory');
+run('sh',['-c','printf "* -export-subst -export-ignore\\\\n" > info/attributes'],cwd);}
 fs.writeFileSync(repo+'/go.mod','module example.test/cwd\\ngo 1.22\\n');fs.writeFileSync(repo+'/main.go','package main\\nfunc main() {}\\n');
 for(const name of ['go.mod','main.go'])fs.chownSync(repo+'/'+name,11000,11000);
 run('git',['init']);run('git',['add','.']);run('git',['-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','fixture']);

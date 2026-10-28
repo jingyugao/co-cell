@@ -72,7 +72,9 @@ export class ProjectSandboxes {
     return this.lifecycle.run(context, async () => {
       let sandbox: SandboxHandle;
       if (creating) {
-        const selection = await this.latestImage?.(target);
+        // An explicitly chosen version pins its revision; the template alone resolves to its default revision.
+        const selection = await this.latestImage?.(target)
+          ?? (target.imageSelection?.revisionId ? target.imageSelection : undefined);
         if (selection && (!selection.templateId || !selection.revisionId)) throw new Error('最新镜像缺少 Cellbox revision');
         const templateId = target.imageSelection?.templateId ?? this.defaultTemplateId;
         sandbox = await this.provider.create(this.template, {

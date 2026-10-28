@@ -403,6 +403,19 @@ test('latest creation re-resolves the revision and reuses retained mounts and ow
   assert.equal(resolutions, 1, 'connecting an existing Box must not resolve latest again');
 });
 
+test('creation with an explicitly chosen version pins that revision instead of the template default', async () => {
+  const { provider, target, sandbox } = fixture();
+  const projects = new ProjectSandboxes(provider, 'base', 'tpl-bootstrap', undefined, undefined, async () => undefined);
+  target.imageSelection = { imageId: 'python', imageName: 'Python', category: '开发', versionId: 'python-r3', version: 'v3',
+    templateId: 'python-template', revisionId: 'python-r3', image: 'registry/python@sha256:chosen' };
+  provider.create = async (_template, options) => {
+    assert.equal(options.metadata?.cellboxTemplateId, undefined);
+    assert.equal(options.metadata?.cellboxRevisionId, 'python-r3');
+    return sandbox;
+  };
+  await projects.acquire(target, { create: true, save: async () => {} });
+});
+
 test('creation without a saved image selection uses the configured template rather than its pinned bootstrap revision', async () => {
   const { provider, target, sandbox } = fixture();
   const projects = new ProjectSandboxes(provider, 'base', 'tpl-bootstrap');

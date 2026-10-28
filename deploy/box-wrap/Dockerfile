@@ -19,7 +19,10 @@ RUN mkdir -p /opt/cellbox/debug-bin \
   && printf '#!/bin/sh\nexec /usr/local/bin/node /opt/product/cocell/tool-client.mjs --dynamic "$@"\n' > /usr/local/bin/cocell \
   && chmod 0755 /usr/local/bin/cocell \
   && node -e 'require("fs").writeFileSync("/opt/product/cocell/proxy-tool-ids.json",JSON.stringify(["cocell_tool"]))'
-COPY --chmod=0644 deploy/box-wrap/tool-path.sh /etc/profile.d/cocell-tools.sh
+COPY --chmod=0644 deploy/box-wrap/profile-loader.sh /etc/profile.d/cocell-tools.sh
+COPY --chmod=0644 deploy/box-wrap/tool-path.sh /opt/product/cocell/
+COPY --chmod=0755 deploy/box-wrap/login-path.mjs /opt/product/cocell/
+RUN --network=none node /opt/product/cocell/login-path.mjs
 COPY --chmod=0755 deploy/box-wrap/launcher.mjs deploy/box-wrap/oss-archive-restore.mjs /opt/product/cocell/
 # Node resolves each entry to its immutable shared version before importing dependencies.
 RUN ln -sfn /var/lib/cellbox/shared/tool-wrap/current/deploy/box-wrap/protected-tool.mjs /opt/product/cocell/protected-tool.mjs \

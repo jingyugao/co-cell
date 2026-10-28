@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 const sources = [
   'deploy/box-wrap/tool-client.mjs',
   'deploy/box-wrap/protected-tool.mjs',
+  'deploy/box-wrap/tool-path.sh',
   'util/tool-working-directory.mjs',
   'util/tool-runtime-identity.mjs',
   'util/dynamic-tool-config.mjs',

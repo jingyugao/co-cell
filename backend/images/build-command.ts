@@ -7,6 +7,7 @@ const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 export async function prepareImageRequest(url: string, userCommand?: string) {
   const sources = [
     ['deploy/box-wrap/tool-path.sh', '/etc/profile.d/cocell-tools.sh'],
+    ['deploy/box-wrap/login-path.mjs', '/opt/product/cocell/login-path.mjs'],
     ['deploy/box-wrap/tools/cocell-proxy', '/opt/cellbox/tools/cocell-proxy'],
     ['deploy/box-wrap/oss-archive-restore.mjs', '/opt/product/cocell/oss-archive-restore.mjs'],
     ['deploy/box-wrap/tools/cocell-archive-restore', '/opt/cellbox/tools/cocell-archive-restore'],
@@ -16,6 +17,7 @@ export async function prepareImageRequest(url: string, userCommand?: string) {
   const payload = gzipSync(JSON.stringify(files)).toString('base64');
   const wrapperRoot = '/var/lib/cellbox/shared/tool-wrap/current/deploy/box-wrap/';
   const proxies = `/usr/local/bin/node -e ${quote(`const fs=require('node:fs'),path=require('node:path'),z=require('node:zlib');for(const f of JSON.parse(z.gunzipSync(Buffer.from('${payload}','base64')))){fs.mkdirSync(path.dirname(f.path),{recursive:true});fs.writeFileSync(f.path,f.content,{mode:0o755});}for(const name of ['protected-tool','tool-client']){const link='/opt/product/cocell/'+name+'.mjs';try{fs.unlinkSync(link);}catch(e){if(e.code!=='ENOENT')throw e;}fs.symlinkSync('${wrapperRoot}'+name+'.mjs',link);}`)}
+/usr/local/bin/node /opt/product/cocell/login-path.mjs
 mkdir -p /opt/cellbox/debug-bin
 printf '#!/bin/sh\nexec /usr/local/bin/node /opt/product/cocell/tool-client.mjs --dynamic \"$@\"\n' > /usr/local/bin/cocell
 chmod 0755 /usr/local/bin/cocell

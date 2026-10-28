@@ -55,6 +55,11 @@ run('git',['init']);run('git',['add','.']);run('git',['-c','user.name=Test','-c'
 const nested=repo+'/nested';fs.mkdirSync(nested);fs.chownSync(nested,11000,11000);if(run('git',['rev-parse','--show-toplevel'],nested)!==repo)throw new Error('Wrong repository');
 run('go',['build','-buildvcs=true','-o',root+'/app','.']);const metadata=run('go',['version','-m',root+'/app']);if(!metadata.includes('vcs.revision='))throw new Error('Missing Git revision');
 console.log(JSON.stringify({repository:repo,metadata}));`;
+  // Codex runs `bash -lc` with its apply_patch alias directory first in the inherited PATH.
+  const loginPath = `const r=require('node:child_process').spawnSync('/bin/bash',['-lc','printf %s "$PATH"'],{uid:11000,gid:11000,encoding:'utf8',env:{HOME:'/home/agent',PATH:'/cocell-e2e-inherited:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin'}});if(r.status!==0)throw new Error(r.stderr);console.log(r.stdout);`;
+  const shellPath = (await exec('kubectl', ['--context', context, '-n', namespace, 'exec', pod, '--', '/usr/local/bin/node', '-e', loginPath], { timeout: 40_000 })).stdout.trim().split(':');
+  assert.equal(shellPath[0], '/var/lib/cellbox/shared/tools/current/bin');
+  assert(shellPath.includes('/cocell-e2e-inherited') && shellPath.includes('/usr/local/go/bin'), `Login shell dropped inherited PATH: ${shellPath.join(':')}`);
   try {
     const result = await exec('kubectl', ['--context', context, '-n', namespace, 'exec', pod, '--', '/usr/local/bin/node', '-e', code], { timeout: 500_000, maxBuffer: 1024 * 1024 });
     const evidence = JSON.parse(result.stdout);

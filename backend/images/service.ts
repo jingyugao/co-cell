@@ -6,6 +6,7 @@ import type { ImageCatalogStore, ImageRecord, ImageVersionRecord } from './store
 import { prepareImageRequest } from './build-command.js';
 import { HttpError, redactCredentials } from '../../util/errors.js';
 import { DockerRegistryClient, normalizeRepository, registryImageReference, type ImageRegistry } from './registry.js';
+import { compareImageVersions } from '../../util/image-versions.js';
 
 const publicImage = ({ deletedAt: _deletedAt, legacyImport: _legacyImport, ...record }: ImageRecord): ManagedImage => ({
   ...record,
@@ -159,7 +160,7 @@ export class ImageCatalog {
     }
     return all.map(image => ({ ...image, versions: image.versions.map(version => ({ ...version,
       isDefault: Boolean(selected && selected.templateId === version.templateId && selected.revisionId === version.revisionId),
-    })) }));
+    })).sort(compareImageVersions) }));
   }
   async addRepository(input: AddImageRepositoryInput): Promise<ManagedImage> {
     await this.loadRecords();
@@ -262,8 +263,7 @@ export class ImageCatalog {
     if (!image) throw new HttpError(requested ? 404 : 503, requested ? '镜像仓库不存在' : '未配置系统默认 Cellbox template');
     const latest = image.versions.filter(version => version.status === 'succeeded' && version.revisionId && version.templateId
       && !version.deprecatedAt && !version.cleanup && !version.migrationRequired && version.projectReady !== false)
-      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)
-        || b.version.localeCompare(a.version, 'en', { numeric: true }) || b.id.localeCompare(a.id))[0];
+      .sort(compareImageVersions)[0];
     if (!latest) throw new HttpError(409, '此镜像仓库暂无可用的成功构建版本');
     return { selection: { ...await this.resolveVersion(image, latest), selectionPolicy: 'latest' as const }, release: async () => {} };
   }

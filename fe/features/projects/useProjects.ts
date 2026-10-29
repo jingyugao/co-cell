@@ -1,13 +1,23 @@
 import { useCallback, useRef, useState } from 'react';
 import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type ProjectSandboxOperation, type ProjectStatus, type ProjectSummary, type ProjectType } from '../../../protocol/types';
+import type { ProjectResumeError, ProjectResumeProgress } from '../../../protocol/resume-types';
 import { api, ApiError } from '../../lib/api';
+import { resumeProjectSandbox as requestResumeProjectSandbox, ResumeRequestError } from '../../lib/project-resume';
 
 export type ProjectValues = { name: string; requirementUrl: string | null; type: ProjectType; imageId?: string; imageVersionId?: string };
 export type ProjectUpdate = Partial<Omit<ProjectValues, 'imageId' | 'imageVersionId'>> & { status?: ProjectStatus };
+export interface ProjectResumeTimeline {
+  requestId: string;
+  status: 'running' | 'completed' | 'failed' | 'unknown';
+  progress: ProjectResumeProgress[];
+  error?: ProjectResumeError;
+}
 
 export function useProjects() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [hasProjectIndex, setHasProjectIndex] = useState(false);
+  const [resumeTimelines, setResumeTimelines] = useState<Record<string, ProjectResumeTimeline>>({});
+  const resumeRequests = useRef(new Map<string, string>());
   const sequence = useRef(0);
   const refreshing = useRef<Promise<ProjectSummary[]> | null>(null);
   const refreshProjects = useCallback(() => {
@@ -94,9 +104,60 @@ export function useProjects() {
   const releaseSandbox = useCallback((id: string) => runSandboxOperation(id, 'release', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/release`, { method: 'POST' }),
   ), [runSandboxOperation]);
-  const resumeSandbox = useCallback((id: string) => runSandboxOperation(id, 'resume', () =>
-    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/resume`, { method: 'POST' }),
-  ), [runSandboxOperation]);
+  const resumeSandbox = useCallback(async (id: string) => {
+    sequence.current++;
+    const requestId = crypto.randomUUID();
+    resumeRequests.current.set(id, requestId);
+    const operation: ProjectSandboxOperation = { kind: 'resume', phase: '提交请求', status: 'running', updatedAt: new Date().toISOString() };
+    setProjects(current => current.map(project => project.id === id ? { ...project, sandboxOperation: operation } : project));
+    setResumeTimelines(current => ({ ...current, [id]: { requestId, status: 'running', progress: [] } }));
+    const isCurrent = () => resumeRequests.current.get(id) === requestId;
+    try {
+      const project = await requestResumeProjectSandbox(id, progress => {
+        if (!isCurrent()) return;
+        setResumeTimelines(current => {
+          const timeline = current[id];
+          if (!timeline || timeline.requestId !== requestId) return current;
+          const lastSequence = timeline.progress.at(-1)?.sequence ?? 0;
+          if (progress.sequence <= lastSequence) return current;
+          return { ...current, [id]: { ...timeline, progress: [...timeline.progress, progress] } };
+        });
+      });
+      if (isCurrent()) {
+        storeProject(project);
+        setResumeTimelines(current => {
+          const timeline = current[id];
+          return !timeline || timeline.requestId !== requestId ? current
+            : { ...current, [id]: { ...timeline, status: 'completed' } };
+        });
+      }
+      return project;
+    } catch (error) {
+      if (isCurrent()) {
+        const knownFailure = error instanceof ResumeRequestError && error.outcome === 'failed';
+        const details = error instanceof ResumeRequestError ? error.details : undefined;
+        const fallback = error instanceof Error ? error.message : '恢复结果未知';
+        const failure: ProjectResumeError = details ?? {
+          message: knownFailure ? fallback : `${fallback}；请查询项目状态，本次不会自动重试。`,
+          status: 0,
+          at: new Date().toISOString(),
+          elapsedMs: 0,
+        };
+        setResumeTimelines(current => {
+          const timeline = current[id];
+          return !timeline || timeline.requestId !== requestId ? current
+            : { ...current, [id]: { ...timeline, status: knownFailure ? 'failed' : 'unknown', error: failure } };
+        });
+        setProjects(current => current.map(item => item.id === id && item.sandboxOperation?.kind === 'resume'
+          ? { ...item, sandboxOperation: { ...item.sandboxOperation, status: knownFailure ? 'failed' : 'unknown', error: failure.message, errorCode: failure.code, updatedAt: failure.at } }
+          : item));
+      }
+      throw error;
+    } finally {
+      if (isCurrent()) resumeRequests.current.delete(id);
+      await refreshProjects().catch(() => undefined);
+    }
+  }, [refreshProjects, storeProject]);
   const checkpointSandbox = useCallback((id: string) => runSandboxOperation(id, 'checkpoint', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/checkpoint`, { method: 'POST' }),
   ), [runSandboxOperation]);
@@ -106,5 +167,5 @@ export function useProjects() {
   const archiveProject = useCallback((id: string, options: { useExistingBackup?: boolean } = {}) => runSandboxOperation(id, 'archive', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify(options) }),
   ), [runSandboxOperation]);
-  return { projects, hasProjectIndex, refreshProjects, refreshProject, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
+  return { projects, hasProjectIndex, resumeTimelines, refreshProjects, refreshProject, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
 }

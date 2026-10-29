@@ -117,12 +117,14 @@ export class LiveEnvironment {
     const session = /^\/api\/sessions\/([^/]+)/.exec(path)?.[1];
     assert((project && this.projects.has(project)) || (session && this.sessions.has(session)), `Refusing mutation of an unowned resource: ${method} ${path}`);
   }
-  async fetch(path, { method = 'GET', body, timeoutMs = 30_000, signal } = {}) {
+  async fetch(path, { method = 'GET', body, timeoutMs = 30_000, signal, accept } = {}) {
     const url = new URL(path, this.config.base);
     assert(url.origin === this.config.base.origin, 'Cross-origin test requests are not allowed');
+    assert(accept === undefined || accept === 'text/event-stream', 'Only the event-stream Accept header may be forwarded');
     this.checkMutation(url.pathname, method, body);
     const options = { method, headers: {
       Authorization: `Bearer ${this.config.token}`, Host: this.config.publicURL.host, Origin: this.config.publicURL.origin,
+      ...(accept === undefined ? {} : { Accept: accept }),
       ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
     }, signal: AbortSignal.any([signal ?? this.controller.signal, AbortSignal.timeout(timeoutMs)]) };
     // Native HTTP preserves an explicit public Host through a loopback forward.
@@ -171,11 +173,14 @@ export class LiveEnvironment {
         assert.equal(data.sandbox?.status, 'ready', 'Project creation response must contain a ready sandbox');
       }
       const durationMs = performance.now() - start;
-      this.report.requests.push({ method, path, status: response.status, durationMs });
+      this.recordRequest(method, path, response.status, durationMs);
       if (expectedStatus !== null) assert((Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus]).includes(response.status),
         `HTTP ${response.status}; ${text.slice(0, 800)}`);
       return { data, durationMs, bytes: buffer.length, buffer, response };
     } catch (error) { throw new Error(this.redact(`${method} ${path}: ${error.message}`)); }
+  }
+  recordRequest(method, path, status, durationMs) {
+    this.report.requests.push({ method, path, status, durationMs });
   }
   async json(path, options) { return (await this.request(path, options)).data; }
   async createProject(label) {

@@ -5,7 +5,8 @@ import type { AppConfig, ProjectSummary, ProjectType } from '../../../protocol/t
 import { projectDisplayName, projectTypeLabel } from '../../../util/project-types';
 import { canEnterProject } from '../../../util/project-sandbox';
 import { projectSandboxActions, type ProjectSandboxAction } from '../../../util/project-sandbox-actions';
-import type { ProjectValues, ProjectUpdate } from './useProjects';
+import type { ProjectValues, ProjectUpdate, ProjectResumeTimeline as ResumeTimelineState } from './useProjects';
+import ResumeTimeline from './ResumeTimeline';
 import { groupArchivedProjectsByWeek } from './project-groups';
 import ArchiveVersionBadge from './ArchiveVersionBadge';
 import './ProjectsPage.css';
@@ -13,6 +14,7 @@ import ProjectToolGrants from './ProjectToolGrants';
 
 type Props = {
   projects: ProjectSummary[];
+  resumeTimelines?: Record<string, ResumeTimelineState>;
   config: AppConfig | null;
   loading: boolean;
   onRefresh: () => Promise<unknown>;
@@ -47,6 +49,15 @@ const duration = (value: number | undefined, fallback: string) => value == null 
 
 function latestBackup(project: ProjectSummary) {
   return project.latestBackup ?? null;
+}
+
+function compareProjectsByCreation(a: ProjectSummary, b: ProjectSummary) {
+  const aCreatedAt = Date.parse(a.createdAt);
+  const bCreatedAt = Date.parse(b.createdAt);
+  const aTimestamp = Number.isFinite(aCreatedAt) ? aCreatedAt : Number.NEGATIVE_INFINITY;
+  const bTimestamp = Number.isFinite(bCreatedAt) ? bCreatedAt : Number.NEGATIVE_INFINITY;
+  if (aTimestamp !== bTimestamp) return aTimestamp > bTimestamp ? -1 : 1;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
 function projectImageLabel(project: ProjectSummary) {
@@ -115,8 +126,9 @@ function DeletingProjectRow({ project, onRetry }: { project: ProjectSummary; onR
   </div>;
 }
 
-function ProjectCard({ project, config, onRefresh, onUpdate, onDelete, onCreateSandbox, onRestoreSandbox, onReleaseSandbox, onResumeSandbox, onCheckpointSandbox, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onStatus }: Pick<Props, 'config' | 'onRefresh' | 'onUpdate' | 'onDelete' | 'onCreateSandbox' | 'onRestoreSandbox' | 'onReleaseSandbox' | 'onResumeSandbox' | 'onCheckpointSandbox' | 'onBackupSandbox' | 'onArchiveProject' | 'onOpenProject' | 'onViewBackup'> & {
+function ProjectCard({ project, resumeTimeline, config, onRefresh, onUpdate, onDelete, onCreateSandbox, onRestoreSandbox, onReleaseSandbox, onResumeSandbox, onCheckpointSandbox, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onStatus }: Pick<Props, 'config' | 'onRefresh' | 'onUpdate' | 'onDelete' | 'onCreateSandbox' | 'onRestoreSandbox' | 'onReleaseSandbox' | 'onResumeSandbox' | 'onCheckpointSandbox' | 'onBackupSandbox' | 'onArchiveProject' | 'onOpenProject' | 'onViewBackup'> & {
   project: ProjectSummary;
+  resumeTimeline?: ResumeTimelineState;
   onStatus: (name: string, status: 'active' | 'completed') => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -220,6 +232,12 @@ function ProjectCard({ project, config, onRefresh, onUpdate, onDelete, onCreateS
     if (id === 'refresh') { void refreshStatus(); return; }
     if (id === 'release') { release(); return; }
     if (id === 'restore') { restore(); return; }
+    if (id === 'resume') {
+      if (busy) return;
+      setBusy(true); setError('');
+      void onResumeSandbox(project.id).catch(() => {}).finally(() => setBusy(false));
+      return;
+    }
     const handlers = { checkpoint: onCheckpointSandbox, resume: onResumeSandbox, create: onCreateSandbox, backup: onBackupSandbox };
     const label = sandboxView.actions.find(action => action.id === id)!.label;
     void run(label, () => handlers[id](project.id));
@@ -265,7 +283,8 @@ function ProjectCard({ project, config, onRefresh, onUpdate, onDelete, onCreateS
         {sandboxView.state === 'released' && <p className="project-rebuild-hint">新建 Sandbox 使用 template 当前 stable{hasRetainedMounts ? '，并复用保留的挂载盘；可直接备份保留的挂载盘' : '；当前未记录保留的挂载盘'}；从备份恢复会创建新的挂载盘。</p>}
       </section>}
     </div>}
-    {operation && !(operation.kind === 'backup' && operation.status === 'succeeded') && !backupCatalogOnlyFailure && !legacyCheckpointBackupFailure && <p className={`project-operation ${operation.status === 'failed' ? 'failed' : ''}`} role={operation.status === 'failed' ? 'alert' : 'status'}><strong>{operationLabels[operation.kind]}：{operation.status === 'running' ? operation.phase : operation.status === 'succeeded' ? '已完成' : operation.status === 'unknown' ? '结果未知' : '失败'}</strong>{operation.errorCode && <code>{operation.errorCode}</code>}{operation.error && <span>{operation.error}</span>}<time dateTime={operation.updatedAt}>更新于 {date(operation.updatedAt)}</time></p>}
+    <ResumeTimeline timeline={resumeTimeline} />
+    {operation && !(operation.kind === 'resume' && resumeTimeline) && !(operation.kind === 'backup' && operation.status === 'succeeded') && !backupCatalogOnlyFailure && !legacyCheckpointBackupFailure && <p className={`project-operation ${operation.status === 'failed' ? 'failed' : ''}`} role={operation.status === 'failed' ? 'alert' : 'status'}><strong>{operationLabels[operation.kind]}：{operation.status === 'running' ? operation.phase : operation.status === 'succeeded' ? '已完成' : operation.status === 'unknown' ? '结果未知' : '失败'}</strong>{operation.errorCode && <code>{operation.errorCode}</code>}{operation.error && <span>{operation.error}</span>}<time dateTime={operation.updatedAt}>更新于 {date(operation.updatedAt)}</time></p>}
     {sandboxBackup?.status === 'running' && <p className="project-operation" role="status"><strong>磁盘备份：{sandboxBackup.phase || '进行中'}</strong></p>}
     {sandboxBackup?.status === 'unknown' && <p className="project-operation" role="status"><strong>磁盘备份结果未知</strong>{sandboxBackup.error}</p>}
     {backupFailed && <p className="project-operation failed" role="alert"><strong>磁盘备份失败</strong>{sandboxBackup?.error || operation?.error}</p>}
@@ -287,7 +306,7 @@ function ProjectCard({ project, config, onRefresh, onUpdate, onDelete, onCreateS
   </article>;
 }
 
-export default function ProjectsPage({ projects, config, loading, onRefresh, onCreate, onUpdate, onDelete, onCreateSandbox, onRestoreSandbox, onReleaseSandbox, onResumeSandbox, onCheckpointSandbox, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onMenu, onBack, initialView = 'active' }: Props) {
+export default function ProjectsPage({ projects, resumeTimelines = {}, config, loading, onRefresh, onCreate, onUpdate, onDelete, onCreateSandbox, onRestoreSandbox, onReleaseSandbox, onResumeSandbox, onCheckpointSandbox, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onMenu, onBack, initialView = 'active' }: Props) {
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState('');
@@ -307,6 +326,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
   const archivedCount = projects.filter(project => projectStatus(project) === 'archived').length;
   const inView = projects.filter(project => projectStatus(project) === view);
   const visible = inView.filter(project => `${project.id} ${project.name} ${project.requirementUrl ?? ''} ${project.sandbox?.id ?? ''}`.toLowerCase().includes(query.trim().toLowerCase()));
+  if (view === 'active') visible.sort(compareProjectsByCreation);
   const archivedGroups = view === 'archived' ? groupArchivedProjectsByWeek(visible) : [];
   const canCreate = config?.sandbox?.enabled === true;
   const stopCreating = () => { setCreating(false); setTimeout(() => createButton.current?.focus(), 0); };
@@ -315,7 +335,7 @@ export default function ProjectsPage({ projects, config, loading, onRefresh, onC
     const timer = window.setInterval(() => { void onRefresh().catch(err => setError(err instanceof Error ? err.message : '状态读取失败，请刷新重试。')); }, 3_000);
     return () => window.clearInterval(timer);
   }, [projects, onRefresh]);
-  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} config={config} onRefresh={onRefresh} onUpdate={onUpdate} onDelete={onDelete} onCreateSandbox={onCreateSandbox} onRestoreSandbox={onRestoreSandbox} onReleaseSandbox={onReleaseSandbox} onResumeSandbox={onResumeSandbox} onCheckpointSandbox={onCheckpointSandbox} onBackupSandbox={onBackupSandbox} onArchiveProject={async (id, options) => {
+  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} resumeTimeline={resumeTimelines[project.id]} config={config} onRefresh={onRefresh} onUpdate={onUpdate} onDelete={onDelete} onCreateSandbox={onCreateSandbox} onRestoreSandbox={onRestoreSandbox} onReleaseSandbox={onReleaseSandbox} onResumeSandbox={onResumeSandbox} onCheckpointSandbox={onCheckpointSandbox} onBackupSandbox={onBackupSandbox} onArchiveProject={async (id, options) => {
     const result = await onArchiveProject(id, options);
     setMessage(`「${project.name}」已归档，可在“归档”页查看。`);
     return result;

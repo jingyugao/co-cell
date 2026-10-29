@@ -377,10 +377,19 @@ export class CellboxClient {
     return this.request<CellboxOperation>('POST', '/v1/boxes:restore', { body: input });
   }
   actBox(id: string, action: 'suspend' | 'resume' | 'destroy' | 'activate', _legacyKey?: string,
-    options: { timeoutMs?: number; expectedGeneration?: number; signal?: AbortSignal } = {}) {
+    options: { timeoutMs?: number; expectedGeneration?: number; signal?: AbortSignal; waitPorts?: number[] } = {}) {
     if (options.expectedGeneration !== undefined && (!Number.isSafeInteger(options.expectedGeneration) || options.expectedGeneration < 1))
       throw new CellboxError('INVALID_REQUEST', 'expectedGeneration must be a positive safe integer');
-    const body = options.expectedGeneration === undefined ? undefined : { expectedGeneration: options.expectedGeneration };
+    if (options.waitPorts !== undefined) {
+      if (action !== 'resume') throw new CellboxError('INVALID_REQUEST', 'waitPorts is only valid for resume');
+      if (!Array.isArray(options.waitPorts) || options.waitPorts.length < 1 || options.waitPorts.length > 64 ||
+        options.waitPorts.some(port => !Number.isInteger(port) || port < 1 || port > 65535))
+        throw new CellboxError('INVALID_REQUEST', 'waitPorts must contain 1..64 integer ports in the range 1..65535');
+    }
+    const body = options.expectedGeneration === undefined && options.waitPorts === undefined ? undefined : {
+      ...(options.expectedGeneration === undefined ? {} : { expectedGeneration: options.expectedGeneration }),
+      ...(options.waitPorts === undefined ? {} : { waitPorts: options.waitPorts }),
+    };
     return this.request<CellboxOperation>('POST', `/v1/boxes/${this.id(id)}:${action}`, { body, timeoutMs: options.timeoutMs, signal: options.signal });
   }
 

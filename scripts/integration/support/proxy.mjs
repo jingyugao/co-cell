@@ -33,11 +33,22 @@ export async function startBrowserProxy(environment) {
       const input = Buffer.concat(chunks).toString();
       const options = { method: request.method, signal: abort.signal,
         ...(input ? { body: JSON.parse(input) } : {}), expectedStatus: null };
-      if (request.url.endsWith('/events')) {
-        const upstream = await environment.fetch(request.url, { ...options, timeoutMs: environment.config.turnTimeout });
-        response.writeHead(upstream.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
-        if (upstream.body) await pipeline(Readable.fromWeb(upstream.body), response);
-        else response.end();
+      const acceptsEventStream = request.headers.accept?.split(',')
+        .some(value => value.trim().split(';')[0].toLowerCase() === 'text/event-stream');
+      if (request.url.endsWith('/events') || acceptsEventStream) {
+        const started = performance.now();
+        const upstream = await environment.fetch(request.url, { ...options, accept: 'text/event-stream',
+          timeoutMs: request.url.endsWith('/events') ? environment.config.turnTimeout : environment.config.operationTimeout });
+        const headers = Object.fromEntries(upstream.headers);
+        for (const name of ['content-encoding', 'content-length', 'transfer-encoding', 'connection', 'set-cookie']) delete headers[name];
+        headers['cache-control'] ??= 'no-store';
+        try {
+          response.writeHead(upstream.status, headers);
+          if (upstream.body) await pipeline(Readable.fromWeb(upstream.body), response);
+          else response.end();
+        } finally {
+          environment.recordRequest(request.method, request.url, upstream.status, performance.now() - started);
+        }
       } else {
         const result = await environment.request(request.url, options);
         const headers = Object.fromEntries(result.response.headers);

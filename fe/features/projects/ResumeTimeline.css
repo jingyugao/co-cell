@@ -1,0 +1,20 @@
+.resume-timeline { min-width: 0; margin: 8px 0; padding: 9px 11px; border: 1px solid #e5e9dc; border-radius: 8px; background: #fafbf7; color: #667358; font-size: 11px; }
+.resume-timeline details { min-width: 0; }
+.resume-timeline summary { display: flex; align-items: center; gap: 8px; min-width: 0; cursor: pointer; list-style: none; font-weight: 600; }
+.resume-timeline summary::-webkit-details-marker { display: none; }
+.resume-timeline-elapsed { margin-left: auto; color: #8b9480; font-variant-numeric: tabular-nums; font-weight: 400; }
+.resume-timeline-spinner { width: 11px; height: 11px; border: 1.5px solid #cbd3bf; border-top-color: #71875a; border-radius: 50%; animation: resume-timeline-spin .8s linear infinite; }
+.resume-timeline ol { display: grid; gap: 6px; margin: 9px 0 0; padding: 0 0 0 18px; }
+.resume-timeline li { min-width: 0; padding-left: 2px; line-height: 1.45; }
+.resume-timeline li::marker { color: #8b9a78; }
+.resume-timeline li time { float: right; margin-left: 8px; color: #8b9480; font-size: 10px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.resume-timeline-stage { overflow-wrap: anywhere; }
+.resume-timeline-metadata { margin: 8px 0 0; color: #929a88; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.resume-timeline-error { display: grid; gap: 4px; margin: 8px 0 0; color: #a3694f; overflow-wrap: anywhere; }
+.resume-timeline-error code { width: fit-content; }
+.resume-timeline-unknown { border-color: #eadfc6; background: #fcf9f1; }
+.resume-timeline-failed { border-color: #efd8d2; background: #fdf8f6; }
+.resume-timeline-completed { border-color: #dce8d4; background: #f8fbf5; }
+@keyframes resume-timeline-spin { to { transform: rotate(360deg); } }
+@media (max-width: 700px) { .resume-timeline { margin: 7px 0; padding: 8px 9px; } .resume-timeline li time { font-size: 9px; } }
+@media (prefers-reduced-motion: reduce) { .resume-timeline-spinner { animation: none; } }

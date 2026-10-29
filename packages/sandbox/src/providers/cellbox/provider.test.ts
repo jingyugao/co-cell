@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CellboxClient, CellboxError } from './client.js';
 import { CellboxSandboxProvider } from './provider.js';
+import type { SandboxResumeProgress } from '../../types.js';
 
 const caps = { exec: true, files: true, http: true, websocket: true, pty: false, reconnectExec: false,
   freeze: false, suspend: 'same-node-checkpoint' as const, archives: 'workspace-best-effort', protectedTools: false };
@@ -13,10 +14,11 @@ const box = (phase: 'running' | 'suspended' | 'resuming', extra: Record<string, 
   image: 'sha256:box-image', imageId: 'rev-a', workspace: '/workspace', capabilities: caps,
   createdAt: new Date().toISOString(), ...extra,
 });
-const op = (kind: string, status: 'succeeded' | 'running' = 'succeeded') => ({ id: 'op-a', kind,
+const op = (kind: string, status: 'queued' | 'running' | 'succeeded' = 'succeeded') => ({ id: 'op-a', kind,
   targetId: 'box-a', status, version: 2, createdAt: new Date().toISOString() });
 
-function provider(fetch: typeof globalThis.fetch, options: { templateId?: string; revisionId?: string } = {}) {
+function provider(fetch: typeof globalThis.fetch, options: { templateId?: string; revisionId?: string;
+  operationTimeoutMs?: number; retryDelayMs?: number } = {}) {
   return new CellboxSandboxProvider({ baseUrl: 'http://cellbox.test', profileId: 'profile-a', ...options, fetch });
 }
 
@@ -148,6 +150,106 @@ test('explicit pause and resume surface BUSY and unknown outcomes with exactly o
       assert.deepEqual(calls, [`POST /v1/boxes/box-a:${action === 'pause' ? 'suspend' : 'resume'}`]);
     }
   }
+});
+
+test('resume sends waitPorts with expectedGeneration and rejects invalid or non-resume use', async () => {
+  const requests: Array<{ path: string; body?: unknown }> = [];
+  const client = new CellboxClient({ baseUrl: 'http://cellbox.test', fetch: async (input, init) => {
+    requests.push({ path: new URL(String(input)).pathname,
+      body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined });
+    return Response.json(op('resume'));
+  } });
+  await client.actBox('box-a', 'resume', undefined, { expectedGeneration: 8, waitPorts: [40000, 4500] });
+  assert.deepEqual(requests, [{ path: '/v1/boxes/box-a:resume', body: { expectedGeneration: 8, waitPorts: [40000, 4500] } }]);
+  for (const waitPorts of [[], [0], [65536], [1.5], Array.from({ length: 65 }, () => 80)]) {
+    assert.throws(() => client.actBox('box-a', 'resume', undefined, { waitPorts }),
+      error => error instanceof CellboxError && error.code === 'INVALID_REQUEST');
+  }
+  assert.throws(() => client.actBox('box-a', 'suspend', undefined, { waitPorts: [80] }),
+    error => error instanceof CellboxError && error.code === 'INVALID_REQUEST');
+});
+
+test('resume reports observed operation progress once and only reports listening after success', async () => {
+  const calls: string[] = [];
+  const events: Array<Pick<SandboxResumeProgress, 'stage' | 'remoteStatus' | 'remoteStage' | 'resumePath'>> = [];
+  let operationReads = 0;
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    calls.push(`${init?.method ?? 'GET'} ${url.pathname}${url.search}`);
+    if (url.pathname === '/v1/boxes/box-a:resume')
+      return Response.json({ ...op('resume', 'queued'), stage: 'accepted' });
+    if (url.pathname === '/v1/operations/op-a') {
+      operationReads++;
+      if (operationReads === 1) return Response.json({ ...op('resume', 'running'), stage: 'restoring' });
+      return Response.json({ ...op('resume'), stage: 'ports_listening', result: { resumePath: 'warm_pool' } });
+    }
+    throw new Error(`unexpected request ${url.pathname}`);
+  };
+  await provider(fetch, { revisionId: 'rev-a' }).resume('box-a', { waitPorts: [40000, 4500], onProgress: event => {
+    events.push({ stage: event.stage, ...(event.remoteStatus === undefined ? {} : { remoteStatus: event.remoteStatus }),
+      ...(event.resumePath === undefined ? {} : { resumePath: event.resumePath }),
+      ...(event.remoteStage === undefined ? {} : { remoteStage: event.remoteStage }) });
+    if (event.stage === 'submitting') assert.equal(calls.length, 0, 'submitting is emitted before the POST');
+  } });
+  assert.deepEqual(events, [
+    { stage: 'submitting' },
+    { stage: 'accepted', remoteStatus: 'queued', remoteStage: 'accepted' },
+    { stage: 'running', remoteStatus: 'queued', remoteStage: 'accepted' },
+    { stage: 'running', remoteStatus: 'running', remoteStage: 'restoring' },
+    { stage: 'ports_listening', remoteStatus: 'succeeded', remoteStage: 'ports_listening', resumePath: 'warm_pool' },
+  ]);
+  assert.equal(calls.filter(call => call.startsWith('POST ')).length, 1);
+  assert.deepEqual(calls.slice(1), [
+    'GET /v1/operations/op-a?waitMs=10000',
+    'GET /v1/operations/op-a?waitMs=10000',
+  ]);
+});
+
+test('resume reports only recognized runtime selections and preserves missing metadata from older servers', async () => {
+  for (const reported of ['warm_pool', 'standard', undefined, 'future_path']) {
+    const events: SandboxResumeProgress[] = [];
+    let calls = 0;
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      calls++;
+      assert.equal(init?.method, 'POST');
+      assert.equal(new URL(String(input)).pathname, '/v1/boxes/box-a:resume');
+      return Response.json({ ...op('resume'), ...(reported ? { result: { resumePath: reported } } : {}) });
+    };
+    await provider(fetch, { revisionId: 'rev-a' }).resume('box-a', { onProgress: event => events.push(event) });
+    assert.equal(calls, 1);
+    assert.deepEqual(events.map(event => event.stage), ['submitting', 'accepted', 'ports_listening']);
+    assert(events.slice(0, -1).every(event => event.resumePath === undefined));
+    assert.equal(events.at(-1)?.resumePath, reported === 'warm_pool' || reported === 'standard' ? reported : undefined);
+  }
+});
+
+test('resume observer exceptions do not affect the operation and timeout never reports success or resubmits', async () => {
+  let submissions = 0;
+  const events: string[] = [];
+  const successFetch: typeof globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path.endsWith(':resume')) { submissions++; return Response.json(op('resume')); }
+    throw new Error(`unexpected request ${path}`);
+  };
+  await provider(successFetch, { revisionId: 'rev-a' }).resume('box-a', { onProgress: event => {
+    events.push(event.stage);
+    throw new Error('display failed');
+  } });
+  assert.deepEqual(events, ['submitting', 'accepted', 'ports_listening']);
+  assert.equal(submissions, 1);
+
+  submissions = 0;
+  events.length = 0;
+  const timeoutFetch: typeof globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path.endsWith(':resume')) { submissions++; return Response.json(op('resume', 'running')); }
+    throw new Error(`unexpected request ${path}`);
+  };
+  await assert.rejects(provider(timeoutFetch, { revisionId: 'rev-a', operationTimeoutMs: 1 })
+    .resume('box-a', { onProgress: event => events.push(event.stage) }),
+  error => error instanceof CellboxError && error.code === 'UNKNOWN_OUTCOME');
+  assert.deepEqual(events, ['submitting', 'accepted', 'running']);
+  assert.equal(submissions, 1);
 });
 
 test('connect joins an existing resume using GET polling only', async () => {

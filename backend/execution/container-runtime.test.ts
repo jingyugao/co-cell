@@ -91,6 +91,30 @@ test('health verification uses a non-resuming connection and never prepares the 
   assert.equal(probes, 1);
 });
 
+test('explicit resume waits for Guest and App Server ports without a readiness probe', async () => {
+  let calls = 0;
+  const events: string[] = [];
+  const provider = {
+    async resume(id, options) {
+      calls++;
+      assert.equal(id, 'resume-box');
+      assert.deepEqual(options?.waitPorts, [40000, 4500]);
+      options?.onProgress?.({ stage: 'ports_listening', sandboxId: id, waitPorts: options.waitPorts });
+    },
+    async getInfo() { assert.fail('resume must not wait on an additional health query'); },
+  } satisfies Partial<SandboxProvider>;
+  const runtime = new ContainerCodexRuntime({ provider: provider as unknown as SandboxProvider,
+    sandboxes: { refresh: async () => {} } as unknown as ProjectSandboxes, apiKey: '',
+    paths: { root: '/workspace', runtime: '/runtime', codexHome: '/codex', node: '/node' },
+    prepareRemote: async () => { assert.fail('resume must not prepare the environment'); },
+  });
+  await runtime.resume({ id: 'project', projectId: 'project', updatedAt: new Date().toISOString(), settings: { workingDirectory: '/workspace' },
+    sandbox: { id: 'resume-box', template: 'test', workingDirectory: '/workspace', status: 'paused' } }, undefined,
+    event => { events.push(event.stage); });
+  assert.equal(calls, 1);
+  assert.deepEqual(events, ['ports_listening']);
+});
+
 test('native preview access releases remote usage once on close or failed acquisition', async t => {
   let releases = 0;
   let fail = false;

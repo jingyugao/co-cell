@@ -127,7 +127,7 @@ export interface SandboxProvider {
   /** Display-only batch observation; missing IDs are omitted and state may be eventually consistent. */
   getInfos?(sandboxIds: string[]): Promise<SandboxInfo[]>;
   /** Submit one explicit lifecycle request; the provider decides whether it is valid. */
-  resume?(sandboxId: string, options?: { signal?: AbortSignal }): Promise<void>;
+  resume?(sandboxId: string, options?: SandboxResumeOptions): Promise<void>;
   /** End a Box, retaining its volumes and returning the terminal metadata. */
   release?(sandboxId: string): Promise<SandboxInfo>;
   /** Query and join existing destruction before submitting a new delete request. */
@@ -137,6 +137,24 @@ export interface SandboxProvider {
 }
 
 export interface CheckpointableSandboxProvider extends SandboxProvider, SandboxCheckpointProvider {}
+
+/** An in-memory observation of one explicit sandbox resume request. */
+export interface SandboxResumeProgress {
+  stage: 'submitting' | 'accepted' | 'running' | 'ports_listening';
+  sandboxId: string;
+  waitPorts?: number[];
+  remoteOperationId?: string;
+  remoteStatus?: string;
+  remoteStage?: string;
+  /** Actual execution source reported by the runtime for this resume. */
+  resumePath?: 'warm_pool' | 'standard';
+}
+
+export interface SandboxResumeOptions {
+  signal?: AbortSignal;
+  waitPorts?: number[];
+  onProgress?: (event: SandboxResumeProgress) => void;
+}
 
 export interface SandboxManagerOptions {
   provider: SandboxProvider;

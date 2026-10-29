@@ -7,7 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { AppServerEventAdapter, Codex, CodexAppServerClient, nativeTurnOptions } from '../../packages/agentcore/src/index.mjs';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
-import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxRecord, CellboxServiceAccess } from '@co-cell/sandbox';
+import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxRecord, CellboxServiceAccess, SandboxResumeProgress } from '@co-cell/sandbox';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import { readCellboxWorkspaceFile, cellboxWorkspaceFileResponse } from '../sandboxes/cellbox-files.js';
 import { holdResponse } from '../../util/http-stream.js';
@@ -59,7 +59,7 @@ export interface SandboxRuntime {
   delete(session: WorkspaceTarget): Promise<void>;
   rebuild(target: WorkspaceTarget, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   rebuildPersistent?(target: WorkspaceTarget, key: string, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
-  resume?(target: WorkspaceTarget, signal?: AbortSignal): Promise<void>;
+  resume?(target: WorkspaceTarget, signal?: AbortSignal, onProgress?: (event: SandboxResumeProgress) => void): Promise<void>;
   checkpoint?(target: WorkspaceTarget): Promise<void>;
   release?(target: WorkspaceTarget): Promise<SandboxState>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
@@ -849,12 +849,12 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     throw new HttpError(422, '当前 Cellbox 不支持同 ID 重建；请明确选择从备份创建新环境。');
   }
 
-  async resume(target: WorkspaceTarget, signal?: AbortSignal): Promise<void> {
+  async resume(target: WorkspaceTarget, signal?: AbortSignal, onProgress?: (event: SandboxResumeProgress) => void): Promise<void> {
     await this.sandboxes.refresh(target);
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
     if (!this.options.provider.resume) throw new HttpError(503, 'Sandbox 不支持恢复运行');
     await traced('sandbox.resume', { 'sandbox.id': target.sandbox.id },
-      () => this.options.provider.resume!(target.sandbox!.id, { signal }));
+      () => this.options.provider.resume!(target.sandbox!.id, { signal, waitPorts: [40000, 4500], onProgress }));
   }
 
   async checkpoint(target: WorkspaceTarget): Promise<void> {

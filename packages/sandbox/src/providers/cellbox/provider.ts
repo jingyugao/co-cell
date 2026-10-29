@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { posix } from 'node:path';
 import { traced, traceEvent } from '../../tracing.js';
-import type { CheckpointableSandboxProvider, SandboxCheckpoint, SandboxCommandHandle, SandboxCommandResult, SandboxHandle, SandboxInfo, SandboxProvider } from '../../types.js';
+import type { CheckpointableSandboxProvider, SandboxCheckpoint, SandboxCommandHandle, SandboxCommandResult, SandboxHandle, SandboxInfo, SandboxProvider, SandboxResumeOptions, SandboxResumeProgress } from '../../types.js';
 import { CellboxClient, CellboxError, type CellboxBox, type CellboxClientOptions, type CellboxOperation, type CellboxProfile } from './client.js';
 
 export interface CellboxSandboxProviderOptions extends CellboxClientOptions {
@@ -29,6 +29,21 @@ export interface CellboxServiceAccess {
 const inside = (path: string, root: string) => path === root || path.startsWith(`${root}/`);
 const q = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const defaultWaitMs = 15 * 60_000;
+
+function emitResumeProgress(observer: SandboxResumeOptions['onProgress'], event: SandboxResumeProgress) {
+  try {
+    const result = observer?.({ ...event, ...(event.waitPorts ? { waitPorts: [...event.waitPorts] } : {}) });
+    if (result && typeof (result as unknown as { then?: unknown }).then === 'function')
+      void Promise.resolve(result).catch(() => {});
+  }
+  catch { /* Observers do not control the remote lifecycle operation. */ }
+}
+
+function validateResumePorts(waitPorts?: number[]) {
+  if (waitPorts !== undefined && (!Array.isArray(waitPorts) || waitPorts.length < 1 || waitPorts.length > 64 ||
+    waitPorts.some(port => !Number.isInteger(port) || port < 1 || port > 65535)))
+    throw new CellboxError('INVALID_REQUEST', 'waitPorts must contain 1..64 integer ports in the range 1..65535');
+}
 
 function validAgent(user?: string) {
   if (user !== undefined && user !== 'agent' && user !== 'user')
@@ -110,7 +125,8 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
       throw new CellboxError('CONFLICT', `Box ${id} workspace differs from configured workspace`);
     return box;
   }
-  private async wait(op: CellboxOperation, timeoutMs = this.maxWaitMs, signal?: AbortSignal): Promise<CellboxOperation> {
+  private async wait(op: CellboxOperation, timeoutMs = this.maxWaitMs, signal?: AbortSignal,
+    onResumeOperation?: (operation: CellboxOperation) => void): Promise<CellboxOperation> {
     if (signal?.aborted) throw new CellboxError('UNKNOWN_OUTCOME', `Cellbox operation ${op.id} continues after caller abort`);
     // Synchronous Cellbox resume already returns a terminal Operation. Avoid
     // emitting a zero-duration waiter span when there was no long poll.
@@ -122,6 +138,8 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
       'cellbox.operation.wait_limit_ms': timeoutMs,
     }, async () => {
       let lastStatus: CellboxOperation['status'] | undefined;
+      let lastObservedStatus: CellboxOperation['status'] | undefined;
+      let lastStage: string | undefined;
       const until = Date.now() + timeoutMs;
       let current = op;
       for (;;) {
@@ -129,6 +147,12 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
           traceEvent('cellbox.operation.status', { 'operation.status': current.status, 'operation.version': current.version });
           lastStatus = current.status;
         }
+        if (onResumeOperation && (current.status === 'queued' || current.status === 'running') &&
+          (current.status !== lastObservedStatus || current.stage !== lastStage)) {
+          onResumeOperation(current);
+        }
+        lastObservedStatus = current.status;
+        lastStage = current.stage;
         if (current.status === 'succeeded') return current;
         if (current.status === 'failed')
           throw new CellboxError(current.error?.code ?? 'CONFLICT', current.error?.message ?? `Cellbox ${current.kind} failed`);
@@ -310,8 +334,31 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
     await this.act(id, 'suspend');
     return true;
   }
-  async resume(id: string, options: { signal?: AbortSignal } = {}): Promise<void> {
-    await this.act(id, 'resume', undefined, undefined, options.signal);
+  async resume(id: string, options: SandboxResumeOptions = {}): Promise<void> {
+    const { signal, waitPorts, onProgress } = options;
+    validateResumePorts(waitPorts);
+    this.checkConnectAbort(signal);
+    const progress = (event: Omit<SandboxResumeProgress, 'sandboxId' | 'waitPorts'>) => emitResumeProgress(onProgress, {
+      ...event,
+      sandboxId: id,
+      ...(waitPorts === undefined ? {} : { waitPorts }),
+    });
+    progress({ stage: 'submitting' });
+    const operation = await this.client.actBox(id, 'resume', undefined, {
+      timeoutMs: this.maxWaitMs + 60_000,
+      signal,
+      ...(waitPorts === undefined ? {} : { waitPorts }),
+    });
+    progress({ stage: 'accepted', remoteOperationId: operation.id, remoteStatus: operation.status,
+      ...(operation.stage === undefined ? {} : { remoteStage: operation.stage }) });
+    const observeOperation = (current: CellboxOperation) => progress({ stage: 'running',
+      remoteOperationId: operation.id, remoteStatus: current.status,
+      ...(current.stage === undefined ? {} : { remoteStage: current.stage }) });
+    const completed = await this.wait(operation, this.maxWaitMs, signal, observeOperation);
+    const resumePath = completed.result?.resumePath;
+    progress({ stage: 'ports_listening', remoteOperationId: completed.id, remoteStatus: completed.status,
+      ...(resumePath === 'warm_pool' || resumePath === 'standard' ? { resumePath } : {}),
+      ...(completed.stage === undefined ? {} : { remoteStage: completed.stage }) });
   }
   /** The marker refers to this box's same-node suspended state, not an independent checkpoint image. */
   async checkpoint(id: string): Promise<SandboxCheckpoint> {

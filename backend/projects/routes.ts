@@ -7,6 +7,7 @@ import { workspaceFileResponse } from '../workspaces/http-files.js';
 import { applicationCookies, applicationSetCookie, previewLocation } from './preview-policy.js';
 import { serviceHost } from './service-host.js';
 import { PROJECT_OPERATION_WAIT_MS } from '../../protocol/types.js';
+import { resumeStream } from './resume-stream.js';
 
 type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'createProjectSandbox' | 'restoreProjectSandbox' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'releaseProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
 
@@ -64,8 +65,12 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
   });
   app.post('/api/projects/:id/open', async c => projectOperationResponse(c,
     await manager.enterProject(c.req.param('id'), c.req.raw.signal)));
-  app.post('/api/projects/:id/sandbox/resume', async c => projectOperationResponse(c,
-    await manager.resumeProjectSandbox(c.req.param('id'), c.req.raw.signal)));
+  app.post('/api/projects/:id/sandbox/resume', async c => {
+    const id = c.req.param('id');
+    if (c.req.header('Accept')?.split(',').some(type => type.trim().split(';')[0] === 'text/event-stream'))
+      return resumeStream(c, observe => manager.resumeProjectSandbox(id, undefined, observe));
+    return projectOperationResponse(c, await manager.resumeProjectSandbox(id, c.req.raw.signal));
+  });
   app.post('/api/projects/:id/sandbox/checkpoint', async c => projectOperationResponse(c, await manager.checkpointProjectSandbox(c.req.param('id'))));
   app.post('/api/projects/:id/sandbox/release', async c => projectOperationResponse(c, await manager.releaseProjectSandbox(c.req.param('id'))));
   app.post('/api/projects/:id/sandbox/refresh-runtime', async c => projectOperationResponse(c, await manager.refreshProjectSandboxRuntime(c.req.param('id'))));

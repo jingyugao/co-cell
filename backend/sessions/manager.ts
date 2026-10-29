@@ -9,6 +9,7 @@ import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type Project, type 
 import type { SandboxRuntime, ServiceProxyAccess } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
+import type { ProjectResumeObserver } from '../../protocol/resume-types.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 
 import { HttpError, redactCredentials } from '../../util/errors.js';
@@ -1267,11 +1268,14 @@ export class SessionManager {
     return this.readProject(id);
   }
 
-  async resumeProjectSandbox(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
+  async resumeProjectSandbox(id: string, signal?: AbortSignal, onProgress?: ProjectResumeObserver): Promise<ProjectSummary> {
     signal?.throwIfAborted();
-    await this.submitProjectSandboxOperation(id, 'resume');
+    await this.submitProjectSandboxOperation(id, 'resume', { onResumeProgress: onProgress });
     signal?.throwIfAborted();
-    return this.readProject(id);
+    onProgress?.({ stage: 'syncing' });
+    const project = await this.readProject(id);
+    onProgress?.({ stage: 'completed' });
+    return project;
   }
 
   async releaseProjectSandbox(id: string): Promise<ProjectSummary> {
@@ -1289,10 +1293,11 @@ export class SessionManager {
     return this.readProject(id);
   }
 
-  private async submitProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'], options: { imageVersionId?: string } = {}) {
+  private async submitProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'], options: { imageVersionId?: string; onResumeProgress?: ProjectResumeObserver } = {}) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
     await this.withProjectOperation(id, async () => {
+      options.onResumeProgress?.({ stage: 'preparing' });
       await this.projects.refreshOne(id);
       await traced('project.operation', { 'project.id': id, 'sandbox.operation.kind': kind }, async () => {
         await this.sandboxOperations!.run(id, kind, options);

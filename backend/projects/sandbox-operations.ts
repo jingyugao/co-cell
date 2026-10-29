@@ -14,8 +14,9 @@ import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import { querySandbox } from '../sandboxes/status.js';
 import { BackupCatalogUnavailable } from '../sandboxes/cellbox-volume-backups.js';
 import { sandboxMounts } from '../../util/sandbox-mounts.js';
+import type { ProjectResumeObserver } from '../../protocol/resume-types.js';
 
-type OperationOptions = { useExistingBackup?: boolean; imageVersionId?: string };
+type OperationOptions = { useExistingBackup?: boolean; imageVersionId?: string; onResumeProgress?: ProjectResumeObserver };
 
 const target = (project: Project): WorkspaceTarget => ({ id: project.id, projectId: project.id,
   settings: { workingDirectory: project.workingDirectory }, imageSelection: project.imageSelection, sandbox: project.sandbox,
@@ -110,7 +111,7 @@ export class ProjectSandboxOperations {
     const perform = async () => {
       try {
         if (kind === 'create') await this.create(id);
-        else if (kind === 'resume') await this.resume(id);
+        else if (kind === 'resume') await this.resume(id, options.onResumeProgress);
         else if (kind === 'release') await this.release(id);
         else if (kind === 'rebuild') throw new HttpError(422, '当前 Cellbox 不支持同 ID 重建；可从备份创建新环境。');
         else if (kind === 'checkpoint') await this.checkpoint(id);
@@ -138,11 +139,12 @@ export class ProjectSandboxOperations {
         { 'project.id': id, 'operation.id': operation.id!, 'sandbox.id': project.sandbox?.id }, perform)));
   }
 
-  private async resume(id: string) {
+  private async resume(id: string, onProgress?: ProjectResumeObserver) {
     const project = this.context.getStore()!.project;
     if (!project.sandbox || !this.deps.runtime.resume) throw new HttpError(409, '项目没有可恢复的 Sandbox');
     await this.phase(id, '恢复运行');
-    await this.deps.runtime.resume(target(project));
+    const operationId = this.context.getStore()!.operation.id;
+    await this.deps.runtime.resume(target(project), undefined, event => onProgress?.({ ...event, operationId }));
   }
 
   private async create(id: string) {

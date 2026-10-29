@@ -78,6 +78,103 @@ test('an existing disk backup does not block explicit resume; project viewing re
   expect(ui.count('POST', '/api/projects/paused/open')).toBe(0);
 });
 
+test('active projects keep creation order after status updates, resume, and refresh', async ({ page, ui }) => {
+  const paused = ui.projects.get('paused');
+  const other = ui.projects.get('other');
+  paused.createdAt = '2026-01-02T00:00:00Z';
+  other.createdAt = '2026-01-02T00:00:00Z';
+  other.sandbox.status = 'paused';
+  const newest = { ...other, id: 'newest', name: '最新项目', createdAt: '2026-01-03T00:00:00Z', sandbox: { ...other.sandbox, id: 'newest-box' } };
+  ui.projects.set(newest.id, newest);
+  const restored = ui.addCompletedProject('restored');
+  restored.name = '恢复后项目';
+  restored.createdAt = '2026-01-01T00:00:00Z';
+  const otherCompleted = ui.addCompletedProject('completed-newer');
+  otherCompleted.name = '另一个已完成项目';
+  otherCompleted.createdAt = '2026-01-04T00:00:00Z';
+
+  const cardOrder = (label) => page.locator(`section[aria-label="${label}"] > article`).evaluateAll(cards => cards.map(card => card.getAttribute('aria-label')));
+  const expectActiveOrder = names => expect.poll(() => cardOrder('使用中项目列表')).toEqual(names);
+  await page.goto('/#projects');
+  await expectActiveOrder(['最新项目', '另一个项目', '暂停项目']);
+
+  await page.getByRole('button', { name: /^已完成 \d+$/ }).click();
+  await expect.poll(() => cardOrder('已完成项目列表')).toEqual(['恢复后项目', '另一个已完成项目']);
+  await page.getByRole('article', { name: '恢复后项目', exact: true }).getByRole('button', { name: '恢复', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: '已恢复为使用中' })).toBeVisible();
+  restored.updatedAt = '2030-01-01T00:00:00Z';
+  await page.getByRole('button', { name: /^使用中 \d+$/ }).click();
+  await page.getByRole('button', { name: '刷新', exact: true }).click();
+  await expectActiveOrder(['最新项目', '另一个项目', '暂停项目', '恢复后项目']);
+
+  const otherCard = page.getByRole('article', { name: '另一个项目', exact: true });
+  await otherCard.getByRole('button', { name: '恢复运行', exact: true }).click();
+  await expect.poll(() => ui.count('POST', '/api/projects/other/sandbox/resume')).toBe(1);
+  await ui.complete('other');
+  await expect(otherCard.getByRole('region', { name: '恢复时间线', exact: true }).locator('summary').getByText('恢复完成', { exact: true })).toBeVisible();
+  other.updatedAt = '2040-01-01T00:00:00Z';
+  await page.getByRole('button', { name: '刷新', exact: true }).click();
+  await expectActiveOrder(['最新项目', '另一个项目', '暂停项目', '恢复后项目']);
+
+  await page.reload();
+  await expectActiveOrder(['最新项目', '另一个项目', '暂停项目', '恢复后项目']);
+});
+
+for (const viewport of [{ name: 'desktop', width: 1280 }, { name: 'mobile', width: 390 }]) {
+  test(`explicit resume shows a transient progress timeline on ${viewport.name}`, async ({ page, ui }) => {
+    await page.setViewportSize({ width: viewport.width, height: 900 });
+    ui.setResumePath('paused', viewport.name === 'desktop' ? 'warm_pool' : 'standard');
+    await page.goto('/#projects');
+    const card = page.getByRole('article', { name: '暂停项目', exact: true });
+    await card.getByRole('button', { name: '恢复运行', exact: true }).click();
+
+    const timeline = card.getByRole('region', { name: '恢复时间线', exact: true });
+    await expect(timeline.getByText('正在恢复', { exact: true })).toBeVisible();
+    await expect(timeline.getByText('提交恢复操作', { exact: true })).toBeVisible();
+    expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(1);
+    expect(ui.calls.find(call => call.path === '/api/projects/paused/sandbox/resume')?.status).toBeUndefined();
+
+    await ui.complete('paused');
+    await expect(timeline.locator('summary').getByText('恢复完成', { exact: true })).toBeVisible();
+    await timeline.locator('summary').click();
+    await expect(timeline.getByText('等待端口已就绪', { exact: true })).toBeVisible();
+    await expect(timeline.locator('.resume-timeline-metadata')).toContainText(viewport.name === 'desktop' ? '本次命中预热池' : '常规恢复（未命中预热池）');
+    expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(1);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.reload();
+    await expect(page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('region', { name: '恢复时间线' })).toHaveCount(0);
+    expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(1);
+  });
+}
+
+test('a completed resume without path metadata stays explicitly unknown and clears on reload', async ({ page, ui }) => {
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '暂停项目', exact: true });
+  await card.getByRole('button', { name: '恢复运行', exact: true }).click();
+  await ui.complete('paused');
+  const timeline = card.getByRole('region', { name: '恢复时间线', exact: true });
+  await expect(timeline.locator('summary').getByText('恢复完成', { exact: true })).toBeVisible();
+  await timeline.locator('summary').click();
+  await expect(timeline.locator('.resume-timeline-metadata')).toContainText('预热信息未上报');
+
+  await page.reload();
+  await expect(page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('region', { name: '恢复时间线' })).toHaveCount(0);
+});
+
+test('a dropped resume progress stream is unknown and is never replayed', async ({ page, ui }) => {
+  ui.disconnectResume('paused');
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '暂停项目', exact: true });
+  await card.getByRole('button', { name: '恢复运行', exact: true }).click();
+
+  const timeline = card.getByRole('region', { name: '恢复时间线', exact: true });
+  await expect(timeline.locator('summary').getByText('结果未知', { exact: true })).toBeVisible();
+  await timeline.locator('summary').click();
+  await expect(timeline.getByText('请刷新项目状态确认结果；不会自动重试恢复请求。', { exact: true })).toBeVisible();
+  await page.waitForTimeout(300);
+  expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(1);
+});
+
 test('paused project submits disk backup only after the explicit backup action', async ({ page, ui }) => {
   await page.goto('/#projects');
   const card = page.getByRole('article', { name: '暂停项目', exact: true });

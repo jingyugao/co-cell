@@ -1,4 +1,5 @@
 import { test as base, expect } from '@playwright/test';
+import { createServer } from 'node:http';
 
 const now = '2026-01-01T00:00:00Z';
 const defaultRoleId = '00000000-0000-4000-8000-000000000001';
@@ -17,6 +18,37 @@ export const test = base.extend({
     const projectRoles = new Map([...projects.keys()].map(id => [id, defaultRoleId]));
     const calls = [], historyReads = [], submissions = [], errors = [], deleteFailures = new Map();
     const pendingRoutes = new Map(), pendingByRequest = new Map();
+    const resumeStreams = new Map();
+    const resumeModes = new Map();
+    const resumePaths = new Map();
+    const resumeServer = createServer(async (request, response) => {
+      const origin = request.headers.origin ?? '*';
+      response.setHeader('Access-Control-Allow-Origin', origin);
+      response.setHeader('Vary', 'Origin');
+      response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      response.setHeader('Cache-Control', 'no-cache');
+      const id = new URL(request.url ?? '/', 'http://localhost').pathname.split('/').at(-1);
+      const stages = [
+        ['received', 0], ['preparing', 25], ['submitting', 55], ['accepted', 90], ['running', 120],
+      ];
+      let sequence = 0, readyResolve;
+      const pending = { response, sequence: 0, ready: new Promise(resolve => { readyResolve = resolve; }) };
+      resumeStreams.set(id, pending);
+      response.on('close', () => resumeStreams.delete(id));
+      for (const [stage, elapsedMs] of stages) {
+        response.write(`event: progress\ndata: ${JSON.stringify({ sequence: ++sequence, stage, at: now, elapsedMs, sandboxId: `${id}-box`, ...(stage === 'running' ? { waitPorts: [40000, 4500] } : {}) })}\n\n`);
+        pending.sequence = sequence;
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      readyResolve();
+      if (resumeModes.get(id) === 'disconnect') {
+        resumeModes.delete(id);
+        response.end();
+        return;
+      }
+    });
+    await new Promise(resolve => resumeServer.listen(0, '127.0.0.1', resolve));
+    const resumeServerUrl = `http://127.0.0.1:${resumeServer.address().port}`;
     const rememberPending = (id, route, kind, call) => {
       const pending = pendingRoutes.get(id) ?? new Set();
       const record = { route, kind, call };
@@ -109,7 +141,7 @@ export const test = base.extend({
           }
         } else if (method === 'POST' && path.endsWith('/resume')) {
           data.sandboxOperation = operation('resume');
-          rememberPending(id, route, 'resume', call); return;
+          await route.continue({ url: `${resumeServerUrl}/resume/${encodeURIComponent(id)}` }); return;
         } else if (method === 'POST' && path.endsWith('/backup')) {
           data.sandboxOperation = operation('backup', 'succeeded');
           data.sandboxBackup = { id: data.sandboxOperation.id, ...(data.sandbox?.id ? { sandboxId: data.sandbox.id } : {}),
@@ -166,8 +198,22 @@ export const test = base.extend({
         delete value.sandboxReclaimedAt;
         if (restoring) value.sandbox.id = `${id}-restored-box`;
         value.sandboxOperation = operation(value.sandboxOperation?.kind ?? 'create', 'succeeded');
+        const pendingResume = resumeStreams.get(id);
+        if (pendingResume) {
+          await pendingResume.ready;
+          if (resumeStreams.get(id) === pendingResume) resumeStreams.delete(id);
+          for (const [stage, elapsedMs] of [['ports_listening', 180], ['syncing', 220], ['completed', 260]]) {
+            const resumePath = resumePaths.get(id);
+            pendingResume.response.write(`event: progress\ndata: ${JSON.stringify({ sequence: ++pendingResume.sequence, stage, at: now, elapsedMs, sandboxId: value.sandbox.id, waitPorts: [40000, 4500], ...(resumePath ? { resumePath } : {}) })}\n\n`);
+            await new Promise(resolve => setTimeout(resolve, 20));
+          }
+          pendingResume.response.write(`event: complete\ndata: ${JSON.stringify(value)}\n\n`);
+          pendingResume.response.end();
+        }
         await fulfillPending(id);
       },
+      disconnectResume(id) { resumeModes.set(id, 'disconnect'); },
+      setResumePath(id, resumePath) { resumePaths.set(id, resumePath); },
       async fail(id, message) {
         const value = projects.get(id);
         value.sandboxOperation = operation(value.sandboxOperation?.kind ?? 'resume', 'failed', message);
@@ -195,6 +241,9 @@ export const test = base.extend({
         forgetPending(id, record);
         try { await record.route.abort(); } catch { /* Request already completed or cancelled. */ }
       })));
+      for (const pending of resumeStreams.values()) pending.response.destroy();
+      resumeStreams.clear();
+      await new Promise(resolve => resumeServer.close(resolve));
     }
     expect(errors).toEqual([]);
   },

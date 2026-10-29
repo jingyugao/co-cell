@@ -67,7 +67,7 @@ function projectImageLabel(project: ProjectSummary) {
   if (project.imageSelection?.migrationRequired) return `${project.imageSelection.imageName} · 需要迁移`;
   if (project.imageSelection?.selectionPolicy === 'latest') return `${project.imageSelection.imageName} · latest`;
   if (project.sandbox) return project.imageSelection ? `${project.imageSelection.imageName} · template` : '系统默认 template';
-  return project.imageSelection ? `${project.imageSelection.imageName} · Cellbox stable` : '系统默认 template · Cellbox stable';
+  return project.imageSelection ? `${project.imageSelection.imageName} · latest` : '系统默认镜像 · latest';
 }
 
 function ProjectForm({ busy, onSubmit, onCancel }: {
@@ -275,12 +275,12 @@ function ProjectCard({ project, resumeTimeline, config, onRefresh, onUpdate, onD
         <div className="project-card-actions">
           {sandboxView.actions.map(action => <button key={action.id} className="secondary-button"
             disabled={action.id === 'refresh' ? refreshing : busy || hasTask || Boolean(action.disabledReason)}
-            title={action.disabledReason ?? (action.id === 'create' && project.sandboxMounts?.length ? '使用 template 当前 stable 创建新 Sandbox，复用保留的挂载盘' : undefined)}
+            title={action.disabledReason ?? (action.id === 'create' && project.sandboxMounts?.length ? '使用所选镜像的最新成功版本创建新 Sandbox，复用保留的挂载盘' : undefined)}
             onClick={() => sandboxAction(action.id)}>{action.id === 'refresh' && refreshing ? '刷新中…' : action.id === 'backup' && backupFailed && sandboxView.state !== 'released' ? '重试磁盘备份' : action.label}</button>)}
         </div>
         {sandboxView.actions.filter(action => action.disabledReason).map(action => <p key={action.id} className="project-rebuild-hint">{action.disabledReason}</p>)}
         {sandboxView.state === 'unknown' && <p className="project-rebuild-hint">状态查询失败或尚未确认，请刷新状态后决定下一步；释放结果以 Cellbox 返回为准。</p>}
-        {sandboxView.state === 'released' && <p className="project-rebuild-hint">新建 Sandbox 使用 template 当前 stable{hasRetainedMounts ? '，并复用保留的挂载盘；可直接备份保留的挂载盘' : '；当前未记录保留的挂载盘'}；从备份恢复会创建新的挂载盘。</p>}
+        {sandboxView.state === 'released' && <p className="project-rebuild-hint">新建 Sandbox 使用所选镜像的最新成功版本{hasRetainedMounts ? '，并复用保留的挂载盘；可直接备份保留的挂载盘' : '；当前未记录保留的挂载盘'}；从备份恢复会创建新的挂载盘。</p>}
       </section>}
     </div>}
     <ResumeTimeline timeline={resumeTimeline} />
@@ -293,7 +293,7 @@ function ProjectCard({ project, resumeTimeline, config, onRefresh, onUpdate, onD
     {project.backupPolicyError && <p className="project-operation failed" role="alert"><strong>无法读取磁盘备份保留策略</strong><span>{project.backupPolicyError}</span></p>}
     {sandboxPaused && !completed && <p className="project-rebuild-hint">Checkpoint 只暂停环境；磁盘备份需单独操作。恢复运行会继续当前环境。</p>}
     {archived && project.executionMode === 'sandbox' && <div className="project-rebuild-hint">
-      <p>恢复时选择{project.imageSelection ? '原仓库默认版本' : '当前系统默认镜像'}；文件和对话历史从备份恢复，服务需要重新启动。</p>
+      <p>恢复时默认使用{project.imageSelection ? '原仓库' : '系统默认镜像'}的最新成功版本；文件和对话历史从备份恢复，服务需要重新启动。</p>
       {project.imageSelection && <><button className="secondary-button" disabled={busy} onClick={() => setChooseRestoreVersion(value => !value)}>选择恢复版本</button>
         {chooseRestoreVersion && <RestoreVersionPicker imageId={project.imageSelection.imageId} disabled={busy} value={restoreVersionId} onChange={setRestoreVersionId} />}</>}
     </div>}

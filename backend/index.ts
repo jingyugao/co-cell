@@ -143,8 +143,8 @@ const imageCatalog = new ImageCatalog(webState, cellboxProvider.client, process.
   () => webState.listProjects(), {defaultTemplateId:process.env.CELLBOX_TEMPLATE_ID,defaultRevisionId:process.env.CELLBOX_REVISION_ID});
 const projectSandboxes = new ProjectSandboxes(provider, sandboxImage, sandboxImageIdentity.templateId, cellboxRuntime.lifecycle,
   async id => { const project = await webState.getProject(id); return project?.removedAt ? undefined : project; },
-  async target => target.imageSelection?.selectionPolicy === 'latest'
-    ? (await imageCatalog.acquireLatestSelection(target.imageSelection.imageId)).selection : undefined);
+  async target => (await imageCatalog.acquireLatestSelection(
+    target.imageSelection?.imageId, target.imageSelection?.templateId)).selection);
 const systemTools = new SystemTools({ projects: () => webState.listProjects(), enter: id => manager.enterProject(id),
   execute: (id, tool, args) => cellboxProvider.client.runTool(id, tool, args, 40_000) });
 const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);

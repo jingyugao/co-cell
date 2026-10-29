@@ -19,12 +19,14 @@ export interface StoredWorkReport extends WorkReport {
   /** A new immutable output directory for each explicit retry. */
   runId: string;
   inputsReady?: boolean;
+  /** Absent on legacy runs, whose submitted prompt hashes must remain stable. */
+  materialVersion?: 2 | 3;
   dailyReportIds?: string[];
   rawSourceIds?: string[];
   previousUsage?: ReportUsage;
 }
 
 export function publicReport(record: StoredWorkReport): WorkReport {
-  const { settings, sources, calls, runId, inputsReady, dailyReportIds, rawSourceIds, previousUsage, ...report } = record;
+  const { settings, sources, calls, runId, inputsReady, materialVersion, dailyReportIds, rawSourceIds, previousUsage, ...report } = record;
   return report;
 }

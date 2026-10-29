@@ -51,8 +51,8 @@ export function installReportRoutes(app: Hono, service?: ReportService) {
   app.get('/api/reports/:id', async c => c.json(await reports().detail(id.parse(c.req.param('id')))));
 
   app.post('/api/reports/:id/retry', async c => {
-    const input = z.object({ updatedAt: z.string().datetime() }).strict().parse(await c.req.json());
-    await reports().retry(id.parse(c.req.param('id')), input.updatedAt);
+    const input = z.object({ updatedAt: z.string().datetime(), regenerate: z.boolean().optional() }).strict().parse(await c.req.json());
+    await reports().retry(id.parse(c.req.param('id')), input.updatedAt, input.regenerate);
     return c.json({ ok: true as const }, 202);
   });
 }

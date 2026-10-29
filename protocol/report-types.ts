@@ -27,7 +27,7 @@ export interface WorkReport {
   /** Local dates, with an exclusive end. */
   periodStart: string;
   periodEnd: string;
-  /** Manual snapshot of the current week, separate from its eventual complete report. */
+  /** Material cutoff for a same-day daily report or a manual current-week snapshot. */
   asOf?: string;
   status: ReportStatus;
   sourceCount: number;
@@ -51,6 +51,8 @@ export interface ReportSource {
   sourceUpdatedAt: string;
   status: 'included' | 'empty' | 'failed';
   materialId?: string;
+  /** Some context segments have neither a readable compaction nor in-period raw text. */
+  coverageIncomplete?: boolean;
   isSnapshot?: boolean;
   collectedAt?: string;
   summary?: string;
@@ -62,6 +64,12 @@ export interface ReportDetail {
   body: string;
   sources: ReportSource[];
   prompt: string;
+}
+
+export interface ReportRetryInput {
+  updatedAt: string;
+  /** Start a fresh run with current materials/settings after verifying all earlier calls stopped. */
+  regenerate?: boolean;
 }
 
 export interface ReportSourceContent {

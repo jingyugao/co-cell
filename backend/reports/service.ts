@@ -4,25 +4,30 @@ import { join } from 'node:path';
 import type { ReportDetail, ReportKind, ReportSettings, ReportSource, ReportSourceContent, ReportUsage, ReportsView } from '../../protocol/report-types.js';
 import { dueReportSchedules, reportPeriod, reportSchedule } from '../../util/report-periods.js';
 import { HttpError, redactCredentials } from '../../util/errors.js';
+import { countTokens } from '../../util/tokenizer.js';
 import { MemoryCoordinator, type SharedCoordinator } from '../infra/storage/coordination.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import type { ConversationMaterialsService } from '../conversation-materials/service.js';
 import type { ConversationMaterialCollector } from '../conversation-materials/collector.js';
 import { readMaterialContent } from '../conversation-materials/content.js';
-import { defaultReportSettings, reportRules, summaryPrompt } from './prompts.js';
+import { defaultReportSettings, hierarchicalReportRules, legacyReportRules, projectSummaryPrompt, reportRules, summaryPrompt } from './prompts.js';
 import type { ReportRepository } from './repository.js';
 import type { ReportRunner } from './runner.js';
 import { publicReport, type StoredWorkReport } from './types.js';
 
 const DAY = 86_400_000;
 const MAX_CHARS = 48_000;
+// Leave room for the agent's own instructions, tools, reasoning, and output in a 256k context.
+const MAX_REPORT_INPUT_TOKENS = 224_000;
 const emptyUsage = (): ReportUsage => ({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, unknownCalls: 0, estimatedCostUsd: 0 });
 const message = (error: unknown) => redactCredentials(error instanceof Error ? error.message : String(error)).slice(0, 1500);
 const localDate = (now: Date) => new Date(now.getTime() + 8 * 3_600_000).toISOString().slice(0, 10);
 const instant = (date: string) => new Date(`${date}T00:00:00+08:00`);
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const periodDescription = (report: StoredWorkReport) => `${report.periodStart} 至 ${report.periodEnd}（不含结束日，北京时间）`
-  + (report.asOf ? `；这是本周进展快照，只统计截至 ${report.asOf} 的内容，本周尚未结束` : '');
+  + (report.asOf ? report.kind === 'daily'
+    ? `；这是当日进展快照，只统计截至 ${report.asOf} 的内容`
+    : `；这是本周进展快照，只统计截至 ${report.asOf} 的内容，本周尚未结束` : '');
 
 /** Split only when necessary, prefer whole Markdown messages, and never drop an oversized message. */
 export function reportChunks(text: string): string[] {
@@ -109,25 +114,32 @@ export class ReportService {
     });
     return readMaterialContent(directory, exists ? input : `${sessionId}.summary.md`, offset);
   }
-  async retry(id: string, updatedAt: string) {
+  async retry(id: string, updatedAt: string, regenerate = false) {
     const result = await this.coordinator.tryRun('reports:worker', async () => {
       const report = await this.require(id);
       if (report.status !== 'failed' || report.updatedAt !== updatedAt) throw new HttpError(409, '报告状态已变化，请刷新后重试');
       await this.deps.runner.assertRetryable(report.calls);
       // In-flight calls are resumed by identity, never blindly submitted a second time.
       const unknown = report.calls.find(call => call.status === 'running' || call.status === 'submitting');
-      if (unknown) {
+      if (unknown && !regenerate) {
         report.status = report.inputsReady ? 'summarizing' : 'collecting';
         delete report.error;
         await this.save(report);
         return;
       }
+      await this.write(join(this.directory(report), 'run-record.json'), JSON.stringify(report));
       report.previousUsage = report.usage;
       report.runId = randomUUID();
       report.settings = await this.settings();
       report.model = report.settings.model;
-      report.calls = []; report.sources = []; report.sourceCount = 0; report.missingCount = 0;
+      report.calls = []; report.sources = []; report.sessionIds = []; report.sourceCount = 0; report.missingCount = 0;
       delete report.inputsReady; delete report.dailyReportIds; delete report.rawSourceIds; delete report.generatedAt; delete report.error;
+      delete report.materialVersion;
+      if (regenerate) {
+        const now = this.now();
+        if (report.periodStart <= localDate(now) && report.periodEnd > localDate(now)) report.asOf = now.toISOString();
+        else delete report.asOf;
+      }
       report.status = 'queued';
       await this.save(report);
     });
@@ -184,6 +196,7 @@ export class ReportService {
   }
 
   private async collect(report: StoredWorkReport, signal: AbortSignal, save: () => Promise<void>) {
+    report.materialVersion = 3;
     report.status = 'collecting'; await save();
     const directory = this.directory(report);
     await rm(join(directory, 'sources'), { recursive: true, force: true });
@@ -193,6 +206,19 @@ export class ReportService {
     const dailyBodies: string[] = [];
     report.dailyReportIds = [];
     report.rawSourceIds = [];
+    let previousDaily = '';
+    if (report.kind === 'daily') {
+      const date = localDate(new Date(instant(report.periodStart).getTime() - DAY));
+      const daily = await this.deps.repository.find('daily', date);
+      if (daily?.status === 'ready') {
+        const body = await this.read(join(this.directory(daily), 'report.md'));
+        if (body) previousDaily = `# ${date} 昨日日报（仅作背景及去重，不是本期成果）\n\n`
+          + (daily.missingCount || daily.snapshotCount || daily.asOf
+            ? '这份日报是快照或存在材料缺失，未提及的事项不能据此认定为本期新增。\n\n' : '') + body;
+      }
+    }
+    // Freeze the baseline with this run's inputs, so resumed calls use the same prompt.
+    await this.write(join(directory, 'previous-daily.md'), previousDaily);
     if (report.kind === 'weekly') {
       for (let at = instant(report.periodStart).getTime(); at < instant(report.periodEnd).getTime(); at += DAY) {
         const date = localDate(new Date(at));
@@ -233,14 +259,16 @@ export class ReportService {
         source.collectedAt = material.createdAt;
         const parts: string[] = [];
         let bytes = 0;
-        for (let at = instant(report.periodStart).getTime(); at < instant(report.periodEnd).getTime(); at += DAY) {
-          const until = Math.min(at + DAY, report.asOf ? Date.parse(report.asOf) : Infinity);
-          if (at >= until) break;
-          const date = localDate(new Date(at));
-          if (readyDays.has(date)) continue;
-          const selected = await this.deps.materials.period(material.id, new Date(at), new Date(until), signal);
+        const start = instant(report.periodStart);
+        const end = new Date(Math.min(instant(report.periodEnd).getTime(), report.asOf ? Date.parse(report.asOf) : Infinity));
+        if (start < end) {
+          const selected = await this.deps.materials.latestContext(material.id, start, end, signal);
           for (const part of selected) {
-            const content = `# ${date} · ${part.path}\n\n${part.content}`;
+            if (part.coverageIncomplete) {
+              source.coverageIncomplete = true;
+              source.error = '最后一个上下文段的段首压缩摘要不可读，历史背景覆盖不完整';
+            }
+            const content = `# ${report.periodStart} 至 ${report.periodEnd} · ${part.path}\n\n${part.content}`;
             bytes += Buffer.byteLength(content);
             if (bytes > 64 * 1024 ** 2) throw new Error('单条会话的报告材料超过 64 MiB，未截断或提交');
             parts.push(content);
@@ -267,7 +295,10 @@ export class ReportService {
   }
 
   private async summarize(report: StoredWorkReport, signal: AbortSignal, save: () => Promise<void>) {
+    if (report.materialVersion === 3) return this.summarizeHierarchy(report, signal, save);
     const directory = this.directory(report);
+    const previousDaily = await this.read(join(directory, 'previous-daily.md'));
+    const baseline = previousDaily ? `\n\n<昨日日报背景>\n${previousDaily}\n</昨日日报背景>` : '';
     for (const source of report.sources.filter(source => source.status === 'included')) {
       signal.throwIfAborted();
       const output = join(directory, 'sources', `${source.sessionId}.summary.md`);
@@ -277,10 +308,10 @@ export class ReportService {
       const chunks = reportChunks(input);
       const summaries: string[] = [];
       for (let index = 0; index < chunks.length; index++) {
-        const prompt = `${reportRules}\n\n${summaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n统计期间：${periodDescription(report)}。\n`
+        const prompt = `${this.rules(report)}\n\n${summaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n统计期间：${periodDescription(report)}。\n`
           + `项目：${source.projectName}\n对话：${source.sessionTitle}\n来源：[原始对话](/sessions/${source.sessionId})\n`
           + (source.isSnapshot ? `此来源含进行中轮次，采集于${source.collectedAt}。只描述快照中可证实的进展，不能推断最终完成。\n` : '')
-          + `材料分段：${index + 1}/${chunks.length}\n\n<工作材料>\n${chunks[index]}\n</工作材料>`;
+          + `材料分段：${index + 1}/${chunks.length}${baseline}\n\n<工作材料>\n${chunks[index]}\n</工作材料>`;
         const result = await this.call(report, prompt, `${source.projectName} · 业务进展摘要`, true, save);
         if (result === undefined) return;
         summaries.push(result);
@@ -296,7 +327,7 @@ export class ReportService {
     const direct = summaries.filter((_summary, index) => (report.rawSourceIds ?? []).includes(
       report.sources.filter(source => source.status === 'included')[index].sessionId)).join('\n\n');
     const combined = [dailyInput, dailyInput ? direct : summaries.join('\n\n')].filter(Boolean).join('\n\n');
-    const missing = report.sources.filter(source => source.status === 'failed');
+    const missing = report.sources.filter(source => source.status === 'failed' || source.coverageIncomplete);
     if (!combined.trim()) {
       if (missing.length) throw new Error(`有 ${missing.length} 条对话材料读取失败，无法判断本期业务进展`);
       await this.complete(report, '# 工作报告\n\n本期可读取的对话中没有新增工作材料。', save);
@@ -306,10 +337,76 @@ export class ReportService {
     if (folded === undefined) return;
     report.status = 'generating'; await save();
     const gaps = missing.length ? `\n材料缺失：${missing.map(source => `${source.projectName} / ${source.sessionTitle}`).join('；')}。报告必须注明覆盖不完整，不可推断这些事项没有进展。` : '';
-    const prompt = `${reportRules}\n\n${report.settings.prompts[report.kind]}\n\n统计期间：${periodDescription(report)}。${gaps}\n控制在 800—1500 个汉字左右。\n\n<业务进展材料>\n${folded}\n</业务进展材料>`;
+    const prompt = `${this.rules(report)}\n\n${report.settings.prompts[report.kind]}\n\n统计期间：${periodDescription(report)}。${gaps}\n控制在 800—1500 个汉字左右。${baseline}\n\n<业务进展材料>\n${folded}\n</业务进展材料>`;
     const body = await this.call(report, prompt, `${report.kind === 'daily' ? '工作日报' : '工作周报'} · ${report.periodStart}`, false, save);
     if (body === undefined) return;
-    await this.complete(report, body + (missing.length ? `\n\n> 本报告有 ${missing.length} 条对话材料未能读取，覆盖不完整。` : ''), save);
+    await this.complete(report, body + (missing.length ? `\n\n> 本报告有 ${missing.length} 条对话的全部或部分材料未能读取，覆盖不完整。` : ''), save);
+  }
+
+  private async summarizeHierarchy(report: StoredWorkReport, signal: AbortSignal, save: () => Promise<void>) {
+    const directory = this.directory(report);
+    const previousDaily = await this.read(join(directory, 'previous-daily.md'));
+    const baseline = previousDaily ? `\n\n<昨日日报背景>\n${previousDaily}\n</昨日日报背景>` : '';
+    const included = report.sources.filter(source => source.status === 'included');
+    const projects = new Map<string, { name: string; summaries: string[] }>();
+    for (const source of included) {
+      signal.throwIfAborted();
+      const output = join(directory, 'sources', `${source.sessionId}.summary.md`);
+      let summary = await this.read(output);
+      if (!summary) {
+        const input = await this.read(join(directory, 'sources', `${source.sessionId}.input.md`));
+        if (!input) throw new Error('报告来源材料丢失，未生成不完整摘要');
+        const prompt = `${hierarchicalReportRules}\n\n${summaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n统计期间：${periodDescription(report)}。\n`
+          + `项目：${source.projectName}\n对话：${source.sessionTitle}\n来源：[原始对话](/sessions/${source.sessionId})\n`
+          + (source.isSnapshot ? `此来源含进行中轮次，采集于${source.collectedAt}。不能推断最终完成。\n` : '')
+          + `${baseline}\n\n<工作材料>\n${input}\n</工作材料>`;
+        const result = await this.hierarchicalCall(report, prompt, `${source.projectName} · 对话摘要`, true, save);
+        if (result === undefined) return;
+        summary = `## ${source.projectName} · ${source.sessionTitle}\n\n来源：[原始对话](/sessions/${source.sessionId})\n\n${result}`;
+        await this.write(output, summary);
+      }
+      const project = projects.get(source.projectId) ?? { name: source.projectName, summaries: [] };
+      project.summaries.push(summary);
+      projects.set(source.projectId, project);
+    }
+    const projectSummaries: string[] = [];
+    for (const [projectId, project] of projects) {
+      signal.throwIfAborted();
+      const output = join(directory, 'projects', `${hash(projectId)}.summary.md`);
+      let summary = await this.read(output);
+      if (!summary) {
+        const prompt = `${hierarchicalReportRules}\n\n${projectSummaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n`
+          + `统计期间：${periodDescription(report)}。\n项目：${project.name}${baseline}\n\n<对话摘要>\n${project.summaries.join('\n\n')}\n</对话摘要>`;
+        const result = await this.hierarchicalCall(report, prompt, `${project.name} · 项目摘要`, true, save);
+        if (result === undefined) return;
+        summary = `# ${project.name}\n\n${result}`;
+        await this.write(output, summary);
+      }
+      projectSummaries.push(summary);
+    }
+    // Daily bodies preserve cross-project decisions when the weekly report reuses ready days.
+    const dailyInput = await this.read(join(directory, 'daily-input.md'));
+    const combined = [projectSummaries.join('\n\n'), dailyInput ? `# 已有日报（与项目摘要去重）\n\n${dailyInput}` : ''].filter(Boolean).join('\n\n');
+    const missing = report.sources.filter(source => source.status === 'failed' || source.coverageIncomplete);
+    if (!combined.trim()) {
+      if (missing.length) throw new Error(`有 ${missing.length} 条对话材料读取失败，无法判断本期业务进展`);
+      await this.complete(report, '# 工作报告\n\n本期选取的主对话材料中没有可报告的新进展。', save);
+      return;
+    }
+    report.status = 'generating'; await save();
+    const gaps = missing.length ? `\n材料缺失：${missing.map(source => `${source.projectName} / ${source.sessionTitle}`).join('；')}。必须注明覆盖不完整。` : '';
+    const prompt = `${hierarchicalReportRules}\n\n${report.settings.prompts[report.kind]}\n\n统计期间：${periodDescription(report)}。${gaps}\n`
+      + `控制在 800—1500 个汉字左右。${baseline}\n\n<项目进展材料>\n${combined}\n</项目进展材料>`;
+    const body = await this.hierarchicalCall(report, prompt, `${report.kind === 'daily' ? '工作日报' : '工作周报'} · ${report.periodStart}`, false, save);
+    if (body === undefined) return;
+    await this.complete(report, body + (missing.length ? `\n\n> 本报告有 ${missing.length} 条对话的全部或部分材料未能读取，覆盖不完整。` : ''), save);
+  }
+
+  private async hierarchicalCall(report: StoredWorkReport, prompt: string, title: string, cacheable: boolean, save: () => Promise<void>) {
+    const tokens = countTokens(prompt);
+    if (tokens > MAX_REPORT_INPUT_TOKENS)
+      throw new Error(`${title}的输入约 ${tokens} token，超过单次报告输入预算 ${MAX_REPORT_INPUT_TOKENS}；未截断或拆分提交`);
+    return this.call(report, prompt, title, cacheable, save);
   }
 
   private async fold(report: StoredWorkReport, text: string, save: () => Promise<void>): Promise<string | undefined> {
@@ -318,7 +415,7 @@ export class ReportService {
       if (level >= 8) throw new Error('报告摘要规模过大，未截断业务材料');
       const results: string[] = [];
       for (const chunk of reportChunks(current)) {
-        const result = await this.call(report, `${reportRules}\n\n将下列业务进展摘要归并为不超过 1200 个汉字的中间摘要。`
+        const result = await this.call(report, `${this.rules(report)}\n\n将下列业务进展摘要归并为不超过 1200 个汉字的中间摘要。`
           + `保留业务事项、进展、状态变化、验证边界和来源。报告期间：${periodDescription(report)}。\n\n${chunk}`,
         '业务进展归并', true, save);
         if (result === undefined) return;
@@ -330,7 +427,7 @@ export class ReportService {
   }
 
   private async call(report: StoredWorkReport, prompt: string, title: string, cacheable: boolean, save: () => Promise<void>) {
-    const key = hash(JSON.stringify([1, report.model, report.settings.modelEntryId, prompt]));
+    const key = hash(JSON.stringify([report.materialVersion ?? 1, report.model, report.settings.modelEntryId, prompt]));
     const cachePath = join(this.deps.directory, 'summaries', `${key}.md`);
     let call = report.calls.find(call => call.key === key);
     if (!call && cacheable) {
@@ -362,14 +459,14 @@ export class ReportService {
   }
 
   private async complete(report: StoredWorkReport, body: string, save: () => Promise<void>) {
-    if (report.asOf) body = `> 本周进展快照，统计截至 ${new Date(report.asOf).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）。本周尚未结束，正式周报另行生成。\n\n${body}`;
+    if (report.asOf) body = `> ${report.kind === 'daily' ? '当日' : '本周'}进展快照，统计截至 ${new Date(report.asOf).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）。${report.kind === 'weekly' ? '本周尚未结束，正式周报另行生成。' : ''}\n\n${body}`;
     await this.write(join(this.directory(report), 'report.md'), body);
     report.status = 'ready'; report.generatedAt = this.now().toISOString(); delete report.error;
     await save();
   }
   private async save(report: StoredWorkReport) {
     report.sourceCount = report.sources.filter(source => source.status === 'included').length;
-    report.missingCount = report.sources.filter(source => source.status === 'failed').length;
+    report.missingCount = report.sources.filter(source => source.status === 'failed' || source.coverageIncomplete).length;
     report.snapshotCount = report.sources.filter(source => source.status === 'included' && source.isSnapshot).length;
     report.sessionIds = [...new Set([...report.sessionIds, ...report.calls.flatMap(call => call.sessionId ? [call.sessionId] : [])])];
     const usage = report.previousUsage ? { ...report.previousUsage } : emptyUsage();
@@ -385,6 +482,7 @@ export class ReportService {
     if (![report.id, report.runId].every(id => /^[a-f\d-]{36}$/i.test(id))) throw new Error('Invalid report metadata');
     return join(this.deps.directory, report.id, report.runId);
   }
+  private rules(report: StoredWorkReport) { return report.materialVersion === 2 ? reportRules : legacyReportRules; }
   private async require(id: string) {
     const report = await this.deps.repository.get(id);
     if (!report) throw new HttpError(404, '工作报告不存在');

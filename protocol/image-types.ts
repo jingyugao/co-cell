@@ -43,7 +43,7 @@ export interface ManagedImage {
   repository?: string;
   buildCommand?: string;
   registryAuthRequired?: boolean;
-  /** Cellbox's current stable revision, used as this template's restore default. */
+  /** Cellbox's current stable revision; CoCell resolves latest for new Boxes by default. */
   defaultVersionId?: string;
   versions: ImageVersion[];
   migrationRequired?: boolean;
@@ -55,7 +55,7 @@ export interface ImageVersionUsage { deletable: boolean; blockers: string[]; man
  * Creation also accepts imageVersionId='latest' to defer version selection.
  * Version fields retain the selection snapshot and are refreshed from the actual Box. */
 export interface ProjectImageSelection {
-  /** Resolve again when creating a Box; existing Boxes keep their concrete revision. */
+  /** Legacy marker; new Boxes resolve latest even when absent. Existing Boxes keep their concrete revision. */
   selectionPolicy?: 'latest';
   imageId: string;
   imageName: string;

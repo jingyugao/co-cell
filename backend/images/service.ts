@@ -252,11 +252,14 @@ export class ImageCatalog {
     return { selection: await this.resolve(imageId, versionId), release: async () => {} };
   }
   /** Resolve latest at use time; the saved default identifies a template, not a version pin. */
-  async acquireLatestSelection(imageId?: string) {
-    const selected = imageId ? undefined : await this.defaultSelection();
-    const templateId = selected?.templateId ?? this.options.defaultTemplateId;
-    const image = (await this.list()).find(value => imageId ? value.id === imageId : value.templateId === templateId);
-    if (!image) throw new HttpError(imageId ? 404 : 503, imageId ? '镜像仓库不存在' : '未配置系统默认 Cellbox template');
+  async acquireLatestSelection(imageId?: string, projectTemplateId?: string) {
+    const requested = Boolean(imageId || projectTemplateId);
+    const selected = requested ? undefined : await this.defaultSelection();
+    const templateId = projectTemplateId ?? selected?.templateId ?? this.options.defaultTemplateId;
+    // A saved project identifies its template even if the catalog's local image ID changes.
+    const image = (await this.list()).find(value => projectTemplateId ? value.templateId === projectTemplateId
+      : imageId ? value.id === imageId : value.templateId === templateId);
+    if (!image) throw new HttpError(requested ? 404 : 503, requested ? '镜像仓库不存在' : '未配置系统默认 Cellbox template');
     const latest = image.versions.filter(version => version.status === 'succeeded' && version.revisionId && version.templateId
       && !version.deprecatedAt && !version.cleanup && !version.migrationRequired && version.projectReady !== false)
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)
@@ -281,16 +284,16 @@ export class ImageCatalog {
   async acquireRestoreSelection(project: Project, versionId?: string) {
     if (!project.imageSelection) {
       if (versionId) throw new HttpError(400, '系统默认镜像项目不能选择其他仓库版本');
-      const selected = await this.acquireDefaultSelection();
-      return selected;
+      return this.acquireLatestSelection();
     }
     if (project.imageSelection.migrationRequired || !project.imageSelection.templateId || !project.imageSelection.revisionId)
       throw new HttpError(409, '项目仍引用旧 importedImage，请先迁移项目镜像后再恢复');
+    if (!versionId || versionId === 'latest')
+      return this.acquireLatestSelection(project.imageSelection.imageId, project.imageSelection.templateId);
     const images = await this.list();
     const image = images.find(value => value.templateId === project.imageSelection!.templateId);
     if (!image) throw new HttpError(409, '项目 Cellbox template 不可用');
-    const selectedId = versionId ?? image.defaultVersionId ?? project.imageSelection.revisionId;
-    const version = image.versions.find(value => value.id === selectedId || value.revisionId === selectedId);
+    const version = image.versions.find(value => value.id === versionId || value.revisionId === versionId);
     if (!version) throw new HttpError(409, '项目选择的 Cellbox revision 不可用');
     return { selection: await this.resolveVersion(image, version), release: async () => {} };
   }

@@ -8,11 +8,9 @@ import { join } from 'node:path';
 import { once } from 'node:events';
 import { Hono } from 'hono';
 import { getRequestListener } from '@hono/node-server';
-import { tsImport } from 'tsx/esm/api';
-
-const { installOperatorAccess } = await tsImport('../../../backend/access/operator.ts', import.meta.url);
-const { serviceHost } = await tsImport('../../../backend/projects/service-host.ts', import.meta.url);
-const { createPreviewProxy } = await tsImport('../../../backend/projects/preview-proxy.ts', import.meta.url);
+import { installOperatorAccess } from '../../../backend/access/operator.ts';
+import { serviceHost } from '../../../backend/projects/service-host.ts';
+import { createPreviewProxy } from '../../../backend/projects/preview-proxy.ts';
 
 const token = 'preview-browser-regression-token-32-bytes';
 const projectId = '11111111-1111-4111-8111-111111111111';

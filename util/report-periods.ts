@@ -45,8 +45,8 @@ function scheduleOn(kind: ReportKind, executionDate: Date, time: string): Report
   // fixed Shanghai offset when constructing the actual instant.
   const scheduled = new Date(Date.UTC(executionDate.getUTCFullYear(), executionDate.getUTCMonth(), executionDate.getUTCDate(), hour, minute)
     - SHANGHAI_OFFSET_MS);
-  const periodEnd = kind === 'daily' ? executionDate : mondayOf(executionDate);
-  const periodStart = kind === 'daily' ? addDays(periodEnd, -1) : addDays(periodEnd, -7);
+  const periodStart = kind === 'daily' ? executionDate : mondayOf(executionDate);
+  const periodEnd = addDays(periodStart, kind === 'daily' ? 1 : 7);
   return { kind, scheduledAt: scheduled.toISOString(), periodStart: dateString(periodStart), periodEnd: dateString(periodEnd) };
 }
 

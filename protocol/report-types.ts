@@ -7,7 +7,7 @@ export interface ReportSettings {
   model: string;
   modelEntryId?: string;
   daily: { enabled: boolean; time: string };
-  /** ISO weekday (Monday=1); the report always covers the preceding complete week. */
+  /** ISO weekday (Monday=1); scheduled reports cover the current week through the scheduled time. */
   weekly: { enabled: boolean; weekday: number; time: string };
   prompts: { daily: string; weekly: string };
 }
@@ -27,7 +27,7 @@ export interface WorkReport {
   /** Local dates, with an exclusive end. */
   periodStart: string;
   periodEnd: string;
-  /** Material cutoff for a same-day daily report or a manual current-week snapshot. */
+  /** Material cutoff for a daily or weekly snapshot, including delayed scheduled runs. */
   asOf?: string;
   status: ReportStatus;
   sourceCount: number;

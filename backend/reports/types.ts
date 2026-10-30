@@ -21,12 +21,14 @@ export interface StoredWorkReport extends WorkReport {
   inputsReady?: boolean;
   /** Absent on legacy runs, whose submitted prompt hashes must remain stable. */
   materialVersion?: 2 | 3;
+  /** A scheduled cutoff waiting for a different same-period snapshot to stop. */
+  scheduledAsOf?: string;
   dailyReportIds?: string[];
   rawSourceIds?: string[];
   previousUsage?: ReportUsage;
 }
 
 export function publicReport(record: StoredWorkReport): WorkReport {
-  const { settings, sources, calls, runId, inputsReady, materialVersion, dailyReportIds, rawSourceIds, previousUsage, ...report } = record;
+  const { settings, sources, calls, runId, inputsReady, materialVersion, scheduledAsOf, dailyReportIds, rawSourceIds, previousUsage, ...report } = record;
   return report;
 }

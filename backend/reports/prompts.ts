@@ -23,10 +23,10 @@ export const projectSummaryPrompt = `将同一项目的对话摘要归并为项�
 
 export const defaultReportSettings: ReportSettings = {
   revision: 0, timezone: 'Asia/Shanghai', model: 'gpt-6-luna',
-  daily: { enabled: false, time: '08:30' },
-  weekly: { enabled: false, weekday: 1, time: '09:00' },
+  daily: { enabled: false, time: '17:45' },
+  weekly: { enabled: false, weekday: 5, time: '15:00' },
   prompts: {
     daily: '生成业务工作日报，按业务事项合并跨会话的重复进展。依次写：当天成果与进展、进行中事项及阻塞、关键决定、已明确的后续安排。每项简洁说明变化和验证边界，附真实来源链接。无证据的栏目可省略。',
-    weekly: '生成业务工作周报，按业务事项归并一周的连续变化，呈现截至周末的最终状态。依次写：本周交付与业务进展、延期或方向变化、未解决问题、已明确的下周安排。合并重复事项，保留关键转折及真实来源链接，不按日期拼接日报。',
+    weekly: '生成业务工作周报，按业务事项归并本周截至统计截止时间的连续变化。依次写：本周交付与业务进展、延期或方向变化、未解决问题、已明确的后续安排。合并重复事项，保留关键转折及真实来源链接，不按日期拼接日报。',
   },
 };

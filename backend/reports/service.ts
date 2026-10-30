@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { ReportDetail, ReportKind, ReportSettings, ReportSource, ReportSourceContent, ReportUsage, ReportsView } from '../../protocol/report-types.js';
+import type { ReportDailyInput, ReportDetail, ReportKind, ReportSettings, ReportSource, ReportSourceContent, ReportUsage, ReportsView } from '../../protocol/report-types.js';
 import { dueReportSchedules, reportPeriod, reportSchedule } from '../../util/report-periods.js';
 import { HttpError, redactCredentials } from '../../util/errors.js';
 import { countTokens } from '../../util/tokenizer.js';
@@ -10,7 +10,7 @@ import type { WebStateStore } from '../infra/storage/web-state.js';
 import type { ConversationMaterialsService } from '../conversation-materials/service.js';
 import type { ConversationMaterialCollector } from '../conversation-materials/collector.js';
 import { readMaterialContent } from '../conversation-materials/content.js';
-import { defaultReportSettings, hierarchicalReportRules, legacyReportRules, projectSummaryPrompt, reportRules, summaryPrompt } from './prompts.js';
+import { defaultReportSettings, hierarchicalReportRules, legacyReportRules, projectSummaryPrompt, reportRules, summaryPrompt, weeklyDailyRules } from './prompts.js';
 import type { ReportRepository } from './repository.js';
 import type { ReportRunner } from './runner.js';
 import { publicReport, type StoredWorkReport } from './types.js';
@@ -97,8 +97,12 @@ export class ReportService {
       || Date.parse(asOf) < instant(period.periodStart).getTime() || Date.parse(asOf) >= instant(period.periodEnd).getTime()))
       throw new HttpError(400, '报告截止时间必须在统计期间内且不晚于现在');
     const settings = await this.settings();
+    const waitingForDaily = kind === 'weekly' && scheduledAt && settings.daily.enabled ? localDate(new Date(scheduledAt)) : undefined;
     return publicReport(await this.deps.repository.insert({ ...period, id: randomUUID(), runId: randomUUID(), kind,
       ...(asOf ? { asOf } : {}),
+      ...(kind === 'weekly' ? { dailyInputs: [] } : {}),
+      ...(waitingForDaily ? { waitingForDaily,
+        weeklyDailyCutoff: new Date(`${waitingForDaily}T${settings.daily.time}:00+08:00`).toISOString() } : {}),
       status: 'queued', model: settings.model, settings, sources: [], calls: [], sourceCount: 0, missingCount: 0,
       sessionIds: [], usage: emptyUsage(), createdAt: now, updatedAt: now }));
   }
@@ -143,6 +147,7 @@ export class ReportService {
       report.calls = []; report.sources = []; report.sessionIds = []; report.sourceCount = 0; report.missingCount = 0;
       delete report.inputsReady; delete report.dailyReportIds; delete report.rawSourceIds; delete report.generatedAt; delete report.error;
       delete report.materialVersion;
+      if (report.kind === 'weekly') report.dailyInputs = [];
       // Repair completed reports against the original cutoff; later work must
       // not silently enter the historical report while missing sources recover.
       if (regenerate && !repairCompleted) {
@@ -186,59 +191,121 @@ export class ReportService {
         for (const due of dueReportSchedules(settings, since, now)) {
           signal.throwIfAborted(); lease.assertHeld();
           const generated = await this.generate(due.kind, due.periodStart, due.scheduledAt);
-          // A manual report must not consume a run with a different cutoff,
-          // including catch-up after a later manual report has already finished.
-          // Queue the scheduled cutoff without interrupting calls in flight.
-          if (generated.asOf !== due.scheduledAt) {
-            const earlier = await this.require(generated.id);
+          const earlier = await this.require(generated.id);
+          const date = localDate(new Date(due.scheduledAt));
+          const dailyCutoff = due.kind === 'weekly' && settings.daily.enabled
+            ? new Date(`${date}T${settings.daily.time}:00+08:00`).toISOString() : undefined;
+          const attachDependency = dailyCutoff && earlier.weeklyDailyCutoff !== dailyCutoff;
+          let changed = false;
+          // Replace a manual snapshot only after its submitted calls have stopped.
+          // Even an identical manual cutoff needs recollection if it bypassed the daily dependency.
+          if (generated.asOf !== due.scheduledAt
+            || attachDependency && (earlier.inputsReady || ['ready', 'failed'].includes(earlier.status))) {
             if (!earlier.scheduledAsOf || Date.parse(earlier.scheduledAsOf) < Date.parse(due.scheduledAt)) {
-              earlier.scheduledAsOf = due.scheduledAt;
-              await this.save(earlier);
+              earlier.scheduledAsOf = due.scheduledAt; changed = true;
+              if (!dailyCutoff) delete earlier.weeklyDailyCutoff;
             }
           }
+          if (attachDependency) {
+            earlier.weeklyDailyCutoff = dailyCutoff; changed = true;
+            if (!earlier.inputsReady && !['ready', 'failed'].includes(earlier.status)) earlier.waitingForDaily = date;
+          }
+          if (changed) await this.save(earlier);
         }
         await this.deps.repository.saveCursor(now.toISOString(), settings.revision);
       });
-      const report = (await this.deps.repository.pending())[0];
-      if (!report) return;
-      const save = async () => { signal.throwIfAborted(); lease.assertHeld(); await this.save(report); };
-      try {
-        if (report.scheduledAsOf && ['ready', 'failed'].includes(report.status)) {
-          await this.deps.runner.assertRetryable(report.calls);
-          await this.write(join(this.directory(report), 'run-record.json'), JSON.stringify(report));
-          report.previousUsage = report.usage;
-          report.runId = randomUUID();
-          report.settings = await this.settings(); report.model = report.settings.model;
-          report.asOf = report.scheduledAsOf;
-          delete report.scheduledAsOf;
-          report.calls = []; report.sources = []; report.sessionIds = [];
-          report.sourceCount = 0; report.missingCount = 0; report.snapshotCount = 0;
-          delete report.inputsReady; delete report.dailyReportIds; delete report.rawSourceIds;
-          delete report.generatedAt; delete report.error; delete report.materialVersion;
-          report.status = 'queued';
+      for (const report of await this.deps.repository.pending()) {
+        const save = async () => { signal.throwIfAborted(); lease.assertHeld(); await this.save(report); };
+        try {
+          if (report.scheduledAsOf && ['ready', 'failed'].includes(report.status)) {
+            await this.deps.runner.assertRetryable(report.calls);
+            await this.write(join(this.directory(report), 'run-record.json'), JSON.stringify(report));
+            report.previousUsage = report.usage;
+            report.runId = randomUUID();
+            report.settings = await this.settings(); report.model = report.settings.model;
+            report.asOf = report.scheduledAsOf;
+            delete report.scheduledAsOf;
+            report.calls = []; report.sources = []; report.sessionIds = [];
+            report.sourceCount = 0; report.missingCount = 0; report.snapshotCount = 0;
+            delete report.inputsReady; delete report.dailyReportIds; delete report.rawSourceIds;
+            delete report.generatedAt; delete report.error; delete report.materialVersion;
+            if (report.kind === 'weekly') {
+              report.dailyInputs = [];
+              if (report.weeklyDailyCutoff) report.waitingForDaily = localDate(new Date(report.weeklyDailyCutoff));
+            }
+            report.status = 'queued';
+            await save();
+          }
+          if (report.waitingForDaily && !report.inputsReady) {
+            const daily = await this.deps.repository.find('daily', report.waitingForDaily);
+            if (daily?.status === 'failed' && !daily.scheduledAsOf)
+              throw new Error(`${report.waitingForDaily} 日报生成失败，请先重试该日报，再重试周报`);
+            // A weekly dependency must not block the worker from advancing daily jobs.
+            if (!daily || daily.status !== 'ready' || daily.scheduledAsOf) continue;
+            const cutoff = daily.asOf ?? new Date(instant(daily.periodEnd).getTime() - 1).toISOString();
+            if (report.weeklyDailyCutoff && Date.parse(cutoff) < Date.parse(report.weeklyDailyCutoff)) continue;
+            if (report.asOf && Date.parse(cutoff) > Date.parse(report.asOf)) report.asOf = cutoff;
+            delete report.waitingForDaily;
+            await save();
+          }
+          if (!report.inputsReady) { await this.collect(report, signal, save); return; }
+          await this.summarize(report, signal, save);
+        } catch (error) {
+          signal.throwIfAborted(); lease.assertHeld();
+          if (error instanceof HttpError && error.status === 409
+            && (await this.deps.repository.get(report.id))?.updatedAt !== report.updatedAt) throw error;
+          report.status = 'failed'; report.error = message(error);
           await save();
         }
-        if (!report.inputsReady) { await this.collect(report, signal, save); return; }
-        await this.summarize(report, signal, save);
-      } catch (error) {
-        signal.throwIfAborted(); lease.assertHeld();
-        if (error instanceof HttpError && error.status === 409
-          && (await this.deps.repository.get(report.id))?.updatedAt !== report.updatedAt) throw error;
-        report.status = 'failed'; report.error = message(error);
-        await save();
+        return;
       }
     } finally { await lease.release(); }
   }
 
+  private async collectDailyReports(report: StoredWorkReport, signal: AbortSignal, save: () => Promise<void>) {
+    report.materialVersion = 4;
+    report.dailyInputs = []; report.dailyReportIds = []; report.rawSourceIds = []; report.sources = [];
+    report.status = 'collecting'; await save();
+    const bodies: string[] = [];
+    const cutoff = Math.min(instant(report.periodEnd).getTime(), report.asOf ? Date.parse(report.asOf) : Infinity);
+    for (let at = instant(report.periodStart).getTime(); at < cutoff; at += DAY) {
+      signal.throwIfAborted();
+      const date = localDate(new Date(at));
+      const daily = await this.deps.repository.find('daily', date);
+      const input: ReportDailyInput = { date, status: 'missing' };
+      if (daily) {
+        input.reportId = daily.id; input.asOf = daily.asOf;
+        input.missingCount = daily.missingCount; input.snapshotCount = daily.snapshotCount;
+        if (daily.status !== 'ready' || daily.scheduledAsOf) {
+          input.status = daily.status === 'failed' && !daily.scheduledAsOf ? 'failed' : 'pending';
+          input.error = input.status === 'failed' ? '日报生成失败' : '日报尚未完成';
+        } else if ((daily.asOf ? Date.parse(daily.asOf) : instant(daily.periodEnd).getTime() - 1) > cutoff) {
+          input.error = '日报统计截止时间晚于本次周报，未纳入';
+        } else {
+          const body = await this.read(join(this.directory(daily), 'report.md'));
+          if (body.trim()) {
+            input.status = 'included'; report.dailyReportIds.push(daily.id);
+            bodies.push(`# ${date} 工作日报${daily.asOf ? `（统计截至 ${daily.asOf}）` : ''}\n`
+              + (daily.missingCount ? `\n该日报有 ${daily.missingCount} 条来源材料缺失，覆盖不完整。\n` : '')
+              + (daily.snapshotCount ? `\n该日报含 ${daily.snapshotCount} 条进行中对话快照。\n` : '') + `\n${body}`);
+          } else input.error = '日报正文缺失';
+        }
+      } else input.error = '尚未生成日报';
+      report.dailyInputs.push(input);
+    }
+    // Freeze only daily bodies and coverage metadata. Never reopen conversation materials.
+    await this.write(join(this.directory(report), 'daily-input.md'), bodies.join('\n\n'));
+    if (!bodies.length) throw new Error('本期没有可用的已完成日报，请先生成日报，再重试周报');
+    report.inputsReady = true; report.status = 'summarizing'; await save();
+  }
+
   private async collect(report: StoredWorkReport, signal: AbortSignal, save: () => Promise<void>) {
+    if (report.kind === 'weekly') return this.collectDailyReports(report, signal, save);
     report.materialVersion = 3;
     report.status = 'collecting'; await save();
     const directory = this.directory(report);
     await rm(join(directory, 'sources'), { recursive: true, force: true });
     await mkdir(join(directory, 'sources'), { recursive: true, mode: 0o700 });
-    const readyDays = new Set<string>();
-    const reused = new Map<string, ReportSource>();
-    const dailyBodies: string[] = [];
     report.dailyReportIds = [];
     report.rawSourceIds = [];
     let previousDaily = '';
@@ -254,33 +321,12 @@ export class ReportService {
     }
     // Freeze the baseline with this run's inputs, so resumed calls use the same prompt.
     await this.write(join(directory, 'previous-daily.md'), previousDaily);
-    if (report.kind === 'weekly') {
-      for (let at = instant(report.periodStart).getTime(); at < instant(report.periodEnd).getTime(); at += DAY) {
-        const date = localDate(new Date(at));
-        const daily = await this.deps.repository.find('daily', date);
-        if (daily?.status !== 'ready' || daily.missingCount || daily.snapshotCount
-          || daily.asOf && Date.parse(daily.asOf) < instant(daily.periodEnd).getTime()
-          || report.asOf && instant(daily.periodEnd).getTime() > Date.parse(report.asOf)) continue;
-        const body = await this.read(join(this.directory(daily), 'report.md'));
-        if (!body) continue;
-        readyDays.add(date); report.dailyReportIds.push(daily.id);
-        dailyBodies.push(`# ${date} 工作日报\n\n${body}`);
-        for (const source of daily.sources) {
-          if (source.status !== 'included') continue;
-          reused.set(source.sessionId, { ...source, summary: undefined });
-          const summary = await this.read(join(this.directory(daily), 'sources', `${source.sessionId}.summary.md`));
-          const existing = await this.read(join(directory, 'sources', `${source.sessionId}.summary.md`));
-          await this.write(join(directory, 'sources', `${source.sessionId}.summary.md`), [existing, `## ${date}\n\n${summary}`].filter(Boolean).join('\n\n'));
-        }
-      }
-    }
-    await this.write(join(directory, 'daily-input.md'), dailyBodies.join('\n\n'));
+    await this.write(join(directory, 'daily-input.md'), '');
     const [projects, sessions] = await Promise.all([this.deps.state.listProjects(), this.deps.state.listSessions()]);
     const byProject = new Map(projects.filter(project => !project.removedAt && project.name.trim().toLowerCase() !== 'system'
       && ['active', 'completed'].includes(project.status ?? 'active')).map(project => [project.id, project]));
-    const needsRaw = report.kind === 'daily' || readyDays.size < 7;
-    const sources = new Map(reused);
-    if (needsRaw) for (const session of sessions) {
+    const sources = new Map<string, ReportSource>();
+    for (const session of sessions) {
       signal.throwIfAborted();
       const project = session.projectId ? byProject.get(session.projectId) : undefined;
       if (!project || !session.threadId || session.settings.executionMode !== 'sandbox'
@@ -318,7 +364,7 @@ export class ReportService {
             [previous ? `# 已有日报中的进展\n\n${previous}` : '', ...parts].filter(Boolean).join('\n\n'));
           // Any earlier daily summary is now background for a new, period-wide summary.
           await this.write(join(directory, 'sources', `${source.sessionId}.summary.md`), '');
-        } else if (reused.has(source.sessionId)) continue;
+        }
       } catch (error) {
         signal.throwIfAborted();
         source.status = 'failed'; source.error = message(error);
@@ -331,6 +377,7 @@ export class ReportService {
   }
 
   private async summarize(report: StoredWorkReport, signal: AbortSignal, save: () => Promise<void>) {
+    if (report.materialVersion === 4) return this.summarizeDailyReports(report, save);
     if (report.materialVersion === 3) return this.summarizeHierarchy(report, signal, save);
     const directory = this.directory(report);
     const previousDaily = await this.read(join(directory, 'previous-daily.md'));
@@ -377,6 +424,24 @@ export class ReportService {
     const body = await this.call(report, prompt, `${report.kind === 'daily' ? '工作日报' : '工作周报'} · ${report.periodStart}`, false, save);
     if (body === undefined) return;
     await this.complete(report, body + (missing.length ? `\n\n> 本报告有 ${missing.length} 条对话的全部或部分材料未能读取，覆盖不完整。` : ''), save);
+  }
+
+  private async summarizeDailyReports(report: StoredWorkReport, save: () => Promise<void>) {
+    const input = await this.read(join(this.directory(report), 'daily-input.md'));
+    if (!input.trim()) throw new Error('周报的日报材料丢失，请重新生成');
+    const gaps = (report.dailyInputs ?? []).filter(day => day.status !== 'included' || day.missingCount || day.snapshotCount);
+    const coverage = gaps.map(day => day.status === 'included'
+      ? `${day.date} 日报：${[day.missingCount ? `${day.missingCount} 条来源材料缺失` : '', day.snapshotCount ? `${day.snapshotCount} 条进行中对话快照` : ''].filter(Boolean).join('，')}`
+      : `${day.date}：${day.error ?? '日报不可用'}`).join('；');
+    report.status = 'generating'; await save();
+    const prompt = `${weeklyDailyRules}\n\n${report.settings.prompts.weekly}\n\n统计期间：${periodDescription(report)}。\n`
+      + `只汇总下列已完成日报，控制在 800—1500 个汉字左右。`
+      + (coverage ? `\n覆盖限制：${coverage}。必须说明这些缺口，不可推断没有进展。` : '')
+      + `\n\n<工作日报>\n${input}\n</工作日报>`;
+    const body = await this.hierarchicalCall(report, prompt, `工作周报 · ${report.periodStart}`, false, save);
+    if (body === undefined) return;
+    await this.complete(report, body + `\n\n> 本周报仅汇总 ${report.dailyReportIds?.length ?? 0} 份已完成日报，覆盖范围以各日报为准。`
+      + (coverage ? `\n> 覆盖不完整：${coverage}。` : ''), save);
   }
 
   private async summarizeHierarchy(report: StoredWorkReport, signal: AbortSignal, save: () => Promise<void>) {
@@ -495,15 +560,21 @@ export class ReportService {
   }
 
   private async complete(report: StoredWorkReport, body: string, save: () => Promise<void>) {
-    if (report.asOf) body = `> ${report.kind === 'daily' ? '当日' : '本周'}进展快照，统计截至 ${new Date(report.asOf).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）。${report.kind === 'weekly' ? '完整自然周报告可在周结束后手动生成。' : ''}\n\n${body}`;
+    if (report.asOf) body = `> ${report.kind === 'daily' ? '当日' : '本周'}进展快照，统计截至 ${new Date(report.asOf).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）。${report.kind === 'weekly' ? report.materialVersion === 4 ? '覆盖范围以各日报为准。' : '完整自然周报告可在周结束后手动生成。' : ''}\n\n${body}`;
     await this.write(join(this.directory(report), 'report.md'), body);
     report.status = 'ready'; report.generatedAt = this.now().toISOString(); delete report.error;
     await save();
   }
   private async save(report: StoredWorkReport) {
-    report.sourceCount = report.sources.filter(source => source.status === 'included').length;
-    report.missingCount = report.sources.filter(source => source.status === 'failed' || source.coverageIncomplete).length;
-    report.snapshotCount = report.sources.filter(source => source.status === 'included' && source.isSnapshot).length;
+    if (report.materialVersion === 4) {
+      report.sourceCount = (report.dailyInputs ?? []).filter(day => day.status === 'included').length;
+      report.missingCount = (report.dailyInputs ?? []).filter(day => day.status !== 'included' || day.missingCount || day.snapshotCount).length;
+      report.snapshotCount = (report.dailyInputs ?? []).filter(day => day.status === 'included' && (day.asOf || day.snapshotCount)).length;
+    } else {
+      report.sourceCount = report.sources.filter(source => source.status === 'included').length;
+      report.missingCount = report.sources.filter(source => source.status === 'failed' || source.coverageIncomplete).length;
+      report.snapshotCount = report.sources.filter(source => source.status === 'included' && source.isSnapshot).length;
+    }
     report.sessionIds = [...new Set([...report.sessionIds, ...report.calls.flatMap(call => call.sessionId ? [call.sessionId] : [])])];
     const usage = report.previousUsage ? { ...report.previousUsage } : emptyUsage();
     for (const call of report.calls) if (call.usage) {

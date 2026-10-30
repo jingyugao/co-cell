@@ -3,6 +3,7 @@ import { join, posix } from 'node:path';
 import type { CellboxClient } from '../../packages/sandbox/src/providers/cellbox/client.js';
 import type { ConversationMaterials } from '../../protocol/conversation-materials-types.js';
 import type { Project, Session } from '../../protocol/types.js';
+import type { CellboxVolumeBackupRef } from '../../protocol/remote-archive-types.js';
 import { HttpError, redactCredentials } from '../../util/errors.js';
 import { sandboxMounts } from '../../util/sandbox-mounts.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
@@ -14,7 +15,8 @@ const HOME = '/home/agent/workspace/.cocell/codex';
 const MAX_ARCHIVE_BYTES = 18 * 1024 ** 3;
 const EXPORT_DEADLINE_MS = 10 * 60_000;
 const EXPORT_POLL_MS = 1_000;
-type Client = Pick<CellboxClient, 'getBox' | 'createVolumeExport' | 'getOperation' | 'getVolumeExport' | 'downloadVolumeExport' | 'deleteVolumeExport'>;
+type Client = Pick<CellboxClient, 'getBox' | 'createVolumeExport' | 'getOperation' | 'getVolumeExport'
+  | 'downloadVolumeExport' | 'downloadVolumeBackupExport' | 'deleteVolumeExport'>;
 
 export interface ConversationMaterialCollectorOptions {
   state: Pick<WebStateStore, 'getProject' | 'getSession'>;
@@ -44,8 +46,43 @@ export class ConversationMaterialCollector {
   async collect(session: Session, signal?: AbortSignal): Promise<ConversationMaterials> {
     if (!session.projectId || !session.threadId) throw unavailable('对话缺少项目或原生线程');
     const initial = await this.source(session);
+    if (initial.archivedBackup) {
+      if (initial.session.status === 'running') throw unavailable('项目对话仍在运行，不能使用旧归档生成材料');
+      const backup = initial.archivedBackup;
+      const archiveIdentity = { id: backup.id, volumeId: backup.volumeId,
+        snapshotId: backup.snapshotId, createdAt: backup.createdAt };
+      const source: MaterialSource = { sessionId: session.id, threadId: session.threadId,
+        sourceUpdatedAt: session.updatedAt, archive: archiveIdentity };
+      const cached = await this.options.materials.cachedArchived({ ...source, archive: archiveIdentity });
+      if (cached) {
+        await this.source(session, undefined, backup);
+        return cached;
+      }
+      const mount = backup.mounts.filter(value => posix.isAbsolute(value.mountPath)
+        && !value.mountPath.split('/').some(segment => segment === '..')
+        && (HOME === value.mountPath || HOME.startsWith(value.mountPath.replace(/\/$/, '') + '/')))
+        .sort((left, right) => right.mountPath.length - left.mountPath.length)[0];
+      if (!mount || mount.volumeId !== backup.volumeId) throw unavailable('归档中的对话目录未挂载于备份磁盘');
+      const relativePath = posix.relative(mount.mountPath, HOME) || '.';
+      if (relativePath === '..' || relativePath.startsWith('../') || posix.isAbsolute(relativePath))
+        throw unavailable('归档对话目录映射无效');
+      signal?.throwIfAborted();
+      await mkdir(this.options.directory, { recursive: true, mode: 0o700 });
+      const workDirectory = await mkdtemp(join(this.options.directory, '.collect-'));
+      try {
+        const archive = join(workDirectory, 'snapshot-export.tar.gz');
+        await this.options.client.downloadVolumeBackupExport(backup.volumeId, backup.snapshotId, relativePath, archive, signal);
+        signal?.throwIfAborted();
+        await this.source(session, undefined, backup);
+        return await this.options.materials.archive(source, archive, signal,
+          async () => { await this.source(session, undefined, backup); });
+      } finally {
+        try { await rm(workDirectory, { recursive: true, force: true }); }
+        catch (error) { this.log('conversation_material.local_cleanup_failed', error, session.id); }
+      }
+    }
     const source: MaterialSource = { sessionId: session.id, threadId: session.threadId,
-      sourceUpdatedAt: session.updatedAt, boxId: initial.project.sandbox!.id };
+      sourceUpdatedAt: session.updatedAt, boxId: initial.boxId! };
 
     if (session.status !== 'running') {
       const cached = await this.options.materials.cached(source);
@@ -53,7 +90,7 @@ export class ConversationMaterialCollector {
     }
 
     signal?.throwIfAborted();
-    const box = await this.options.client.getBox(source.boxId, signal);
+    const box = await this.options.client.getBox(source.boxId!, signal);
     if (box.id !== source.boxId) throw unavailable('Sandbox 与项目记录不匹配');
     if (box.phase === 'running') {
       const current = await this.source(session, source);
@@ -122,19 +159,44 @@ export class ConversationMaterialCollector {
     }
   }
 
-  private async source(session: Session, expected?: MaterialSource): Promise<{ session: Session; project: Project }> {
+  private async source(session: Session, expected?: MaterialSource, expectedBackup?: CellboxVolumeBackupRef): Promise<{
+    session: Session; project: Project; boxId?: string; archivedBackup?: CellboxVolumeBackupRef;
+  }> {
     const [currentSession, project] = await Promise.all([
       this.options.state.getSession(session.id), this.options.state.getProject(session.projectId!),
     ]);
+    const sessionAt = Date.parse(session.updatedAt);
+    const archivedBackups = !project?.sandbox?.id && project?.status === 'completed'
+      ? (project.remoteArchives ?? []).filter((archive): archive is CellboxVolumeBackupRef =>
+        archive.storageType === 'cellbox-volume' && !!archive.id && !!archive.volumeId && !!archive.snapshotId
+        && archive.threadIds.includes(session.threadId!) && Number.isFinite(sessionAt)
+        && Number.isFinite(Date.parse(archive.createdAt)) && Date.parse(archive.createdAt) >= sessionAt)
+      : [];
+    const archivedBackup = expectedBackup
+      ? archivedBackups.find(archive => this.sameBackup(archive, expectedBackup))
+      : archivedBackups.sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+    const boxId = project?.sandbox?.id ?? archivedBackup?.sourceSandboxId;
     if (!currentSession || !project || project.removedAt || project.name.trim().toLowerCase() === 'system'
-      || !['active', 'completed'].includes(project.status ?? 'active') || !project.sandbox?.id
+      || !['active', 'completed'].includes(project.status ?? 'active') || !boxId
+      && !archivedBackup
       || currentSession.projectId !== project.id || currentSession.threadId !== session.threadId
       || currentSession.updatedAt !== session.updatedAt
-      || currentSession.sandbox?.id && currentSession.sandbox.id !== project.sandbox.id
+      || currentSession.sandbox?.id && boxId && currentSession.sandbox.id !== boxId
       || expected && (expected.threadId !== currentSession.threadId || expected.sourceUpdatedAt !== currentSession.updatedAt
-        || expected.boxId !== project.sandbox.id))
+        || expected.boxId !== boxId))
       throw unavailable('项目或对话已变化，不能使用旧版本生成材料');
-    return { session: currentSession, project };
+    if (expectedBackup && !archivedBackup)
+      throw unavailable('项目归档版本已变化，不能使用旧版本生成材料');
+    if (expectedBackup && currentSession.status === 'running')
+      throw unavailable('项目对话已开始运行，不能使用旧归档生成材料');
+    return { session: currentSession, project, boxId, archivedBackup };
+  }
+
+  private sameBackup(left: CellboxVolumeBackupRef, right: CellboxVolumeBackupRef) {
+    return left.id === right.id && left.volumeId === right.volumeId && left.snapshotId === right.snapshotId
+      && left.createdAt === right.createdAt && left.ownerKey === right.ownerKey && left.profileId === right.profileId
+      && JSON.stringify(left.mounts) === JSON.stringify(right.mounts)
+      && JSON.stringify(left.threadIds) === JSON.stringify(right.threadIds);
   }
 
   private log(event: string, error: unknown, sessionId: string) {

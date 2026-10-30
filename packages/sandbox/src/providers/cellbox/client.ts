@@ -10,6 +10,7 @@ import { pipeline } from 'node:stream/promises';
 const cellboxVolumeIdPattern = /^[a-z0-9]([-a-z0-9]{0,53}[a-z0-9])?$/;
 const cellboxBackupIdPattern = /^[0-9a-f]{64}$/;
 const cellboxExportIdPattern = /^exp-[0-9a-f]{32}$/;
+const MAX_VOLUME_ARCHIVE_BYTES = 18 * 1024 ** 3;
 /** The internal Cellbox REST contract. Calls require no Cellbox credential. */
 export interface CellboxCapabilities {
   exec: boolean; files: boolean; http: boolean; websocket: boolean;
@@ -349,6 +350,67 @@ export class CellboxClient {
       await rm(partPath, { force: true }).catch(() => undefined);
       if (cause instanceof CellboxError) throw cause;
       throw new CellboxError('TRANSPORT', 'Cellbox export could not be downloaded and verified', undefined, { cause });
+    }
+  }
+  /** Streams a retained snapshot directory export without restoring its volume. */
+  async downloadVolumeBackupExport(volumeId: string, backupId: string, path: string, destination: string,
+    signal?: AbortSignal): Promise<void> {
+    const segments = typeof path === 'string' ? path.split('/') : [];
+    if (!cellboxVolumeIdPattern.test(volumeId) || !cellboxBackupIdPattern.test(backupId)
+      || typeof path !== 'string' || Buffer.byteLength(path, 'utf8') > 4096 || path.startsWith('/') || path.includes('\\')
+      || (path !== '.' && path !== '' && segments.some(segment => !segment || segment === '.' || segment === '..'))
+      || segments.length > 64 || /[\u0000-\u001f\u007f]/.test(path))
+      throw new CellboxError('INVALID_REQUEST', 'Valid Cellbox volume and snapshot IDs and a clean relative export path are required');
+    if (signal?.aborted) throw new CellboxError('TRANSPORT', 'Cellbox snapshot export was cancelled before download');
+    const outgoing = this.clientHeaders();
+    injectTraceHeaders(outgoing);
+    const headers = new Headers({ ...outgoing, 'Accept-Encoding': 'identity' });
+    const requestTimeout = AbortSignal.timeout(15 * 60_000);
+    const requestSignal = signal ? AbortSignal.any([signal, requestTimeout]) : requestTimeout;
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}/v1/volumes/${this.id(volumeId)}/backups/${this.id(backupId)}/export?path=${encodeURIComponent(path || '.')}`,
+        { method: 'GET', headers, signal: requestSignal, redirect: 'error' });
+    } catch (cause) { throw new CellboxError('TRANSPORT', 'Cellbox snapshot export download failed', undefined, { cause }); }
+    if (!response.ok) {
+      let error: { code?: string; message?: string } | undefined;
+      try { error = (JSON.parse(Buffer.from(await this.readBounded(response, 1024 * 1024)).toString()) as { error?: { code?: string; message?: string } }).error; }
+      catch { /* Preserve the HTTP status. */ }
+      throw new CellboxError(error?.code ?? statusCode(response.status), error?.message ?? `Cellbox HTTP ${response.status}`, response.status);
+    }
+    if (!response.body) throw new CellboxError('PROTOCOL', 'Cellbox returned an empty snapshot export body');
+    const expectedSha256 = response.headers.get('x-cellbox-export-sha256');
+    if (!expectedSha256 || !/^[0-9a-f]{64}$/.test(expectedSha256)) {
+      await response.body.cancel().catch(() => undefined);
+      throw new CellboxError('PROTOCOL', 'Cellbox snapshot export is missing a valid SHA-256');
+    }
+    const declaredLength = response.headers.get('content-length');
+    if (declaredLength !== null && (!/^\d+$/.test(declaredLength) || Number(declaredLength) > MAX_VOLUME_ARCHIVE_BYTES)) {
+      await response.body.cancel().catch(() => undefined);
+      throw new CellboxError('PROTOCOL', 'Cellbox snapshot export exceeds the 18 GiB limit');
+    }
+    const partPath = `${destination}.part-${randomUUID()}`;
+    let size = 0;
+    const hash = createHash('sha256');
+    const bound = new Transform({ transform(chunk: Buffer, _encoding, callback) {
+      size += chunk.length;
+      if (size > MAX_VOLUME_ARCHIVE_BYTES) return callback(new CellboxError('PROTOCOL', 'Cellbox snapshot export exceeds the 18 GiB limit'));
+      hash.update(chunk);
+      callback(null, chunk);
+    } });
+    try {
+      await mkdir(dirname(destination), { recursive: true });
+      await pipeline(Readable.fromWeb(response.body as unknown as import('node:stream/web').ReadableStream<Uint8Array>),
+        bound, createWriteStream(partPath, { flags: 'wx', mode: 0o600 }), { signal: requestSignal });
+      if (declaredLength !== null && size !== Number(declaredLength))
+        throw new CellboxError('PROTOCOL', 'Cellbox snapshot export size does not match Content-Length');
+      if (hash.digest('hex') !== expectedSha256)
+        throw new CellboxError('PROTOCOL', 'Cellbox snapshot export SHA-256 does not match its metadata');
+      await rename(partPath, destination);
+    } catch (cause) {
+      await rm(partPath, { force: true }).catch(() => undefined);
+      if (cause instanceof CellboxError) throw cause;
+      throw new CellboxError('TRANSPORT', 'Cellbox snapshot export could not be downloaded', undefined, { cause });
     }
   }
   async deleteVolumeExport(volumeId: string, exportId: string, signal?: AbortSignal) {

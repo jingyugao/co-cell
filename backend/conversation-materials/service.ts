@@ -12,7 +12,12 @@ import type { MaterialsRepository } from './repository.js';
 import { readMaterialContent } from './content.js';
 
 const VERSION = 2;
-export interface MaterialSource { sessionId: string; threadId: string; sourceUpdatedAt: string; boxId: string }
+export interface ArchiveMaterialIdentity { id: string; volumeId: string; snapshotId: string; createdAt: string }
+interface MaterialSourceBase { sessionId: string; threadId: string; sourceUpdatedAt: string }
+export type MaterialSource = MaterialSourceBase & (
+  | { boxId: string; archive?: never }
+  | { boxId?: never; archive: ArchiveMaterialIdentity }
+);
 export interface PeriodMaterial { path: string; content: string; coverageIncomplete?: boolean }
 
 async function fileHash(path: string) {
@@ -29,7 +34,11 @@ export class ConversationMaterialsService {
   }
 
   private key(source: MaterialSource) {
-    return createHash('sha256').update(JSON.stringify([VERSION, source.sessionId, source.threadId, source.sourceUpdatedAt, source.boxId])).digest('hex');
+    const identity = source.archive
+      ? [VERSION, source.sessionId, source.threadId, source.sourceUpdatedAt, 'archive', source.archive.id,
+        source.archive.volumeId, source.archive.snapshotId, source.archive.createdAt]
+      : [VERSION, source.sessionId, source.threadId, source.sourceUpdatedAt, source.boxId];
+    return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
   }
   private directory(id: string) {
     if (!/^[a-f\d-]{36}$/i.test(id)) throw new Error('Invalid conversation material ID');
@@ -37,7 +46,32 @@ export class ConversationMaterialsService {
   }
   async cached(source: MaterialSource) {
     const material = await this.deps.repository.find(this.key(source));
-    if (!material?.complete || material.version !== VERSION) return undefined;
+    return material && await this.validCached(material, source, this.key(source));
+  }
+
+  /** Reuse a complete cache for a retained snapshot when its original Box ID
+   * was not persisted, while still matching the immutable conversation version. */
+  async cachedArchived(source: Extract<MaterialSource, { archive: ArchiveMaterialIdentity }>) {
+    const sessionAt = Date.parse(source.sourceUpdatedAt);
+    const backupAt = Date.parse(source.archive.createdAt);
+    if (!Number.isFinite(sessionAt) || !Number.isFinite(backupAt) || backupAt < sessionAt) return undefined;
+    const exact = await this.deps.repository.find(this.key(source));
+    if (exact) {
+      const valid = await this.validCached(exact, source, this.key(source));
+      if (valid) return valid;
+    }
+    const candidates = await this.deps.repository.findForSession(source.sessionId);
+    for (const material of candidates) {
+      if (await this.validCached(material, source)) return material;
+    }
+    return undefined;
+  }
+
+  private async validCached(material: ConversationMaterials, source: Pick<MaterialSource, 'sessionId' | 'threadId' | 'sourceUpdatedAt'>,
+    sourceKey?: string) {
+    if (!material.complete || material.version !== VERSION || material.sessionId !== source.sessionId
+      || material.threadId !== source.threadId || material.sourceUpdatedAt !== source.sourceUpdatedAt
+      || sourceKey && material.sourceKey !== sourceKey) return undefined;
     try {
       const root = this.directory(material.id);
       const index = await lstat(join(root, 'events.jsonl'));

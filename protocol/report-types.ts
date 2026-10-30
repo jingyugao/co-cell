@@ -68,7 +68,7 @@ export interface ReportDetail {
 
 export interface ReportRetryInput {
   updatedAt: string;
-  /** Start a fresh run with current materials/settings after verifying all earlier calls stopped. */
+  /** Start a fresh run after checking earlier calls stopped; also permits repairing ready reports with missing sources, preserving their cutoff. */
   regenerate?: boolean;
 }
 

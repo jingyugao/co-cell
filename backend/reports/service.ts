@@ -117,7 +117,9 @@ export class ReportService {
   async retry(id: string, updatedAt: string, regenerate = false) {
     const result = await this.coordinator.tryRun('reports:worker', async () => {
       const report = await this.require(id);
-      if (report.status !== 'failed' || report.updatedAt !== updatedAt) throw new HttpError(409, '报告状态已变化，请刷新后重试');
+      const repairCompleted = report.status === 'ready' && report.missingCount > 0 && regenerate;
+      if (!(report.status === 'failed' || repairCompleted) || report.updatedAt !== updatedAt)
+        throw new HttpError(409, '仅失败报告或明确重新生成的材料缺失报告可重试，请刷新后重试');
       await this.deps.runner.assertRetryable(report.calls);
       // In-flight calls are resumed by identity, never blindly submitted a second time.
       const unknown = report.calls.find(call => call.status === 'running' || call.status === 'submitting');
@@ -135,7 +137,9 @@ export class ReportService {
       report.calls = []; report.sources = []; report.sessionIds = []; report.sourceCount = 0; report.missingCount = 0;
       delete report.inputsReady; delete report.dailyReportIds; delete report.rawSourceIds; delete report.generatedAt; delete report.error;
       delete report.materialVersion;
-      if (regenerate) {
+      // Repair completed reports against the original cutoff; later work must
+      // not silently enter the historical report while missing sources recover.
+      if (regenerate && !repairCompleted) {
         const now = this.now();
         if (report.periodStart <= localDate(now) && report.periodEnd > localDate(now)) report.asOf = now.toISOString();
         else delete report.asOf;

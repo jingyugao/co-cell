@@ -4,6 +4,7 @@ import type { ConversationMaterials } from '../../protocol/conversation-material
 export interface MaterialsRepository {
   get(id: string): Promise<ConversationMaterials | undefined>;
   find(sourceKey: string): Promise<ConversationMaterials | undefined>;
+  findForSession(sessionId: string): Promise<ConversationMaterials[]>;
   insert(material: ConversationMaterials): Promise<ConversationMaterials>;
 }
 
@@ -23,6 +24,12 @@ export class MySqlMaterialsRepository implements MaterialsRepository {
   }
   get(id: string) { return this.read('id', id); }
   find(key: string) { return this.read('source_key', key); }
+  async findForSession(sessionId: string) {
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      'SELECT document FROM conversation_materials WHERE session_id=? ORDER BY created_at DESC LIMIT 32', [sessionId]);
+    return rows.map(row => typeof row.document === 'string' ? JSON.parse(row.document) : row.document)
+      .filter((value): value is ConversationMaterials => !!value && typeof value === 'object');
+  }
   async insert(material: ConversationMaterials) {
     await this.pool.query(`INSERT INTO conversation_materials(id,source_key,session_id,document,created_at)
       VALUES(?,?,?,CAST(? AS JSON),?) ON DUPLICATE KEY UPDATE id=VALUES(id),document=VALUES(document),created_at=VALUES(created_at)`,

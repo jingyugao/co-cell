@@ -21,7 +21,7 @@ export interface StoredWorkReport extends WorkReport {
   inputsReady?: boolean;
   /** Absent on legacy runs, whose submitted prompt hashes must remain stable. */
   materialVersion?: 2 | 3;
-  /** A scheduled cutoff waiting for an earlier same-period snapshot to stop. */
+  /** A scheduled cutoff waiting for a different same-period snapshot to stop. */
   scheduledAsOf?: string;
   dailyReportIds?: string[];
   rawSourceIds?: string[];

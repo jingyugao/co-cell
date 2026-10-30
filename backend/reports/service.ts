@@ -182,9 +182,10 @@ export class ReportService {
         for (const due of dueReportSchedules(settings, since, now)) {
           signal.throwIfAborted(); lease.assertHeld();
           const generated = await this.generate(due.kind, due.periodStart, due.scheduledAt);
-          // An earlier manual snapshot must not consume the scheduled run.
-          // Queue the later cutoff without interrupting any calls already in flight.
-          if (generated.asOf && Date.parse(generated.asOf) < Date.parse(due.scheduledAt)) {
+          // A manual report must not consume a run with a different cutoff,
+          // including catch-up after a later manual report has already finished.
+          // Queue the scheduled cutoff without interrupting calls in flight.
+          if (generated.asOf !== due.scheduledAt) {
             const earlier = await this.require(generated.id);
             if (!earlier.scheduledAsOf || Date.parse(earlier.scheduledAsOf) < Date.parse(due.scheduledAt)) {
               earlier.scheduledAsOf = due.scheduledAt;

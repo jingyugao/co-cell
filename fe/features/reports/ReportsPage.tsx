@@ -21,6 +21,22 @@ const mondayOf = (date: string) => {
   const weekday = new Date(`${date}T00:00:00Z`).getUTCDay() || 7;
   return addDays(date, 1 - weekday);
 };
+const reportsByWeek = (reports: WorkReport[]) => {
+  const weeks = new Map<string, WorkReport[]>();
+  for (const report of reports) {
+    const start = mondayOf(dateOnly(report.periodStart));
+    const entries = weeks.get(start) ?? [];
+    entries.push(report);
+    weeks.set(start, entries);
+  }
+  return [...weeks].sort(([left], [right]) => right.localeCompare(left)).map(([start, entries]) => ({
+    start,
+    reports: entries.sort((left, right) => Number(right.kind === 'weekly') - Number(left.kind === 'weekly')
+      || right.periodStart.localeCompare(left.periodStart)
+      || (right.generatedAt ?? right.createdAt).localeCompare(left.generatedAt ?? left.createdAt)
+      || left.id.localeCompare(right.id)),
+  }));
+};
 const dateLimit = (_kind: ReportKind, today = beijingToday()) => today;
 const defaultDate = (kind: ReportKind, today = beijingToday()) => kind === 'daily'
   ? today
@@ -73,6 +89,7 @@ export default function ReportsPage({ onMenu, onBack }: { onMenu: () => void; on
   const dirty = Boolean(draft && JSON.stringify(draft) !== baseline);
   const hasActive = Boolean(view?.reports.some(item => active.has(item.status)));
   const generationSessions = detail ? Array.from(new Set(detail.report.sessionIds)) : [];
+  const weeks = reportsByWeek(view?.reports ?? []);
 
   const refresh = useCallback(async (initial = false) => {
     try {
@@ -232,7 +249,7 @@ export default function ReportsPage({ onMenu, onBack }: { onMenu: () => void; on
           </div>
         </section>}
         <section className="reports-manual"><div><h2>手动生成</h2><p>统计范围：{dateRange(selectedKind, selectedDate)}（北京时间）。{selectedKind === 'weekly' ? '周报汇总所选周内已生成的日报；尚无日报的日期会标明缺失。' : '日报总结所选日期截至现在的工作。'}</p></div><select aria-label="报告类型" value={selectedKind} onChange={event => { const kind = event.target.value as ReportKind; setSelectedKind(kind); setSelectedDate(defaultDate(kind)); }}><option value="daily">日报</option><option value="weekly">周报</option></select><input aria-label="报告日期" type="date" value={selectedDate} max={dateLimit(selectedKind)} onChange={event => setSelectedDate(event.target.value)} /><button className="primary-button" disabled={generating || !selectedDate || selectedDate > dateLimit(selectedKind)} onClick={() => void generate()}>{generating ? '提交中…' : '生成报告'}</button></section>
-        <section className="reports-records"><div className="reports-section-title"><div><h2>历史报告</h2><p>周报按覆盖日报天数显示，并按日报覆盖不完整天数标记缺口。</p></div></div>{loading && !view ? <div className="reports-state">正在加载报告…</div> : !view?.reports.length ? <div className="reports-state">暂无报告</div> : <><div className="reports-table-head"><span>类型与日期</span><span>状态</span><span>来源</span><span>费用</span></div>{view.reports.map(report => { const dailyInputs = dailyInputsOf(report); return <button className="reports-row" key={report.id} onClick={() => void loadDetail(report.id)}><span><strong>{kinds[report.kind]} · {reportPeriod(report)}</strong><small>{report.waitingForDaily ? `等待 ${dateOnly(report.waitingForDaily)} 日报 · ` : ''}{reportAsOf(report) ? `${snapshotLabel(report)} · 截至 ${dateLabel(reportAsOf(report))} · ` : ''}生成于 {dateLabel(report.generatedAt || report.createdAt)}</small></span><span className={`report-status report-${report.status}`}>{statusLabels[report.status]}</span><span>{dailyInputs ? `${dailyInputs.filter(item => item.status === 'included').length} 天日报` : `${report.sourceCount} 条来源`}{report.missingCount > 0 && <small className="report-missing"> · {dailyInputs ? '覆盖不完整' : '缺失'} {report.missingCount}{dailyInputs ? ' 天' : ''}</small>}</span><span>{feeLabel(report.usage.estimatedCostUsd, report.usage.unknownCalls)}</span></button>; })}</>}
+        <section className="reports-records"><div className="reports-section-title"><div><h2>历史报告</h2><p>按周一至周日分组，最新一周在前；每周先显示周报，再按日期倒序显示日报。</p></div></div>{loading && !view ? <div className="reports-state">正在加载报告…</div> : !view?.reports.length ? <div className="reports-state">暂无报告</div> : weeks.map(week => <section className="reports-week" key={week.start} aria-labelledby={`report-week-${week.start}`}><div className="reports-week-heading"><h3 id={`report-week-${week.start}`}>{week.start} 至 {addDays(week.start, 6)}</h3><span>{week.reports.filter(report => report.kind === 'weekly').length} 份周报 · {week.reports.filter(report => report.kind === 'daily').length} 份日报</span></div><div className="reports-table-head"><span>类型与日期</span><span>状态</span><span>来源</span><span>费用</span></div>{week.reports.map(report => { const dailyInputs = dailyInputsOf(report); return <button className="reports-row" key={report.id} onClick={() => void loadDetail(report.id)}><span><strong>{kinds[report.kind]} · {reportPeriod(report)}</strong><small>{report.waitingForDaily ? `等待 ${dateOnly(report.waitingForDaily)} 日报 · ` : ''}{reportAsOf(report) ? `${snapshotLabel(report)} · 截至 ${dateLabel(reportAsOf(report))} · ` : ''}生成于 {dateLabel(report.generatedAt || report.createdAt)}</small></span><span className={`report-status report-${report.status}`}>{statusLabels[report.status]}</span><span>{dailyInputs ? `${dailyInputs.filter(item => item.status === 'included').length} 天日报` : `${report.sourceCount} 条来源`}{report.missingCount > 0 && <small className="report-missing"> · {dailyInputs ? '覆盖不完整' : '缺失'} {report.missingCount}{dailyInputs ? ' 天' : ''}</small>}</span><span>{feeLabel(report.usage.estimatedCostUsd, report.usage.unknownCalls)}</span></button>; })}</section>)}
         </section>
       </>}
       {detail && <section className="report-detail"><button className="report-back-inline" onClick={closeDetail}>← 返回报告列表</button><div className="report-detail-heading"><div><span className="reports-eyebrow">{kinds[detail.report.kind]} · {reportPeriod(detail.report)}</span><h1>{statusLabels[detail.report.status]}</h1><p>{reportAsOf(detail.report) ? `${snapshotLabel(detail.report)} · 截至 ${dateLabel(reportAsOf(detail.report))} · ` : ''}模型 {detail.report.model} · 生成于 {dateLabel(detail.report.generatedAt || detail.report.createdAt)}</p></div>{detail.report.status === 'failed' && <button className="primary-button" disabled={retrying} onClick={() => void retry()}>{retrying ? '提交中…' : '重试'}</button>}{detail.report.status === 'ready' && detail.report.missingCount > 0 && <button className="primary-button" disabled={retrying} onClick={() => void retry(true)}>{retrying ? '提交中…' : '重新采集并生成'}</button>}</div>

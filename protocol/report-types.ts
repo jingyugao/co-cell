@@ -7,7 +7,7 @@ export interface ReportSettings {
   model: string;
   modelEntryId?: string;
   daily: { enabled: boolean; time: string };
-  /** ISO weekday (Monday=1); scheduled reports cover the current week through the scheduled time. */
+  /** ISO weekday (Monday=1); earliest weekly run, after that day's scheduled daily report when enabled. */
   weekly: { enabled: boolean; weekday: number; time: string };
   prompts: { daily: string; weekly: string };
 }
@@ -29,6 +29,10 @@ export interface WorkReport {
   periodEnd: string;
   /** Material cutoff for a daily or weekly snapshot, including delayed scheduled runs. */
   asOf?: string;
+  /** Weekly runs freeze completed daily reports as their only inputs. Absent on legacy runs. */
+  dailyInputs?: ReportDailyInput[];
+  /** Scheduled weekly report waiting for this local date's daily report. */
+  waitingForDaily?: string;
   status: ReportStatus;
   sourceCount: number;
   missingCount: number;
@@ -41,6 +45,16 @@ export interface WorkReport {
   /** System-project sessions used to generate summaries and the final report. */
   sessionIds: string[];
   usage: ReportUsage;
+}
+
+export interface ReportDailyInput {
+  date: string;
+  reportId?: string;
+  status: 'included' | 'missing' | 'failed' | 'pending';
+  asOf?: string;
+  missingCount?: number;
+  snapshotCount?: number;
+  error?: string;
 }
 
 export interface ReportSource {

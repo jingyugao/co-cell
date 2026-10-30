@@ -117,7 +117,7 @@ export class MySqlReportRepository implements ReportRepository {
     const [rows] = await this.pool.query<RowDataPacket[]>(`SELECT id,kind,DATE_FORMAT(period_start,'%Y-%m-%d') AS period_start,
       document,status,created_at,updated_at FROM work_reports WHERE status NOT IN ('ready','failed')
       OR JSON_UNQUOTE(JSON_EXTRACT(document,'$.scheduledAsOf')) IS NOT NULL
-      ORDER BY created_at,id LIMIT 10`);
+      ORDER BY CASE WHEN kind='daily' THEN 0 ELSE 1 END,created_at,id LIMIT 10`);
     return rows.map(fromRow);
   }
 

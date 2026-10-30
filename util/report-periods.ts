@@ -39,6 +39,12 @@ function validateSettings(settings: ReportSettings): void {
     throw new Error('周报 weekday 必须为 ISO 星期 1-7');
 }
 
+// A fixed weekly clock cannot race the daily report it summarizes. Completion
+// is checked by the worker; this clock is only the earliest eligible time.
+function weeklyTime(settings: ReportSettings): string {
+  return settings.daily.enabled && settings.daily.time > settings.weekly.time ? settings.daily.time : settings.weekly.time;
+}
+
 function scheduleOn(kind: ReportKind, executionDate: Date, time: string): ReportSchedule {
   const { hour, minute } = validateTime(time);
   // Dates are represented as UTC calendar days; shift the wall clock by the
@@ -75,10 +81,10 @@ export function reportSchedule(settings: ReportSettings, now = new Date()): Repo
     const today = new Date(Date.UTC(localToday.getUTCFullYear(), localToday.getUTCMonth(), localToday.getUTCDate()));
     const currentWeekday = today.getUTCDay() || 7;
     let days = (settings.weekly.weekday - currentWeekday + 7) % 7;
-    let candidate = scheduleOn('weekly', addDays(today, days), settings.weekly.time);
+    let candidate = scheduleOn('weekly', addDays(today, days), weeklyTime(settings));
     if (Date.parse(candidate.scheduledAt) <= now.getTime()) {
       days += 7;
-      candidate = scheduleOn('weekly', addDays(today, days), settings.weekly.time);
+      candidate = scheduleOn('weekly', addDays(today, days), weeklyTime(settings));
     }
     result.push(candidate);
   }
@@ -104,7 +110,7 @@ export function dueReportSchedules(settings: ReportSettings, since: Date, now: D
     const date = new Date(day);
     if (settings.daily.enabled) result.push(scheduleOn('daily', date, settings.daily.time));
     if (settings.weekly.enabled && (date.getUTCDay() || 7) === settings.weekly.weekday)
-      result.push(scheduleOn('weekly', date, settings.weekly.time));
+      result.push(scheduleOn('weekly', date, weeklyTime(settings)));
   }
   return result.filter(item => {
     const at = Date.parse(item.scheduledAt);

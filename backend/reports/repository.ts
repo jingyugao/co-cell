@@ -116,6 +116,7 @@ export class MySqlReportRepository implements ReportRepository {
   async pending() {
     const [rows] = await this.pool.query<RowDataPacket[]>(`SELECT id,kind,DATE_FORMAT(period_start,'%Y-%m-%d') AS period_start,
       document,status,created_at,updated_at FROM work_reports WHERE status NOT IN ('ready','failed')
+      OR JSON_UNQUOTE(JSON_EXTRACT(document,'$.scheduledAsOf')) IS NOT NULL
       ORDER BY created_at,id LIMIT 10`);
     return rows.map(fromRow);
   }
@@ -123,7 +124,7 @@ export class MySqlReportRepository implements ReportRepository {
   async insert(record: StoredWorkReport) {
     const safe = withoutSourceSummaries(record);
     // A current-week snapshot must never occupy the complete weekly report's deduplication key.
-    const kind = safe.asOf ? 'weekly-preview' : safe.kind;
+    const kind = safe.kind === 'weekly' && safe.asOf ? 'weekly-preview' : safe.kind;
     await this.pool.query(`INSERT IGNORE INTO work_reports(id,kind,period_start,document,status,created_at,updated_at)
       VALUES(?,?,?,CAST(? AS JSON),?,?,?)`, [safe.id, kind, safe.periodStart, document(safe), safe.status,
       new Date(safe.createdAt), new Date(safe.updatedAt)]);

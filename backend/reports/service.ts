@@ -27,7 +27,7 @@ const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 const periodDescription = (report: StoredWorkReport) => `${report.periodStart} 至 ${report.periodEnd}（不含结束日，北京时间）`
   + (report.asOf ? report.kind === 'daily'
     ? `；这是当日进展快照，只统计截至 ${report.asOf} 的内容`
-    : `；这是本周进展快照，只统计截至 ${report.asOf} 的内容，本周尚未结束` : '');
+    : `；这是周进展快照，只统计截至 ${report.asOf} 的内容，不代表完整自然周` : '');
 
 /** Split only when necessary, prefer whole Markdown messages, and never drop an oversized message. */
 export function reportChunks(text: string): string[] {
@@ -84,15 +84,21 @@ export class ReportService {
     if (!result) throw new HttpError(409, '报告计划正在更新，请稍后重试');
     return result.value;
   }
-  async generate(kind: ReportKind, date: string) {
+  async generate(kind: ReportKind, date: string, scheduledAt?: string) {
     const period = reportPeriod(kind, date);
     const now = this.now().toISOString();
     const today = localDate(new Date(now));
+    const currentDay = kind === 'daily' && period.periodStart === today;
     const preview = kind === 'weekly' && period.periodStart <= today && period.periodEnd > today;
-    if (period.periodEnd > today && !preview) throw new HttpError(400, '请选择已结束的自然日、本周或已经结束的自然周');
+    if (period.periodEnd > today && !preview && !currentDay) throw new HttpError(400, '请选择今天或已结束的自然日、本周或已经结束的自然周');
+    // Catch-up runs retain the scheduled cutoff even after that day/week ends.
+    const asOf = scheduledAt ?? (currentDay || preview ? now : undefined);
+    if (asOf && (!Number.isFinite(Date.parse(asOf)) || Date.parse(asOf) > Date.parse(now)
+      || Date.parse(asOf) < instant(period.periodStart).getTime() || Date.parse(asOf) >= instant(period.periodEnd).getTime()))
+      throw new HttpError(400, '报告截止时间必须在统计期间内且不晚于现在');
     const settings = await this.settings();
     return publicReport(await this.deps.repository.insert({ ...period, id: randomUUID(), runId: randomUUID(), kind,
-      ...(preview ? { asOf: now } : {}),
+      ...(asOf ? { asOf } : {}),
       status: 'queued', model: settings.model, settings, sources: [], calls: [], sourceCount: 0, missingCount: 0,
       sessionIds: [], usage: emptyUsage(), createdAt: now, updatedAt: now }));
   }
@@ -175,7 +181,16 @@ export class ReportService {
         const since = new Date(Math.min(now.getTime(), Math.max(Date.parse(cursor), now.getTime() - 30 * DAY)));
         for (const due of dueReportSchedules(settings, since, now)) {
           signal.throwIfAborted(); lease.assertHeld();
-          await this.generate(due.kind, due.periodStart);
+          const generated = await this.generate(due.kind, due.periodStart, due.scheduledAt);
+          // An earlier manual snapshot must not consume the scheduled run.
+          // Queue the later cutoff without interrupting any calls already in flight.
+          if (generated.asOf && Date.parse(generated.asOf) < Date.parse(due.scheduledAt)) {
+            const earlier = await this.require(generated.id);
+            if (!earlier.scheduledAsOf || Date.parse(earlier.scheduledAsOf) < Date.parse(due.scheduledAt)) {
+              earlier.scheduledAsOf = due.scheduledAt;
+              await this.save(earlier);
+            }
+          }
         }
         await this.deps.repository.saveCursor(now.toISOString(), settings.revision);
       });
@@ -183,6 +198,21 @@ export class ReportService {
       if (!report) return;
       const save = async () => { signal.throwIfAborted(); lease.assertHeld(); await this.save(report); };
       try {
+        if (report.scheduledAsOf && ['ready', 'failed'].includes(report.status)) {
+          await this.deps.runner.assertRetryable(report.calls);
+          await this.write(join(this.directory(report), 'run-record.json'), JSON.stringify(report));
+          report.previousUsage = report.usage;
+          report.runId = randomUUID();
+          report.settings = await this.settings(); report.model = report.settings.model;
+          report.asOf = report.scheduledAsOf;
+          delete report.scheduledAsOf;
+          report.calls = []; report.sources = []; report.sessionIds = [];
+          report.sourceCount = 0; report.missingCount = 0; report.snapshotCount = 0;
+          delete report.inputsReady; delete report.dailyReportIds; delete report.rawSourceIds;
+          delete report.generatedAt; delete report.error; delete report.materialVersion;
+          report.status = 'queued';
+          await save();
+        }
         if (!report.inputsReady) { await this.collect(report, signal, save); return; }
         await this.summarize(report, signal, save);
       } catch (error) {
@@ -224,6 +254,7 @@ export class ReportService {
         const date = localDate(new Date(at));
         const daily = await this.deps.repository.find('daily', date);
         if (daily?.status !== 'ready' || daily.missingCount || daily.snapshotCount
+          || daily.asOf && Date.parse(daily.asOf) < instant(daily.periodEnd).getTime()
           || report.asOf && instant(daily.periodEnd).getTime() > Date.parse(report.asOf)) continue;
         const body = await this.read(join(this.directory(daily), 'report.md'));
         if (!body) continue;
@@ -459,7 +490,7 @@ export class ReportService {
   }
 
   private async complete(report: StoredWorkReport, body: string, save: () => Promise<void>) {
-    if (report.asOf) body = `> ${report.kind === 'daily' ? '当日' : '本周'}进展快照，统计截至 ${new Date(report.asOf).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）。${report.kind === 'weekly' ? '本周尚未结束，正式周报另行生成。' : ''}\n\n${body}`;
+    if (report.asOf) body = `> ${report.kind === 'daily' ? '当日' : '本周'}进展快照，统计截至 ${new Date(report.asOf).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）。${report.kind === 'weekly' ? '完整自然周报告可在周结束后手动生成。' : ''}\n\n${body}`;
     await this.write(join(this.directory(report), 'report.md'), body);
     report.status = 'ready'; report.generatedAt = this.now().toISOString(); delete report.error;
     await save();

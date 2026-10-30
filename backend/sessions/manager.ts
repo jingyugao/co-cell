@@ -1241,11 +1241,11 @@ export class SessionManager {
     await this.projects.refreshOne(id);
     const project = await this.liveProject(this.projects.get(id));
     if (project.sandbox?.status === 'paused') throw new HttpError(409, 'Sandbox 已暂停，请恢复运行');
-    if (project.sandbox?.status === 'starting') throw new HttpError(409, 'Sandbox 正在切换状态，请稍后重试');
-    if (project.sandbox?.status === 'ready' && !(project.sandboxOperation?.status === 'failed' && ['create', 'resume', 'rebuild'].includes(project.sandboxOperation.kind))) {
+    if (project.sandbox?.status === 'starting' && !project.sandbox.creation) throw new HttpError(409, 'Sandbox 正在切换状态，请稍后重试');
+    if (project.sandbox?.status === 'ready' && !project.sandbox.creation && !(project.sandboxOperation?.status === 'failed' && ['create', 'resume', 'rebuild'].includes(project.sandboxOperation.kind))) {
       throw new HttpError(409, 'Sandbox 已就绪，无需重建');
     }
-    const kind = project.status === 'archived' ? 'restore' : !project.sandbox ? 'create' : 'rebuild';
+    const kind = project.status === 'archived' ? 'restore' : !project.sandbox || project.sandbox.creation ? 'create' : 'rebuild';
     await this.submitProjectSandboxOperation(id, kind, { imageVersionId });
     return this.readProject(id);
   }
@@ -1253,7 +1253,7 @@ export class SessionManager {
   async createProjectSandbox(id: string): Promise<ProjectSummary> {
     await this.projects.refreshOne(id);
     const project = this.projects.get(id);
-    if (project.sandbox) throw new HttpError(409, '项目已有 Sandbox，请查看当前资源状态。');
+    if (project.sandbox && !project.sandbox.creation) throw new HttpError(409, '项目已有 Sandbox，请查看当前资源状态。');
     await this.submitProjectSandboxOperation(id, 'create');
     return this.readProject(id);
   }
@@ -1502,7 +1502,7 @@ export class SessionManager {
       const freshEnvironment = replacing && project?.sandboxOperation?.kind === 'create'
         && !(project.sandboxMounts ?? sandboxMounts(project.sandbox ?? {}))?.length;
       if (!await this.projects.updateSandbox(projectId, sandbox, restoreProject, restoreImage, expectedSandboxId)) {
-        if (expectedSandboxId !== undefined) throw new HttpError(409, '项目 Sandbox 引用已变化，请检查新旧资源状态。');
+        if (expectedSandboxId !== undefined || sandbox.creation) throw new HttpError(409, '项目 Sandbox 引用已变化，请检查新旧资源状态。');
         return;
       }
       for (const sibling of this.sessions.values()) {
@@ -1523,7 +1523,10 @@ export class SessionManager {
       }
     } else {
       const session = this.sessions.get(sessionId);
-      if (!session || this.deleting.has(sessionId)) return;
+      if (!session || this.deleting.has(sessionId)) {
+        if (sandbox.creation) throw new HttpError(409, '会话已删除，无法保存 Sandbox 创建请求');
+        return;
+      }
       session.sandbox = sandbox;
       await this.save(session);
       this.publish(sessionId, { type: 'state', session: this.get(sessionId) });

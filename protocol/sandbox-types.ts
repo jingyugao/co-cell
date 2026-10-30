@@ -24,6 +24,14 @@ export interface SandboxMount {
 
 /** Sandbox reference and live observation; status is never persisted by CoCell. */
 export interface SandboxState {
+  /** Durable create intent. Keep until the caller-selected ID is observed ready. */
+  creation?: {
+    metadata: Record<string, string>;
+    /** Incremented durably before each POST; rejected means no attempt can still arrive. */
+    attempt?: number;
+    rejected?: boolean;
+    uncertain?: boolean;
+  };
   ownerKey?: string;
   mounts?: SandboxMount[];
   homeVolumeId?: string;

@@ -161,6 +161,8 @@ export class ProjectService {
   async releaseSandbox(id: string, sandbox: SandboxState): Promise<void> {
     await this.mutateSandboxMetadata(id, project => {
       if (project.sandbox?.id !== sandbox.id) throw new HttpError(409, '项目 Sandbox 引用已变化，请检查已释放的实例。');
+      if (!isDeepStrictEqual(project.sandbox.creation, sandbox.creation))
+        throw new HttpError(409, 'Sandbox 创建请求已变化，请重新查询后释放');
       const mounts = sandboxMounts(sandbox) ?? sandboxMounts(project.sandbox);
       if (mounts) project.sandboxMounts = mounts;
       if (sandbox.ownerKey) project.sandboxOwnerKey = sandbox.ownerKey;
@@ -381,6 +383,18 @@ export class ProjectService {
       if (expectedSandboxId === undefined && !next.sandbox && (restoreProject || !next.sandboxReclaimedAt && next.status !== 'archived')) {
         // Initial creation can establish a previously absent binding.
       } else if (expectedSandboxId === undefined && next.sandbox?.id !== sandbox.id) return;
+      // A submitted intent may advance only its existing binding, never revive
+      // a reference that another request has released or replaced.
+      if (sandbox.creation?.attempt && next.sandbox?.id !== sandbox.id) return;
+      if (sandbox.creation && next.sandbox?.id === sandbox.id) {
+        const before = next.sandbox.creation, after = sandbox.creation;
+        if (!before || !isDeepStrictEqual(before.metadata, after.metadata)) return;
+        const submitting = (after.attempt ?? 0) === (before.attempt ?? 0) + 1 && !after.rejected
+          && Boolean(after.uncertain) === Boolean(before.uncertain || before.attempt && !before.rejected);
+        const rejected = after.attempt === before.attempt && after.rejected && !before.rejected
+          && !before.uncertain && !after.uncertain;
+        if (!submitting && !rejected) return;
+      }
       applied = true;
       if (restoreProject) {
         delete next.sandboxMounts;

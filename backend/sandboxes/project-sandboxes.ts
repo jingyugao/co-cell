@@ -1,4 +1,5 @@
 import { SandboxLifecycle, type SandboxHandle, type SandboxInfo, type SandboxLifecycleContext, type SandboxProvider, type SandboxRecord } from '@co-cell/sandbox';
+import { randomUUID } from 'node:crypto';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import type { ProjectImageSelection } from '../../protocol/image-types.js';
 import type { WorkspaceTarget } from './types.js';
@@ -33,7 +34,7 @@ export class ProjectSandboxes {
     const phase = info.metadata?.phase;
     return {
       id: info.sandboxId, template: target.sandbox?.template ?? this.template,
-      workingDirectory: target.settings.workingDirectory,
+      workingDirectory: target.sandbox?.workingDirectory ?? target.settings.workingDirectory,
       status: info.state === 'running' ? 'ready' : info.state === 'paused' ? 'paused' : 'unavailable',
       ...(info.metadata?.ownerKey ? { ownerKey: info.metadata.ownerKey } : {}),
       ...(info.mounts ? { mounts: structuredClone(info.mounts) } : {}),
@@ -53,7 +54,7 @@ export class ProjectSandboxes {
     options.signal?.throwIfAborted();
     await this.refresh(target);
     options.signal?.throwIfAborted();
-    if (options.create && options.replaceMissing && target.sandbox) {
+    if (options.create && options.replaceMissing && target.sandbox && !target.sandbox.creation) {
       try {
         if ((await this.provider.getInfo(target.sandbox.id)).metadata?.phase === 'deleted') target.sandbox = undefined;
       } catch (error) {
@@ -62,40 +63,75 @@ export class ProjectSandboxes {
       }
     }
     if (!target.sandbox && !options.create) throw new HttpError(409, '项目没有 Sandbox，请先创建');
-    if (!target.sandbox && !options.save) throw new Error('项目沙箱的持久化入口尚未配置');
+    if ((!target.sandbox || options.create && target.sandbox.creation) && !options.save) throw new Error('项目沙箱的持久化入口尚未配置');
     if (!target.sandbox && target.imageSelection && !target.imageSelection.templateId)
       throw new Error('项目仍引用旧导入镜像，请先迁移为 Cellbox template。');
-    const creating = !target.sandbox;
+    const creating = !target.sandbox || Boolean(options.create && target.sandbox.creation);
     const context: SandboxLifecycleContext = { action: creating ? 'create' : 'connect', resourceKey: resourceKey(target),
       sandboxId: target.sandbox?.id, signal: options.signal,
       metadata: { ...(target.projectId ? { projectId: target.projectId } : {}), sessionId: target.id } };
     return this.lifecycle.run(context, async () => {
       let sandbox: SandboxHandle;
       if (creating) {
-        // Resolve at Box creation time; a saved revision is only a fallback for adapters without a catalog.
-        const selection = await this.latestImage?.(target)
-          ?? (target.imageSelection?.revisionId ? target.imageSelection : undefined);
-        if (selection && (!selection.templateId || !selection.revisionId)) throw new Error('最新镜像缺少 Cellbox revision');
-        const templateId = target.imageSelection?.templateId ?? this.defaultTemplateId;
-        sandbox = await this.provider.create(this.template, {
-          timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false },
-          metadata: { ...context.metadata, app: 'codex-web', workingDirectory: target.settings.workingDirectory,
+        let metadata = target.sandbox?.creation?.metadata;
+        if (!metadata) {
+          // Resolve once per creation attempt, before persisting its immutable parameters.
+          const selection = await this.latestImage?.(target)
+            ?? (target.imageSelection?.revisionId ? target.imageSelection : undefined);
+          if (selection && (!selection.templateId || !selection.revisionId)) throw new Error('最新镜像缺少 Cellbox revision');
+          const templateId = target.imageSelection?.templateId ?? this.defaultTemplateId;
+          metadata = { ...context.metadata, app: 'codex-web', workingDirectory: target.settings.workingDirectory,
             ...(target.sandboxOwnerKey ? { cellboxOwnerKey: target.sandboxOwnerKey } : {}),
             ...(target.sandboxMounts?.length ? { cellboxMounts: JSON.stringify(target.sandboxMounts) } : {}),
             ...(selection ? { cellboxRevisionId: selection.revisionId! }
-              : templateId ? { cellboxTemplateId: templateId } : {}) },
-        });
-        context.sandboxId = sandbox.sandboxId;
-        // Record the returned identity before any further remote calls. Failures
-        // remain visible on the project and never cause a second create request.
-        const initial: SandboxState = { id: sandbox.sandboxId, template: this.template, status: 'starting',
-          workingDirectory: target.settings.workingDirectory };
-        try { await options.save!(initial); }
-        catch (error) {
-          if (error instanceof Error) Object.assign(error, { sandboxId: sandbox.sandboxId });
-          throw error;
+              : templateId ? { cellboxTemplateId: templateId } : {}) };
+          if (this.provider.prepareCreate) {
+            metadata = await this.provider.prepareCreate(this.template, metadata);
+            const initial: SandboxState = { id: `box-${randomUUID()}`, template: this.template, status: 'starting',
+              workingDirectory: target.settings.workingDirectory, ownerKey: metadata.cellboxOwnerKey,
+              ...(target.sandboxMounts?.length ? { mounts: structuredClone(target.sandboxMounts) } : {}),
+              creation: { metadata: structuredClone(metadata) } };
+            // The save callback must reject a lost binding race. No remote resource
+            // is created until the ID and request have committed together.
+            await options.save!(initial);
+            target.sandbox = initial;
+            context.sandboxId = initial.id;
+          }
         }
-        target.sandbox = initial;
+        const pending = target.sandbox;
+        options.signal?.throwIfAborted();
+        sandbox = await this.provider.create(pending?.template ?? this.template, {
+          ...(pending?.creation ? { sandboxId: pending.id,
+            beforeCreate: async () => {
+              const previous = target.sandbox!.creation!;
+              const next: SandboxState = { ...target.sandbox!, creation: { metadata: previous.metadata,
+                attempt: (previous.attempt ?? 0) + 1,
+                uncertain: previous.uncertain || Boolean(previous.attempt && !previous.rejected) } };
+              await options.save!(next);
+              target.sandbox = next;
+            },
+            createRejected: async () => {
+              if (target.sandbox!.creation!.uncertain) return;
+              const next = { ...target.sandbox!, creation: { ...target.sandbox!.creation!, rejected: true } };
+              await options.save!(next);
+              target.sandbox = next;
+            },
+          } : {}),
+          timeoutMs: 120_000, lifecycle: { onTimeout: 'pause', autoResume: false }, metadata,
+        });
+        if (pending?.creation && sandbox.sandboxId !== pending.id) throw new Error('Sandbox 返回的 ID 与已保存的创建请求不一致');
+        context.sandboxId = sandbox.sandboxId;
+        if (!pending?.creation) {
+          // Compatibility for providers without caller-selected resource IDs.
+          const initial: SandboxState = { id: sandbox.sandboxId, template: this.template, status: 'starting',
+            workingDirectory: target.settings.workingDirectory };
+          try { await options.save!(initial); }
+          catch (error) {
+            if (error instanceof Error) Object.assign(error, { sandboxId: sandbox.sandboxId });
+            throw error;
+          }
+          target.sandbox = initial;
+        }
       } else {
         sandbox = await this.provider.connect(target.sandbox!.id, { timeoutMs: 120_000, signal: options.signal });
       }
@@ -128,6 +164,8 @@ export class ProjectSandboxes {
         else await this.provider.kill(sandboxId);
       } catch (error) {
         if (!['NOT_FOUND', 'not_found'].includes((error as { code?: string }).code ?? '')) throw error;
+        if (target.sandbox?.creation?.attempt && !target.sandbox.creation.rejected)
+          throw Object.assign(new HttpError(409, '创建结果尚未确认，请重试创建后再释放此 Sandbox'), { code: 'UNKNOWN_OUTCOME' });
       }
     });
   }

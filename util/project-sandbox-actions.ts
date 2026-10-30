@@ -47,7 +47,9 @@ export function projectSandboxViewState(project: ProjectSummary): ProjectSandbox
 export function projectSandboxActions(project: ProjectSummary) {
   const state = projectSandboxViewState(project);
   const config = projectSandboxActionConfig[state];
-  const actions = config.actions.filter(id => (id !== 'restore' || Boolean(project.latestBackup) && !project.archiveCleanupSourceId)
+  const retryCreate = Boolean(project.sandbox?.creation) && project.sandboxOperation?.status !== 'running';
+  const available: readonly ProjectSandboxAction[] = retryCreate ? ['create', ...config.actions.filter(id => id !== 'create')] : config.actions;
+  const actions = available.filter(id => (id !== 'restore' || Boolean(project.latestBackup) && !project.archiveCleanupSourceId)
       && (id !== 'release' || Boolean(project.sandbox)))
     .map(id => {
       let disabledReason: string | undefined;
@@ -59,7 +61,7 @@ export function projectSandboxActions(project: ProjectSummary) {
           || project.sandboxBackup.volumeId && (project.sandbox?.mounts ?? project.sandboxMounts ?? []).some(mount => mount.volumeId === project.sandboxBackup!.volumeId)
         )) disabledReason = '磁盘备份正在进行中';
       }
-      return { id, label: actionLabels[id], disabledReason };
+      return { id, label: id === 'create' && retryCreate ? '重试创建' : actionLabels[id], disabledReason };
     });
   return { state, label: config.label, actions };
 }

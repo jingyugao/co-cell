@@ -106,7 +106,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       sandbox_last_active_at DATETIME(3) NULL,sandbox_paused_at DATETIME(3) NULL,sandbox_reclaimed_at DATETIME(3) NULL,sandbox_artifacts_cleaned_at DATETIME(3) NULL,
       image_catalog_id VARCHAR(200) NULL,image_name VARCHAR(255) NULL,image_category VARCHAR(255) NULL,image_version_id VARCHAR(200) NULL,
       image_version VARCHAR(255) NULL,template_id VARCHAR(200) NULL,revision_id VARCHAR(200) NULL,image_reference TEXT NULL,image_migration_required BOOLEAN NULL,
-      sandbox_operation_json JSON NULL,sandbox_backup_json JSON NULL,latest_backup_json JSON NULL,
+      sandbox_operation_json JSON NULL,sandbox_backup_json JSON NULL,latest_backup_json JSON NULL,sandbox_create_json JSON NULL,
       remote_archives_json JSON NULL,pending_sandbox_cleanup_json JSON NULL,pending_volume_cleanup_json JSON NULL,
       archive_cleanup_source_id VARCHAR(200) NULL,lifecycle_history_json JSON NULL,removed_at DATETIME(3) NULL,completed_at DATETIME(3) NULL,
       archived_at DATETIME(3) NULL,created_at DATETIME(3) NOT NULL,updated_at DATETIME(3) NOT NULL,
@@ -123,6 +123,14 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       "SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='projects' AND COLUMN_NAME='status'");
     if (projectStatus.length && !projectStatus[0].COLUMN_TYPE.includes("'deleting'"))
       await this.pool.query("ALTER TABLE projects MODIFY COLUMN status ENUM('active','completed','archived','deleting') NOT NULL DEFAULT 'active'");
+    const [createColumns] = await this.pool.query<Array<RowDataPacket & { COLUMN_NAME: string }>>(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='projects' AND COLUMN_NAME='sandbox_create_json'");
+    if (!createColumns.length) {
+      try { await this.pool.query('ALTER TABLE projects ADD COLUMN sandbox_create_json JSON NULL'); }
+      catch (error) {
+        if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ER_DUP_FIELDNAME')) throw error;
+      }
+    }
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sessions (
       id CHAR(36) PRIMARY KEY,project_id CHAR(36) NULL,thread_id VARCHAR(191) NULL,native_history_path TEXT NULL,title VARCHAR(255) NOT NULL,
       execution_mode ENUM('sandbox','local') NOT NULL,working_directory TEXT NOT NULL,model VARCHAR(200) NOT NULL,model_entry_id VARCHAR(200) NULL,

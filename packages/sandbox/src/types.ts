@@ -109,7 +109,15 @@ export interface SandboxCheckpointProvider {
 }
 
 export interface SandboxProvider {
+  /** Resolve immutable create parameters without allocating a resource.
+   * Providers implementing this also honor sandboxId and reconcile repeated creates. */
+  prepareCreate?(template: string, metadata: Record<string, string>): Promise<Record<string, string>>;
   create(template: string, options: {
+    sandboxId?: string;
+    /** Durable submission fence, called only before an actual create POST. */
+    beforeCreate?: () => Promise<void>;
+    /** Called for a definitive rejection of that POST, never for a wait failure. */
+    createRejected?: () => Promise<void>;
     timeoutMs: number;
     lifecycle: { onTimeout: 'pause'; autoResume: false };
     metadata?: Record<string, string>;

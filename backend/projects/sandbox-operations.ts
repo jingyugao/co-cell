@@ -100,6 +100,8 @@ export class ProjectSandboxOperations {
     else if (!(kind === 'restore' && this.deps.projects.get(id).removedAt)) this.deps.projects.assertAvailable(id);
     const project = this.deps.projects.get(id);
     if (project.executionMode !== 'sandbox') throw new HttpError(400, '此项目不使用 Sandbox');
+    if (project.sandbox?.creation && (kind === 'restore' || kind === 'archive'))
+      throw new HttpError(409, 'Sandbox 创建尚未完成，请重试创建或释放运行环境后再操作');
     const selection = kind === 'restore' && this.deps.selectRestoreImage
       ? await this.deps.selectRestoreImage(project, options.imageVersionId) : undefined;
     const previous = kind === 'delete' && project.sandboxOperation?.kind === 'delete' ? project.sandboxOperation : undefined;
@@ -152,7 +154,11 @@ export class ProjectSandboxOperations {
     const project = projects.get(id);
     if (project.status === 'archived') throw new HttpError(409, '已归档项目须从备份恢复');
     await this.phase(id, '创建并准备环境');
-    await runtime.rebuild(target(project), sandbox => this.deps.saveSandbox(id, sandbox, false, undefined, project.sandbox?.id ?? null));
+    let expectedId = project.sandbox?.id ?? null;
+    await runtime.rebuild(target(project), async sandbox => {
+      await this.deps.saveSandbox(id, sandbox, false, undefined, expectedId);
+      expectedId = sandbox.id;
+    });
     const candidate = projects.get(id).sandbox;
     if (!candidate) throw new Error('创建操作没有返回 Sandbox');
     await this.phase(id, '验证环境');

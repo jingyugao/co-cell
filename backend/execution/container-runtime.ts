@@ -881,7 +881,13 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       return traced('sandbox.release', { 'sandbox.id': sandboxId },
         () => provider.ensureDeleted ? provider.ensureDeleted(sandboxId) : provider.release!(sandboxId));
     }).catch(error => {
-      if (['NOT_FOUND', 'not_found'].includes((error as { code?: string }).code ?? '')) return undefined;
+      if (['NOT_FOUND', 'not_found'].includes((error as { code?: string }).code ?? '')) {
+        // A delayed create may still arrive after this lookup. Keep its durable ID
+        // until Cellbox confirms deletion (and reserves the ID against reuse).
+        if (target.sandbox?.creation?.attempt && !target.sandbox.creation.rejected)
+          throw Object.assign(new HttpError(409, '创建结果尚未确认，请重试创建后再释放此 Sandbox'), { code: 'UNKNOWN_OUTCOME' });
+        return undefined;
+      }
       throw error;
     });
     return info ? this.sandboxObservation(target.sandbox, info)

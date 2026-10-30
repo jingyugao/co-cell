@@ -206,27 +206,93 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
       throw new CellboxError('CONFLICT', `Box ${box.id} still has active operation ${current.operationId}`);
     return current;
   }
-  async create(template: string, options: Parameters<SandboxProvider['create']>[1]): Promise<SandboxHandle> {
-    await this.ready();
+  private createRequest(template: string, metadata: Record<string, string> = {}): Omit<Parameters<CellboxClient['createBox']>[0], 'id'> {
     if (template !== this.profileId && template !== this.templateId && template !== this.revisionId)
       throw new CellboxError('INVALID_REQUEST', 'Create selector must match configured profile or Cellbox template/revision');
-    const ownerKey = options.metadata?.cellboxOwnerKey
-      ?? (options.metadata?.projectId ? `project:${options.metadata.projectId}` : undefined)
-      ?? (options.metadata?.sessionId ? `session:${options.metadata.sessionId}` : undefined);
+    const ownerKey = metadata.cellboxOwnerKey
+      ?? (metadata.projectId ? `project:${metadata.projectId}` : undefined)
+      ?? (metadata.sessionId ? `session:${metadata.sessionId}` : undefined);
     if (!ownerKey) throw new CellboxError('INVALID_REQUEST', 'Create requires a project, session, or explicit Cellbox owner key');
-    const metadataRevisionId = options.metadata?.cellboxRevisionId;
-    const metadataTemplateId = options.metadata?.cellboxTemplateId;
+    const metadataRevisionId = metadata.cellboxRevisionId;
+    const metadataTemplateId = metadata.cellboxTemplateId;
     const revisionId = metadataRevisionId ?? (metadataTemplateId ? undefined : (template === this.revisionId ? template : undefined) ?? this.revisionId);
     const templateId = metadataTemplateId ?? (metadataRevisionId ? undefined : (template === this.templateId ? template : undefined) ?? this.templateId);
     if (Boolean(revisionId) === Boolean(templateId)) throw new CellboxError('INVALID_REQUEST', 'Exactly one Cellbox templateId or revisionId must be selected');
-    const staged = options.metadata?.cellboxStaged === 'true';
-    const mounts = options.metadata?.cellboxMounts ? JSON.parse(options.metadata.cellboxMounts) : undefined;
-    const homeVolumeId = options.metadata?.cellboxHomeVolumeId;
-    const op = await this.client.createBox({ ownerKey, ...(revisionId ? { revisionId } : { templateId: templateId! }),
-      ...(mounts ? { mounts } : homeVolumeId ? { homeVolumeId } : {}), ...(staged ? { staged: true } : {}) });
+    const staged = metadata.cellboxStaged === 'true';
+    const mounts: CellboxBox['mounts'] = metadata.cellboxMounts ? JSON.parse(metadata.cellboxMounts) : undefined;
+    const homeVolumeId = metadata.cellboxHomeVolumeId;
+    return { ownerKey, ...(revisionId ? { revisionId } : { templateId: templateId! }),
+      ...(mounts ? { mounts } : homeVolumeId ? { homeVolumeId } : {}), ...(staged ? { staged: true } : {}) };
+  }
+  async prepareCreate(template: string, metadata: Record<string, string>): Promise<Record<string, string>> {
+    await this.ready();
+    const request = this.createRequest(template, metadata);
+    const revisionId = request.revisionId ?? (await this.client.getTemplate(request.templateId!)).stableRevisionId;
+    if (!revisionId) throw new CellboxError('NOT_FOUND', 'The selected template has no stable revision');
+    const prepared = { ...metadata, cellboxOwnerKey: request.ownerKey, cellboxRevisionId: revisionId };
+    delete (prepared as Record<string, string>).cellboxTemplateId;
+    return prepared;
+  }
+  private async recoverCreate(id: string, request: ReturnType<CellboxSandboxProvider['createRequest']>): Promise<SandboxHandle | undefined> {
+    let box: CellboxBox;
+    try { box = await this.box(id); }
+    catch (error) {
+      if (error instanceof CellboxError && error.code === 'NOT_FOUND') return undefined;
+      throw error;
+    }
+    const validate = (box: CellboxBox) => {
+      const mounts = (values: NonNullable<CellboxBox['mounts']>) => JSON.stringify(values.map(mount =>
+        [mount.volumeId, mount.mountPath, Boolean(mount.readOnly)]).sort((a, b) => String(a[1]).localeCompare(String(b[1]))));
+      if (box.id !== id || box.ownerKey !== request.ownerKey || box.revisionId !== request.revisionId
+        || request.mounts && mounts(box.mounts ?? []) !== mounts(request.mounts)
+        || request.homeVolumeId && box.homeVolumeId !== request.homeVolumeId)
+        throw new CellboxError('CONFLICT', `Box ${id} does not match the saved create request`);
+    };
+    validate(box);
+    if (box.operationId) {
+      const operation = await this.client.getOperation(box.operationId);
+      if (operation.id !== box.operationId || operation.kind !== 'create' || operation.targetId !== id)
+        throw new CellboxError('BUSY', `Box ${id} has another lifecycle operation`);
+      await this.wait(operation);
+      box = await this.box(id);
+      validate(box);
+    }
+    if (box.error || box.phase !== 'running' && !(request.staged && box.phase === 'staged'))
+      throw new CellboxError(box.error?.code ?? 'CONFLICT', box.error?.message ?? `Created box ${id} is ${box.phase}`);
+    return this.handle(box);
+  }
+  async create(template: string, options: Parameters<SandboxProvider['create']>[1]): Promise<SandboxHandle> {
+    await this.ready();
+    const request = this.createRequest(template, options.metadata);
+    const id = options.sandboxId;
+    if (id) {
+      if (!request.revisionId) throw new CellboxError('INVALID_REQUEST', 'Caller-selected IDs require a pinned revision');
+      const recovered = await this.recoverCreate(id, request);
+      if (recovered) return recovered;
+    }
+    let op: CellboxOperation;
+    await options.beforeCreate?.();
+    try { op = await this.client.createBox({ ...request, ...(id ? { id } : {}) }); }
+    catch (error) {
+      // Another caller may have submitted this same durable intent after our GET.
+      if (error instanceof CellboxError && error.code === 'CONFLICT' && id) {
+        const recovered = await this.recoverCreate(id, request);
+        if (recovered) return recovered;
+      }
+      if (error instanceof CellboxError && error.status && [400, 401, 403, 404, 409, 422].includes(error.status))
+        await options.createRejected?.();
+      throw error;
+    }
+    if (id && (op.targetId !== id || op.kind !== 'create'))
+      throw new CellboxError('PROTOCOL', 'Cellbox returned an operation for another create request');
     await this.wait(op);
+    if (id) {
+      const recovered = await this.recoverCreate(id, request);
+      if (!recovered) throw new CellboxError('UNKNOWN_OUTCOME', `Created box ${id} is unavailable`);
+      return recovered;
+    }
     const box = await this.box(op.targetId);
-    if (box.phase !== 'running' && !(staged && box.phase === 'staged')) throw new CellboxError('CONFLICT', `Created box ${box.id} is ${box.phase}`);
+    if (box.phase !== 'running' && !(request.staged && box.phase === 'staged')) throw new CellboxError('CONFLICT', `Created box ${box.id} is ${box.phase}`);
     return this.handle(box);
   }
   async connect(id: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<SandboxHandle> {

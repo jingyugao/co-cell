@@ -31,12 +31,12 @@ function sandboxColumns(project: Project) {
     image?.reference ?? null, image?.id ?? null, json(image?.repoDigests), image?.version ?? null,
     image?.templateId ?? null, image?.revisionId ?? null, sandbox?.homeVolumeId ?? null,
     date(sandbox?.lastActiveAt), date(sandbox?.pausedAt), date(project.sandboxReclaimedAt),
-    date(project.sandboxArtifactsCleanedAt)];
+    date(project.sandboxArtifactsCleanedAt), json(sandbox?.creation)];
 }
 export const PROJECT_COLUMNS = `id,name,type,week_of,requirement_url,requirement_status,execution_mode,working_directory,status,
  current_box_id,sandbox_owner_key,sandbox_template,sandbox_working_directory,mounts_json,sandbox_image_reference,sandbox_image_id,
  sandbox_image_repo_digests_json,sandbox_image_version,sandbox_image_template_id,sandbox_image_revision_id,home_volume_id,
- sandbox_last_active_at,sandbox_paused_at,sandbox_reclaimed_at,sandbox_artifacts_cleaned_at,image_catalog_id,image_name,image_category,image_version_id,image_version,
+ sandbox_last_active_at,sandbox_paused_at,sandbox_reclaimed_at,sandbox_artifacts_cleaned_at,sandbox_create_json,image_catalog_id,image_name,image_category,image_version_id,image_version,
  template_id,revision_id,image_reference,image_migration_required,
  sandbox_operation_json,sandbox_backup_json,latest_backup_json,remote_archives_json,pending_sandbox_cleanup_json,
  pending_volume_cleanup_json,archive_cleanup_source_id,lifecycle_history_json,removed_at,completed_at,archived_at,created_at,updated_at`;
@@ -54,7 +54,7 @@ export function projectValues(project: Project): unknown[] {
     json(project.latestBackup), json(project.remoteArchives), json((project.pendingSandboxCleanup ?? []).map(s => ({
       id: s.id, ownerKey: s.ownerKey, mounts: s.mounts, homeVolumeId: s.homeVolumeId, phase: s.phase,
       generation: s.generation, operationId: s.operationId, lastActiveAt: s.lastActiveAt, pausedAt: s.pausedAt,
-      template: s.template, image: s.image, workingDirectory: s.workingDirectory,
+      template: s.template, image: s.image, workingDirectory: s.workingDirectory, creation: s.creation,
     }))), json(project.pendingVolumeCleanup), project.archiveCleanupSourceId ?? null, json(project.lifecycleHistory),
     date(project.removedAt), date(project.completedAt), date(project.archivedAt), date(project.createdAt), date(project.updatedAt)];
 }
@@ -67,6 +67,7 @@ export function projectFromRow(row: Record<string, unknown>): Project {
     mounts, homeVolumeId: row.home_volume_id ? String(row.home_volume_id) : undefined,
     lastActiveAt: iso(row.sandbox_last_active_at) ?? undefined, pausedAt: iso(row.sandbox_paused_at) ?? undefined,
     status: 'unknown',
+    ...(row.sandbox_create_json ? { creation: fromJson<SandboxState['creation']>(row.sandbox_create_json, undefined) } : {}),
     ...(row.sandbox_image_id ? { image: {
       reference: String(row.sandbox_image_reference ?? ''), id: String(row.sandbox_image_id),
       repoDigests: fromJson<string[]>(row.sandbox_image_repo_digests_json, []),

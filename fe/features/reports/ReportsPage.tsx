@@ -204,14 +204,15 @@ export default function ReportsPage({ onMenu, onBack }: { onMenu: () => void; on
     finally { setGenerating(false); }
   }
 
-  async function retry() {
-    if (!detail || retrying || detail.report.status !== 'failed') return;
+  async function retry(regenerate = false) {
+    if (!detail || retrying || !(detail.report.status === 'failed'
+      || regenerate && detail.report.status === 'ready' && detail.report.missingCount > 0)) return;
     setRetrying(true); setError(''); setNotice('');
     try {
-      await api<{ ok: true }>(`/api/reports/${encodeURIComponent(detail.report.id)}/retry`, { method: 'POST', body: JSON.stringify({ updatedAt: detail.report.updatedAt }) });
+      await api<{ ok: true }>(`/api/reports/${encodeURIComponent(detail.report.id)}/retry`, { method: 'POST', body: JSON.stringify({ updatedAt: detail.report.updatedAt, ...(regenerate ? { regenerate: true } : {}) }) });
       sourceGeneration.current++;
       setSourceMaterials(value => resetInterruptedLoads(Object.fromEntries(Object.entries(value).filter(([key]) => !key.startsWith(`${detail.report.id}:`)))));
-      setNotice('已提交重试。'); await Promise.all([refresh(), loadDetail(detail.report.id)]);
+      setNotice(regenerate ? '已提交重新生成，将重新采集材料并保留原统计截止时间。' : '已提交重试。'); await Promise.all([refresh(), loadDetail(detail.report.id)]);
     } catch (cause) { setError(errorMessage(cause)); }
     finally { setRetrying(false); }
   }
@@ -235,7 +236,7 @@ export default function ReportsPage({ onMenu, onBack }: { onMenu: () => void; on
         <section className="reports-records"><div className="reports-section-title"><div><h2>历史报告</h2><p>列表显示已记录的来源数量及生成费用信息。</p></div></div>{loading && !view ? <div className="reports-state">正在加载报告…</div> : !view?.reports.length ? <div className="reports-state">暂无报告</div> : <><div className="reports-table-head"><span>类型与日期</span><span>状态</span><span>来源</span><span>费用</span></div>{view.reports.map(report => <button className="reports-row" key={report.id} onClick={() => void loadDetail(report.id)}><span><strong>{kinds[report.kind]} · {reportPeriod(report)}</strong><small>{reportAsOf(report) ? `${snapshotLabel(report)} · 截至 ${dateLabel(reportAsOf(report))} · ` : ''}生成于 {dateLabel(report.generatedAt || report.createdAt)}</small></span><span className={`report-status report-${report.status}`}>{statusLabels[report.status]}</span><span>{report.sourceCount} 条来源{report.missingCount > 0 && <small className="report-missing"> · 缺失 {report.missingCount}</small>}</span><span>{feeLabel(report.usage.estimatedCostUsd, report.usage.unknownCalls)}</span></button>)}</>}
         </section>
       </>}
-      {detail && <section className="report-detail"><button className="report-back-inline" onClick={closeDetail}>← 返回报告列表</button><div className="report-detail-heading"><div><span className="reports-eyebrow">{kinds[detail.report.kind]} · {reportPeriod(detail.report)}</span><h1>{statusLabels[detail.report.status]}</h1><p>{reportAsOf(detail.report) ? `${snapshotLabel(detail.report)} · 截至 ${dateLabel(reportAsOf(detail.report))} · ` : ''}模型 {detail.report.model} · 生成于 {dateLabel(detail.report.generatedAt || detail.report.createdAt)}</p></div>{detail.report.status === 'failed' && <button className="primary-button" disabled={retrying} onClick={() => void retry()}>{retrying ? '提交中…' : '重试'}</button>}</div>
+      {detail && <section className="report-detail"><button className="report-back-inline" onClick={closeDetail}>← 返回报告列表</button><div className="report-detail-heading"><div><span className="reports-eyebrow">{kinds[detail.report.kind]} · {reportPeriod(detail.report)}</span><h1>{statusLabels[detail.report.status]}</h1><p>{reportAsOf(detail.report) ? `${snapshotLabel(detail.report)} · 截至 ${dateLabel(reportAsOf(detail.report))} · ` : ''}模型 {detail.report.model} · 生成于 {dateLabel(detail.report.generatedAt || detail.report.createdAt)}</p></div>{detail.report.status === 'failed' && <button className="primary-button" disabled={retrying} onClick={() => void retry()}>{retrying ? '提交中…' : '重试'}</button>}{detail.report.status === 'ready' && detail.report.missingCount > 0 && <button className="primary-button" disabled={retrying} onClick={() => void retry(true)}>{retrying ? '提交中…' : '重新采集并生成'}</button>}</div>
         {detail.report.error && <div className="reports-error">{detail.report.error}</div>}
         <div className="report-usage"><span>来源 {detail.report.sourceCount} 条 · 缺失 {detail.report.missingCount} 条{(detail.report.snapshotCount ?? 0) > 0 && ` · ${detail.report.snapshotCount} 条进行中快照`}</span><span>输入 {detail.report.usage.inputTokens.toLocaleString()} tokens · 缓存输入 {detail.report.usage.cachedInputTokens.toLocaleString()} tokens · 输出 {detail.report.usage.outputTokens.toLocaleString()} tokens</span><span>{feeLabel(detail.report.usage.estimatedCostUsd, detail.report.usage.unknownCalls)}{detail.report.usage.unknownCalls > 0 && ` · ${detail.report.usage.unknownCalls} 次调用用量未知`}</span><small>费用按本次实际发起的调用估算；缓存复用不重复计入历史费用。</small></div>
         <div className="report-body">{detail.body ? <Markdown text={detail.body} /> : <div className="reports-state">{active.has(detail.report.status) ? '报告生成中…' : '暂无报告正文'}</div>}</div>

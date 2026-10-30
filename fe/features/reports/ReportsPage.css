@@ -5,3 +5,5 @@
 @media(max-width:760px){.report-source-actions{align-items:flex-end;flex-direction:column;gap:6px}.report-usage{align-items:flex-start;flex-direction:column}}
 .report-material-progress{padding:8px 0;color:#77806d;font-size:10px}.report-material-footer{display:flex!important;align-items:center;justify-content:space-between;gap:10px;padding-top:9px;border-top:1px solid #e5eadc}.report-material-footer small{color:#89917d;font-size:9px}.report-material-footer button{color:#66834f;font-size:10px;white-space:nowrap}.report-material-footer button:disabled{opacity:.55}
 @media(max-width:760px){.report-material-footer{align-items:flex-start!important;flex-direction:column}.report-material-footer button{padding:5px 0}}
+
+.reports-week{margin-top:18px;min-width:0}.reports-week-heading{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px 14px;padding:11px 14px;border:1px solid #e3e8d9;border-radius:7px;background:#f8faf4}.reports-week-heading h3{margin:0;color:#536547;font-size:12px;font-weight:600}.reports-week-heading>span{color:#858d7a;font-size:10px}

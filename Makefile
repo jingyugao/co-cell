@@ -1,4 +1,4 @@
-.PHONY: build up start down restart logs ps prepare-cocell-runtime build-cocell-runtime deploy-co-cell deploy-cellbox-server deploy-cellbox-controller deploy-cellbox-api deploy-cellbox-local-metadata deploy-cocell-sandbox deploy-debug-mount deploy-all
+.PHONY: build up start down restart logs ps prepare-cocell-runtime build-cocell-runtime build-cocell-artifacts deploy-co-cell deploy-cellbox-server deploy-cellbox-controller deploy-cellbox-api deploy-cellbox-local-metadata deploy-cocell-sandbox deploy-debug-mount deploy-all
 
 COMPOSE := docker compose
 SERVICE := swarm-hive
@@ -26,7 +26,7 @@ ps:
 	$(COMPOSE) ps
 
 ifneq ($(COCELL_DEPLOY_ENV_LOADED),1)
-prepare-cocell-runtime build-cocell-runtime deploy-co-cell deploy-cellbox-server deploy-cellbox-api deploy-cellbox-controller deploy-cellbox-local-metadata deploy-cocell-sandbox deploy-debug-mount deploy-all:
+prepare-cocell-runtime build-cocell-runtime build-cocell-artifacts deploy-co-cell deploy-cellbox-server deploy-cellbox-api deploy-cellbox-controller deploy-cellbox-local-metadata deploy-cocell-sandbox deploy-debug-mount deploy-all:
 	node deploy/scripts/with-env.mjs $(MAKE) COCELL_DEPLOY_ENV_LOADED=1 $@
 else
 prepare-cocell-runtime:
@@ -34,6 +34,9 @@ prepare-cocell-runtime:
 
 build-cocell-runtime:
 	node deploy/scripts/cellbox/build-offline-runtime.mjs
+
+build-cocell-artifacts:
+	node deploy/scripts/cellbox/build-artifacts-image.mjs
 
 deploy-co-cell:
 	deploy/scripts/k8s/deploy-co-cell.sh

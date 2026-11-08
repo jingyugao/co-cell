@@ -107,6 +107,18 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width);
   };
   await verifyBounds();
+  if (testInfo.project.name === 'ui-desktop') {
+    const bounds = await dialog.boundingBox();
+    const anchor = await trigger.boundingBox();
+    expect(bounds.width).toBeLessThanOrEqual(336);
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(anchor.y);
+    expect(Math.abs(bounds.x + bounds.width - anchor.x - anchor.width)).toBeLessThanOrEqual(1);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await verifyBounds();
+    await expect(modelSelect).toHaveValue('channel-b-gpt');
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await verifyBounds();
+  }
   await testInfo.attach('model-configuration-open', { body: await page.screenshot(), contentType: 'image/png' });
   if (testInfo.project.name === 'ui-mobile') {
     await page.setViewportSize({ width: 320, height: 480 });

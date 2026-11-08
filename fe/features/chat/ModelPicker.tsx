@@ -1,9 +1,10 @@
-import { useId, useLayoutEffect, useRef, useState } from 'react';
+import { useId, useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { MODEL_OPTIONS } from '../../../util/models';
 import type { ModelOption } from '../../../protocol/model-types';
 import type { Settings } from '../../../protocol/types';
 import { errorMessage } from '../../lib/api';
+import { useMobileLayout } from './useMobileViewport';
 import './ModelPicker.css';
 
 type ModelSettings = Pick<Settings, 'model' | 'modelEntryId' | 'modelReasoningEffort' | 'fastMode'>;
@@ -15,12 +16,14 @@ function SelectArrows() {
   return <svg className="model-config-arrows" width="14" height="18" viewBox="0 0 14 18" fill="none" aria-hidden="true"><path d="m4 6 3-3 3 3M4 12l3 3 3-3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>;
 }
 
-function ModelConfiguration({ current, defaults, choices, managed, disabled, onSave, onClose }: {
+function ModelConfiguration({ current, defaults, choices, managed, disabled, anchor, onSave, onClose }: {
   current: ModelSettings; defaults?: ModelSettings; choices: readonly ModelOption[]; managed: boolean; disabled: boolean;
+  anchor: RefObject<HTMLButtonElement | null>;
   onSave: (patch: Partial<ModelSettings>) => Promise<void>; onClose: () => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
+  const mobile = useMobileLayout();
   const [draft, setDraft] = useState(current);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
@@ -32,6 +35,34 @@ function ModelConfiguration({ current, defaults, choices, managed, disabled, onS
     dialog.focus({ preventScroll: true });
     return () => { dialog.close(); if (previous?.isConnected) previous.focus(); };
   }, []);
+  useLayoutEffect(() => {
+    const dialog = ref.current!;
+    if (mobile) {
+      for (const property of ['left', 'top', 'max-height']) dialog.style.removeProperty(property);
+      return;
+    }
+    const position = () => {
+      const trigger = anchor.current;
+      if (!trigger) return;
+      const rect = trigger.getBoundingClientRect();
+      const above = rect.top - 20, below = window.innerHeight - rect.bottom - 20;
+      const opensAbove = above >= below;
+      dialog.style.maxHeight = `${Math.max(0, Math.min(480, opensAbove ? above : below))}px`;
+      dialog.style.left = `${Math.max(12, Math.min(rect.right - dialog.offsetWidth, window.innerWidth - dialog.offsetWidth - 12))}px`;
+      dialog.style.top = `${opensAbove ? Math.max(12, rect.top - dialog.offsetHeight - 8) : rect.bottom + 8}px`;
+    };
+    position();
+    const observer = new ResizeObserver(position);
+    observer.observe(dialog);
+    if (anchor.current) observer.observe(anchor.current);
+    window.addEventListener('resize', position);
+    window.addEventListener('scroll', position, true);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', position);
+      window.removeEventListener('scroll', position, true);
+    };
+  }, [anchor, mobile]);
 
   async function save() {
     if (disabled || saving.current) return;
@@ -85,9 +116,11 @@ function ModelConfiguration({ current, defaults, choices, managed, disabled, onS
           </select>
         </label>
       </fieldset>
-      <button className="model-config-reset" type="button" disabled={locked || !defaults} onClick={() => { if (defaults) setDraft({ ...defaults }); }}>恢复默认</button>
       {error && <p className="model-config-error" role="alert">{error}</p>}
-      <button className="model-config-done" type="submit" disabled={locked}>{pending ? '保存中…' : '完成'}</button>
+      <div className="model-config-actions">
+        <button className="model-config-reset" type="button" disabled={locked || !defaults} onClick={() => { if (defaults) setDraft({ ...defaults }); }}>恢复默认</button>
+        <button className="model-config-done" type="submit" disabled={locked}>{pending ? '保存中…' : '完成'}</button>
+      </div>
     </form>
   </dialog>, document.body);
 }
@@ -112,6 +145,6 @@ export default function ModelPicker({ model, modelEntryId, effort, disabled, fas
       <span className="model-picker-name">{model || '选择模型'}</span><span className="model-picker-effort">{efforts[effort]}</span>
     </button>
     {open && <ModelConfiguration current={{ model, modelEntryId, modelReasoningEffort: effort, fastMode }} defaults={defaults} choices={choices} managed={managed}
-      disabled={disabled} onSave={onSettingsChange} onClose={() => setOpen(false)} />}
+      disabled={disabled} anchor={trigger} onSave={onSettingsChange} onClose={() => setOpen(false)} />}
   </div>;
 }

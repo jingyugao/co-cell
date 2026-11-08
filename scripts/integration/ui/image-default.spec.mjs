@@ -33,17 +33,19 @@ async function imageRoutes(page, initial = initialImages()) {
   return { reads, writes };
 }
 
-test('CoCell default template follows latest independently of the archive restore default', async ({ page, ui }) => {
+test('CoCell default template follows latest independently of Cellbox stable', async ({ page, ui }) => {
   const { reads, writes } = await imageRoutes(page);
   await page.goto('/#images');
   await expect(page.getByText('新项目自动使用默认镜像的 latest；新版本构建成功后自动生效，已有 Sandbox 保持原版本。')).toBeVisible();
 
   await page.getByRole('article').filter({ hasText: 'Managed Runtime' }).getByRole('button', { name: '进入仓库' }).click();
   const managedVersion = page.locator('.image-version').filter({ hasText: '2.0' });
-  await expect(page.locator('.image-version').filter({ hasText: '1.0' }).getByText('仓库默认 · 归档恢复')).toBeVisible();
+  await expect(page.getByText('新建 Sandbox 和归档恢复默认使用所选镜像的最新成功版本，无需逐个版本设置默认。归档恢复时也可手动选择版本。')).toBeVisible();
+  await expect(page.locator('.image-version').filter({ hasText: '1.0' }).getByText('Cellbox stable', { exact: true })).toBeVisible();
   await managedVersion.getByRole('button', { name: '设为 CoCell 默认' }).click();
   await expect(managedVersion.getByText('默认镜像参考版本', { exact: true })).toBeVisible();
   await expect(page.locator('.image-version').filter({ hasText: '1.0' }).getByText('默认镜像参考版本', { exact: true })).toHaveCount(0);
+  await expect(page.locator('.image-version').filter({ hasText: '1.0' }).getByText('Cellbox stable', { exact: true })).toBeVisible();
   expect(writes).toEqual([{ imageId: 'managed', versionId: 'managed-v2', body: {} }]);
 
   await page.getByRole('button', { name: '返回仓库列表' }).click();

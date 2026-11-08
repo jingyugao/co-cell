@@ -165,6 +165,10 @@ jobs:
             echo 'publish=false' >> "$GITHUB_OUTPUT"
             echo 'Skipping deployment for superseded master commit.'
           fi
+      - name: Enable IPv6 for deployment notification
+        if: steps.notify_check.outputs.publish == 'true' && vars.COCELL_DEPLOY_IPV6 == 'true'
+        timeout-minutes: 6
+        run: bash .deployment-chart/scripts/ci/enable-ipv6.sh
       - name: Notify deployment receiver
         if: steps.notify_check.outputs.publish == 'true'
         env:

@@ -19,6 +19,8 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
   ui.sessions.get('old-session').settings = { ...defaults };
   let savedInput;
   let sessionPatch;
+  const sessionPatches = [];
+  let persistedSettings = { ...defaults };
   await page.route('**/api/models', async route => {
     if (route.request().method() === 'GET') return route.fulfill({ json: initial });
     savedInput = route.request().postDataJSON();
@@ -30,7 +32,7 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
     await route.fulfill({ json: saved });
   });
   await page.route('**/api/config', route => route.fulfill({ json: {
-    defaults, sandbox: { provider: 'cellbox', enabled: true, image: 'default', workingDirectory: defaults.workingDirectory },
+    defaults: { ...defaults, model: 'gpt-6-sol', modelEntryId: 'channel-a-gpt', fastMode: false }, sandbox: { provider: 'cellbox', enabled: true, image: 'default', workingDirectory: defaults.workingDirectory },
     codexVersion: 'integration', approvalPolicy: 'never', auth: 'api-key', models: ['gpt-6-sol'], modelOptions,
     capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true },
   } }));
@@ -38,9 +40,11 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
   await page.route('**/api/sessions/old-session', async route => {
     if (route.request().method() !== 'PATCH') return route.fallback();
     sessionPatch = route.request().postDataJSON();
+    sessionPatches.push(sessionPatch);
+    persistedSettings = { ...persistedSettings, ...sessionPatch.settings };
     await route.fulfill({ json: {
       id: 'old-session', projectId: 'paused', title: '旧会话', threadId: 'existing-thread', status: 'idle',
-      settings: { ...defaults, ...sessionPatch.settings }, turns: [], archivedAt: null,
+      settings: persistedSettings, turns: [], archivedAt: null,
       createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
     } });
   });
@@ -76,49 +80,63 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
   await testInfo.attach('model-management', { body: await page.screenshot(), contentType: 'image/png' });
 
   await page.goto('/sessions/old-session');
-  {
-    const trigger = page.getByRole('button', { name: /^选择模型与模式/ });
-    await expect(trigger).toHaveAccessibleName('选择模型与模式，当前 integration-model，计划模式，Fast 模式已开启');
-    await expect(trigger).toContainText('计划 · Fast');
-    await trigger.click();
-    const dialog = page.getByRole('dialog', { name: '模型与模式' });
-    await expect(dialog.getByRole('radio', { name: 'gpt-6-sol（渠道 A）', exact: true })).toHaveValue('channel-a-gpt');
-    const channelBOption = dialog.getByRole('radio', { name: 'gpt-6-sol（渠道 B）', exact: true });
-    await expect(channelBOption).toHaveValue('channel-b-gpt');
-    await channelBOption.click();
-    await expect(dialog).toHaveCount(0);
-    await expect(trigger).toHaveAccessibleName('选择模型与模式，当前 gpt-6-sol，渠道 B，计划模式，Fast 模式已开启');
-    await trigger.click();
-    await expect(dialog.getByRole('radio', { name: 'gpt-6-sol（渠道 B）', exact: true })).toBeChecked();
-    const verifyBounds = async () => {
-      await expect(dialog).toBeInViewport({ ratio: 1 });
-      const bounds = await dialog.boundingBox();
-      const anchor = await trigger.boundingBox();
-      const viewport = page.viewportSize();
-      expect(bounds.x).toBeGreaterThanOrEqual(0);
-      expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width);
-      expect(bounds.y).toBeGreaterThanOrEqual(0);
-      expect(bounds.y + bounds.height).toBeLessThanOrEqual(anchor.y);
-      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width);
-    };
-    await dialog.locator('summary').click();
-    await expect(dialog.getByRole('switch', { name: 'Fast 模式' })).toBeVisible();
-    await verifyBounds();
-    await dialog.locator('summary').click();
-    await verifyBounds();
-    await testInfo.attach('model-menu-open', { body: await page.screenshot(), contentType: 'image/png' });
-    if (testInfo.project.name === 'ui-mobile') {
-      await page.setViewportSize({ width: 320, height: 480 });
-      await verifyBounds();
-      await testInfo.attach('model-menu-narrow', { body: await page.screenshot(), contentType: 'image/png' });
-    }
-    await page.keyboard.press('Escape');
-    await expect(dialog).toHaveCount(0);
-    await expect(trigger).toBeFocused();
-    await trigger.click();
-    await page.mouse.click(4, 4);
-    await expect(dialog).toHaveCount(0);
-  }
+  const trigger = page.getByRole('button', { name: /^配置模型/ });
+  await expect(trigger).toHaveAccessibleName('配置模型，当前 integration-model，Medium，Fast');
+  await trigger.click();
+  const dialog = page.getByRole('dialog', { name: '配置', exact: true });
+  const modelSelect = dialog.getByRole('combobox', { name: '模型', exact: true });
+  await expect(modelSelect.locator('option')).toHaveText([
+    'integration-model', 'gpt-6-sol（渠道 A）', 'gpt-6-sol（渠道 B）',
+  ]);
+  await modelSelect.selectOption('channel-b-gpt');
+  expect(sessionPatches).toHaveLength(0);
+  await dialog.getByRole('button', { name: '完成', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
   await expect.poll(() => sessionPatch).toEqual({ settings: { model: 'gpt-6-sol', modelEntryId: 'channel-b-gpt' } });
+  await expect(trigger).toHaveAccessibleName('配置模型，当前 gpt-6-sol，渠道 B，Medium，Fast');
+  await trigger.click();
+  await expect(modelSelect).toHaveValue('channel-b-gpt');
+  const verifyBounds = async () => {
+    await expect(dialog).toBeInViewport({ ratio: 1 });
+    const bounds = await dialog.boundingBox();
+    const viewport = page.viewportSize();
+    expect(bounds.x).toBeGreaterThanOrEqual(0);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width);
+    expect(bounds.y).toBeGreaterThanOrEqual(0);
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(viewport.height);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width);
+  };
+  await verifyBounds();
+  await testInfo.attach('model-configuration-open', { body: await page.screenshot(), contentType: 'image/png' });
+  if (testInfo.project.name === 'ui-mobile') {
+    await page.setViewportSize({ width: 320, height: 480 });
+    await verifyBounds();
+    await testInfo.attach('model-configuration-narrow', { body: await page.screenshot(), contentType: 'image/png' });
+  }
+  await dialog.getByRole('combobox', { name: '推理强度' }).selectOption('high');
+  await dialog.getByRole('combobox', { name: '速度' }).selectOption('standard');
+  await dialog.getByRole('button', { name: '完成', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect.poll(() => sessionPatch).toEqual({ settings: { modelReasoningEffort: 'high', fastMode: false } });
+  await expect(trigger).toHaveAccessibleName('配置模型，当前 gpt-6-sol，渠道 B，High');
+  await trigger.click();
+  await dialog.getByRole('button', { name: '恢复默认' }).click();
+  await expect(modelSelect).toHaveValue('channel-a-gpt');
+  await expect(dialog.getByRole('combobox', { name: '推理强度' })).toHaveValue('medium');
+  await expect(dialog.getByRole('combobox', { name: '速度' })).toHaveValue('standard');
+  expect(sessionPatches).toHaveLength(2);
+  await dialog.getByRole('button', { name: '完成', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect.poll(() => sessionPatch).toEqual({ settings: { model: 'gpt-6-sol', modelEntryId: 'channel-a-gpt', modelReasoningEffort: 'medium' } });
+  await trigger.click();
+  await dialog.getByRole('combobox', { name: '推理强度' }).selectOption('low');
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+  await trigger.click();
+  await expect(dialog.getByRole('combobox', { name: '推理强度' })).toHaveValue('medium');
+  await page.mouse.click(4, 4);
+  await expect(dialog).toHaveCount(0);
+  expect(sessionPatches).toHaveLength(3);
   await testInfo.attach('chat-model-picker', { body: await page.screenshot(), contentType: 'image/png' });
 });

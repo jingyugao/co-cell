@@ -1,143 +1,117 @@
-import { useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { MODEL_OPTIONS } from '../../../util/models';
 import type { ModelOption } from '../../../protocol/model-types';
+import type { Settings } from '../../../protocol/types';
 import { errorMessage } from '../../lib/api';
-import { Icon } from '../../components/Icon';
 import './ModelPicker.css';
 
-function ModelMenu({ children, busy, anchor, onClose }: { children: ReactNode; busy: boolean; anchor: RefObject<HTMLButtonElement | null>; onClose: () => void }) {
+type ModelSettings = Pick<Settings, 'model' | 'modelEntryId' | 'modelReasoningEffort' | 'fastMode'>;
+const efforts: Record<Settings['modelReasoningEffort'], string> = {
+  minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max', ultra: 'Ultra', persistent: 'Persistent',
+};
+
+function SelectArrows() {
+  return <svg className="model-config-arrows" width="14" height="18" viewBox="0 0 14 18" fill="none" aria-hidden="true"><path d="m4 6 3-3 3 3M4 12l3 3 3-3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>;
+}
+
+function ModelConfiguration({ current, defaults, choices, managed, disabled, onSave, onClose }: {
+  current: ModelSettings; defaults?: ModelSettings; choices: readonly ModelOption[]; managed: boolean; disabled: boolean;
+  onSave: (patch: Partial<ModelSettings>) => Promise<void>; onClose: () => void;
+}) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
+  const [draft, setDraft] = useState(current);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState('');
+  const saving = useRef(false);
   useLayoutEffect(() => {
     const dialog = ref.current!;
     const previous = document.activeElement as HTMLElement | null;
     dialog.showModal();
-    const position = () => {
-      const trigger = anchor.current;
-      if (!trigger) return;
-      const viewport = window.visualViewport;
-      const left = viewport?.offsetLeft ?? 0, top = viewport?.offsetTop ?? 0;
-      const width = viewport?.width ?? window.innerWidth, height = viewport?.height ?? window.innerHeight;
-      const rect = trigger.getBoundingClientRect();
-      const above = rect.top - top - 20, below = top + height - rect.bottom - 20;
-      const opensAbove = above >= below;
-      dialog.style.width = `${Math.min(344, width - 24)}px`;
-      dialog.style.maxHeight = `${Math.max(0, Math.min(560, opensAbove ? above : below))}px`;
-      dialog.style.left = `${Math.max(left + 12, Math.min(rect.left, left + width - dialog.offsetWidth - 12))}px`;
-      dialog.style.top = `${opensAbove ? Math.max(top + 12, rect.top - dialog.offsetHeight - 8) : rect.bottom + 8}px`;
-    };
-    position();
-    const observer = new ResizeObserver(position);
-    observer.observe(dialog);
-    window.addEventListener('resize', position);
-    window.addEventListener('scroll', position, true);
-    window.visualViewport?.addEventListener('resize', position);
-    window.visualViewport?.addEventListener('scroll', position);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener('resize', position);
-      window.removeEventListener('scroll', position, true);
-      window.visualViewport?.removeEventListener('resize', position);
-      window.visualViewport?.removeEventListener('scroll', position);
-      dialog.close();
-      if (previous?.isConnected) previous.focus();
-    };
-  }, [anchor]);
-  return createPortal(<dialog ref={ref} className="model-menu" aria-labelledby={titleId}
-    onCancel={event => { event.preventDefault(); if (!busy) onClose(); }}
-    onClick={event => {
-      if (busy || event.target !== event.currentTarget) return;
-      const rect = event.currentTarget.getBoundingClientRect();
-      if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) onClose();
-    }}>
-    <header className="model-menu-heading"><h2 id={titleId}>模型与模式</h2><button type="button" aria-label="关闭模型选择" disabled={busy} onClick={onClose}><Icon name="close" size={20} /></button></header>
-    <div className="model-menu-body">{children}</div>
-  </dialog>, document.body);
-}
+    dialog.focus({ preventScroll: true });
+    return () => { dialog.close(); if (previous?.isConnected) previous.focus(); };
+  }, []);
 
-export default function ModelPicker({ model, modelEntryId, effort, disabled, collaborationMode = 'default', fastMode = false, onChange, onSettingsChange, models, modelOptions }: {
-  model: string;
-  modelEntryId?: string;
-  effort: string;
-  disabled: boolean;
-  collaborationMode?: 'default' | 'plan';
-  fastMode?: boolean;
-  onChange: (model: string, modelEntryId?: string) => Promise<void>;
-  onSettingsChange: (patch: { collaborationMode?: 'default' | 'plan'; fastMode?: boolean }) => Promise<void>;
-  models?: readonly string[];
-  modelOptions?: readonly ModelOption[];
-}) {
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState('');
-  const [open, setOpen] = useState(false);
-  const trigger = useRef<HTMLButtonElement>(null);
-  const radioName = useId();
-  const saving = useRef(false);
-
-  async function changeModel(value: string) {
-    const option = modelOptions?.find(item => item.id === value);
-    const nextModel = option?.model ?? value;
-    const nextId = option?.id;
-    if (disabled || saving.current || (nextId ? nextId === modelEntryId : nextModel === model && !modelEntryId)) return;
-    if (await changeSetting(() => onChange(nextModel, nextId))) setOpen(false);
-  }
-
-  async function changeSetting(change: () => Promise<void>) {
+  async function save() {
     if (disabled || saving.current) return;
+    const patch: Partial<ModelSettings> = {};
+    if (draft.model !== current.model || draft.modelEntryId !== current.modelEntryId) {
+      patch.model = draft.model;
+      patch.modelEntryId = draft.modelEntryId;
+    }
+    if (draft.modelReasoningEffort !== current.modelReasoningEffort) patch.modelReasoningEffort = draft.modelReasoningEffort;
+    if (Boolean(draft.fastMode) !== Boolean(current.fastMode)) patch.fastMode = Boolean(draft.fastMode);
+    if (!Object.keys(patch).length) { onClose(); return; }
     saving.current = true;
     setPending(true);
     setError('');
-    try {
-      await change();
-      return true;
-    } catch (err) {
-      setError(errorMessage(err));
-      return false;
-    } finally {
-      saving.current = false;
-      setPending(false);
-    }
+    try { await onSave(patch); onClose(); }
+    catch (err) { setError(errorMessage(err)); }
+    finally { saving.current = false; setPending(false); }
   }
 
-  const managed = modelOptions !== undefined;
-  const options = models?.length ? models : MODEL_OPTIONS;
-  const selectedValue = managed ? modelEntryId || '' : model;
-  const choices = managed ? modelOptions.map(option => ({ value: option.id, model: option.model, channel: option.channelName }))
-    : options.map(value => ({ value, model: value, channel: '' }));
-  const selected = choices.find(option => option.value === selectedValue);
-  return <div className="model-picker model-picker-compact" aria-busy={pending}>
-    <button ref={trigger} type="button" className="model-picker-trigger" aria-label={`选择模型与模式，当前 ${model}${selected?.channel ? `，${selected.channel}` : ''}${collaborationMode === 'plan' ? '，计划模式' : ''}${fastMode ? '，Fast 模式已开启' : ''}`} aria-haspopup="dialog" aria-expanded={open}
-      title={selected?.channel ? `${model}（${selected.channel}）` : model} disabled={disabled || pending} onClick={() => setOpen(true)}>
-      <span className="model-picker-summary"><span className="model-picker-name">{model || '选择模型'}</span>{(pending || selected?.channel) && <span className="model-picker-status">{pending ? '保存中…' : selected?.channel}</span>}</span>
-      {(collaborationMode === 'plan' || fastMode) && <span className="model-picker-badge">{[collaborationMode === 'plan' && '计划', fastMode && 'Fast'].filter(Boolean).join(' · ')}</span>}
-      <Icon name="chevron" size={14} />
-    </button>
-    {open && <ModelMenu anchor={trigger} busy={pending} onClose={() => setOpen(false)}>
-      <fieldset className="model-menu-options" disabled={disabled || pending} aria-busy={pending}>
-        <legend>模型</legend>
-        {!selected && <p className="model-menu-unavailable">当前：{model || '未选择模型'}{modelEntryId ? '（不可用）' : ''}</p>}
-        {choices.map(option => <label key={option.value} className={`model-menu-option${selectedValue === option.value ? ' selected' : ''}`}>
-          <input type="radio" name={radioName} value={option.value} checked={selectedValue === option.value}
-            aria-label={option.channel ? `${option.model}（${option.channel}）` : option.model}
-            onClick={() => { if (selectedValue === option.value) setOpen(false); }} onChange={() => void changeModel(option.value)} />
-          <span><strong>{option.model}</strong>{option.channel && <small>{option.channel}</small>}</span>
-          {selectedValue === option.value && <Icon name="check" size={18} />}
-        </label>)}
+  const value = managed ? draft.modelEntryId || '' : draft.model;
+  const selected = choices.find(option => option.id === value);
+  const locked = disabled || pending;
+  return createPortal(<dialog ref={ref} className="model-config" aria-labelledby={titleId}
+    onCancel={event => { event.preventDefault(); if (!pending) onClose(); }}
+    onClick={event => {
+      if (pending || event.target !== event.currentTarget) return;
+      const rect = event.currentTarget.getBoundingClientRect();
+      if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) onClose();
+    }}>
+    <div className="model-config-handle" aria-hidden="true" />
+    <h2 id={titleId}>配置</h2>
+    <form onSubmit={event => { event.preventDefault(); void save(); }} aria-busy={pending}>
+      <fieldset className="model-config-fields" disabled={locked}>
+        <label className="model-config-row"><span>模型</span><span className="model-config-value" title={selected?.label || draft.model}>{selected?.label || draft.model || '选择模型'}</span><SelectArrows />
+          <select aria-label="模型" value={value} onChange={event => {
+            const choice = choices.find(option => option.id === event.target.value);
+            if (choice) setDraft(previous => ({ ...previous, model: choice.model, modelEntryId: managed ? choice.id : undefined }));
+          }}>
+            {!selected && <option value={value} disabled>{draft.model || '请选择模型'}{draft.modelEntryId ? '（不可用）' : ''}</option>}
+            {choices.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}
+          </select>
+        </label>
+        <label className="model-config-row"><span>推理强度</span><span className="model-config-value">{efforts[draft.modelReasoningEffort]}</span><SelectArrows />
+          <select aria-label="推理强度" value={draft.modelReasoningEffort} onChange={event => setDraft(previous => ({ ...previous, modelReasoningEffort: event.target.value as Settings['modelReasoningEffort'] }))}>
+            {Object.entries(efforts).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+          </select>
+        </label>
+        <label className="model-config-row"><span>速度</span><span className="model-config-value">{draft.fastMode ? 'Fast' : 'Standard'}</span><SelectArrows />
+          <select aria-label="速度" value={draft.fastMode ? 'fast' : 'standard'} onChange={event => setDraft(previous => ({ ...previous, fastMode: event.target.value === 'fast' }))}>
+            <option value="standard">Standard</option><option value="fast">Fast · 优先处理，可能产生更高费用</option>
+          </select>
+        </label>
       </fieldset>
-      <details className="model-menu-settings">
-        <summary>运行模式<span>{collaborationMode === 'plan' ? '计划' : '普通'}{fastMode ? ' · Fast' : ''}</span><Icon name="chevron" size={14} /></summary>
-        <fieldset disabled={disabled || pending}>
-          <div className="model-menu-modes" role="group" aria-label="协作模式">
-            <button type="button" aria-pressed={collaborationMode === 'default'} onClick={() => void changeSetting(() => onSettingsChange({ collaborationMode: 'default' }))}>普通</button>
-            <button type="button" aria-pressed={collaborationMode === 'plan'} onClick={() => void changeSetting(() => onSettingsChange({ collaborationMode: 'plan' }))}>计划</button>
-          </div>
-          <div className="model-menu-fast"><span><strong>Fast 模式</strong><small>优先处理，可能产生更高费用</small></span><button type="button" role="switch" aria-label="Fast 模式" aria-checked={fastMode} onClick={() => void changeSetting(() => onSettingsChange({ fastMode: !fastMode }))}><span /></button></div>
-          <p className="model-menu-effort">推理强度：{effort}<span role="status">{pending ? '保存中…' : ''}</span></p>
-        </fieldset>
-      </details>
-      {error && <p className="model-menu-error" role="alert">{error}</p>}
-    </ModelMenu>}
-    {error && !open && <div className="model-picker-error" role="alert">{error}</div>}
+      <button className="model-config-reset" type="button" disabled={locked || !defaults} onClick={() => { if (defaults) setDraft({ ...defaults }); }}>恢复默认</button>
+      {error && <p className="model-config-error" role="alert">{error}</p>}
+      <button className="model-config-done" type="submit" disabled={locked}>{pending ? '保存中…' : '完成'}</button>
+    </form>
+  </dialog>, document.body);
+}
+
+export default function ModelPicker({ model, modelEntryId, effort, disabled, fastMode = false, defaults, onSettingsChange, models, modelOptions }: {
+  model: string; modelEntryId?: string; effort: Settings['modelReasoningEffort']; disabled: boolean; fastMode?: boolean;
+  defaults?: ModelSettings; onSettingsChange: (patch: Partial<ModelSettings>) => Promise<void>;
+  models?: readonly string[]; modelOptions?: readonly ModelOption[];
+}) {
+  const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const managed = modelOptions !== undefined;
+  const choices = modelOptions ?? (models?.length ? models : MODEL_OPTIONS).map(value => ({ id: value, model: value, label: value, channelId: '', channelName: '' }));
+  const selected = choices.find(option => option.id === (managed ? modelEntryId : model));
+  return <div className="model-picker">
+    <button ref={trigger} type="button" className="model-picker-trigger" aria-label={`配置模型，当前 ${model}${selected?.channelName ? `，${selected.channelName}` : ''}，${efforts[effort]}${fastMode ? '，Fast' : ''}`}
+      aria-haspopup="dialog" aria-expanded={open} title={selected?.label || model} disabled={disabled} onClick={() => {
+        if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+        trigger.current?.focus({ preventScroll: true });
+        setOpen(true);
+      }}>
+      <span className="model-picker-name">{model || '选择模型'}</span><span className="model-picker-effort">{efforts[effort]}</span>
+    </button>
+    {open && <ModelConfiguration current={{ model, modelEntryId, modelReasoningEffort: effort, fastMode }} defaults={defaults} choices={choices} managed={managed}
+      disabled={disabled} onSave={onSettingsChange} onClose={() => setOpen(false)} />}
   </div>;
 }

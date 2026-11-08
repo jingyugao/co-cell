@@ -10,32 +10,22 @@ work="${RUNNER_TEMP:?}/cocell-ci"
 mkdir -p "$work"
 chmod 700 "$work"
 
-gvisor_commit='fe674565335026d0b688291941f4d5fcbb542b6d'
-gvisor_source="${COCELL_GVISOR_SOURCE_DIR:?}"
-gvisor_release="${COCELL_GVISOR_RELEASE_DIR:?}"
-[[ "$(git -C "$gvisor_source" rev-parse HEAD)" == "$gvisor_commit" ]] || {
-  echo 'gVisor source does not match the pinned CoCell fork revision' >&2
-  exit 1
-}
-test -x "$gvisor_release/runsc"
-test -x "$gvisor_release/containerd-shim-runsc-v1"
-test -x "$gvisor_release/gvisor-bin/gvisor_sentry"
-test -x "$gvisor_release/gvisor-bin/checkpointgofer"
-gvisor_install="/usr/local/lib/cellbox/gvisor/$gvisor_commit"
-sudo install -d -m 755 "$gvisor_install"
-sudo install -m 755 "$gvisor_release/runsc" "$gvisor_release/containerd-shim-runsc-v1" "$gvisor_install/"
-sudo install -d -m 755 "$gvisor_install/gvisor-bin"
-sudo cp -a "$gvisor_release/gvisor-bin/." "$gvisor_install/gvisor-bin/"
+# Cellbox owns the runtime version, release layout, and checksum verification.
+runtime_release="$work/cellbox-runtime"
+bash "$CELLBOX_SOURCE_DIR/scripts/download-runtime.sh" "$runtime_release"
+runtime_install="/usr/local/lib/cellbox/runtime"
+sudo install -d -m 755 "$runtime_install"
+sudo cp -a "$runtime_release/." "$runtime_install/"
 sudo install -d -m 755 /usr/local/libexec
 cat > "$work/cellbox-runsc-launcher" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-export CELLBOX_RUNSC="$gvisor_install/runsc"
+export CELLBOX_RUNSC="$runtime_install/runsc"
 exec /usr/local/libexec/cellbox-runsc-wrapper "\$@"
 EOF
 sudo install -m 755 "$work/cellbox-runsc-launcher" /usr/local/libexec/cellbox-runsc-launcher
-printf 'COCELL_CI_RUNSC=%s\n' "$gvisor_install/runsc" >> "$GITHUB_ENV"
-printf 'COCELL_CI_SHIM=%s\n' "$gvisor_install/containerd-shim-runsc-v1" >> "$GITHUB_ENV"
+printf 'CELLBOX_RUNSC_PATH=%s\n' "$runtime_install/runsc" >> "$GITHUB_ENV"
+printf 'CELLBOX_SHIM_PATH=%s\n' "$runtime_install/containerd-shim-runsc-v1" >> "$GITHUB_ENV"
 
 # Fixed versions: containerd 2.x uses the v3 runtime template below.
 k3s_version='v1.34.1+k3s1'
@@ -78,7 +68,7 @@ cat > "$work/containerd.tmpl" <<EOF
 {{ template "base" . }}
 [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc-recoverable]
   runtime_type = "io.containerd.runsc.v1"
-  runtime_path = "$gvisor_install/containerd-shim-runsc-v1"
+  runtime_path = "$runtime_install/containerd-shim-runsc-v1"
   pod_annotations = ["dev.gvisor.internal.recovery.ticket"]
   [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc-recoverable.options]
     TypeUrl = "io.containerd.runsc.v1.options"
@@ -94,4 +84,4 @@ until kubectl --context cocell-ci get --raw=/readyz >/dev/null 2>&1; do
   sleep 2
 done
 kubectl --context cocell-ci wait --for=condition=Ready node --all --timeout=180s
-"$gvisor_install/runsc" --version
+"$runtime_install/runsc" --version

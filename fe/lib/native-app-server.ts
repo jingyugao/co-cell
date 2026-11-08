@@ -60,13 +60,13 @@ export class NativeAppServerClient {
       else pending.resolve(message.result);
     }
   }
-  request(method: string, params: Record<string, unknown>) {
+  request(method: string, params: Record<string, unknown>, timeoutMs = 30_000) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error('Codex App Server 尚未连接'));
     const id = ++this.sequence;
     return new Promise<any>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(String(id)); reject(Object.assign(new Error(`${method} 响应超时，执行结果未知。请刷新状态后再决定下一步。`), { unknownOutcome: true }));
-      }, 30_000);
+      }, timeoutMs);
       this.pending.set(String(id), { resolve, reject, timer });
       try { this.socket!.send(JSON.stringify({ id, method, params })); }
       catch (error) {

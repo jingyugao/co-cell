@@ -267,8 +267,49 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
       if (retryTimer) clearTimeout(retryTimer);
       await connect(true);
     };
+    // Mobile browsers may keep a suspended WebSocket marked OPEN after the
+    // network has disappeared. Probe it without interrupting pending RPCs.
+    let probing = false;
+    let visibilityVersion = 0;
+    const checkConnection = async () => {
+      if (!alive || probing || document.visibilityState !== 'visible' || !navigator.onLine || !connectedRef.current || !client) return;
+      const checkedClient = client;
+      const checkedGeneration = generation;
+      const checkedVisibility = visibilityVersion;
+      probing = true;
+      try {
+        await checkedClient.request('thread/list', { limit: 1 }, 5_000);
+      } catch (error) {
+        if (!alive || checkedGeneration !== generation || client !== checkedClient
+          || checkedVisibility !== visibilityVersion || document.visibilityState !== 'visible'
+          || (error instanceof Error && 'code' in error)) return;
+        generation++;
+        client = undefined;
+        if (clientRef.current === checkedClient) clientRef.current = null;
+        checkedClient.close();
+        setSessionRef.current(current => current ? withNativeQuestions(current) : current);
+        markConnected(false);
+        scheduleRetry();
+      } finally {
+        probing = false;
+        if (checkedVisibility !== visibilityVersion) void checkConnection();
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') visibilityVersion++;
+      else void checkConnection();
+    };
+    const onPageShow = (event: PageTransitionEvent) => { if (event.persisted) void checkConnection(); };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('online', checkConnection);
+    window.addEventListener('pageshow', onPageShow);
     void connect().catch(() => {});
-    return () => { alive = false; generation++; refreshConnectionRef.current = null; bufferingEvents.current = false; if (retryTimer) clearTimeout(retryTimer); client?.close(); if (clientRef.current === client) clientRef.current = null; if (connectionRef.current?.session.id === id) connectionRef.current = null; markConnected(false); };
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('online', checkConnection);
+      window.removeEventListener('pageshow', onPageShow);
+      alive = false; generation++; refreshConnectionRef.current = null; bufferingEvents.current = false; if (retryTimer) clearTimeout(retryTimer); client?.close(); if (clientRef.current === client) clientRef.current = null; if (connectionRef.current?.session.id === id) connectionRef.current = null; markConnected(false);
+    };
   }, [selected, enabled, acceptEvent, acceptServerRequest, mergeHistory, refreshHistory, withNativeQuestions]);
 
   const send = useCallback(async (prompt: string, images: string[] = [], options: { expectedTurnId?: string; forceStart?: boolean } = {}) => {

@@ -25,3 +25,16 @@
 .model-config-reset:disabled,.model-config-done:disabled{opacity:.45;cursor:not-allowed}
 .model-config-error{margin:12px 0 0;padding:10px 12px;border-radius:7px;background:#fbede7;color:#a56955;font-size:13px;line-height:1.5;overflow-wrap:anywhere}
 @media(max-width:700px){.model-picker-trigger{min-height:44px;padding:8px 6px}.model-picker-name,.model-picker-effort{font-size:14px}}
+
+@media(min-width:701px){
+  .model-config{inset:auto;margin:0;width:336px;max-width:calc(100vw - 24px);padding:16px;border-radius:12px;box-shadow:0 8px 32px #252f2026}
+  .model-config::backdrop{background:transparent;backdrop-filter:none}
+  .model-config-handle{display:none}
+  .model-config h2{margin-bottom:12px;text-align:left;font-size:14px}
+  .model-config-fields{padding:0 12px;border-radius:8px;background:#f8faf3}
+  .model-config-row{min-height:40px;font-size:12px}
+  .model-config-row>select{font-size:13px}
+  .model-config-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px}
+  .model-config-actions>button{width:auto;min-height:34px;margin:0;padding:7px 12px;font-size:12px;border-radius:6px}
+  .model-config-done{min-width:72px}
+}

@@ -25,6 +25,7 @@ jobs:
     env:
       SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
       CHART_REF: ${{ vars.COCELL_CHART_REF }}
+      CHART_REPOSITORY: ${{ vars.COCELL_CHART_REPOSITORY }}
       DEPLOY_URL: ${{ vars.COCELL_DEPLOY_WEBHOOK_URL }}
       DEPLOY_SECRET: ${{ secrets.COCELL_DEPLOY_WEBHOOK_SECRET }}
       CHART_KEY: ${{ secrets.COCELL_CHART_DEPLOY_KEY }}
@@ -36,6 +37,7 @@ jobs:
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$CHART_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CHART_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
           [[ -n "$DEPLOY_URL" && -n "$DEPLOY_SECRET" && -n "$CHART_KEY" ]]
           node -e 'try { const u = new URL(process.env.DEPLOY_URL); if (!["http:", "https:"].includes(u.protocol) || u.username || u.password) process.exit(1); } catch { process.exit(1); }'
       - name: Check triggering commit is current master
@@ -107,7 +109,7 @@ jobs:
         if: steps.recheck.outputs.publish == 'true'
         uses: actions/checkout@v4
         with:
-          repository: jingyugao/k3s-helm
+          repository: ${{ vars.COCELL_CHART_REPOSITORY }}
           ref: ${{ vars.COCELL_CHART_REF }}
           ssh-key: ${{ secrets.COCELL_CHART_DEPLOY_KEY }}
           persist-credentials: false

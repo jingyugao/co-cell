@@ -15,7 +15,8 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
     { id: 'channel-a-gpt', model: 'gpt-6-sol', channelId: 'channel-a', channelName: '渠道 A', label: 'gpt-6-sol（渠道 A）' },
     { id: 'channel-b-gpt', model: 'gpt-6-sol', channelId: 'channel-b', channelName: '渠道 B', label: 'gpt-6-sol（渠道 B）' },
   ];
-  const defaults = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'integration-model', modelReasoningEffort: 'medium', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const defaults = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'integration-model', modelReasoningEffort: 'medium', collaborationMode: 'plan', fastMode: true, sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  ui.sessions.get('old-session').settings = { ...defaults };
   let savedInput;
   let sessionPatch;
   await page.route('**/api/models', async route => {
@@ -75,9 +76,10 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
   await testInfo.attach('model-management', { body: await page.screenshot(), contentType: 'image/png' });
 
   await page.goto('/sessions/old-session');
-  if (testInfo.project.name === 'ui-mobile') {
+  {
     const trigger = page.getByRole('button', { name: /^选择模型与模式/ });
-    await expect(trigger).toHaveAccessibleName('选择模型与模式，当前 integration-model');
+    await expect(trigger).toHaveAccessibleName('选择模型与模式，当前 integration-model，计划模式，Fast 模式已开启');
+    await expect(trigger).toContainText('计划 · Fast');
     await trigger.click();
     const dialog = page.getByRole('dialog', { name: '模型与模式' });
     await expect(dialog.getByRole('radio', { name: 'gpt-6-sol（渠道 A）', exact: true })).toHaveValue('channel-a-gpt');
@@ -85,17 +87,37 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
     await expect(channelBOption).toHaveValue('channel-b-gpt');
     await channelBOption.click();
     await expect(dialog).toHaveCount(0);
-    await expect(trigger).toHaveAccessibleName('选择模型与模式，当前 gpt-6-sol，渠道 B');
+    await expect(trigger).toHaveAccessibleName('选择模型与模式，当前 gpt-6-sol，渠道 B，计划模式，Fast 模式已开启');
     await trigger.click();
     await expect(dialog.getByRole('radio', { name: 'gpt-6-sol（渠道 B）', exact: true })).toBeChecked();
-    await dialog.getByRole('button', { name: '关闭模型选择' }).click();
-  } else {
-    const chatModel = page.getByRole('combobox', { name: '切换模型', exact: true });
-    await expect(chatModel.locator('option')).toHaveText([
-      'integration-model', 'gpt-6-sol（渠道 A）', 'gpt-6-sol（渠道 B）',
-    ]);
-    await chatModel.selectOption('channel-b-gpt');
-    await expect(chatModel).toHaveValue('channel-b-gpt');
+    const verifyBounds = async () => {
+      await expect(dialog).toBeInViewport({ ratio: 1 });
+      const bounds = await dialog.boundingBox();
+      const anchor = await trigger.boundingBox();
+      const viewport = page.viewportSize();
+      expect(bounds.x).toBeGreaterThanOrEqual(0);
+      expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width);
+      expect(bounds.y).toBeGreaterThanOrEqual(0);
+      expect(bounds.y + bounds.height).toBeLessThanOrEqual(anchor.y);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(viewport.width);
+    };
+    await dialog.locator('summary').click();
+    await expect(dialog.getByRole('switch', { name: 'Fast 模式' })).toBeVisible();
+    await verifyBounds();
+    await dialog.locator('summary').click();
+    await verifyBounds();
+    await testInfo.attach('model-menu-open', { body: await page.screenshot(), contentType: 'image/png' });
+    if (testInfo.project.name === 'ui-mobile') {
+      await page.setViewportSize({ width: 320, height: 480 });
+      await verifyBounds();
+      await testInfo.attach('model-menu-narrow', { body: await page.screenshot(), contentType: 'image/png' });
+    }
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+    await trigger.click();
+    await page.mouse.click(4, 4);
+    await expect(dialog).toHaveCount(0);
   }
   await expect.poll(() => sessionPatch).toEqual({ settings: { model: 'gpt-6-sol', modelEntryId: 'channel-b-gpt' } });
   await testInfo.attach('chat-model-picker', { body: await page.screenshot(), contentType: 'image/png' });

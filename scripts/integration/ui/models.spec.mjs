@@ -75,12 +75,28 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
   await testInfo.attach('model-management', { body: await page.screenshot(), contentType: 'image/png' });
 
   await page.goto('/sessions/old-session');
-  const chatModel = page.getByRole('combobox', { name: '切换模型', exact: true });
-  await expect(chatModel.locator('option')).toHaveText([
-    'integration-model', 'gpt-6-sol（渠道 A）', 'gpt-6-sol（渠道 B）',
-  ]);
-  await chatModel.selectOption('channel-b-gpt');
+  if (testInfo.project.name === 'ui-mobile') {
+    const trigger = page.getByRole('button', { name: /^选择模型与模式/ });
+    await expect(trigger).toHaveAccessibleName('选择模型与模式，当前 integration-model');
+    await trigger.click();
+    const dialog = page.getByRole('dialog', { name: '模型与模式' });
+    await expect(dialog.getByRole('radio', { name: 'gpt-6-sol（渠道 A）', exact: true })).toHaveValue('channel-a-gpt');
+    const channelBOption = dialog.getByRole('radio', { name: 'gpt-6-sol（渠道 B）', exact: true });
+    await expect(channelBOption).toHaveValue('channel-b-gpt');
+    await channelBOption.click();
+    await expect(dialog).toHaveCount(0);
+    await expect(trigger).toHaveAccessibleName('选择模型与模式，当前 gpt-6-sol，渠道 B');
+    await trigger.click();
+    await expect(dialog.getByRole('radio', { name: 'gpt-6-sol（渠道 B）', exact: true })).toBeChecked();
+    await dialog.getByRole('button', { name: '关闭模型选择' }).click();
+  } else {
+    const chatModel = page.getByRole('combobox', { name: '切换模型', exact: true });
+    await expect(chatModel.locator('option')).toHaveText([
+      'integration-model', 'gpt-6-sol（渠道 A）', 'gpt-6-sol（渠道 B）',
+    ]);
+    await chatModel.selectOption('channel-b-gpt');
+    await expect(chatModel).toHaveValue('channel-b-gpt');
+  }
   await expect.poll(() => sessionPatch).toEqual({ settings: { model: 'gpt-6-sol', modelEntryId: 'channel-b-gpt' } });
-  await expect(chatModel).toHaveValue('channel-b-gpt');
   await testInfo.attach('chat-model-picker', { body: await page.screenshot(), contentType: 'image/png' });
 });

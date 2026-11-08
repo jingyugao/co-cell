@@ -5,3 +5,4 @@
 .workspace-switcher>button:hover,.conversation-tabs>button:hover{color:#657e4c;background:#eef3e5}
 .workspace-switcher>button.selected,.conversation-tabs>button.selected{color:#5c7543;background:#fff;border-color:#dce5ce;box-shadow:0 1px 3px #33441105}
 .conversation-tabs{margin:24px 0 8px}
+.sidebar-footer>button{align-items:center;min-height:44px;flex-shrink:0}

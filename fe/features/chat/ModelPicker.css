@@ -1,57 +1,25 @@
-.model-picker{position:relative;display:flex;align-items:center;min-width:0;max-width:100%}
-.model-picker-error{position:absolute;bottom:calc(100% + 8px);left:0;z-index:2;width:max-content;max-width:min(320px,70vw);padding:9px 12px;border:1px solid #ecd7ce;border-radius:7px;background:#fbede7;color:#a56955;font-size:11px;line-height:1.6;overflow-wrap:anywhere}
-.model-picker-compact{flex-wrap:nowrap}
-.model-picker-trigger{display:flex;align-items:center;gap:6px;min-width:0;width:100%;min-height:32px;padding:4px 8px;border-radius:8px;text-align:left;color:#58634b}
-.model-picker-trigger:hover:not(:disabled){background:#eeefe7}
-.model-picker-summary{display:flex;flex-direction:column;gap:2px;min-width:0}
-.model-picker-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:550}
-.model-picker-status{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;color:#929984}
-.model-picker-badge{flex-shrink:0;border-radius:4px;padding:2px 4px;background:#edf1e5;color:#586b45;font-size:10px;white-space:nowrap}
-.model-picker-trigger>svg{transform:rotate(90deg)}
-.model-picker-trigger:disabled{cursor:not-allowed;opacity:.55}
+.model-picker{display:flex;align-items:center;justify-content:flex-end;min-width:0;max-width:100%;margin-left:auto}
+.model-picker-trigger{display:flex;align-items:baseline;justify-content:flex-end;gap:4px;min-width:0;max-width:100%;min-height:32px;padding:6px 8px;border-radius:8px;color:#242424;text-align:right}
+.model-picker-trigger:hover:not(:disabled){background:#00000005}
+.model-picker-trigger:disabled{opacity:.5;cursor:not-allowed}
 .model-picker-trigger:focus-visible{outline:2px solid #72785a;outline-offset:2px}
-.model-picker-trigger>svg{flex-shrink:0;transition:transform .15s ease}
-.model-picker-trigger[aria-expanded=true]>svg{transform:rotate(-90deg)}
-.model-menu{position:fixed;inset:auto;margin:0;padding:0;width:min(344px,calc(100vw - 24px));max-height:calc(100dvh - 24px);border:1px solid #e0e5d4;border-radius:16px;background:#fcfcf8;color:#393e31;box-shadow:0 8px 40px #252f2026;overflow:auto;overscroll-behavior:contain}
-.model-menu::backdrop{background:transparent}
-.model-menu-heading{position:sticky;top:0;z-index:1;display:flex;align-items:center;justify-content:space-between;padding:6px 8px 6px 18px;border-bottom:1px solid #e9ecdf;background:#fcfcf8}
-.model-menu-heading h2{margin:0;font-size:13px;font-weight:600}
-.model-menu-heading>button{display:flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:50%;color:#828576}
-.model-menu-heading>button:hover{background:#eeefe7}
-.model-menu-body{padding:8px}
-.model-menu fieldset{margin:0;padding:0;border:0;min-width:0}
-.model-menu legend{padding:0 8px;margin-bottom:8px;font-size:11px;color:#929984}
-.model-menu-option{position:relative;display:flex;align-items:center;gap:12px;min-height:52px;padding:10px 12px;border:1px solid transparent;border-radius:10px;cursor:pointer}
-.model-menu-option.selected{background:#f0f3e9}
-.model-menu-option:hover{background:#f0f3e9}
-.model-menu-option:focus-within{outline:2px solid #72785a;outline-offset:-2px}
-.model-menu-option>input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer}
-.model-menu-option>span{display:flex;flex:1;flex-direction:column;gap:4px;min-width:0;overflow-wrap:anywhere}
-.model-menu-option strong{font-size:15px;font-weight:550}
-.model-menu-option small{font-size:12px;color:#929984}
-.model-menu-option>svg{color:#5c7543}
-.model-menu-options:disabled .model-menu-option{opacity:.55;cursor:not-allowed}
-.model-menu-unavailable{margin:0 8px 12px;font-size:13px;color:#929984;overflow-wrap:anywhere}
-.model-menu-settings{margin-top:8px;padding:4px 8px 0;border-top:1px solid #e9ecdf}
-.model-menu-settings>summary{display:flex;align-items:center;gap:8px;min-height:44px;cursor:pointer;list-style:none;font-size:13px}
-.model-menu-settings>summary::-webkit-details-marker{display:none}
-.model-menu-settings>summary>span{margin-left:auto;color:#929984;font-size:12px}
-.model-menu-settings>summary>svg{flex-shrink:0}
-.model-menu-settings[open]>summary>svg{transform:rotate(90deg)}
-.model-menu-settings>fieldset{padding-bottom:8px}
-.model-menu-modes{display:flex;gap:4px;padding:4px;border:1px solid #e0e6d5;border-radius:12px;background:#f3f5ed}
-.model-menu-modes>button{flex:1;min-height:44px;border:1px solid transparent;border-radius:8px;font-size:14px;color:#929984}
-.model-menu-modes>button[aria-pressed=true]{background:#fff;border-color:#dce5ce;color:#4c5b3b;box-shadow:0 1px 3px #33441108}
-.model-menu-fast{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px}
-.model-menu-fast>span{display:flex;flex-direction:column;gap:5px;min-width:0}
-.model-menu-fast strong{font-size:14px;font-weight:500}
-.model-menu-fast small{font-size:11px;line-height:1.5;color:#929984}
-.model-menu-fast>button{display:flex;align-items:center;flex-shrink:0;width:52px;height:44px;padding:0 4px}
-.model-menu-fast>button>span{display:block;position:relative;width:44px;height:26px;border-radius:20px;background:#d9dfd0}
-.model-menu-fast>button>span::after{content:'';position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 2px #0002}
-.model-menu-fast>button[aria-checked=true]>span{background:#879b6c}
-.model-menu-fast>button[aria-checked=true]>span::after{left:21px}
-.model-menu-effort{display:flex;justify-content:space-between;gap:8px;margin:14px 0 0;font-size:11px;color:#929984}
-.model-menu-error{padding:10px 12px;border-radius:8px;background:#fbede7;color:#a56955;font-size:12px;line-height:1.6;overflow-wrap:anywhere}
-
-@media(max-width:700px){.model-picker-name{font-size:14px}.model-picker-trigger{min-height:44px;padding:4px 6px}.model-menu-heading h2{font-size:14px}}
+.model-picker-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:550}
+.model-picker-effort{flex-shrink:0;color:#929292;font-size:13px;font-weight:400;white-space:nowrap}
+.model-config{position:fixed;inset:auto 8px max(8px,env(safe-area-inset-bottom));margin:0 auto;padding:0 24px 30px;width:calc(100% - 16px);max-width:430px;max-height:calc(100dvh - 16px - env(safe-area-inset-bottom));overflow:auto;overscroll-behavior:contain;border:1px solid #ffffffa6;border-radius:36px;outline:none;background:#f7f7f8;color:#151515;box-shadow:0 16px 70px #00000018}
+.model-config::backdrop{background:#0003}
+.model-config-handle{width:32px;height:4px;margin:5px auto 19px;border-radius:8px;background:#bcbcbc}
+.model-config h2{margin:0 0 20px;text-align:center;font-size:16px;line-height:22px;font-weight:600}
+.model-config-fields{min-width:0;margin:0;padding:0 18px;border:0;border-radius:26px;background:#eaeaec}
+.model-config-row{position:relative;display:flex;align-items:center;gap:8px;min-width:0;min-height:48px;font-size:16px;line-height:22px;cursor:pointer}
+.model-config-row+.model-config-row{border-top:1px solid #d4d4d6}
+.model-config-row>span:first-child{flex-shrink:0}
+.model-config-value{margin-left:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#727272;text-align:right}
+.model-config-arrows{flex-shrink:0;color:#727272}
+.model-config-row>select{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;font-size:16px}
+.model-config-row:has(select:focus-visible){outline:2px solid #929292;outline-offset:2px;border-radius:6px}
+.model-config-fields:disabled{opacity:.55}
+.model-config-reset{display:block;width:100%;margin-top:30px;min-height:46px;padding:10px 18px;border:0;border-radius:24px;background:#eaeaec;color:#1685f8;font-size:16px;text-align:left}
+.model-config-done{display:block;width:100%;min-height:44px;margin-top:30px;padding:10px 16px;border:0;border-radius:26px;background:#000;color:#fff;font-size:16px;font-weight:600}
+.model-config-reset:disabled,.model-config-done:disabled{opacity:.45;cursor:not-allowed}
+.model-config-error{margin:16px 0 0;color:#a24737;font-size:13px;line-height:1.5;overflow-wrap:anywhere}
+@media(max-width:700px){.model-picker-trigger{min-height:44px;padding:8px 6px}.model-picker-name,.model-picker-effort{font-size:14px}}

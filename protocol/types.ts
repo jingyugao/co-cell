@@ -4,7 +4,8 @@ import type { ThreadEvent, ThreadItem, Usage } from './agent-protocol.js';
 import type { UserInputRequest } from './user-input-types.js';
 import type { InputRequestType } from './input-request-types.js';
 
-export type SessionStatus = 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
+/** A bound thread's execution status is unknown until read from Codex. */
+export type SessionStatus = 'unknown' | 'idle' | 'running' | 'completed' | 'failed' | 'cancelled';
 export interface RetryState {
   attempt: number;
   maxRetries: number;
@@ -262,7 +263,7 @@ export interface Session {
   threadId: string | null;
   /** Verified relative location of the Codex rollout, refreshed when it moves. */
   nativeHistoryPath?: string;
-  /** Transient history refresh failure; the saved transcript remains available. */
+  /** Transient Codex history failure; never replaced with a MySQL transcript. */
   historyError?: string;
   title: string;
   settings: Settings;
@@ -283,7 +284,7 @@ export interface Session {
   imageSelection?: ProjectImageSelection;
   sandbox?: SandboxState;
 }
-export type SessionSummary = Omit<Session, 'turns'> & { turnCount: number };
+export type SessionSummary = Omit<Session, 'turns'>;
 export interface SessionTurnPage { turns: Turn[]; nextCursor: string | null }
 export interface SubagentConversation {
   threadId: string;

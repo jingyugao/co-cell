@@ -250,7 +250,7 @@ const nativeRelay = createNativeRelay({ publicUrl, token: process.env.COCELL_ACC
         outcome: event.message.error ? 'error' : 'received',
         ...(event.message.method === 'thread/tokenUsage/updated' ? { usage: event.message.params?.tokenUsage?.last } : {}) });
     }
-  } }, { name: 'session-projection', observe: event => manager.observeNativeMessage(event) }],
+  } }, { name: 'session-activity', observe: event => manager.observeNativeMessage(event) }],
   onError: error => { void runtimeLog.write({ event: 'app_server.observer_or_transport_failed', error }); },
 });
 closeNativeSandboxConnections = id => nativeRelay.closeSandbox(id);

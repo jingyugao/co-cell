@@ -16,3 +16,10 @@ export interface NativeSessionConnection {
 
 /** Persist the native identity before submitting the first turn. Safe to repeat. */
 export interface BindNativeThreadRequest { threadId: string }
+
+/** Read from Codex thread/queue/list; never reconstructed from CoCell storage. */
+export interface NativeQueuedSubmission {
+  id: string;
+  clientUserMessageId: string;
+  input: Array<{ type: string; text?: string; path?: string; url?: string }>;
+}

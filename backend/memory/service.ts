@@ -140,7 +140,7 @@ export class MemoryService {
         || !['active', 'completed'].includes(project.status ?? 'active') || !project.sandbox
         || project.sandboxOperation && project.sandboxOperation.status !== 'succeeded'
         || project.sandboxBackup && project.sandboxBackup.status !== 'succeeded'
-        || session.settings.executionMode !== 'sandbox' || !session.threadId || !(session.turnCount || session.turns.length)
+        || session.settings.executionMode !== 'sandbox' || !session.threadId
         || session.status === 'running' || session.turns.some(turn => turn.status === 'running')
         || !Number.isFinite(Date.parse(session.updatedAt)) || Date.now() - Date.parse(session.updatedAt) < DAY) continue;
       const boxId = project.sandbox.id;

@@ -36,7 +36,7 @@ import type { InputRequestRecord, InputRequestType } from '../../protocol/input-
 import type { InputRequestHook } from '../../packages/agentcore/src/index.mjs';
 import type { NativeSessionConnection } from '../../protocol/native-app-server.js';
 import type { NativeRelayEvent } from '../execution/native-relay.js';
-import { normalizeNativeEvents } from './native-events.js';
+import { sessionMetadata } from '../../util/session-metadata.js';
 import type { CompactionContent, CompactionSelector } from '../../protocol/types.js';
 
 export type { CodexClient } from '../execution/runner.js';
@@ -104,8 +104,6 @@ export class SessionManager {
   private autoCheckpointAfterMs: number;
   private mutations = new Map<string, number>();
   private subscriptionPolls = new Map<string, SubscriptionWatch>();
-  private nativeObservation?: Promise<void>;
-  private nativeObservationTimer?: ReturnType<typeof setInterval>;
 
   constructor(
     private client: CodexClient,
@@ -181,7 +179,7 @@ export class SessionManager {
     this.refreshing = (async () => {
       await this.projects.refresh(new Set(this.mutations.keys()));
       const baselines = new Map(this.savedSessions);
-      const sessions = await this.state.listSessions();
+      const sessions = (await this.state.listSessions()).map(session => this.isNativeSession(session) ? sessionMetadata(session) : session);
       const stored = new Map(sessions.map(session => [session.id, session]));
       const ids = new Set([...sessions.map(session => session.id), ...this.sessions.keys()]);
       await Promise.all([...ids].map(id => this.writer.run(id, async () => {
@@ -266,7 +264,7 @@ export class SessionManager {
   }
 
   private async recoverSharedExecutions() {
-    if (!this.coordinator || this.closing || this.reconciling) return;
+    if (!this.coordinator || this.nativeWebSocketEnabled || this.closing || this.reconciling) return;
     this.reconciling = (async () => {
       await this.refreshSharedState();
       for (const candidate of [...this.sessions.values()]) {
@@ -322,7 +320,8 @@ export class SessionManager {
   async init() {
     await this.state.init();
     await this.projects.init();
-    for (const session of await this.state.listSessions()) {
+    for (const stored of await this.state.listSessions()) {
+      const session = this.isNativeSession(stored) ? sessionMetadata(stored) : stored;
       this.savedSessions.set(session.id, structuredClone(session));
       // Invalid state is reported rather than silently overwriting someone's history.
       if (!session.id || !Array.isArray(session.turns) || !session.settings) {
@@ -390,8 +389,6 @@ export class SessionManager {
           changed = true;
         }
       }
-      if (this.isNativeSession(session) && changed)
-        session.status = session.turns.some(turn => turn.status === 'running') ? 'running' : session.turns.at(-1)?.status ?? 'idle';
       if (!this.coordinator && !this.isNativeSession(session) && (session.status === 'running' || session.turns.some(turn => turn.status === 'running' || this.canRecover(session, turn)))) {
         changed = true;
         for (const turn of session.turns.filter(t => t.status === 'running' || this.canRecover(session, t))) {
@@ -423,18 +420,7 @@ export class SessionManager {
         void this.startQueuedUserInput(session.id).catch(error => console.error('Queued input recovery failed:', error));
     }
     this.lifecycle?.start();
-    if (this.nativeWebSocketEnabled) {
-      // Reconcile projections only: never submit input, interrupt, or claim an execution.
-      await this.observeNativeSessions(true);
-      let scans = 0;
-      this.nativeObservationTimer = setInterval(() => {
-        // A missed start can leave durable state idle. Periodically check all
-        // bound threads, including those whose live transaction never committed.
-        void this.observeNativeSessions(++scans % 12 === 0).catch(error => console.error('Native observation failed:', error.message));
-      }, 5000);
-      this.nativeObservationTimer.unref();
-    }
-    if (this.coordinator) {
+    if (this.coordinator && !this.nativeWebSocketEnabled) {
       await this.recoverSharedExecutions();
       this.recoveryTimer = setInterval(() => {
         void this.recoverSharedExecutions().catch(error => console.error('Shared execution recovery failed:', error.message));
@@ -503,52 +489,17 @@ export class SessionManager {
     });
   }
 
-  /** The database transaction owns deduplication and business effects. */
+  /** Observe activity only; conversation contents and execution remain in Codex. */
   async observeNativeMessage(event: NativeRelayEvent): Promise<void> {
-    await this.persistNativeMessage(event);
-  }
-
-  private async persistNativeMessage(event: NativeRelayEvent): Promise<Session | undefined> {
-    const events = normalizeNativeEvents(event);
-    if (!events.length) return undefined;
-    if (!this.state.consumeNativeEvents) throw new Error('Native events require transactional storage');
-    return this.state.consumeNativeEvents(events);
-  }
-
-  private async observeNativeSessions(initial = false) {
-    if (this.closing || this.nativeObservation) return this.nativeObservation;
-    this.nativeObservation = (async () => {
-      for (const session of await this.state.listSessions()) {
-        if (this.closing) return;
-        if (!this.isNativeSession(session) || !session.threadId || !session.sandbox || (!initial && session.status !== 'running')) continue;
-        try {
-          const known = new Map(session.turns.map(turn => [turn.nativeTurnId ?? turn.id, turn]));
-          const running = new Set(session.turns.filter(turn => turn.status === 'running').map(turn => turn.nativeTurnId ?? turn.id));
-          const cursors = new Set<string>();
-          let cursor: string | undefined, boundary = false;
-          do {
-            const page = await this.sandbox!.history(structuredClone(session), { limit: initial ? 20 : 1, ...(cursor ? { cursor } : {}) });
-            for (const turn of page.turns) {
-              const previous = known.get(turn.id);
-              boundary ||= !!previous;
-              running.delete(turn.id);
-              if (previous?.status === turn.status && previous.codexAccepted && (previous.prompt || !turn.prompt)) continue;
-              await this.observeNativeMessage({ sessionId: session.id, connectionId: 'history', direction: 'server',
-                receivedAt: Date.now(), message: { method: turn.status === 'running' ? 'turn/started' : 'turn/completed',
-                  params: { threadId: session.threadId, turn: { id: turn.id,
-                    status: turn.status === 'running' ? 'inProgress' : turn.status === 'cancelled' ? 'interrupted' : turn.status,
-                    prompt: turn.prompt, startedAt: Date.parse(turn.startedAt) / 1000,
-                    completedAt: turn.completedAt ? Date.parse(turn.completedAt) / 1000 : undefined,
-                    ...(turn.error ? { error: { message: turn.error } } : {}) } } } });
-            }
-            cursor = page.nextCursor ?? undefined;
-            if (cursor && cursors.has(cursor)) throw new Error('App Server returned a repeated history cursor');
-            if (cursor) cursors.add(cursor);
-          } while (initial && cursor && (!boundary || running.size));
-        } catch (error) { void this.logger?.write({ event: 'session.native_projection_failed', sessionId: session.id, error }); }
-      }
-    })();
-    try { await this.nativeObservation; } finally { this.nativeObservation = undefined; }
+    if (event.direction !== 'server' || !['turn/started', 'turn/completed'].includes(event.message.method ?? '')) return;
+    await this.writer.run(event.sessionId, async () => {
+      const session = await this.state.getSession(event.sessionId);
+      if (!session || !this.isNativeSession(session) || session.threadId !== event.message.params?.threadId) return;
+      if (event.receivedAt <= Date.parse(session.updatedAt)) return;
+      const metadata = sessionMetadata(session);
+      metadata.updatedAt = new Date(event.receivedAt).toISOString();
+      await this.state.saveSession(metadata, sessionMetadata(session), true);
+    });
   }
 
   private reserveTurn(session: Session, lease?: SharedLease): ActiveExecution {
@@ -681,10 +632,23 @@ export class SessionManager {
   }
 
   async answerUserInput(id: string, turnId: string, requestId: string, answer: string, answers?: string[]): Promise<Session> {
-    if (this.isNativeSession(this.lookup(id))) {
+    if (this.isNativeSession(await this.readMetadata(id))) {
       const session = await this.read(id);
-      const request = session.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId)
+      let request = session.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId)
         ?.userInputRequests?.find(value => value.id === requestId);
+      const answersFromHistory: NativeUserInputAnswers = new Map();
+      collectNativeUserInputAnswers(session.turns, answersFromHistory);
+      let cursor = session.historyNextCursor;
+      const cursors = new Set<string>();
+      while (!request && cursor) {
+        if (cursors.has(cursor)) throw new HttpError(502, 'Codex 返回重复的历史游标');
+        cursors.add(cursor);
+        const page = await this.olderTurns(id, cursor);
+        collectNativeUserInputAnswers(page.turns, answersFromHistory);
+        request = page.turns.map(turn => withNativeUserInput(turn, answersFromHistory))
+          .find(turn => turn.id === turnId || turn.nativeTurnId === turnId)?.userInputRequests?.find(value => value.id === requestId);
+        cursor = page.nextCursor;
+      }
       if (!request) throw new HttpError(404, '问题不存在');
       if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
       const values = answers ?? [answer];
@@ -794,8 +758,9 @@ export class SessionManager {
 
   async readMetadata(id: string): Promise<Session> {
     if (this.deleting.has(id)) throw new HttpError(409, '会话正在删除');
-    const stored = await this.state.getSession(id);
+    let stored = await this.state.getSession(id);
     if (!stored) throw new HttpError(404, '会话不存在');
+    if (this.isNativeSession(stored)) stored = sessionMetadata(stored);
     if (stored.projectId) await this.projects.refreshOne(stored.projectId);
     if (this.active.has(id) && !this.isNativeSession(stored)) return this.get(id);
     // Legacy synchronous helpers receive a request-local baseline, never an observer update.
@@ -805,18 +770,18 @@ export class SessionManager {
   }
 
   async listStored(): Promise<SessionSummary[]> {
-    const sessions = await this.state.listSessions();
+    const sessions = (await this.state.listSessions()).map(session => this.isNativeSession(session) ? sessionMetadata(session) : session);
     return sessions.map(stored => this.active.has(stored.id) && !this.isNativeSession(stored)
       ? this.get(stored.id) : stored)
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-      .map(({ turns, ...session }) => ({ ...session, turnCount: session.settings.executionMode === 'sandbox'
-        ? Math.max(session.turnCount ?? 0, turns.filter(turn => turn.codexAccepted).length) : turns.length }));
+      .map(({ turns, ...session }) => this.isNativeSession({ ...session, turns }) ? session
+        : { ...session, turnCount: turns.length });
   }
 
   list(): SessionSummary[] {
     return [...this.sessions.values()].map(session => this.hydrate(session)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-      .map(({ turns, ...session }) => structuredClone({ ...session, turnCount: session.settings.executionMode === 'sandbox'
-        ? Math.max(session.turnCount ?? 0, turns.filter(turn => turn.codexAccepted).length) : turns.length }));
+      .map(({ turns, ...session }) => structuredClone(this.isNativeSession({ ...session, turns }) ? session
+        : { ...session, turnCount: turns.length }));
   }
 
   private async liveProject(project: Project, allowUnknown = false): Promise<Project> {
@@ -866,8 +831,28 @@ export class SessionManager {
     const turns = session.settings.executionMode === 'sandbox' ? session.turns.slice(-1) : session.turns;
     return structuredClone({ ...session, turns, historyError: this.historyErrors.get(id) });
   }
+  private async readNativeSession(metadata: Session): Promise<Session> {
+    const session = await this.refreshSessionSandbox(metadata);
+    if (!session.threadId) return { ...sessionMetadata(session), historyNextCursor: null };
+    try {
+      const page = await this.readSandboxHistory(session, { limit: 20 });
+      const turns = page.turns.map(turn => withNativeUserInput(turn)).sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+      const answers: NativeUserInputAnswers = new Map();
+      collectNativeUserInputAnswers(turns, answers);
+      return { ...sessionMetadata(session), turns: turns.map(turn => withNativeUserInput(turn, answers)),
+        status: turns.some(turn => turn.status === 'running') ? 'running' : turns.at(-1)?.status ?? 'idle',
+        historyNextCursor: page.nextCursor ?? null };
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 409) throw error;
+      void this.logger?.write({ event: 'session.native_history_failed', sessionId: session.id, error });
+      return { ...sessionMetadata(session), historyNextCursor: null,
+        historyError: '历史消息暂时无法从 Codex 加载，请确认项目 Sandbox 可用后刷新重试。' };
+    }
+  }
+
   async read(id: string): Promise<Session> {
     const session = await this.readMetadata(id);
+    if (this.isNativeSession(session)) return this.readNativeSession(session);
     if (session.settings.executionMode === 'sandbox') {
       const snapshot = await this.snapshot(id);
       if (!session.threadId) {
@@ -920,6 +905,7 @@ export class SessionManager {
     const session = await this.readMetadata(id);
     if (session.settings.executionMode !== 'sandbox' || !session.threadId) throw new HttpError(400, '此会话没有可分页的 Sandbox 历史');
     const page = await this.readSandboxHistory(session, { cursor, limit: 20 });
+    if (this.isNativeSession(session)) return { turns: page.turns.map(turn => withNativeUserInput(turn)).sort((a, b) => a.startedAt.localeCompare(b.startedAt)), nextCursor: page.nextCursor ?? null };
     const result = { turns: this.withUserInputHistory(session, page.turns.map(turn => withNativeUserInput({ ...turn,
       userInputRequests: session.turns.find(old => old.id === turn.id || old.nativeTurnId === turn.id)?.userInputRequests ?? turn.userInputRequests,
     })).sort((left, right) => left.startedAt.localeCompare(right.startedAt))), nextCursor: page.nextCursor ?? null };
@@ -1365,15 +1351,13 @@ export class SessionManager {
           // Observations are asynchronous and may be dropped under pressure.
           // Check the execution authority before an automatic lifecycle action.
           let nativeBusy = false;
-          for (const session of this.sessions.values()) {
-            if (session.projectId !== project.id || !this.isNativeSession(session) || !session.threadId) continue;
+          if (this.nativeWebSocketEnabled) {
             try {
-              const page = await this.sandbox!.history(structuredClone(session), { limit: 1 });
-              if (page.turns.some(turn => turn.status === 'running')) { nativeBusy = true; break; }
+              // An unavailable status query must never authorize automatic suspension.
+              nativeBusy = !this.sandbox?.hasActiveThreads || await this.sandbox.hasActiveThreads(observed.sandbox);
             } catch (error) {
               nativeBusy = true;
               void this.logger?.write({ event: 'sandbox.auto_checkpoint_observation_failed', projectId: project.id, error });
-              break;
             }
           }
           if (nativeBusy) continue;
@@ -1395,7 +1379,7 @@ export class SessionManager {
   }
 
   private async ensureProjectSandbox(id: string): Promise<void> {
-    await this.refreshSharedState();
+    await this.projects.refreshOne(id);
     this.projects.assertAvailable(id);
     const project = await this.liveProject(this.projects.get(id));
     if (project.status === 'archived') {
@@ -1589,6 +1573,17 @@ export class SessionManager {
     } finally { release(); }
   }
 
+  private async assertNativeIdle(session: Session): Promise<void> {
+    if (!this.isNativeSession(session) || !session.threadId || !session.sandbox) return;
+    const sandbox = await querySandbox(this.sandbox, session.sandbox, true);
+    if (sandbox.status === 'paused') return;
+    if (sandbox.status !== 'ready') throw new HttpError(409, '无法确认 Codex 的执行状态，请恢复 Sandbox 后重试');
+    const response = await this.sandbox!.nativeRequest!(session, 'thread/read', { threadId: session.threadId, includeTurns: false });
+    const status = response.thread?.status?.type;
+    if (status === 'active') throw new HttpError(409, '请先停止当前任务');
+    if (status !== 'idle' && status !== 'notLoaded') throw new HttpError(409, '无法确认 Codex 的执行状态');
+  }
+
   async update(id: string, input: { title?: string; settings?: Partial<Settings>; archived?: boolean }): Promise<Session> {
     return this.sessionMutation(id, () => this.updateLocal(id, input), false);
   }
@@ -1600,6 +1595,7 @@ export class SessionManager {
       this.projects.assertAvailable(projectId);
     }
     const session = this.lookup(id);
+    await this.assertNativeIdle(session);
     if (this.active.has(id) || session.status === 'running') throw new HttpError(409, '请先停止当前任务再修改会话');
     if (input.archived && session.turns.some(turn => turn.status === 'running')) {
       throw new HttpError(409, '请先停止当前任务再归档会话');
@@ -1629,6 +1625,7 @@ export class SessionManager {
 
   private async deleteLocal(id: string) {
     const session = this.lookup(id);
+    await this.assertNativeIdle(session);
     if (this.active.has(id) || session.status === 'running') throw new HttpError(409, '请先停止当前任务');
     const release = this.projects.acquire(session.projectId);
     this.deleting.add(id);
@@ -1748,6 +1745,14 @@ export class SessionManager {
   }
 
   private save(session: Session): Promise<void> {
+    if (this.isNativeSession(session)) {
+      const metadata = sessionMetadata(session);
+      return this.writer.run(session.id, async () => {
+        const previous = this.savedSessions.get(session.id);
+        await this.state.saveSession(metadata, previous ? sessionMetadata(previous) : undefined, true);
+        this.savedSessions.set(session.id, structuredClone(metadata));
+      });
+    }
     // Persist submitted inputs, control boundaries and statistics. Native
     // App Server history owns the output; never copy it into MySQL snapshots.
     const turns = session.turns.map(turn => ({
@@ -1827,9 +1832,7 @@ export class SessionManager {
     const result = await this.sandbox!.nativeRequest!(session, method, params);
     const nativeId = result.turn?.id ?? result.turnId ?? running?.id;
     if (!nativeId) throw new HttpError(502, 'App Server 未返回执行标识，接收状态未知，请检查会话');
-    const stored = await this.persistNativeMessage({ sessionId: id, connectionId: `http:${randomUUID()}`, direction: 'server',
-      receivedAt: Date.now(), request: { id: 1, method, params }, message: { id: 1, result } });
-    return stored?.turns.find(turn => turn.nativeTurnId === nativeId)?.id ?? nativeId;
+    return nativeId;
   }
 
   async startTurn(id: string, prompt: string, images: string[] = []): Promise<string> {
@@ -2127,8 +2130,6 @@ export class SessionManager {
 
   async close() {
     this.closing = true;
-    clearInterval(this.nativeObservationTimer);
-    await this.nativeObservation;
     clearInterval(this.recoveryTimer);
     for (const poll of this.subscriptionPolls.values()) { clearInterval(poll.timer); poll.observation?.controller.abort(); }
     await Promise.allSettled([...this.subscriptionPolls.values()].map(poll => poll.pending));

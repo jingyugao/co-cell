@@ -330,8 +330,7 @@ export class ReportService {
       signal.throwIfAborted();
       const project = session.projectId ? byProject.get(session.projectId) : undefined;
       if (!project || !session.threadId || session.settings.executionMode !== 'sandbox'
-        || !(session.turnCount || session.turns.length)
-        || session.status !== 'running' && Date.parse(session.updatedAt) < instant(report.periodStart).getTime()) continue;
+        || !['running', 'unknown'].includes(session.status) && Date.parse(session.updatedAt) < instant(report.periodStart).getTime()) continue;
       const source: ReportSource = { sessionId: session.id, projectId: project.id, projectName: project.name,
         sessionTitle: session.title, sourceUpdatedAt: session.updatedAt, status: 'empty' };
       try {

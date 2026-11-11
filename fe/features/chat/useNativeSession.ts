@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { markPageLoad, pageLoadFailure } from '../../lib/page-load';
-import type { NativeSessionConnection } from '../../../protocol/native-app-server';
+import type { NativeSessionConnection, NativeQueuedSubmission } from '../../../protocol/native-app-server';
 import type { Session, Turn } from '../../../protocol/types';
 import type { UserInputRequest } from '../../../protocol/user-input-types';
 import { applySdkEvent } from '../../../util/session-events';
@@ -23,6 +23,8 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   onError: (error: string) => void;
 }) {
   const [connected, setConnected] = useState(false);
+  const [queuedSubmissions, setQueuedSubmissions] = useState<NativeQueuedSubmission[]>([]);
+  const queueRevision = useRef(0);
   const connectedRef = useRef(false);
   const clientRef = useRef<NativeAppServerClient | null>(null);
   const sessionRef = useRef(session); sessionRef.current = session;
@@ -46,6 +48,31 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   const threadBoundRef = useRef(false);
   const selectedRef = useRef(selected); selectedRef.current = selected;
   const nativeQuestions = useRef(new Map<string, NativeQuestion>());
+
+  const refreshQueue = useCallback(async () => {
+    const client = clientRef.current, threadId = threadRef.current;
+    const revision = ++queueRevision.current;
+    if (!client || !threadId) { setQueuedSubmissions([]); return; }
+    try {
+      const items: NativeQueuedSubmission[] = [], cursors = new Set<string>();
+      let cursor: string | undefined;
+      do {
+        const page = await client.request('thread/queue/list', { threadId, limit: 100, ...(cursor ? { cursor } : {}) });
+        if (revision !== queueRevision.current || client !== clientRef.current || threadId !== threadRef.current) return;
+        if (!Array.isArray(page.data)) throw new Error('Codex 未返回待执行消息列表');
+        items.push(...page.data);
+        cursor = page.nextCursor ?? undefined;
+        if (cursor && cursors.has(cursor)) throw new Error('Codex 返回重复的队列游标');
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      setQueuedSubmissions(items);
+    } catch (error) {
+      if (client !== clientRef.current || revision !== queueRevision.current) return;
+      // Older App Servers do not expose the experimental queue API.
+      if (String((error as { code?: string }).code) === '-32601') { setQueuedSubmissions([]); return; }
+      errorRef.current(errorMessage(error));
+    }
+  }, []);
 
   const withNativeQuestions = useCallback((current: Session): Session => ({ ...current, turns: current.turns.map(turn => {
     const questions = [...nativeQuestions.current.values()].filter(question => question.sessionId === current.id
@@ -95,6 +122,13 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   const applyEvent = useCallback((message: { method?: string; params?: Record<string, any> }) => {
     const method = message.method ?? ''; const params = message.params ?? {};
     if (params.threadId && params.threadId !== threadRef.current) return;
+    if (method === 'thread/tokenUsage/updated' && params.tokenUsage?.last) {
+      const usage = params.tokenUsage.last;
+      setSessionRef.current(current => current?.id === selectedRef.current ? { ...current, contextUsage: {
+        inputTokens: usage.inputTokens ?? 0, cachedInputTokens: usage.cachedInputTokens ?? 0,
+        outputTokens: usage.outputTokens ?? 0, observedAt: new Date().toISOString(),
+      } } : current);
+    }
     if (method === 'serverRequest/resolved' || method === 'turn/completed') {
       for (const question of nativeQuestions.current.values()) {
         if (question.request.status === 'pending' && (method === 'serverRequest/resolved'
@@ -168,6 +202,9 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   }, [refreshHistory, withNativeQuestions]);
 
   const acceptEvent = useCallback((message: { method?: string; params?: Record<string, any> }) => {
+    if (message.method === 'thread/queue/changed' && message.params?.threadId === threadRef.current) {
+      void refreshQueue(); return;
+    }
     if (bufferingEvents.current) {
       const params = message.params ?? {};
       if (params.threadId && params.threadId !== threadRef.current) return;
@@ -177,9 +214,11 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
       return;
     }
     applyEvent(message);
-  }, [applyEvent]);
+  }, [applyEvent, refreshQueue]);
 
   useEffect(() => {
+    ++queueRevision.current;
+    setQueuedSubmissions([]);
     if (!enabled || !selected) { markConnected(false); return; }
     pendingSteers.current = []; observedUserItems.current.clear();
     for (const [key, question] of nativeQuestions.current) if (question.sessionId !== selected) nativeQuestions.current.delete(key);
@@ -228,6 +267,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
         await attemptClient.connect(connection.threadId);
         markPageLoad('websocketConnectedMs', id);
         if (!alive || attempt !== generation || client !== attemptClient) { attemptClient.close(); return; }
+        void refreshQueue();
         const { value: history, quiet } = connection.threadId === null
           ? { value: nativeIds(connection.session), quiet: true }
           : await (async () => {
@@ -310,7 +350,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
       window.removeEventListener('pageshow', onPageShow);
       alive = false; generation++; refreshConnectionRef.current = null; bufferingEvents.current = false; if (retryTimer) clearTimeout(retryTimer); client?.close(); if (clientRef.current === client) clientRef.current = null; if (connectionRef.current?.session.id === id) connectionRef.current = null; markConnected(false);
     };
-  }, [selected, enabled, acceptEvent, acceptServerRequest, mergeHistory, refreshHistory, withNativeQuestions]);
+  }, [selected, enabled, acceptEvent, acceptServerRequest, mergeHistory, refreshHistory, refreshQueue, withNativeQuestions]);
 
   const send = useCallback(async (prompt: string, images: string[] = [], options: { expectedTurnId?: string; forceStart?: boolean } = {}) => {
     const client = clientRef.current; const current = sessionRef.current;
@@ -428,5 +468,5 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
     await refresh();
   }, []);
 
-  return { connected, waitUntilConnected, refreshConnection, send, stop, answer };
+  return { connected, queuedSubmissions, waitUntilConnected, refreshConnection, send, stop, answer };
 }

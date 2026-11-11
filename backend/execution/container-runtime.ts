@@ -54,6 +54,8 @@ export interface SandboxRuntime {
   querySandbox?(sandbox: SandboxState): Promise<SandboxState>;
   /** Display-only batch observation; does not perform execution validation. */
   querySandboxes?(sandboxes: SandboxState[]): Promise<SandboxState[]>;
+  /** Lifecycle preflight only; never loads conversation bodies. */
+  hasActiveThreads?(sandbox: SandboxState, signal?: AbortSignal): Promise<boolean>;
   history(session: Session, options?: { cursor?: string; limit?: number; signal?: AbortSignal }): Promise<NativeHistory>;
   subagents?(session: Session, signal?: AbortSignal): Promise<SubagentConversation[]>;
   delete(session: WorkspaceTarget): Promise<void>;
@@ -370,13 +372,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         // Create an initial thread on the browser's own socket, immediately
         // before its first turn. Empty paginated threads cannot be cold-resumed.
         if (!session.threadId) return null;
-        let response;
-        try { response = await client.request('thread/resume', { ...threadOptions, threadId: session.threadId, excludeTurns: true }); }
-        catch (error) {
-          const noAcceptedInput = !session.turnCount && !session.turns.some(turn => turn.codexAccepted);
-          if (noAcceptedInput && error instanceof Error && /no rollout found|missing source rollout/.test(error.message)) return null;
-          throw error;
-        }
+        const response = await client.request('thread/resume', { ...threadOptions, threadId: session.threadId, excludeTurns: true });
         if (session.threadId && model?.modelProvider && response.modelProvider && response.modelProvider !== model.modelProvider) {
           const forked = await client.request('thread/fork', { ...threadOptions, threadId: session.threadId });
           return forked.thread.id as string;
@@ -400,9 +396,11 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async nativeRequest(session: Session, method: string, params: unknown) {
     if (!session.sandbox) throw new HttpError(409, '项目没有 Sandbox');
     return this.reader.read(session.sandbox.id, async client => {
-      if (!['thread/start', 'thread/read'].includes(method) && session.threadId
-        && (session.turnCount || session.turns.some(turn => turn.codexAccepted)))
-        await client.threadResume({ threadId: session.threadId, excludeTurns: true });
+      if (!['thread/start', 'thread/read'].includes(method) && session.threadId) {
+        const { thread } = await client.request('thread/read', { threadId: session.threadId, includeTurns: false });
+        if (thread.status?.type === 'notLoaded')
+          await client.threadResume({ threadId: session.threadId, excludeTurns: true });
+      }
       return client.request(method, params);
     });
   }
@@ -500,6 +498,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         if (!hasOriginalPrompt) {
           turn.prompt = text;
           turn.userInputItemId = item.id;
+          turn.images = (item.content ?? []).flatMap((part: any) =>
+            part.type === 'localImage' && typeof part.path === 'string' ? [part.path]
+              : part.type === 'image' && typeof part.url === 'string' ? [part.url] : []);
           hasOriginalPrompt = true;
         } else {
           (turn.additionalUserInputs ??= []).push(text);
@@ -731,6 +732,27 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         ...(options.cursor ? { cursor: options.cursor } : {}) });
       return { turns: (response.data ?? []).map((rawTurn: any) => this.mapAppServerTurn(rawTurn)), nextCursor: response.nextCursor ?? null };
     }, options.signal).catch(error => { throw this.safeError(error); });
+  }
+
+  async hasActiveThreads(sandbox: SandboxState, signal = AbortSignal.timeout(10_000)): Promise<boolean> {
+    return this.reader.read(sandbox.id, async client => {
+      let cursor: string | undefined;
+      const cursors = new Set<string>();
+      do {
+        const page = await client.request('thread/loaded/list', { limit: 100, ...(cursor ? { cursor } : {}) });
+        if (!Array.isArray(page.data)) throw new Error('Codex 未返回已加载线程列表');
+        for (const threadId of page.data) {
+          const response = await client.request('thread/read', { threadId, includeTurns: false });
+          const status = response.thread?.status?.type;
+          if (status === 'active') return true;
+          if (status !== 'idle' && status !== 'notLoaded') throw new Error('无法确认 Codex 线程是否空闲');
+        }
+        cursor = page.nextCursor ?? undefined;
+        if (cursor && cursors.has(cursor)) throw new Error('Codex 返回重复的线程游标');
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      return false;
+    }, signal);
   }
   async steer(session: Session, turn: Turn, text: string, onInputRequest?: InputRequestHook): Promise<boolean> {
     if (!session.sandbox || !session.threadId || !turn.nativeTurnId) return false;

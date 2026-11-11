@@ -84,7 +84,8 @@ export class ConversationMaterialCollector {
     const source: MaterialSource = { sessionId: session.id, threadId: session.threadId,
       sourceUpdatedAt: session.updatedAt, boxId: initial.boxId! };
 
-    if (session.status !== 'running') {
+    // Binding timestamps cannot establish freshness for an unobserved Codex thread.
+    if (session.status !== 'running' && session.status !== 'unknown') {
       const cached = await this.options.materials.cached(source);
       if (cached) { await this.source(session, source); return cached; }
     }

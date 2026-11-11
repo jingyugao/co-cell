@@ -16,6 +16,7 @@ import { MySqlNotificationRepository, saveNotificationsInTransaction } from '../
 import { applyNativeEvent, type NativeBusinessEvent } from '../../sessions/native-events.js';
 import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../../util/user-input.js';
 import { HttpError } from '../../../util/errors.js';
+import { sessionMetadata } from '../../../util/session-metadata.js';
 import { mergeRecord } from './record-merge.js';
 import { date, fromJson, iso, inputRequestFromRow, mainTurnValues, projectFromRow, projectValues, PROJECT_COLUMNS, requestTurnValues, SESSION_COLUMNS, sessionFromRow, sessionValues, turnFromRow, type SessionTurnRow } from './relational-records.js';
 
@@ -198,22 +199,23 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   }
   async listSessions(): Promise<Session[]> {
     const [rows] = await this.pool.query<Array<RowDataPacket & Record<string, unknown>>>(`SELECT ${SESSION_COLUMNS} FROM sessions`);
-    return this.hydrateSessions(rows, this.pool, false);
+    return this.hydrateSessions(rows);
   }
   async listProjectSessions(projectId: string): Promise<Session[]> {
     const [rows] = await this.pool.query<Array<RowDataPacket & Record<string, unknown>>>(
       `SELECT ${SESSION_COLUMNS} FROM sessions WHERE project_id = ?`, [projectId]);
-    return this.hydrateSessions(rows, this.pool, false);
+    return this.hydrateSessions(rows);
   }
-  private async hydrateSessions(rows: Array<Record<string, unknown>>, executor: Pick<Pool, 'query'> = this.pool, nativeMetadata = true): Promise<Session[]> {
+  private async hydrateSessions(rows: Array<Record<string, unknown>>, executor: Pick<Pool, 'query'> = this.pool): Promise<Session[]> {
     if (!rows.length) return [];
-    const ids = rows.map(row => String(row.id));
+    // Native threads never hydrate conversation content from the CoCell database.
+    const ids = rows.filter(row => row.execution_mode !== 'sandbox').map(row => String(row.id));
     const placeholders = ids.map(() => '?').join(',');
-    const [turnRows] = await executor.query<Array<RowDataPacket & SessionTurnRow>>(
+    const [turnRows] = ids.length ? await executor.query<Array<RowDataPacket & SessionTurnRow>>(
       `SELECT id,session_id,target_turn_id,type,input_text,images_json,native_turn_id,codex_accepted,turn_status,input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens,sdk_input_tokens,sdk_cached_input_tokens,sdk_cache_write_input_tokens,sdk_output_tokens,sdk_reasoning_output_tokens,started_at,completed_at,error
        FROM session_turns st WHERE st.session_id IN (${placeholders}) AND st.id=st.target_turn_id AND
        (st.turn_status='running' OR st.id=(SELECT st2.id FROM session_turns st2 WHERE st2.session_id=st.session_id AND st2.id=st2.target_turn_id
-       ORDER BY st2.started_at DESC,st2.id DESC LIMIT 1)) ORDER BY started_at`, ids);
+       ORDER BY st2.started_at DESC,st2.id DESC LIMIT 1)) ORDER BY started_at`, ids) : [[]];
     const bySession = new Map<string, Turn[]>();
     for (const row of turnRows) { const list = bySession.get(row.session_id) ?? []; list.push(turnFromRow(row)); bySession.set(row.session_id, list); }
     const projects = new Map<string, Project>();
@@ -224,13 +226,14 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       for (const row of projectRows) projects.set(String(row.id), projectFromRow(row));
     }
     const sessions = rows.map(row => {
-      const session = sessionFromRow(row); session.turns = bySession.get(session.id) ?? [];
+      const decoded = sessionFromRow(row);
+      const session = decoded.settings.executionMode === 'sandbox' ? sessionMetadata(decoded) : decoded;
+      session.turns = bySession.get(session.id) ?? [];
       const project = session.projectId ? projects.get(session.projectId) : undefined;
       if (project?.sandbox) session.sandbox = project.sandbox;
       if (project?.imageSelection) session.imageSelection = project.imageSelection;
       return session;
     });
-    if (nativeMetadata) await this.hydrateNativeMetadata(sessions, executor);
     return sessions;
   }
 
@@ -367,7 +370,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   }
   saveSession(session: Session, previous?: Session, metadataOnly = false): Promise<void> {
     if (previous && previous.id !== session.id) return Promise.reject(new HttpError(409, '不能将记录基线用于其他记录'));
-    return this.saveSessionRelational(session, previous, metadataOnly);
+    return this.saveSessionRelational(session, previous, metadataOnly || session.settings.executionMode === 'sandbox');
   }
   async saveInputRequest(request: InputRequestRecord): Promise<void> {
     const connection = await this.pool.getConnection();
@@ -499,11 +502,8 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
         const latest = sessionFromRow(found[0]);
         effective = { ...mergeRecord(this.sessionMergeShape(previous), this.sessionMergeShape(session), this.sessionMergeShape(latest)), turns: session.turns } as Session;
       }
-      if (metadataOnly && found[0]) {
-        const latest = sessionFromRow(found[0]);
-        effective = { ...effective, status: latest.status, turnCount: latest.turnCount, contextUsage: latest.contextUsage };
-      }
-      await this.saveSessionRow(connection, effective);
+      if (metadataOnly) effective = { ...sessionMetadata(effective), status: 'idle', turnCount: 0 };
+      await this.saveSessionRow(connection, effective, metadataOnly);
       // Save only the active/control turns already present in the web session. Native history
       // loaded for display is never imported; existing rows remain untouched when omitted.
       const turns = effective.turns ?? [];
@@ -513,10 +513,11 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     } catch (error) { await connection.rollback().catch(() => undefined); throw error; }
     finally { connection.release(); }
   }
-  private async saveSessionRow(executor: Pick<Pool, 'query'>, session: Session) {
+  private async saveSessionRow(executor: Pick<Pool, 'query'>, session: Session, metadataOnly = false) {
     const cols = SESSION_COLUMNS.split(',').map(column => column.trim()).filter(Boolean);
     const values = sessionValues(session);
-    const updates = cols.slice(1).map(column => column === 'turn_count' ? 'turn_count=GREATEST(turn_count,VALUES(turn_count))' : `${column}=VALUES(${column})`).join(',');
+    const updates = cols.slice(1).filter(column => !metadataOnly || (column !== 'status' && column !== 'turn_count' && !column.startsWith('context_')))
+      .map(column => column === 'turn_count' ? 'turn_count=GREATEST(turn_count,VALUES(turn_count))' : `${column}=VALUES(${column})`).join(',');
     await executor.query(`INSERT INTO sessions (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')}) ON DUPLICATE KEY UPDATE ${updates}`, values);
   }
   private projectMergeShape(project: Project): Project {

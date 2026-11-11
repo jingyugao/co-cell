@@ -3,6 +3,7 @@ import type { Session, SessionTurnPage, StreamMessage, Turn } from '../../../pro
 import { applySdkEvent } from '../../../util/session-events';
 import { api, errorMessage } from '../../lib/api';
 import { markPageLoad, pageLoadFailure } from '../../lib/page-load';
+import { collectNativeUserInputAnswers, withNativeUserInput, type NativeUserInputAnswers } from '../../../util/user-input';
 
 function applyStream(current: Session | null, data: StreamMessage): Session | null {
   if (data.type === 'snapshot' || data.type === 'state') return data.session;
@@ -33,6 +34,7 @@ function preserveClientFailures(canonical: Session, current: Session | null): Se
 
 export function mergeSession(current: Session | null, incoming: Session): Session {
   if (!current || current.id !== incoming.id || incoming.settings.executionMode !== 'sandbox') return preserveClientFailures(incoming, current);
+  if (current.threadId && current.threadId !== incoming.threadId) return incoming;
   const key = (turn: Turn) => turn.nativeTurnId ?? turn.id;
   const turns = new Map(current.turns.map(turn => [key(turn), turn]));
   const turnIds = new Map(current.turns.map(turn => [turn.id, key(turn)]));
@@ -57,7 +59,12 @@ export function mergeSession(current: Session | null, incoming: Session): Sessio
     turnIds.set(merged.id, key(merged));
   }
   const merged: Session = { ...incoming, turns: [...turns.values()].sort((left, right) => left.startedAt.localeCompare(right.startedAt)),
+    ...(incoming.threadId === current.threadId && !incoming.contextUsage && current.contextUsage
+      ? { contextUsage: current.contextUsage } : {}),
     historyNextCursor: current.historyNextCursor !== undefined ? current.historyNextCursor : incoming.historyNextCursor };
+  const answers: NativeUserInputAnswers = new Map();
+  collectNativeUserInputAnswers(merged.turns, answers);
+  merged.turns = merged.turns.map(turn => withNativeUserInput(turn, answers));
   return preserveClientFailures(merged, current);
 }
 

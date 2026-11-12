@@ -7,7 +7,7 @@
  * - 清晰展示每个 turn 的费用构成：历史上下文占多少、新输入占多少、输出占多少
  */
 import type { Session, Turn, ContextUsage } from '../protocol/types.js';
-import { countTokens, extractTurnText } from './tokenizer.js';
+import { extractTurnText } from './turn-text.js';
 import type { ModelTokenRates } from './model-costs.js';
 
 export interface TokenRates {
@@ -99,7 +99,7 @@ export interface EstimatedSegment {
 
 /**
  * 对会话进行费用预估。
- * 使用 tiktoken（OpenAI 库）对文本 token 计数，应用简化的缓存模型：
+ * 按字符串长度粗估（1 个 UTF-16 码元约 1 token），应用简化的缓存模型：
  * - 第一个 turn 全部输入按非缓存
  * - 后续 turn 的历史上下文按缓存，新输入按非缓存
  */
@@ -128,9 +128,9 @@ export function estimateSessionCosts(
       cumulativeHistoryTokens = 0;
     }
 
-    // 提取当前 turn 的文本内容用于 token 计数
+    // 提取当前 turn 的文本内容，按字符长度粗估 token 数
     const turnText = extractTurnText(turn);
-    const newInputTokens = countTokens(turnText);
+    const newInputTokens = turnText.length;
 
     // 预估输出 token 数
     let estimatedOutputTokens = 0;
@@ -143,12 +143,12 @@ export function estimateSessionCosts(
     if (providerOutputTokens > 0) {
       estimatedOutputTokens = providerOutputTokens;
     } else {
-      // 回退到本地预估：输出文本 token 数
+      // 回退到本地预估：输出文本的字符长度
       const outputText = turn.items
         .filter(item => item.type === 'agent_message' || item.type === 'reasoning')
         .map(item => 'text' in item ? item.text : '')
         .join('\n');
-      estimatedOutputTokens = countTokens(outputText);
+      estimatedOutputTokens = outputText.length;
     }
 
     // 区分历史 token 和新增 token
@@ -222,7 +222,7 @@ export function estimateChangedInputSegments(
   providerUncachedTokens: number,
   _tokenize?: (text: string) => number,
 ): { estimated: true; providerUncachedTokens: number; localTokens: number; segments: EstimatedSegment[] } {
-  const measured = segments.map(segment => ({ ...segment, localTokens: Math.max(0, Math.floor(countTokens(segment.text))) }));
+  const measured = segments.map(segment => ({ ...segment, localTokens: segment.text.length }));
   const localTokens = measured.reduce((sum, segment) => sum + segment.localTokens, 0);
   const total = Math.max(0, Math.floor(providerUncachedTokens));
   return {

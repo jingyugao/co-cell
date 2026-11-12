@@ -100,7 +100,9 @@ export function createPreviewProxy(options: PreviewProxyOptions) {
       access.signal.addEventListener('abort', abort, { once: true });
       metadata.set(request, { target, path: request.url! });
       sanitize(request, access);
-      const proxyOptions = { target: access.url.replace(/\/$/, ''), headers: access.headers };
+      // Cellbox's service root requires its trailing slash; otherwise its router
+      // redirects the browser to the internal /v1/boxes/.../services/... path.
+      const proxyOptions = { target: access.url, headers: access.headers };
       if (head !== undefined) await proxy.ws(request, response as Socket, proxyOptions, head);
       else await proxy.web(request, response as ServerResponse, proxyOptions);
     } catch (error) {

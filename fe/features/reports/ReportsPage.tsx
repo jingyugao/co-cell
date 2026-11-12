@@ -46,7 +46,7 @@ const dateRange = (kind: ReportKind, date: string, today = beijingToday()) => ki
   : mondayOf(date) === mondayOf(today) ? `${mondayOf(date)} 至现在（本周快照，北京时间）`
     : `${mondayOf(date)} 至 ${addDays(mondayOf(date), 6)}`;
 const feeLabel = (value: number | null, unknownCalls: number) => value === null ? '本次新增预估费用未知'
-  : unknownCalls > 0 ? `本次新增预估费用（文本估算） $${value.toFixed(4)}（实际以渠道账单为准）`
+  : unknownCalls > 0 ? `本次新增预估费用（按字符长度，1 字符约 1 token） $${value.toFixed(4)}（实际以渠道账单为准）`
     : `本次新增预估费用 $${value.toFixed(4)}`;
 const lastIncludedDay = (exclusiveEnd: string) => {
   const value = new Date(`${exclusiveEnd.slice(0, 10)}T00:00:00Z`);

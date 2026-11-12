@@ -4,7 +4,6 @@ import { join } from 'node:path';
 import type { ReportDailyInput, ReportDetail, ReportKind, ReportSettings, ReportSource, ReportSourceContent, ReportUsage, ReportsView } from '../../protocol/report-types.js';
 import { dueReportSchedules, reportPeriod, reportSchedule } from '../../util/report-periods.js';
 import { HttpError, redactCredentials } from '../../util/errors.js';
-import { countTokens } from '../../util/tokenizer.js';
 import { MemoryCoordinator, type SharedCoordinator } from '../infra/storage/coordination.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import type { ConversationMaterialsService } from '../conversation-materials/service.js';
@@ -17,8 +16,8 @@ import { publicReport, type StoredWorkReport } from './types.js';
 
 const DAY = 86_400_000;
 const MAX_CHARS = 48_000;
-// Leave room for the agent's own instructions, tools, reasoning, and output in a 256k context.
-const MAX_REPORT_INPUT_TOKENS = 224_000;
+// Character budget for report material; actual token usage depends on the model.
+const MAX_REPORT_INPUT_CHARS = 224_000;
 const emptyUsage = (): ReportUsage => ({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, unknownCalls: 0, estimatedCostUsd: 0 });
 const message = (error: unknown) => redactCredentials(error instanceof Error ? error.message : String(error)).slice(0, 1500);
 const localDate = (now: Date) => new Date(now.getTime() + 8 * 3_600_000).toISOString().slice(0, 10);
@@ -503,9 +502,8 @@ export class ReportService {
   }
 
   private async hierarchicalCall(report: StoredWorkReport, prompt: string, title: string, cacheable: boolean, save: () => Promise<void>) {
-    const tokens = countTokens(prompt);
-    if (tokens > MAX_REPORT_INPUT_TOKENS)
-      throw new Error(`${title}的输入约 ${tokens} token，超过单次报告输入预算 ${MAX_REPORT_INPUT_TOKENS}；未截断或拆分提交`);
+    if (prompt.length > MAX_REPORT_INPUT_CHARS)
+      throw new Error(`${title}的输入为 ${prompt.length} 字符，超过单次报告输入预算 ${MAX_REPORT_INPUT_CHARS} 字符；未截断或拆分提交`);
     return this.call(report, prompt, title, cacheable, save);
   }
 

@@ -3,7 +3,7 @@ import type { WebStateStore } from '../infra/storage/web-state.js';
 import type { SessionManager } from '../sessions/manager.js';
 import type { ModelService } from '../models/service.js';
 import { HttpError } from '../../util/errors.js';
-import { countTokens, extractTurnText } from '../../util/tokenizer.js';
+import { extractTurnText } from '../../util/turn-text.js';
 import { estimateTokenCostUsd } from '../../util/model-costs.js';
 import type { ReportCall } from './types.js';
 
@@ -52,7 +52,8 @@ export class ReportRunner {
     if (call.status === 'pending') {
       call.status = 'submitting';
       call.startedAt = new Date().toISOString();
-      call.usage = { inputTokens: countTokens(prompt), cachedInputTokens: 0, outputTokens: 0,
+      // Until actual usage arrives, use string length as a coarse 1:1 token estimate.
+      call.usage = { inputTokens: prompt.length, cachedInputTokens: 0, outputTokens: 0,
         unknownCalls: 1, estimatedCostUsd: null };
       call.usage.estimatedCostUsd = estimateTokenCostUsd(settings.model, call.usage);
       await save();
@@ -96,9 +97,9 @@ export class ReportRunner {
     }
     const usage = turn.usage;
     const validTokens = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
-    call.usage = { inputTokens: validTokens(usage?.input_tokens) ? usage.input_tokens : countTokens(prompt),
+    call.usage = { inputTokens: validTokens(usage?.input_tokens) ? usage.input_tokens : prompt.length,
       cachedInputTokens: validTokens(usage?.cached_input_tokens) ? usage.cached_input_tokens : 0,
-      outputTokens: validTokens(usage?.output_tokens) ? usage.output_tokens : countTokens(extractTurnText({ prompt: '', items: turn.items })),
+      outputTokens: validTokens(usage?.output_tokens) ? usage.output_tokens : extractTurnText({ prompt: '', items: turn.items }).length,
       unknownCalls: validTokens(usage?.input_tokens) && validTokens(usage?.output_tokens) ? 0 : 1, estimatedCostUsd: null } satisfies ReportUsage;
     call.usage.estimatedCostUsd = estimateTokenCostUsd(settings.model, call.usage);
     if (turn.status !== 'completed') {

@@ -28,7 +28,7 @@ export interface ContextUsage {
   outputItemIds?: string[];
   /** Transient native-reader input; removed before returning/persisting estimates. */
   blockTexts?: Array<{ id: string; label: string; text: string; turnId?: string; direction: 'input' | 'output' }>;
-  /** Local text tokenizer estimates; not provider-attributed message usage. */
+  /** Legacy local text estimates; not provider-attributed message usage. */
   blockEstimates?: BlockEstimate[];
   blockTokenizer?: string;
   requestId?: string;

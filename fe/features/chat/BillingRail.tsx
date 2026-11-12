@@ -190,7 +190,7 @@ export default function BillingRail({ turns, sessionId, selectedBlockId, onSelec
         <span className="billing-legend-dot billing-dot-newInput" /> 新输入
         <span className="billing-legend-dot billing-dot-output" /> 输出
       </div>
-      <small>费用为基于 OpenAI tiktoken 的预估，假设始终使用提示缓存</small>
+      <small>费用按字符长度粗估（1 字符约 1 token），假设始终使用提示缓存；实际以渠道账单为准</small>
     </footer>
   </aside>;
 }

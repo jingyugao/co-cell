@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { markPageLoad, pageLoadFailure } from '../../lib/page-load';
 import type { NativeSessionConnection, NativeQueuedSubmission } from '../../../protocol/native-app-server';
+import { NATIVE_CONNECTION_INACTIVE } from '../../../protocol/native-app-server';
 import type { Session, Turn } from '../../../protocol/types';
 import type { UserInputRequest } from '../../../protocol/user-input-types';
 import { applySdkEvent } from '../../../util/session-events';
@@ -223,10 +224,10 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
     pendingSteers.current = []; observedUserItems.current.clear();
     for (const [key, question] of nativeQuestions.current) if (question.sessionId !== selected) nativeQuestions.current.delete(key);
     const id = selected; threadRef.current = ''; threadBoundRef.current = false; connectionRef.current = null; liveTurnIds.current.clear(); activeTurnId.current = null; pendingStart.current = null; terminalTurnIds.current.clear(); let alive = true; let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    let retryDelay = 500; let generation = 0;
+    let retryDelay = 500; let generation = 0; let connectionInactive = false;
     let client: NativeAppServerClient | undefined;
     const scheduleRetry = () => {
-      if (!alive) return;
+      if (!alive || connectionInactive) return;
       if (retryTimer) clearTimeout(retryTimer);
       const delay = retryDelay; retryDelay = Math.min(retryDelay * 2, 10_000);
       retryTimer = setTimeout(() => {
@@ -253,12 +254,16 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
         bufferingEvents.current = true;
         const connection = connectionRef.current;
         if (!connection) throw new Error('会话连接尚未准备好');
-        attemptClient = new NativeAppServerClient(nativeWebSocketUrl(connection.websocketPath), acceptEvent, () => {
+        attemptClient = new NativeAppServerClient(nativeWebSocketUrl(connection.websocketPath), acceptEvent, error => {
           if (!alive || attempt !== generation || client !== attemptClient) return;
           client = undefined;
           if (clientRef.current === attemptClient) clientRef.current = null;
           setSessionRef.current(current => current ? withNativeQuestions(current) : current);
           markConnected(false);
+          if (error?.closeCode === NATIVE_CONNECTION_INACTIVE) {
+            connectionInactive = true;
+            errorRef.current('项目或会话已不可用，对话连接已关闭。');
+          }
           scheduleRetry();
         }, error => errorRef.current(error.message), acceptServerRequest);
         client = attemptClient;
@@ -468,5 +473,9 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
     await refresh();
   }, []);
 
-  return { connected, queuedSubmissions, waitUntilConnected, refreshConnection, send, stop, answer };
+  const renewLease = useCallback(async () => {
+    if (connectedRef.current) await clientRef.current?.renewLease();
+  }, []);
+
+  return { connected, queuedSubmissions, waitUntilConnected, refreshConnection, renewLease, send, stop, answer };
 }

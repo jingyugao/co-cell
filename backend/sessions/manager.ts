@@ -473,6 +473,17 @@ export class SessionManager {
     return { ...await this.sandbox!.openNativeConnection!(structuredClone(session), signal), sandboxId: session.sandbox?.id };
   }
 
+  /** Read the shared authority, including changes made through another API instance. */
+  async canRenewNativeConnection(id: string, sandboxId: string | undefined): Promise<boolean> {
+    if (this.closing || !sandboxId) return false;
+    const session = await this.state.getSession(id);
+    if (!session || session.archivedAt || !this.isNativeSession(session)) return false;
+    if (!session.projectId) return session.sandbox?.id === sandboxId;
+    const project = await this.state.getProject(session.projectId);
+    return Boolean(project && project.status === 'active' && !project.removedAt
+      && project.sandbox?.id === sandboxId && project.sandboxOperation?.status !== 'running');
+  }
+
   async bindNativeThread(id: string, threadId: string): Promise<Session> {
     return this.nativeControl(id, async () => {
       const session = await this.refreshSessionSandbox(await this.readMetadata(id));

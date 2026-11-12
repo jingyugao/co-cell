@@ -4,6 +4,9 @@ import type { Socket } from 'node:net';
 import WebSocket, { WebSocketServer } from 'ws';
 import { isAuthenticatedOperatorRequest } from '../access/operator.js';
 import { createMessageObservers, type MessageObservation } from './message-observers.js';
+import { abortable } from '../../util/abortable.js';
+import { NATIVE_CONNECTION_RENEW_METHOD, NATIVE_CONNECTION_TTL_MS,
+  NATIVE_CONNECTION_EXPIRED, NATIVE_CONNECTION_INACTIVE } from '../../protocol/native-app-server.js';
 
 export type NativeRelayEvent = MessageObservation;
 
@@ -18,6 +21,8 @@ export interface NativeRelayOptions {
   publicUrl: string;
   token: string;
   open(sessionId: string, signal: AbortSignal): Promise<NativeRelayOpen>;
+  canRenew(sessionId: string, sandboxId: string | undefined): Promise<boolean>;
+  leaseTtlMs?: number;
   observe?(event: NativeRelayEvent): Promise<void> | void;
   observers?: Array<{ name: string; observe(event: NativeRelayEvent): Promise<void> | void }>;
   onError(error: unknown): void;
@@ -54,6 +59,9 @@ type RelayConnection = {
   pendingRequestBytes: number;
   closing: boolean;
   closeTimer?: ReturnType<typeof setTimeout>;
+  leaseTimer?: ReturnType<typeof setTimeout>;
+  leaseExpiresAt: number;
+  renewing: boolean;
   released: boolean;
   releaseTask?: Promise<void>;
 };
@@ -104,6 +112,9 @@ function writeRejection(socket: Socket, status: number, message: string) {
 }
 
 export function createNativeRelay(options: NativeRelayOptions) {
+  const leaseTtlMs = options.leaseTtlMs ?? NATIVE_CONNECTION_TTL_MS;
+  if (!Number.isSafeInteger(leaseTtlMs) || leaseTtlMs <= 0 || leaseTtlMs > 2_147_483_647)
+    throw new Error('Native connection lease TTL must be a positive timer duration');
   const publicUrl = new URL(options.publicUrl);
   const publicHost = publicUrl.host.toLowerCase();
   const pending = new Map<AbortController, PendingSetup>();
@@ -207,6 +218,7 @@ export function createNativeRelay(options: NativeRelayOptions) {
     if (connection.releaseTask) return connection.releaseTask;
     connection.released = true;
     if (connection.closeTimer) clearTimeout(connection.closeTimer);
+    clearTimeout(connection.leaseTimer);
     connections.delete(connection);
     connection.releaseTask = (async () => {
       try { await connection.release(); }
@@ -218,6 +230,7 @@ export function createNativeRelay(options: NativeRelayOptions) {
   function terminatePair(connection: RelayConnection, code = 1011, reason = 'Relay closed') {
     if (connection.closing) return;
     connection.closing = true;
+    clearTimeout(connection.leaseTimer);
     const close = (socket: WebSocket) => {
       if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
         try { socket.close(code, Buffer.from(reason).subarray(0, 123).toString()); }
@@ -234,9 +247,50 @@ export function createNativeRelay(options: NativeRelayOptions) {
     connection.closeTimer.unref?.();
   }
 
+  function expireLease(connection: RelayConnection) {
+    terminatePair(connection, NATIVE_CONNECTION_EXPIRED, 'Connection lease expired');
+  }
+
+  function extendLease(connection: RelayConnection) {
+    clearTimeout(connection.leaseTimer);
+    connection.leaseExpiresAt = performance.now() + leaseTtlMs;
+    connection.leaseTimer = setTimeout(() => expireLease(connection), leaseTtlMs);
+    connection.leaseTimer.unref();
+  }
+
+  async function renewLease(connection: RelayConnection, id: string | number) {
+    const reply = (payload: Record<string, unknown>) => {
+      if (connection.closing || connection.client.readyState !== WebSocket.OPEN) return;
+      if (connection.client.bufferedAmount > MAX_BUFFERED_BYTES) { terminatePair(connection); return; }
+      connection.client.send(JSON.stringify({ id, ...payload }), error => {
+        if (error) { safeOnError(options.onError, error); terminatePair(connection); }
+      });
+    };
+    if (connection.renewing) { reply({ error: { code: -32000, message: 'Connection renewal already pending' } }); return; }
+    connection.renewing = true;
+    try {
+      const allowed = await abortable(options.canRenew(connection.sessionId, connection.sandboxId), AbortSignal.timeout(5_000));
+      if (connection.closing) return;
+      if (performance.now() >= connection.leaseExpiresAt) { expireLease(connection); return; }
+      if (!allowed) { terminatePair(connection, NATIVE_CONNECTION_INACTIVE, 'Project or session is no longer active'); return; }
+      extendLease(connection);
+      reply({ result: { ttlMs: leaseTtlMs } });
+    } catch (error) {
+      safeOnError(options.onError, error);
+      // An unavailable state store must not silently extend the old deadline.
+      reply({ error: { code: -32000, message: 'Unable to renew connection lease' } });
+    } finally { connection.renewing = false; }
+  }
+
   function forwardMessage(connection: RelayConnection, destination: WebSocket,
     direction: NativeRelayEvent['direction'], data: WebSocket.RawData, isBinary: boolean) {
     if (connection.closing) return;
+    if (performance.now() >= connection.leaseExpiresAt) { expireLease(connection); return; }
+    const message = parsedMessage(data);
+    if (direction === 'client' && !isBinary && message?.method === NATIVE_CONNECTION_RENEW_METHOD) {
+      if (typeof message.id === 'string' || typeof message.id === 'number') void renewLease(connection, message.id);
+      return;
+    }
     const size = Array.isArray(data) ? data.reduce((total, part) => total + part.byteLength, 0)
       : Buffer.isBuffer(data) ? data.byteLength : Buffer.byteLength(String(data));
     if (destination.readyState !== WebSocket.OPEN || destination.bufferedAmount + size > MAX_BUFFERED_BYTES) {
@@ -254,7 +308,6 @@ export function createNativeRelay(options: NativeRelayOptions) {
       return;
     }
 
-    const message = parsedMessage(data);
     if (!message) return;
     const receivedAt = Date.now();
     if (direction === 'client') rememberClientRequest(connection, message, receivedAt);
@@ -272,6 +325,7 @@ export function createNativeRelay(options: NativeRelayOptions) {
         if (!connection.closing) {
           const peer = source === connection.client ? connection.upstream : connection.client;
           connection.closing = true;
+          clearTimeout(connection.leaseTimer);
           if (peer.readyState === WebSocket.OPEN || peer.readyState === WebSocket.CONNECTING) peer.close(1000, 'Peer closed');
           connection.closeTimer = setTimeout(() => {
             connection.client.terminate(); connection.upstream.terminate(); void releaseConnection(connection);
@@ -426,9 +480,11 @@ export function createNativeRelay(options: NativeRelayOptions) {
           return;
         }
         const relay: RelayConnection = { id: randomUUID(), sessionId, sandboxId: pendingSetup.sandboxId, client, upstream, release: releaseOpened,
-          requests: new Map(), pendingRequestCount: 0, pendingRequestBytes: 0, closing: false, released: false };
+          requests: new Map(), pendingRequestCount: 0, pendingRequestBytes: 0, closing: false, released: false,
+          leaseExpiresAt: 0, renewing: false };
         connectionOwned = true;
         connections.add(relay);
+        extendLease(relay);
         bind(relay, earlyMessages);
       });
       if (!callbackCalled) throw new Error('WebSocket upgrade did not complete');

@@ -241,6 +241,7 @@ const previewProxy = previewSubdomains ? createPreviewProxy({ publicUrl, token: 
 }) : undefined;
 const nativeRelay = createNativeRelay({ publicUrl, token: process.env.COCELL_ACCESS_TOKEN!,
   open: (id, signal) => manager.openNativeConnection(id, signal),
+  canRenew: (id, sandboxId) => manager.canRenewNativeConnection(id, sandboxId),
   observers: [{ name: 'runtime-log', observe: async event => {
     // Only metadata goes to logs. Native prompt/config bodies stay on the transport.
     if (event.direction === 'server' && (event.request || event.message.method?.startsWith('turn/')

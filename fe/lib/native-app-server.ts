@@ -1,4 +1,6 @@
-export type NativeRpcError = Error & { code?: string; data?: unknown; unknownOutcome?: boolean };
+import { NATIVE_CONNECTION_RENEW_METHOD } from '../../protocol/native-app-server';
+
+export type NativeRpcError = Error & { code?: string; data?: unknown; unknownOutcome?: boolean; closeCode?: number };
 type RpcMessage = { id?: string | number; method?: string; params?: Record<string, any>; result?: any; error?: { code?: string | number; message?: string; data?: unknown } };
 
 export class NativeAppServerClient {
@@ -9,7 +11,7 @@ export class NativeAppServerClient {
   private opening?: Promise<void>;
   private failOpening?: (error: Error) => void;
   constructor(private readonly url: string, private readonly notification: (message: RpcMessage) => void,
-    private readonly onClose: (error?: Error) => void, private readonly onError: (error: Error) => void = () => {},
+    private readonly onClose: (error?: NativeRpcError) => void, private readonly onError: (error: Error) => void = () => {},
     private readonly serverRequest?: (message: RpcMessage) => boolean) {}
   async connect(threadId: string | null) {
     await this.open();
@@ -29,10 +31,10 @@ export class NativeAppServerClient {
       socket.onopen = () => { if (settled) return; settled = true; clearTimeout(timer); this.failOpening = undefined; resolve(); };
       socket.onerror = () => { const error = new Error('无法连接 Codex App Server'); this.onError(error); fail(error); socket.close(); };
       socket.onmessage = event => this.receive(event.data);
-      socket.onclose = () => {
+      socket.onclose = event => {
         if (this.socket === socket) this.socket = undefined;
         if (!settled) fail(new Error('Codex App Server WebSocket 在连接完成前关闭'));
-        const error = new Error('Codex App Server WebSocket 已断开');
+        const error = Object.assign(new Error('Codex App Server WebSocket 已断开'), { closeCode: event.code });
         for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(Object.assign(new Error(error.message), { unknownOutcome: true })); }
         this.pending.clear();
         if (!this.closed) this.onClose(error);
@@ -73,6 +75,9 @@ export class NativeAppServerClient {
         this.pending.delete(String(id)); clearTimeout(timer); reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
+  }
+  async renewLease(): Promise<void> {
+    await this.request(NATIVE_CONNECTION_RENEW_METHOD, {}, 5_000);
   }
   notify(method: string, params: Record<string, unknown>) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error('Codex App Server 尚未连接');

@@ -1,10 +1,19 @@
 import type { Session } from './types.js';
 import type { NativeTurnOptions } from '../packages/agentcore/src/index.mjs';
 
+/** CoCell handles this JSON-RPC request on the browser's existing socket;
+ * it is never forwarded to Codex. Only successful renewals extend the lease. */
+export const NATIVE_CONNECTION_RENEW_METHOD = 'cocell/connection/renew';
+export const NATIVE_CONNECTION_TTL_MS = 60_000;
+export const NATIVE_CONNECTION_EXPIRED = 4000;
+export const NATIVE_CONNECTION_INACTIVE = 4001;
+
 /** Prepare a native thread without starting or taking ownership of a turn.
  * Connect to websocketPath and initialize. Resume an existing threadId; when it
  * is null, start a thread on that socket immediately before the first input.
- * JSON-RPC frames pass through unchanged; reconnecting never resubmits input. */
+ * Codex JSON-RPC frames pass through unchanged; reconnecting never resubmits input.
+ * Renew the connection lease during workspace polling via
+ * cocell/connection/renew with {} params; the result contains ttlMs. */
 export interface NativeSessionConnection {
   session: Session;
   websocketPath: string;

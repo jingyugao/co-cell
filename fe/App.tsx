@@ -171,7 +171,8 @@ export default function App() {
   }, []);
   // Session mutations and runtime state also change project counts/status.
   const refreshWorkspace = useCallback(async () => {
-    await Promise.all([refreshSessions(), refreshProjects()]);
+    const [, projects] = await Promise.all([refreshSessions(), refreshProjects()]);
+    return projects;
   }, [refreshSessions, refreshProjects]);
   const project = projects.find(item => item.id === selectedProject) ?? null;
   const projectReadOnly = Boolean(project && !canEnterProject(project));
@@ -208,7 +209,8 @@ export default function App() {
   const nativeConnectEnabled = nativeEnabled && page === 'chat' && !sessions.find(item => item.id === selected)?.archivedAt && !projectReadOnly;
   const nativeHistoryManaged = nativeConnectEnabled && historyReady;
   const { session, setSession, connected: streamConnected, loadOlder, loadingOlder, loadingHistory } = useSessionStream({
-    selected, enabled: !loading, historyReady, native: nativeEnabled, nativeHistoryManaged, onState: refreshWorkspace, onError: setError,
+    selected, enabled: !loading, historyReady, native: nativeEnabled, nativeHistoryManaged,
+    onState: async () => { await refreshWorkspace(); }, onError: setError,
   });
   const native = useNativeSession({ selected, enabled: !loading && nativeConnectEnabled && historyReady, session, setSession, onError: setError });
   const connected = nativeEnabled ? native.connected : streamConnected;
@@ -293,9 +295,30 @@ export default function App() {
     if (selectedProject) localStorage.setItem('codex-project', selectedProject); else localStorage.removeItem('codex-project');
   }, [selectedProject]);
   useEffect(() => {
-    const timer = setInterval(() => { if (!document.hidden) void refreshWorkspace().catch(() => {}); }, 10_000);
-    return () => clearInterval(timer);
-  }, [refreshWorkspace]);
+    // A background chat still holds a WebSocket. Refresh its project status so
+    // completion in another tab disables the connection and its reconnect loop.
+    let reading = false, alive = true;
+    const refresh = () => {
+      if (reading || (document.hidden && !nativeConnectEnabled)) return;
+      reading = true;
+      void (async () => {
+        const latest = await refreshWorkspace();
+        const current = latest.find(project => project.id === activeProjectId.current);
+        if (alive && nativeConnectEnabled && current && canEnterProject(current)) await native.renewLease();
+      })().catch(() => {}).finally(() => { reading = false; });
+    };
+    const onVisible = () => { if (!document.hidden) refresh(); };
+    const onPageShow = (event: PageTransitionEvent) => { if (event.persisted) refresh(); };
+    const timer = setInterval(refresh, 10_000);
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('pageshow', onPageShow);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('pageshow', onPageShow);
+    };
+  }, [refreshWorkspace, nativeConnectEnabled, native.renewLease]);
 
   useEffect(() => {
     let alive = true;

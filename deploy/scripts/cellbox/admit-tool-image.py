@@ -2,6 +2,7 @@
 """Explicitly admit an inspected immutable tool image to the operator's profile."""
 import re
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'k8s'))
 from cellbox_deploy import CellboxRelease
@@ -16,6 +17,8 @@ profiles = [p for p in config['profiles'] if p['id'] == sys.argv[2]]
 if len(profiles) != 1:
     raise SystemExit('Expected exactly one profile')
 profile = profiles[0]
+if profile.get('sharedReadOnlyHostPath'):
+    profile['guest'].setdefault('credentialSources', {})['cocell_tool_runtime'] = '/var/lib/cellbox/shared/runtime/tool-configs/{boxId}.json'
 trusted = profile.setdefault('trustedToolImages', [])
 if sys.argv[3] not in trusted:
     trusted.append(sys.argv[3])

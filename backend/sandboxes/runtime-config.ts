@@ -1,4 +1,6 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmod, lstat, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { SandboxExtension, SandboxLifecycleContext } from '@co-cell/sandbox';
 import type { CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import type { SecretService } from '../secrets/service.js';
@@ -41,6 +43,9 @@ export class SandboxRuntimeConfig {
       if (['create', 'connect', 'restore', 'reconcile'].includes(context.action)) await this.sync(context);
       if (context.action === 'destroy' && context.sandboxId) {
         assertActive(context.signal);
+        if (this.options.sharedDataRoot) await unlink(this.sourcePath(context.sandboxId)).catch(error => {
+          if (error.code !== 'ENOENT') throw error;
+        });
         await this.options.secrets?.repository.forgetRuntime(context.sandboxId);
         assertActive(context.signal);
       }
@@ -117,6 +122,9 @@ export class SandboxRuntimeConfig {
         }
         const config: ToolHomeRuntimeConfig = { mode: 'home', boxId, url: this.options.toolBrokerUrl };
         slots = { cocell_tool_runtime: Buffer.from(JSON.stringify(config)) };
+        // Publish durable source state even when the historical delivery digest
+        // matches. The guest reloads this file after execution replacement.
+        if (this.options.sharedDataRoot) await this.publishRuntimeSource(boxId, slots.cocell_tool_runtime);
       }
     } else {
       slots = await this.archiveSlots(archive);
@@ -172,5 +180,26 @@ export class SandboxRuntimeConfig {
       const value = files[source];
       return [slot, value?.byteLength ? value : Buffer.from('\n')];
     }));
+  }
+
+  private sourcePath(boxId: string) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(boxId)) throw new Error('Invalid Box identity');
+    return join(this.options.sharedDataRoot!, 'runtime', 'tool-configs', `${boxId}.json`);
+  }
+
+  private async publishRuntimeSource(boxId: string, bytes: Uint8Array) {
+    const destination = this.sourcePath(boxId);
+    const directory = join(this.options.sharedDataRoot!, 'runtime', 'tool-configs');
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const info = await lstat(directory);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('Unsafe tool configuration directory');
+    await chmod(directory, 0o700);
+    const temporary = join(directory, `.${boxId}-${randomUUID()}`);
+    try {
+      await writeFile(temporary, bytes, { flag: 'wx', mode: 0o600 });
+      await rename(temporary, destination);
+    } finally {
+      await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    }
   }
 }

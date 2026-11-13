@@ -47,8 +47,10 @@ guest["workspace"] = sample["guest"]["workspace"]
 guest["command"] = sample["guest"]["command"]
 if profile.get("sharedReadOnlyHostPath"):
     guest.setdefault("env", {})["COCELL_LAUNCHER_SHARED_DIRECTORY"] = "/var/lib/cellbox/shared"
+    guest.setdefault("credentialSources", {})["cocell_tool_runtime"] = "/var/lib/cellbox/shared/runtime/tool-configs/{boxId}.json"
 else:
     guest.setdefault("env", {}).pop("COCELL_LAUNCHER_SHARED_DIRECTORY", None)
+    guest.setdefault("credentialSources", {}).pop("cocell_tool_runtime", None)
 # Register the protected entries once; auto-trusted imports inherit them.
 tools = guest.setdefault("tools", [])
 # Disk backups are owned by Cellbox; CoCell no longer ships this tool.

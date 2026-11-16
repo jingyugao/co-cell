@@ -18,6 +18,7 @@ const DAY = 86_400_000;
 const MAX_CHARS = 48_000;
 // Character budget for report material; actual token usage depends on the model.
 const MAX_REPORT_INPUT_CHARS = 224_000;
+type ReportInput = { context: string; material: string; tag: string };
 const emptyUsage = (): ReportUsage => ({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, unknownCalls: 0, estimatedCostUsd: 0 });
 const message = (error: unknown) => redactCredentials(error instanceof Error ? error.message : String(error)).slice(0, 1500);
 const localDate = (now: Date) => new Date(now.getTime() + 8 * 3_600_000).toISOString().slice(0, 10);
@@ -29,21 +30,22 @@ const periodDescription = (report: StoredWorkReport) => `${report.periodStart} �
     : `；这是周进展快照，只统计截至 ${report.asOf} 的内容，不代表完整自然周` : '');
 
 /** Split only when necessary, prefer whole Markdown messages, and never drop an oversized message. */
-export function reportChunks(text: string): string[] {
+export function reportChunks(text: string, maxChars = MAX_CHARS): string[] {
+  if (!Number.isSafeInteger(maxChars) || maxChars < 2) throw new Error('报告分段预算必须至少为 2 字符');
   const result: string[] = [];
   let current = '';
   for (const section of text.split(/(?=\n## )/)) {
-    if (current && current.length + section.length > MAX_CHARS) { result.push(current); current = ''; }
+    if (current && current.length + section.length > maxChars) { result.push(current); current = ''; }
     let remaining = section;
-    while (remaining.length > MAX_CHARS) {
-      let end = MAX_CHARS;
+    while (remaining.length > maxChars) {
+      let end = maxChars;
       if (/[\uD800-\uDBFF]/.test(remaining[end - 1])) end--;
       result.push(remaining.slice(0, end));
       remaining = remaining.slice(end);
     }
     current += remaining;
   }
-  if (current.trim()) result.push(current);
+  if (current) result.push(current);
   return result;
 }
 
@@ -432,11 +434,10 @@ export class ReportService {
       ? `${day.date} 日报：${[day.missingCount ? `${day.missingCount} 条来源材料缺失` : '', day.snapshotCount ? `${day.snapshotCount} 条进行中对话快照` : ''].filter(Boolean).join('，')}`
       : `${day.date}：${day.error ?? '日报不可用'}`).join('；');
     report.status = 'generating'; await save();
-    const prompt = `${weeklyDailyRules}\n\n${report.settings.prompts.weekly}\n\n统计期间：${periodDescription(report)}。\n`
+    const context = `${weeklyDailyRules}\n\n${report.settings.prompts.weekly}\n\n统计期间：${periodDescription(report)}。\n`
       + `只汇总下列已完成日报，控制在 800—1500 个汉字左右。`
-      + (coverage ? `\n覆盖限制：${coverage}。必须说明这些缺口，不可推断没有进展。` : '')
-      + `\n\n<工作日报>\n${input}\n</工作日报>`;
-    const body = await this.hierarchicalCall(report, prompt, `工作周报 · ${report.periodStart}`, false, save);
+      + (coverage ? `\n覆盖限制：${coverage}。必须说明这些缺口，不可推断没有进展。` : '');
+    const body = await this.hierarchicalCall(report, { context, material: input, tag: '工作日报' }, `工作周报 · ${report.periodStart}`, false, save);
     if (body === undefined) return;
     await this.complete(report, body + `\n\n> 本周报仅汇总 ${report.dailyReportIds?.length ?? 0} 份已完成日报，覆盖范围以各日报为准。`
       + (coverage ? `\n> 覆盖不完整：${coverage}。` : ''), save);
@@ -455,11 +456,11 @@ export class ReportService {
       if (!summary) {
         const input = await this.read(join(directory, 'sources', `${source.sessionId}.input.md`));
         if (!input) throw new Error('报告来源材料丢失，未生成不完整摘要');
-        const prompt = `${hierarchicalReportRules}\n\n${summaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n统计期间：${periodDescription(report)}。\n`
+        const context = `${hierarchicalReportRules}\n\n${summaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n统计期间：${periodDescription(report)}。\n`
           + `项目：${source.projectName}\n对话：${source.sessionTitle}\n来源：[原始对话](/sessions/${source.sessionId})\n`
           + (source.isSnapshot ? `此来源含进行中轮次，采集于${source.collectedAt}。不能推断最终完成。\n` : '')
-          + `${baseline}\n\n<工作材料>\n${input}\n</工作材料>`;
-        const result = await this.hierarchicalCall(report, prompt, `${source.projectName} · 对话摘要`, true, save);
+          + baseline;
+        const result = await this.hierarchicalCall(report, { context, material: input, tag: '工作材料' }, `${source.projectName} · 对话摘要`, true, save);
         if (result === undefined) return;
         summary = `## ${source.projectName} · ${source.sessionTitle}\n\n来源：[原始对话](/sessions/${source.sessionId})\n\n${result}`;
         await this.write(output, summary);
@@ -474,9 +475,9 @@ export class ReportService {
       const output = join(directory, 'projects', `${hash(projectId)}.summary.md`);
       let summary = await this.read(output);
       if (!summary) {
-        const prompt = `${hierarchicalReportRules}\n\n${projectSummaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n`
-          + `统计期间：${periodDescription(report)}。\n项目：${project.name}${baseline}\n\n<对话摘要>\n${project.summaries.join('\n\n')}\n</对话摘要>`;
-        const result = await this.hierarchicalCall(report, prompt, `${project.name} · 项目摘要`, true, save);
+        const context = `${hierarchicalReportRules}\n\n${projectSummaryPrompt}\n\n报告要求：${report.settings.prompts[report.kind]}\n`
+          + `统计期间：${periodDescription(report)}。\n项目：${project.name}${baseline}`;
+        const result = await this.hierarchicalCall(report, { context, material: project.summaries.join('\n\n'), tag: '对话摘要' }, `${project.name} · 项目摘要`, true, save);
         if (result === undefined) return;
         summary = `# ${project.name}\n\n${result}`;
         await this.write(output, summary);
@@ -494,17 +495,44 @@ export class ReportService {
     }
     report.status = 'generating'; await save();
     const gaps = missing.length ? `\n材料缺失：${missing.map(source => `${source.projectName} / ${source.sessionTitle}`).join('；')}。必须注明覆盖不完整。` : '';
-    const prompt = `${hierarchicalReportRules}\n\n${report.settings.prompts[report.kind]}\n\n统计期间：${periodDescription(report)}。${gaps}\n`
-      + `控制在 800—1500 个汉字左右。${baseline}\n\n<项目进展材料>\n${combined}\n</项目进展材料>`;
-    const body = await this.hierarchicalCall(report, prompt, `${report.kind === 'daily' ? '工作日报' : '工作周报'} · ${report.periodStart}`, false, save);
+    const context = `${hierarchicalReportRules}\n\n${report.settings.prompts[report.kind]}\n\n统计期间：${periodDescription(report)}。${gaps}\n`
+      + `控制在 800—1500 个汉字左右。${baseline}`;
+    const body = await this.hierarchicalCall(report, { context, material: combined, tag: '项目进展材料' }, `${report.kind === 'daily' ? '工作日报' : '工作周报'} · ${report.periodStart}`, false, save);
     if (body === undefined) return;
     await this.complete(report, body + (missing.length ? `\n\n> 本报告有 ${missing.length} 条对话的全部或部分材料未能读取，覆盖不完整。` : ''), save);
   }
 
-  private async hierarchicalCall(report: StoredWorkReport, prompt: string, title: string, cacheable: boolean, save: () => Promise<void>) {
-    if (prompt.length > MAX_REPORT_INPUT_CHARS)
-      throw new Error(`${title}的输入为 ${prompt.length} 字符，超过单次报告输入预算 ${MAX_REPORT_INPUT_CHARS} 字符；未截断或拆分提交`);
-    return this.call(report, prompt, title, cacheable, save);
+  private async hierarchicalCall(report: StoredWorkReport, input: ReportInput, title: string, cacheable: boolean, save: () => Promise<void>) {
+    const prompt = (material: string) => `${input.context}\n\n<${input.tag}>\n${material}\n</${input.tag}>`;
+    const budget = MAX_REPORT_INPUT_CHARS - prompt('').length;
+    let current = input.material;
+    if (current.length > budget) {
+      const prefix = `${input.context}\n\n本次只生成材料分段的中间摘要，不直接生成完整报告，控制在 1200 个汉字以内。`
+        + '保留业务事项、明确日期、本期变化、当前状态、验证边界、真实来源链接与覆盖限制，合并重复内容。'
+        + '输入可能是原始材料片段或上一层的中间摘要；背景不算本期成果。'
+        + '一条消息或工具记录可能跨段，片段不代表完整执行；缺少日期或完成证据时不得推断为本期已完成。\n\n<材料分段>\n';
+      const suffix = '\n</材料分段>';
+      const chunkBudget = Math.min(200_000, MAX_REPORT_INPUT_CHARS - prefix.length - suffix.length);
+      if (budget < 2 || chunkBudget < 2)
+        throw new Error(`${title}的固定提示或背景过长，无法在 ${MAX_REPORT_INPUT_CHARS} 字符预算内分段；未截断或提交`);
+      // Deterministic prompts reuse persisted calls when the worker resumes.
+      for (let level = 0; current.length > budget; level++) {
+        if (level >= 8) throw new Error(`${title}分段归并超过 8 层，未截断业务材料`);
+        const chunks = reportChunks(current, chunkBudget);
+        const summaries: string[] = [];
+        for (let index = 0; index < chunks.length; index++) {
+          const result = await this.call(report, prefix + chunks[index] + suffix,
+            `${title} · 分段 ${level + 1}-${index + 1}`, true, save);
+          if (result === undefined) return undefined;
+          summaries.push(result);
+        }
+        const next = summaries.join('\n\n');
+        if (next.length >= current.length && next.length > budget)
+          throw new Error(`${title}分段摘要未缩小，已停止归并；未截断业务材料`);
+        current = next;
+      }
+    }
+    return this.call(report, prompt(current), title, cacheable, save);
   }
 
   private async fold(report: StoredWorkReport, text: string, save: () => Promise<void>): Promise<string | undefined> {

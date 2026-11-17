@@ -223,7 +223,10 @@ export default function App() {
   const visibleSessions = selectedProject ? sessions.filter(item => item.projectId === selectedProject) : [];
   const activeSessions = visibleSessions.filter(item => !isArchived(item));
   const archivedSessions = visibleSessions.filter(isArchived).sort((left, right) => Date.parse(archivedAt(right)) - Date.parse(archivedAt(left)));
-  const recentSessions = sessions.filter(item => !isArchived(item) && projects.some(project => project.id === item.projectId && (project.status ?? (project.archivedAt ? 'archived' : 'active')) === 'active')).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)).slice(0, 50);
+  const recentSessions = sessions.filter(item => !isArchived(item) && projects.some(project => project.id === item.projectId
+    && project.name.trim().toLowerCase() !== 'system'
+    && (project.status ?? (project.archivedAt ? 'archived' : 'active')) === 'active'))
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)).slice(0, 50);
   const projectName = (id: string | undefined) => {
     const owner = projects.find(item => item.id === id && !item.archivedAt);
     return owner ? projectDisplayName(owner) : undefined;

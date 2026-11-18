@@ -157,7 +157,7 @@ export class SessionManager {
       this.lifecycle = new SandboxLifecycleService({
         ...lifecycleOptions,
         listProjects: () => this.listProjectsWithArchives(),
-        reclaim: (id, options) => this.archiveProjectNow(id, options).then(() => {}),
+        reclaim: id => this.archiveCompletedProject(id),
       });
     }
   }
@@ -1226,6 +1226,12 @@ export class SessionManager {
   }
 
   async updateProject(id: string, input: ProjectUpdate): Promise<ProjectSummary> {
+    if (input.status !== undefined) {
+      // A restore-to-active request must serialize with automatic archival,
+      // including across API replicas. Ordinary metadata edits remain available.
+      await this.withProjectOperation(id, async () => { await this.projects.update(id, input); });
+      return this.readProject(id);
+    }
     return this.updateProjectLocal(id, input);
   }
 
@@ -1310,6 +1316,28 @@ export class SessionManager {
   async archiveProjectNow(id: string, options: { useExistingBackup?: boolean } = {}): Promise<ProjectSummary> {
     await this.runProjectSandboxOperation(id, 'archive', options);
     return this.readProject(id);
+  }
+
+  private async archiveCompletedProject(id: string): Promise<void> {
+    if (this.closing || !this.sandboxOperations) return;
+    await this.withProjectOperation(id, async () => {
+      await this.projects.refreshOne(id);
+      const project = await this.liveProject(this.projects.get(id), true);
+      if (this.closing || !this.lifecycle?.isEligible(project)) return;
+      const sessions = await this.state.listProjectSessions(id);
+      if (sessions.some(session => session.status === 'running')) return;
+      if (project.sandbox?.status === 'ready' && this.nativeWebSocketEnabled) {
+        try {
+          if (!this.sandbox?.hasActiveThreads || await this.sandbox.hasActiveThreads(project.sandbox)) return;
+        } catch (error) {
+          void this.logger?.write({ event: 'sandbox.auto_archive_observation_failed', projectId: id, error });
+          return;
+        }
+      }
+      await this.sandboxOperations!.run(id, 'archive', {
+        automaticArchiveAttempt: (project.sandboxOperation?.automaticArchiveAttempt ?? 0) + 1,
+      });
+    });
   }
 
   private async runProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'],

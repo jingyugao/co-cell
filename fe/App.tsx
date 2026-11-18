@@ -212,6 +212,12 @@ export default function App() {
     selected, enabled: !loading, historyReady, native: nativeEnabled, nativeHistoryManaged,
     onState: async () => { await refreshWorkspace(); }, onError: setError,
   });
+  const listedTitle = nativeEnabled ? sessions.find(item => item.id === selected)?.title : undefined;
+  useEffect(() => {
+    if (listedTitle === undefined) return;
+    setSession(current => current?.id === selected && current.title !== listedTitle
+      ? { ...current, title: listedTitle } : current);
+  }, [listedTitle, selected, setSession]);
   const native = useNativeSession({ selected, enabled: !loading && nativeConnectEnabled && historyReady, session, setSession, onError: setError });
   const connected = nativeEnabled ? native.connected : streamConnected;
   const { prompt, setPrompt, setSessionDraft, moveToSession } = usePromptDraft(

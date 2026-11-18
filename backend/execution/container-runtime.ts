@@ -396,7 +396,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async nativeRequest(session: Session, method: string, params: unknown) {
     if (!session.sandbox) throw new HttpError(409, '项目没有 Sandbox');
     return this.reader.read(session.sandbox.id, async client => {
-      if (!['thread/start', 'thread/read'].includes(method) && session.threadId) {
+      if (!['thread/start', 'thread/read', 'thread/turns/list'].includes(method) && session.threadId) {
         const { thread } = await client.request('thread/read', { threadId: session.threadId, includeTurns: false });
         if (thread.status?.type === 'notLoaded')
           await client.threadResume({ threadId: session.threadId, excludeTurns: true });

@@ -1639,15 +1639,26 @@ export class SessionManager {
     } finally { release(); }
   }
 
-  private async assertNativeIdle(session: Session): Promise<void> {
+  private async assertNativeIdle(session: Session, checkTurnAfterError = false): Promise<void> {
     if (!this.isNativeSession(session) || !session.threadId || !session.sandbox) return;
     const sandbox = await querySandbox(this.sandbox, session.sandbox, true);
     if (sandbox.status === 'paused') return;
     if (sandbox.status !== 'ready') throw new HttpError(409, '无法确认 Codex 的执行状态，请恢复 Sandbox 后重试');
     const response = await this.sandbox!.nativeRequest!(session, 'thread/read', { threadId: session.threadId, includeTurns: false });
     const status = response.thread?.status?.type;
-    if (status === 'active') throw new HttpError(409, '请先停止当前任务');
-    if (status !== 'idle' && status !== 'notLoaded') throw new HttpError(409, '无法确认 Codex 的执行状态');
+    if (status === 'idle' || status === 'notLoaded') return;
+    let turnStatus: unknown;
+    if (status === 'systemError' && checkTurnAfterError) {
+      // Codex can retain systemError after a turn fails. Check the latest turn
+      // before letting the user change settings for the next turn.
+      const page = await this.sandbox!.nativeRequest!(session, 'thread/turns/list', {
+        threadId: session.threadId, itemsView: 'notLoaded', sortDirection: 'desc', limit: 1,
+      });
+      turnStatus = page?.data?.[0]?.status;
+      if (turnStatus === 'failed' || turnStatus === 'completed' || turnStatus === 'interrupted') return;
+    }
+    if (status === 'active' || turnStatus === 'inProgress') throw new HttpError(409, '请先停止当前任务');
+    throw new HttpError(409, '无法确认 Codex 的执行状态');
   }
 
   async update(id: string, input: { title?: string; settings?: Partial<Settings>; archived?: boolean }): Promise<Session> {
@@ -1661,7 +1672,7 @@ export class SessionManager {
       this.projects.assertAvailable(projectId);
     }
     const session = this.lookup(id);
-    await this.assertNativeIdle(session);
+    await this.assertNativeIdle(session, input.settings !== undefined && input.archived === undefined);
     if (this.active.has(id) || session.status === 'running') throw new HttpError(409, '请先停止当前任务再修改会话');
     if (input.archived && session.turns.some(turn => turn.status === 'running')) {
       throw new HttpError(409, '请先停止当前任务再归档会话');

@@ -131,6 +131,8 @@ export interface ProjectSandboxOperation {
   status: 'running' | 'failed' | 'succeeded' | 'unknown';
   error?: string;
   errorCode?: string;
+  /** Persisted automatic archive submission count; bounds retries after explicit BUSY failures. */
+  automaticArchiveAttempt?: number;
   /** Archive is durable; reclaiming the old runtime or cache can be retried independently. */
   cleanupError?: string;
   retentionError?: string;
@@ -162,6 +164,7 @@ export interface ProjectSandboxBackup {
   status: 'running' | 'failed' | 'succeeded' | 'unknown';
   phase: string;
   error?: string;
+  errorCode?: string;
   durationMs?: number;
   scannedBytes?: number;
   verified?: boolean;

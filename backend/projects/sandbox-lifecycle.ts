@@ -2,6 +2,8 @@ import type { Project } from '../../protocol/types.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 const MINUTE = 60 * 1000;
+const BUSY_RETRY_DELAY = 5 * MINUTE;
+const MAX_AUTOMATIC_ARCHIVE_ATTEMPTS = 3;
 
 export interface SandboxLifecycleOptions {
   listProjects: () => Project[] | Promise<Project[]>;
@@ -46,28 +48,42 @@ export class SandboxLifecycleService {
     return current;
   }
 
+  /** Rechecked under the project operation lock before any automatic mutation. */
+  isEligible(project: Project): boolean {
+    if (project.removedAt || project.executionMode !== 'sandbox' || project.status !== 'completed') return false;
+    const now = this.now();
+    const timestamp = Date.parse(project.completedAt ?? '');
+    if (!Number.isFinite(timestamp) || timestamp > now - this.archivedReclaimAfterMs) return false;
+    const operation = project.sandboxOperation;
+    const retryable = operation?.status === 'failed' && operation.errorCode === 'BUSY'
+      && ['checkpoint', 'release', 'archive'].includes(operation.kind);
+    if (operation && operation.status !== 'succeeded') {
+      // Only an explicit BUSY failure authorizes a new submission. Unknown
+      // outcomes and other failures still require an operator decision.
+      if (!retryable || (operation.automaticArchiveAttempt ?? 0) >= MAX_AUTOMATIC_ARCHIVE_ATTEMPTS) return false;
+      const failedAt = Date.parse(operation.updatedAt);
+      if (!Number.isFinite(failedAt) || now - failedAt < BUSY_RETRY_DELAY) return false;
+    }
+    const backup = project.sandboxBackup;
+    if (backup && backup.status !== 'succeeded') {
+      const busyBackup = backup.errorCode === 'BUSY'
+        || (retryable && operation?.kind === 'archive' && backup.id === operation.id);
+      if (backup.status !== 'failed' || !busyBackup) return false;
+    }
+    if (project.sandbox) {
+      if (project.sandbox.creation) return false;
+      // Running environments are released with their disks intact before capture.
+      return ['ready', 'paused'].includes(project.sandbox.status) || project.sandbox.phase === 'failed';
+    }
+    return Boolean(project.sandboxMounts?.length || project.archiveCleanupSourceId);
+  }
+
   private async runSweep(): Promise<void> {
-    const cutoff = this.now() - this.archivedReclaimAfterMs;
-    const eligible = (await this.options.listProjects()).filter(project => {
-      if (project.executionMode !== 'sandbox') return false;
-      if (project.status !== 'completed') return false;
-      // A failed, unknown, or still-running operation needs an explicit user
-      // decision; a later sweep must not submit that mutation again.
-      if (project.sandboxOperation && project.sandboxOperation.status !== 'succeeded') return false;
-      if (project.sandboxBackup && project.sandboxBackup.status !== 'succeeded') return false;
-      // Automatic capture is disk-only: it can read a paused box or a box whose
-      // failed phase confirms execution has stopped. It never checkpoints a
-      // running box implicitly. A committed archive may still need cleanup.
-      if (project.sandbox) {
-        if (project.sandbox.status !== 'paused' && project.sandbox.phase !== 'failed') return false;
-      } else if (!project.archiveCleanupSourceId) return false;
-      const timestamp = Date.parse(project.completedAt ?? '');
-      return Number.isFinite(timestamp) && timestamp <= cutoff;
-    });
+    const eligible = (await this.options.listProjects()).filter(project => this.isEligible(project));
     for (const project of eligible) {
       if (this.closed) break;
       try { await this.options.reclaim(project.id, { useExistingBackup: false }); }
-      catch { /* The next sweep consults persisted operation/backup state before any new submission. */ }
+      catch { /* Persisted outcomes bound retries and prevent replay after an unknown result. */ }
     }
   }
 

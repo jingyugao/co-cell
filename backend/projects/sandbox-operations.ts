@@ -16,7 +16,8 @@ import { BackupCatalogUnavailable } from '../sandboxes/cellbox-volume-backups.js
 import { sandboxMounts } from '../../util/sandbox-mounts.js';
 import type { ProjectResumeObserver } from '../../protocol/resume-types.js';
 
-type OperationOptions = { useExistingBackup?: boolean; imageVersionId?: string; onResumeProgress?: ProjectResumeObserver };
+type OperationOptions = { useExistingBackup?: boolean; imageVersionId?: string; onResumeProgress?: ProjectResumeObserver;
+  automaticArchiveAttempt?: number };
 
 const target = (project: Project): WorkspaceTarget => ({ id: project.id, projectId: project.id,
   settings: { workingDirectory: project.workingDirectory }, imageSelection: project.imageSelection, sandbox: project.sandbox,
@@ -105,8 +106,17 @@ export class ProjectSandboxOperations {
     const selection = kind === 'restore' && this.deps.selectRestoreImage
       ? await this.deps.selectRestoreImage(project, options.imageVersionId) : undefined;
     const previous = kind === 'delete' && project.sandboxOperation?.kind === 'delete' ? project.sandboxOperation : undefined;
+    // Legacy backups stored their provider code only on the enclosing operation.
+    // Preserve that evidence before a new archive attempt replaces the operation,
+    // including when its release step fails before another backup is submitted.
+    if (options.automaticArchiveAttempt !== undefined && project.sandboxBackup?.status === 'failed'
+      && !project.sandboxBackup.errorCode && project.sandboxBackup.id === project.sandboxOperation?.id
+      && project.sandboxOperation.status === 'failed' && project.sandboxOperation.errorCode === 'BUSY') {
+      await this.deps.projects.updateSandboxBackup(id, { ...project.sandboxBackup, errorCode: 'BUSY' }, project.sandboxBackup.id);
+    }
     const operation: ProjectSandboxOperation = { ...previous, id: previous?.id ?? randomUUID(), kind, phase: '提交操作', status: 'running',
       error: undefined, errorCode: undefined, cleanupError: undefined,
+      ...(options.automaticArchiveAttempt === undefined ? {} : { automaticArchiveAttempt: options.automaticArchiveAttempt }),
       ...(selection?.selection ? { imageSelection: selection.selection } : {}), updatedAt: new Date().toISOString() };
     await this.deps.projects.updateSandboxOperation(id, operation);
     const started = Date.now();
@@ -121,7 +131,7 @@ export class ProjectSandboxOperations {
         else if (kind === 'backup') await this.backup(id);
         else if (kind === 'delete') await this.remove(id);
         else if (kind === 'refresh') throw new HttpError(422, '当前 Cellbox 不支持原地刷新；请选择明确版本创建新环境。');
-        else await this.archive(id, options.useExistingBackup === true);
+        else await this.archive(id, options.useExistingBackup === true, options.automaticArchiveAttempt !== undefined);
         operation.status = 'succeeded'; operation.phase = operation.cleanupError ? '操作完成，资源清理未完成' : '完成'; operation.updatedAt = new Date().toISOString();
         await this.deps.projects.updateSandboxOperation(id, { ...operation });
       } catch (error) {
@@ -254,7 +264,7 @@ export class ProjectSandboxOperations {
           durationMs: Date.now() - started, updatedAt: new Date().toISOString() }, operation.id);
       } else {
         await this.deps.projects.updateSandboxBackup(id, { ...backup, status: detail.unknown ? 'unknown' : 'failed',
-          error: detail.message, updatedAt: new Date().toISOString() }, operation.id);
+          error: detail.message, errorCode: detail.code, updatedAt: new Date().toISOString() }, operation.id);
       }
       throw error;
     }
@@ -349,8 +359,14 @@ export class ProjectSandboxOperations {
     await this.cleanup(id, false, new Set(project.sandbox ? [project.sandbox.id] : []));
   }
 
-  private async archive(id: string, useExistingBackup: boolean) {
+  private async archive(id: string, useExistingBackup: boolean, releaseBeforeBackup = false) {
     const { projects } = this.deps;
+    if (releaseBeforeBackup && projects.get(id).sandbox) {
+      // Release avoids process checkpointing and removes runtime fences while
+      // preserving the latest disk contents. A failed release stops the archive.
+      await this.release(id);
+      this.context.getStore()!.project = projects.get(id);
+    }
     const project = await this.inspect(id);
     const originalTarget = target(project);
     if (project.status !== 'archived' || project.sandbox) {

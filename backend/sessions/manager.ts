@@ -500,9 +500,15 @@ export class SessionManager {
     });
   }
 
-  /** Observe activity only; conversation contents and execution remain in Codex. */
+  /** Observe activity and generate a title after Codex accepts a user message. */
   async observeNativeMessage(event: NativeRelayEvent): Promise<void> {
-    if (event.direction !== 'server' || !['turn/started', 'turn/completed'].includes(event.message.method ?? '')) return;
+    if (event.direction !== 'server') return;
+    const { method, params } = event.message;
+    if (method === 'item/completed' && params?.item?.type === 'userMessage' && typeof params.threadId === 'string') {
+      this.generateNativeTitle(event.sessionId, params.threadId);
+      return;
+    }
+    if (!['turn/started', 'turn/completed'].includes(method ?? '')) return;
     await this.writer.run(event.sessionId, async () => {
       const session = await this.state.getSession(event.sessionId);
       if (!session || !this.isNativeSession(session) || session.threadId !== event.message.params?.threadId) return;
@@ -511,6 +517,27 @@ export class SessionManager {
       metadata.updatedAt = new Date(event.receivedAt).toISOString();
       await this.state.saveSession(metadata, sessionMetadata(session), true);
     });
+  }
+
+  private generateNativeTitle(id: string, threadId: string) {
+    if (!this.state.replaceSessionTitle || !this.sandbox?.nativeRequest || this.closing) return;
+    void this.updateNativeTitle(id, threadId).catch(() => {
+      void this.logger?.write({ event: 'session.title_generation_failed', sessionId: id });
+    });
+  }
+
+  private async updateNativeTitle(id: string, threadId: string) {
+    const session = await this.state.getSession(id);
+    if (!session || session.archivedAt || session.title !== '新任务' || session.threadId !== threadId) return;
+    const { thread } = await this.sandbox!.nativeRequest!(session, 'thread/read', { threadId, includeTurns: false });
+    const prompt = typeof thread?.preview === 'string' ? thread.preview.trim() : '';
+    if (!prompt) return;
+    const fallback = Array.from(prompt.slice(0, 4000).replace(/\s+/g, ' ')).slice(0, 60).join('').trimEnd();
+    const initialTitle = fallback === session.title ? `「${fallback}」` : fallback;
+    if (!await this.state.replaceSessionTitle!(id, threadId, session.title, initialTitle)) return;
+    const title = await this.models?.generateSessionTitle(session.settings, prompt);
+    if (title && title !== initialTitle && title !== session.title && !this.closing)
+      await this.state.replaceSessionTitle!(id, threadId, initialTitle, title);
   }
 
   private reserveTurn(session: Session, lease?: SharedLease): ActiveExecution {
@@ -1871,6 +1898,7 @@ export class SessionManager {
     const result = await this.sandbox!.nativeRequest!(session, method, params);
     const nativeId = result.turn?.id ?? result.turnId ?? running?.id;
     if (!nativeId) throw new HttpError(502, 'App Server 未返回执行标识，接收状态未知，请检查会话');
+    if (method === 'turn/start' && session.threadId) this.generateNativeTitle(id, session.threadId);
     return nativeId;
   }
 

@@ -7,7 +7,7 @@ import { MySqlKnowledgeRepository } from '../../knowledge/repository.js';
 import { MySqlFileFavoriteRepository } from '../../file-favorites/repository.js';
 import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
 import type { DefaultImageSelection } from '../../../protocol/image-types.js';
-import { createPool, type Pool, type RowDataPacket } from 'mysql2/promise';
+import { createPool, type Pool, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise';
 import type { Project, Session, Turn } from '../../../protocol/types.js';
 import type { InputRequestRecord } from '../../../protocol/input-request-types.js';
 import { MySqlSecretRepository } from '../../secrets/repository.js';
@@ -27,6 +27,7 @@ export interface WebStateStore {
   /** The synchronous mutation runs against the latest project in a short transaction. */
   mutateProject(id: string, mutate: (current: Project) => void): Promise<Project>;
   saveProject(project: Project, previous?: Project): Promise<void>; saveSession(session: Session, previous?: Session, metadataOnly?: boolean): Promise<void>;
+  replaceSessionTitle?(id: string, threadId: string, expected: string, title: string): Promise<boolean>;
   saveInputRequest?(request: InputRequestRecord): Promise<void>; listInputRequests?(sessionId: string): Promise<InputRequestRecord[]>;
   /** Deduplication, projection, notifications and result reads share one transaction. */
   consumeNativeEvents?(events: NativeBusinessEvent[]): Promise<Session | undefined>;
@@ -371,6 +372,12 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   saveSession(session: Session, previous?: Session, metadataOnly = false): Promise<void> {
     if (previous && previous.id !== session.id) return Promise.reject(new HttpError(409, '不能将记录基线用于其他记录'));
     return this.saveSessionRelational(session, previous, metadataOnly || session.settings.executionMode === 'sandbox');
+  }
+  async replaceSessionTitle(id: string, threadId: string, expected: string, title: string): Promise<boolean> {
+    const [result] = await this.pool.execute<ResultSetHeader>(
+      'UPDATE sessions SET title=? WHERE id=? AND thread_id=? AND archived_at IS NULL AND BINARY title=BINARY ?',
+      [title, id, threadId, expected]);
+    return result.affectedRows === 1;
   }
   async saveInputRequest(request: InputRequestRecord): Promise<void> {
     const connection = await this.pool.getConnection();

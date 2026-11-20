@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { DynamicToolCreateInput, DynamicToolExecution, DynamicToolInput } from '../../protocol/tool-types.js';
-import { validateDynamicToolExecution } from '../../util/dynamic-tool-config.mjs';
+import { MAX_TOOL_TIMEOUT_MS, validateDynamicToolExecution } from '../../util/dynamic-tool-config.mjs';
 import { HttpError } from '../../util/errors.js';
 import { credentialPath, toolName } from '../secrets/policy.js';
 import type { SharedCoordinator } from '../infra/storage/coordination.js';
@@ -36,7 +36,7 @@ export class DynamicTools {
     const definition: DynamicToolInput = {
       ...input, name: input.name, description: input.description ?? '', instructions: input.instructions ?? '',
       enabled: input.enabled ?? true, executable: input.executable ?? input.name,
-      args: input.args ?? [], env: input.env ?? {}, timeoutMs: input.timeoutMs ?? 20000,
+      args: input.args ?? [], env: input.env ?? {}, timeoutMs: input.timeoutMs ?? MAX_TOOL_TIMEOUT_MS,
     };
     return this.save(definition);
   }

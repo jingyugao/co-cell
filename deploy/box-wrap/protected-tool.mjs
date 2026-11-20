@@ -79,7 +79,7 @@ async function agentGroup(agentHome) {
   const { gid } = await stat(agentHome);
   return gid === 0 ? undefined : gid;
 }
-async function execute(executable, args, env, cwd, timeoutMs = 20000, gid) {
+async function execute(executable, args, env, cwd, timeoutMs, gid) {
   if (gid !== undefined) process.umask(0o002);
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true, ...(gid !== undefined ? { gid } : {}) });
@@ -87,9 +87,16 @@ async function execute(executable, args, env, cwd, timeoutMs = 20000, gid) {
     let stdout = '', stderr = '', size = 0;
     const collect = target => chunk => { size += chunk.length; if (size <= 1024 * 1024) { if (target === 'out') stdout += chunk; else stderr += chunk; } };
     child.stdout.on('data', collect('out')); child.stderr.on('data', collect('err'));
-    const timer = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* Already exited. */ } }, timeoutMs);
-    child.once('error', error => { clearTimeout(timer); reject(error); });
-    child.once('close', (code, signal) => { clearTimeout(timer); resolve({ exitCode: signal ? 124 : code ?? 1, stdout, stderr }); });
+    const kill = () => { if (child.pid) try { process.kill(-child.pid, 'SIGKILL'); } catch { /* Already exited. */ } };
+    // The native command has its own process group. Forward cancellation from the guest.
+    process.on('SIGTERM', kill);
+    const timer = setTimeout(kill, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      process.removeListener('SIGTERM', kill);
+    };
+    child.once('error', error => { cleanup(); reject(error); });
+    child.once('close', (code, signal) => { cleanup(); resolve({ exitCode: signal ? 124 : code ?? 1, stdout, stderr }); });
   });
 }
 

@@ -4,6 +4,7 @@ import { TOOL_NAME_PATTERN } from '../../util/tool-secrets.js';
 import { HttpError } from '../../util/errors.js';
 import type { DynamicTools } from './service.js';
 import type { SecretService } from '../secrets/service.js';
+import { MAX_TOOL_TIMEOUT_MS } from '../../util/dynamic-tool-config.mjs';
 
 const name = z.string().regex(TOOL_NAME_PATTERN);
 const version = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
@@ -22,7 +23,7 @@ const input = z.object({
   credentialExcludedPaths: z.array(z.string().min(1).max(256)).max(16).optional(),
   credentialContext: z.object({ identity: identity.optional(), targetIdentity: identity.optional() }).strict().optional(),
   permissionScriptId: scriptId, credentialParseScriptId: scriptId, credentialSaveScriptId: scriptId,
-  timeoutMs: z.number().int().min(100).max(20000),
+  timeoutMs: z.number().int().min(100).max(MAX_TOOL_TIMEOUT_MS),
 }).strict();
 const createInput = input.partial().extend({ name });
 

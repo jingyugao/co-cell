@@ -4,6 +4,8 @@ const COMMAND_EXECUTABLE = /^[A-Za-z][A-Za-z0-9_.+-]{0,254}$/;
 const NATIVE_EXECUTABLE = /^\/(?:opt\/cellbox\/debug-bin|usr\/bin|usr\/local\/bin)\/[A-Za-z0-9._+-]+$/;
 const PACKAGE_EXECUTABLE = /^\/var\/lib\/cellbox\/shared\/tools\/packages\/[a-f0-9]{64}\/(?:[A-Za-z0-9._+-]+\/)*[A-Za-z0-9._+-]+$/;
 
+export const MAX_TOOL_TIMEOUT_MS = 60 * 60 * 1000;
+
 function validExecutable(path) {
   if (typeof path !== 'string' || path.length > 4096 || path === 'cocell' || path === '/usr/local/bin/cocell' || path.includes('\\') ||
       /[\u0000-\u001f\u007f]/.test(path) || path.split('/').some(part => part === '.' || part === '..')) return false;
@@ -18,7 +20,7 @@ export function validateDynamicToolExecution(value, { credentialAvailable } = {}
       value.args.some(arg => typeof arg !== 'string' || arg.includes('\0')) ||
       value.args.reduce((size, arg) => size + Buffer.byteLength(arg), 0) > 8192 ||
       !value.env || typeof value.env !== 'object' || Array.isArray(value.env) || Object.keys(value.env).length > 64 ||
-      !Number.isInteger(value.timeoutMs) || value.timeoutMs < 100 || value.timeoutMs > 20000)
+      !Number.isInteger(value.timeoutMs) || value.timeoutMs < 100 || value.timeoutMs > MAX_TOOL_TIMEOUT_MS)
     throw new Error('Invalid dynamic tool execution');
   let environmentBytes = 0;
   for (const [key, template] of Object.entries(value.env)) {

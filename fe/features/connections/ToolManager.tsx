@@ -4,6 +4,7 @@ import type { DynamicTool, DynamicToolCreateInput, DynamicToolInput } from '../.
 import type { ToolScript } from '../../../protocol/tool-script-types';
 import type { ToolCatalogEntry } from '../../../protocol/secret-types';
 import { TOOL_NAME_PATTERN } from '../../../util/tool-secrets';
+import { MAX_TOOL_TIMEOUT_MS } from '../../../util/dynamic-tool-config.mjs';
 import { api, errorMessage } from '../../lib/api';
 import ToolCredentialBrowser from './ToolCredentialBrowser';
 import EditorDialog from './EditorDialog';
@@ -17,9 +18,10 @@ type Editor = DynamicTool | 'new' | null;
 type Draft = Pick<DynamicToolInput, 'name' | 'enabled' | 'permissionScriptId' | 'credentialParseScriptId' | 'credentialSaveScriptId'> & {
   credentialMode: 'shared' | 'named';
   credentialPath: string;
+  timeoutMs: number | '';
 };
 
-const blank: Draft = { name: '', enabled: true, credentialMode: 'shared', credentialPath: '', permissionScriptId: '', credentialParseScriptId: '', credentialSaveScriptId: '' };
+const blank: Draft = { name: '', enabled: true, credentialMode: 'shared', credentialPath: '', timeoutMs: '', permissionScriptId: '', credentialParseScriptId: '', credentialSaveScriptId: '' };
 const catalogChanged = () => window.dispatchEvent(new Event('cocell:tool-catalog-changed'));
 
 function readJson<T>(value: string, expected: string): T {
@@ -105,7 +107,7 @@ export default function ToolManager() {
     if (draftGuard && !draftGuard.canLeave(['tool-editor', 'credential-browser'])) return;
     setBrowsing(null);
     setEmbeddedCredentialOpen(Boolean(item));
-    const nextDraft = item ? { name: item.name, enabled: item.enabled, credentialMode: item.credentialMode ?? 'shared', credentialPath: item.credentialPath ?? '', permissionScriptId: item.permissionScriptId ?? '', credentialParseScriptId: item.credentialParseScriptId ?? '', credentialSaveScriptId: item.credentialSaveScriptId ?? '' } : { ...blank };
+    const nextDraft: Draft = item ? { name: item.name, enabled: item.enabled, credentialMode: item.credentialMode ?? 'shared', credentialPath: item.credentialPath ?? '', timeoutMs: item.timeoutMs ?? '', permissionScriptId: item.permissionScriptId ?? '', credentialParseScriptId: item.credentialParseScriptId ?? '', credentialSaveScriptId: item.credentialSaveScriptId ?? '' } : { ...blank };
     const nextArgs = JSON.stringify(item?.args ?? [], null, 2);
     const nextPaths = (item?.credentialPaths ?? []).join('\n');
     editorBaseline.current = JSON.stringify({ draft: nextDraft, argsText: nextArgs, credentialPathsText: nextPaths });
@@ -148,6 +150,7 @@ export default function ToolManager() {
       const changes: DynamicToolCreateInput = {
         name: draft.name.trim(), enabled: draft.enabled,
         ...savedMode,
+        ...(!creating || draft.timeoutMs !== '' ? { timeoutMs: draft.timeoutMs === '' ? MAX_TOOL_TIMEOUT_MS : draft.timeoutMs } : {}),
         ...(credentialPath ? { credentialPath } : {}),
         ...(!creating || args.length ? { args } : {}),
         ...(credentialPaths.length ? { credentialPaths } : {}),
@@ -202,6 +205,9 @@ export default function ToolManager() {
         <label className="tool-enabled"><input type="checkbox" checked={draft.enabled} onChange={event => setField('enabled', event.target.checked)} />启用</label>
       </div>
       <label>启动参数（JSON 字符串数组）<textarea aria-label="启动参数（JSON 字符串数组）" className="tool-json" rows={3} spellCheck={false} value={argsText} onChange={event => setArgsText(event.target.value)} /></label>
+      <label>执行时限（毫秒）<input type="number" min={100} max={MAX_TOOL_TIMEOUT_MS} step={1}
+        placeholder={String(MAX_TOOL_TIMEOUT_MS)} value={draft.timeoutMs}
+        onChange={event => setField('timeoutMs', event.target.value === '' ? '' : event.target.valueAsNumber)} /></label>
       <label>凭据模式<select aria-label="凭据模式" value={draft.credentialMode} onChange={event => setField('credentialMode', event.target.value as Draft['credentialMode'])}>
         <option value="shared">共享凭据</option><option value="named">命名凭据</option>
       </select></label>

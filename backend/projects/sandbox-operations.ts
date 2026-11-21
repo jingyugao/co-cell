@@ -30,7 +30,9 @@ export class ProjectSandboxOperations {
   constructor(private deps: {
     projects: ProjectService;
     runtime: SandboxRuntime;
-    threadIds: (id: string) => string[];
+    captureHistoryIndex: (id: string) => Promise<Pick<RemoteArchiveRef, 'threadIds' | 'claudeSessionIds'>>;
+    assertClaudeIdle?: (project: Project) => Promise<void>;
+    verifyClaude?: (box: string, ids: string[]) => Promise<void>;
     saveSandbox: (id: string, sandbox: SandboxState, restore: boolean, image?: ProjectImageSelection, expectedSandboxId?: string | null) => Promise<void>;
     selectRestoreImage?: (project: Project, versionId?: string) => Promise<{ selection?: ProjectImageSelection; release(): void | Promise<void> }>;
     detached: (id: string) => Promise<void>;
@@ -97,6 +99,10 @@ export class ProjectSandboxOperations {
   }
 
   private async execute(id: string, kind: ProjectSandboxOperation['kind'], options: OperationOptions): Promise<void> {
+    // Only operations that can stop or replace the worker need an execution fence.
+    // A standalone volume backup keeps Cellbox's existing consistency checks.
+    if (['checkpoint', 'release', 'restore', 'archive', 'delete'].includes(kind))
+      await this.deps.assertClaudeIdle?.(this.deps.projects.get(id));
     if (kind === 'delete') await this.deps.projects.markDeleting(id);
     else if (!(kind === 'restore' && this.deps.projects.get(id).removedAt)) this.deps.projects.assertAvailable(id);
     const project = this.deps.projects.get(id);
@@ -213,8 +219,8 @@ export class ProjectSandboxOperations {
       phase: '提交磁盘备份', updatedAt: new Date().toISOString() };
     await this.deps.projects.updateSandboxBackup(id, backup);
     const started = Date.now();
-    const threadIds = this.deps.threadIds(id);
     try {
+      const historyIndex = await this.deps.captureHistoryIndex(id);
       await this.phase(id, backup.phase);
       const captured = await remote.capture(target(project), this.operationKey(id, 'capture'), {
         ...(operation.kind === 'delete' ? {
@@ -231,7 +237,7 @@ export class ProjectSandboxOperations {
           await this.deps.projects.updateSandboxBackup(id, backup, operation.id);
         },
       });
-      const reference: RemoteArchiveRef = { ...captured, threadIds };
+      const reference: RemoteArchiveRef = { ...captured, ...historyIndex };
       const retentionError = reference.storageType === 'cellbox-volume' ? reference.retentionError : undefined;
       if (reference.storageType === 'cellbox-volume') delete reference.retentionError;
       await this.deps.projects.saveRemoteArchive(id, reference);
@@ -344,6 +350,10 @@ export class ProjectSandboxOperations {
     await remote.activate(candidate);
     await runtime.verifySandbox(candidate);
     await runtime.verifyHistory?.(candidate, reference.threadIds);
+    if (reference.claudeSessionIds?.length) {
+      if (!this.deps.verifyClaude) throw new HttpError(503, '无法验证归档中的 Claude 会话');
+      await this.deps.verifyClaude(candidate.id, reference.claudeSessionIds);
+    }
     // The old binding remains intact through staged restore and verification.
     await this.phase(id, '切换环境');
     if (project.sandbox) {

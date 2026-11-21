@@ -2,7 +2,7 @@ import ImagesPage from './features/images/ImagesPage';
 import TurnContextStatus from './features/chat/TurnContextStatus';
 import BillingRail from './features/chat/LazyBillingRail';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { AppConfig, ProjectSummary, Session, SessionSummary, Settings } from '../protocol/types';
+import type { AgentKind, AppConfig, ProjectSummary, Session, SessionSummary, Settings } from '../protocol/types';
 import { useProjects } from './features/projects/useProjects';
 import { useProjectEntry } from './features/projects/useProjectEntry';
 import './features/projects/ProjectEntry.css';
@@ -15,7 +15,7 @@ import { DEFAULT_MODEL } from '../util/models';
 import { projectDisplayName } from '../util/project-types';
 import { userInputReplyDisplayText } from '../util/user-input';
 import { Icon, Mark } from './components/Icon';
-import { api, errorMessage as message } from './lib/api';
+import { api, ApiError, errorMessage as message } from './lib/api';
 import { completePageLoad, markPageLoad, pageLoadFailure, setPageLoadSession } from './lib/page-load';
 import { readRoute, resolveSelection, routeUrl, type Page, type Selection } from './lib/navigation';
 import TurnProgress from './features/chat/TurnProgress';
@@ -52,6 +52,32 @@ const isArchived = (value: ArchivableSession) => Boolean(value.archivedAt);
 const archivedAt = (value: ArchivableSession) => value.archivedAt || '';
 const dateTime = (value: string) => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) : '—';
 const turnPrompt = (session: Session | null) => session?.turns.at(-1)?.prompt || '继续';
+
+async function submitClaudeTurn(sessionId: string, prompt: string, images: string[]) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({ prompt, images })));
+  const fingerprint = Array.from(new Uint8Array(digest), value => value.toString(16).padStart(2, '0')).join('');
+  const storageKey = `cocell-claude-submissions:${sessionId}`;
+  let pending: Record<string, string> = {};
+  try { pending = JSON.parse(sessionStorage.getItem(storageKey) || '{}'); } catch { /* A fresh ID remains safe. */ }
+  const clientRequestId = pending[fingerprint] || crypto.randomUUID();
+  pending[fingerprint] = clientRequestId;
+  sessionStorage.setItem(storageKey, JSON.stringify(pending));
+  try {
+    const result = await api(`/api/sessions/${sessionId}/turns`, {
+      method: 'POST', body: JSON.stringify({ prompt, images, clientRequestId }),
+    });
+    delete pending[fingerprint];
+    sessionStorage.setItem(storageKey, JSON.stringify(pending));
+    return result;
+  } catch (error) {
+    if (error instanceof ApiError && error.status && error.status < 500 && error.status !== 408 && error.status !== 409
+      && error.code !== 'UNKNOWN_OUTCOME') {
+      delete pending[fingerprint];
+      sessionStorage.setItem(storageKey, JSON.stringify(pending));
+    }
+    throw error;
+  }
+}
 function ConversationList({ items, archivedItems, selected, projectName, emptyMessage, busy, menuOpen, onMenuOpen, onSelect, onArchive }: {
   items: SessionSummary[];
   archivedItems?: SessionSummary[];
@@ -65,7 +91,7 @@ function ConversationList({ items, archivedItems, selected, projectName, emptyMe
   onArchive: (id: string) => void;
 }) {
   const label = (item: SessionSummary) => projectName ? `${item.title} · ${projectName(item.projectId) ?? '未关联项目'}` : item.title;
-  return <nav className="session-list" aria-label="对话列表">{items.map(item => <div key={item.id} className={`session-row ${selected === item.id ? 'active' : ''}`}><button disabled={busy} className="session-link" onClick={() => onSelect(item.id)} title={label(item)}><Icon name="chat" size={15} /><span>{label(item)}</span>{item.status === 'running' && <span className="running-dot" />}</button><div className="session-menu-wrap"><button disabled={busy} className="session-menu-btn" aria-label="会话操作" onClick={event => { event.stopPropagation(); onMenuOpen(menuOpen === item.id ? null : item.id); }}><svg width="12" height="12" viewBox="0 0 16 16"><circle cx="8" cy="3" r="1.5" fill="currentColor"/><circle cx="8" cy="8" r="1.5" fill="currentColor"/><circle cx="8" cy="13" r="1.5" fill="currentColor"/></svg></button>{menuOpen === item.id && <><button className="session-menu-backdrop" onClick={() => onMenuOpen(null)} /><div className="session-menu-dropdown"><button disabled={busy} className="session-menu-item" onClick={() => { onMenuOpen(null); onArchive(item.id); }}>归档会话</button></div></>}</div></div>)}{!items.length && <p className="empty-history">{emptyMessage}</p>}{archivedItems && archivedItems.length > 0 && <details className="archived-sessions"><summary>已归档 <span>{archivedItems.length}</span></summary>{archivedItems.map(item => <button key={item.id} disabled={busy} className={`session-link archived ${selected === item.id ? 'active' : ''}`} onClick={() => onSelect(item.id)}><Icon name="chat" size={15} /><span>{item.title}</span></button>)}</details>}</nav>;
+  return <nav className="session-list" aria-label="对话列表">{items.map(item => <div key={item.id} className={`session-row ${selected === item.id ? 'active' : ''}`}><button disabled={busy} className="session-link" onClick={() => onSelect(item.id)} title={label(item)}><Icon name="chat" size={15} /><span>{label(item)}{item.agentKind === 'claude-code' ? ' · Claude Code' : ''}</span>{item.status === 'running' && <span className="running-dot" />}</button><div className="session-menu-wrap"><button disabled={busy} className="session-menu-btn" aria-label="会话操作" onClick={event => { event.stopPropagation(); onMenuOpen(menuOpen === item.id ? null : item.id); }}><svg width="12" height="12" viewBox="0 0 16 16"><circle cx="8" cy="3" r="1.5" fill="currentColor"/><circle cx="8" cy="8" r="1.5" fill="currentColor"/><circle cx="8" cy="13" r="1.5" fill="currentColor"/></svg></button>{menuOpen === item.id && <><button className="session-menu-backdrop" onClick={() => onMenuOpen(null)} /><div className="session-menu-dropdown"><button disabled={busy} className="session-menu-item" onClick={() => { onMenuOpen(null); onArchive(item.id); }}>归档会话</button></div></>}</div></div>)}{!items.length && <p className="empty-history">{emptyMessage}</p>}{archivedItems && archivedItems.length > 0 && <details className="archived-sessions"><summary>已归档 <span>{archivedItems.length}</span></summary>{archivedItems.map(item => <button key={item.id} disabled={busy} className={`session-link archived ${selected === item.id ? 'active' : ''}`} onClick={() => onSelect(item.id)}><Icon name="chat" size={15} /><span>{item.title}</span></button>)}</details>}</nav>;
 }
 
 export default function App() {
@@ -131,6 +157,8 @@ export default function App() {
   const [showBilling, setShowBilling] = useState(false);
   useEffect(() => { setBillingSelection(null); setConversationDetailsOpen(false); setShowBilling(false); }, [selected, selectedProject]);
   const [draftSettings, setDraftSettings] = useState<Settings | null>(null);
+  const [draftAgentKind, setDraftAgentKind] = useState<AgentKind>('codex');
+  const [claudeDraftModel, setClaudeDraftModel] = useState<{ model: string; modelEntryId: string } | null>(null);
   const [attachments, setAttachments] = useState<{ path: string; name: string }[]>([]);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -206,7 +234,9 @@ export default function App() {
     finally { setResumingProject(null); }
   }
   const historyReady = !project || (isProjectSandboxReady(project) && !entry.pending);
-  const nativeEnabled = Boolean(config?.capabilities.nativeWebSocket && sessions.find(item => item.id === selected)?.settings.executionMode === 'sandbox');
+  const selectedSummary = sessions.find(item => item.id === selected);
+  const agentKind = selected ? selectedSummary?.agentKind ?? 'codex' : draftAgentKind;
+  const nativeEnabled = Boolean(config?.capabilities.nativeWebSocket && agentKind === 'codex' && selectedSummary?.settings.executionMode === 'sandbox');
   const nativeConnectEnabled = nativeEnabled && page === 'chat' && !sessions.find(item => item.id === selected)?.archivedAt && !projectReadOnly;
   const nativeHistoryManaged = nativeConnectEnabled && historyReady;
   const { session, setSession, connected: streamConnected, loadOlder, loadingOlder, loadingHistory } = useSessionStream({
@@ -235,7 +265,9 @@ export default function App() {
   );
   const baseSettings = draftSettings || config?.defaults;
   const storedSettings = session?.settings || (baseSettings && project ? { ...baseSettings, executionMode: project.executionMode, workingDirectory: project.workingDirectory, networkAccessEnabled: draftSettings?.networkAccessEnabled ?? true } : baseSettings);
-  const settings = storedSettings ? effectiveSettings(storedSettings) : storedSettings;
+  const settings = storedSettings ? effectiveSettings(agentKind === 'claude-code' && !selected
+    ? { ...storedSettings, ...(claudeDraftModel ?? config?.claudeDefaults ?? { model: '', modelEntryId: undefined }) }
+    : storedSettings) : storedSettings;
   const visibleSessions = selectedProject ? sessions.filter(item => item.projectId === selectedProject) : [];
   const activeSessions = visibleSessions.filter(item => !isArchived(item));
   const archivedSessions = visibleSessions.filter(isArchived).sort((left, right) => Date.parse(archivedAt(right)) - Date.parse(archivedAt(left)));
@@ -253,7 +285,7 @@ export default function App() {
   const environmentPending = sandboxNotReady && (resumingProject === project?.id || sandboxView?.state === 'processing' || !entry.error && entry.pending);
   const running = session?.status === 'running';
   const { agents: subagents, error: subagentsError } = useSubagentConversations(
-    session?.threadId && !sandboxNotReady ? session.id : null, running,
+    session?.agentKind !== 'claude-code' && session?.threadId && !sandboxNotReady ? session.id : null, running,
   );
   // Native failed turns are execution history rather than user-visible chat.
   // `clientFailure` is injected below only for this browser page's failed POST.
@@ -280,7 +312,7 @@ export default function App() {
   const localReadOnly = Boolean(config?.sandbox?.enabled && settings && !sandbox);
   function applySelection(target: Selection) {
     if (target.sessionId !== activeId.current || target.projectId !== activeProjectId.current) {
-      setSession(null); setDraftSettings(null); setAttachments([]); setOpenFile(null);
+      setSession(null); setDraftSettings(null); setClaudeDraftModel(null); setAttachments([]); setOpenFile(null);
     }
     activeId.current = target.sessionId; activeProjectId.current = target.projectId;
     setSelected(target.sessionId); setSelectedProject(target.projectId); setError('');
@@ -456,7 +488,7 @@ export default function App() {
     if (session) return session;
     if (!project) throw new Error('请先创建或选择一个项目');
     if (projectReadOnly) throw new Error('项目当前只读，不能创建会话。');
-    const created = await api<Session>('/api/sessions', { method: 'POST', body: JSON.stringify({ projectId: project.id, settings }) });
+    const created = await api<Session>('/api/sessions', { method: 'POST', body: JSON.stringify({ projectId: project.id, agentKind, settings }) });
     moveToSession(created.id);
     if (activeProjectId.current === project.id && activeId.current === selected) {
       navigate(currentPage.current, { sessionId: created.id, projectId: project.id }, true); setSession(created);
@@ -471,16 +503,17 @@ export default function App() {
     setBusy(true); setError('');
     try {
       target = await ensureSession();
-      if (config.capabilities.nativeWebSocket && target.settings.executionMode === 'sandbox') {
+      if (config.capabilities.nativeWebSocket && target.agentKind !== 'claude-code' && target.settings.executionMode === 'sandbox') {
         await native.waitUntilConnected();
         await native.send(submittedPrompt, submittedImages);
-      } else await api(`/api/sessions/${target.id}/turns`, { method: 'POST', body: JSON.stringify({ prompt: submittedPrompt, images: submittedImages }) });
+      } else if (target.agentKind === 'claude-code') await submitClaudeTurn(target.id, submittedPrompt, submittedImages);
+      else await api(`/api/sessions/${target.id}/turns`, { method: 'POST', body: JSON.stringify({ prompt: submittedPrompt, images: submittedImages }) });
       setSessionDraft(target.id, ''); setAttachments([]); followOutput.current = true; await refreshWorkspace();
     } catch (err) {
       const reason = message(err);
       // Keep the submission visible in browser memory when the response is lost or
       // rejected; the server outcome may be uncertain until history is refreshed.
-      if (target && !(config?.capabilities.nativeWebSocket && target.settings.executionMode === 'sandbox')) {
+      if (target && !(config?.capabilities.nativeWebSocket && target.agentKind !== 'claude-code' && target.settings.executionMode === 'sandbox')) {
         const failedAt = new Date().toISOString();
         const failedId = `client-failure-${crypto.randomUUID()}`;
         setSession(current => {
@@ -500,12 +533,17 @@ export default function App() {
   async function watchContinue(prompt = '继续') {
     if (!session || busy || archivedSession || projectReadOnly || localReadOnly) return;
     setBusy(true); setError('');
-    try { if (nativeEnabled) { await native.waitUntilConnected(); await native.send(prompt, []); } else await api(`/api/sessions/${session.id}/turns`, { method: 'POST', body: JSON.stringify({ prompt, images: [] }) }); await refreshWorkspace(); }
+    try {
+      if (nativeEnabled) { await native.waitUntilConnected(); await native.send(prompt, []); }
+      else if (session.agentKind === 'claude-code') await submitClaudeTurn(session.id, prompt, []);
+      else await api(`/api/sessions/${session.id}/turns`, { method: 'POST', body: JSON.stringify({ prompt, images: [] }) });
+      await refreshWorkspace();
+    }
     catch (err) { setError(message(err)); } finally { setBusy(false); }
   }
   async function answerNativeInput(request: import('../protocol/user-input-types').UserInputRequest, _answer: string, answers: string[]) {
     if (!nativeEnabled || projectReadOnly) throw new Error('项目当前只读，不能提交会话回答。');
-    await native.waitUntilConnected();
+    if (request.id.startsWith('request_user_input:')) await native.waitUntilConnected();
     await native.answer(request.id, request.questions, answers);
   }
   async function updateSessionSettings(patch: Partial<Settings>) {
@@ -516,7 +554,9 @@ export default function App() {
         const id = session.id;
         const updated = await api<Session>(`/api/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ settings: patch }) });
         if (activeId.current === id) setSession(updated);
-        if (config?.capabilities.nativeWebSocket && updated.settings.executionMode === 'sandbox') { await native.waitUntilConnected(); await native.refreshConnection(); }
+        if (config?.capabilities.nativeWebSocket && updated.agentKind !== 'claude-code' && updated.settings.executionMode === 'sandbox') { await native.waitUntilConnected(); await native.refreshConnection(); }
+      } else if (agentKind === 'claude-code' && patch.model && patch.modelEntryId) {
+        setClaudeDraftModel({ model: patch.model, modelEntryId: patch.modelEntryId });
       } else setDraftSettings({ ...settings, ...patch });
     } finally { setBusy(false); }
   }
@@ -530,9 +570,9 @@ export default function App() {
   }
   async function saveSettings(next: Settings, threadId: string, title: string) {
     if (projectDeleting) throw new Error('项目正在删除，不能修改设置。');
-    if (threadId.trim()) { const created = await api<Session>('/api/sessions', { method: 'POST', body: JSON.stringify({ ...(project ? { projectId: project.id } : {}), settings: next, threadId: threadId.trim(), title: title || '导入的 CoCell 会话' }) }); selectSession(created.id); setSession(created); }
-    else if (session) { const updated = await api<Session>(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify({ settings: next, title: title.trim() || session.title }) }); setSession(updated); if (config?.capabilities.nativeWebSocket && updated.settings.executionMode === 'sandbox') { await native.waitUntilConnected(); await native.refreshConnection(); } }
-    else setDraftSettings(next);
+    if (threadId.trim()) { const created = await api<Session>('/api/sessions', { method: 'POST', body: JSON.stringify({ ...(project ? { projectId: project.id } : {}), agentKind, settings: next, threadId: threadId.trim(), title: title || '导入的 CoCell 会话' }) }); selectSession(created.id); setSession(created); }
+    else if (session) { const updated = await api<Session>(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify({ ...(session.agentKind === 'claude-code' ? {} : { settings: next }), title: title.trim() || session.title }) }); setSession(updated); if (config?.capabilities.nativeWebSocket && updated.agentKind !== 'claude-code' && updated.settings.executionMode === 'sandbox') { await native.waitUntilConnected(); await native.refreshConnection(); } }
+    else if (agentKind !== 'claude-code') setDraftSettings(next);
     await refreshWorkspace(); setSettingsOpen(false);
   }
   async function deleteSession() {
@@ -580,7 +620,7 @@ export default function App() {
     {page === 'reports' ? <ReportsPage onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} /> : page === 'knowledge' ? <KnowledgePage onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} onDirtyChange={updateKnowledgeDirty} /> : page === 'favorites' ? <FavoritesPage onMenu={() => setSidebar(true)} onOpenFile={favorite => {
       setOpenFile({ path: favorite.path, projectId: favorite.projectId, workingDirectory: favorite.workingDirectory });
     }} /> : page === 'memory' ? <MemoryPage onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} /> : page === 'images' ? <ImagesPage onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} /> : page === 'connections' ? <ConnectionsPage onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} onStatusChange={updateConnectionsDraft} /> : page === 'models' ? <ModelsPage onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} onSaved={refreshConfig} onDirtyChange={updateModelsDirty} /> : page === 'files' ? <SharedFilesPage onMenu={() => setSidebar(true)} onDirtyChange={updateFilesDirty} /> : page === 'projects' ? <ProjectsPage projects={projects} resumeTimelines={resumeTimelines} config={config} loading={loading} onRefresh={refreshProjects} onCreate={createProject} onUpdate={updateProject} onDelete={deleteProject} onCreateSandbox={createSandbox} onRestoreSandbox={restoreSandbox} onReleaseSandbox={releaseSandbox} onResumeSandbox={resumeSandbox} onCheckpointSandbox={checkpointSandbox} onBackupSandbox={backupSandbox} onArchiveProject={archiveProject} onOpenProject={id => openProject(id, true)} onViewBackup={(key, versionId, meta) => setArchiveDetail({ key, versionId, meta })} onMenu={() => setSidebar(true)} onBack={returnToChat} /> : page === 'sandboxes' ? <SandboxManager config={config} onOpenProject={openProject} onOpenSession={selectSession} onMenu={() => setSidebar(true)} onBack={() => navigate('chat')} /> : <main className='main-pane'>
-	      <header className='topbar'><button className='icon-button mobile-only' aria-label='打开导航' onClick={() => setSidebar(true)}><Icon name='menu' /></button><div className='breadcrumbs'><span title={project ? projectDisplayName(project) : undefined}>{project ? projectDisplayName(project) : (settings ? basename(settings.workingDirectory) : 'CoCell')}</span><span className='slash'>/</span><strong>{session?.title || '新建会话'}</strong></div><div className='topbar-actions'>{project?.executionMode === 'sandbox' && <button className='icon-button project-status-shortcut' aria-label='项目进展' title='打开 PROJECT_STATUS.md' disabled={projectDeleting} onClick={() => setOpenFile({ projectId: project.id, workingDirectory: project.workingDirectory, path: `${project.workingDirectory.replace(/\/+$/, '')}/PROJECT_STATUS.md` })}><Icon name='folder' size={16} /><span>项目进展</span></button>}<button className={`icon-button mobile-only ${conversationDetailsOpen ? 'pressed' : ''}`} aria-label='对话详情' aria-expanded={conversationDetailsOpen} aria-controls='conversation-details' onClick={() => setConversationDetailsOpen(!conversationDetailsOpen)}><Icon name='panel' /></button><button className={'icon-button ' + (showBilling ? 'pressed' : '')} aria-label='费用估算' aria-expanded={showBilling} disabled={!session} onClick={() => setShowBilling(!showBilling)}><svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'><path d='M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6'/></svg></button><div className='notif-bell-wrapper'><button className='icon-button notif-bell' aria-label='消息通知' onClick={() => { setNotifOpen(!notifOpen); if (notifDot && notifications.length > 0) { localStorage.setItem('codex-last-notif', notifications[0].id); setNotifDot(false); } }}>{notifDot && <span className='notif-dot' />}<svg width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'><path d='M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9'/><path d='M10.3 21a1.94 1.94 0 0 0 3.4 0'/></svg></button>{notifOpen && <><button className='session-menu-backdrop' onClick={() => setNotifOpen(false)} /><div className='notif-dropdown'><div className='notif-dropdown-header'>消息通知</div><div className='notif-dropdown-body'>{notifications.length === 0 ? <p className='notif-empty'>暂无消息</p> : notifications.slice(0, 20).map(n => <button key={n.id} className='notif-item' onClick={() => { setNotifOpen(false); selectSession(n.sessionId); }}><span className={'notif-type-badge ' + ('turn')}>{n.type === 'turn_completed' ? '完成' : n.type === 'turn_failed' ? '失败' : '停止'}</span><span className='notif-title'>{n.title}</span><span className='notif-body'>{n.body}</span></button>)}</div></div></>}</div></div></header>
+	      <header className='topbar'><button className='icon-button mobile-only' aria-label='打开导航' onClick={() => setSidebar(true)}><Icon name='menu' /></button><div className='breadcrumbs'><span title={project ? projectDisplayName(project) : undefined}>{project ? projectDisplayName(project) : (settings ? basename(settings.workingDirectory) : 'CoCell')}</span><span className='slash'>/</span><strong>{session?.title || '新建会话'}</strong></div><div className='topbar-actions'>{project?.executionMode === 'sandbox' && <button className='icon-button project-status-shortcut' aria-label='项目进展' title='打开 PROJECT_STATUS.md' disabled={projectDeleting} onClick={() => setOpenFile({ projectId: project.id, workingDirectory: project.workingDirectory, path: `${project.workingDirectory.replace(/\/+$/, '')}/PROJECT_STATUS.md` })}><Icon name='folder' size={16} /><span>项目进展</span></button>}<button className={`icon-button mobile-only ${conversationDetailsOpen ? 'pressed' : ''}`} aria-label='对话详情' aria-expanded={conversationDetailsOpen} aria-controls='conversation-details' onClick={() => setConversationDetailsOpen(!conversationDetailsOpen)}><Icon name='panel' /></button>{agentKind !== 'claude-code' && <button className={'icon-button ' + (showBilling ? 'pressed' : '')} aria-label='费用估算' aria-expanded={showBilling} disabled={!session} onClick={() => setShowBilling(!showBilling)}><svg width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'><path d='M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6'/></svg></button>}<div className='notif-bell-wrapper'><button className='icon-button notif-bell' aria-label='消息通知' onClick={() => { setNotifOpen(!notifOpen); if (notifDot && notifications.length > 0) { localStorage.setItem('codex-last-notif', notifications[0].id); setNotifDot(false); } }}>{notifDot && <span className='notif-dot' />}<svg width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='currentColor' strokeWidth='2' strokeLinecap='round' strokeLinejoin='round'><path d='M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9'/><path d='M10.3 21a1.94 1.94 0 0 0 3.4 0'/></svg></button>{notifOpen && <><button className='session-menu-backdrop' onClick={() => setNotifOpen(false)} /><div className='notif-dropdown'><div className='notif-dropdown-header'>消息通知</div><div className='notif-dropdown-body'>{notifications.length === 0 ? <p className='notif-empty'>暂无消息</p> : notifications.slice(0, 20).map(n => <button key={n.id} className='notif-item' onClick={() => { setNotifOpen(false); selectSession(n.sessionId); }}><span className={'notif-type-badge ' + ('turn')}>{n.type === 'turn_completed' ? '完成' : n.type === 'turn_failed' ? '失败' : '停止'}</span><span className='notif-title'>{n.title}</span><span className='notif-body'>{n.body}</span></button>)}</div></div></>}</div></div></header>
       {error && <div className="error-banner" role="alert"><span>{error}</span><button className="icon-button" onClick={() => setError('')} aria-label="关闭错误"><Icon name="close" size={15} /></button></div>}
       {session?.historyError && <div className="error-banner" role="status">{session.historyError}</div>}
       {subagentsError && <div className="error-banner" role="status">子代理对话暂时无法加载，正在自动重试。</div>}
@@ -596,7 +636,7 @@ export default function App() {
       <div className="content-layout">{session && showBilling && <button className="billing-backdrop mobile-only" aria-label="关闭费用估算" onClick={() => setShowBilling(false)} />}{session && showBilling && <BillingRail sessionId={session.id} turns={conversationTurns} selectedBlockId={billingSelection?.blockId} onSelectBlock={(blockId, turnId, itemIds) => { const targetId = blockId.endsWith(':input') ? itemIds?.at(-1) : itemIds?.[0]; setBillingSelection({ blockId, turnId, itemIds: targetId ? [targetId] : [] }); followOutput.current = false; document.getElementById(`turn-${turnId}-item-${targetId}`)?.scrollIntoView({ block: 'start', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); }} />}<section className="conversation">
         <div className="conversation-scroll" ref={scrollArea} onScroll={() => { const el = scrollArea.current; if (el) followOutput.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100; }}>
           {session?.historyNextCursor && <div className="history-pager"><button disabled={loadingOlder} onClick={() => void loadOlderTurns()}>{loadingOlder ? '加载中…' : '加载更早消息'}</button></div>}
-          {(loadingHistory || (nativeHistoryManaged && !native.connected && !conversationTurns.length)) && (session?.threadId || nativeHistoryManaged) ? <div className="history-loading" role="status">正在加载历史消息…</div> : !conversationTurns.length ? <div className="welcome"><div className="welcome-eyebrow"><span className="connection-dot" />YOUR WORKSPACE, WITH AN AGENT</div><Mark /><h1>一起，把想法变成代码。</h1><p>{sandbox ? <>CoCell 在独立的 Sandbox 环境中阅读、编写和运行代码。<br />本项目的会话共享文件和已安装工具，可以继续已有工作或克隆仓库。</> : <>让 CoCell 阅读项目、编写代码、执行代码。<br />从一个任务开始，所有进展都在这里。</>}</p><div className="suggestions">{suggestions.map(item => <button key={item.title} onClick={() => { setPrompt(item.text); textarea.current?.focus(); }}><Icon name={item.icon} size={20} /><strong>{item.title}</strong><span>{"description" in item ? item.description : item.text}</span><span className="suggestion-arrow">↗</span></button>)}</div></div> : <div className="turn-list">{session && conversationTurns.map(turn => <article key={turn.id} id={`turn-${turn.id}`} className="turn"><div id={`turn-${turn.id}-item-user-input`} className={`user-message${billingSelection?.turnId === turn.id && billingSelection.itemIds?.includes('user-input') ? ' billing-item-selected' : ''}`}><p>{userInputReplyDisplayText(turn.prompt)}</p><TurnContextStatus turn={turn} /><time className="message-time user-time" dateTime={turn.startedAt}>{dateTime(turn.startedAt)}</time>{turn.images.length > 0 && <div className="sent-images">{turn.images.map((path, i) => <span key={i}><Icon name="attach" size={13} />{basename(path)}</span>)}</div>}</div><div className="assistant-header"><Mark small /><strong>CoCell</strong><span>{turn.clientFailure ? '发送未确认' : turn.status === 'running' ? '正在处理你的任务' : statusLabels[turn.status]}</span>{turn.completedAt && <time className="message-time" dateTime={turn.completedAt}>{dateTime(turn.completedAt)}</time>}</div><div className="turn-items"><TurnItems sessionId={session.id} readOnly={projectReadOnly} onUserInputAnswered={updated => setSession(current => current?.id === updated.id ? updated : current)} onNativeAnswer={nativeEnabled && !projectReadOnly ? answerNativeInput : undefined} highlightedItemIds={billingSelection?.turnId === turn.id ? billingSelection.itemIds : undefined} subagents={subagents.filter(agent => agent.startedAt >= turn.startedAt && agent.startedAt <= (turn.completedAt ?? new Date().toISOString()))} turn={turn} projectId={session.settings.executionMode === 'sandbox' ? session.projectId : undefined} workingDirectory={session.settings.workingDirectory} onOpenFile={openConversationFile} />{turn.error && <div className="inline-error">{turn.error}</div>}<TurnProgress turn={turn} />{turn.status === 'cancelled' && <div className="muted turn-note">任务已停止，可以继续发送消息。</div>}</div>{turn.usage && <div className="usage">输入 {turn.usage.input_tokens.toLocaleString()} · 输出 {turn.usage.output_tokens.toLocaleString()} tokens · 缓存 {turn.usage.cached_input_tokens.toLocaleString()}</div>}</article>)}</div>}
+          {(loadingHistory || (nativeHistoryManaged && !native.connected && !conversationTurns.length)) && (session?.threadId || nativeHistoryManaged) ? <div className="history-loading" role="status">正在加载历史消息…</div> : !conversationTurns.length ? <div className="welcome"><div className="welcome-eyebrow"><span className="connection-dot" />YOUR WORKSPACE, WITH AN AGENT</div><Mark /><h1>一起，把想法变成代码。</h1><p>{sandbox ? <>CoCell 在独立的 Sandbox 环境中阅读、编写和运行代码。<br />本项目的会话共享文件和已安装工具，可以继续已有工作或克隆仓库。</> : <>让 CoCell 阅读项目、编写代码、执行代码。<br />从一个任务开始，所有进展都在这里。</>}</p><div className="suggestions">{suggestions.map(item => <button key={item.title} onClick={() => { setPrompt(item.text); textarea.current?.focus(); }}><Icon name={item.icon} size={20} /><strong>{item.title}</strong><span>{"description" in item ? item.description : item.text}</span><span className="suggestion-arrow">↗</span></button>)}</div></div> : <div className="turn-list">{session && conversationTurns.map(turn => <article key={turn.id} id={`turn-${turn.id}`} className="turn"><div id={`turn-${turn.id}-item-user-input`} className={`user-message${billingSelection?.turnId === turn.id && billingSelection.itemIds?.includes('user-input') ? ' billing-item-selected' : ''}`}><p>{userInputReplyDisplayText(turn.prompt)}</p><TurnContextStatus turn={turn} agentKind={session.agentKind} /><time className="message-time user-time" dateTime={turn.startedAt}>{dateTime(turn.startedAt)}</time>{turn.images.length > 0 && <div className="sent-images">{turn.images.map((path, i) => <span key={i}><Icon name="attach" size={13} />{basename(path)}</span>)}</div>}</div><div className="assistant-header"><Mark small /><strong>CoCell</strong><span>{turn.clientFailure ? '发送未确认' : turn.status === 'running' ? '正在处理你的任务' : statusLabels[turn.status]}</span>{turn.completedAt && <time className="message-time" dateTime={turn.completedAt}>{dateTime(turn.completedAt)}</time>}</div><div className="turn-items"><TurnItems sessionId={session.id} readOnly={projectReadOnly} onUserInputAnswered={updated => setSession(current => current?.id === updated.id ? updated : current)} onNativeAnswer={nativeEnabled && !projectReadOnly ? answerNativeInput : undefined} highlightedItemIds={billingSelection?.turnId === turn.id ? billingSelection.itemIds : undefined} subagents={subagents.filter(agent => agent.startedAt >= turn.startedAt && agent.startedAt <= (turn.completedAt ?? new Date().toISOString()))} turn={turn} projectId={session.settings.executionMode === 'sandbox' ? session.projectId : undefined} workingDirectory={session.settings.workingDirectory} onOpenFile={openConversationFile} />{turn.error && <div className="inline-error">{turn.error}</div>}<TurnProgress turn={turn} />{turn.status === 'cancelled' && <div className="muted turn-note">任务已停止，可以继续发送消息。</div>}</div>{turn.usage && <div className="usage">输入 {turn.usage.input_tokens.toLocaleString()} · 输出 {turn.usage.output_tokens.toLocaleString()} tokens · 缓存 {turn.usage.cached_input_tokens.toLocaleString()}</div>}</article>)}</div>}
         {nativeEnabled && native.queuedSubmissions.length > 0 && <section className="user-input-card" aria-label="待执行消息">
           <header><strong>待执行消息</strong><span>{native.queuedSubmissions.length}</span></header>
           <ol>{native.queuedSubmissions.map(item => <li key={item.id}>
@@ -608,11 +648,11 @@ export default function App() {
         <div className="composer-area">{sandboxNotReady && <div className={`project-entry-status${entry.error ? ' is-error' : ''}`} role="status" aria-live="polite">
           {environmentPending ? <><span className="spinner" aria-hidden="true" /><span>{project?.sandboxOperation?.kind === 'resume' || project?.sandbox?.status === 'paused' ? '正在恢复环境' : '正在准备环境'}，可以先输入任务…</span></>
             : <><span>{sandboxView?.state === 'paused' ? '环境已暂停，可以先输入任务。' : entry.error || '环境暂不可用，请重新读取状态。'}</span>{canResumeProject && <button disabled={entry.pending || Boolean(resumingProject)} onClick={() => void resumeCurrentProject()}>恢复运行</button>}<button onClick={entry.retry}>重新读取状态</button><button onClick={() => navigate('projects')}>项目管理</button></>}
-        </div>}{project && <ResumeTimeline timeline={resumeTimelines[project.id]} />}<div className={`composer ${running ? 'is-running' : ''}`}>{attachments.length > 0 && <div className="attachments">{attachments.map((item, index) => <span key={item.path}><Icon name="attach" size={13} />{item.name}<button aria-label={`移除 ${item.name}`} onClick={() => setAttachments(items => items.filter((_, i) => i !== index))}><Icon name="close" size={12} /></button></span>)}</div>}<textarea ref={textarea} disabled={busy || archivedSession || projectReadOnly || localReadOnly} aria-label="任务描述" placeholder={archivedSession ? '会话已归档，取消归档后可继续对话…' : running ? '追加消息到当前任务…' : '描述任务，或提出一个问题…'} value={prompt} rows={1} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && (!window.matchMedia('(pointer: coarse)').matches || event.ctrlKey || event.metaKey)) { event.preventDefault(); void send(); } }} /><div className="composer-toolbar"><div className="composer-options"><input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" multiple hidden onChange={event => void upload(event.target.files)} /><button className="icon-button" aria-label="添加图片" title="添加图片" disabled={busy || running || archivedSession || projectReadOnly || localReadOnly || needsProject || sandboxNotReady || !config || Boolean(selected && !session)} onClick={() => fileInput.current?.click()}><Icon name="plus" size={20} /></button><ModelPicker key={selected || selectedProject || "new"} model={settings?.model || DEFAULT_MODEL} modelEntryId={settings?.modelEntryId} modelOptions={config?.modelOptions} effort={settings?.modelReasoningEffort || "medium"} models={config?.models} defaults={config?.defaults} fastMode={settings?.fastMode || false} disabled={!settings || busy || running || archivedSession || projectReadOnly || localReadOnly || Boolean(selected && !session)} onSettingsChange={updateSessionSettings} /></div><button className="send-button" aria-label={running ? '追加消息' : '发送任务'} title={running ? '追加消息 (Enter)' : '发送任务 (Enter)'} disabled={busy || archivedSession || projectReadOnly || localReadOnly || needsProject || sandboxNotReady || !config || !prompt.trim() || Boolean(selected && !session)} onClick={() => void send()}>{busy ? <span className="spinner" /> : <Icon name="arrow" size={20} />}</button>{running && <button className="send-button stop-button" aria-label="停止任务" title="停止任务" disabled={busy || (projectReadOnly && !projectDeleting)} onClick={() => void stop()}><Icon name="stop" size={18} /></button>}</div></div><div className="composer-meta"><button onClick={() => setSettingsOpen(true)} disabled={!settings || busy || projectDeleting}><Icon name="folder" size={12} /><span>{settings ? basename(settings.workingDirectory) : '工作目录'}</span><span className="meta-dot">·</span><span>{sandbox ? 'Sandbox · 沙箱内完全访问' : settings?.sandboxMode === 'read-only' ? '只读沙箱' : settings?.sandboxMode === 'workspace-write' ? '工作区可写' : '完全访问'}</span></button><span title="最近一次已完成模型请求的输入 token 数；下一次模型响应后更新。">{contextUsage ? `上下文 ${contextUsage.inputTokens.toLocaleString()} tokens${contextUsage.cachedInputTokens !== undefined ? ` · 缓存 ${contextUsage.cachedInputTokens.toLocaleString()}` : ''}` : '上下文将在首次模型响应后显示'}</span></div></div>
+        </div>}{project && <ResumeTimeline timeline={resumeTimelines[project.id]} />}<div className={`composer ${running ? 'is-running' : ''}`}>{attachments.length > 0 && <div className="attachments">{attachments.map((item, index) => <span key={item.path}><Icon name="attach" size={13} />{item.name}<button aria-label={`移除 ${item.name}`} onClick={() => setAttachments(items => items.filter((_, i) => i !== index))}><Icon name="close" size={12} /></button></span>)}</div>}<textarea ref={textarea} disabled={busy || archivedSession || projectReadOnly || localReadOnly} aria-label="任务描述" placeholder={archivedSession ? '会话已归档，取消归档后可继续对话…' : running ? '追加消息到当前任务…' : '描述任务，或提出一个问题…'} value={prompt} rows={1} onChange={event => setPrompt(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && (!window.matchMedia('(pointer: coarse)').matches || event.ctrlKey || event.metaKey)) { event.preventDefault(); void send(); } }} /><div className="composer-toolbar"><div className="composer-options"><input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" multiple hidden onChange={event => void upload(event.target.files)} /><button className="icon-button" aria-label="添加图片" title="添加图片" disabled={busy || running || archivedSession || projectReadOnly || localReadOnly || needsProject || sandboxNotReady || !config || Boolean(selected && !session)} onClick={() => fileInput.current?.click()}><Icon name="plus" size={20} /></button>{config?.capabilities.claudeCode && <label className="agent-picker"><select aria-label="执行引擎" value={agentKind} disabled={Boolean(selected) || busy || archivedSession || projectReadOnly || localReadOnly} onChange={event => setDraftAgentKind(event.target.value as AgentKind)}><option value="codex">Codex</option><option value="claude-code">Claude Code</option></select></label>}{agentKind === 'codex' ? <ModelPicker key={selected || selectedProject || "new"} model={settings?.model || DEFAULT_MODEL} modelEntryId={settings?.modelEntryId} modelOptions={config?.modelOptions} effort={settings?.modelReasoningEffort || "medium"} models={config?.models} defaults={config?.defaults} fastMode={settings?.fastMode || false} disabled={!settings || busy || running || archivedSession || projectReadOnly || localReadOnly || Boolean(selected && !session)} onSettingsChange={updateSessionSettings} /> : <ModelPicker key={selected || selectedProject || "new-claude"} model={settings?.model || ''} modelEntryId={settings?.modelEntryId} modelOptions={config?.claudeModelOptions ?? []} modelOnly effort={settings?.modelReasoningEffort || "medium"} defaults={config?.claudeDefaults && settings ? { ...settings, ...config.claudeDefaults } : undefined} disabled={!settings || busy || running || archivedSession || projectReadOnly || localReadOnly || Boolean(selected && !session)} onSettingsChange={updateSessionSettings} />}</div><button className="send-button" aria-label={running ? '追加消息' : '发送任务'} title={running ? '追加消息 (Enter)' : '发送任务 (Enter)'} disabled={busy || archivedSession || projectReadOnly || localReadOnly || needsProject || sandboxNotReady || !config || !prompt.trim() || Boolean(selected && !session)} onClick={() => void send()}>{busy ? <span className="spinner" /> : <Icon name="arrow" size={20} />}</button>{running && <button className="send-button stop-button" aria-label="停止任务" title="停止任务" disabled={busy || (projectReadOnly && !projectDeleting)} onClick={() => void stop()}><Icon name="stop" size={18} /></button>}</div></div><div className="composer-meta"><button onClick={() => setSettingsOpen(true)} disabled={!settings || busy || projectDeleting}><Icon name="folder" size={12} /><span>{settings ? basename(settings.workingDirectory) : '工作目录'}</span><span className="meta-dot">·</span><span>{sandbox ? 'Sandbox · 沙箱内完全访问' : settings?.sandboxMode === 'read-only' ? '只读沙箱' : settings?.sandboxMode === 'workspace-write' ? '工作区可写' : '完全访问'}</span></button><span title="最近一次已完成模型请求的输入 token 数；下一次模型响应后更新。">{contextUsage ? `上下文 ${contextUsage.inputTokens.toLocaleString()} tokens${contextUsage.cachedInputTokens !== undefined ? ` · 缓存 ${contextUsage.cachedInputTokens.toLocaleString()}` : ''}` : '上下文将在首次模型响应后显示'}</span></div></div>
       </section></div>
     </main>}
     {archiveDetail && <ArchiveViewer archiveKey={archiveDetail.key} versionId={archiveDetail.versionId} archiveMeta={archiveDetail.meta} onClose={() => setArchiveDetail(null)} />}
     {openFile && <WorkspaceFileView file={openFile} onOpenFile={setOpenFile} onClose={() => setOpenFile(null)} />}
-    {settingsOpen && settings && !projectDeleting && <SettingsModal project={project} readOnly={projectDeleting} settings={settings} session={session} config={config} onClose={() => setSettingsOpen(false)} onSave={saveSettings} onDelete={deleteSession} />}
+    {settingsOpen && settings && !projectDeleting && <SettingsModal agentKind={agentKind} project={project} readOnly={projectDeleting} settings={settings} session={session} config={config} onClose={() => setSettingsOpen(false)} onSave={saveSettings} onDelete={deleteSession} />}
   </div>;
 }

@@ -16,8 +16,8 @@ function SelectArrows() {
   return <svg className="model-config-arrows" width="14" height="18" viewBox="0 0 14 18" fill="none" aria-hidden="true"><path d="m4 6 3-3 3 3M4 12l3 3 3-3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>;
 }
 
-function ModelConfiguration({ current, defaults, choices, managed, disabled, anchor, onSave, onClose }: {
-  current: ModelSettings; defaults?: ModelSettings; choices: readonly ModelOption[]; managed: boolean; disabled: boolean;
+function ModelConfiguration({ current, defaults, choices, managed, modelOnly, disabled, anchor, onSave, onClose }: {
+  current: ModelSettings; defaults?: ModelSettings; choices: readonly ModelOption[]; managed: boolean; modelOnly: boolean; disabled: boolean;
   anchor: RefObject<HTMLButtonElement | null>;
   onSave: (patch: Partial<ModelSettings>) => Promise<void>; onClose: () => void;
 }) {
@@ -105,7 +105,7 @@ function ModelConfiguration({ current, defaults, choices, managed, disabled, anc
             {choices.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}
           </select>
         </label>
-        <label className="model-config-row"><span>推理强度</span><span className="model-config-value">{efforts[draft.modelReasoningEffort]}</span><SelectArrows />
+        {!modelOnly && <><label className="model-config-row"><span>推理强度</span><span className="model-config-value">{efforts[draft.modelReasoningEffort]}</span><SelectArrows />
           <select aria-label="推理强度" value={draft.modelReasoningEffort} onChange={event => setDraft(previous => ({ ...previous, modelReasoningEffort: event.target.value as Settings['modelReasoningEffort'] }))}>
             {Object.entries(efforts).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
           </select>
@@ -114,7 +114,7 @@ function ModelConfiguration({ current, defaults, choices, managed, disabled, anc
           <select aria-label="速度" value={draft.fastMode ? 'fast' : 'standard'} onChange={event => setDraft(previous => ({ ...previous, fastMode: event.target.value === 'fast' }))}>
             <option value="standard">Standard</option><option value="fast">Fast · 优先处理，可能产生更高费用</option>
           </select>
-        </label>
+        </label></>}
       </fieldset>
       {error && <p className="model-config-error" role="alert">{error}</p>}
       <div className="model-config-actions">
@@ -125,10 +125,10 @@ function ModelConfiguration({ current, defaults, choices, managed, disabled, anc
   </dialog>, document.body);
 }
 
-export default function ModelPicker({ model, modelEntryId, effort, disabled, fastMode = false, defaults, onSettingsChange, models, modelOptions }: {
+export default function ModelPicker({ model, modelEntryId, effort, disabled, fastMode = false, defaults, onSettingsChange, models, modelOptions, modelOnly = false }: {
   model: string; modelEntryId?: string; effort: Settings['modelReasoningEffort']; disabled: boolean; fastMode?: boolean;
   defaults?: ModelSettings; onSettingsChange: (patch: Partial<ModelSettings>) => Promise<void>;
-  models?: readonly string[]; modelOptions?: readonly ModelOption[];
+  models?: readonly string[]; modelOptions?: readonly ModelOption[]; modelOnly?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -136,15 +136,15 @@ export default function ModelPicker({ model, modelEntryId, effort, disabled, fas
   const choices = modelOptions ?? (models?.length ? models : MODEL_OPTIONS).map(value => ({ id: value, model: value, label: value, channelId: '', channelName: '' }));
   const selected = choices.find(option => option.id === (managed ? modelEntryId : model));
   return <div className="model-picker">
-    <button ref={trigger} type="button" className="model-picker-trigger" aria-label={`配置模型，当前 ${model}${selected?.channelName ? `，${selected.channelName}` : ''}，${efforts[effort]}${fastMode ? '，Fast' : ''}`}
+    <button ref={trigger} type="button" className="model-picker-trigger" aria-label={`配置模型，当前 ${model}${selected?.channelName ? `，${selected.channelName}` : ''}${modelOnly ? '' : `，${efforts[effort]}${fastMode ? '，Fast' : ''}`}`}
       aria-haspopup="dialog" aria-expanded={open} title={selected?.label || model} disabled={disabled} onClick={() => {
         if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
         trigger.current?.focus({ preventScroll: true });
         setOpen(true);
       }}>
-      <span className="model-picker-name">{model || '选择模型'}</span><span className="model-picker-effort">{efforts[effort]}</span>
+      <span className="model-picker-name">{model || '选择模型'}</span>{!modelOnly && <span className="model-picker-effort">{efforts[effort]}</span>}
     </button>
-    {open && <ModelConfiguration current={{ model, modelEntryId, modelReasoningEffort: effort, fastMode }} defaults={defaults} choices={choices} managed={managed}
+    {open && <ModelConfiguration current={{ model, modelEntryId, modelReasoningEffort: effort, fastMode }} defaults={defaults} choices={choices} managed={managed} modelOnly={modelOnly}
       disabled={disabled} anchor={trigger} onSave={onSettingsChange} onClose={() => setOpen(false)} />}
   </div>;
 }

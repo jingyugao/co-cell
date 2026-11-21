@@ -23,6 +23,7 @@ COPY --chmod=0644 deploy/box-wrap/profile-loader.sh /etc/profile.d/cocell-tools.
 COPY --chmod=0644 deploy/box-wrap/tool-path.sh /opt/product/cocell/
 COPY --chmod=0755 deploy/box-wrap/login-path.mjs /opt/product/cocell/
 RUN --network=none node /opt/product/cocell/login-path.mjs
+COPY deploy/box-wrap/acp/ /opt/product/cocell/acp/
 COPY --chmod=0755 deploy/box-wrap/launcher.mjs deploy/box-wrap/oss-archive-restore.mjs /opt/product/cocell/
 # Node resolves each entry to its immutable shared version before importing dependencies.
 RUN ln -sfn /var/lib/cellbox/shared/tool-wrap/current/deploy/box-wrap/protected-tool.mjs /opt/product/cocell/protected-tool.mjs \

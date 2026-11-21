@@ -7,7 +7,7 @@ export interface InputRequestRecord {
   /** The Web turn that owns native execution and usage. */
   turnId: string;
   type: InputRequestType;
-  method?: 'turn/start' | 'turn/steer';
+  method?: 'turn/start' | 'turn/steer' | 'thread/queue/add';
   params?: Record<string, unknown>;
   /** Non-sensitive thread/start, resume or fork configuration used for this input. */
   threadRequest?: { method: string; params: Record<string, unknown> };

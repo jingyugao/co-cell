@@ -1,3 +1,4 @@
+import { ClaudeBoxClient } from './execution/claude-box.js';
 import { createPreviewProxy } from './projects/preview-proxy.js';
 import { readSystemRequirementInfo } from './projects/requirements.js';
 import { SystemTools } from './execution/system-tools.js';
@@ -170,6 +171,8 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
     autoCheckpointAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   }, notifications, coordinator);
+const claude = new ClaudeBoxClient((id, port) => cellboxProvider.getServiceAccess(id, port));
+manager.setClaudeRuntime(claude);
 manager.setModelService(models);
 manager.setProjectFileReader(createProjectFileReader(cellboxProvider.client, (project, path, request) =>
   runtime.fileResponse({ id: project.id, projectId: project.id, settings: { workingDirectory: project.workingDirectory },
@@ -221,7 +224,7 @@ manager.setImageCatalog(imageCatalog);
 const config: AppConfig = { models: availableModels, sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
   ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}),
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
-  localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true, nativeWebSocket: true } };
+  localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true, nativeWebSocket: true, claudeCode: true } };
 const publicUrl=cocellPublicUrl;
 const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;

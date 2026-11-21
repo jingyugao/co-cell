@@ -28,7 +28,7 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   });
   app.post('/api/sessions', async c => {
     const input = z.object({
-      projectId: z.string().uuid().optional(), settings: settingsSchema.optional(), threadId: z.string().uuid().optional(), title: z.string().trim().min(1).max(100).optional(),
+      projectId: z.string().uuid().optional(), agentKind: z.enum(['codex', 'claude-code']).optional(), settings: settingsSchema.optional(), threadId: z.string().uuid().optional(), title: z.string().trim().min(1).max(100).optional(),
     }).strict().parse(await c.req.json());
     // Mirror the manager's effective mode, including omitted settings and legacy
     // project defaults, before it can create or resume a host Codex thread.
@@ -74,9 +74,9 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
     return c.json({ ok: true });
   });
   app.post('/api/sessions/:id/turns', async c => {
-    const input = z.object({ prompt: z.string().trim().min(1).max(200_000), images: z.array(z.string().max(4096)).max(5).default([]) }).strict().parse(await c.req.json());
+    const input = z.object({ prompt: z.string().trim().min(1).max(200_000), images: z.array(z.string().max(4096)).max(5).default([]), clientRequestId: z.string().uuid().optional() }).strict().parse(await c.req.json());
     requireAllowedExecution((await manager.readMetadata(c.req.param('id'))).settings.executionMode);
-    const turnId = await manager.startTurn(c.req.param('id'), input.prompt, input.images);
+    const turnId = await manager.startTurn(c.req.param('id'), input.prompt, input.images, input.clientRequestId);
     return c.json({ turnId } satisfies SubmitTurnResponse, 202);
   });
   app.post('/api/sessions/:id/stop', async c => {

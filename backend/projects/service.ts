@@ -186,7 +186,11 @@ export class ProjectService {
         .map(ref => [ref.id, ref]));
       project.remoteArchives = [...(project.remoteArchives ?? []).filter(ref => ref.storageType !== 'cellbox-volume' || ref.volumeId !== volumeId),
         ...archives.filter(ref => ref.storageType === 'cellbox-volume' && ref.volumeId === volumeId)
-          .map(ref => ({ ...ref, threadIds: saved.get(ref.id)?.threadIds ?? ref.threadIds }))]
+          .map(ref => {
+            const index = saved.get(ref.id);
+            return { ...ref, threadIds: index?.threadIds ?? ref.threadIds,
+              ...(index?.claudeSessionIds ? { claudeSessionIds: index.claudeSessionIds } : {}) };
+          })]
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       const latest = project.remoteArchives[0];
       project.latestBackup = latest ? { createdAt: latest.createdAt, sizeBytes: latest.sizeBytes,

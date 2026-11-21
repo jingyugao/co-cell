@@ -38,3 +38,15 @@
   .model-config-actions>button{width:auto;min-height:34px;margin:0;padding:7px 12px;font-size:12px;border-radius:6px}
   .model-config-done{min-width:72px}
 }
+
+.agent-picker select {
+  max-width: 125px;
+  padding: 7px 24px 7px 10px;
+  border: 1px solid #dfe5d3;
+  border-radius: 7px;
+  background: #fff;
+  color: #48553a;
+  font: inherit;
+  font-size: 12px;
+}
+.agent-picker select:disabled { opacity: .8; }

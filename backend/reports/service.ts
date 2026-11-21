@@ -338,6 +338,10 @@ export class ReportService {
         const material = await this.deps.collector.collect(session, signal);
         source.materialId = material.id;
         source.isSnapshot = !material.complete;
+        if (session.agentKind === 'claude-code') {
+          source.coverageIncomplete = true;
+          source.error = 'Claude 对话材料包含主会话，子 Agent 对话和上下文压缩边界未能确认';
+        }
         source.collectedAt = material.createdAt;
         const parts: string[] = [];
         let bytes = 0;

@@ -40,6 +40,11 @@ try {
     if (!matches) await download(item.url, path);
     if (await fileHash(path, algorithm, 'base64') !== expected) throw new Error(`Publisher checksum mismatch: ${item.file}`);
   }
+  const claudeArchive = resolve(artifacts, packages.claudeAcp.file);
+  if (await fileHash(claudeArchive).catch(() => '') !== packages.claudeAcp.sha256)
+    await download(packages.claudeAcp.url, claudeArchive);
+  if (await fileHash(claudeArchive) !== packages.claudeAcp.sha256)
+    throw new Error('Publisher checksum mismatch: Claude ACP');
   const restic = resolve(artifacts, packages.restic.file);
   let resticMatches = false; try { resticMatches = await fileHash(restic) === packages.restic.sha256; } catch {}
   if (!resticMatches) {
@@ -56,7 +61,7 @@ try {
     '--mount', `type=bind,source=${resolve(artifacts, 'debs')},target=/var/cache/apt/archives`, info.Id,
     '-ec', 'apt-get update && apt-get install --download-only -y --no-install-recommends "$@" && chmod -R a+rX /var/cache/apt/archives', 'sh', ...packages.systemPackages]);
   const files = [];
-  for (const path of [packages.codex.file, packages.codexLinuxX64.file, packages.restic.file,
+  for (const path of [packages.codex.file, packages.codexLinuxX64.file, packages.claudeAcp.file, packages.restic.file,
     ...(await readdir(resolve(artifacts, 'debs'))).filter(name => name.endsWith('.deb')).map(name => 'debs/' + name)])
     files.push({ path, sha256: await fileHash(resolve(artifacts, path)) });
   await writeFile(resolve(artifacts, 'manifest.json'), JSON.stringify({ baseImage: base, baseImageId: info.Id, packages, files }, null, 2) + '\n');

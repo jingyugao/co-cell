@@ -4,11 +4,15 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
   const initial = {
     revision: 4,
     defaultModelId: 'channel-a-gpt',
+    claudeDefaultModelId: 'claude-model',
     channels: [
       { id: 'channel-a', name: '渠道 A', endpoint: 'https://a.example/v1', enabled: true, hasApiKey: true,
         models: [{ id: 'channel-a-gpt', model: 'gpt-6-sol', visible: true }] },
       { id: 'channel-b', name: '渠道 B', endpoint: 'https://b.example/v1', enabled: true, hasApiKey: false,
         models: [{ id: 'channel-b-gpt', model: 'gpt-6-sol', visible: true }] },
+      { id: 'channel-claude', name: 'Claude 渠道', endpoint: 'https://claude.example/v1', protocol: 'anthropic-messages', enabled: true, hasApiKey: true,
+        models: [{ id: 'claude-model', model: 'claude-sonnet', visible: true }] },
+      { id: 'channel-empty', name: '空渠道', endpoint: 'https://empty.example/v1', enabled: true, hasApiKey: false, models: [] },
     ],
   };
   const modelOptions = [
@@ -27,6 +31,7 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
     const saved = {
       revision: initial.revision + 1,
       defaultModelId: savedInput.defaultModelId,
+      claudeDefaultModelId: savedInput.claudeDefaultModelId,
       channels: savedInput.channels.map(({ apiKey, ...channel }) => ({ ...channel, hasApiKey: Boolean(apiKey) || channel.id === 'channel-a' })),
     };
     await route.fulfill({ json: saved });
@@ -63,6 +68,12 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
     '未设置', 'gpt-6-sol（渠道 A）', 'gpt-6-sol（渠道 B）',
   ]);
   await defaultModel.selectOption('channel-b-gpt');
+  const claudeDefault = page.getByRole('combobox', { name: 'Claude Code 默认模型', exact: true });
+  await expect(claudeDefault.locator('option')).toHaveText(['未设置', 'claude-sonnet（Claude 渠道）']);
+  await expect(claudeDefault).toHaveValue('claude-model');
+  const emptyChannel = page.locator('.model-channel-card').filter({ has: page.getByRole('heading', { name: '空渠道', exact: true }) });
+  await expect(emptyChannel.getByLabel('渠道协议')).toBeEnabled();
+  await emptyChannel.getByLabel('渠道协议').selectOption('anthropic-messages');
 
   const channelB = page.locator('.model-channel-card').filter({ has: page.getByRole('heading', { name: '渠道 B', exact: true }) });
   await channelB.getByLabel('Endpoint', { exact: true }).fill('https://b.example/v1/responses');
@@ -71,12 +82,35 @@ test('model management keeps duplicate model IDs scoped to their channels', asyn
 
   await expect(page.getByRole('status')).toHaveText('模型配置已保存。');
   expect(savedInput.defaultModelId).toBe('channel-b-gpt');
+  expect(savedInput.claudeDefaultModelId).toBe('claude-model');
+  expect(savedInput.channels.find(channel => channel.id === 'channel-claude').protocol).toBe('anthropic-messages');
+  expect(savedInput.channels.find(channel => channel.id === 'channel-empty').protocol).toBe('anthropic-messages');
   expect(savedInput.channels.find(channel => channel.id === 'channel-b')).toMatchObject({
     endpoint: 'https://b.example/v1/responses', apiKey: 'test-channel-b-key',
     models: [{ id: 'channel-b-gpt', model: 'gpt-6-sol', visible: true }],
   });
   await expect(channelB.getByLabel('API Key', { exact: true })).toHaveValue('');
   await expect(channelB.getByText('API Key 已配置', { exact: true })).toBeVisible();
+
+  await page.getByRole('button', { name: '添加渠道', exact: true }).click();
+  const newChannel = page.locator('.model-channel-card').last();
+  await newChannel.getByLabel('渠道协议').selectOption('anthropic-messages');
+  await newChannel.getByLabel('鉴权方式').selectOption('bearer');
+  await newChannel.getByLabel('渠道名称').fill('Claude 备用');
+  await newChannel.getByLabel('Endpoint').fill('https://alternate.example/v1');
+  await newChannel.getByLabel('Bearer Token').fill('alternate-key');
+  await newChannel.getByLabel('Haiku 模型别名').fill('haiku-upstream');
+  await newChannel.getByLabel('Sonnet 模型别名').fill('sonnet-upstream');
+  await newChannel.getByLabel('Opus 模型别名').fill('opus-upstream');
+  await newChannel.getByLabel('手动添加模型 ID').fill('claude-alt');
+  await newChannel.getByRole('button', { name: '添加模型', exact: true }).click();
+  await newChannel.getByRole('button', { name: '设为默认模型：claude-alt（Claude 备用）' }).click();
+  await page.getByRole('button', { name: '保存配置', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('模型配置已保存。');
+  const alternate = savedInput.channels.find(channel => channel.name === 'Claude 备用');
+  expect(alternate).toMatchObject({ protocol: 'anthropic-messages', authMode: 'bearer', endpoint: 'https://alternate.example/v1', apiKey: 'alternate-key', claudeModelAliases: { haiku: 'haiku-upstream', sonnet: 'sonnet-upstream', opus: 'opus-upstream' } });
+  expect(savedInput.claudeDefaultModelId).toBe(alternate.models[0].id);
+  await expect(newChannel.getByLabel('渠道协议')).toBeDisabled();
   await testInfo.attach('model-management', { body: await page.screenshot(), contentType: 'image/png' });
 
   await page.goto('/sessions/old-session');

@@ -135,7 +135,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     }
     await this.pool.query(`CREATE TABLE IF NOT EXISTS sessions (
       id CHAR(36) PRIMARY KEY,project_id CHAR(36) NULL,thread_id VARCHAR(191) NULL,native_history_path TEXT NULL,title VARCHAR(255) NOT NULL,
-      execution_mode ENUM('sandbox','local') NOT NULL,working_directory TEXT NOT NULL,model VARCHAR(200) NOT NULL,model_entry_id VARCHAR(200) NULL,
+      agent_kind VARCHAR(32) NOT NULL DEFAULT 'codex',execution_mode ENUM('sandbox','local') NOT NULL,working_directory TEXT NOT NULL,model VARCHAR(200) NOT NULL,model_entry_id VARCHAR(200) NULL,
       model_reasoning_effort VARCHAR(20) NOT NULL,sandbox_mode VARCHAR(32) NOT NULL,web_search_mode VARCHAR(16) NOT NULL,
       collaboration_mode VARCHAR(16) NOT NULL DEFAULT 'default',fast_mode BOOLEAN NOT NULL DEFAULT FALSE,
       network_access_enabled BOOLEAN NOT NULL,status ENUM('idle','running','completed','failed','cancelled') NOT NULL,
@@ -146,10 +146,11 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       INDEX sessions_status(status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     const [modeColumns] = await this.pool.query<Array<RowDataPacket & { COLUMN_NAME: string }>>(
-      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sessions' AND COLUMN_NAME IN ('collaboration_mode','fast_mode')");
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sessions' AND COLUMN_NAME IN ('collaboration_mode','fast_mode','agent_kind')");
     for (const [column, definition] of [
       ['collaboration_mode', "VARCHAR(16) NOT NULL DEFAULT 'default'"],
       ['fast_mode', 'BOOLEAN NOT NULL DEFAULT FALSE'],
+      ['agent_kind', "VARCHAR(32) NOT NULL DEFAULT 'codex'"],
     ]) {
       if (modeColumns.some(row => row.COLUMN_NAME === column)) continue;
       try { await this.pool.query(`ALTER TABLE sessions ADD COLUMN ${column} ${definition}`); }
@@ -228,7 +229,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     }
     const sessions = rows.map(row => {
       const decoded = sessionFromRow(row);
-      const session = decoded.settings.executionMode === 'sandbox' ? sessionMetadata(decoded) : decoded;
+      const session = decoded.settings.executionMode === 'sandbox' && decoded.agentKind !== 'claude-code' ? sessionMetadata(decoded) : decoded;
       session.turns = bySession.get(session.id) ?? [];
       const project = session.projectId ? projects.get(session.projectId) : undefined;
       if (project?.sandbox) session.sandbox = project.sandbox;
@@ -239,7 +240,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   }
 
   private async hydrateNativeMetadata(sessions: Session[], executor: Pick<Pool, 'query'>) {
-    const native = sessions.filter(session => session.settings.executionMode === 'sandbox' && session.threadId);
+    const native = sessions.filter(session => session.agentKind !== 'claude-code' && session.settings.executionMode === 'sandbox' && session.threadId);
     if (!native.length) return;
     const ids = native.map(session => session.id);
     const placeholders = ids.map(() => '?').join(',');
@@ -523,7 +524,8 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   private async saveSessionRow(executor: Pick<Pool, 'query'>, session: Session, metadataOnly = false) {
     const cols = SESSION_COLUMNS.split(',').map(column => column.trim()).filter(Boolean);
     const values = sessionValues(session);
-    const updates = cols.slice(1).filter(column => !metadataOnly || (column !== 'status' && column !== 'turn_count' && !column.startsWith('context_')))
+    const updates = cols.slice(1).filter(column => column !== 'agent_kind'
+      && (!metadataOnly || (column !== 'status' && column !== 'turn_count' && !column.startsWith('context_'))))
       .map(column => column === 'turn_count' ? 'turn_count=GREATEST(turn_count,VALUES(turn_count))' : `${column}=VALUES(${column})`).join(',');
     await executor.query(`INSERT INTO sessions (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')}) ON DUPLICATE KEY UPDATE ${updates}`, values);
   }

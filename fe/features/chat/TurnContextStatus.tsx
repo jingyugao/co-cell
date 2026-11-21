@@ -1,6 +1,11 @@
-import type { Turn } from '../../../protocol/types';
+import type { AgentKind, Turn } from '../../../protocol/types';
 
-export default function TurnContextStatus({ turn }: { turn: Turn }) {
+export default function TurnContextStatus({ turn, agentKind = 'codex' }: { turn: Turn; agentKind?: AgentKind }) {
+  if (agentKind === 'claude-code') {
+    return turn.clientFailure
+      ? <span className="turn-context-status">提交状态未确认</span>
+      : null;
+  }
   // Historical failures without an SDK receipt must remain unknown.
   const accepted = turn.codexAccepted === true || Boolean(turn.items.length || turn.contextUsage?.length || turn.sdkUsage);
   if (accepted) return null;

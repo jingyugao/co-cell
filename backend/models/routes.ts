@@ -9,8 +9,11 @@ const model = z.object({ id: text(100), model: text(200), visible: z.boolean() }
 const catalog = z.object({
   revision: z.number().int().nonnegative(),
   defaultModelId: text(100).nullable(),
+  claudeDefaultModelId: text(100).nullable().optional(),
   channels: z.array(z.object({
-    id: text(100), name: text(100), endpoint: text(2048), enabled: z.boolean(),
+    id: text(100), name: text(100), endpoint: text(2048), protocol: z.enum(['responses', 'anthropic-messages']).optional(),
+    authMode: z.enum(['api-key', 'bearer']).optional(),
+    claudeModelAliases: z.object({ haiku: text(200).optional(), sonnet: text(200).optional(), opus: text(200).optional() }).strict().optional(), enabled: z.boolean(),
     apiKey: z.string().min(1).max(4096).optional(), models: z.array(model).max(500),
   }).strict()).max(100),
 }).strict();

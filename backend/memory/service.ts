@@ -8,6 +8,7 @@ import { sandboxMounts } from '../../util/sandbox-mounts.js';
 import type { SharedCoordinator, SharedLease } from '../infra/storage/coordination.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import { prepareMaterials } from './materials.js';
+import { CLAUDE_MATERIAL_HOME, prepareClaudeArchive } from '../conversation-materials/claude.js';
 import { readMaterialContent } from '../conversation-materials/content.js';
 import type { ConversationMaterials } from '../../protocol/conversation-materials-types.js';
 import type { ConversationMaterialsService } from '../conversation-materials/service.js';
@@ -166,7 +167,8 @@ export class MemoryService {
   }
 
   private async begin(record: StoredMemory, signal: AbortSignal, assertActive: () => void) {
-    if (!await this.source(record)) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
+    const source = await this.source(record);
+    if (!source) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
     const box = await this.deps.client.getBox(record.sourceBoxId, signal);
     if (box.phase !== 'suspended' || box.operationId) return;
     const cached = await this.deps.materials?.cached({ sessionId: record.sessionId, threadId: record.sourceThreadId,
@@ -176,7 +178,7 @@ export class MemoryService {
       if (!await this.source(record)) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
       await this.publishMaterial(record, cached); return;
     }
-    const home = '/home/agent/workspace/.cocell/codex';
+    const home = source.session.agentKind === 'claude-code' ? CLAUDE_MATERIAL_HOME : '/home/agent/workspace/.cocell/codex';
     const mount = (sandboxMounts(box) ?? []).filter(m => home === m.mountPath || home.startsWith(m.mountPath.replace(/\/$/, '') + '/'))
       .sort((a, b) => b.mountPath.length - a.mountPath.length)[0];
     if (!mount) throw new Error('对话目录没有独立持久卷');
@@ -210,7 +212,8 @@ export class MemoryService {
     record.status = 'cleaning';
     assertActive();
     await this.deps.repository.save(record);
-    if (!await this.source(record)) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
+    const source = await this.source(record);
+    if (!source) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
     const directory = this.directory(record);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await this.removeWork(record, assertActive);
@@ -224,13 +227,14 @@ export class MemoryService {
       if (this.deps.materials) {
         const material = await this.deps.materials.archive({ sessionId: record.sessionId, threadId: record.sourceThreadId,
           sourceUpdatedAt: record.sourceUpdatedAt, boxId: record.sourceBoxId }, archive, signal,
-        async () => { if (!await this.source(record)) throw new HttpError(409, '对话已变化，未发布旧版本材料'); });
+        async () => { if (!await this.source(record)) throw new HttpError(409, '对话已变化，未发布旧版本材料'); }, source.session.agentKind);
         assertActive();
         if (!await this.source(record)) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
         await this.publishMaterial(record, material);
         return;
       }
-      const prepared = await (this.deps.prepare ?? prepareMaterials)(archive, join(work, 'files'), record.sourceThreadId, signal);
+      const prepare = source.session.agentKind === 'claude-code' ? prepareClaudeArchive : this.deps.prepare ?? prepareMaterials;
+      const prepared = await prepare(archive, join(work, 'files'), record.sourceThreadId, signal);
       assertActive();
       if (!await this.source(record)) { record.status = 'skipped'; await this.deps.repository.save(record); return; }
       // Each attempt publishes immutable files. Only the winning DB update makes its directory visible.

@@ -90,8 +90,12 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
     return c.json({ error: '服务器处理失败，请查看服务端日志' }, 500);
   });
 
-  app.get('/api/config', async c => c.json(models ? { ...config, modelOptions: await models.options(),
-    defaults: { ...config.defaults, ...await models.defaultSelection() } } : config));
+  app.get('/api/config', async c => {
+    if (!models) return c.json(config);
+    const catalog = await models.sessionModelConfig();
+    return c.json({ ...config, ...catalog, defaults: { ...config.defaults, ...catalog.defaults },
+      capabilities: { ...config.capabilities, claudeCode: Boolean(config.capabilities.claudeCode && catalog.claudeModelOptions.length) } });
+  });
   app.post('/api/diagnostics/page-load', async c => {
     let payload: unknown;
     try { payload = await c.req.json(); }

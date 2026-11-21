@@ -8,6 +8,7 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Project, ProjectSummary, Session, Settings } from '../../protocol/types.js';
 import type { SandboxMount, SandboxState } from '../../protocol/sandbox-types.js';
 import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
+import { ClaudeBoxClient } from '../execution/claude-box.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { installProjectsRoutes } from '../projects/routes.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
@@ -478,5 +479,37 @@ test('archive directory uses the local index and keyed version refresh queries o
 
     assert.deepEqual(await manager.listArchiveProjects('missing-volume-backup'), []);
     assert.deepEqual(nativeQueries, ['archive-b'], 'an unknown key does not query any native catalog');
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('a disconnected Claude task prevents checkpoint and deletion before the project enters deleting state', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-claude-lifecycle-'));
+  const store = new MemoryWebStateStore();
+  const settings: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
+    modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
+  const at = new Date().toISOString();
+  const box = { id: 'box-claude', template: 'default', workingDirectory: settings.workingDirectory, status: 'ready' as const };
+  const project: Project = { id: 'project-claude', name: 'Claude', type: 1, status: 'active', requirementUrl: null,
+    executionMode: 'sandbox', workingDirectory: settings.workingDirectory, createdAt: at, updatedAt: at, sandbox: box };
+  await store.saveProject(project);
+  await store.saveSession({ id: 'claude-session', agentKind: 'claude-code', projectId: project.id, threadId: 'claude-session',
+    title: 'Running in Box', settings, status: 'idle', archivedAt: null, startedAt: at, createdAt: at, updatedAt: at, turns: [] });
+  let checkpoints = 0, busy = true;
+  const runtime = { async close() {}, async querySandbox() { return box; }, async checkpoint() { checkpoints++; } };
+  const manager = new SessionManager({} as CodexClient, directory, settings, store, runtime as unknown as SandboxRuntime);
+  class Host extends ClaudeBoxClient {
+    override async health(id: string) { assert.equal(id, box.id); return { active: busy }; }
+  }
+  manager.setClaudeRuntime(new Host(async () => assert.fail('only the host health check is needed')));
+  try {
+    await manager.init();
+    await assert.rejects(manager.checkpointProjectSandbox(project.id), /Claude 任务仍在运行/);
+    await assert.rejects(manager.deleteProject(project.id), /Claude 任务仍在运行/);
+    assert.equal(checkpoints, 0);
+    assert.equal((await store.getProject(project.id))?.status, 'active');
+    assert.equal((await store.getProject(project.id))?.sandboxOperation, undefined);
+    busy = false;
+    await manager.checkpointProjectSandbox(project.id);
+    assert.equal(checkpoints, 1);
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

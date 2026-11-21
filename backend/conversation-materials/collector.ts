@@ -10,12 +10,13 @@ import type { WebStateStore } from '../infra/storage/web-state.js';
 import type { MaterialSource } from './service.js';
 import type { ConversationMaterialsService } from './service.js';
 import type { MaterialThread } from './materials.js';
+import { CLAUDE_MATERIAL_HOME, readClaudeMaterialThreads } from './claude.js';
 
 const HOME = '/home/agent/workspace/.cocell/codex';
 const MAX_ARCHIVE_BYTES = 18 * 1024 ** 3;
 const EXPORT_DEADLINE_MS = 10 * 60_000;
 const EXPORT_POLL_MS = 1_000;
-type Client = Pick<CellboxClient, 'getBox' | 'createVolumeExport' | 'getOperation' | 'getVolumeExport'
+type Client = Pick<CellboxClient, 'getBox' | 'createVolumeExport' | 'getOperation' | 'getVolumeExport' | 'listFiles' | 'fileResponse'
   | 'downloadVolumeExport' | 'downloadVolumeBackupExport' | 'deleteVolumeExport'>;
 
 export interface ConversationMaterialCollectorOptions {
@@ -45,6 +46,7 @@ export class ConversationMaterialCollector {
 
   async collect(session: Session, signal?: AbortSignal): Promise<ConversationMaterials> {
     if (!session.projectId || !session.threadId) throw unavailable('对话缺少项目或原生线程');
+    const home = session.agentKind === 'claude-code' ? CLAUDE_MATERIAL_HOME : HOME;
     const initial = await this.source(session);
     if (initial.archivedBackup) {
       if (initial.session.status === 'running') throw unavailable('项目对话仍在运行，不能使用旧归档生成材料');
@@ -60,10 +62,10 @@ export class ConversationMaterialCollector {
       }
       const mount = backup.mounts.filter(value => posix.isAbsolute(value.mountPath)
         && !value.mountPath.split('/').some(segment => segment === '..')
-        && (HOME === value.mountPath || HOME.startsWith(value.mountPath.replace(/\/$/, '') + '/')))
+        && (home === value.mountPath || home.startsWith(value.mountPath.replace(/\/$/, '') + '/')))
         .sort((left, right) => right.mountPath.length - left.mountPath.length)[0];
       if (!mount || mount.volumeId !== backup.volumeId) throw unavailable('归档中的对话目录未挂载于备份磁盘');
-      const relativePath = posix.relative(mount.mountPath, HOME) || '.';
+      const relativePath = posix.relative(mount.mountPath, home) || '.';
       if (relativePath === '..' || relativePath.startsWith('../') || posix.isAbsolute(relativePath))
         throw unavailable('归档对话目录映射无效');
       signal?.throwIfAborted();
@@ -75,7 +77,7 @@ export class ConversationMaterialCollector {
         signal?.throwIfAborted();
         await this.source(session, undefined, backup);
         return await this.options.materials.archive(source, archive, signal,
-          async () => { await this.source(session, undefined, backup); });
+          async () => { await this.source(session, undefined, backup); }, session.agentKind);
       } finally {
         try { await rm(workDirectory, { recursive: true, force: true }); }
         catch (error) { this.log('conversation_material.local_cleanup_failed', error, session.id); }
@@ -95,7 +97,9 @@ export class ConversationMaterialCollector {
     if (box.id !== source.boxId) throw unavailable('Sandbox 与项目记录不匹配');
     if (box.phase === 'running') {
       const current = await this.source(session, source);
-      const result = await this.options.live(current.session, signal);
+      const result = current.session.agentKind === 'claude-code'
+        ? await readClaudeMaterialThreads(this.options.client, current.session, signal)
+        : await this.options.live(current.session, signal);
       signal?.throwIfAborted();
       await this.source(session, source);
       return this.options.materials.live(source, result.threads, result.complete, signal,
@@ -104,11 +108,11 @@ export class ConversationMaterialCollector {
     if (box.phase !== 'suspended' || box.operationId)
       throw unavailable(`Sandbox 当前状态不可离线读取（${box.phase}）`);
 
-    const mount = (sandboxMounts(box) ?? []).filter(value => HOME === value.mountPath
-      || HOME.startsWith(value.mountPath.replace(/\/$/, '') + '/'))
+    const mount = (sandboxMounts(box) ?? []).filter(value => home === value.mountPath
+      || home.startsWith(value.mountPath.replace(/\/$/, '') + '/'))
       .sort((left, right) => right.mountPath.length - left.mountPath.length)[0];
     if (!mount) throw unavailable('对话目录没有独立持久卷');
-    const relativePath = posix.relative(mount.mountPath, HOME) || '.';
+    const relativePath = posix.relative(mount.mountPath, home) || '.';
     let exportId: string | undefined;
     let workDirectory: string | undefined;
     try {
@@ -129,7 +133,7 @@ export class ConversationMaterialCollector {
       signal?.throwIfAborted();
       await this.source(session, source);
       return await this.options.materials.archive(source, archive, signal,
-        async () => { await this.source(session, source); });
+        async () => { await this.source(session, source); }, session.agentKind);
     } finally {
       if (exportId) {
         try {
@@ -167,10 +171,12 @@ export class ConversationMaterialCollector {
       this.options.state.getSession(session.id), this.options.state.getProject(session.projectId!),
     ]);
     const sessionAt = Date.parse(session.updatedAt);
-    const archivedBackups = !project?.sandbox?.id && project?.status === 'completed'
+    const archivedBackups = project && !project.sandbox?.id && ['completed', 'archived'].includes(project.status ?? '')
       ? (project.remoteArchives ?? []).filter((archive): archive is CellboxVolumeBackupRef =>
         archive.storageType === 'cellbox-volume' && !!archive.id && !!archive.volumeId && !!archive.snapshotId
-        && archive.threadIds.includes(session.threadId!) && Number.isFinite(sessionAt)
+        && (session.agentKind === 'claude-code'
+          ? archive.claudeSessionIds?.includes(session.id) === true
+          : archive.threadIds.includes(session.threadId!)) && Number.isFinite(sessionAt)
         && Number.isFinite(Date.parse(archive.createdAt)) && Date.parse(archive.createdAt) >= sessionAt)
       : [];
     const archivedBackup = expectedBackup
@@ -178,9 +184,10 @@ export class ConversationMaterialCollector {
       : archivedBackups.sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
     const boxId = project?.sandbox?.id ?? archivedBackup?.sourceSandboxId;
     if (!currentSession || !project || project.removedAt || project.name.trim().toLowerCase() === 'system'
-      || !['active', 'completed'].includes(project.status ?? 'active') || !boxId
+      || !['active', 'completed', 'archived'].includes(project.status ?? 'active') || !boxId
       && !archivedBackup
       || currentSession.projectId !== project.id || currentSession.threadId !== session.threadId
+      || (currentSession.agentKind ?? 'codex') !== (session.agentKind ?? 'codex')
       || currentSession.updatedAt !== session.updatedAt
       || currentSession.sandbox?.id && boxId && currentSession.sandbox.id !== boxId
       || expected && (expected.threadId !== currentSession.threadId || expected.sourceUpdatedAt !== currentSession.updatedAt
@@ -197,7 +204,8 @@ export class ConversationMaterialCollector {
     return left.id === right.id && left.volumeId === right.volumeId && left.snapshotId === right.snapshotId
       && left.createdAt === right.createdAt && left.ownerKey === right.ownerKey && left.profileId === right.profileId
       && JSON.stringify(left.mounts) === JSON.stringify(right.mounts)
-      && JSON.stringify(left.threadIds) === JSON.stringify(right.threadIds);
+      && JSON.stringify(left.threadIds) === JSON.stringify(right.threadIds)
+      && JSON.stringify(left.claudeSessionIds ?? []) === JSON.stringify(right.claudeSessionIds ?? []);
   }
 
   private log(event: string, error: unknown, sessionId: string) {

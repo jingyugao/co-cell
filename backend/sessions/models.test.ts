@@ -5,18 +5,25 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionManager, type CodexClient } from './manager.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
-import { ModelService } from '../models/service.js';
+import { ModelService, type ModelSelection } from '../models/service.js';
 import { SecretCrypto } from '../secrets/crypto.js';
 import type { StoredModelCatalog } from '../models/repository.js';
-import type { Settings } from '../../protocol/types.js';
+import { ClaudeBoxClient } from '../execution/claude-box.js';
+import type { SandboxRuntime } from '../execution/container-runtime.js';
+import type { Settings, Session } from '../../protocol/types.js';
 
-test('session defaults pin channel identity, later defaults affect only new sessions, and disabled channels block submission', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'cocell-models-'));
+async function modelService() {
   let catalog: StoredModelCatalog | null = null;
   const models = new ModelService({ init: async () => {}, load: async () => structuredClone(catalog),
     save: async (revision, next) => { if ((catalog?.revision ?? null) !== revision) return false; catalog = structuredClone(next); return true; } },
   new SecretCrypto(Buffer.alloc(32, 3).toString('base64')), { model: 'same', models: [] });
   await models.init();
+  return models;
+}
+
+test('session defaults pin channel identity, later defaults affect only new sessions, and disabled channels block submission', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-models-'));
+  const models = await modelService();
   await models.update({ revision: 1, defaultModelId: 'a-model', channels: [
     { id: 'a', name: 'A', endpoint: 'https://a.example/v1', enabled: true, apiKey: 'key-a', models: [{ id: 'a-model', model: 'same', visible: true }] },
     { id: 'b', name: 'B', endpoint: 'https://b.example/v1', enabled: true, apiKey: 'key-b', models: [{ id: 'b-model', model: 'same', visible: true }] },
@@ -45,5 +52,50 @@ test('session defaults pin channel identity, later defaults affect only new sess
     await models.update({ ...config, channels: config.channels.map(channel => channel.id === 'b' ? { ...channel, enabled: false } : channel) });
     await assert.rejects(manager.startTurn(first.id, 'hello'), /停用/);
     assert.equal(manager.get(first.id).turns.length, 0);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+
+test('Claude sessions pin their managed entry and resolve channel edits before the next turn', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-claude-model-'));
+  const models = await modelService();
+  const entries = ['a', 'b'].map(id => ({ id, name: id, endpoint: 'http://' + id + '.test', protocol: 'anthropic-messages' as const,
+    enabled: true, apiKey: 'test-' + id, models: [{ id: id + '-entry', model: 'same', visible: true }] }));
+  await models.update({ revision: 1, defaultModelId: null, claudeDefaultModelId: 'a-entry', channels: entries });
+  const store = new MemoryWebStateStore();
+  const at = new Date().toISOString();
+  const settings: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'codex-only', modelReasoningEffort: 'low',
+    webSearchMode: 'disabled', networkAccessEnabled: true, sandboxMode: 'danger-full-access' };
+  const sandbox = { id: 'box', workingDirectory: settings.workingDirectory, template: 'default', status: 'ready' as const };
+  await store.saveProject({ id: 'project', name: 'Project', status: 'active', type: 1, requirementUrl: null, executionMode: 'sandbox',
+    workingDirectory: settings.workingDirectory, sandbox, createdAt: at, updatedAt: at });
+  const calls: string[][] = [];
+  class Host extends ClaudeBoxClient {
+    override async reserve() {}
+    override async snapshot() { return { snapshot: { threadId: null, turns: [] } }; }
+    override async submit(_box: string, _session: Session, selected: ModelSelection, id: string) {
+      calls.push([selected.modelEntryId, selected.endpoint, selected.apiKey]); return id;
+    }
+  }
+  const runtime = { async close() {}, async querySandbox() { return sandbox; } };
+  const manager = new SessionManager({} as CodexClient, directory, settings, store, runtime as unknown as SandboxRuntime);
+  manager.setModelService(models);
+  manager.setClaudeRuntime(new Host(async () => assert.fail('unexpected service access')));
+  try {
+    await manager.init();
+    const session = await manager.create({ projectId: 'project', agentKind: 'claude-code' });
+    assert.equal(session.settings.modelEntryId, 'a-entry');
+    const saved = await models.catalog();
+    await models.update({ ...saved, claudeDefaultModelId: 'b-entry', channels: saved.channels.map(channel =>
+      channel.id === 'a' ? { ...channel, endpoint: 'http://rotated.test', apiKey: 'rotated' } : channel) });
+    await manager.startTurn(session.id, 'continue');
+    await manager.update(session.id, { settings: { model: 'same', modelEntryId: 'b-entry' } });
+    await manager.startTurn(session.id, 'continue on B');
+    assert.deepEqual(calls, [['a-entry', 'http://rotated.test', 'rotated'], ['b-entry', 'http://b.test', 'test-b']]);
+    const disabled = await models.catalog();
+    await models.update({ ...disabled, claudeDefaultModelId: 'a-entry', channels: disabled.channels.map(channel =>
+      channel.id === 'b' ? { ...channel, enabled: false } : channel) });
+    await assert.rejects(manager.startTurn(session.id, 'blocked'), /停用/);
+    assert.equal(calls.length, 2);
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });

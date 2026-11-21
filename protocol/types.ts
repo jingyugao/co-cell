@@ -260,9 +260,12 @@ export interface ProjectReadOptions {
   /** Integer milliseconds, 0 through PROJECT_OPERATION_WAIT_MS; default 10s. */
   waitMs?: number;
 }
+export type AgentKind = 'codex' | 'claude-code';
 export interface Session {
   projectId?: string;
   id: string;
+  /** Legacy sessions without this field use Codex. */
+  agentKind?: AgentKind;
   threadId: string | null;
   /** Verified relative location of the Codex rollout, refreshed when it moves. */
   nativeHistoryPath?: string;
@@ -334,6 +337,8 @@ export interface SandboxInventory {
   sandboxes: SandboxRecord[];
 }
 export interface AppConfig {
+  claudeModelOptions?: import('./model-types.js').ModelOption[];
+  claudeDefaults?: { model: string; modelEntryId: string };
   modelOptions?: import('./model-types.js').ModelOption[];
   /** Models discovered from the configured upstream, when available. */
   models?: string[];
@@ -351,7 +356,7 @@ export interface AppConfig {
   codexVersion: string;
   auth: 'api-key' | 'local-codex';
   approvalPolicy: 'never';
-  capabilities: { interactiveApprovals: false; tokenDeltas: false; sandboxPreviews?: boolean; nativeWebSocket?: boolean };
+  capabilities: { interactiveApprovals: false; tokenDeltas: false; sandboxPreviews?: boolean; nativeWebSocket?: boolean; claudeCode?: boolean };
 }
 export type StreamMessage =
   | { type: 'snapshot'; session: Session }

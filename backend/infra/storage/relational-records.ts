@@ -107,12 +107,12 @@ export function projectFromRow(row: Record<string, unknown>): Project {
   };
 }
 
-export const SESSION_COLUMNS = `id,project_id,thread_id,native_history_path,title,execution_mode,working_directory,model,model_entry_id,
+export const SESSION_COLUMNS = `id,project_id,thread_id,native_history_path,title,agent_kind,execution_mode,working_directory,model,model_entry_id,
  model_reasoning_effort,collaboration_mode,fast_mode,sandbox_mode,web_search_mode,network_access_enabled,status,turn_count,context_input_tokens,
  context_cached_input_tokens,context_output_tokens,context_model,context_observed_at,context_source,archived_at,started_at,created_at,updated_at`;
 export function sessionValues(session: Session): unknown[] {
   const usage = session.contextUsage;
-  return [session.id, session.projectId ?? null, session.threadId, session.nativeHistoryPath ?? null, session.title,
+  return [session.id, session.projectId ?? null, session.threadId, session.nativeHistoryPath ?? null, session.title, session.agentKind ?? 'codex',
     session.settings.executionMode ?? 'local', session.settings.workingDirectory, session.settings.model,
     session.settings.modelEntryId ?? null, session.settings.modelReasoningEffort,
     session.settings.collaborationMode ?? 'default', session.settings.fastMode ? 1 : 0, session.settings.sandboxMode,
@@ -126,6 +126,7 @@ export function sessionFromRow(row: Record<string, unknown>): Session {
   const executionMode = String(row.execution_mode) as NonNullable<Session['settings']['executionMode']>;
   const session: Session = {
     id: String(row.id), projectId: row.project_id == null ? undefined : String(row.project_id),
+    agentKind: row.agent_kind === 'claude-code' ? 'claude-code' : 'codex',
     threadId: row.thread_id == null ? null : String(row.thread_id),
     ...(row.native_history_path ? { nativeHistoryPath: String(row.native_history_path) } : {}), title: String(row.title),
     settings: { executionMode, workingDirectory: String(row.working_directory), model: String(row.model),

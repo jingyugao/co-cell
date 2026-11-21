@@ -232,3 +232,173 @@ test('unexpected Codex exit is reported as launcher failure', async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('Claude ACP host reconciles durable answers once and preserves unknown outcomes', { timeout: 15_000 }, async () => {
+  const { startClaudeAcpHost } = await import('./acp/server.mjs');
+  const root = await mkdtemp(join(tmpdir(), 'cocell-acp-host-'));
+  const workspace = join(root, 'workspace');
+  const directory = join(workspace, '.cocell', 'claude-acp');
+  const command = join(root, 'agent.mjs');
+  const counter = join(root, 'counter');
+  const id = '9dbbf207-acfd-401d-b65c-077679dd3b5a';
+  const native = 'e051d0eb-e40c-4d29-879e-d640367f6ad7';
+  const turnId = 'a2c32b2d-a1d0-4351-a149-02a27436789f';
+  const answerId = '013afdf7-f906-49e8-bd4a-081e0b7294b8';
+  const stamp = new Date().toISOString();
+  let host;
+  try {
+    await mkdir(directory, { recursive: true });
+    const state = { id, cwd: workspace, threadId: native, turns: [{ id: turnId, prompt: 'question', images: [], status: 'completed', items: [], startedAt: stamp,
+      userInputRequests: [{ id: 'q', questions: [{ title: 'Choice?' }], status: 'queued', deliveryStatus: 'queued', answers: ['A'], answerTurnId: answerId, createdAt: stamp },
+        { id: 'unknown', questions: [{ title: 'Unknown?' }], status: 'queued', deliveryStatus: 'unknown', answers: ['B'], answerTurnId: 'c3fded45-dd07-4b07-85d9-0fcf3d438fda', createdAt: stamp },
+        { id: 'q-switch', questions: [{ title: 'Choice after switch?' }], status: 'pending', createdAt: stamp }] }] };
+    await writeFile(join(directory, id + '.json'), JSON.stringify(state));
+    const adapter = [
+      '#!' + process.execPath,
+      "import { appendFileSync, closeSync } from 'node:fs';",
+      "import { createInterface } from 'node:readline';",
+      "const send = v => process.stdout.write(JSON.stringify(v) + '\\n');",
+      'let held, selectedModel;',
+      'createInterface({input:process.stdin}).on("line", line => {',
+      '  const m=JSON.parse(line);',
+      '  if(m.method==="session/cancel"){ if(held)send({jsonrpc:"2.0",id:held,result:{stopReason:"cancelled"}}); return; }',
+      '  if(m.id===undefined)return;',
+      '  if(m.method==="initialize")return send({jsonrpc:"2.0",id:m.id,result:{protocolVersion:1}});',
+      '  if(m.method==="session/load"){',
+      '    send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_message_chunk",content:{type:"text",text:"OLD_HISTORY"}}}});',
+      '    return send({jsonrpc:"2.0",id:m.id,result:{}});',
+      '  }',
+      '  if(m.method==="session/set_config_option"){ selectedModel=m.params.value; return send({jsonrpc:"2.0",id:m.id,result:{}}); }',
+      '  if(m.method==="_session/steering")return send({jsonrpc:"2.0",id:m.id,result:{outcome:"promptRequired",reason:"noRunningTurn"}});',
+      '  if(m.method==="session/prompt"){',
+      '    if(m.params.prompt[0].text==="BREAK"){closeSync(0); setInterval(()=>{}, 1000); return;}',
+      '    if(m.params.prompt[0].text==="HOLD"){',
+      '      held=m.id;',
+      '      for(let i=0;i<300;i++)send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_message_chunk",messageId:"burst",content:{type:"text",text:"x"}}}});',
+      '      for(let i=0;i<300;i++)send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"usage_update",used:i}}});',
+      '      return;',
+      '    }',
+      '    send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_thought_chunk",messageId:"shared",content:{type:"text",text:"thinking"}}}});',
+      '    send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_message_chunk",messageId:"shared",content:{type:"text",text:"visible "}}}});',
+      '    send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_message_chunk",messageId:"shared",content:{type:"text",text:"answer"}}}});',
+      '    appendFileSync(' + JSON.stringify(counter) + ', JSON.stringify({text:m.params.prompt[0].text,openAiEnv:!!process.env.OPENAI_API_KEY,channel:process.env.ANTHROPIC_BASE_URL,key:process.env.ANTHROPIC_API_KEY,model:selectedModel,haiku:process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL,sonnet:process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,opus:process.env.ANTHROPIC_DEFAULT_OPUS_MODEL}) + "\\n");',
+      '    return send({jsonrpc:"2.0",id:m.id,result:{stopReason:"end_turn"}});',
+      '  }',
+      '  return send({jsonrpc:"2.0",id:m.id,result:{}});',
+      '});',
+    ].join('\n');
+    await writeFile(command, adapter, { mode: 0o755 });
+    const previousKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'must-not-reach-claude';
+    try {
+      host = await startClaudeAcpHost({ directory, workspace, agentHome: root, command, port: 0 });
+      let base = 'http://127.0.0.1:' + host.port;
+      const path = '/sessions/' + id;
+      assert.equal((await (await fetch(base + '/health')).json()).active, true);
+      const resume = () => fetch(base + path + '/reconcile', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({cwd:workspace,env:{ANTHROPIC_API_KEY:'test-only'}}) });
+      const attempts = await Promise.all([resume(), resume()]);
+      assert.deepEqual(attempts.map(response => response.status), [200, 200]);
+      let snapshot;
+      for (let attempt = 0; attempt < 200; attempt++) {
+        snapshot = await (await fetch(base + path)).json();
+        if (snapshot.turns[1]?.status === 'completed') break;
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+      assert.equal(snapshot.turns.length, 2);
+      assert.equal(snapshot.turns[1].status, 'completed');
+      assert.equal(snapshot.turns[0].userInputRequests[0].status, 'answered');
+      assert.equal(snapshot.turns[0].userInputRequests[1].deliveryStatus, 'unknown');
+      assert.ok(snapshot.turns[1].items.every(item => item.text !== 'OLD_HISTORY'));
+      const sent = (await readFile(counter, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+      assert.equal(sent.length, 1);
+      assert.match(sent[0].text, /Answer: A/);
+      assert.equal(sent[0].openAiEnv, false);
+      const answerAfterSwitch = await fetch(base + path + '/answers', { method:'POST', headers:{'content-type':'application/json'},
+        body:JSON.stringify({ ownerTurnId:turnId, requestId:'q-switch', answers:['new'], cwd:workspace,
+          model:'new-model', env:{ ANTHROPIC_BASE_URL:'https://new.example', ANTHROPIC_API_KEY:'new-secret', ANTHROPIC_MODEL:'new-model',
+            ANTHROPIC_DEFAULT_HAIKU_MODEL:'fast-model', ANTHROPIC_DEFAULT_SONNET_MODEL:'work-model', ANTHROPIC_DEFAULT_OPUS_MODEL:'deep-model' } }) });
+      assert.equal(answerAfterSwitch.status, 200);
+      for (let attempt = 0; attempt < 200; attempt++) {
+        snapshot = await (await fetch(base + path)).json();
+        if (snapshot.turns[2]?.status === 'completed') break;
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+      assert.equal(snapshot.turns[2].status, 'completed');
+      assert.equal(snapshot.turns[2].items.find(item => item.type === 'agent_message')?.text, 'visible answer');
+      assert.equal(snapshot.turns[2].items.find(item => item.type === 'reasoning')?.text, 'thinking');
+      assert.notEqual(snapshot.turns[2].items.find(item => item.type === 'agent_message')?.id,
+        snapshot.turns[2].items.find(item => item.type === 'reasoning')?.id);
+      const switched = (await readFile(counter, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+      assert.equal(switched.length, 2);
+      assert.equal(switched[1].channel, 'https://new.example');
+      assert.equal(switched[1].key, 'new-secret');
+      assert.equal(switched[1].model, 'new-model');
+      assert.equal(switched[1].haiku, 'fast-model');
+      assert.equal(switched[1].sonnet, 'work-model');
+      assert.equal(switched[1].opus, 'deep-model');
+      assert.equal((await readFile(join(directory, id + '.json'), 'utf8')).includes('new-secret'), false);
+      assert.equal((await (await fetch(base + '/health')).json()).active, false);
+      const project = workspace.replace(/[^a-zA-Z0-9]/g, '-');
+      const transcriptDir = join(workspace, '.cocell', 'claude', 'projects', project);
+      await mkdir(transcriptDir, { recursive: true });
+      const transcript = join(transcriptDir, native + '.jsonl');
+      await writeFile(transcript, JSON.stringify({ type: 'user', sessionId: native, cwd: workspace }) + '\n');
+      assert.equal((await (await fetch(base + path + '/verify')).json()).verified, true);
+      await rm(transcript);
+      assert.equal((await fetch(base + path + '/verify')).status, 409);
+      const response = await fetch(base + path);
+      const etag = response.headers.get('etag');
+      assert.equal((await fetch(base + path, { headers:{'if-none-match':etag} })).status, 304);
+      await host.close();
+      host = await startClaudeAcpHost({ directory, workspace, agentHome: root, command, port: 0 });
+      base = 'http://127.0.0.1:' + host.port;
+      assert.equal((await fetch(base + path, { headers:{'if-none-match':etag} })).status, 200);
+      const holdId = '4ad51254-999d-4255-b0a3-b4f9ba3b891b';
+      const { watch } = await import('node:fs');
+      let writes = 0;
+      const watcher = watch(directory, (event, file) => { if (event === 'rename' && file === id + '.json') writes++; });
+      const submit = await fetch(base + path + '/turns', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({ id:holdId, prompt:'HOLD', images:[], cwd:workspace, env:{ANTHROPIC_API_KEY:'test-only'} }) });
+      assert.equal(submit.status, 200);
+      let burst;
+      for (let attempt = 0; attempt < 200; attempt++) {
+        snapshot = await (await fetch(base + path)).json();
+        burst = snapshot.turns.at(-1)?.items.find(item => item.id === 'agent_message_chunk:burst');
+        if (burst?.text.length === 300) break;
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+      assert.equal(burst?.text, 'x'.repeat(300));
+      await new Promise(resolve => setTimeout(resolve, 200));
+      watcher.close();
+      assert.ok(writes <= 3, 'Streaming chunks should share a bounded number of durable writes: ' + writes);
+      const steerId = 'a177cf32-2db5-4da7-bd8f-5f9369aa150c';
+      const steer = () => fetch(base + path + '/turns', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({ id:steerId, prompt:'STEER', images:[], cwd:workspace, env:{ANTHROPIC_API_KEY:'test-only'} }) });
+      assert.equal((await steer()).status, 422);
+      assert.equal((await steer()).status, 422);
+      assert.equal((await fetch(base + path + '/stop', { method:'POST' })).status, 200);
+      for (let attempt = 0; attempt < 200; attempt++) {
+        snapshot = await (await fetch(base + path)).json();
+        if (snapshot.turns.at(-1)?.status !== 'running') break;
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+      assert.equal(snapshot.turns.at(-1).status, 'cancelled');
+      assert.equal(snapshot.turns.at(-1).items.find(item => item.id === 'agent_message_chunk:burst')?.text, 'x'.repeat(300));
+      const brokenId = '1271eccf-4c63-4242-852b-f862d6af1a8b';
+      const broken = await fetch(base + path + '/turns', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({ id:brokenId, prompt:'BREAK', images:[], cwd:workspace, env:{ANTHROPIC_API_KEY:'test-only'} }) });
+      assert.equal(broken.status, 200);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await fetch(base + path + '/stop', { method:'POST' });
+      for (let attempt = 0; attempt < 200; attempt++) {
+        snapshot = await (await fetch(base + path)).json();
+        if (snapshot.turns.at(-1)?.status !== 'running') break;
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+      assert.equal(snapshot.turns.at(-1).status, 'failed');
+      assert.equal((await (await fetch(base + '/health')).json()).active, false);
+    } finally {
+      if (previousKey === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previousKey;
+    }
+  } finally {
+    await host?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

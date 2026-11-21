@@ -9,6 +9,7 @@ export interface LegacyRemoteArchiveRef {
   imageId: string;
   sourceSandboxId: string;
   threadIds: string[];
+  claudeSessionIds?: string[];
   storageType?: 'cellbox' | 'oss';
   /** Verified workspace archive that can be restored with another image. */
   portable?: boolean;
@@ -32,6 +33,7 @@ export interface CellboxVolumeBackupRef {
   sourceSandboxId?: string;
   /** Threads known at capture time. External snapshots may have no saved index. */
   threadIds: string[];
+  claudeSessionIds?: string[];
   sha256?: never;
   imageId?: never;
   portable?: never;

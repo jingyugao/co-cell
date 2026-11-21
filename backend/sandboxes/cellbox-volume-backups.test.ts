@@ -105,7 +105,7 @@ test('list trusts the native catalog and joins saved capture-time threads by vol
   const sameSnapshot = 'b'.repeat(64);
   const saved: CellboxVolumeBackupRef[] = [
     { storageType: 'cellbox-volume', id: `volume:volume-a:${sameSnapshot}`, volumeId: 'volume-a', snapshotId: sameSnapshot,
-      ownerKey: 'project:project-a', profileId: 'profile-a', mounts: [mount('volume-a')], createdAt: '2026-10-17T00:00:00.000Z', threadIds: ['thread-a'] },
+      ownerKey: 'project:project-a', profileId: 'profile-a', mounts: [mount('volume-a')], createdAt: '2026-10-17T00:00:00.000Z', threadIds: ['thread-a'], claudeSessionIds: ['claude-a'] },
     { storageType: 'cellbox-volume', id: `volume:volume-b:${sameSnapshot}`, volumeId: 'volume-b', snapshotId: sameSnapshot,
       ownerKey: 'project:project-a', profileId: 'profile-a', mounts: [mount('volume-b')], createdAt: '2026-10-17T00:00:00.000Z', threadIds: ['thread-b'] },
     { storageType: 'cellbox-volume', id: `volume:volume-a:${'c'.repeat(64)}`, volumeId: 'volume-a', snapshotId: 'c'.repeat(64),
@@ -121,6 +121,8 @@ test('list trusts the native catalog and joins saved capture-time threads by vol
   const native = listed.filter((ref): ref is CellboxVolumeBackupRef => ref.storageType === 'cellbox-volume');
 
   assert.deepEqual(new Set(calls.filter(call => call.name === 'listVolumeBackups').map(call => call.input)), new Set(['volume-a', 'volume-b']));
+  assert.deepEqual(native.find(ref => ref.volumeId === 'volume-a' && ref.snapshotId === sameSnapshot)?.claudeSessionIds, ['claude-a']);
+  assert.equal(native.find(ref => ref.volumeId === 'volume-b' && ref.snapshotId === sameSnapshot)?.claudeSessionIds, undefined);
   assert.equal(native.length, 4, 'the pruned saved reference is absent because Cellbox no longer lists it');
   assert.deepEqual(native.find(ref => ref.volumeId === 'volume-a' && ref.snapshotId === sameSnapshot)?.threadIds, ['thread-a']);
   assert.deepEqual(native.find(ref => ref.volumeId === 'volume-b' && ref.snapshotId === sameSnapshot)?.threadIds, ['thread-b']);

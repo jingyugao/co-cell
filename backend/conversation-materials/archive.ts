@@ -124,7 +124,8 @@ async function writeChunk(stream: NodeJS.WritableStream, bytes: Buffer): Promise
   if (!stream.write(bytes)) await once(stream, 'drain');
 }
 
-export async function extractMemoryArchive(archivePath: string, destination: string, signal?: AbortSignal): Promise<void> {
+export async function extractMemoryArchive(archivePath: string, destination: string, signal?: AbortSignal,
+  wantedFile: (name: string) => boolean = isWantedFile, maxFileBytes?: number): Promise<void> {
   signal?.throwIfAborted();
   await mkdir(destination, { recursive: true, mode: 0o700 });
   const source = createReadStream(archivePath, { signal });
@@ -179,8 +180,9 @@ export async function extractMemoryArchive(archivePath: string, destination: str
         throw new Error('Memory export contains a symbolic link or special tar entry');
       if (kind === 53 && size !== 0) throw new Error('Memory export contains an invalid directory entry');
       if (kind === 53) {
-        if (isWantedFile(name)) throw new Error('Memory export directory conflicts with a data file');
-      } else if (isWantedFile(name)) {
+        if (wantedFile(name)) throw new Error('Memory export directory conflicts with a data file');
+      } else if (wantedFile(name)) {
+        if (maxFileBytes !== undefined && size > maxFileBytes) throw new Error('Memory export file exceeds the size limit');
         const target = resolve(destination, ...name.split('/'));
         if (!target.startsWith(`${resolve(destination)}${sep}`)) throw new Error('Memory export path escapes its extraction directory');
         await mkdir(dirname(target), { recursive: true, mode: 0o700 });

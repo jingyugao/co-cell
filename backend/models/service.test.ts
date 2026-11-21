@@ -6,6 +6,8 @@ import { HttpError } from '../../util/errors.js';
 import type { ModelCatalogInput } from '../../protocol/model-types.js';
 import type { ModelRepository, StoredModelCatalog } from './repository.js';
 import { ModelService } from './service.js';
+import { ClaudeBoxClient } from '../execution/claude-box.js';
+import type { Session } from '../../protocol/types.js';
 
 class MemoryRepository implements ModelRepository {
   value: StoredModelCatalog | null = null;
@@ -178,4 +180,131 @@ test('discovery and test use the configured key, validate successful Responses J
     && error.message.includes('HTTP 401') && !error.message.includes('test-secret'));
   await assert.rejects(service.discover('test'), (error: unknown) => error instanceof HttpError && error.status === 502
     && !error.message.includes('test-secret'));
+});
+
+
+test('Claude channels retain independent defaults and require an unambiguous channel identity', async () => {
+  const { service, repo } = await makeService();
+  const initial = createCatalog((await service.catalog()).revision);
+  const channel = { id: 'anthropic', name: 'Claude', endpoint: 'https://claude.example/prefix/v1',
+    protocol: 'anthropic-messages' as const, enabled: true, apiKey: 'claude-secret',
+    models: [{ id: 'claude-one', model: 'claude-model', visible: true }] };
+  const configured = await service.update({ ...initial, claudeDefaultModelId: 'claude-one', channels: [...initial.channels, channel] });
+  assert.equal(configured.defaultModelId, 'a-sol');
+  assert.equal(configured.claudeDefaultModelId, 'claude-one');
+  assert.deepEqual(await service.claudeDefaultSelection(), { model: 'claude-model', modelEntryId: 'claude-one' });
+  assert.equal((await service.options()).some(value => value.id === 'claude-one'), false);
+  assert.equal((await service.sessionModelConfig()).claudeModelOptions[0].id, 'claude-one');
+  const publicConfig = await service.sessionModelConfig();
+  assert.equal(publicConfig.defaults.modelEntryId, 'a-sol');
+  assert.equal(publicConfig.claudeDefaults?.modelEntryId, 'claude-one');
+  assert.deepEqual(publicConfig.claudeModelOptions.map(item => item.id), ['claude-one']);
+  assert.equal((await service.claudeSelection({ model: 'claude-model', modelEntryId: 'claude-one' })).apiKey, 'claude-secret');
+  assert.equal(JSON.stringify(configured).includes('claude-secret'), false);
+  assert.equal(JSON.stringify(repo.value).includes('claude-secret'), false);
+  assert.equal((await service.claudeSelection({ model: 'claude-model' })).channelId, 'anthropic');
+  await assert.rejects(service.selection({ model: 'claude-model', modelEntryId: 'claude-one' }), /不存在/);
+  await assert.rejects(service.claudeSelection({ model: 'wrong', modelEntryId: 'claude-one' }), /不匹配/);
+  const update = { ...configured, claudeDefaultModelId: undefined, channels: configured.channels.map(({ protocol, ...item }) => item) };
+  const preserved = await service.update(update);
+  assert.equal(preserved.claudeDefaultModelId, 'claude-one');
+  assert.equal(preserved.channels.find(item => item.id === 'anthropic')?.protocol, 'anthropic-messages');
+  await assert.rejects(service.update({ ...preserved, channels: preserved.channels.map(item => item.id === 'anthropic'
+    ? { ...item, protocol: 'responses' } : item) }), /协议不可更改/);
+  const changed = await service.update({ ...preserved, channels: [...preserved.channels, { ...channel, id: 'anthropic-two',
+    name: 'Claude Two', models: [{ id: 'claude-two', model: 'claude-model', visible: true }] }] });
+  await assert.rejects(service.claudeSelection({ model: 'claude-model' }), /唯一有效/);
+  const disabled = await service.update({ ...changed, claudeDefaultModelId: null, channels: changed.channels.map(item =>
+    item.protocol === 'anthropic-messages' ? { ...item, enabled: false } : item) });
+  assert.equal(disabled.claudeDefaultModelId, null);
+  await assert.rejects(service.claudeSelection({ model: 'claude-model', modelEntryId: 'claude-one' }), /停用/);
+});
+
+test('Anthropic channel discovery and test use the configured proxy prefix and API key', async t => {
+  const requests: Array<{ path: string; key?: string; authorization?: string; version?: string; body: string }> = [];
+  let messageResponse = JSON.stringify({ type: 'message', content: [{ type: 'text', text: 'OK' }] });
+  const server = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    requests.push({ path: req.url ?? '', key: String(req.headers['x-api-key'] ?? ''),
+      authorization: String(req.headers.authorization ?? ''),
+      version: String(req.headers['anthropic-version'] ?? ''), body: Buffer.concat(chunks).toString() });
+    res.setHeader('content-type', 'application/json');
+    res.end(req.url?.endsWith('/models') ? JSON.stringify({ data: [{ id: 'claude-test' }] })
+      : messageResponse);
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); }));
+  const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}/proxy/v1`;
+  const { service } = await makeService();
+  await service.update({ revision: 1, defaultModelId: null, claudeDefaultModelId: 'c', channels: [
+    { id: 'anthropic', name: 'Claude', endpoint, protocol: 'anthropic-messages', enabled: true, apiKey: 'secret',
+      models: [{ id: 'c', model: 'claude-test', visible: true }] },
+  ] });
+  assert.deepEqual(await service.discover('anthropic'), ['claude-test']);
+  assert.deepEqual(await service.test('anthropic'), { ok: true });
+  assert.deepEqual(requests.map(value => value.path), ['/proxy/v1/models', '/proxy/v1/messages']);
+  assert(requests.every(value => value.key === 'secret' && value.version === '2023-06-01'));
+  assert.deepEqual(JSON.parse(requests[1].body).messages, [{ role: 'user', content: 'Reply with OK.' }]);
+  const initial = await service.catalog();
+  const bearer = await service.update({ ...initial, channels: initial.channels.map(channel => ({ ...channel, authMode: 'bearer' })) });
+  assert.equal(bearer.channels[0].authMode, 'bearer');
+  const mapped = await service.update({ ...bearer, channels: bearer.channels.map(channel => ({ ...channel,
+    claudeModelAliases: { haiku: 'fast-model', sonnet: 'work-model', opus: 'work-model' } })) });
+  assert.deepEqual((await service.claudeSelection({ model: 'claude-test', modelEntryId: 'c' })).claudeModelAliases,
+    { haiku: 'fast-model', sonnet: 'work-model', opus: 'work-model' });
+  const legacyClient = { ...mapped, channels: mapped.channels.map(({ authMode: _authMode, claudeModelAliases: _aliases, ...channel }) => channel) };
+  const preserved = await service.update(legacyClient);
+  assert.equal(preserved.channels[0].authMode, 'bearer');
+  assert.deepEqual(preserved.channels[0].claudeModelAliases, mapped.channels[0].claudeModelAliases);
+  const selected = await service.claudeSelection({ model: 'claude-test', modelEntryId: 'c' });
+  assert.equal(selected.authMode, 'bearer');
+  await service.discover('anthropic');
+  await service.test('anthropic');
+  assert(requests.slice(-2).every(value => value.key === '' && value.authorization === 'Bearer secret'));
+  const cleared = await service.update({ ...preserved, channels: preserved.channels.map(channel => ({ ...channel, claudeModelAliases: {} })) });
+  assert.deepEqual(cleared.channels[0].claudeModelAliases, {});
+  messageResponse = 'null';
+  await assert.rejects(service.test('anthropic'), (error: unknown) => error instanceof HttpError && error.status === 502);
+});
+
+
+test('an empty channel can correct its protocol before adding models', async () => {
+  const { service } = await makeService();
+  const catalog = await service.update({ revision: 1, defaultModelId: null, channels: [
+    { id: 'empty', name: 'Empty', endpoint: 'https://example.test', enabled: true, models: [] },
+  ] });
+  const changed = await service.update({ ...catalog, channels: catalog.channels.map(channel => ({
+    ...channel, protocol: 'anthropic-messages',
+  })) });
+  assert.equal(changed.channels[0].protocol, 'anthropic-messages');
+});
+
+test('Claude Box submission passes the selected bearer token without putting it in the model endpoint', async t => {
+  let body: Record<string, any> = {};
+  const host = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    body = JSON.parse(Buffer.concat(chunks).toString());
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ turnId: body.id }));
+  });
+  await new Promise<void>(resolve => host.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => { host.closeAllConnections(); host.close(() => resolve()); }));
+  const port = (host.address() as { port: number }).port;
+  const client = new ClaudeBoxClient(async () => ({ url: `http://127.0.0.1:${port}`, headers: {} }));
+  const session = { id: 'session', settings: { workingDirectory: '/home/agent/workspace' } } as Session;
+  const selected = { model: 'model', modelEntryId: 'entry', channelId: 'channel',
+    endpoint: 'https://channel.example/proxy/v1', apiKey: 'test-token', authMode: 'bearer' as const,
+    claudeModelAliases: { haiku: 'fast-model', sonnet: 'work-model', opus: 'work-model' } };
+  assert.equal(await client.submit('box', session, selected, 'turn', 'hello', []), 'turn');
+  assert.equal(body.env.ANTHROPIC_AUTH_TOKEN, 'test-token');
+  assert.equal(body.env.ANTHROPIC_API_KEY, undefined);
+  assert.equal(body.env.ANTHROPIC_BASE_URL, 'https://channel.example/proxy');
+  assert.equal(body.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'fast-model');
+  assert.equal(body.env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'work-model');
+  assert.equal(body.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'work-model');
+  await client.submit('box', session, { ...selected, authMode: 'api-key' }, 'turn-2', 'hello', []);
+  assert.equal(body.env.ANTHROPIC_API_KEY, 'test-token');
+  assert.equal(body.env.ANTHROPIC_AUTH_TOKEN, undefined);
 });

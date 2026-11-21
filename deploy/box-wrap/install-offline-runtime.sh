@@ -17,6 +17,11 @@ mkdir -p "$codex/node_modules/@openai/codex-linux-x64"
 tar -xzf "$artifacts/codex.tgz" --strip-components=1 -C "$codex"
 tar -xzf "$artifacts/codex-linux-x64.tgz" --strip-components=1 -C "$codex/node_modules/@openai/codex-linux-x64"
 ln -sf "$codex/bin/codex.js" /usr/local/bin/codex
+claude_dir=/opt/product/claude
+mkdir -p "$claude_dir"
+tar -xzf "$artifacts/claude-agent-acp-linux-x64.tar.gz" -C "$claude_dir" claude-agent-acp claude
+ln -sf "$claude_dir/claude-agent-acp" /usr/local/bin/claude-agent-acp
+"$claude_dir/claude" --version
 install -m 0755 "$artifacts/restic" /usr/local/bin/restic
 codex_version="$(node -p 'JSON.parse(require("fs").readFileSync("/opt/product/cocell/deploy/box-wrap/runtime-packages.json")).codexVersion')"
 restic_version="$(node -p 'JSON.parse(require("fs").readFileSync("/opt/product/cocell/deploy/box-wrap/runtime-packages.json")).resticVersion')"

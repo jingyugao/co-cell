@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { Project } from '../../../protocol/types.js';
+import type { Project, Session } from '../../../protocol/types.js';
 import { createWebStateStore, MySqlWebStateStore } from './web-state.js';
-import { projectFromRow } from './relational-records.js';
+import { projectFromRow, SESSION_COLUMNS, sessionFromRow, sessionValues } from './relational-records.js';
 
 test('metadata storage requires MYSQL_URL and rejects invalid URLs without exposing credentials', () => {
   for (const value of [undefined, '', ' \t\n']) {
@@ -35,6 +35,21 @@ test('database initialization failure propagates instead of falling back to loca
 });
 
 const now = '2026-09-24T00:00:00.000Z';
+
+test('session engine survives relational round trips and legacy rows default to Codex', () => {
+  const session: Session = {
+    id: 'session', agentKind: 'claude-code', threadId: null, title: 'task',
+    settings: { executionMode: 'sandbox', workingDirectory: '/workspace', model: 'claude',
+      modelReasoningEffort: 'medium', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true },
+    status: 'idle', startedAt: now, createdAt: now, updatedAt: now, archivedAt: null, turns: [],
+  };
+  const columns = SESSION_COLUMNS.split(',').map(column => column.trim());
+  const values = sessionValues(session);
+  assert.equal(values.length, columns.length);
+  const row = Object.fromEntries(columns.map((column, index) => [column, values[index]]));
+  assert.equal(sessionFromRow(row).agentKind, 'claude-code');
+  assert.equal(sessionFromRow({ ...row, agent_kind: undefined }).agentKind, 'codex');
+});
 
 function rowFromProjectWrite(sql: string, values: unknown[] = []): Record<string, unknown> {
   const match = /^INSERT INTO projects \(([^)]+)\)/.exec(sql);

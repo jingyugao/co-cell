@@ -1,9 +1,28 @@
 import type { Project } from '../../protocol/types.js';
+import { sandboxMounts } from '../../util/sandbox-mounts.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 const MINUTE = 60 * 1000;
 const BUSY_RETRY_DELAY = 5 * MINUTE;
-const MAX_AUTOMATIC_ARCHIVE_ATTEMPTS = 3;
+const FAST_ARCHIVE_ATTEMPTS = 3;
+
+function completedAfterReleaseReadFailed(project: Project): boolean {
+  const op = project.sandboxOperation;
+  const box = project.sandbox;
+  if (op?.kind !== 'release' || op.status !== 'unknown' || op.errorCode !== 'TRANSPORT'
+    || !box || box.operationId || box.ownerKey !== `project:${project.id}`
+    || !Number.isSafeInteger(box.generation) || (box.generation ?? 0) < 1
+    || !['running', 'suspended'].includes(box.phase ?? '')) return false;
+  const mounts = sandboxMounts(box);
+  const saved = project.sandboxMounts;
+  if (!mounts?.length || !saved?.length || saved.length !== mounts.length || !saved.every(mount =>
+    mounts.some(live => live.volumeId === mount.volumeId && live.mountPath === mount.mountPath))) return false;
+  // A later explicit completion creates a new archive intent for this same Box.
+  // A lost mutation response (UNKNOWN_OUTCOME) cannot authorize this path.
+  return Date.parse(project.completedAt ?? '') > Date.parse(op.updatedAt)
+    && Boolean(project.lifecycleHistory?.some(event => event.action === 'completed'
+      && event.at === project.completedAt && event.sandboxId === box.id));
+}
 
 export interface SandboxLifecycleOptions {
   listProjects: () => Project[] | Promise<Project[]>;
@@ -55,25 +74,31 @@ export class SandboxLifecycleService {
     const timestamp = Date.parse(project.completedAt ?? '');
     if (!Number.isFinite(timestamp) || timestamp > now - this.archivedReclaimAfterMs) return false;
     const operation = project.sandboxOperation;
-    const retryable = operation?.status === 'failed' && operation.errorCode === 'BUSY'
+    const retryable = operation?.status === 'failed' && ['BUSY', 'PREFLIGHT_UNAVAILABLE'].includes(operation.errorCode ?? '')
       && ['checkpoint', 'release', 'archive'].includes(operation.kind);
-    if (operation && operation.status !== 'succeeded') {
-      // Only an explicit BUSY failure authorizes a new submission. Unknown
-      // outcomes and other failures still require an operator decision.
-      if (!retryable || (operation.automaticArchiveAttempt ?? 0) >= MAX_AUTOMATIC_ARCHIVE_ATTEMPTS) return false;
+    if (operation && operation.status !== 'succeeded' && !completedAfterReleaseReadFailed(project)) {
+      if (!retryable) return false;
+      // A confirmed BUSY is temporary. Limit persistent contention to one
+      // attempt per day after the initial burst, including across restarts.
+      const delay = (operation.automaticArchiveAttempt ?? 0) >= FAST_ARCHIVE_ATTEMPTS ? DAY : BUSY_RETRY_DELAY;
       const failedAt = Date.parse(operation.updatedAt);
-      if (!Number.isFinite(failedAt) || now - failedAt < BUSY_RETRY_DELAY) return false;
+      if (!Number.isFinite(failedAt) || now - failedAt < delay) return false;
     }
     const backup = project.sandboxBackup;
     if (backup && backup.status !== 'succeeded') {
-      const busyBackup = backup.errorCode === 'BUSY'
-        || (retryable && operation?.kind === 'archive' && backup.id === operation.id);
-      if (backup.status !== 'failed' || !busyBackup) return false;
+      const retryableBackup = ['BUSY', 'PREFLIGHT_UNAVAILABLE'].includes(backup.errorCode ?? '')
+        || (!backup.errorCode && retryable && operation?.errorCode === 'BUSY' && operation.kind === 'archive' && backup.id === operation.id);
+      if (backup.status !== 'failed' || !retryableBackup) return false;
     }
     if (project.sandbox) {
-      if (project.sandbox.creation) return false;
+      if (project.sandbox.creation || project.sandbox.operationId) return false;
+      if (project.sandbox.ownerKey && project.sandbox.ownerKey !== (project.sandboxOwnerKey ?? `project:${project.id}`)) return false;
+      // Native capture supports a single volume. Check before stopping a Box.
+      const volumes = [...(project.sandboxMounts ?? []), ...(sandboxMounts(project.sandbox) ?? [])];
+      if (new Set(volumes.map(mount => mount.volumeId)).size > 1) return false;
       // Running environments are released with their disks intact before capture.
-      return ['ready', 'paused'].includes(project.sandbox.status) || project.sandbox.phase === 'failed';
+      return ['ready', 'paused'].includes(project.sandbox.status)
+        || (project.sandbox.status === 'unavailable' && project.sandbox.phase === 'failed');
     }
     return Boolean(project.sandboxMounts?.length || project.archiveCleanupSourceId);
   }

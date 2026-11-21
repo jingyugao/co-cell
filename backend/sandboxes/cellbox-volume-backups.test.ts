@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { SandboxLifecycle } from '@co-cell/sandbox';
-import type { CellboxSandboxProvider, CellboxOperation, CellboxVolumeBackup } from '../../packages/sandbox/src/providers/cellbox/index.js';
+import { CellboxError, type CellboxSandboxProvider, type CellboxOperation, type CellboxVolumeBackup } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import type { CellboxVolumeBackupRef, RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import type { SandboxState } from '../../protocol/sandbox-types.js';
 import { BackupCatalogUnavailable, createCellboxVolumeBackups } from './cellbox-volume-backups.js';
@@ -73,6 +73,41 @@ test('capture rejects multiple retained volumes before submitting any backup', a
   const backup = createCellboxVolumeBackups(provider, 'profile-a', new SandboxLifecycle([]));
   await assert.rejects(backup.capture(target({ sandboxMounts: [mount('volume-a'), mount('volume-b', '/data')] }), 'request-a'),
     error => (error as { status?: number }).status === 422 && /尚未提交备份/.test((error as Error).message));
+  assert.deepEqual(calls, []);
+});
+
+test('detached archive releases only its failed generation on the retained disk before capturing', async () => {
+  const mounts = [mount('volume-a')];
+  const ownerKey = 'project:project-a', profileId = 'profile-a';
+  const failed = { id: 'failed-box', generation: 2, phase: 'failed', ownerKey, profileId, mounts };
+  let attached = [failed];
+  const { provider, calls } = fakeProvider({
+    getVolume: async () => ({ id: 'volume-a', phase: 'available', ownerKey, profileId }),
+    listResourceBoxes: async () => attached,
+  });
+  provider.ensureDeleted = async (id, expected) => {
+    assert.deepEqual(expected, { id, generation: 2, phase: 'failed', ownerKey, volumeId: 'volume-a' });
+    calls.push({ name: 'release', input: id });
+    return { sandboxId: id, state: 'unknown', startedAt: new Date(0) };
+  };
+  provider.client.createVolumeBackup = async id => {
+    calls.push({ name: 'backup', input: id });
+    return operation('capture', 'volume-backup', id, { backupId });
+  };
+  const backups = createCellboxVolumeBackups(provider, profileId, new SandboxLifecycle([]));
+  const capture = () => backups.capture(target({ sandboxMounts: mounts }), 'archive', { releaseFailedAttachments: true });
+  for (const other of [{ ownerKey: 'foreign' }, { phase: 'running' }, { operationId: 'pending' },
+    { mounts: [...mounts, mount('second-disk')] }]) {
+    attached = [failed, { ...failed, id: 'another-box', ...other }];
+    await assert.rejects(capture(), (error: CellboxError) => ['BUSY', 'CONFLICT'].includes(error.code));
+    assert.deepEqual(calls, [], 'preflight must inspect every attachment before releasing any');
+  }
+  attached = [failed, { ...failed, id: 'unrelated', mounts: [mount('other-disk')] }];
+  await capture();
+  assert.deepEqual(calls.slice(0, 2), [{ name: 'release', input: failed.id }, { name: 'backup', input: 'volume-a' }]);
+  calls.length = 0;
+  provider.client.getVolume = async () => { throw new CellboxError('TRANSPORT', 'read failed'); };
+  await assert.rejects(capture(), { code: 'PREFLIGHT_UNAVAILABLE' });
   assert.deepEqual(calls, []);
 });
 

@@ -107,6 +107,15 @@ export class CellboxError extends Error {
   }
 }
 
+/** Use only on reads before submission, never on a mutation or its waiter. */
+export function rethrowPreflightError(error: unknown): never {
+  if (error instanceof CellboxError && (['TRANSPORT', 'TIMEOUT'].includes(error.code)
+    || (error.code === 'PROTOCOL' && (error.status === 502 || error.status === 503)))) {
+    throw new CellboxError('PREFLIGHT_UNAVAILABLE', error.message, error.status, { cause: error });
+  }
+  throw error;
+}
+
 function statusCode(status: number): CellboxErrorCode {
   switch (status) {
     case 400: return 'INVALID_REQUEST';

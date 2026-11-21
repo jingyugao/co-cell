@@ -139,9 +139,19 @@ export interface SandboxProvider {
   /** End a Box, retaining its volumes and returning the terminal metadata. */
   release?(sandboxId: string): Promise<SandboxInfo>;
   /** Query and join existing destruction before submitting a new delete request. */
-  ensureDeleted?(sandboxId: string): Promise<SandboxInfo>;
+  ensureDeleted?(sandboxId: string, expected?: SandboxReleaseObservation): Promise<SandboxInfo>;
   pause(sandboxId: string): Promise<boolean>;
   kill(sandboxId: string): Promise<boolean>;
+}
+
+/** The runtime and execution generation on which an automatic release was authorized. */
+export interface SandboxReleaseObservation {
+  id: string;
+  phase: string;
+  generation: number;
+  ownerKey?: string;
+  /** All attachments must still refer to this independent disk. */
+  volumeId?: string;
 }
 
 export interface CheckpointableSandboxProvider extends SandboxProvider, SandboxCheckpointProvider {}

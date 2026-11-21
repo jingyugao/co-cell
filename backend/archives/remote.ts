@@ -13,6 +13,8 @@ export interface RemoteArchives {
   capture(target: WorkspaceTarget, requestId: string,
     options?: {
       onOperation?: (operationId: string, volumeId: string) => Promise<void>;
+      /** A detached project's archive may release failed Boxes retaining its source disk. */
+      releaseFailedAttachments?: boolean;
       /** Reconcile an explicit deletion retry against native operations and snapshots. */
       recovery?: { operationId?: string; snapshotIds?: string[] };
       onSnapshotBaseline?: (volumeId: string, snapshotIds: string[]) => Promise<void>;

@@ -1,5 +1,5 @@
 import type { SandboxLifecycle, SandboxLifecycleContext } from '@co-cell/sandbox';
-import { CellboxError, type CellboxSandboxProvider, type CellboxOperation, type CellboxVolumeBackup } from '../../packages/sandbox/src/providers/cellbox/index.js';
+import { CellboxError, rethrowPreflightError, type CellboxSandboxProvider, type CellboxOperation, type CellboxVolumeBackup } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import type { CellboxVolumeBackupRef, RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 import type { SandboxMount, SandboxState } from '../../protocol/sandbox-types.js';
 import { sandboxMounts } from '../../util/sandbox-mounts.js';
@@ -29,6 +29,32 @@ function reference(snapshot: CellboxVolumeBackup, mounts: SandboxMount[], saved?
 }
 
 export function createCellboxVolumeBackups(provider: CellboxSandboxProvider, profileId: string, lifecycle: SandboxLifecycle) {
+  async function prepareDetachedVolume(target: WorkspaceTarget, volumeId: string) {
+    const ownerKey = `project:${target.projectId}`;
+    const [volume, boxes] = await Promise.all([provider.client.getVolume(volumeId), provider.client.listResourceBoxes()])
+      .catch(rethrowPreflightError);
+    if (!target.projectId || target.sandbox || volume.id !== volumeId || volume.ownerKey !== ownerKey || volume.profileId !== profileId)
+      throw new CellboxError('CONFLICT', '无法确认待归档磁盘的项目归属');
+    if (volume.operationId || !['available', 'failed'].includes(volume.phase))
+      throw new CellboxError('BUSY', '待归档磁盘仍有操作在进行');
+    // Resource inventory excludes historical checkpoints. Validate all live
+    // attachments before releasing any, and retain every independent volume.
+    const attachments = boxes.filter(box =>
+      box.phase !== 'deleted' && sandboxMounts(box)?.some(mount => mount.volumeId === volumeId));
+    for (const box of attachments) {
+      if (box.ownerKey !== ownerKey || box.profileId !== profileId || box.operationId
+        || !['failed', 'suspended'].includes(box.phase))
+        throw new CellboxError('BUSY', '待归档磁盘仍被其他环境或操作占用');
+      if (box.phase === 'failed' && (sandboxMounts(box)!.some(mount => mount.volumeId !== volumeId)
+        || !Number.isSafeInteger(box.generation) || box.generation < 1))
+        throw new CellboxError('CONFLICT', '无法确认遗留 Sandbox 的磁盘或运行代次');
+    }
+    for (const box of attachments.filter(box => box.phase === 'failed')) {
+      await lifecycle.run({ action: 'destroy', resourceKey: ownerKey, sandboxId: box.id },
+        () => provider.ensureDeleted(box.id, { id: box.id, phase: box.phase, generation: box.generation, ownerKey, volumeId }));
+    }
+  }
+
   return {
     policy: () => provider.client.getBackupPolicy(),
     async list(target: WorkspaceTarget, saved: readonly RemoteArchiveRef[]): Promise<RemoteArchiveRef[]> {
@@ -58,6 +84,7 @@ export function createCellboxVolumeBackups(provider: CellboxSandboxProvider, pro
       if (!ids.length) throw new HttpError(409, '项目没有可备份的独立磁盘');
       if (ids.length !== 1) throw new HttpError(422, '项目挂载了多个独立磁盘；当前项目备份只支持单个磁盘，尚未提交备份。');
       const volumeId = ids[0];
+      if (options?.releaseFailedAttachments) await prepareDetachedVolume(target, volumeId);
       let operation: CellboxOperation | undefined;
       if (options?.recovery) {
         const snapshots = await provider.client.listVolumeBackups(volumeId);

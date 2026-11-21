@@ -259,6 +259,7 @@ function ProjectCard({ project, resumeTimeline, config, onRefresh, onUpdate, onD
       <section className="project-action-group" aria-label="项目操作">
         <h3>项目操作</h3>
         <div className="project-card-actions">
+          {project.status === 'active' && project.executionMode === 'sandbox' && config?.capabilities.workflows && <a className="secondary-button" href={'/projects/'+project.id+'/workflows/new'}>多 agent 工作台</a>}
           <button className="secondary-button" onClick={() => setShowToolGrants(true)}>工具权限</button>
           {project.executionMode === 'sandbox' && (!archived || archiveRetry) && <>
             <button className="secondary-button" disabled={archiveDisabled} title={!sandboxPaused && !releasedWithMounts && !archiveRetryCleanup ? '请先暂停后归档，或明确选择使用已有备份' : undefined} onClick={() => archive()}>{archiveRetryCleanup ? '重试清理' : archiveRetry ? '重试归档' : '手动归档'}</button>

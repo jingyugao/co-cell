@@ -397,3 +397,74 @@ test('releasing a runtime confirms process termination and keeps project mounts 
   await expect(card.locator('.project-card-statuses .project-status')).toHaveText('已释放');
   expect(project.sandbox).toBeUndefined();
 });
+
+test('workflow reviews the frozen command before submitting one version-bound decision', async ({ page }) => {
+  const runId = '60aa10c6-f002-49a1-a3a2-970a20ab8a79';
+  const hash = 'a'.repeat(64);
+  const task = {
+    key: 'typecheck',
+    role: 'worker',
+    description: '检查项目类型',
+    dependsOn: [],
+    ownedPaths: ['src'],
+    readPaths: [],
+    acceptance: '类型检查通过',
+    validation: { argv: ['pnpm', 'typecheck'], cwd: '.', timeoutMs: 30000, outputPaths: [] },
+  };
+  const plan = {
+    id: 'immutable-plan',
+    approvalId: 'approval',
+    approvalRevision: 1,
+    version: 1,
+    hash,
+    plan: {
+      design: '执行类型检查',
+      alternatives: '复用项目脚本',
+      publicContracts: [],
+      risks: '现有类型错误',
+      reviewDecisions: '已评审',
+      tasks: [task],
+    },
+  };
+  const run = {
+    id: runId,
+    projectId: 'paused',
+    requirement: '验证审批流程',
+    model: 'codex',
+    parallelism: 2,
+    version: 1,
+    revision: 4,
+    status: 'awaiting_approval',
+    jobs: [],
+    decisions: [],
+    artifacts: [],
+    plans: [plan],
+    events: [],
+  };
+  const decisions = [];
+  await page.route('**/api/workflow-runs/**', async (route) => {
+    if (route.request().method() === 'POST') {
+      decisions.push(route.request().postDataJSON());
+      run.status = 'executing';
+      run.revision++;
+      await route.fulfill({ status: 202, json: { id: runId, revision: run.revision } });
+    } else await route.fulfill({ json: run });
+  });
+  await page.goto('/workflows/' + runId);
+  await page.getByRole('button', { name: '查看计划并审批' }).click();
+  await expect(page.getByText('["pnpm","typecheck"]', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '批准 v1' }).click();
+  await expect(page.getByText('并行实施', { exact: true })).toBeVisible();
+  expect(decisions).toHaveLength(1);
+  expect(decisions[0]).toMatchObject({
+    planId: plan.id,
+    planHash: hash,
+    approvalRevision: 1,
+    expectedRevision: 4,
+    decision: 'approve',
+  });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.reload();
+  await expect(page.getByText('并行实施', { exact: true })).toBeVisible();
+  expect(decisions).toHaveLength(1);
+});

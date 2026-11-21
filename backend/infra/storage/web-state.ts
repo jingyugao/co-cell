@@ -2,6 +2,7 @@ import { MySqlPreviewGrantStore } from '../../access/preview-grants.js';
 import { MySqlModelRepository } from '../../models/repository.js';
 import { MySqlMemoryRepository } from '../../memory/repository.js';
 import { MySqlMaterialsRepository } from '../../conversation-materials/repository.js';
+import { MySqlWorkflowStore } from '../../workflows/store.js';
 import { MySqlReportRepository } from '../../reports/repository.js';
 import { MySqlKnowledgeRepository } from '../../knowledge/repository.js';
 import { MySqlFileFavoriteRepository } from '../../file-favorites/repository.js';
@@ -21,6 +22,7 @@ import { mergeRecord } from './record-merge.js';
 import { date, fromJson, iso, inputRequestFromRow, mainTurnValues, projectFromRow, projectValues, PROJECT_COLUMNS, requestTurnValues, SESSION_COLUMNS, sessionFromRow, sessionValues, turnFromRow, type SessionTurnRow } from './relational-records.js';
 
 export interface WebStateStore {
+  isWorkflowThread?(threadId: string): Promise<boolean>;
   init(): Promise<void>; listProjects(): Promise<Project[]>; listSessions(): Promise<Session[]>;
   listProjectSessions(projectId: string): Promise<Session[]>;
   getProject(id: string): Promise<Project | undefined>; getSession(id: string): Promise<Session | undefined>;
@@ -51,6 +53,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   readonly modelRepository: MySqlModelRepository;
   readonly memoryRepository: MySqlMemoryRepository;
   readonly materialsRepository: MySqlMaterialsRepository;
+  readonly workflowRepository: MySqlWorkflowStore;
   readonly reportRepository: MySqlReportRepository;
   readonly knowledgeRepository: MySqlKnowledgeRepository;
   readonly fileFavoriteRepository: MySqlFileFavoriteRepository;
@@ -63,6 +66,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     this.modelRepository = new MySqlModelRepository(this.pool);
     this.memoryRepository = new MySqlMemoryRepository(this.pool);
     this.materialsRepository = new MySqlMaterialsRepository(this.pool);
+    this.workflowRepository = new MySqlWorkflowStore(this.pool);
     this.reportRepository = new MySqlReportRepository(this.pool);
     this.knowledgeRepository = new MySqlKnowledgeRepository(this.pool);
     this.fileFavoriteRepository = new MySqlFileFavoriteRepository(this.pool);
@@ -143,14 +147,15 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       context_output_tokens BIGINT UNSIGNED NULL,context_model VARCHAR(200) NULL,context_observed_at DATETIME(3) NULL,
       context_source ENUM('responses','rollout') NULL,archived_at DATETIME(3) NULL,started_at DATETIME(3) NOT NULL,
       created_at DATETIME(3) NOT NULL,updated_at DATETIME(3) NOT NULL,INDEX sessions_project_updated(project_id,updated_at),
-      INDEX sessions_status(status)
+      INDEX sessions_status(status),INDEX sessions_native_thread(thread_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     const [modeColumns] = await this.pool.query<Array<RowDataPacket & { COLUMN_NAME: string }>>(
-      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sessions' AND COLUMN_NAME IN ('collaboration_mode','fast_mode','agent_kind')");
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sessions' AND COLUMN_NAME IN ('collaboration_mode','fast_mode','agent_kind','managed_by_json')");
     for (const [column, definition] of [
       ['collaboration_mode', "VARCHAR(16) NOT NULL DEFAULT 'default'"],
       ['fast_mode', 'BOOLEAN NOT NULL DEFAULT FALSE'],
       ['agent_kind', "VARCHAR(32) NOT NULL DEFAULT 'codex'"],
+      ['managed_by_json', 'JSON NULL'],
     ]) {
       if (modeColumns.some(row => row.COLUMN_NAME === column)) continue;
       try { await this.pool.query(`ALTER TABLE sessions ADD COLUMN ${column} ${definition}`); }
@@ -158,6 +163,12 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
         // Multiple API instances may initialize the same schema concurrently.
         if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ER_DUP_FIELDNAME')) throw error;
       }
+    }
+    const [threadIndex] = await this.pool.query<RowDataPacket[]>(
+      "SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sessions' AND COLUMN_NAME='thread_id' AND SEQ_IN_INDEX=1 LIMIT 1");
+    if (!threadIndex.length) {
+      try { await this.pool.query('ALTER TABLE sessions ADD INDEX sessions_native_thread(thread_id)'); }
+      catch (error) { if ((error as { code?: string }).code !== 'ER_DUP_KEYNAME') throw error; }
     }
     await this.pool.query(`CREATE TABLE IF NOT EXISTS session_turns (
       id CHAR(36) PRIMARY KEY,session_id CHAR(36) NOT NULL,target_turn_id CHAR(36) NOT NULL,type ENUM('message','steer','question_reply') NOT NULL,
@@ -195,6 +206,11 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     if (!questionIndex.length) throw new Error('CoCell session_turns question request index is missing; automatic schema migration is disabled.');
     await this.notificationRepository.init();
   }
+  async isWorkflowThread(threadId: string) {
+    const [rows] = await this.pool.query<RowDataPacket[]>('SELECT 1 FROM sessions WHERE thread_id=? AND managed_by_json IS NOT NULL LIMIT 1', [threadId]);
+    return rows.length > 0;
+  }
+
   async listProjects(): Promise<Project[]> {
     const [rows] = await this.pool.query<Array<RowDataPacket & Record<string, unknown>>>(`SELECT ${PROJECT_COLUMNS} FROM projects`);
     return rows.map(projectFromRow);
@@ -524,7 +540,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   private async saveSessionRow(executor: Pick<Pool, 'query'>, session: Session, metadataOnly = false) {
     const cols = SESSION_COLUMNS.split(',').map(column => column.trim()).filter(Boolean);
     const values = sessionValues(session);
-    const updates = cols.slice(1).filter(column => column !== 'agent_kind'
+    const updates = cols.slice(1).filter(column => column !== 'agent_kind' && column !== 'managed_by_json'
       && (!metadataOnly || (column !== 'status' && column !== 'turn_count' && !column.startsWith('context_'))))
       .map(column => column === 'turn_count' ? 'turn_count=GREATEST(turn_count,VALUES(turn_count))' : `${column}=VALUES(${column})`).join(',');
     await executor.query(`INSERT INTO sessions (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')}) ON DUPLICATE KEY UPDATE ${updates}`, values);

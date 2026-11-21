@@ -66,7 +66,9 @@ type SubscriptionWatch = {
   observation?: { key: string; controller: AbortController; done: Promise<void> };
 };
 
-function normalizeExecutionSettings(settings: Settings): Settings {
+function normalizeExecutionSettings(settings: Settings, owner?: Session['managedBy']): Settings {
+  if (owner) return { ...settings, sandboxMode: owner.writable ? 'workspace-write' : 'read-only',
+    networkAccessEnabled: false, webSearchMode: 'disabled' };
   // Sandbox is the isolation boundary; Codex inside it uses guidance rather than
   // another filesystem/network sandbox (toolchain caches live outside cwd).
   return settings.executionMode === 'sandbox'
@@ -373,7 +375,7 @@ export class SessionManager {
         session.settings.executionMode = project.executionMode;
         session.settings.workingDirectory = project.workingDirectory;
       }
-      const normalized = normalizeExecutionSettings(session.settings);
+      const normalized = normalizeExecutionSettings(session.settings, session.managedBy);
       if (normalized.sandboxMode !== session.settings.sandboxMode || normalized.networkAccessEnabled !== session.settings.networkAccessEnabled) {
         session.settings = normalized;
         changed = true;
@@ -486,7 +488,7 @@ export class SessionManager {
       throw new HttpError(409, '项目或会话已归档');
     if (session.projectId && this.projects.get(session.projectId).sandboxOperation?.status === 'running')
       throw new HttpError(409, '项目环境操作进行中，请稍后再连接');
-    return { ...await this.sandbox!.openNativeConnection!(structuredClone(session), signal), sandboxId: session.sandbox?.id };
+    return { ...await this.sandbox!.openNativeConnection!(structuredClone(session), signal), sandboxId: session.sandbox?.id, managed: Boolean(session.managedBy), threadId: session.threadId };
   }
 
   /** Read the shared authority, including changes made through another API instance. */
@@ -1853,7 +1855,46 @@ export class SessionManager {
     return this.createLocal(input);
   }
 
-  private async createLocal(input: { projectId?: string; agentKind?: Session['agentKind']; settings?: Partial<Settings>; threadId?: string; title?: string }): Promise<Session> {
+  async ensureWorkflowSession(id: string, owner: NonNullable<Session['managedBy']>, projectId: string, title: string, model: string, modelEntryId?: string) {
+    const stored = await this.state.getSession(id);
+    if (stored) {
+      if (stored.projectId !== projectId || stored.managedBy?.runId !== owner.runId || stored.managedBy.taskId !== owner.taskId
+        || stored.managedBy.writable !== owner.writable) throw new HttpError(409, '工作台会话归属冲突');
+      return stored;
+    }
+    return this.createLocal({ projectId, title, settings: { executionMode: 'sandbox', model, modelEntryId } }, { id, owner });
+  }
+
+  async isWorkflowThread(threadId: string) {
+    if (this.state.isWorkflowThread) return this.state.isWorkflowThread(threadId);
+    return (await this.state.listSessions()).some(s => s.threadId === threadId && s.managedBy);
+  }
+
+  async prepareWorkflowThread(id: string) {
+    const session = await this.readMetadata(id);
+    if (!session.managedBy) throw new HttpError(409, '需要工作台受管会话');
+    const prepared = await this.nativeConnection(id);
+    if (session.threadId && prepared.threadId !== session.threadId) throw new HttpError(409, '工作台会话身份已改变');
+    if (prepared.threadId) return prepared.threadId;
+    const result = await this.sandbox!.nativeRequest!(session, 'thread/start', prepared.threadOptions);
+    const expected = session.managedBy.writable ? 'workspaceWrite' : 'readOnly';
+    if (result.sandbox?.type !== expected || result.sandbox.networkAccess || !result.thread?.id)
+      throw new HttpError(409, 'App Server 未确认工作台所需沙箱策略');
+    await this.bindNativeThread(id, result.thread.id);
+    return String(result.thread.id);
+  }
+
+  async submitWorkflowTurn(id: string, threadId: string, prompt: string, outputSchema: unknown, guard: () => Promise<void>) {
+    const session = await this.readMetadata(id);
+    if (!session.managedBy || session.threadId !== threadId) throw new HttpError(409, '工作台线程身份已变化');
+    const sandboxPolicy = { type: session.managedBy.writable ? 'workspaceWrite' : 'readOnly', networkAccess: false };
+    const result = await this.sandbox!.nativeRequest!(session, 'turn/start', { threadId, sandboxPolicy, outputSchema,
+      input: [{ type: 'text', text: prompt, text_elements: [] }], model: session.settings.model }, guard);
+    if (!result.turn?.id) throw new HttpError(502, '工作台提交结果未知');
+    return String(result.turn.id);
+  }
+
+  private async createLocal(input: { projectId?: string; agentKind?: Session['agentKind']; settings?: Partial<Settings>; threadId?: string; title?: string }, workflow?: { id: string; owner: NonNullable<Session['managedBy']> }): Promise<Session> {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (input.projectId) await this.projects.refreshOne(input.projectId);
     let project = input.projectId ? this.projects.get(input.projectId) : undefined;
@@ -1884,7 +1925,7 @@ export class SessionManager {
         release = this.projects.acquire(project.id);
       }
       const now = new Date().toISOString();
-      const session: Session = { id: randomUUID(), agentKind: input.agentKind ?? 'codex', ...(project ? { projectId: project.id, ...(project.sandbox ? { sandbox: structuredClone(project.sandbox) } : {}) } : {}), threadId: input.threadId ?? null, title: input.title ?? '新任务', settings, status: 'idle', startedAt: now, archivedAt: null, createdAt: now, updatedAt: now, turns: [] };
+      const session: Session = { id: workflow?.id ?? randomUUID(), ...(workflow ? { managedBy: workflow.owner } : {}), agentKind: input.agentKind ?? 'codex', ...(project ? { projectId: project.id, ...(project.sandbox ? { sandbox: structuredClone(project.sandbox) } : {}) } : {}), threadId: input.threadId ?? null, title: input.title ?? '新任务', settings: normalizeExecutionSettings(settings, workflow?.owner), status: 'idle', startedAt: now, archivedAt: null, createdAt: now, updatedAt: now, turns: [] };
       await this.save(session);
       this.sessions.set(session.id, session);
       return this.snapshot(session.id);
@@ -1950,7 +1991,7 @@ export class SessionManager {
     let selected;
     if (changedModel) selected = session.agentKind === 'claude-code'
       ? await this.claudeModels.claudeSelection(proposed, true) : await this.models?.selection(proposed, true);
-    const settings = input.settings ? await this.validateSettings({ ...proposed, ...(selected ? { model: selected.model, modelEntryId: selected.modelEntryId } : {}) }) : normalizeExecutionSettings(session.settings);
+    const settings = input.settings ? await this.validateSettings({ ...proposed, ...(selected ? { model: selected.model, modelEntryId: selected.modelEntryId } : {}) }) : normalizeExecutionSettings(session.settings, session.managedBy);
     this.lookup(id);
     // Re-check after filesystem validation so a concurrent turn cannot change settings mid-run.
     if (this.active.has(id)) throw new HttpError(409, '任务正在执行');
@@ -2191,6 +2232,7 @@ export class SessionManager {
 
   async startTurn(id: string, prompt: string, images: string[] = [], clientRequestId?: string): Promise<string> {
     const metadata = await this.readMetadata(id);
+    if (metadata.managedBy) throw new HttpError(409, '此会话由工作台管理，请从工作台操作');
     if (metadata.agentKind === 'claude-code') return this.claudeControl(metadata, async (client, session, box) => {
       const selected = await this.boundClaudeModel(session);
       if (!session.threadId) {
@@ -2288,7 +2330,7 @@ export class SessionManager {
     try { execution = this.reserveTurn(session, lease); }
     catch (error) { await lease?.release(); throw error; }
     try {
-      session.settings = normalizeExecutionSettings(session.settings);
+      session.settings = normalizeExecutionSettings(session.settings, session.managedBy);
       // Older uploads may still be queued in a browser when storage is moved.
       const imageRoots = [resolve(this.imagesDirectory, id) + sep, resolve(this.dataDirectory, 'images', id) + sep];
       for (const image of images) {

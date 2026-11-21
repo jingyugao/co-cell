@@ -1,0 +1,190 @@
+.workflow-page {
+  height: 100dvh;
+  overflow: auto;
+  background: #f6f7f2;
+  color: #263622;
+  font-family: inherit;
+}
+.wf-wrap {
+  max-width: 960px;
+  margin: auto;
+  padding: 28px clamp(16px, 4vw, 48px) 80px;
+  overflow-wrap: anywhere;
+}
+.wf-wrap nav,
+.wf-controls,
+.wf-tabs,
+.wf-actions fieldset,
+.wf-wrap header,
+.wf-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.wf-wrap nav {
+  font-size: 13px;
+  color: #586750;
+}
+.wf-wrap a {
+  color: #34582b;
+}
+.wf-wrap header {
+  justify-content: space-between;
+  margin: 28px 0 16px;
+}
+.wf-wrap h1 {
+  margin: 0;
+  font-size: clamp(27px, 5vw, 40px);
+  letter-spacing: -0.04em;
+}
+.wf-wrap h2 {
+  font-size: 20px;
+  margin: 26px 0 14px;
+}
+.wf-wrap h4 {
+  margin: 14px 0 6px;
+}
+.wf-wrap form,
+.wf-plan,
+.wf-job,
+.wf-actions,
+.wf-row {
+  padding: 16px;
+  background: white;
+  border: 1px solid #d3dccb;
+  border-radius: 8px;
+  margin: 8px 0;
+}
+.wf-wrap label {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+.wf-wrap textarea,
+.wf-wrap select {
+  max-width: 100%;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #bac7b3;
+  border-radius: 5px;
+  font: inherit;
+  background: #fff;
+  color: inherit;
+}
+.wf-wrap textarea {
+  resize: vertical;
+}
+.wf-wrap button {
+  cursor: pointer;
+  padding: 7px 13px;
+  border: 1px solid #bdc9b6;
+  border-radius: 5px;
+  background: #f6f8f3;
+  color: #30452a;
+  font: inherit;
+}
+.wf-wrap button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.wf-wrap button[aria-pressed='true'],
+.wf-wrap .primary-button {
+  background: #344e2b;
+  color: white;
+}
+.wf-row {
+  justify-content: space-between;
+  text-decoration: none;
+}
+.wf-row strong {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 75%;
+}
+.wf-alert {
+  background: #fff2d5;
+  color: #6f4705;
+  padding: 12px;
+  border-radius: 6px;
+}
+.wf-state {
+  font-weight: 600;
+  background: #e0ead8;
+  padding: 4px 10px;
+  border-radius: 4px;
+}
+.wf-meta,
+.wf-note,
+.wf-job small,
+.wf-timeline time {
+  color: #5c6857;
+  font-size: 13px;
+}
+.wf-requirement {
+  white-space: pre-wrap;
+}
+.wf-job summary,
+.wf-plan summary {
+  cursor: pointer;
+}
+.wf-job small {
+  float: right;
+}
+.wf-plan dl {
+  display: grid;
+  grid-template-columns: 6em 1fr;
+  gap: 6px;
+}
+.wf-plan dd {
+  margin: 0;
+  min-width: 0;
+}
+.wf-plan section,
+.wf-job section {
+  border-top: 1px solid #e4e8e0;
+  margin-top: 14px;
+}
+.wf-wrap pre {
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+.wf-wrap fieldset {
+  padding: 0;
+  border: 0;
+}
+.wf-hash {
+  display: block;
+  font-size: 12px;
+}
+.wf-timeline {
+  padding-left: 24px;
+}
+.wf-timeline li {
+  margin: 9px 0;
+}
+.wf-timeline time {
+  display: inline-block;
+  margin-right: 10px;
+}
+@media (max-width: 600px) {
+  .wf-wrap {
+    padding-top: 14px;
+  }
+  .wf-tabs button {
+    padding: 7px 9px;
+  }
+  .wf-actions {
+    margin-left: -8px;
+    margin-right: -8px;
+  }
+  .wf-plan dl {
+    grid-template-columns: 4.5em 1fr;
+  }
+  .wf-wrap header {
+    margin-top: 20px;
+  }
+}

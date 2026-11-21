@@ -58,3 +58,77 @@ Start it using a detached child process with stdin ignored, stdout/stderr append
     return current;
   });
 });
+
+test('real workflow gates parallel file owners and records independent validation', async ({
+  environment: env,
+}) => {
+  const config = await env.json('/api/config');
+  assert(
+    config.capabilities.workflows,
+    'This test requires a test installation built with the workflow workbench'
+  );
+  const project = await env.createProject('workflow-files');
+  await env.waitProject(project.id, { kind: 'create', status: 'ready' });
+  const base = '/api/workflow-runs';
+  const input = {
+    projectId: project.id,
+    parallelism: 3,
+    clientRequestId: randomUUID(),
+    requirement:
+      'Create alpha.txt containing alpha and beta.txt containing beta, one line each. Use two independent worker tasks, one per file. Integration and final verification check both files. Use node -e assertions as each validation argv. Work only on these files. Keep design and reviews concise.',
+  };
+  const send = (path, body) => env.json(path, { method: 'POST', expectedStatus: 202, body });
+  const { id } = await send(base, input);
+  let approved = false,
+    parallel = false;
+  const deadline = Date.now() + 30 * 60_000;
+  while (Date.now() < deadline) {
+    const r = await env.json(base + '/' + id);
+    if (!approved) assert(!r.jobs.some((j) => j.spec && j.attempts.length), 'Writable task before approval');
+    if (r.status === 'awaiting_human') {
+      await send(base + '/' + id + '/resume', {
+        expectedRevision: r.revision,
+        clientRequestId: randomUUID(),
+        reason: 'Keep both file changes independent. Use the requested node assertions.',
+      });
+    } else if (r.status === 'awaiting_approval') {
+      const p = r.plans.at(-1);
+      assert.equal(p.plan.tasks.filter((t) => t.role === 'worker').length, 2);
+      for (const task of p.plan.tasks) {
+        assert(task.ownedPaths.every((path) => ['alpha.txt', 'beta.txt'].includes(path)));
+        assert.deepEqual(task.validation.argv.slice(0, 2), ['node', '-e']);
+      }
+      const decision = {
+        clientRequestId: randomUUID(),
+        expectedRevision: r.revision,
+        planId: p.id,
+        planHash: p.hash,
+        approvalRevision: p.approvalRevision,
+        decision: 'approve',
+        reason: 'Approve the isolated two-file test',
+      };
+      const endpoint = base + '/' + id + '/approvals/' + p.approvalId + '/decisions';
+      assert.deepEqual(await send(endpoint, decision), await send(endpoint, decision));
+      approved = true;
+    } else if (r.status === 'blocked' || r.status === 'cancelled') assert.fail(r.attention ?? r.status);
+    parallel ||= r.jobs.filter((j) => j.role === 'worker' && j.attempts.at(-1)?.status === 'running').length >= 2;
+    if (r.status === 'completed') {
+      assert(approved && parallel, 'Expected approved, overlapping native attempts');
+      const workers = r.jobs.filter((j) => j.role === 'worker').map((j) => j.attempts.at(-1));
+      assert(
+        Math.min(...workers.map((a) => Date.parse(a.nativeCompletedAt))) >
+          Math.max(...workers.map((a) => Date.parse(a.nativeStartedAt))),
+        'Native worker turn intervals must overlap'
+      );
+      for (const j of r.jobs.filter((j) => j.spec)) {
+        assert.equal(j.attempts.length, 1);
+        const attempt = j.attempts[0];
+        assert(attempt.turnId && attempt.threadId && attempt.validation.operationId);
+        assert.equal(attempt.validation.exitCode, 0);
+      }
+      return;
+    }
+    await delay(1000, undefined, { signal: env.controller.signal });
+  }
+  assert.fail('Workflow exceeded the test deadline');
+});

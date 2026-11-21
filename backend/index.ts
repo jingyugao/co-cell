@@ -7,6 +7,8 @@ import { MemoryService } from './memory/service.js';
 import { ConversationMaterialsService } from './conversation-materials/service.js';
 import { ConversationMaterialCollector } from './conversation-materials/collector.js';
 import { readLiveMaterialThreads } from './conversation-materials/live-reader.js';
+import { WorkflowService } from './workflows/service.js';
+import { WorkflowValidationRunner } from './workflows/validation.js';
 import { ReportService } from './reports/service.js';
 import { ReportRunner } from './reports/runner.js';
 import { KnowledgeService } from './knowledge/service.js';
@@ -184,6 +186,11 @@ const materialCollector = new ConversationMaterialCollector({ state: webState, c
   directory: resolve(sharedDataRoot, 'runtime/conversation-exports'), logger: runtimeLog });
 const memory = new MemoryService({ repository: webState.memoryRepository, state: webState, materials,
   client: cellboxProvider.client, directory: resolve(sharedDataRoot, 'runtime/memory'), coordinator, logger: runtimeLog });
+// Workflow turn admission is shared even when the rest of the installation
+// uses single-instance mode. CAS also fences a worker that loses its lease.
+const workflowCoordinator = coordinator ?? new MySqlCoordinator(mysqlUrl);
+const workflows = new WorkflowService(webState.workflowRepository, manager, new WorkflowValidationRunner(cellboxProvider.client),
+  () => models.defaultSelection(), workflowCoordinator, error => { void runtimeLog.write({ event: 'workflow.tick.failed', error: String(error) }); });
 const reports = new ReportService({ repository: webState.reportRepository, state: webState, materials, collector: materialCollector,
   runner: new ReportRunner({ state: webState, manager, models }), directory: resolve(sharedDataRoot, 'runtime/reports'), coordinator, logger: runtimeLog });
 const knowledge = new KnowledgeService({ repository: webState.knowledgeRepository, materials: webState.memoryRepository,
@@ -191,13 +198,14 @@ const knowledge = new KnowledgeService({ repository: webState.knowledgeRepositor
   ...(process.env.HINDSIGHT_API_URL?.trim() ? { client: new HindsightClient({ url: process.env.HINDSIGHT_API_URL.trim(),
     bankId: process.env.HINDSIGHT_BANK_ID?.trim() || 'cocell', apiKey: process.env.HINDSIGHT_API_KEY }) } : {}) });
 // Project tables must exist before the Secret schema's foreign keys are created.
-const initializeSchemas = async () => { await webState.init(); await webState.fileFavoriteRepository.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); await webState.knowledgeRepository.init(); await webState.materialsRepository.init(); await webState.reportRepository.init(); };
+const initializeSchemas = async () => { await webState.init(); await webState.fileFavoriteRepository.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); await webState.knowledgeRepository.init(); await webState.materialsRepository.init(); await webState.reportRepository.init(); await webState.workflowRepository.init(); };
 if (coordinator) await coordinator.run('cocell-schema-init', initializeSchemas);
 else await initializeSchemas();
 await manager.init();
 memory.start();
 knowledge.start();
 reports.start();
+workflows.start();
 // Paused instances are configured on resume. Running instances survive a web
 // service restart; compare their durable acknowledgements before writing slots.
 const reconcileProjects = async () => {
@@ -224,14 +232,14 @@ manager.setImageCatalog(imageCatalog);
 const config: AppConfig = { models: availableModels, sandbox: { provider:'cellbox',kind:'k8s-resumable',enabled: true, image: sandboxImage, workingDirectory: sandboxWorkingDirectory,
   ...(sandboxImageIdentity ? { imageIdentity: sandboxImageIdentity } : {}),
   archivedReclaimAfterMs }, defaults, codexVersion: '0.153.4', auth: apiKey ? 'api-key' : 'local-codex',
-  localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true, nativeWebSocket: true, claudeCode: true } };
+  localWorkingDirectory, approvalPolicy: 'never', capabilities: { interactiveApprovals: false, tokenDeltas: false, sandboxPreviews: true, nativeWebSocket: true, workflows: true, claudeCode: true } };
 const publicUrl=cocellPublicUrl;
 const previewSubdomains=process.env.COCELL_PREVIEW_SUBDOMAINS==='1';
 const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
   inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), notifications,
-  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge, runtimeLog, reports);
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge, runtimeLog, reports, workflows);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }
@@ -243,6 +251,7 @@ const previewProxy = previewSubdomains ? createPreviewProxy({ publicUrl, token: 
   onError: error => { void runtimeLog.write({ event: 'preview.proxy_failed', error }); },
 }) : undefined;
 const nativeRelay = createNativeRelay({ publicUrl, token: process.env.COCELL_ACCESS_TOKEN!,
+  isWorkflowThread: id => manager.isWorkflowThread(id),
   open: (id, signal) => manager.openNativeConnection(id, signal),
   canRenew: (id, sandboxId) => manager.canRenewNativeConnection(id, sandboxId),
   observers: [{ name: 'runtime-log', observe: async event => {
@@ -283,8 +292,9 @@ let shuttingDown = false;
 // Periodic sandbox archive for active projects — every 30 minutes
 const archiveInterval = setInterval(() => { void manager.scheduledArchive().catch(() => {}); }, 60 * 1000);
 archiveInterval.unref();
-async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await nativeRelay.close(); await previewProxy?.close(); await reports.close(); await knowledge.close(); await memory.close(); await manager.close(); await cellboxRuntime.close();
+async function shutdown() { if (shuttingDown) return; shuttingDown = true; server.close(); await nativeRelay.close(); await previewProxy?.close(); await workflows.close(); await reports.close(); await knowledge.close(); await memory.close(); await manager.close(); await cellboxRuntime.close();
   clearInterval(archiveInterval);
+  if (workflowCoordinator !== coordinator) await workflowCoordinator.close();
   await coordinator?.close();
   await runtimeLog.write({ event: 'service.stopped' }); await runtimeLog.flush(); await vite?.close(); server.closeAllConnections(); await shutdownTracing?.(); }
 process.on('SIGINT', () => void shutdown()); process.on('SIGTERM', () => void shutdown());

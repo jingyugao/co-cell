@@ -240,6 +240,7 @@ test('Claude ACP host reconciles durable answers once and preserves unknown outc
   const directory = join(workspace, '.cocell', 'claude-acp');
   const command = join(root, 'agent.mjs');
   const counter = join(root, 'counter');
+  const configLog = join(root, 'config-log');
   const id = '9dbbf207-acfd-401d-b65c-077679dd3b5a';
   const native = 'e051d0eb-e40c-4d29-879e-d640367f6ad7';
   const turnId = 'a2c32b2d-a1d0-4351-a149-02a27436789f';
@@ -258,19 +259,27 @@ test('Claude ACP host reconciles durable answers once and preserves unknown outc
       "import { appendFileSync, closeSync } from 'node:fs';",
       "import { createInterface } from 'node:readline';",
       "const send = v => process.stdout.write(JSON.stringify(v) + '\\n');",
-      'let held, selectedModel;',
+      'let held, selectedModel, selectedEffort, permissionMode;',
       'createInterface({input:process.stdin}).on("line", line => {',
       '  const m=JSON.parse(line);',
       '  if(m.method==="session/cancel"){ if(held)send({jsonrpc:"2.0",id:held,result:{stopReason:"cancelled"}}); return; }',
       '  if(m.id===undefined)return;',
       '  if(m.method==="initialize")return send({jsonrpc:"2.0",id:m.id,result:{protocolVersion:1}});',
+      '  if(m.method==="session/set_mode"){ permissionMode=m.params.modeId; return send({jsonrpc:"2.0",id:m.id,result:{}}); }',
       '  if(m.method==="session/load"){',
       '    send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_message_chunk",content:{type:"text",text:"OLD_HISTORY"}}}});',
       '    return send({jsonrpc:"2.0",id:m.id,result:{}});',
       '  }',
-      '  if(m.method==="session/set_config_option"){ selectedModel=m.params.value; return send({jsonrpc:"2.0",id:m.id,result:{}}); }',
+      '  if(m.method==="session/set_config_option"){',
+      '    appendFileSync(' + JSON.stringify(configLog) + ', JSON.stringify(m.params) + "\\n");',
+      '    if(m.params.configId==="effort" && m.params.value==="max") return send({jsonrpc:"2.0",id:m.id,error:{code:-32602,message:"effort rejected"}});',
+      '    if(m.params.configId==="model") selectedModel=m.params.value;',
+      '    if(m.params.configId==="effort") selectedEffort=m.params.value;',
+      '    return send({jsonrpc:"2.0",id:m.id,result:{}});',
+      '  }',
       '  if(m.method==="_session/steering")return send({jsonrpc:"2.0",id:m.id,result:{outcome:"promptRequired",reason:"noRunningTurn"}});',
       '  if(m.method==="session/prompt"){',
+      '    if(permissionMode!=="bypassPermissions")return send({jsonrpc:"2.0",id:m.id,error:{code:-32603,message:"Expected bypassPermissions before prompt"}});',
       '    if(m.params.prompt[0].text==="BREAK"){closeSync(0); setInterval(()=>{}, 1000); return;}',
       '    if(m.params.prompt[0].text==="HOLD"){',
       '      held=m.id;',
@@ -281,7 +290,7 @@ test('Claude ACP host reconciles durable answers once and preserves unknown outc
       '    send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_thought_chunk",messageId:"shared",content:{type:"text",text:"thinking"}}}});',
       '    send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_message_chunk",messageId:"shared",content:{type:"text",text:"visible "}}}});',
       '    send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_message_chunk",messageId:"shared",content:{type:"text",text:"answer"}}}});',
-      '    appendFileSync(' + JSON.stringify(counter) + ', JSON.stringify({text:m.params.prompt[0].text,openAiEnv:!!process.env.OPENAI_API_KEY,channel:process.env.ANTHROPIC_BASE_URL,key:process.env.ANTHROPIC_API_KEY,model:selectedModel,haiku:process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL,sonnet:process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,opus:process.env.ANTHROPIC_DEFAULT_OPUS_MODEL}) + "\\n");',
+      '    appendFileSync(' + JSON.stringify(counter) + ', JSON.stringify({text:m.params.prompt[0].text,openAiEnv:!!process.env.OPENAI_API_KEY,channel:process.env.ANTHROPIC_BASE_URL,key:process.env.ANTHROPIC_API_KEY,model:selectedModel,effort:selectedEffort,haiku:process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL,sonnet:process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,opus:process.env.ANTHROPIC_DEFAULT_OPUS_MODEL}) + "\\n");',
       '    return send({jsonrpc:"2.0",id:m.id,result:{stopReason:"end_turn"}});',
       '  }',
       '  return send({jsonrpc:"2.0",id:m.id,result:{}});',
@@ -315,7 +324,7 @@ test('Claude ACP host reconciles durable answers once and preserves unknown outc
       assert.equal(sent[0].openAiEnv, false);
       const answerAfterSwitch = await fetch(base + path + '/answers', { method:'POST', headers:{'content-type':'application/json'},
         body:JSON.stringify({ ownerTurnId:turnId, requestId:'q-switch', answers:['new'], cwd:workspace,
-          model:'new-model', env:{ ANTHROPIC_BASE_URL:'https://new.example', ANTHROPIC_API_KEY:'new-secret', ANTHROPIC_MODEL:'new-model',
+          model:'new-model', effort:'xhigh', env:{ ANTHROPIC_BASE_URL:'https://new.example', ANTHROPIC_API_KEY:'new-secret', ANTHROPIC_MODEL:'new-model',
             ANTHROPIC_DEFAULT_HAIKU_MODEL:'fast-model', ANTHROPIC_DEFAULT_SONNET_MODEL:'work-model', ANTHROPIC_DEFAULT_OPUS_MODEL:'deep-model' } }) });
       assert.equal(answerAfterSwitch.status, 200);
       for (let attempt = 0; attempt < 200; attempt++) {
@@ -333,9 +342,34 @@ test('Claude ACP host reconciles durable answers once and preserves unknown outc
       assert.equal(switched[1].channel, 'https://new.example');
       assert.equal(switched[1].key, 'new-secret');
       assert.equal(switched[1].model, 'new-model');
+      assert.equal(switched[1].effort, 'xhigh');
       assert.equal(switched[1].haiku, 'fast-model');
       assert.equal(switched[1].sonnet, 'work-model');
       assert.equal(switched[1].opus, 'deep-model');
+      const turnEnv = { ANTHROPIC_BASE_URL:'https://new.example', ANTHROPIC_API_KEY:'new-secret', ANTHROPIC_MODEL:'new-model',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL:'fast-model', ANTHROPIC_DEFAULT_SONNET_MODEL:'work-model', ANTHROPIC_DEFAULT_OPUS_MODEL:'deep-model' };
+      const submitEffort = async (id, effort) => {
+        const response = await fetch(base + path + '/turns', { method:'POST', headers:{'content-type':'application/json'},
+          body:JSON.stringify({ id, prompt:'effort check', images:[], cwd:workspace, model:'new-model', effort, env:turnEnv }) });
+        assert.equal(response.status, 200);
+        for (let attempt = 0; attempt < 200; attempt++) {
+          snapshot = await (await fetch(base + path)).json();
+          const turn = snapshot.turns.find(value => value.id === id);
+          if (turn?.status !== 'running') return turn;
+          await new Promise(resolve => setTimeout(resolve, 15));
+        }
+        throw new Error('Timed out waiting for effort check');
+      };
+      const reset = await submitEffort('88dbdd89-f202-4b8d-bb1a-a54c74f18122');
+      assert.equal(reset.status, 'completed');
+      assert.equal((await submitEffort('d8dd5b38-8027-400a-90ea-150c800748ca', 'low')).status, 'completed');
+      assert.equal((await submitEffort('e8856989-e568-45a8-b6ab-201402d35a79', 'default')).status, 'completed');
+      const rejected = await submitEffort('7e358647-a617-435c-b163-1c86ce168e17', 'max');
+      assert.equal(rejected.status, 'failed');
+      assert.match(rejected.error, /effort rejected/);
+      assert.equal((await submitEffort('c2e0dc1d-d2a7-4207-9c23-a804d082424f', 'default')).status, 'completed');
+      const configs = (await readFile(configLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+      assert.deepEqual(configs.filter(entry => entry.configId === 'effort').map(entry => entry.value), ['xhigh', 'default', 'low', 'default', 'max']);
       assert.equal((await readFile(join(directory, id + '.json'), 'utf8')).includes('new-secret'), false);
       assert.equal((await (await fetch(base + '/health')).json()).active, false);
       const project = workspace.replace(/[^a-zA-Z0-9]/g, '-');
@@ -346,6 +380,8 @@ test('Claude ACP host reconciles durable answers once and preserves unknown outc
       assert.equal((await (await fetch(base + path + '/verify')).json()).verified, true);
       await rm(transcript);
       assert.equal((await fetch(base + path + '/verify')).status, 409);
+      // Allow the host's bounded streaming flush to settle before checking the ETag.
+      await new Promise(resolve => setTimeout(resolve, 200));
       const response = await fetch(base + path);
       const etag = response.headers.get('etag');
       assert.equal((await fetch(base + path, { headers:{'if-none-match':etag} })).status, 304);

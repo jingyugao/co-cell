@@ -282,11 +282,16 @@ test('an empty channel can correct its protocol before adding models', async () 
 
 test('Claude Box submission passes the selected bearer token without putting it in the model endpoint', async t => {
   let body: Record<string, any> = {};
+  let supportsEffort = false;
   const host = createServer(async (req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/health') {
+      res.end(JSON.stringify({ protocol: 'cocell-claude-acp-v1', active: false, ...(supportsEffort && { supportsEffort }) }));
+      return;
+    }
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
     body = JSON.parse(Buffer.concat(chunks).toString());
-    res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ turnId: body.id }));
   });
   await new Promise<void>(resolve => host.listen(0, '127.0.0.1', resolve));
@@ -304,7 +309,13 @@ test('Claude Box submission passes the selected bearer token without putting it 
   assert.equal(body.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'fast-model');
   assert.equal(body.env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'work-model');
   assert.equal(body.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'work-model');
+  assert.equal(body.effort, undefined);
+  session.settings.claudeEffort = 'xhigh';
+  await assert.rejects(client.submit('box', session, selected, 'unsupported', 'hello', []), /镜像不支持设置 Claude 推理强度/);
+  assert.equal(body.id, 'turn');
+  supportsEffort = true;
   await client.submit('box', session, { ...selected, authMode: 'api-key' }, 'turn-2', 'hello', []);
+  assert.equal(body.effort, 'xhigh');
   assert.equal(body.env.ANTHROPIC_API_KEY, 'test-token');
   assert.equal(body.env.ANTHROPIC_AUTH_TOKEN, undefined);
 });

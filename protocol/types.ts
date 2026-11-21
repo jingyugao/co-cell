@@ -56,6 +56,8 @@ export interface ContextUsage {
 export type AgentEvent = ThreadEvent
   | { type: 'runtime.retry'; retry: RetryState | null }
   | { type: 'runtime.context_usage'; contextUsage: ContextUsage };
+export const claudeEffortLevels = ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type ClaudeEffort = typeof claudeEffortLevels[number];
 export interface Settings {
   executionMode?: 'local' | 'sandbox';
   workingDirectory: string;
@@ -63,6 +65,8 @@ export interface Settings {
   /** Stable channel-model identity; absent on legacy sessions. */
   modelEntryId?: string;
   modelReasoningEffort: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'persistent';
+  /** Claude Code uses its own default when unset. */
+  claudeEffort?: ClaudeEffort;
   collaborationMode?: 'default' | 'plan';
   fastMode?: boolean;
   sandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access';

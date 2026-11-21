@@ -1945,7 +1945,7 @@ export class SessionManager {
     if (input.settings?.model !== undefined && !input.settings.modelEntryId && input.settings.model !== session.settings.model) delete proposed.modelEntryId;
     const changedModel = proposed.model !== session.settings.model || proposed.modelEntryId !== session.settings.modelEntryId;
     if (session.agentKind === 'claude-code' && input.settings && Object.keys(input.settings).some(key =>
-      !['workingDirectory', 'executionMode', 'model', 'modelEntryId'].includes(key)))
+      !['workingDirectory', 'executionMode', 'model', 'modelEntryId', 'claudeEffort'].includes(key)))
       throw new HttpError(400, 'Claude Code 不支持这些执行设置');
     let selected;
     if (changedModel) selected = session.agentKind === 'claude-code'

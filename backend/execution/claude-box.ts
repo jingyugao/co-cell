@@ -28,7 +28,7 @@ export class ClaudeBoxClient {
       detail ? redactCredentials(detail).slice(0, 320) : 'Claude 会话宿主不可用，请检查 Sandbox 镜像');
   }
 
-  async health(box: string): Promise<{ active: boolean }> {
+  async health(box: string): Promise<{ active: boolean; supportsEffort?: boolean }> {
     const data = await (await this.request(box, '/health')).json();
     if (data.protocol !== 'cocell-claude-acp-v1' || typeof data.active !== 'boolean')
       throw new HttpError(503, '当前 Sandbox 镜像不支持 Claude Code');
@@ -54,8 +54,11 @@ export class ClaudeBoxClient {
     await (await this.request(box, '/sessions/' + encodeURIComponent(session), { method: 'PUT' })).arrayBuffer();
   }
 
-  private sendModelRequest(box: string, session: Session, action: 'turns' | 'answers' | 'reconcile',
+  private async sendModelRequest(box: string, session: Session, action: 'turns' | 'answers' | 'reconcile',
     selected: ModelSelection, input: Record<string, unknown>) {
+    const effort = session.settings.claudeEffort;
+    if (effort && effort !== 'default' && (await this.health(box)).supportsEffort !== true)
+      throw new HttpError(409, '当前 Sandbox 镜像不支持设置 Claude 推理强度，请选择默认或升级镜像');
     const env = { ANTHROPIC_BASE_URL: anthropicBaseUrl(selected.endpoint), ANTHROPIC_MODEL: selected.model,
       ...(selected.claudeModelAliases?.haiku ? { ANTHROPIC_DEFAULT_HAIKU_MODEL: selected.claudeModelAliases.haiku } : {}),
       ...(selected.claudeModelAliases?.sonnet ? { ANTHROPIC_DEFAULT_SONNET_MODEL: selected.claudeModelAliases.sonnet } : {}),
@@ -63,7 +66,7 @@ export class ClaudeBoxClient {
       ...(selected.apiKey && selected.authMode !== 'bearer' ? { ANTHROPIC_API_KEY: selected.apiKey }
         : { ANTHROPIC_AUTH_TOKEN: selected.apiKey || anonymousClaudeToken }) };
     return this.request(box, '/sessions/' + encodeURIComponent(session.id) + '/' + action, { method: 'POST',
-      body: JSON.stringify({ ...input, cwd: session.settings.workingDirectory, model: selected.model, env }) }, selected.apiKey);
+      body: JSON.stringify({ ...input, cwd: session.settings.workingDirectory, model: selected.model, effort, env }) }, selected.apiKey);
   }
 
   async submit(box: string, session: Session, selected: ModelSelection, id: string, prompt: string, images: string[]) {

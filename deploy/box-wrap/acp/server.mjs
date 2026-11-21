@@ -11,6 +11,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const envNames = new Set(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL']);
+const effortLevels = new Set(['default', 'low', 'medium', 'high', 'xhigh', 'max']);
 const timestamp = () => new Date().toISOString();
 const inputText = value => [{ type: 'text', text: value }];
 const failure = (status, message) => Object.assign(new Error(message), { status });
@@ -129,12 +130,16 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
     }
     return env;
   }
+  function redactWorkerError(error, env) {
+    const secrets = [env?.ANTHROPIC_API_KEY, env?.ANTHROPIC_AUTH_TOKEN].filter(secret => typeof secret === 'string' && secret.trim());
+    return secrets.reduce((message, secret) => message.replaceAll(secret, '[redacted]'), String(error.message || error)).slice(0, 1024);
+  }
   function createWorker(state, env) {
     const child = spawn(command, [], { cwd: state.cwd, env: workerEnv(env), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     const signature = createHash('sha256').update(JSON.stringify(env ?? {})).digest('hex');
-    const worker = { child, signature, secrets: [env?.ANTHROPIC_API_KEY, env?.ANTHROPIC_AUTH_TOKEN].filter(secret => typeof secret === 'string' && secret.trim()), id: 0, pending: new Map(), questions: new Map(), token: randomUUID(), sessionId: null, active: false, exited: false };
+    const worker = { child, signature, id: 0, pending: new Map(), questions: new Map(), token: randomUUID(), sessionId: null, active: false, exited: false };
     worker.done = new Promise(resolve => { worker.resolveExit = resolve; });
-    worker.onError = error => worker.secrets.reduce((message, secret) => message.replaceAll(secret, '[redacted]'), String(error.message || error)).slice(0, 1024);
+    worker.onError = error => redactWorkerError(error, env);
     worker.send = message => {
       if (worker.exited || !child.stdin.writable) throw new Error('Claude ACP 连接已关闭');
       child.stdin.write(`${JSON.stringify(message)}\n`);
@@ -284,25 +289,40 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
     if (worker.exited) return;
     try { process.kill(-worker.child.pid, signal); } catch { worker.child.kill(signal); }
   }
-  async function ensureWorker(state, env, model) {
+  async function retireWorker(state, worker) {
+    worker.retiring = true;
+    terminateWorker(worker);
+    let timer;
+    await Promise.race([worker.done, new Promise(resolvePromise => { timer = setTimeout(resolvePromise, 3000); })]);
+    clearTimeout(timer);
+    if (!worker.exited) { terminateWorker(worker, 'SIGKILL'); await worker.done; }
+    if (workers.get(state.id) === worker) workers.delete(state.id);
+  }
+  async function configureWorker(worker, model, effort) {
+    if (model) await worker.rpc('session/set_config_option', { sessionId: worker.sessionId, configId: 'model', value: model });
+    if (effort && (effort !== 'default' || worker.effort)) {
+      await worker.rpc('session/set_config_option', { sessionId: worker.sessionId, configId: 'effort', value: effort });
+      worker.effort = effort === 'default' ? undefined : effort;
+    }
+  }
+  async function ensureWorker(state, env, model, effort) {
     if (shuttingDown) throw new Error('Claude 运行时正在关闭');
     let worker = workers.get(state.id);
     if (worker) clearTimeout(worker.idleTimer);
     const signature = env === undefined ? undefined : createHash('sha256').update(JSON.stringify(env)).digest('hex');
     if (worker && !worker.exited && signature && worker.signature !== signature) {
       // Drain the previous adapter before loading the same transcript with new credentials.
-      worker.retiring = true;
-      terminateWorker(worker);
-      let timer;
-      await Promise.race([worker.done, new Promise(resolvePromise => { timer = setTimeout(resolvePromise, 3000); })]);
-      clearTimeout(timer);
-      if (!worker.exited) { terminateWorker(worker, 'SIGKILL'); await worker.done; }
-      if (workers.get(state.id) === worker) workers.delete(state.id);
+      await retireWorker(state, worker);
       worker = undefined;
     }
     if (worker && !worker.exited) {
       await worker.ready;
-      if (model) await worker.rpc('session/set_config_option', { sessionId: worker.sessionId, configId: 'model', value: model });
+      try { await configureWorker(worker, model, effort); }
+      catch (error) {
+        const message = worker.onError(error);
+        await retireWorker(state, worker);
+        throw new Error(message);
+      }
       return worker;
     }
     worker = createWorker(state, env);
@@ -325,19 +345,24 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
           try { await save(state); } catch (error) { state.threadId = null; throw error; }
         });
       }
-      await worker.rpc('session/set_mode', { sessionId: worker.sessionId, modeId: 'default' });
-      if (model) await worker.rpc('session/set_config_option', { sessionId: worker.sessionId, configId: 'model', value: model });
+      await worker.rpc('session/set_mode', { sessionId: worker.sessionId, modeId: 'bypassPermissions' });
+      await configureWorker(worker, model, effort);
       worker.initialized = true;
       return worker;
-    } catch (error) { terminateWorker(worker); if (workers.get(state.id) === worker) workers.delete(state.id); throw error; }
+    } catch (error) {
+      const message = worker.onError(error);
+      terminateWorker(worker);
+      if (workers.get(state.id) === worker) workers.delete(state.id);
+      throw new Error(message);
+    }
     })();
     return worker.ready;
   }
-  async function startPrompt(state, turn, env, model) {
+  async function startPrompt(state, turn, env, model, effort) {
     let worker;
     let promptDispatched = false;
     try {
-      worker = await ensureWorker(state, env, model);
+      worker = await ensureWorker(state, env, model, effort);
       worker.active = true;
       if (turn.cancelRequested) {
         await locked(state.id, async () => { turn.status = 'cancelled'; turn.completedAt = timestamp(); await save(state); });
@@ -374,7 +399,7 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
       });
     } catch (error) {
       await locked(state.id, async () => {
-        turn.status = 'failed'; turn.error = worker ? worker.onError(error) : 'Claude Agent 启动失败';
+        turn.status = 'failed'; turn.error = worker ? worker.onError(error) : redactWorkerError(error, env);
         if (promptDispatched) turn.error += '，执行结果未知，请检查工作区后重试';
         turn.completedAt = timestamp();
         if (turn.answerRequestId) findRequest(state, turn.answerRequestId).request.deliveryStatus = 'unknown';
@@ -397,8 +422,8 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
       if (!shuttingDown) void dispatchAnswer(state).catch(() => {});
     }
   }
-  function launchPrompt(state, turn, env, model) {
-    const task = startPrompt(state, turn, env, model);
+  function launchPrompt(state, turn, env, model, effort) {
+    const task = startPrompt(state, turn, env, model, effort);
     tasks.add(task);
     void task.finally(() => tasks.delete(task)).catch(() => {});
   }
@@ -416,13 +441,13 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
       state.turns.push(turn);
       try { await save(state); } catch (error) { state.turns.pop(); source.deliveryStatus = 'queued'; throw error; }
       answerConfigs.delete(source);
-      launchPrompt(state, turn, config?.env, config?.model);
+      launchPrompt(state, turn, config?.env, config?.model, config?.effort);
     });
   }
   function ensureId(value) { if (!sessionIdPattern.test(value ?? '')) throw failure(400, '会话 ID 无效'); }
   async function handle(req, res) {
     const url = new URL(req.url, 'http://localhost');
-    if (req.method === 'GET' && url.pathname === '/health') return { protocol: 'cocell-claude-acp-v1', active: [...sessions.values()].some(state => state.steers?.some(item => item.status === 'sending') || state.turns.some(turn => turn.status === 'running' || turn.userInputRequests?.some(request => request.status === 'queued' && ['queued', 'sending'].includes(request.deliveryStatus)))) };
+    if (req.method === 'GET' && url.pathname === '/health') return { protocol: 'cocell-claude-acp-v1', supportsEffort: true, active: [...sessions.values()].some(state => state.steers?.some(item => item.status === 'sending') || state.turns.some(turn => turn.status === 'running' || turn.userInputRequests?.some(request => request.status === 'queued' && ['queued', 'sending'].includes(request.deliveryStatus)))) };
     const match = /^\/(internal\/questions|sessions)\/([^/]+)(?:\/(turns|stop|answers|verify|reconcile))?$/.exec(url.pathname);
     if (!match) throw failure(404, '未找到');
     const [, group, id, action] = match;
@@ -481,6 +506,7 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
     let body;
     try { body = size === 0 && group === 'sessions' && action === 'stop' ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8')); }
     catch { throw failure(400, '请求格式无效'); }
+    if (group === 'sessions' && body.effort !== undefined && !effortLevels.has(body.effort)) throw failure(400, '推理强度无效');
     if (group === 'internal/questions') {
       const worker = workers.get(id);
       const token = String(req.headers.authorization ?? '');
@@ -540,7 +566,7 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
         const turn = { id: body.id, prompt: body.prompt, images: body.images ?? [], status: 'running', items: [], startedAt: timestamp() };
         state.turns.push(turn);
         try { await save(state); } catch (error) { state.turns.pop(); throw error; }
-        launchPrompt(state, turn, body.env, body.model);
+        launchPrompt(state, turn, body.env, body.model, body.effort ?? 'default');
         return { turnId: turn.id };
       }
       if (!state) throw failure(404, '会话不存在');
@@ -549,7 +575,10 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
         workerEnv(body.env);
         const pending = state.turns.flatMap(turn => turn.userInputRequests ?? [])
           .filter(request => request.status === 'queued' && request.deliveryStatus === 'queued');
-        for (const request of pending) if (!answerConfigs.has(request)) answerConfigs.set(request, { env: body.env, model: body.model });
+        const configured = body.env !== undefined || body.model !== undefined || body.effort !== undefined;
+        for (const request of pending) if (configured && !answerConfigs.has(request)) {
+          answerConfigs.set(request, { env: body.env, model: body.model, effort: body.effort ?? 'default' });
+        }
         if (!pending.length || state.turns.some(turn => turn.status === 'running') || state.steers?.some(item => item.status === 'sending')) return { ok: true };
         return { reconcile: { state } };
       }
@@ -579,7 +608,7 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
         if (request.status !== 'pending') {
           if (JSON.stringify(request.answers) === JSON.stringify(body.answers) && request.deliveryStatus !== 'unknown') {
             if (request.deliveryStatus === 'queued') {
-              if (body.env !== undefined && !answerConfigs.has(request)) answerConfigs.set(request, { env: body.env, model: body.model });
+              if (body.env !== undefined && !answerConfigs.has(request)) answerConfigs.set(request, { env: body.env, model: body.model, effort: body.effort ?? 'default' });
               setImmediate(() => { void dispatchAnswer(state).catch(() => {}); });
             }
             return { ok: true, request };
@@ -609,7 +638,7 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
           }
         }
         if (!request.blocking) {
-          if (body.env !== undefined) answerConfigs.set(request, { env: body.env, model: body.model });
+          if (body.env !== undefined) answerConfigs.set(request, { env: body.env, model: body.model, effort: body.effort ?? 'default' });
           setImmediate(() => { void dispatchAnswer(state).catch(() => {}); });
         }
         return { ok: true, request };

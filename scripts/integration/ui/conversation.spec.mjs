@@ -88,14 +88,16 @@ test('Claude Code selection persists on creation and uses the session HTTP path'
   const agent = page.getByRole('combobox', { name: '执行引擎', exact: true });
   await agent.selectOption('claude-code');
   const picker = page.getByRole('button', { name: /^配置模型/ });
-  await expect(picker).toHaveAccessibleName('配置模型，当前 claude-fixture，渠道 A');
+  await expect(picker).toHaveAccessibleName('配置模型，当前 claude-fixture，渠道 A，默认');
   await picker.click();
   const dialog = page.getByRole('dialog', { name: '配置' });
-  await expect(dialog.getByLabel('推理强度')).toHaveCount(0);
+  const effort = dialog.getByLabel('推理强度');
+  await expect(effort.locator('option')).toHaveText(['默认', 'Low', 'Medium', 'High', 'Extra High', 'Max']);
+  await effort.selectOption('xhigh');
   await expect(dialog.getByLabel('速度')).toHaveCount(0);
   await dialog.getByLabel('模型').selectOption('claude-b');
   await dialog.getByRole('button', { name: '完成' }).click();
-  await expect(picker).toHaveAccessibleName('配置模型，当前 claude-fixture，渠道 B');
+  await expect(picker).toHaveAccessibleName('配置模型，当前 claude-fixture，渠道 B，Extra High');
   const settingsButton = page.locator('.composer-meta button');
   if (await settingsButton.isVisible()) {
     await settingsButton.click();
@@ -104,19 +106,20 @@ test('Claude Code selection persists on creation and uses the session HTTP path'
   await agent.selectOption('codex');
   await expect(page.getByRole('button', { name: /^配置模型/ })).toHaveAccessibleName(/当前 codex-model/);
   await agent.selectOption('claude-code');
-  await expect(picker).toHaveAccessibleName('配置模型，当前 claude-fixture，渠道 B');
+  await expect(picker).toHaveAccessibleName('配置模型，当前 claude-fixture，渠道 B，Extra High');
   await ui.editor.fill('检查项目结构');
   await ui.send.click();
   await expect.poll(() => createdInput?.agentKind).toBe('claude-code');
   expect(createdInput.settings.model).toBe('claude-fixture');
   expect(createdInput.settings.modelEntryId).toBe('claude-b');
+  expect(createdInput.settings.claudeEffort).toBe('xhigh');
   await expect.poll(() => ui.submissions.length).toBe(1);
   expect(ui.submissions[0]).toMatchObject({ prompt: '检查项目结构', images: [] });
   expect(ui.submissions[0].clientRequestId).toMatch(/^[0-9a-f-]{36}$/);
   await expect(agent).toBeDisabled();
   await page.reload();
   await expect(page.getByRole('combobox', { name: '执行引擎', exact: true })).toHaveValue('claude-code');
-  await expect(page.getByRole('button', { name: /^配置模型/ })).toHaveAccessibleName('配置模型，当前 claude-fixture，渠道 B');
+  await expect(page.getByRole('button', { name: /^配置模型/ })).toHaveAccessibleName('配置模型，当前 claude-fixture，渠道 B，Extra High');
 });
 
 test('Claude Code retry after an uncertain response keeps the same submission ID across reload', async ({ page, ui }) => {
@@ -178,7 +181,16 @@ test('an idle Claude session can change its selected channel', async ({ page, ui
   await dialog.getByLabel('模型').selectOption('claude-b');
   await dialog.getByRole('button', { name: '完成' }).click();
   await expect.poll(() => patch?.settings).toEqual({ model: 'claude-sonnet', modelEntryId: 'claude-b' });
-  await expect(picker).toHaveAccessibleName('配置模型，当前 claude-sonnet，渠道 B');
+  await expect(picker).toHaveAccessibleName('配置模型，当前 claude-sonnet，渠道 B，默认');
+  await picker.click();
+  await dialog.getByLabel('推理强度').selectOption('low');
+  await dialog.getByRole('button', { name: '完成' }).click();
+  await expect.poll(() => patch?.settings).toEqual({ claudeEffort: 'low' });
+  await expect(picker).toHaveAccessibleName('配置模型，当前 claude-sonnet，渠道 B，Low');
+  await picker.click();
+  await dialog.getByRole('button', { name: '恢复默认' }).click();
+  await dialog.getByRole('button', { name: '完成' }).click();
+  await expect.poll(() => patch?.settings).toEqual({ model: 'claude-sonnet', modelEntryId: 'claude-a', claudeEffort: 'default' });
 });
 
 test('Claude Code session does not request Codex subagent history', async ({ page, ui }) => {

@@ -112,9 +112,14 @@ export const SESSION_COLUMNS = `id,project_id,thread_id,native_history_path,titl
  context_cached_input_tokens,context_output_tokens,context_model,context_observed_at,context_source,archived_at,started_at,created_at,updated_at`;
 export function sessionValues(session: Session): unknown[] {
   const usage = session.contextUsage;
+  // Claude's explicit choice shares the existing column. Old rows without a
+  // suffix retain their original Codex setting and use Claude's default.
+  const effort = session.agentKind === 'claude-code' && session.settings.claudeEffort
+    ? `${session.settings.modelReasoningEffort}:${session.settings.claudeEffort}`
+    : session.settings.modelReasoningEffort;
   return [session.id, session.projectId ?? null, session.threadId, session.nativeHistoryPath ?? null, session.title, session.agentKind ?? 'codex',
     session.settings.executionMode ?? 'local', session.settings.workingDirectory, session.settings.model,
-    session.settings.modelEntryId ?? null, session.settings.modelReasoningEffort,
+    session.settings.modelEntryId ?? null, effort,
     session.settings.collaborationMode ?? 'default', session.settings.fastMode ? 1 : 0, session.settings.sandboxMode,
     session.settings.webSearchMode, session.settings.networkAccessEnabled ? 1 : 0, session.status,
     session.turnCount ?? session.turns.filter(t => t.codexAccepted || t.nativeTurnId).length,
@@ -124,6 +129,8 @@ export function sessionValues(session: Session): unknown[] {
 }
 export function sessionFromRow(row: Record<string, unknown>): Session {
   const executionMode = String(row.execution_mode) as NonNullable<Session['settings']['executionMode']>;
+  const storedEffort = String(row.model_reasoning_effort);
+  const [modelReasoningEffort, claudeEffort] = row.agent_kind === 'claude-code' ? storedEffort.split(':', 2) : [storedEffort];
   const session: Session = {
     id: String(row.id), projectId: row.project_id == null ? undefined : String(row.project_id),
     agentKind: row.agent_kind === 'claude-code' ? 'claude-code' : 'codex',
@@ -131,7 +138,8 @@ export function sessionFromRow(row: Record<string, unknown>): Session {
     ...(row.native_history_path ? { nativeHistoryPath: String(row.native_history_path) } : {}), title: String(row.title),
     settings: { executionMode, workingDirectory: String(row.working_directory), model: String(row.model),
       ...(row.model_entry_id ? { modelEntryId: String(row.model_entry_id) } : {}),
-      modelReasoningEffort: String(row.model_reasoning_effort) as Session['settings']['modelReasoningEffort'],
+      modelReasoningEffort: modelReasoningEffort as Session['settings']['modelReasoningEffort'],
+      ...(claudeEffort ? { claudeEffort: claudeEffort as Session['settings']['claudeEffort'] } : {}),
       collaborationMode: row.collaboration_mode === 'plan' ? 'plan' : 'default', fastMode: Boolean(row.fast_mode),
       sandboxMode: String(row.sandbox_mode) as Session['settings']['sandboxMode'],
       webSearchMode: String(row.web_search_mode) as Session['settings']['webSearchMode'], networkAccessEnabled: Boolean(row.network_access_enabled) },

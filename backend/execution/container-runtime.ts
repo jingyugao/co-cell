@@ -7,7 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { AppServerEventAdapter, Codex, CodexAppServerClient, nativeTurnOptions } from '../../packages/agentcore/src/index.mjs';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, posix } from 'node:path';
-import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxRecord, CellboxServiceAccess, SandboxResumeProgress } from '@co-cell/sandbox';
+import type { SandboxHandle, SandboxInfo, SandboxProvider, SandboxRecord, CellboxServiceAccess, SandboxReleaseObservation, SandboxResumeProgress } from '@co-cell/sandbox';
 import { ProjectSandboxes, type SaveSandbox } from '../sandboxes/project-sandboxes.js';
 import { readCellboxWorkspaceFile, cellboxWorkspaceFileResponse } from '../sandboxes/cellbox-files.js';
 import { holdResponse } from '../../util/http-stream.js';
@@ -63,7 +63,7 @@ export interface SandboxRuntime {
   rebuildPersistent?(target: WorkspaceTarget, key: string, onSandbox: (value: SandboxState) => Promise<void>): Promise<void>;
   resume?(target: WorkspaceTarget, signal?: AbortSignal, onProgress?: (event: SandboxResumeProgress) => void): Promise<void>;
   checkpoint?(target: WorkspaceTarget): Promise<void>;
-  release?(target: WorkspaceTarget): Promise<SandboxState>;
+  release?(target: WorkspaceTarget, expected?: SandboxReleaseObservation): Promise<SandboxState>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
   verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
   fenceSandbox?(sandbox: SandboxState): Promise<void>;
@@ -891,17 +891,19 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     });
   }
 
-  async release(target: WorkspaceTarget): Promise<SandboxState> {
+  async release(target: WorkspaceTarget, expected?: SandboxReleaseObservation): Promise<SandboxState> {
     await this.sandboxes.refresh(target);
     if (!target.sandbox) throw new HttpError(409, '项目 Sandbox 不存在');
     if (!this.options.provider.release) throw new HttpError(503, 'Sandbox 不支持保留磁盘的释放操作');
     const sandboxId = target.sandbox.id;
+    if (expected && (expected.id !== sandboxId || !this.options.provider.ensureDeleted))
+      throw new HttpError(409, '无法按已确认的 Sandbox 实例释放环境');
     const info = await this.sandboxes.lifecycle.run({ action: 'pause',
       resourceKey: target.projectId ? `project:${target.projectId}` : `session:${target.id}`, sandboxId }, async () => {
       await this.reader.closeIdle(sandboxId);
       const provider = this.options.provider;
       return traced('sandbox.release', { 'sandbox.id': sandboxId },
-        () => provider.ensureDeleted ? provider.ensureDeleted(sandboxId) : provider.release!(sandboxId));
+        () => provider.ensureDeleted ? provider.ensureDeleted(sandboxId, expected) : provider.release!(sandboxId));
     }).catch(error => {
       if (['NOT_FOUND', 'not_found'].includes((error as { code?: string }).code ?? '')) {
         // A delayed create may still arrive after this lookup. Keep its durable ID

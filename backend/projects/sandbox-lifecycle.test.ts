@@ -33,7 +33,7 @@ test('sweep archives only completed Sandbox projects after the grace period', as
     if (options?.useExistingBackup) existingBackups.push(id);
   }, now: () => now });
   await service.sweep();
-  assert.deepEqual(reclaimed, ['paused', 'failed-phase']);
+  assert.deepEqual(reclaimed, ['running', 'paused', 'failed-phase']);
   assert.deepEqual(existingBackups, [], 'automatic reclamation must preserve the latest disk contents');
   await service.close();
 });
@@ -86,7 +86,6 @@ test('failed, unknown, and running saved operation results are not resubmitted b
       sandbox: { ...sandbox, status: 'paused' }, sandboxBackup: {
         id: 'backup-1', sandboxId: 'sandbox-backup-pending', status: 'unknown', phase: '校验备份', updatedAt: new Date(0).toISOString(),
       } }),
-    project('healthy-running', { status: 'completed', completedAt: new Date(0).toISOString() }),
   ];
   const calls: string[] = [];
   const service = new SandboxLifecycleService({
@@ -103,6 +102,52 @@ test('failed, unknown, and running saved operation results are not resubmitted b
   await service.sweep();
   assert.deepEqual(calls, ['running', 'unknown', 'failed'], 'saved nonterminal/failed operations require user decision');
   await service.close();
+});
+
+test('persisted BUSY attempts cool down across sweeps and restart without permanently excluding a detached volume', async () => {
+  const day = 86_400_000;
+  let now = day * 2 - 1;
+  const failedAt = new Date(day).toISOString();
+  const value = project('detached', { status: 'completed', completedAt: new Date(0).toISOString(), sandbox: undefined,
+    sandboxMounts: [{ volumeId: 'volume-a', mountPath: '/home/agent' }],
+    sandboxOperation: { id: 'attempt-3', kind: 'archive', phase: 'backup', status: 'failed', errorCode: 'BUSY',
+      automaticArchiveAttempt: 3, updatedAt: failedAt },
+    sandboxBackup: { id: 'attempt-3', phase: 'backup', status: 'failed', errorCode: 'BUSY', updatedAt: failedAt } });
+  const calls: string[] = [];
+  const restart = () => new SandboxLifecycleService({ listProjects: () => [value], now: () => now,
+    reclaim: async id => { calls.push(id); } });
+  const service = restart();
+  await service.sweep();
+  assert.deepEqual(calls, []);
+  await service.close();
+  const restarted = restart();
+  now++;
+  await restarted.sweep();
+  assert.deepEqual(calls, ['detached']);
+  value.sandboxBackup!.status = 'unknown';
+  await restarted.sweep();
+  assert.deepEqual(calls, ['detached']);
+  await restarted.close();
+});
+
+test('a newer completion can supersede a release read failure only for the same observed stable Box', () => {
+  const at = new Date(3600000).toISOString();
+  const mounts = [{ volumeId: 'volume-a', mountPath: '/home/agent' }];
+  const value = project('one', { status: 'completed', completedAt: at, sandboxMounts: mounts,
+    sandbox: { ...sandbox, phase: 'running', generation: 2, ownerKey: 'project:one', mounts },
+    lifecycleHistory: [{ id: 'completion', action: 'completed', at, sandboxId: sandbox.id }],
+    sandboxOperation: { id: 'release', kind: 'release', phase: 'unknown', status: 'unknown', errorCode: 'TRANSPORT',
+      updatedAt: new Date(0).toISOString() } });
+  const service = new SandboxLifecycleService({ listProjects: () => [], reclaim: async () => {}, now: () => 2 * 86_400_000 });
+  assert.equal(service.isEligible(value), true);
+  const op = value.sandboxOperation!, box = value.sandbox!;
+  for (const changes of [
+    { sandboxOperation: { ...op, updatedAt: at } }, { sandboxOperation: { ...op, errorCode: 'UNKNOWN_OUTCOME' } },
+    { sandboxOperation: { ...op, kind: 'backup' as const } }, { lifecycleHistory: [] },
+    { sandbox: { ...box, id: 'replacement' } }, { sandbox: { ...box, ownerKey: 'other' } },
+    { sandbox: { ...box, operationId: 'in-flight' } }, { sandbox: { ...box, generation: undefined } },
+    { sandbox: { ...box, mounts: [] } }, { sandbox: { ...box, status: 'unknown' as const } },
+  ]) assert.equal(service.isEligible({ ...value, ...changes }), false, JSON.stringify(changes));
 });
 
 test('close waits for the current reclaim and stops the remaining pass', async () => {

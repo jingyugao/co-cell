@@ -1,4 +1,4 @@
-import { traced, traceEvent } from '@co-cell/sandbox';
+import { traced, traceEvent, type SandboxReleaseObservation } from '@co-cell/sandbox';
 import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Project, ProjectSandboxOperation } from '../../protocol/types.js';
@@ -17,7 +17,7 @@ import { sandboxMounts } from '../../util/sandbox-mounts.js';
 import type { ProjectResumeObserver } from '../../protocol/resume-types.js';
 
 type OperationOptions = { useExistingBackup?: boolean; imageVersionId?: string; onResumeProgress?: ProjectResumeObserver;
-  automaticArchiveAttempt?: number };
+  automaticArchiveAttempt?: number; releaseObservation?: SandboxReleaseObservation };
 
 const target = (project: Project): WorkspaceTarget => ({ id: project.id, projectId: project.id,
   settings: { workingDirectory: project.workingDirectory }, imageSelection: project.imageSelection, sandbox: project.sandbox,
@@ -137,7 +137,7 @@ export class ProjectSandboxOperations {
         else if (kind === 'backup') await this.backup(id);
         else if (kind === 'delete') await this.remove(id);
         else if (kind === 'refresh') throw new HttpError(422, '当前 Cellbox 不支持原地刷新；请选择明确版本创建新环境。');
-        else await this.archive(id, options.useExistingBackup === true, options.automaticArchiveAttempt !== undefined);
+        else await this.archive(id, options);
         operation.status = 'succeeded'; operation.phase = operation.cleanupError ? '操作完成，资源清理未完成' : '完成'; operation.updatedAt = new Date().toISOString();
         await this.deps.projects.updateSandboxOperation(id, { ...operation });
       } catch (error) {
@@ -183,12 +183,12 @@ export class ProjectSandboxOperations {
     await this.deps.saveSandbox(id, { ...candidate, status: 'ready' }, false);
   }
 
-  private async release(id: string) {
+  private async release(id: string, expected?: SandboxReleaseObservation) {
     const project = this.context.getStore()!.project;
     if (!project.sandbox) throw new HttpError(409, '项目没有可释放的 Sandbox');
     if (!this.deps.runtime.release) throw new HttpError(503, 'Sandbox 不支持保留磁盘的释放操作');
     await this.phase(id, '释放运行环境并保留磁盘');
-    const sandbox = await this.deps.runtime.release(target(project));
+    const sandbox = await this.deps.runtime.release(target(project), expected);
     this.context.getStore()!.operation.result = { sandbox };
     await this.deps.projects.releaseSandbox(id, sandbox);
     await this.deps.released?.(id);
@@ -223,6 +223,7 @@ export class ProjectSandboxOperations {
       const historyIndex = await this.deps.captureHistoryIndex(id);
       await this.phase(id, backup.phase);
       const captured = await remote.capture(target(project), this.operationKey(id, 'capture'), {
+        releaseFailedAttachments: operation.kind === 'archive' && !project.sandbox,
         ...(operation.kind === 'delete' ? {
           recovery: { operationId: previous?.remoteOperationId, snapshotIds: previous?.captureBaseline },
           onSnapshotBaseline: async (volumeId: string, snapshotIds: string[]) => {
@@ -369,19 +370,19 @@ export class ProjectSandboxOperations {
     await this.cleanup(id, false, new Set(project.sandbox ? [project.sandbox.id] : []));
   }
 
-  private async archive(id: string, useExistingBackup: boolean, releaseBeforeBackup = false) {
+  private async archive(id: string, options: OperationOptions) {
     const { projects } = this.deps;
-    if (releaseBeforeBackup && projects.get(id).sandbox) {
+    if (options.automaticArchiveAttempt !== undefined && projects.get(id).sandbox) {
       // Release avoids process checkpointing and removes runtime fences while
       // preserving the latest disk contents. A failed release stops the archive.
-      await this.release(id);
+      await this.release(id, options.releaseObservation);
       this.context.getStore()!.project = projects.get(id);
     }
     const project = await this.inspect(id);
     const originalTarget = target(project);
     if (project.status !== 'archived' || project.sandbox) {
       let captured: RemoteArchiveRef | undefined;
-      if (project.archiveCleanupSourceId || useExistingBackup) {
+      if (project.archiveCleanupSourceId || options.useExistingBackup) {
         await this.latestRemote(id);
         // The operator explicitly accepted this immutable backup's date.
         // Stopping/deleting the source belongs to cleanup, not checkpointing.

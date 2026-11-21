@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { posix } from 'node:path';
 import { traced, traceEvent } from '../../tracing.js';
-import type { CheckpointableSandboxProvider, SandboxCheckpoint, SandboxCommandHandle, SandboxCommandResult, SandboxHandle, SandboxInfo, SandboxProvider, SandboxResumeOptions, SandboxResumeProgress } from '../../types.js';
-import { CellboxClient, CellboxError, type CellboxBox, type CellboxClientOptions, type CellboxOperation, type CellboxProfile } from './client.js';
+import type { CheckpointableSandboxProvider, SandboxCheckpoint, SandboxCommandHandle, SandboxCommandResult, SandboxHandle, SandboxInfo, SandboxProvider, SandboxReleaseObservation, SandboxResumeOptions, SandboxResumeProgress } from '../../types.js';
+import { CellboxClient, CellboxError, rethrowPreflightError, type CellboxBox, type CellboxClientOptions, type CellboxOperation, type CellboxProfile } from './client.js';
 
 export interface CellboxSandboxProviderOptions extends CellboxClientOptions {
   /** An admitted Cellbox profile. initialize() verifies Kubernetes checkpoint support. */
@@ -365,7 +365,7 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
         ...(box.templateVersion ? { version: box.templateVersion } : {}) } };
   }
   private async releaseObservation(id: string, signal?: AbortSignal): Promise<SandboxInfo | undefined> {
-    const box = await this.box(id, signal);
+    const box = await this.box(id, signal).catch(rethrowPreflightError);
     if (box.phase === 'deleted') return this.boxInfo(box);
     if (!box.operationId) return undefined;
 
@@ -446,7 +446,8 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
   async rebuildPersistent(_id: string, _key: string) {
     throw new CellboxError('UNSUPPORTED_CAPABILITY', 'Cellbox does not support rebuilding a persistent Box');
   }
-  async ensureDeleted(id: string): Promise<SandboxInfo> {
+  async ensureDeleted(id: string, expected?: SandboxReleaseObservation): Promise<SandboxInfo> {
+    if (expected && expected.id !== id) throw new CellboxError('CONFLICT', 'Box binding changed before release');
     const observed = await this.releaseObservation(id);
     if (observed) return observed;
 
@@ -458,11 +459,21 @@ export class CellboxSandboxProvider implements CheckpointableSandboxProvider {
         throw new CellboxError('UNSUPPORTED_CAPABILITY', 'Cellbox must support independent volumes before releasing a Sandbox');
       throw error;
     });
-    await this.volumeAPI;
+    await this.volumeAPI.catch(rethrowPreflightError);
     let operation: CellboxOperation;
     try {
-      const current = await this.box(id);
+      const current = await this.box(id).catch(rethrowPreflightError);
       if (current.phase === 'deleted') return this.boxInfo(current);
+      if (expected && (current.phase !== expected.phase || current.generation !== expected.generation
+        || !Number.isSafeInteger(expected.generation) || expected.generation < 1))
+        throw new CellboxError('BUSY', `Box ${id} changed since the archive preflight`);
+      if (expected?.ownerKey && current.ownerKey !== expected.ownerKey)
+        throw new CellboxError('CONFLICT', `Box ${id} belongs to another project`);
+      if (expected?.volumeId) {
+        const volumes = current.mounts?.length ? current.mounts.map(mount => mount.volumeId) : [current.homeVolumeId];
+        if (volumes.some(volumeId => volumeId !== expected.volumeId))
+          throw new CellboxError('CONFLICT', `Box ${id} mounts differ from the archive source`);
+      }
       if (current.operationId) {
         const joined = await this.releaseObservation(id);
         if (joined) return joined;

@@ -1593,6 +1593,10 @@ export class SessionManager {
       }
       await this.sandboxOperations!.run(id, 'archive', {
         automaticArchiveAttempt: (project.sandboxOperation?.automaticArchiveAttempt ?? 0) + 1,
+        ...(project.sandbox?.generation && project.sandbox.phase ? { releaseObservation: {
+          id: project.sandbox.id, generation: project.sandbox.generation, phase: project.sandbox.phase,
+          ownerKey: project.sandbox.ownerKey, volumeId: project.sandboxMounts?.[0]?.volumeId,
+        } } : {}),
       });
     });
   }

@@ -341,6 +341,49 @@ test('release refuses an old Cellbox server before a destructive request', async
   assert.deepEqual(calls, ['GET /v1/volumes']);
 });
 
+test('guarded release cannot destroy a Box whose generation or phase changed after inspection', async () => {
+  const submissions: unknown[] = [];
+  let current = box('running', { phase: 'failed' });
+  const instance = provider(async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === '/v1/volumes') return Response.json([]);
+    if (path === '/v1/boxes/box-a') return Response.json(current);
+    if (path === '/v1/boxes/box-a:destroy') {
+      submissions.push(JSON.parse(String(init?.body)));
+      return Response.json({ ...op('destroy'), box: { ...current, phase: 'deleted' } });
+    }
+    assert.fail(path);
+  }, { revisionId: 'rev-a' });
+  const expected = { id: current.id, generation: current.generation, phase: 'failed' };
+  current = box('running');
+  await assert.rejects(instance.ensureDeleted(current.id, expected), { code: 'BUSY' });
+  current = box('running', { phase: 'failed', generation: expected.generation + 1 });
+  await assert.rejects(instance.ensureDeleted(current.id, expected), { code: 'BUSY' });
+  const observed = { ...expected, generation: current.generation, volumeId: 'disk', ownerKey: current.ownerKey };
+  await assert.rejects(instance.ensureDeleted(current.id, observed), { code: 'CONFLICT' });
+  current = box('running', { phase: 'failed', generation: observed.generation, homeVolumeId: 'disk' });
+  await assert.rejects(instance.ensureDeleted(current.id, { ...observed, ownerKey: 'another-project' }), { code: 'CONFLICT' });
+  assert.deepEqual(submissions, []);
+  const released = await instance.ensureDeleted(current.id, observed);
+  assert.equal(released.metadata?.phase, 'deleted');
+  assert.deepEqual(submissions, [{ expectedGeneration: current.generation }]);
+});
+
+test('failed preflight reads can be retried, while a lost destroy response remains unknown', async () => {
+  let reachable = false, submitted = 0;
+  const instance = provider(async (input, init) => {
+    if (!reachable) throw new Error('read interrupted');
+    if (new URL(String(input)).pathname === '/v1/volumes') return Response.json([]);
+    if (init?.method === 'POST') { submitted++; throw new Error('response interrupted'); }
+    return Response.json(box('running'));
+  }, { revisionId: 'rev-a' });
+  await assert.rejects(instance.ensureDeleted('box-a'), { code: 'PREFLIGHT_UNAVAILABLE' });
+  assert.equal(submitted, 0);
+  reachable = true;
+  await assert.rejects(instance.ensureDeleted('box-a'), { code: 'UNKNOWN_OUTCOME' });
+  assert.equal(submitted, 1);
+});
+
 test('template creation forwards retained mounts and records the admitted stable revision', async () => {
   const mounts = [{ volumeId: 'shared-volume', mountPath: '/home/agent' },
     { volumeId: 'shared-volume', mountPath: '/data', readOnly: true }];

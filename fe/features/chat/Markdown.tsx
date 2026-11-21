@@ -77,8 +77,13 @@ function remarkLocalServices() {
   };
   return walk;
 }
+
 export function MarkdownLink({ href, resources, children, ...props }: ComponentProps<'a'> & { resources: MarkdownResources }) {
   const resource = href ? resolveResource(href, resources) : null;
+  const [selectingFileLink, setSelectingFileLink] = useState(false);
+  const filePointerStart = useRef<{ x: number; y: number } | undefined>(undefined);
+  const selectionEvents = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => selectionEvents.current?.abort(), []);
   let target = href ? defaultUrlTransform(href) : '';
   if (resource?.kind === 'file') target = fileViewUrl(resources.projectId!, resource.path, resource.line, resource.fragment);
   else if (resource?.kind === 'service') {
@@ -87,10 +92,43 @@ export function MarkdownLink({ href, resources, children, ...props }: ComponentP
   else if (resource?.kind === 'external' || resource?.kind === 'anchor') target = resource.href;
   // Unresolved local paths must never become accidental routes on the Web host.
   if (!resource && target && !/^(?:https?:|mailto:|tel:|#)/i.test(target)) target = '';
-  return target ? <a {...props} href={target} title={resource?.kind === 'file' ? `查看文件：${resource.path}` : resource?.kind === 'service' ? `打开沙箱服务：${resource.href}` : props.title}
+  return target ? <a {...props} href={selectingFileLink ? undefined : target} title={resource?.kind === 'file' ? `查看文件：${resource.path}` : resource?.kind === 'service' ? `打开沙箱服务：${resource.href}` : props.title}
     {...(resource?.kind !== 'anchor' && !target.startsWith('#') ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
+    onPointerDown={event => {
+      props.onPointerDown?.(event);
+      filePointerStart.current = undefined;
+      if (event.defaultPrevented || resource?.kind !== 'file' || event.pointerType !== 'mouse' || event.button !== 0 ||
+        event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      filePointerStart.current = { x: event.clientX, y: event.clientY };
+      const document = event.currentTarget.ownerDocument;
+      const pointerId = event.pointerId;
+      selectionEvents.current?.abort();
+      const events = new AbortController();
+      selectionEvents.current = events;
+      const options = { capture: true, signal: events.signal };
+      // Let the browser select text during a mouse drag, then restore the link before click.
+      const restore = () => {
+        events.abort();
+        selectionEvents.current = undefined;
+        setSelectingFileLink(false);
+      };
+      const finish = (up: PointerEvent) => { if (up.pointerId === pointerId) restore(); };
+      setSelectingFileLink(true);
+      document.addEventListener('pointerup', finish, options);
+      document.addEventListener('pointercancel', finish, options);
+      document.defaultView?.addEventListener('blur', restore, { signal: events.signal });
+    }}
     onClick={event => {
       props.onClick?.(event);
+      const start = filePointerStart.current;
+      filePointerStart.current = undefined;
+      if (start && event.detail > 0 && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 3) {
+        const selection = event.currentTarget.ownerDocument.getSelection();
+        if (selection && !selection.isCollapsed && selection.containsNode(event.currentTarget, true)) {
+          event.preventDefault();
+          return;
+        }
+      }
       if (!event.defaultPrevented && resource?.kind === 'file' && resources.onOpenFile && event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
         event.preventDefault(); resources.onOpenFile(resource);
       }

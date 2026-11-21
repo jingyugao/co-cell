@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Session, SessionTurnPage, StreamMessage, Turn } from '../../../protocol/types';
 import { applySdkEvent } from '../../../util/session-events';
 import { api, errorMessage } from '../../lib/api';
@@ -187,12 +187,12 @@ export function useSessionStream({ selected, enabled, historyReady = true, nativ
     finally { loadingOlderRef.current = false; setLoadingOlder(false); }
   };
 
-  const updateSession = (value: Session | null | ((current: Session | null) => Session | null)) => {
+  const updateSession = useCallback((value: Session | null | ((current: Session | null) => Session | null)) => {
     setSession(current => {
       const next = typeof value === 'function' ? value(current) : value;
-      return next ? mergeSession(current, next) : next;
+      return next && next !== current ? mergeSession(current, next) : next;
     });
-  };
+  }, []);
 
   return { session, setSession: updateSession, connected, loadOlder, loadingOlder, loadingHistory };
 }

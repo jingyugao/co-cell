@@ -38,6 +38,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   const threadChangeVersion = useRef(0);
   const terminalTurnIds = useRef(new Set<string>());
   const refreshConnectionRef = useRef<(() => Promise<void>) | null>(null);
+  const checkConnectionRef = useRef<(() => Promise<void>) | null>(null);
   const liveTurnIds = useRef(new Set<string>());
   const pendingStart = useRef<Submission | null>(null);
   const pendingSteers = useRef<Array<{ turnId: string; text: string; accepted: boolean; observed: boolean }>>([]);
@@ -99,30 +100,27 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
     return true;
   }, [withNativeQuestions]);
 
-  const mergeHistory = useCallback((id: string, latest: Session) => {
-    const normalized = nativeIds(latest);
+  const refreshHistory = useCallback(async (id: string) => {
+    const liveTurns = liveTurnIds.current;
+    const normalized = nativeIds(await api<Session>(`/api/sessions/${encodeURIComponent(id)}`));
     if (selectedRef.current === id) setSessionRef.current(current => {
+      if (liveTurns !== liveTurnIds.current || selectedRef.current !== id) return current;
       if (!current) return normalized;
       const merged = mergeSession(current, normalized);
-      if (!liveTurnIds.current.size) return withNativeQuestions(merged);
+      if (!liveTurns.size) return withNativeQuestions(merged);
       const local = new Map(current.turns.map(turn => [turn.nativeTurnId ?? turn.id, turn]));
-      const turns = merged.turns.map(turn => liveTurnIds.current.has(turn.nativeTurnId ?? turn.id)
+      const turns = merged.turns.map(turn => liveTurns.has(turn.nativeTurnId ?? turn.id)
         ? { ...turn, ...local.get(turn.nativeTurnId ?? turn.id) } : turn);
-      const latestLocal = [...local.values()].filter(turn => liveTurnIds.current.has(turn.nativeTurnId ?? turn.id))
+      const latestLocal = [...local.values()].filter(turn => liveTurns.has(turn.nativeTurnId ?? turn.id))
         .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
       const keepTerminalStatus = latestLocal && latestLocal.status !== 'running'
         && turns.some(turn => turn.id === latestLocal.id && turn.status !== 'running');
       return withNativeQuestions({ ...merged, ...(keepTerminalStatus ? { status: current.status } : {}), turns });
     });
-    return normalized;
   }, [withNativeQuestions]);
-
-  const refreshHistory = useCallback(async (id: string) =>
-    mergeHistory(id, await api<Session>(`/api/sessions/${encodeURIComponent(id)}`)), [mergeHistory]);
 
   const applyEvent = useCallback((message: { method?: string; params?: Record<string, any> }) => {
     const method = message.method ?? ''; const params = message.params ?? {};
-    if (params.threadId && params.threadId !== threadRef.current) return;
     if (method === 'thread/tokenUsage/updated' && params.tokenUsage?.last) {
       const usage = params.tokenUsage.last;
       setSessionRef.current(current => current?.id === selectedRef.current ? { ...current, contextUsage: {
@@ -203,17 +201,12 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   }, [refreshHistory, withNativeQuestions]);
 
   const acceptEvent = useCallback((message: { method?: string; params?: Record<string, any> }) => {
+    if (message.params?.threadId && message.params.threadId !== threadRef.current) return;
     if (message.method === 'thread/queue/changed' && message.params?.threadId === threadRef.current) {
       void refreshQueue(); return;
     }
-    if (bufferingEvents.current) {
-      const params = message.params ?? {};
-      if (params.threadId && params.threadId !== threadRef.current) return;
-      if (message.method === 'thread/tokenUsage/updated' || message.method === 'serverRequest/resolved') { applyEvent(message); return; }
-      if (/^(turn\/(started|completed|plan\/updated)|item\/(started|completed|agentMessage\/delta|plan\/delta|reasoning\/.*Delta|reasoning\/summaryPartAdded|commandExecution\/outputDelta))$/.test(message.method ?? ''))
-        threadChangeVersion.current++;
-      return;
-    }
+    if (/^(turn|item)\//.test(message.method ?? '')) threadChangeVersion.current++;
+    if (bufferingEvents.current && message.method !== 'thread/tokenUsage/updated' && message.method !== 'serverRequest/resolved') return;
     applyEvent(message);
   }, [applyEvent, refreshQueue]);
 
@@ -223,9 +216,25 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
     if (!enabled || !selected) { markConnected(false); return; }
     pendingSteers.current = []; observedUserItems.current.clear();
     for (const [key, question] of nativeQuestions.current) if (question.sessionId !== selected) nativeQuestions.current.delete(key);
-    const id = selected; threadRef.current = ''; threadBoundRef.current = false; connectionRef.current = null; liveTurnIds.current.clear(); activeTurnId.current = null; pendingStart.current = null; terminalTurnIds.current.clear(); let alive = true; let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const id = selected; threadRef.current = ''; threadBoundRef.current = false; connectionRef.current = null; liveTurnIds.current = new Set(); activeTurnId.current = null; pendingStart.current = null; terminalTurnIds.current.clear(); let alive = true; let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let retryDelay = 500; let generation = 0; let connectionInactive = false;
     let client: NativeAppServerClient | undefined;
+    let historyRetry: ReturnType<typeof setTimeout> | undefined;
+    const readHistory = () => api<Session>(`/api/sessions/${encodeURIComponent(id)}`, { signal: AbortSignal.timeout(15_000) });
+    const applySnapshot = (latest: Session) => {
+      const history = nativeIds(latest);
+      const currentTurn = [...history.turns].reverse().find(turn => turn.status === 'running');
+      // Only events after this snapshot may take precedence over history.
+      liveTurnIds.current = new Set();
+      adapterRef.current.seed(currentTurn?.items ?? []);
+      activeTurnId.current = currentTurn?.id ?? null;
+      for (const turn of history.turns) if (turn.status !== 'running') terminalTurnIds.current.add(turn.id);
+      setSessionRef.current(current => selectedRef.current === id ? withNativeQuestions(mergeSession(current, history)) : current);
+    };
+    const scheduleHistoryCheck = () => {
+      clearTimeout(historyRetry);
+      historyRetry = setTimeout(() => void checkConnection(), 5_000);
+    };
     const scheduleRetry = () => {
       if (!alive || connectionInactive) return;
       if (retryTimer) clearTimeout(retryTimer);
@@ -236,6 +245,7 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
       }, delay);
     };
     const connect = async (refresh = false): Promise<void> => {
+      clearTimeout(historyRetry);
       const attempt = ++generation;
       let attemptClient: NativeAppServerClient | undefined;
       try {
@@ -274,22 +284,17 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
         if (!alive || attempt !== generation || client !== attemptClient) { attemptClient.close(); return; }
         void refreshQueue();
         const { value: history, quiet } = connection.threadId === null
-          ? { value: nativeIds(connection.session), quiet: true }
-          : await (async () => {
-            const snapshot = await readQuietSnapshot(
-              () => api<Session>(`/api/sessions/${encodeURIComponent(id)}`), () => threadChangeVersion.current, 10_000);
-            return { value: mergeHistory(id, snapshot.value), quiet: snapshot.quiet };
-          })();
+          ? { value: connection.session, quiet: true }
+          : await readQuietSnapshot(readHistory, () => threadChangeVersion.current);
         if (!alive || attempt !== generation || client !== attemptClient || clientRef.current !== attemptClient) return;
         markPageLoad('historyReadyMs', id);
-        if (!quiet) errorRef.current('会话历史在初始化期间持续变化；已显示最近读取的历史，请稍后刷新。');
-        const currentTurn = [...history.turns].reverse().find(turn => turn.status === 'running');
-        adapterRef.current.seed(currentTurn?.items ?? []);
-        // While reading the quiet snapshot, discard notifications already
-        // represented in history; only events after this point are applied.
+        if (history.historyError) {
+          setSessionRef.current(current => current?.id === id ? { ...current, historyError: history.historyError } : current);
+        } else {
+          applySnapshot(history);
+        }
+        if (history.historyError || !quiet) scheduleHistoryCheck();
         bufferingEvents.current = false;
-        activeTurnId.current = currentTurn ? currentTurn.nativeTurnId ?? currentTurn.id : null;
-        for (const turn of history.turns) if (turn.status !== 'running') terminalTurnIds.current.add(turn.nativeTurnId ?? turn.id);
         retryDelay = 500; markConnected(true);
       } catch (error) {
         if (!alive || attempt !== generation) return;
@@ -321,13 +326,29 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
       const checkedClient = client;
       const checkedGeneration = generation;
       const checkedVisibility = visibilityVersion;
+      const stillCurrent = () => alive && checkedGeneration === generation && client === checkedClient
+        && checkedVisibility === visibilityVersion && document.visibilityState === 'visible' && selectedRef.current === id;
+      clearTimeout(historyRetry);
       probing = true;
       try {
         await checkedClient.request('thread/list', { limit: 1 }, 5_000);
+        if (!stillCurrent() || !threadBoundRef.current) return;
+        // Keep processing live deltas. A read crossed by a notification cannot
+        // safely seed the adapter because native deltas have no offsets.
+        const version = threadChangeVersion.current;
+        try {
+          const history = await readHistory();
+          if (!stillCurrent()) return;
+          if (version === threadChangeVersion.current && !history.historyError && history.threadId === threadRef.current) {
+            applySnapshot(history);
+          } else {
+            scheduleHistoryCheck();
+          }
+        } catch {
+          if (stillCurrent()) scheduleHistoryCheck();
+        }
       } catch (error) {
-        if (!alive || checkedGeneration !== generation || client !== checkedClient
-          || checkedVisibility !== visibilityVersion || document.visibilityState !== 'visible'
-          || (error instanceof Error && 'code' in error)) return;
+        if (!stillCurrent() || (error instanceof Error && 'code' in error)) return;
         generation++;
         client = undefined;
         if (clientRef.current === checkedClient) clientRef.current = null;
@@ -345,17 +366,20 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
       else void checkConnection();
     };
     const onPageShow = (event: PageTransitionEvent) => { if (event.persisted) void checkConnection(); };
+    checkConnectionRef.current = checkConnection;
     document.addEventListener('visibilitychange', onVisibilityChange);
     window.addEventListener('online', checkConnection);
     window.addEventListener('pageshow', onPageShow);
     void connect().catch(() => {});
     return () => {
+      checkConnectionRef.current = null;
+      clearTimeout(historyRetry);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('online', checkConnection);
       window.removeEventListener('pageshow', onPageShow);
       alive = false; generation++; refreshConnectionRef.current = null; bufferingEvents.current = false; if (retryTimer) clearTimeout(retryTimer); client?.close(); if (clientRef.current === client) clientRef.current = null; if (connectionRef.current?.session.id === id) connectionRef.current = null; markConnected(false);
     };
-  }, [selected, enabled, acceptEvent, acceptServerRequest, mergeHistory, refreshHistory, refreshQueue, withNativeQuestions]);
+  }, [selected, enabled, acceptEvent, acceptServerRequest, refreshQueue, withNativeQuestions]);
 
   const send = useCallback(async (prompt: string, images: string[] = [], options: { expectedTurnId?: string; forceStart?: boolean } = {}) => {
     const client = clientRef.current; const current = sessionRef.current;
@@ -474,7 +498,13 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
   }, []);
 
   const renewLease = useCallback(async () => {
-    if (connectedRef.current) await clientRef.current?.renewLease();
+    const client = clientRef.current;
+    if (!connectedRef.current || !client) return;
+    try { await client.renewLease(); }
+    catch (error) {
+      if (client === clientRef.current && !(error instanceof Error && 'code' in error)) void checkConnectionRef.current?.();
+      throw error;
+    }
   }, []);
 
   return { connected, queuedSubmissions, waitUntilConnected, refreshConnection, renewLease, send, stop, answer };

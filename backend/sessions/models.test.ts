@@ -73,8 +73,8 @@ test('Claude sessions pin their managed entry and resolve channel edits before t
   class Host extends ClaudeBoxClient {
     override async reserve() {}
     override async snapshot() { return { snapshot: { threadId: null, turns: [] } }; }
-    override async submit(_box: string, _session: Session, selected: ModelSelection, id: string) {
-      calls.push([selected.modelEntryId, selected.endpoint, selected.apiKey]); return id;
+    override async submit(_box: string, session: Session, selected: ModelSelection, id: string) {
+      calls.push([selected.modelEntryId, selected.endpoint, selected.apiKey, session.settings.claudeEffort ?? 'default']); return id;
     }
   }
   const runtime = { async close() {}, async querySandbox() { return sandbox; } };
@@ -89,9 +89,11 @@ test('Claude sessions pin their managed entry and resolve channel edits before t
     await models.update({ ...saved, claudeDefaultModelId: 'b-entry', channels: saved.channels.map(channel =>
       channel.id === 'a' ? { ...channel, endpoint: 'http://rotated.test', apiKey: 'rotated' } : channel) });
     await manager.startTurn(session.id, 'continue');
-    await manager.update(session.id, { settings: { model: 'same', modelEntryId: 'b-entry' } });
+    await manager.update(session.id, { settings: { claudeEffort: 'xhigh' } });
+    const updated = await manager.update(session.id, { settings: { model: 'same', modelEntryId: 'b-entry' } });
+    assert.equal(updated.settings.claudeEffort, 'xhigh');
     await manager.startTurn(session.id, 'continue on B');
-    assert.deepEqual(calls, [['a-entry', 'http://rotated.test', 'rotated'], ['b-entry', 'http://b.test', 'test-b']]);
+    assert.deepEqual(calls, [['a-entry', 'http://rotated.test', 'rotated', 'default'], ['b-entry', 'http://b.test', 'test-b', 'xhigh']]);
     const disabled = await models.catalog();
     await models.update({ ...disabled, claudeDefaultModelId: 'a-entry', channels: disabled.channels.map(channel =>
       channel.id === 'b' ? { ...channel, enabled: false } : channel) });

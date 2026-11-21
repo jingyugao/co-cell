@@ -40,7 +40,7 @@ test('session engine survives relational round trips and legacy rows default to 
   const session: Session = {
     id: 'session', agentKind: 'claude-code', threadId: null, title: 'task',
     settings: { executionMode: 'sandbox', workingDirectory: '/workspace', model: 'claude',
-      modelReasoningEffort: 'medium', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true },
+      modelReasoningEffort: 'medium', claudeEffort: 'xhigh', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true },
     status: 'idle', startedAt: now, createdAt: now, updatedAt: now, archivedAt: null, turns: [],
   };
   const columns = SESSION_COLUMNS.split(',').map(column => column.trim());
@@ -48,6 +48,27 @@ test('session engine survives relational round trips and legacy rows default to 
   assert.equal(values.length, columns.length);
   const row = Object.fromEntries(columns.map((column, index) => [column, values[index]]));
   assert.equal(sessionFromRow(row).agentKind, 'claude-code');
+  assert.equal(row.model_reasoning_effort, 'medium:xhigh');
+  assert.equal(sessionFromRow(row).settings.modelReasoningEffort, 'medium');
+  assert.equal(sessionFromRow(row).settings.claudeEffort, 'xhigh');
+  assert.equal(sessionFromRow({ ...row, model_reasoning_effort: 'medium:default' }).settings.claudeEffort, 'default');
+  const legacy = sessionFromRow({ ...row, model_reasoning_effort: 'medium' });
+  assert.equal(legacy.settings.modelReasoningEffort, 'medium');
+  assert.equal(legacy.settings.claudeEffort, undefined);
+  assert.equal(sessionValues(legacy)[columns.indexOf('model_reasoning_effort')], 'medium');
+  const defaultValues = sessionValues({ ...session, settings: { ...session.settings, claudeEffort: undefined } });
+  assert.equal(defaultValues[columns.indexOf('model_reasoning_effort')], 'medium');
+  const resetValues = sessionValues({ ...session, settings: { ...session.settings, claudeEffort: 'default' } });
+  assert.equal(resetValues[columns.indexOf('model_reasoning_effort')], 'medium:default');
+  const codexValues = sessionValues({ ...session, agentKind: 'codex' });
+  assert.equal(codexValues[columns.indexOf('model_reasoning_effort')], 'medium');
+  assert.equal(sessionFromRow({ ...row, agent_kind: 'codex', model_reasoning_effort: 'medium' }).settings.claudeEffort, undefined);
+  for (const modelReasoningEffort of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent'] as const) {
+    for (const claudeEffort of ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const) {
+      const value = sessionValues({ ...session, settings: { ...session.settings, modelReasoningEffort, claudeEffort } })[columns.indexOf('model_reasoning_effort')];
+      assert.ok(typeof value === 'string' && value.length <= 20);
+    }
+  }
   assert.equal(sessionFromRow({ ...row, agent_kind: undefined }).agentKind, 'codex');
 });
 

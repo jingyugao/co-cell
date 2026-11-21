@@ -2,22 +2,25 @@ import { useId, useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import { createPortal } from 'react-dom';
 import { MODEL_OPTIONS } from '../../../util/models';
 import type { ModelOption } from '../../../protocol/model-types';
-import type { Settings } from '../../../protocol/types';
+import { claudeEffortLevels, type ClaudeEffort, type Settings } from '../../../protocol/types';
 import { errorMessage } from '../../lib/api';
 import { useMobileLayout } from './useMobileViewport';
 import './ModelPicker.css';
 
-type ModelSettings = Pick<Settings, 'model' | 'modelEntryId' | 'modelReasoningEffort' | 'fastMode'>;
+type ModelSettings = Pick<Settings, 'model' | 'modelEntryId' | 'modelReasoningEffort' | 'fastMode' | 'claudeEffort'>;
 const efforts: Record<Settings['modelReasoningEffort'], string> = {
   minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max', ultra: 'Ultra', persistent: 'Persistent',
+};
+const claudeEfforts: Record<ClaudeEffort, string> = {
+  default: '默认', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra High', max: 'Max',
 };
 
 function SelectArrows() {
   return <svg className="model-config-arrows" width="14" height="18" viewBox="0 0 14 18" fill="none" aria-hidden="true"><path d="m4 6 3-3 3 3M4 12l3 3 3-3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>;
 }
 
-function ModelConfiguration({ current, defaults, choices, managed, modelOnly, disabled, anchor, onSave, onClose }: {
-  current: ModelSettings; defaults?: ModelSettings; choices: readonly ModelOption[]; managed: boolean; modelOnly: boolean; disabled: boolean;
+function ModelConfiguration({ current, defaults, choices, managed, isClaude, disabled, anchor, onSave, onClose }: {
+  current: ModelSettings; defaults?: ModelSettings; choices: readonly ModelOption[]; managed: boolean; isClaude: boolean; disabled: boolean;
   anchor: RefObject<HTMLButtonElement | null>;
   onSave: (patch: Partial<ModelSettings>) => Promise<void>; onClose: () => void;
 }) {
@@ -71,8 +74,12 @@ function ModelConfiguration({ current, defaults, choices, managed, modelOnly, di
       patch.model = draft.model;
       patch.modelEntryId = draft.modelEntryId;
     }
-    if (draft.modelReasoningEffort !== current.modelReasoningEffort) patch.modelReasoningEffort = draft.modelReasoningEffort;
-    if (Boolean(draft.fastMode) !== Boolean(current.fastMode)) patch.fastMode = Boolean(draft.fastMode);
+    if (isClaude) {
+      if ((draft.claudeEffort ?? 'default') !== (current.claudeEffort ?? 'default')) patch.claudeEffort = draft.claudeEffort ?? 'default';
+    } else {
+      if (draft.modelReasoningEffort !== current.modelReasoningEffort) patch.modelReasoningEffort = draft.modelReasoningEffort;
+      if (Boolean(draft.fastMode) !== Boolean(current.fastMode)) patch.fastMode = Boolean(draft.fastMode);
+    }
     if (!Object.keys(patch).length) { onClose(); return; }
     saving.current = true;
     setPending(true);
@@ -105,16 +112,22 @@ function ModelConfiguration({ current, defaults, choices, managed, modelOnly, di
             {choices.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}
           </select>
         </label>
-        {!modelOnly && <><label className="model-config-row"><span>推理强度</span><span className="model-config-value">{efforts[draft.modelReasoningEffort]}</span><SelectArrows />
-          <select aria-label="推理强度" value={draft.modelReasoningEffort} onChange={event => setDraft(previous => ({ ...previous, modelReasoningEffort: event.target.value as Settings['modelReasoningEffort'] }))}>
-            {Object.entries(efforts).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+        <label className="model-config-row"><span>推理强度</span><span className="model-config-value">{isClaude ? claudeEfforts[draft.claudeEffort ?? 'default'] : efforts[draft.modelReasoningEffort]}</span><SelectArrows />
+          <select aria-label="推理强度" value={isClaude ? draft.claudeEffort ?? 'default' : draft.modelReasoningEffort}
+            onChange={event => {
+              const value = event.target.value;
+              setDraft(previous => isClaude ? { ...previous, claudeEffort: value as ClaudeEffort }
+                : { ...previous, modelReasoningEffort: value as Settings['modelReasoningEffort'] });
+            }}>
+            {isClaude ? claudeEffortLevels.map(level => <option key={level} value={level}>{claudeEfforts[level]}</option>)
+              : Object.entries(efforts).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
           </select>
         </label>
-        <label className="model-config-row"><span>速度</span><span className="model-config-value">{draft.fastMode ? 'Fast' : 'Standard'}</span><SelectArrows />
+        {!isClaude && <label className="model-config-row"><span>速度</span><span className="model-config-value">{draft.fastMode ? 'Fast' : 'Standard'}</span><SelectArrows />
           <select aria-label="速度" value={draft.fastMode ? 'fast' : 'standard'} onChange={event => setDraft(previous => ({ ...previous, fastMode: event.target.value === 'fast' }))}>
             <option value="standard">Standard</option><option value="fast">Fast · 优先处理，可能产生更高费用</option>
           </select>
-        </label></>}
+        </label>}
       </fieldset>
       {error && <p className="model-config-error" role="alert">{error}</p>}
       <div className="model-config-actions">
@@ -125,10 +138,11 @@ function ModelConfiguration({ current, defaults, choices, managed, modelOnly, di
   </dialog>, document.body);
 }
 
-export default function ModelPicker({ model, modelEntryId, effort, disabled, fastMode = false, defaults, onSettingsChange, models, modelOptions, modelOnly = false }: {
+export default function ModelPicker({ model, modelEntryId, effort, claudeEffort = 'default', disabled, fastMode = false, defaults, onSettingsChange, models, modelOptions, isClaude = false }: {
   model: string; modelEntryId?: string; effort: Settings['modelReasoningEffort']; disabled: boolean; fastMode?: boolean;
+  claudeEffort?: ClaudeEffort;
   defaults?: ModelSettings; onSettingsChange: (patch: Partial<ModelSettings>) => Promise<void>;
-  models?: readonly string[]; modelOptions?: readonly ModelOption[]; modelOnly?: boolean;
+  models?: readonly string[]; modelOptions?: readonly ModelOption[]; isClaude?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -136,15 +150,15 @@ export default function ModelPicker({ model, modelEntryId, effort, disabled, fas
   const choices = modelOptions ?? (models?.length ? models : MODEL_OPTIONS).map(value => ({ id: value, model: value, label: value, channelId: '', channelName: '' }));
   const selected = choices.find(option => option.id === (managed ? modelEntryId : model));
   return <div className="model-picker">
-    <button ref={trigger} type="button" className="model-picker-trigger" aria-label={`配置模型，当前 ${model}${selected?.channelName ? `，${selected.channelName}` : ''}${modelOnly ? '' : `，${efforts[effort]}${fastMode ? '，Fast' : ''}`}`}
+    <button ref={trigger} type="button" className="model-picker-trigger" aria-label={`配置模型，当前 ${model}${selected?.channelName ? `，${selected.channelName}` : ''}，${isClaude ? claudeEfforts[claudeEffort] : `${efforts[effort]}${fastMode ? '，Fast' : ''}`}`}
       aria-haspopup="dialog" aria-expanded={open} title={selected?.label || model} disabled={disabled} onClick={() => {
         if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
         trigger.current?.focus({ preventScroll: true });
         setOpen(true);
       }}>
-      <span className="model-picker-name">{model || '选择模型'}</span>{!modelOnly && <span className="model-picker-effort">{efforts[effort]}</span>}
+      <span className="model-picker-name">{model || '选择模型'}</span><span className="model-picker-effort">{isClaude ? claudeEfforts[claudeEffort] : efforts[effort]}</span>
     </button>
-    {open && <ModelConfiguration current={{ model, modelEntryId, modelReasoningEffort: effort, fastMode }} defaults={defaults} choices={choices} managed={managed} modelOnly={modelOnly}
+    {open && <ModelConfiguration current={{ model, modelEntryId, modelReasoningEffort: effort, fastMode, claudeEffort }} defaults={defaults} choices={choices} managed={managed} isClaude={isClaude}
       disabled={disabled} anchor={trigger} onSave={onSettingsChange} onClose={() => setOpen(false)} />}
   </div>;
 }

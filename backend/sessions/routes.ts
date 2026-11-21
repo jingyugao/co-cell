@@ -2,7 +2,7 @@ import type { Hono } from 'hono';
 import { z } from 'zod';
 import { HttpError } from '../../util/errors.js';
 import { streamSSE } from 'hono/streaming';
-import type { AppConfig, StreamMessage, SubmitTurnResponse } from '../../protocol/types.js';
+import { claudeEffortLevels, type AppConfig, type StreamMessage, type SubmitTurnResponse } from '../../protocol/types.js';
 import type { SessionManager } from './manager.js';
 
 const settingsSchema = z.object({
@@ -11,6 +11,7 @@ const settingsSchema = z.object({
   model: z.string().trim().max(200),
   modelEntryId: z.string().trim().min(1).max(100),
   modelReasoningEffort: z.enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent']),
+  claudeEffort: z.enum(claudeEffortLevels),
   collaborationMode: z.enum(['default', 'plan']),
   fastMode: z.boolean(),
   sandboxMode: z.enum(['read-only', 'workspace-write', 'danger-full-access']),

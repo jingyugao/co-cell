@@ -22,6 +22,7 @@ function reference(snapshot: CellboxVolumeBackup, mounts: SandboxMount[], saved?
   return { storageType: 'cellbox-volume', id: key(snapshot.volumeId, snapshot.id), volumeId: snapshot.volumeId,
     snapshotId: snapshot.id, ownerKey: snapshot.ownerKey, profileId: snapshot.profileId,
     mounts: structuredClone(mounts), threadIds: saved?.threadIds ?? [], createdAt: snapshot.createdAt,
+    ...(saved?.claudeSessionIds ? { claudeSessionIds: saved.claudeSessionIds } : {}),
     ...(saved?.sourceSandboxId ? { sourceSandboxId: saved.sourceSandboxId } : {}),
     ...(snapshot.sizeBytes === undefined ? {} : { sizeBytes: snapshot.sizeBytes }),
     ...(snapshot.addedBytes === undefined ? {} : { addedBytes: snapshot.addedBytes }) };

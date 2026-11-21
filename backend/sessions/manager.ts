@@ -6,6 +6,7 @@ import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve, sep, posix } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type Project, type ProjectSummary, type Session, type SessionSummary, type SessionTurnPage, type Settings, type StreamMessage, type SubagentConversation, type Turn } from '../../protocol/types.js';
+import { CLAUDE_HOST_PORT, type ClaudeBoxClient } from '../execution/claude-box.js';
 import type { SandboxRuntime, ServiceProxyAccess } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
@@ -34,6 +35,7 @@ import type { SharedCoordinator, SharedLease } from '../infra/storage/coordinati
 import { applyTurnEvent } from '../../util/session-events.js';
 import type { InputRequestRecord, InputRequestType } from '../../protocol/input-request-types.js';
 import type { InputRequestHook } from '../../packages/agentcore/src/index.mjs';
+import { AppServerRpcError } from '../../packages/agentcore/src/index.mjs';
 import type { NativeSessionConnection } from '../../protocol/native-app-server.js';
 import type { NativeRelayEvent } from '../execution/native-relay.js';
 import { sessionMetadata } from '../../util/session-metadata.js';
@@ -58,6 +60,9 @@ type SubscriptionWatch = {
   pending?: Promise<void>;
   last?: string;
   completedKey?: string;
+  etag?: string;
+  box?: string;
+  snapshot?: Session;
   observation?: { key: string; controller: AbortController; done: Promise<void> };
 };
 
@@ -94,6 +99,8 @@ export class SessionManager {
   private historyReads = new Map<string, Promise<void>>();
   private userInputAnswers = new Map<string, { threadId: Session['threadId']; answers: NativeUserInputAnswers }>();
   private userInputDeliveries = new Map<string, Promise<void>>();
+  private claudeReplyRecoveries = new Set<string>();
+  private nativeReplyRecoveries = new Map<string, Promise<void>>();
   private inputTasks = new Set<Promise<void>>();
   private historyErrors = new Map<string, string>();
   private billingReads = new Map<string, Promise<SessionCostBreakdown>>();
@@ -124,7 +131,12 @@ export class SessionManager {
     if (sandbox) {
       this.sandboxOperations = new ProjectSandboxOperations({
         projects: this.projects, runtime: sandbox,
-        threadIds: id => [...this.sessions.values()].filter(session => session.projectId === id).flatMap(session => session.threadId ? [session.threadId] : []),
+        captureHistoryIndex: id => this.projectHistoryIndex(id),
+        assertClaudeIdle: project => this.assertClaudeProjectIdle(project),
+        verifyClaude: async (box, handles) => {
+          if (!this.claude) throw new HttpError(503, '无法验证 Claude 会话');
+          for (const id of handles) await this.claude.verify(box, id);
+        },
         saveSandbox: (id, value, restore, image, expectedId) => this.updateSandbox(id, id, value, restore, image, expectedId),
         selectRestoreImage: async (project, versionId) => this.imageCatalog
           ? this.imageCatalog.acquireRestoreSelection(project, versionId)
@@ -163,6 +175,8 @@ export class SessionManager {
   }
 
 	get remoteArchives() { return this.sandbox?.remoteArchives; }
+  private claude?: ClaudeBoxClient;
+  setClaudeRuntime(client: ClaudeBoxClient) { this.claude = client; }
   private models?: ModelService;
   setModelService(models: ModelService) { this.models = models; }
   private projectFileReader?: import('../workspaces/project-file-reader.js').ProjectFileReader;
@@ -171,7 +185,9 @@ export class SessionManager {
 
   get sharedStateEnabled() { return Boolean(this.coordinator); }
   get nativeWebSocketEnabled() { return Boolean(this.sandbox?.prepareNativeSession && this.sandbox.openNativeConnection); }
-  private isNativeSession(session: Session) { return this.nativeWebSocketEnabled && session.settings.executionMode === 'sandbox'; }
+  private isNativeSession(session: Session) { return session.agentKind !== 'claude-code' && this.nativeWebSocketEnabled && session.settings.executionMode === 'sandbox'; }
+
+  private externalSession(session: Session) { return session.agentKind === 'claude-code' || this.isNativeSession(session); }
 
   async refreshSharedState(): Promise<void> {
     if (!this.coordinator || this.closing) return;
@@ -179,7 +195,7 @@ export class SessionManager {
     this.refreshing = (async () => {
       await this.projects.refresh(new Set(this.mutations.keys()));
       const baselines = new Map(this.savedSessions);
-      const sessions = (await this.state.listSessions()).map(session => this.isNativeSession(session) ? sessionMetadata(session) : session);
+      const sessions = (await this.state.listSessions()).map(session => this.externalSession(session) ? sessionMetadata(session) : session);
       const stored = new Map(sessions.map(session => [session.id, session]));
       const ids = new Set([...sessions.map(session => session.id), ...this.sessions.keys()]);
       await Promise.all([...ids].map(id => this.writer.run(id, async () => {
@@ -269,7 +285,7 @@ export class SessionManager {
       await this.refreshSharedState();
       for (const candidate of [...this.sessions.values()]) {
         if (this.closing || this.active.has(candidate.id)) continue;
-        if (this.isNativeSession(candidate)) continue;
+        if (this.externalSession(candidate)) continue;
         const queued = (await this.state.listInputRequests?.(candidate.id) ?? [])
           .some(input => input.type === 'question_reply' && input.status === 'queued');
         if (!queued && !candidate.turns.some(turn => turn.status === 'running')) continue;
@@ -321,7 +337,7 @@ export class SessionManager {
     await this.state.init();
     await this.projects.init();
     for (const stored of await this.state.listSessions()) {
-      const session = this.isNativeSession(stored) ? sessionMetadata(stored) : stored;
+      const session = this.externalSession(stored) ? sessionMetadata(stored) : stored;
       this.savedSessions.set(session.id, structuredClone(session));
       // Invalid state is reported rather than silently overwriting someone's history.
       if (!session.id || !Array.isArray(session.turns) || !session.settings) {
@@ -369,7 +385,7 @@ export class SessionManager {
           turn.completedAt = new Date().toISOString();
           changed = true;
         }
-        if (!this.coordinator && !this.isNativeSession(session) && turn.status === 'running' && !this.canRecover(session, turn)) {
+        if (!this.coordinator && !this.externalSession(session) && turn.status === 'running' && !this.canRecover(session, turn)) {
           turn.status = 'cancelled';
           turn.error = '服务重启时发现本轮没有可恢复的执行任务，已标记为已停止。';
           turn.completedAt = new Date().toISOString();
@@ -389,7 +405,7 @@ export class SessionManager {
           changed = true;
         }
       }
-      if (!this.coordinator && !this.isNativeSession(session) && (session.status === 'running' || session.turns.some(turn => turn.status === 'running' || this.canRecover(session, turn)))) {
+      if (!this.coordinator && !this.externalSession(session) && (session.status === 'running' || session.turns.some(turn => turn.status === 'running' || this.canRecover(session, turn)))) {
         changed = true;
         for (const turn of session.turns.filter(t => t.status === 'running' || this.canRecover(session, t))) {
           if (this.canRecover(session, turn)) {
@@ -409,13 +425,13 @@ export class SessionManager {
       this.sessions.set(session.id, session);
     }
     const recoverable = [...this.sessions.values()].flatMap(session => {
-      if (this.isNativeSession(session)) return [];
+      if (this.externalSession(session)) return [];
       const turn = session.turns.find(turn => this.canRecover(session, turn));
       return turn ? [{ session, turn }] : [];
     });
     if (!this.coordinator) for (const { session, turn } of recoverable) this.executeTurn(session, turn, this.reserveTurn(session), true);
     for (const session of this.sessions.values()) {
-      if (!this.coordinator && !this.isNativeSession(session) && !this.active.has(session.id)
+      if (!this.coordinator && !this.externalSession(session) && !this.active.has(session.id)
         && (await this.state.listInputRequests?.(session.id) ?? []).some(input => input.type === 'question_reply' && input.status === 'queued'))
         void this.startQueuedUserInput(session.id).catch(error => console.error('Queued input recovery failed:', error));
     }
@@ -436,9 +452,9 @@ export class SessionManager {
   }
 
   /** Serialize bootstrap/binding metadata, never the lifetime of a native turn. */
-  private async nativeControl<T>(id: string, action: () => Promise<T>): Promise<T> {
+  private async nativeControl<T>(id: string, action: () => Promise<T>, projectAdmission = true): Promise<T> {
     let result!: T;
-    await this.writer.run(`native-control:${id}`, async () => { result = await this.sessionMutation(id, action); });
+    await this.writer.run(`native-control:${id}`, async () => { result = await this.sessionMutation(id, action, projectAdmission); });
     return result;
   }
 
@@ -575,7 +591,7 @@ export class SessionManager {
     };
   }
 
-  private async applyRecordedReplies(session: Pick<Session, 'id' | 'turns'>): Promise<void> {
+  private async applyRecordedReplies(session: Pick<Session, 'id' | 'turns'>, preserveNativeAnswers = false): Promise<InputRequestRecord[]> {
     const inputs = await this.state.listInputRequests?.(session.id) ?? [];
     const replies: NativeUserInputAnswers = new Map();
     for (const input of inputs) {
@@ -586,11 +602,14 @@ export class SessionManager {
     for (const turn of session.turns) {
       const derived = withNativeUserInput(turn, replies);
       if (derived.userInputRequests) turn.userInputRequests = derived.userInputRequests.map(request => {
+        const native = preserveNativeAnswers && turn.userInputRequests?.find(item => item.id === request.id && item.status === 'answered');
+        if (native) return native;
         const matches = inputs.filter(input => input.type === 'question_reply' && input.requestId === request.id && input.status !== 'failed');
         const input = matches.find(input => input.status === 'accepted') ?? matches.at(-1);
         return input ? { ...request, status: input.status === 'accepted' ? 'answered' : 'queued', deliveryStatus: input.status } : request;
       });
     }
+    return inputs;
   }
 
   private async queueInput(sessionId: string, turnId: string, input: string, type: InputRequestType,
@@ -670,34 +689,165 @@ export class SessionManager {
   }
 
   async answerUserInput(id: string, turnId: string, requestId: string, answer: string, answers?: string[]): Promise<Session> {
-    if (this.isNativeSession(await this.readMetadata(id))) {
-      const session = await this.read(id);
-      let request = session.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId)
-        ?.userInputRequests?.find(value => value.id === requestId);
-      const answersFromHistory: NativeUserInputAnswers = new Map();
-      collectNativeUserInputAnswers(session.turns, answersFromHistory);
-      let cursor = session.historyNextCursor;
-      const cursors = new Set<string>();
-      while (!request && cursor) {
-        if (cursors.has(cursor)) throw new HttpError(502, 'Codex 返回重复的历史游标');
-        cursors.add(cursor);
-        const page = await this.olderTurns(id, cursor);
-        collectNativeUserInputAnswers(page.turns, answersFromHistory);
-        request = page.turns.map(turn => withNativeUserInput(turn, answersFromHistory))
-          .find(turn => turn.id === turnId || turn.nativeTurnId === turnId)?.userInputRequests?.find(value => value.id === requestId);
-        cursor = page.nextCursor;
-      }
-      if (!request) throw new HttpError(404, '问题不存在');
-      if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
-      const values = answers ?? [answer];
-      if (values.length !== request.questions.length) throw new HttpError(400, '请回答所有问题');
-      const prompt = '<send_user_message_question_reply>\n' + JSON.stringify(request.questions.map((question, index) => ({
-        answer: values[index], question: question.title, questionItemId: JSON.stringify(['request_user_input_async', request.id, index]),
-      }))) + '\n</send_user_message_question_reply>';
-      await this.startNativeTurn(id, prompt);
+    const metadata = await this.readMetadata(id);
+    if (metadata.agentKind === 'claude-code') {
+      await this.claudeControl(metadata, async (client, session, box) => {
+        const selected = await this.boundClaudeModel(session);
+        await client.answer(box, session, selected, turnId, requestId, answers ?? [answer]);
+        session.updatedAt = new Date().toISOString();
+        await this.save(session);
+      });
       return this.read(id);
     }
+    if (this.isNativeSession(metadata)) {
+      let result!: Session;
+      const submit = () => this.writer.run(`native-input:${id}`, async () => {
+        result = await this.answerNativeUserInput(id, turnId, requestId, answer, answers);
+      });
+      if (this.coordinator) await this.coordinator.run(`session-input:${id}`, submit);
+      else await submit();
+      return result;
+    }
     return this.sessionMutation(id, () => this.answerUserInputLocal(id, turnId, requestId, answer, answers));
+  }
+
+  private async answerNativeUserInput(id: string, turnId: string, requestId: string, answer: string, answers?: string[]): Promise<Session> {
+    const session = await this.read(id);
+    if (session.historyError || !session.threadId) throw new HttpError(409, '无法确认会话历史，请稍后重试');
+    let request = session.turns.find(turn => turn.id === turnId || turn.nativeTurnId === turnId)
+      ?.userInputRequests?.find(value => value.id === requestId);
+    const answersFromHistory: NativeUserInputAnswers = new Map();
+    collectNativeUserInputAnswers(session.turns, answersFromHistory);
+    let cursor = session.historyNextCursor;
+    const cursors = new Set<string>();
+    while (!request && cursor) {
+      if (cursors.has(cursor)) throw new HttpError(502, 'Codex 返回重复的历史游标');
+      cursors.add(cursor);
+      const page = await this.olderTurns(id, cursor);
+      collectNativeUserInputAnswers(page.turns, answersFromHistory);
+      request = page.turns.map(turn => withNativeUserInput(turn, answersFromHistory))
+        .find(turn => turn.id === turnId || turn.nativeTurnId === turnId)?.userInputRequests?.find(value => value.id === requestId);
+      cursor = page.nextCursor;
+    }
+    if (!request) throw new HttpError(404, '问题不存在');
+    const values = answers ?? [answer];
+    if (values.length !== request.questions.length) throw new HttpError(400, '请回答所有问题');
+    const prompt = '<send_user_message_question_reply>\n' + JSON.stringify(request.questions.map((question, index) => ({
+      answer: values[index], question: question.title, questionItemId: JSON.stringify(['request_user_input_async', request.id, index]),
+    }))) + '\n</send_user_message_question_reply>';
+    if (!this.state.saveInputRequest || !this.state.listInputRequests) throw new HttpError(503, '无法保存回答投递状态');
+    const previous = (await this.state.listInputRequests(id)).find(input => input.type === 'question_reply'
+      && input.requestId === requestId && input.status !== 'failed');
+    if (previous) {
+      if (previous.input !== prompt) throw new HttpError(409, '该问题已有待投递或结果未确认的回答');
+      if (previous.status !== 'queued') {
+        if (previous.status === 'accepted') return session;
+        if (request.status === 'answered') {
+          previous.status = 'accepted'; previous.acceptedAt = new Date().toISOString();
+          await this.state.saveInputRequest(previous);
+          return this.read(id);
+        }
+        if (await this.reconcileNativeQuestionReply(session, previous)) return this.read(id);
+        throw new HttpError(409, '回答的接收状态尚未确认，请检查会话后再试');
+      }
+    } else if (request.status !== 'pending') throw new HttpError(409, '问题已经回答');
+
+    const submission = previous ?? await this.queueInput(id, turnId, prompt, 'question_reply', { requestId });
+    const latest = await this.sandbox!.history(structuredClone(session), { limit: 1 });
+    const running = latest.turns.find(turn => turn.status === 'running');
+    const sourceRunning = running && (running.id === turnId || running.nativeTurnId === turnId);
+    await this.deliverNativeQuestionReply(session, submission, sourceRunning ? running.id : undefined);
+    return this.read(id);
+  }
+
+  private async deliverNativeQuestionReply(session: Session, submission: InputRequestRecord, sourceTurnId?: string): Promise<void> {
+    const input = [{ type: 'text', text: submission.input, text_elements: [] }];
+    const method = sourceTurnId ? 'turn/steer' : 'thread/queue/add';
+    const params = sourceTurnId
+      ? { threadId: session.threadId, expectedTurnId: sourceTurnId, input }
+      : { threadId: session.threadId, clientUserMessageId: submission.id, input };
+    submission.method = method;
+    submission.params = params;
+    submission.status = 'sending';
+    submission.sentAt = new Date().toISOString();
+    await this.state.saveInputRequest!(submission);
+    try {
+      const result = await this.sandbox!.nativeRequest!(session, method, params);
+      if (sourceTurnId ? result.turnId !== sourceTurnId
+        : !result.queuedSubmission?.id || result.queuedSubmission.clientUserMessageId !== submission.id) {
+        throw new Error('Codex 未返回匹配的回答接收标识');
+      }
+    } catch (error) {
+      submission.status = error instanceof AppServerRpcError ? 'failed' : 'unknown';
+      submission.error = error instanceof Error ? error.message : String(error);
+      await this.state.saveInputRequest!(submission);
+      if (sourceTurnId && error instanceof AppServerRpcError && /no active turn|expected.*turn|turn.*mismatch/i.test(error.rpc.message)) {
+        const queued = await this.queueInput(session.id, submission.turnId, submission.input, 'question_reply', { requestId: submission.requestId });
+        await this.deliverNativeQuestionReply(session, queued);
+        return;
+      }
+      throw error;
+    }
+    submission.status = 'accepted';
+    submission.acceptedAt = new Date().toISOString();
+    if (sourceTurnId) submission.nativeTurnId = sourceTurnId;
+    await this.state.saveInputRequest!(submission);
+  }
+
+  private async reconcileNativeQuestionReply(session: Session, input: InputRequestRecord): Promise<boolean> {
+    const history = await this.sandbox!.history(structuredClone(session), { limit: 20 });
+    let observed = history.turns.some(turn => turn.codexAccepted
+      && (turn.prompt === input.input || turn.additionalUserInputs?.includes(input.input)));
+    if (!observed && input.method === 'thread/queue/add') {
+      let cursor: string | undefined;
+      const cursors = new Set<string>();
+      do {
+        const queued = await this.sandbox!.nativeRequest!(session, 'thread/queue/list',
+          { threadId: session.threadId, limit: 100, ...(cursor ? { cursor } : {}) });
+        if (!Array.isArray(queued.data)) throw new HttpError(502, 'Codex 未返回排队中的消息');
+        observed = queued.data.some((item: { clientUserMessageId?: string }) => item.clientUserMessageId === input.id);
+        cursor = queued.nextCursor ?? undefined;
+        if (cursor && cursors.has(cursor)) throw new HttpError(502, 'Codex 返回重复的队列游标');
+        if (cursor) cursors.add(cursor);
+      } while (!observed && cursor);
+    }
+    if (observed) {
+      input.status = 'accepted'; input.acceptedAt = new Date().toISOString();
+      await this.state.saveInputRequest!(input);
+    }
+    return observed;
+  }
+
+  /** Recover unsent replies and reconcile uncertain ones only when a session is read. */
+  private recoverNativeQuestionReplies(id: string): void {
+    if (this.closing || this.nativeReplyRecoveries.has(id)) return;
+    const recover = () => this.writer.run(`native-input:${id}`, async () => {
+      const session = await this.refreshSessionSandbox(await this.readMetadata(id));
+      if (!this.isNativeSession(session) || !session.threadId || session.archivedAt || !session.sandbox) return;
+      if (session.projectId) {
+        const project = this.projects.get(session.projectId);
+        if (project.status !== 'active' || project.removedAt) return;
+      }
+      const inputs = await this.state.listInputRequests?.(id) ?? [];
+      for (const input of inputs) {
+        if (this.closing || input.type !== 'question_reply') continue;
+        if (input.status === 'sending' || input.status === 'unknown') {
+          await this.reconcileNativeQuestionReply(session, input);
+          continue;
+        }
+        if (input.status !== 'queued') continue;
+        const history = await this.sandbox!.history(structuredClone(session), { limit: 1 });
+        const running = history.turns.find(turn => turn.status === 'running');
+        const sourceRunning = running && (running.id === input.turnId || running.nativeTurnId === input.turnId);
+        await this.deliverNativeQuestionReply(session, input, sourceRunning ? running.id : undefined);
+      }
+    });
+    const task = (this.coordinator ? this.coordinator.run(`session-input:${id}`, recover) : recover())
+      .catch(error => { void this.logger?.write({ event: 'session.native_reply_recovery_failed', sessionId: id, error }); })
+      .finally(() => { this.nativeReplyRecoveries.delete(id); });
+    this.nativeReplyRecoveries.set(id, task);
+    this.inputTasks.add(task);
+    void task.finally(() => this.inputTasks.delete(task));
   }
 
   private async answerUserInputLocal(id: string, turnId: string, requestId: string, answer: string, answers?: string[]): Promise<Session> {
@@ -798,7 +948,7 @@ export class SessionManager {
     if (this.deleting.has(id)) throw new HttpError(409, '会话正在删除');
     let stored = await this.state.getSession(id);
     if (!stored) throw new HttpError(404, '会话不存在');
-    if (this.isNativeSession(stored)) stored = sessionMetadata(stored);
+    if (this.externalSession(stored)) stored = sessionMetadata(stored);
     if (stored.projectId) await this.projects.refreshOne(stored.projectId);
     if (this.active.has(id) && !this.isNativeSession(stored)) return this.get(id);
     // Legacy synchronous helpers receive a request-local baseline, never an observer update.
@@ -808,17 +958,17 @@ export class SessionManager {
   }
 
   async listStored(): Promise<SessionSummary[]> {
-    const sessions = (await this.state.listSessions()).map(session => this.isNativeSession(session) ? sessionMetadata(session) : session);
+    const sessions = (await this.state.listSessions()).map(session => this.externalSession(session) ? sessionMetadata(session) : session);
     return sessions.map(stored => this.active.has(stored.id) && !this.isNativeSession(stored)
       ? this.get(stored.id) : stored)
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-      .map(({ turns, ...session }) => this.isNativeSession({ ...session, turns }) ? session
+      .map(({ turns, ...session }) => this.externalSession({ ...session, turns }) ? session
         : { ...session, turnCount: turns.length });
   }
 
   list(): SessionSummary[] {
     return [...this.sessions.values()].map(session => this.hydrate(session)).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-      .map(({ turns, ...session }) => structuredClone(this.isNativeSession({ ...session, turns }) ? session
+      .map(({ turns, ...session }) => structuredClone(this.externalSession({ ...session, turns }) ? session
         : { ...session, turnCount: turns.length }));
   }
 
@@ -869,6 +1019,75 @@ export class SessionManager {
     const turns = session.settings.executionMode === 'sandbox' ? session.turns.slice(-1) : session.turns;
     return structuredClone({ ...session, turns, historyError: this.historyErrors.get(id) });
   }
+  /** Browser and API connections own observations. Only the Box owns the ACP process. */
+  private async claudeControl<T>(metadata: Session, action: (client: ClaudeBoxClient, session: Session, box: string) => Promise<T>): Promise<T> {
+    if (!this.claude || !metadata.projectId) throw new HttpError(503, 'Claude Code 尚未配置');
+    const client = this.claude;
+    let result!: T;
+    await this.withProjectOperation(metadata.projectId, async () => {
+      await this.ensureProjectSandbox(metadata.projectId!);
+      result = await this.nativeControl(metadata.id, async () => {
+        const session = this.lookup(metadata.id);
+        const project = this.projects.get(metadata.projectId!);
+        if (this.closing || session.archivedAt || project.status !== 'active' || !project.sandbox || project.sandboxOperation?.status === 'running')
+          throw new HttpError(409, '项目或会话当前不可执行');
+        return action(client, session, project.sandbox.id);
+      });
+    });
+    return result;
+  }
+
+  private get claudeModels(): ModelService {
+    if (!this.models) throw new HttpError(503, '模型管理尚未初始化');
+    return this.models;
+  }
+
+  private async boundClaudeModel(session: Session) {
+    const selected = await this.claudeModels.claudeSelection(session.settings);
+    // Pin a legacy name-only session once its channel can be identified unambiguously.
+    if (!session.settings.modelEntryId) {
+      session.settings.modelEntryId = selected.modelEntryId;
+      await this.save(session);
+    }
+    return selected;
+  }
+
+  private recoverQueuedClaudeAnswers(session: Session) {
+    if (this.closing || !this.claude || session.archivedAt || this.claudeReplyRecoveries.has(session.id)) return;
+    this.claudeReplyRecoveries.add(session.id);
+    const task = this.claudeControl(session, async (client, current, box) =>
+      client.reconcile(box, current, await this.boundClaudeModel(current)))
+      .catch(error => { void this.logger?.write({ event: 'session.claude_answer_recovery_failed', sessionId: session.id, error }); })
+      .finally(() => this.claudeReplyRecoveries.delete(session.id));
+    this.inputTasks.add(task);
+    void task.finally(() => this.inputTasks.delete(task));
+  }
+
+  private async readClaudeSession(metadata: Session, watch?: SubscriptionWatch): Promise<Session> {
+    const session = await this.refreshSessionSandbox(metadata);
+    if (!session.threadId) return { ...session, turns: [], status: 'idle' };
+    try {
+      if (!session.sandbox || !this.claude) throw new Error('Sandbox 不可用');
+      session.sandbox = await querySandbox(this.sandbox, session.sandbox, true);
+      if (session.sandbox.status !== 'ready') throw new Error('请先恢复项目 Sandbox');
+      const box = session.sandbox.id;
+      const result = await this.claude.snapshot(box, session.id, watch?.box === box && watch.snapshot?.updatedAt === session.updatedAt ? watch.etag : undefined);
+      if (!result && watch?.snapshot) return watch.snapshot;
+      if (!result) throw new Error('缺少 Claude 会话快照');
+      const turns = result.snapshot.turns;
+      if (!turns.some(turn => turn.status === 'running') && turns.some(turn =>
+        turn.userInputRequests?.some(request => request.deliveryStatus === 'queued'))) this.recoverQueuedClaudeAnswers(session);
+      const view = { ...session, turns, turnCount: turns.length, historyNextCursor: null,
+        status: turns.some(t => t.status === 'running') ? 'running' as const : turns.at(-1)?.status ?? 'idle' as const };
+      if (watch) { watch.etag = result.etag; watch.box = box; watch.snapshot = view; }
+      return view;
+    } catch (error) {
+      if (watch) watch.etag = undefined;
+      const turns = watch?.box === session.sandbox?.id ? watch?.snapshot?.turns ?? [] : [];
+      return { ...session, status: 'unknown', turns, historyError: error instanceof Error ? error.message : 'Claude 会话暂时不可用' };
+    }
+  }
+
   private async readNativeSession(metadata: Session): Promise<Session> {
     const session = await this.refreshSessionSandbox(metadata);
     if (!session.threadId) return { ...sessionMetadata(session), historyNextCursor: null };
@@ -877,9 +1096,13 @@ export class SessionManager {
       const turns = page.turns.map(turn => withNativeUserInput(turn)).sort((a, b) => a.startedAt.localeCompare(b.startedAt));
       const answers: NativeUserInputAnswers = new Map();
       collectNativeUserInputAnswers(turns, answers);
-      return { ...sessionMetadata(session), turns: turns.map(turn => withNativeUserInput(turn, answers)),
+      const result = { ...sessionMetadata(session), turns: turns.map(turn => withNativeUserInput(turn, answers)),
         status: turns.some(turn => turn.status === 'running') ? 'running' : turns.at(-1)?.status ?? 'idle',
-        historyNextCursor: page.nextCursor ?? null };
+        historyNextCursor: page.nextCursor ?? null } as Session;
+      const inputs = await this.applyRecordedReplies(result, true);
+      if (inputs.some(input => input.type === 'question_reply' && ['queued', 'sending', 'unknown'].includes(input.status)))
+        this.recoverNativeQuestionReplies(session.id);
+      return result;
     } catch (error) {
       if (error instanceof HttpError && error.status === 409) throw error;
       void this.logger?.write({ event: 'session.native_history_failed', sessionId: session.id, error });
@@ -890,6 +1113,7 @@ export class SessionManager {
 
   async read(id: string): Promise<Session> {
     const session = await this.readMetadata(id);
+    if (session.agentKind === 'claude-code') return this.readClaudeSession(session);
     if (this.isNativeSession(session)) return this.readNativeSession(session);
     if (session.settings.executionMode === 'sandbox') {
       const snapshot = await this.snapshot(id);
@@ -941,9 +1165,13 @@ export class SessionManager {
 
   async olderTurns(id: string, cursor: string): Promise<SessionTurnPage> {
     const session = await this.readMetadata(id);
-    if (session.settings.executionMode !== 'sandbox' || !session.threadId) throw new HttpError(400, '此会话没有可分页的 Sandbox 历史');
+    if (session.agentKind === 'claude-code' || session.settings.executionMode !== 'sandbox' || !session.threadId) throw new HttpError(400, '此会话没有可分页的 Sandbox 历史');
     const page = await this.readSandboxHistory(session, { cursor, limit: 20 });
-    if (this.isNativeSession(session)) return { turns: page.turns.map(turn => withNativeUserInput(turn)).sort((a, b) => a.startedAt.localeCompare(b.startedAt)), nextCursor: page.nextCursor ?? null };
+    if (this.isNativeSession(session)) {
+      const result = { turns: page.turns.map(turn => withNativeUserInput(turn)).sort((a, b) => a.startedAt.localeCompare(b.startedAt)), nextCursor: page.nextCursor ?? null };
+      await this.applyRecordedReplies({ id, turns: result.turns }, true);
+      return result;
+    }
     const result = { turns: this.withUserInputHistory(session, page.turns.map(turn => withNativeUserInput({ ...turn,
       userInputRequests: session.turns.find(old => old.id === turn.id || old.nativeTurnId === turn.id)?.userInputRequests ?? turn.userInputRequests,
     })).sort((left, right) => left.startedAt.localeCompare(right.startedAt))), nextCursor: page.nextCursor ?? null };
@@ -965,6 +1193,7 @@ export class SessionManager {
 
   async compaction(id: string, selector: CompactionSelector, threadId?: string, signal?: AbortSignal): Promise<CompactionContent> {
     const session = await this.refreshSessionSandbox(await this.readMetadata(id));
+    if (session.agentKind === 'claude-code') throw new HttpError(404, 'Claude 会话暂不提供压缩详情');
     if (!session.threadId) throw new HttpError(404, '会话没有原生线程');
     const read = this.projects.beginRead(session.projectId);
     const waiting = signal ? AbortSignal.any([signal, read.signal]) : read.signal;
@@ -990,7 +1219,7 @@ export class SessionManager {
 
   async subagents(id: string): Promise<SubagentConversation[]> {
     const session = await this.refreshSessionSandbox(await this.readMetadata(id));
-    if (!session.threadId) return [];
+    if (session.agentKind === 'claude-code' || !session.threadId) return [];
     if (session.settings.executionMode === 'sandbox') {
       if (!session.sandbox) return [];
       if (!this.sandbox?.subagents) return [];
@@ -1057,6 +1286,7 @@ export class SessionManager {
    */
   private async calculateBilling(id: string): Promise<SessionCostBreakdown> {
     const session = await this.readMetadata(id);
+    if (session.agentKind === 'claude-code') throw new HttpError(422, 'Claude 会话暂不提供费用估算');
     let turns = session.turns;
     if (session.settings.executionMode === 'sandbox' && session.threadId) {
       turns = [];
@@ -1378,6 +1608,26 @@ export class SessionManager {
     });
   }
 
+  private async projectHistoryIndex(projectId: string) {
+    const threadIds: string[] = [];
+    const claudeSessionIds: string[] = [];
+    for (const session of await this.state.listProjectSessions(projectId)) {
+      if (!session.threadId) continue;
+      if (session.agentKind === 'claude-code') claudeSessionIds.push(session.id);
+      else threadIds.push(session.threadId);
+    }
+    return { threadIds, ...(claudeSessionIds.length ? { claudeSessionIds } : {}) };
+  }
+
+  private async assertClaudeProjectIdle(project: Project): Promise<void> {
+    if (!project.sandbox || !(await this.projectHistoryIndex(project.id)).claudeSessionIds) return;
+    // A confirmed missing Box has no worker. Transport failures must still block lifecycle actions.
+    const box = await querySandbox(this.sandbox, { ...project.sandbox, phase: undefined, operationId: undefined });
+    if (box.status === 'paused' || (box.status === 'unavailable' && !box.operationId && (!box.phase || box.phase === 'deleted'))) return;
+    if (!this.claude || box.status !== 'ready') throw new HttpError(409, '无法确认 Claude 会话空闲');
+    if ((await this.claude.health(box.id)).active) throw new HttpError(409, '项目中的 Claude 任务仍在运行');
+  }
+
   private async withProjectOperation(id: string, action: () => Promise<void>): Promise<void> {
     // These queues only serialize live requests. Retrying after restart reads
     // the durable deletion intent and Cellbox resources from the beginning.
@@ -1488,14 +1738,7 @@ export class SessionManager {
     if (current.removedAt) return;
     if (current.executionMode === 'sandbox') {
       if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
-      await this.projects.markDeleting(id);
-      // Capture every durable session, including those created on another API,
-      // before collecting backup thread IDs. New sessions are fenced in storage.
-      for (const session of await this.state.listProjectSessions(id)) {
-        const local = this.sessions.get(session.id);
-        if (local) local.threadId = session.threadId;
-        else this.sessions.set(session.id, session);
-      }
+      // The operation checks the execution hosts before fencing new sessions in storage.
       await this.sandboxOperations.run(id, 'delete');
       const operation = this.projects.get(id).sandboxOperation!;
       try {
@@ -1602,11 +1845,11 @@ export class SessionManager {
     return { ...settings, workingDirectory: directory };
   }
 
-  async create(input: { projectId?: string; settings?: Partial<Settings>; threadId?: string; title?: string } = {}): Promise<Session> {
+  async create(input: { projectId?: string; agentKind?: Session['agentKind']; settings?: Partial<Settings>; threadId?: string; title?: string } = {}): Promise<Session> {
     return this.createLocal(input);
   }
 
-  private async createLocal(input: { projectId?: string; settings?: Partial<Settings>; threadId?: string; title?: string }): Promise<Session> {
+  private async createLocal(input: { projectId?: string; agentKind?: Session['agentKind']; settings?: Partial<Settings>; threadId?: string; title?: string }): Promise<Session> {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (input.projectId) await this.projects.refreshOne(input.projectId);
     let project = input.projectId ? this.projects.get(input.projectId) : undefined;
@@ -1616,12 +1859,17 @@ export class SessionManager {
         || (input.settings?.workingDirectory && posix.normalize(input.settings.workingDirectory) !== project.workingDirectory))) throw new HttpError(400, '会话必须使用项目的执行环境和工作目录');
       const executionMode = project?.executionMode ?? input.settings?.executionMode ?? this.defaults.executionMode;
       if (input.threadId && executionMode === 'sandbox') throw new HttpError(400, 'Sandbox 项目不能导入本机 thread，请在已有 Sandbox 会话中继续');
-      const modelDefaults = await this.models?.defaultSelection();
+      const claude = input.agentKind === 'claude-code';
+      if (claude && (!this.claude || executionMode !== 'sandbox'))
+        throw new HttpError(409, 'Claude Code 需要支持 ACP 的 Sandbox');
+      const modelDefaults = claude ? await this.claudeModels.claudeDefaultSelection() : await this.models?.defaultSelection();
+      if (claude && !modelDefaults && !input.settings?.model)
+        throw new HttpError(409, '请先在模型管理中配置 Claude Code 模型');
       const proposed = { ...this.defaults, ...modelDefaults,
         ...(executionMode !== this.defaults.executionMode ? { networkAccessEnabled: executionMode === 'sandbox' } : {}), ...input.settings,
         ...(project ? { executionMode: project.executionMode, workingDirectory: project.workingDirectory } : {}), };
       if (input.settings?.model !== undefined && !input.settings.modelEntryId) delete proposed.modelEntryId;
-      const selected = await this.models?.selection(proposed, true);
+      const selected = claude ? await this.claudeModels.claudeSelection(proposed, true) : await this.models?.selection(proposed, true);
       const settings = await this.validateSettings({ ...proposed, ...(selected ? { model: selected.model, modelEntryId: selected.modelEntryId } : {}) });
       if (!project && settings.executionMode === 'sandbox') {
         project = await this.projects.create({ name: input.title ?? '新项目' }, settings);
@@ -1632,7 +1880,7 @@ export class SessionManager {
         release = this.projects.acquire(project.id);
       }
       const now = new Date().toISOString();
-      const session: Session = { id: randomUUID(), ...(project ? { projectId: project.id, ...(project.sandbox ? { sandbox: structuredClone(project.sandbox) } : {}) } : {}), threadId: input.threadId ?? null, title: input.title ?? '新任务', settings, status: 'idle', startedAt: now, archivedAt: null, createdAt: now, updatedAt: now, turns: [] };
+      const session: Session = { id: randomUUID(), agentKind: input.agentKind ?? 'codex', ...(project ? { projectId: project.id, ...(project.sandbox ? { sandbox: structuredClone(project.sandbox) } : {}) } : {}), threadId: input.threadId ?? null, title: input.title ?? '新任务', settings, status: 'idle', startedAt: now, archivedAt: null, createdAt: now, updatedAt: now, turns: [] };
       await this.save(session);
       this.sessions.set(session.id, session);
       return this.snapshot(session.id);
@@ -1640,6 +1888,14 @@ export class SessionManager {
   }
 
   private async assertNativeIdle(session: Session, checkTurnAfterError = false): Promise<void> {
+    if (session.agentKind === 'claude-code' && session.threadId && session.sandbox) {
+      if ((await querySandbox(this.sandbox, session.sandbox)).status === 'paused') return;
+      const current = await this.readClaudeSession(session);
+      if (current.historyError || current.status === 'running' || current.turns.some(turn =>
+        turn.userInputRequests?.some(request => request.deliveryStatus === 'queued' || request.deliveryStatus === 'sending')))
+        throw new HttpError(409, '无法确认 Claude 会话空闲，请检查任务状态');
+      return;
+    }
     if (!this.isNativeSession(session) || !session.threadId || !session.sandbox) return;
     const sandbox = await querySandbox(this.sandbox, session.sandbox, true);
     if (sandbox.status === 'paused') return;
@@ -1662,6 +1918,8 @@ export class SessionManager {
   }
 
   async update(id: string, input: { title?: string; settings?: Partial<Settings>; archived?: boolean }): Promise<Session> {
+    const session = this.sessions.get(id) ?? await this.readMetadata(id);
+    if (session.agentKind === 'claude-code') return this.nativeControl(id, () => this.updateLocal(id, input), false);
     return this.sessionMutation(id, () => this.updateLocal(id, input), false);
   }
 
@@ -1682,7 +1940,12 @@ export class SessionManager {
     const proposed = { ...session.settings, ...input.settings };
     if (input.settings?.model !== undefined && !input.settings.modelEntryId && input.settings.model !== session.settings.model) delete proposed.modelEntryId;
     const changedModel = proposed.model !== session.settings.model || proposed.modelEntryId !== session.settings.modelEntryId;
-    const selected = changedModel ? await this.models?.selection(proposed, true) : undefined;
+    if (session.agentKind === 'claude-code' && input.settings && Object.keys(input.settings).some(key =>
+      !['workingDirectory', 'executionMode', 'model', 'modelEntryId'].includes(key)))
+      throw new HttpError(400, 'Claude Code 不支持这些执行设置');
+    let selected;
+    if (changedModel) selected = session.agentKind === 'claude-code'
+      ? await this.claudeModels.claudeSelection(proposed, true) : await this.models?.selection(proposed, true);
     const settings = input.settings ? await this.validateSettings({ ...proposed, ...(selected ? { model: selected.model, modelEntryId: selected.modelEntryId } : {}) }) : normalizeExecutionSettings(session.settings);
     this.lookup(id);
     // Re-check after filesystem validation so a concurrent turn cannot change settings mid-run.
@@ -1718,12 +1981,12 @@ export class SessionManager {
   }
 
   subscribe(id: string, callback: Subscriber): () => void {
-    this.lookup(id);
+    const session = this.lookup(id);
     const subscribers = this.subscribers.get(id) ?? new Set<Subscriber>();
     this.subscribers.set(id, subscribers);
     subscribers.add(callback);
-    callback({ type: 'snapshot', session: this.get(id) });
-    if ((this.coordinator || this.nativeWebSocketEnabled) && !this.subscriptionPolls.has(id)) {
+    callback({ type: 'snapshot', session: this.subscriptionPolls.get(id)?.snapshot ?? this.get(id) });
+    if ((session.agentKind === 'claude-code' || this.coordinator || this.nativeWebSocketEnabled) && !this.subscriptionPolls.has(id)) {
       const poll: SubscriptionWatch = {
         timer: setInterval(() => {
           if (this.closing || poll.pending) return;
@@ -1748,11 +2011,20 @@ export class SessionManager {
     };
   }
 
-  /** Poll only control metadata. Conversation bodies arrive over the native connection. */
+  /** Observe only sessions with connected SSE clients. Claude snapshots support conditional reads. */
   private async syncSubscriber(id: string, watch: SubscriptionWatch) {
     if (this.active.has(id)) { watch.observation?.controller.abort(); return; }
     const stored = await this.state.getSession(id);
     if (!stored || this.closing || !this.subscribers.has(id) || this.active.has(id)) return;
+    if (stored.agentKind === 'claude-code') {
+      const view = await this.readClaudeSession(stored, watch);
+      const key = JSON.stringify([view.threadId, view.status, view.sandbox?.id, view.historyError, view.updatedAt, watch.etag]);
+      if (this.subscriptionPolls.get(id) === watch && watch.last !== key) {
+        watch.last = key;
+        this.publish(id, { type: 'state', session: view });
+      }
+      return;
+    }
     const previous = this.sessions.get(id);
     const session = { ...stored, turns: stored.turns.map(turn => {
       const old = previous?.threadId === stored.threadId && previous?.sandbox?.id === stored.sandbox?.id
@@ -1822,7 +2094,7 @@ export class SessionManager {
   }
 
   private save(session: Session): Promise<void> {
-    if (this.isNativeSession(session)) {
+    if (this.externalSession(session)) {
       const metadata = sessionMetadata(session);
       return this.writer.run(session.id, async () => {
         const previous = this.savedSessions.get(session.id);
@@ -1869,7 +2141,7 @@ export class SessionManager {
       await mkdir(directory, { recursive: true, mode: 0o700 });
       const path = join(directory, `${randomUUID()}.${extension}`);
       await writeFile(path, content, { mode: 0o600 });
-      if (this.isNativeSession(session)) {
+      if (this.externalSession(session)) {
         if (session.projectId) await this.ensureProjectSandbox(session.projectId);
         return this.sandbox!.uploadNativeImage!(this.lookup(id), path);
       }
@@ -1913,8 +2185,21 @@ export class SessionManager {
     return nativeId;
   }
 
-  async startTurn(id: string, prompt: string, images: string[] = []): Promise<string> {
-    if (this.isNativeSession(await this.readMetadata(id))) return this.startNativeTurn(id, prompt, images);
+  async startTurn(id: string, prompt: string, images: string[] = [], clientRequestId?: string): Promise<string> {
+    const metadata = await this.readMetadata(id);
+    if (metadata.agentKind === 'claude-code') return this.claudeControl(metadata, async (client, session, box) => {
+      const selected = await this.boundClaudeModel(session);
+      if (!session.threadId) {
+        await client.reserve(box, session.id);
+        // The host binds this durable CoCell handle to its own native ACP session.
+        session.threadId = session.id;
+      }
+      session.updatedAt = new Date().toISOString();
+      if (session.title === '新任务') session.title = prompt.slice(0, 50);
+      await this.save(session);
+      return client.submit(box, session, selected, clientRequestId ?? randomUUID(), prompt, images);
+    });
+    if (this.isNativeSession(metadata)) return this.startNativeTurn(id, prompt, images);
     const deadline = Date.now() + 10_000;
     while (true) {
       if (!images.length) await this.waitForNativeTurnAcceptance(id, deadline);
@@ -2033,6 +2318,7 @@ export class SessionManager {
 
   async stop(id: string) {
     const session = await this.readMetadata(id);
+    if (session.agentKind === 'claude-code') return this.claudeControl(session, (client, current, box) => client.stop(box, current.id));
     if (this.isNativeSession(session)) {
       const page = await this.sandbox!.history(structuredClone(session), { limit: 1 });
       const turn = page.turns.find(value => value.status === 'running');
@@ -2111,7 +2397,7 @@ export class SessionManager {
       throw new HttpError(400, '仅支持沙箱内 localhost 服务的 HTTP/HTTPS 链接');
     }
     const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
-    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, '服务端口无效');
+    if (!Number.isInteger(port) || port < 1 || port > 65535 || port === CLAUDE_HOST_PORT) throw new HttpError(400, '服务端口不可用于预览');
     await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
     if (project.executionMode !== 'sandbox' || !this.sandbox) throw new HttpError(400, '此项目不使用 Sandbox 沙箱');
@@ -2121,7 +2407,7 @@ export class SessionManager {
 
   /** Hold project and runtime leases until the native proxy closes its response/socket. */
   async projectServiceAccess(projectId: string, port: number, method: string, requestSignal: AbortSignal): Promise<ServiceProxyAccess & { signal: AbortSignal }> {
-    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, '服务端口无效');
+    if (!Number.isInteger(port) || port < 1 || port > 65535 || port === CLAUDE_HOST_PORT) throw new HttpError(400, '服务端口不可用于预览');
     await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
     if (!project.sandbox || !this.sandbox?.openServiceAccess) throw new HttpError(503, 'Sandbox 服务代理未配置');
@@ -2144,7 +2430,7 @@ export class SessionManager {
   }
 
   async projectService(projectId: string, port: number, path: string, request: Request): Promise<Response> {
-    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, '服务端口无效');
+    if (!Number.isInteger(port) || port < 1 || port > 65535 || port === CLAUDE_HOST_PORT) throw new HttpError(400, '服务端口不可用于预览');
     await this.ensureProjectSandbox(projectId);
     const project = this.projects.get(projectId);
     if (!project.sandbox || !this.sandbox?.service) throw new HttpError(503, 'Sandbox 服务代理未配置');

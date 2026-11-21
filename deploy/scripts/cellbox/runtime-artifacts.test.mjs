@@ -14,12 +14,14 @@ async function fixture() {
   const contents = new Map([
     ['codex.tgz', Buffer.from('synthetic codex package')],
     ['codex-linux-x64.tgz', Buffer.from('synthetic native codex package')],
+    ['claude-acp.tgz', Buffer.from('synthetic Claude ACP distribution')],
     ['restic', Buffer.from('synthetic restic binary')],
   ]);
   const packages = {
     codexVersion: '1.2.3',
     codex: { file: 'codex.tgz', url: 'https://packages.example.test/codex.tgz', integrity: sha512Integrity(contents.get('codex.tgz')) },
     codexLinuxX64: { file: 'codex-linux-x64.tgz', url: 'https://packages.example.test/codex-linux-x64.tgz', integrity: sha512Integrity(contents.get('codex-linux-x64.tgz')) },
+    claudeAcp: { file: 'claude-acp.tgz', sha256: sha256(contents.get('claude-acp.tgz')) },
     resticVersion: '0.18.1',
     restic: { file: 'restic', url: 'https://packages.example.test/restic.bz2', sha256: sha256(contents.get('restic')) },
     systemPackages: ['ca-certificates'],
@@ -44,7 +46,7 @@ test('accepts a complete offline runtime artifact bundle with matching package l
   try {
     const manifest = await validateArtifacts(value.root, { baseImageId: value.baseImageId, packages: value.packages });
     assert.equal(manifest.baseImage, 'node:22.18.0-bookworm-slim');
-    assert.equal(manifest.files.length, 3);
+    assert.equal(manifest.files.length, 4);
   } finally { await rm(value.root, { recursive: true, force: true }); }
 });
 
@@ -74,8 +76,8 @@ test('rejects corrupted payloads even when their manifest checksum is unchanged'
   } finally { await rm(value.root, { recursive: true, force: true }); }
 });
 
-test('rejects a manifest that omits any required codex, native codex, or restic payload', async () => {
-  const required = ['codex.tgz', 'codex-linux-x64.tgz', 'restic'];
+test('rejects a manifest that omits any required runtime payload', async () => {
+  const required = ['codex.tgz', 'codex-linux-x64.tgz', 'claude-acp.tgz', 'restic'];
   for (const missing of required) {
     const value = await fixture();
     try {

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { ManagedModel, ModelCatalog, ModelCatalogInput, ModelOption } from '../../protocol/model-types.js';
+import type { ManagedModel, ModelCatalog, ModelCatalogInput, ModelOption, ModelAuthMode, ClaudeModelAliases } from '../../protocol/model-types.js';
 import { SecretCrypto } from '../secrets/crypto.js';
 import { HttpError } from '../../util/errors.js';
 import type { ModelRepository, StoredModelCatalog, StoredModelChannel } from './repository.js';
@@ -7,6 +7,13 @@ import type { ModelRepository, StoredModelCatalog, StoredModelChannel } from './
 const keyContext = 'model-channel-api-key-v1';
 const legacyModelId = (model: string) => `legacy-${createHash('sha256').update(model).digest('hex')}`;
 const cleanEndpoint = (value: string) => value.replace(/\/+$/, '');
+/** Claude Code appends /v1/messages to this base. Preserve any proxy prefix. */
+export const anthropicBaseUrl = (endpoint: string) => cleanEndpoint(endpoint).replace(/\/v1$/i, '');
+const isClaudeChannel = (channel: StoredModelChannel) => channel.protocol === 'anthropic-messages';
+// Claude Code requires a nonempty token even when a private gateway allows anonymous requests.
+export const anonymousClaudeToken = 'cocell-anonymous';
+const anthropicHeaders = (key: string, authMode?: ModelAuthMode) => ({ 'anthropic-version': '2023-06-01',
+  ...(key && authMode !== 'bearer' ? { 'x-api-key': key } : { Authorization: `Bearer ${key || anonymousClaudeToken}` }) });
 
 function validateEndpoint(value: string) {
   let url: URL;
@@ -28,7 +35,7 @@ const safeId = (value: string, field: string) => {
 };
 
 export interface LegacyModelSeed { endpoint?: string; apiKey?: string; model: string; models: string[] }
-export interface ModelSelection { model: string; modelEntryId: string; channelId: string; endpoint: string; apiKey: string }
+export interface ModelSelection { model: string; modelEntryId: string; channelId: string; endpoint: string; apiKey: string; authMode?: ModelAuthMode; claudeModelAliases?: ClaudeModelAliases }
 
 export class ModelService {
   private state: StoredModelCatalog | null = null;
@@ -74,8 +81,8 @@ export class ModelService {
 
   async catalog(): Promise<ModelCatalog> {
     await this.refresh();
-    const { revision, defaultModelId, channels } = this.current();
-    return { revision, defaultModelId, channels: channels.map(({ apiKeyCiphertext: _ciphertext, ...channel }) => ({ ...channel, models: channel.models.map(model => ({ ...model })) })) };
+    const { revision, defaultModelId, claudeDefaultModelId, channels } = this.current();
+    return { revision, defaultModelId, claudeDefaultModelId: claudeDefaultModelId ?? null, channels: channels.map(({ apiKeyCiphertext: _ciphertext, ...channel }) => ({ ...channel, models: channel.models.map(model => ({ ...model })) })) };
   }
 
   async update(input: ModelCatalogInput): Promise<ModelCatalog> {
@@ -83,8 +90,10 @@ export class ModelService {
       const current = await this.refresh();
       if (input.revision !== current.revision) throw new HttpError(409, '模型配置已被其他管理员修改，请刷新后重试');
       const channels = this.prepareChannels(input, current);
-      this.validateDefault(input.defaultModelId, channels);
-      const next: StoredModelCatalog = { revision: current.revision + 1, defaultModelId: input.defaultModelId, channels };
+      this.validateDefault(input.defaultModelId, channels.filter(channel => !isClaudeChannel(channel)), current.defaultModelId);
+      const claudeDefaultModelId = input.claudeDefaultModelId === undefined ? current.claudeDefaultModelId ?? null : input.claudeDefaultModelId;
+      this.validateDefault(claudeDefaultModelId, channels.filter(isClaudeChannel), null);
+      const next: StoredModelCatalog = { revision: current.revision + 1, defaultModelId: input.defaultModelId, claudeDefaultModelId, channels };
       if (!await this.repository.save(current.revision, next)) {
         await this.refresh();
         throw new HttpError(409, '模型配置已被其他管理员修改，请刷新后重试');
@@ -115,6 +124,21 @@ export class ModelService {
         throw new HttpError(400, '渠道配置无效');
       const endpoint = validateEndpoint(channel.endpoint);
       const prior = previousChannels.get(id);
+      const protocol = channel.protocol ?? prior?.protocol ?? 'responses';
+      if (!['responses', 'anthropic-messages'].includes(protocol)) throw new HttpError(400, '模型渠道协议无效');
+      const authMode = channel.authMode ?? (protocol === (prior?.protocol ?? 'responses') ? prior?.authMode : undefined) ?? 'api-key';
+      if (!['api-key', 'bearer'].includes(authMode)) throw new HttpError(400, '模型渠道认证方式无效');
+      if (protocol !== 'anthropic-messages' && authMode !== 'api-key') throw new HttpError(400, '此模型渠道不支持该认证方式');
+      if (protocol !== 'anthropic-messages' && channel.claudeModelAliases !== undefined)
+        throw new HttpError(400, '此模型渠道不支持 Claude 模型别名');
+      const aliases = channel.claudeModelAliases ?? (protocol === 'anthropic-messages' ? prior?.claudeModelAliases : undefined);
+      if (aliases !== undefined && (!aliases || typeof aliases !== 'object' || Array.isArray(aliases)
+        || Object.entries(aliases).some(([key, value]) => !['haiku', 'sonnet', 'opus'].includes(key) || typeof value !== 'string')))
+        throw new HttpError(400, 'Claude 模型别名无效');
+      const claudeModelAliases = aliases === undefined ? undefined : Object.fromEntries(
+        Object.entries(aliases).map(([key, value]) => [key, trimmed(value, 'Claude 模型别名', 200)]));
+      if (prior && (prior.id === 'legacy-default' || prior.models.length > 0) && (prior.protocol ?? 'responses') !== protocol)
+        throw new HttpError(400, '已有模型的渠道协议不可更改，请新建渠道');
       if (id === 'legacy-default' && !prior) throw new HttpError(400, 'legacy-default 是保留的迁移渠道 ID');
       if (!prior && current.channels.some(existing => existing.id === id)) throw new HttpError(400, '渠道 ID 无效');
       if (prior && prior.id !== id) throw new HttpError(400, '渠道 ID 不可更改');
@@ -135,13 +159,13 @@ export class ModelService {
       if (prior) {
         for (const old of prior.models) if (!models.some(model => model.id === old.id)) throw new HttpError(400, '不能删除已有模型条目，请隐藏该模型');
         if (channel.apiKey !== undefined) {
-          return { id, name, endpoint, enabled: channel.enabled, hasApiKey: true,
+          return { id, name, endpoint, protocol, authMode, ...(claudeModelAliases ? { claudeModelAliases } : {}), enabled: channel.enabled, hasApiKey: true,
             apiKeyCiphertext: this.crypto.seal(id, keyContext, Buffer.from(channel.apiKey.trim())), models };
         }
-        return { id, name, endpoint, enabled: channel.enabled, hasApiKey: prior.hasApiKey,
+        return { id, name, endpoint, protocol, authMode, ...(claudeModelAliases ? { claudeModelAliases } : {}), enabled: channel.enabled, hasApiKey: prior.hasApiKey,
           ...(prior.apiKeyCiphertext ? { apiKeyCiphertext: prior.apiKeyCiphertext } : {}), models };
       }
-      return { id, name, endpoint, enabled: channel.enabled, hasApiKey: Boolean(channel.apiKey),
+      return { id, name, endpoint, protocol, authMode, ...(claudeModelAliases ? { claudeModelAliases } : {}), enabled: channel.enabled, hasApiKey: Boolean(channel.apiKey),
         ...(channel.apiKey ? { apiKeyCiphertext: this.crypto.seal(id, keyContext, Buffer.from(channel.apiKey.trim())) } : {}), models };
     });
     for (const old of current.channels) if (!nextChannels.some(channel => channel.id === old.id)) throw new HttpError(400, '不能删除已有渠道，请停用该渠道');
@@ -150,8 +174,7 @@ export class ModelService {
     return nextChannels;
   }
 
-  private validateDefault(defaultModelId: string | null, channels: StoredModelChannel[]) {
-    const currentDefault = this.current().defaultModelId;
+  private validateDefault(defaultModelId: string | null, channels: StoredModelChannel[], currentDefault: string | null) {
     const hasSelectable = channels.some(channel => channel.enabled && channel.models.some(entry => entry.visible));
     if (defaultModelId === null) {
       if (hasSelectable || currentDefault !== null) throw new HttpError(400, '请为已启用的模型设置默认模型');
@@ -162,24 +185,15 @@ export class ModelService {
   }
 
   async options(): Promise<ModelOption[]> {
-    await this.refresh();
-    return this.current().channels.filter(channel => channel.enabled).flatMap(channel => channel.models.filter(model => model.visible).map(model => ({
-      id: model.id, model: model.model, channelId: channel.id, channelName: channel.name, label: `${model.model}（${channel.name}）`,
-    })));
+    return (await this.sessionModelConfig()).modelOptions;
   }
 
   async defaultSelection(): Promise<{ model: string; modelEntryId?: string }> {
-    await this.refresh();
-    const catalog = this.current();
-    for (const channel of catalog.channels) {
-      const model = channel.models.find(entry => entry.id === catalog.defaultModelId);
-      if (model) return { model: model.model, modelEntryId: model.id };
-    }
-    return { model: this.legacy.model };
+    return (await this.sessionModelConfig()).defaults;
   }
 
   async selection(settings: { model: string; modelEntryId?: string }, selectable = false): Promise<ModelSelection | undefined> {
-    const channels = (await this.refresh()).channels;
+    const channels = (await this.refresh()).channels.filter(channel => !isClaudeChannel(channel));
     let channel: StoredModelChannel | undefined;
     let entry: ManagedModel | undefined;
     if (settings.modelEntryId !== undefined) {
@@ -211,13 +225,55 @@ export class ModelService {
     return { model: entry.model, modelEntryId: entry.id, channelId: channel.id, endpoint: channel.endpoint, apiKey };
   }
 
+  /** All public session choices come from one catalog revision. */
+  async sessionModelConfig(): Promise<{
+    modelOptions: ModelOption[];
+    defaults: { model: string; modelEntryId?: string };
+    claudeModelOptions: ModelOption[];
+    claudeDefaults?: { model: string; modelEntryId: string };
+  }> {
+    const catalog = await this.refresh();
+    const choices = (claude: boolean) => catalog.channels.filter(channel => channel.enabled && isClaudeChannel(channel) === claude)
+      .flatMap(channel => channel.models.filter(model => model.visible).map(model => ({
+        id: model.id, model: model.model, channelId: channel.id, channelName: channel.name, label: `${model.model}（${channel.name}）`,
+      })));
+    const modelOptions = choices(false);
+    const claudeModelOptions = choices(true);
+    const defaultModel = modelOptions.find(model => model.id === catalog.defaultModelId);
+    const claudeDefault = claudeModelOptions.find(model => model.id === catalog.claudeDefaultModelId);
+    return { modelOptions, defaults: defaultModel ? { model: defaultModel.model, modelEntryId: defaultModel.id } : { model: this.legacy.model },
+      claudeModelOptions, ...(claudeDefault ? { claudeDefaults: { model: claudeDefault.model, modelEntryId: claudeDefault.id } } : {}) };
+  }
+
+  async claudeDefaultSelection(): Promise<{ model: string; modelEntryId: string } | undefined> {
+    return (await this.sessionModelConfig()).claudeDefaults;
+  }
+
+  async claudeSelection(settings: { model: string; modelEntryId?: string }, selectable = false): Promise<ModelSelection> {
+    const channels = (await this.refresh()).channels.filter(isClaudeChannel);
+    const candidates = channels.flatMap(channel => channel.models.map(entry => ({ channel, entry })));
+    const matches = candidates.filter(({ channel, entry }) => settings.modelEntryId
+      ? entry.id === settings.modelEntryId
+      : channel.enabled && entry.model === settings.model && (!selectable || entry.visible));
+    if (matches.length !== 1) throw new HttpError(400, '此 Claude 会话没有唯一有效的模型渠道，请重新选择模型');
+    const { channel, entry } = matches[0];
+    if (entry.model !== settings.model) throw new HttpError(400, '所选模型与模型条目不匹配');
+    if (!channel.enabled) throw new HttpError(400, '模型渠道已停用，请重新选择模型');
+    if (selectable && !entry.visible) throw new HttpError(400, '模型已隐藏，请重新选择模型');
+    return { model: entry.model, modelEntryId: entry.id, channelId: channel.id, endpoint: channel.endpoint,
+      apiKey: channel.apiKeyCiphertext ? this.decryptKey(channel) : '', authMode: channel.authMode ?? 'api-key',
+      ...(channel.claudeModelAliases ? { claudeModelAliases: { ...channel.claudeModelAliases } } : {}) };
+  }
+
   async discover(id: string): Promise<string[]> {
     const channel = (await this.refresh()).channels.find(value => value.id === id);
     if (!channel) throw new HttpError(404, '渠道不存在');
     if (!channel.enabled) throw new HttpError(400, '渠道已停用');
     let response: Response;
     try {
-      response = await fetch(`${channel.endpoint}/models`, { method: 'GET', headers: channel.apiKeyCiphertext ? { Authorization: `Bearer ${this.decryptKey(channel)}` } : {},
+      const key = channel.apiKeyCiphertext ? this.decryptKey(channel) : '';
+      const url = isClaudeChannel(channel) ? `${anthropicBaseUrl(channel.endpoint)}/v1/models` : `${channel.endpoint}/models`;
+      response = await fetch(url, { method: 'GET', headers: isClaudeChannel(channel) ? anthropicHeaders(key, channel.authMode) : key ? { Authorization: `Bearer ${key}` } : {},
         redirect: 'manual', signal: AbortSignal.timeout(15_000) });
     } catch { throw new HttpError(502, '无法连接模型渠道'); }
     if (!response.ok || response.status >= 300) { await response.body?.cancel(); throw new HttpError(502, '模型渠道未能返回模型列表'); }
@@ -262,9 +318,13 @@ export class ModelService {
     if (!model) throw new HttpError(400, '请指定要测试的模型');
     let response: Response;
     try {
-      response = await fetch(`${channel.endpoint}/responses`, { method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(15_000),
-        headers: { 'Content-Type': 'application/json', ...(channel.apiKeyCiphertext ? { Authorization: `Bearer ${this.decryptKey(channel)}` } : {}) },
-        body: JSON.stringify({ model, input: 'Reply with OK.', max_output_tokens: 8, stream: false }) });
+      const key = channel.apiKeyCiphertext ? this.decryptKey(channel) : '';
+      const claude = isClaudeChannel(channel);
+      response = await fetch(claude ? `${anthropicBaseUrl(channel.endpoint)}/v1/messages` : `${channel.endpoint}/responses`, {
+        method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(15_000),
+        headers: { 'Content-Type': 'application/json', ...(claude ? anthropicHeaders(key, channel.authMode) : key ? { Authorization: `Bearer ${key}` } : {}) },
+        body: JSON.stringify(claude ? { model, messages: [{ role: 'user', content: 'Reply with OK.' }], max_tokens: 8, stream: false }
+          : { model, input: 'Reply with OK.', max_output_tokens: 8, stream: false }) });
     } catch { throw new HttpError(502, '无法连接模型渠道'); }
     if (!response.ok || response.status >= 300) {
       await cancelQuietly(response);
@@ -277,7 +337,8 @@ export class ModelService {
       throw new HttpError(502, '模型渠道测试响应格式无效');
     }
     const value = body as { object?: unknown; status?: unknown; error?: unknown };
-    if (!value || value.object !== 'response' || value.error != null || value.status === 'failed') {
+    const validResponse = isClaudeChannel(channel) ? (value as { type?: unknown } | null)?.type === 'message' : value?.object === 'response';
+    if (!value || !validResponse || value.error != null || value.status === 'failed') {
       await cancelQuietly(response);
       const diagnostic = safeFailureCode(value?.error, channel.apiKeyCiphertext ? this.decryptKey(channel) : '');
       throw new HttpError(502, diagnostic ? `模型渠道测试失败（${diagnostic}）` : '模型渠道测试响应无效');

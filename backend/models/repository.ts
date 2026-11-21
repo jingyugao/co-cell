@@ -1,10 +1,13 @@
 import type { Pool, RowDataPacket, ResultSetHeader } from 'mysql2/promise';
-import type { ManagedModel } from '../../protocol/model-types.js';
+import type { ManagedModel, ModelProtocol, ModelAuthMode, ClaudeModelAliases } from '../../protocol/model-types.js';
 
 export interface StoredModelChannel {
   id: string;
   name: string;
   endpoint: string;
+  protocol?: ModelProtocol;
+  authMode?: ModelAuthMode;
+  claudeModelAliases?: ClaudeModelAliases;
   enabled: boolean;
   hasApiKey: boolean;
   apiKeyCiphertext?: string;
@@ -14,6 +17,7 @@ export interface StoredModelChannel {
 export interface StoredModelCatalog {
   revision: number;
   defaultModelId: string | null;
+  claudeDefaultModelId?: string | null;
   channels: StoredModelChannel[];
 }
 
@@ -47,7 +51,7 @@ export class MySqlModelRepository implements ModelRepository {
   }
 
   async save(expectedRevision: number | null, catalog: StoredModelCatalog): Promise<boolean> {
-    const document = JSON.stringify({ defaultModelId: catalog.defaultModelId, channels: catalog.channels });
+    const document = JSON.stringify({ defaultModelId: catalog.defaultModelId, claudeDefaultModelId: catalog.claudeDefaultModelId, channels: catalog.channels });
     if (expectedRevision === null) {
       try {
         const [result] = await this.pool.query<ResultSetHeader>(

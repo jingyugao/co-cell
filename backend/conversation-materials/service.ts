@@ -8,6 +8,8 @@ import type { MemoryFileContent } from '../../protocol/memory-types.js';
 import { HttpError } from '../../util/errors.js';
 import { MemoryCoordinator, type SharedCoordinator } from '../infra/storage/coordination.js';
 import { prepareMaterials, prepareLiveMaterials, type IndexedMaterialEvent, type MaterialThread } from './materials.js';
+import { prepareClaudeArchive } from './claude.js';
+import type { AgentKind } from '../../protocol/types.js';
 import type { MaterialsRepository } from './repository.js';
 import { readMaterialContent } from './content.js';
 
@@ -89,7 +91,11 @@ export class ConversationMaterialsService {
   }
   get(id: string) { return this.deps.repository.get(id); }
 
-  async archive(source: MaterialSource, archive: string, signal?: AbortSignal, validate?: () => Promise<void>) {
+  async archive(source: MaterialSource, archive: string, signal?: AbortSignal, validate?: () => Promise<void>, agentKind?: AgentKind) {
+    if (agentKind === 'claude-code') {
+      if (source.threadId !== source.sessionId) throw new Error('Claude 对话来源身份不匹配');
+      return this.prepare(source, false, output => prepareClaudeArchive(archive, output, source.sessionId, signal), signal, validate);
+    }
     return this.prepare(source, true, output => prepareMaterials(archive, output, source.threadId, signal), signal, validate);
   }
   async live(source: MaterialSource, threads: MaterialThread[], complete: boolean, signal?: AbortSignal, validate?: () => Promise<void>) {

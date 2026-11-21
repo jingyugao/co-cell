@@ -18,7 +18,7 @@ const runtimeKey = /^(?:call_?id|item_?id|turn_?id|thread_?id|client_?id|chunk_?
 const INTERNAL_CONTEXT_KINDS = /^(?:agents_md(?:\.|$)|environments?(?:\.|$))/i;
 
 type FileInfo = ConversationMaterialFile;
-type Thread = { id: string; path: string; name: string };
+type Thread = { id: string; path: string; name: string; coverageNote?: string };
 type EventKind = 'message' | 'tool_call' | 'tool_result' | 'question' | 'compaction' | 'collaboration';
 type MaterialEvent = {
   threadId: string;
@@ -39,7 +39,8 @@ export interface MaterialThread {
   id: string;
   path: string;
   name: string;
-  /** Raw App Server turns, so injected context can be removed before rendering. */
+  coverageNote?: string;
+  /** Source turns, with provider messages normalized at the material boundary. */
   turns: Array<Record<string, any>>;
 }
 
@@ -693,6 +694,7 @@ async function openMaterial(outputDirectory: string, thread: Thread, contextInde
   const hash = createHash('sha256');
   let bytes = 0;
   const parts = [`# ${thread.name} · 上下文 ${contextIndex}`];
+  if (thread.coverageNote) parts.push(thread.coverageNote);
   if (summary) parts.push(`## 前文压缩摘要\n\n以下是此前对话的压缩摘要，仅作为本段背景，不是新的发言。\n\n${summary}`);
   for (const part of parts) {
     const text = `${part}\n\n`;

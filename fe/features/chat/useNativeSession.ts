@@ -480,16 +480,13 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
     const current = sessionRef.current;
     const ownerTurn = current?.turns.find(turn => turn.userInputRequests?.some(item => item.id === requestId));
     const request = ownerTurn?.userInputRequests?.find(item => item.id === requestId);
-    const prompt = '<send_user_message_question_reply>\n' + JSON.stringify(questions.map((question, index) => ({
-      answer: answers[index], question: question.title,
-      questionItemId: JSON.stringify(['request_user_input_async', requestId, index]),
-    }))) + '\n</send_user_message_question_reply>';
-    if (!request) throw new Error('问题已更新，请刷新后重试。');
-    if (ownerTurn?.status === 'running') await send(prompt, [], { expectedTurnId: ownerTurn.nativeTurnId ?? ownerTurn.id });
-    else await send(prompt, [], { forceStart: true });
+    if (!current || !ownerTurn || !request) throw new Error('问题已更新，请刷新后重试。');
     const answer = answers.length === 1 ? answers[0] : answers.map((value, index) => `${index + 1}. ${questions[index].title}\n${value}`).join('\n\n');
-    setSessionRef.current(current => current ? { ...current, turns: current.turns.map(turn => ({ ...turn, userInputRequests: turn.userInputRequests?.map(item => item.id === requestId ? { ...item, status: 'answered', answer, answers, answeredAt: new Date().toISOString() } : item) })) } : current);
-  }, [send, withNativeQuestions]);
+    const updated = await api<Session>(`/api/sessions/${encodeURIComponent(current.id)}/turns/${encodeURIComponent(ownerTurn.id)}/user-input/${encodeURIComponent(requestId)}`, {
+      method: 'POST', body: JSON.stringify({ answer, answers }),
+    });
+    if (selectedRef.current === current.id) setSessionRef.current(updated);
+  }, [withNativeQuestions]);
 
   const refreshConnection = useCallback(async () => {
     const refresh = refreshConnectionRef.current;

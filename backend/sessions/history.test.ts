@@ -3,10 +3,12 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { randomUUID } from 'node:crypto';
 import type { Session, Settings, Turn } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
 import { SessionManager, type CodexClient } from './manager.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
+import { MemoryCoordinator } from '../infra/storage/coordination.js';
 
 const defaults: Settings = { executionMode: 'sandbox', workingDirectory: '/home/agent/workspace', model: 'test',
   modelReasoningEffort: 'low', sandboxMode: 'danger-full-access', webSearchMode: 'disabled', networkAccessEnabled: true };
@@ -389,3 +391,86 @@ test('preview and file streams remain available while a project lifecycle operat
     finishTask();
   } finally { await f.close(); }
 });
+
+for (const scenario of ['late-answer', 'unknown-outcome', 'unknown-unconfirmed', 'queued-recovery'] as const) {
+  test(`native async question ${scenario} preserves one delivery across API instances`, async () => {
+    const state = new MemoryWebStateStore();
+    const coordinator = new MemoryCoordinator();
+    const directory = await mkdtemp(join(tmpdir(), 'cocell-native-answer-'));
+    const id = randomUUID(), sourceTurnId = randomUUID(), otherTurnId = randomUUID();
+    const questionId = 'question-1';
+    const now = new Date().toISOString();
+    const session: Session = { id, threadId: randomUUID(), title: '对话', settings: defaults,
+      status: 'idle', startedAt: now, createdAt: now, updatedAt: now, archivedAt: null, turns: [],
+      sandbox: { id: 'test-sandbox', template: 'test', status: 'ready', workingDirectory: defaults.workingDirectory } };
+    const source: Turn = { id: sourceTurnId, status: 'completed', prompt: '提问', images: [], codexAccepted: true,
+      startedAt: now, items: [{ id: questionId, type: 'agent_message', text: '请选择', delivery: 'async',
+        questions: [{ title: '数据库？', options: ['PostgreSQL', 'MySQL'] }] }] };
+    const other: Turn = { id: otherTurnId, status: 'running', prompt: '另一个任务', images: [], items: [],
+      codexAccepted: true, startedAt: now };
+    const queue: Array<{ id: string; clientUserMessageId: string }> = [];
+    const sent: string[] = [];
+    let unknown = scenario === 'unknown-outcome' || scenario === 'unknown-unconfirmed';
+    const runtime = {
+      async close() {},
+      async prepareNativeSession() { return { threadId: session.threadId!, threadOptions: {}, turnOptions: {} }; },
+      async openNativeConnection() { return { url: '', async release() {} }; },
+      async querySandbox(value: NonNullable<Session['sandbox']>) { return value; },
+      async history(_session: Session, options?: { limit?: number }) {
+        return { turns: options?.limit === 1 ? [other] : [source, other] };
+      },
+      async nativeRequest(_session: Session, method: string, params: any) {
+        if (method === 'thread/queue/list') return { data: queue };
+        sent.push(method);
+        if (method !== 'thread/queue/add') throw new Error('late answer was steered into another turn');
+        const queuedSubmission = { id: randomUUID(), clientUserMessageId: params.clientUserMessageId };
+        queue.push(queuedSubmission);
+        if (unknown) {
+          unknown = false;
+          if (scenario === 'unknown-unconfirmed') queue.pop();
+          throw new Error('connection lost after submission');
+        }
+        return { queuedSubmission };
+      },
+    } as unknown as SandboxRuntime;
+    await state.saveSession(session);
+    const managers = [0, 1].map(() => new SessionManager({} as CodexClient, directory, defaults, state, runtime,
+      undefined, undefined, undefined, {}, undefined, coordinator));
+    try {
+      await Promise.all(managers.map(manager => manager.init()));
+      const answer = (manager: SessionManager) => manager.answerUserInput(id, sourceTurnId, questionId, 'PostgreSQL', ['PostgreSQL']);
+      if (scenario === 'late-answer') {
+        await Promise.all(managers.map(answer));
+      } else if (scenario === 'unknown-outcome' || scenario === 'unknown-unconfirmed') {
+        await assert.rejects(answer(managers[0]), /connection lost/);
+        if (scenario === 'unknown-unconfirmed') {
+          await assert.rejects(answer(managers[1]), /尚未确认/);
+        } else {
+          const result = await answer(managers[1]);
+          assert.equal(result.turns[0].userInputRequests?.[0].status, 'answered');
+        }
+      } else {
+        const prompt = '<send_user_message_question_reply>\n' + JSON.stringify([{
+          answer: 'PostgreSQL', question: '数据库？',
+          questionItemId: JSON.stringify(['request_user_input_async', questionId, 0]),
+        }]) + '\n</send_user_message_question_reply>';
+        await state.saveInputRequest({ id: randomUUID(), sessionId: id, turnId: sourceTurnId, requestId: questionId,
+          type: 'question_reply', status: 'queued', input: prompt, createdAt: now });
+        await Promise.all(managers.map(manager => manager.read(id)));
+        const deadline = Date.now() + 3000;
+        while (!(await state.listInputRequests(id)).some(input => input.status === 'accepted')) {
+          if (Date.now() >= deadline) throw new Error('Queued reply was not recovered');
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+      }
+      assert.deepEqual(sent, ['thread/queue/add']);
+      assert.equal(queue.length, scenario === 'unknown-unconfirmed' ? 0 : 1);
+      const inputs = await state.listInputRequests(id);
+      assert.equal(inputs[0].status, scenario === 'unknown-unconfirmed' ? 'unknown' : 'accepted');
+    } finally {
+      await Promise.all(managers.map(manager => manager.close()));
+      await coordinator.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}

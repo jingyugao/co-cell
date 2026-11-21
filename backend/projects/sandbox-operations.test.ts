@@ -27,6 +27,7 @@ async function fixture(overrides: Partial<Project> = {}, changes: Partial<Sandbo
   const projects = new ProjectService(store); await projects.init();
   const calls: string[] = [];
   const threadIds = ['thread-one'];
+  const claudeSessionIds: string[] = [];
   const logs: Record<string, unknown>[] = [];
   let observed: SandboxState['status'] = overrides.sandbox?.status ?? 'ready';
   const runtime = {
@@ -48,12 +49,12 @@ async function fixture(overrides: Partial<Project> = {}, changes: Partial<Sandbo
     },
     ...changes,
   } satisfies SandboxRuntime;
-  const operations = new ProjectSandboxOperations({ projects, runtime, logger: { async write(record) { logs.push(record); } }, threadIds: () => [...threadIds],
+  const operations = new ProjectSandboxOperations({ projects, runtime, logger: { async write(record) { logs.push(record); } }, captureHistoryIndex: async () => ({ threadIds: [...threadIds], ...(claudeSessionIds.length ? { claudeSessionIds: [...claudeSessionIds] } : {}) }),
     ...(selection ? { selectRestoreImage: async () => ({ selection, release() {} }) } : {}),
     async saveSandbox(id, value, restore, image, expectedId) {
       if (!await projects.updateSandbox(id, value, restore, image, expectedId)) throw new Error('Project binding changed');
     }, detached: async () => { calls.push('detached'); } });
-  return { store, projects, operations, calls, runtime, logs, threadIds, async close() { await operations.close(); await projects.close(); await store.close(); } };
+  return { store, projects, operations, calls, runtime, logs, threadIds, claudeSessionIds, async close() { await operations.close(); await projects.close(); await store.close(); } };
 }
 
 test('backup records threads known before submission rather than threads created while waiting', async () => {
@@ -61,11 +62,14 @@ test('backup records threads known before submission rather than threads created
   const f = await fixture({ sandbox: undefined, sandboxMounts: volumeArchive.mounts });
   f.runtime.remoteArchives.capture = async () => { captured.resolve(); await release.promise; return volumeArchive; };
   try {
+    f.claudeSessionIds.push('claude-before');
     const request = f.operations.run('project-one', 'backup');
     await captured.promise;
+    f.claudeSessionIds.push('claude-after');
     f.threadIds.push('thread-after-capture');
     release.resolve(); await request;
     assert.deepEqual(f.projects.get('project-one').remoteArchives?.[0].threadIds, ['thread-one']);
+    assert.deepEqual(f.projects.get('project-one').remoteArchives?.[0].claudeSessionIds, ['claude-before']);
   } finally { release.resolve(); await f.close(); }
 });
 

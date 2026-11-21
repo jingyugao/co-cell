@@ -22,6 +22,12 @@ try {
     if (integrity !== pkg.integrity) throw new Error(`Publisher checksum mismatch: ${name}`);
     files.push({ path: name, sha256: await fileHash(destination), integrity, source: pkg.url });
   }
+  const claude = runtimePackages.claudeAcp;
+  const claudeArchive = join(context, claude.file);
+  await copyFile(join(root, 'deploy/box-wrap/artifacts', claude.file), claudeArchive);
+  const claudeChecksum = await fileHash(claudeArchive);
+  if (claudeChecksum !== claude.sha256) throw new Error('Publisher checksum mismatch: Claude ACP');
+  files.push({ path: claude.file, sha256: claudeChecksum, source: claude.url });
   await writeFile(join(context, 'manifest.json'), JSON.stringify({
     version: 1, codexVersion: runtimePackages.codexVersion, platform: 'linux/amd64', files,
   }, null, 2) + '\n');
@@ -34,7 +40,7 @@ try {
     child.once('error', reject);
     child.once('exit', code => code === 0 ? resolve() : reject(new Error(`docker build exited ${code}`)));
   });
-  console.log(`Built ${image}: Codex ${runtimePackages.codexVersion} linux/amd64 archives in /artifacts/`);
+  console.log(`Built ${image}: Codex ${runtimePackages.codexVersion} and Claude ACP linux/amd64 archives in /artifacts/`);
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;

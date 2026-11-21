@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { startAcpHost } from './acp/host.mjs';
 
 const exec = promisify(execFile);
 
@@ -214,7 +215,7 @@ async function runCodex(config, { workspace, agentHome, codex, codexHome, shared
 export async function startLauncher({ workspace = DEFAULT_WORKSPACE, codex = DEFAULT_CODEX,
   agentHome = '/home/agent',
   startupDirectory = '/home/agent/.cocell-startup', sharedDirectory = process.env.COCELL_LAUNCHER_SHARED_DIRECTORY,
-  pollMs = POLL_MS, signal, log = message => console.error(`cocell launcher: ${message}`) } = {}) {
+  pollMs = POLL_MS, signal, acpHost, log = message => console.error(`cocell launcher: ${message}`) } = {}) {
   if (!signal) throw new Error('an AbortSignal is required');
   const cocellDir = join(workspace, '.cocell');
   const runtimeDir = startupDirectory;
@@ -228,7 +229,15 @@ export async function startLauncher({ workspace = DEFAULT_WORKSPACE, codex = DEF
   log(sharedDirectory ? 'reading shared startup config' : 'waiting for provisioning config');
   while (!signal.aborted) {
     const config = await takeConfig(configPath, Boolean(sharedDirectory));
-    if (config) return runCodex(config, { workspace, agentHome, codex, codexHome, sharedDirectory, signal, log });
+    if (config) {
+      let host;
+      if (acpHost) {
+        try { host = await acpHost({ workspace, agentHome, sharedDirectory, signal }); }
+        catch { log('Claude ACP host unavailable; continuing with Codex App Server'); }
+      }
+      try { return await runCodex(config, { workspace, agentHome, codex, codexHome, sharedDirectory, signal, log }); }
+      finally { await host?.close(); }
+    }
     await delay(pollMs, signal);
   }
   return 0;
@@ -239,7 +248,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   process.on('SIGINT', () => shutdown.abort());
   process.on('SIGTERM', () => shutdown.abort());
   try {
-    process.exitCode = await startLauncher({ signal: shutdown.signal });
+    process.exitCode = await startLauncher({ signal: shutdown.signal, acpHost: startAcpHost });
   } catch (error) {
     // Config and environment values may be secret; only controlled error text is emitted.
     console.error(`cocell launcher: ${error.message}`);

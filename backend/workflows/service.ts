@@ -7,7 +7,8 @@ import type { SharedCoordinator, SharedLease } from '../infra/storage/coordinati
 import { MemoryCoordinator } from '../infra/storage/coordination.js';
 import { HttpError, redactCredentials } from '../../util/errors.js';
 import { resultSchema, validatePlan, within, type Finding } from '../../packages/workflow/src/index.js';
-import type { WorkflowAttempt, WorkflowJob, WorkflowRun } from '../../protocol/workflow-types.js';
+import type { CreateWorkflowInput, WorkflowAttempt, WorkflowJob, WorkflowRun, WorkflowModel } from '../../protocol/workflow-types.js';
+import { workflowJobTitle, workflowModelForRole } from '../../util/workflow.js';
 import { publicRun, terminal, type StoredRun, type WorkflowStore } from './store.js';
 import {
   canonical,
@@ -16,7 +17,7 @@ import {
   job,
   outputSchema,
   promptFor,
-  templateDigest,
+  digestForMode,
   version,
 } from './templates.js';
 import type { WorkflowValidationRunner } from './validation.js';
@@ -65,6 +66,8 @@ const conflict = (s: string): never => {
 };
 const jobs = (r: StoredRun) => r.jobs.filter((j) => j.version === r.version);
 const canDispatch = (r: StoredRun) => isDispatchable(r.status);
+const jobPhase = (r: StoredRun, j: WorkflowJob) =>
+  r.planningMode === 'modules' && j.role === 'plan' ? 'designing' : phaseForRole[j.role];
 const writable = (j: WorkflowJob) =>
   Boolean(j.spec?.ownedPaths.length) && (j.role === 'worker' || j.role === 'integration');
 
@@ -77,7 +80,7 @@ export class WorkflowService {
     private store: WorkflowStore,
     private manager: Manager,
     private validation: Validator,
-    private selectModel: () => Promise<{ model: string; modelEntryId?: string }>,
+    private selectModel: (entryId?: string) => Promise<WorkflowModel>,
     coordinator?: SharedCoordinator,
     private log: (error: unknown) => void = console.error
   ) {
@@ -123,7 +126,7 @@ export class WorkflowService {
       throw new WorkflowPersistenceError(error);
     }
   }
-  async create(input: { projectId: string; requirement: string; parallelism: number; clientRequestId: string }) {
+  async create(input: CreateWorkflowInput) {
     const id = input.clientRequestId,
       createDigest = digest(canonical(input));
     const existing = await this.store.get(id);
@@ -134,8 +137,11 @@ export class WorkflowService {
     const p = await this.manager.readProject(input.projectId);
     if (p.status !== 'active' || p.executionMode !== 'sandbox' || p.sandbox?.status !== 'ready')
       conflict('请先打开项目并准备好 Sandbox');
-    const selected = await this.selectModel();
+    const selected = await this.selectModel(input.leadModelEntryId);
     if (!selected.model) conflict('请先配置 Codex 模型');
+    const workerModel = input.workerModelEntryId && input.workerModelEntryId !== selected.modelEntryId
+      ? await this.selectModel(input.workerModelEntryId) : undefined;
+    const modular = input.planningMode === 'modules';
     const at = now();
     const r: StoredRun = {
       id,
@@ -146,9 +152,11 @@ export class WorkflowService {
       requests: {},
       requirement: input.requirement,
       ...selected,
+      planningMode: input.planningMode,
+      workerModel,
       parallelism: input.parallelism,
       templateVersion: version,
-      templateDigest,
+      templateDigest: digestForMode(input.planningMode),
       status: 'designing',
       revision: 1,
       version: 1,
@@ -159,13 +167,15 @@ export class WorkflowService {
       plans: [],
       decisions: [],
       artifacts: [],
-      events: [{ sequence: 1, at, message: '开始只读调查与设计' }],
+      events: [{ sequence: 1, at, message: modular ? '主 agent 开始拆分功能模块' : '开始只读调查与设计' }],
     };
     r.jobs = designJobs(r, '');
     try {
       await this.store.insert(r);
     } catch (error) {
-      if ((await this.store.get(id))?.createDigest !== createDigest) throw error;
+      const saved = await this.store.get(id);
+      if (!saved) throw error;
+      if (saved.createDigest !== createDigest) conflict('幂等键已用于其他请求');
     }
     return { id, revision: 1 };
   }
@@ -247,7 +257,7 @@ export class WorkflowService {
             throw new HttpError(409, '只允许在旧尝试已明确结束后重试失败任务');
           // Preserve every failed attempt; a new ordinal gets a new session and marker.
           this.prepare(r, j, false);
-          r.status = phaseForRole[j.role];
+          r.status = jobPhase(r, j);
           delete r.attention;
           break;
         }
@@ -258,7 +268,7 @@ export class WorkflowService {
             !r.attention?.includes('ownership_conflict')
           ) {
             const pending = jobs(r).find((j) => last(j)?.status !== 'succeeded');
-            r.status = pending ? phaseForRole[pending.role] : r.approvedHash ? 'verifying' : 'discussing';
+            r.status = pending ? jobPhase(r, pending) : r.approvedHash ? 'verifying' : 'discussing';
             delete r.attention;
           }
           break;
@@ -285,7 +295,7 @@ export class WorkflowService {
     delete r.attention;
     delete r.baseline;
     delete r.wave;
-    r.templateDigest = templateDigest;
+    r.templateDigest = digestForMode(r.planningMode);
     r.templateVersion = version;
     r.version++;
     r.discussionRound = 0;
@@ -362,7 +372,7 @@ export class WorkflowService {
         await this.observe(r, j, a);
         if (r.status === 'cancelling' && a.status === 'running' && !a.stopRequestedAt) {
           a.stopRequestedAt = now();
-          await this.save(r, '请求停止 ' + j.key);
+          await this.save(r, '请求停止 ' + workflowJobTitle(r, j));
           await this.manager.stop(a.sessionId);
         }
       }
@@ -420,12 +430,12 @@ export class WorkflowService {
     }
   }
   private async dispatch(r: StoredRun, j: WorkflowJob, lease: SharedLease) {
-    if (r.templateDigest !== templateDigest) throw Error('模板版本已变化，请修订计划');
+    if (r.templateDigest !== digestForMode(r.planningMode)) throw Error('模板版本已变化，请修订计划');
     if (!canDispatch(r) || (j.spec && (!r.approvedHash || r.approvedHash !== r.plans.at(-1)?.hash)))
       throw Error('缺少当前计划审批');
     if (!last(j)) {
       this.prepare(r, j);
-      await this.save(r, '准备任务 ' + j.key);
+      await this.save(r, '准备任务 ' + workflowJobTitle(r, j));
     }
     const a = last(j)!;
     const ownerJob = r.jobs.find((other) =>
@@ -434,26 +444,27 @@ export class WorkflowService {
     try {
       await this.context(r);
       const owner = { kind: 'workflow' as const, runId: r.id, taskId: ownerJob.id, writable: writable(j) };
+      const selected = workflowModelForRole(r, j.role);
       await this.manager.ensureWorkflowSession(
         a.sessionId,
         owner,
         r.projectId,
-        '工作台 · ' + j.key,
-        r.model,
-        r.modelEntryId
+        '工作台 · ' + workflowJobTitle(r, j),
+        selected.model,
+        selected.modelEntryId
       );
       a.threadId = await this.manager.prepareWorkflowThread(a.sessionId);
       const prompt = promptFor(r, j, a.id);
       if (digest(prompt) !== a.promptHash) throw Error('任务输入已变化');
       lease.assertHeld();
       a.status = 'sending';
-      r.status = phaseForRole[j.role];
-      await this.save(r, '提交 ' + j.key + ' 尝试 ' + a.ordinal);
+      r.status = jobPhase(r, j);
+      await this.save(r, '提交 ' + workflowJobTitle(r, j) + ' 尝试 ' + a.ordinal);
       a.turnId = await this.manager.submitWorkflowTurn(
         a.sessionId,
         a.threadId,
         prompt,
-        outputSchema(j.role),
+        outputSchema(j.role, r.planningMode),
         async () => {
           lease.assertHeld();
           if (!(await this.store.atRevision(r.id, r.revision))) throw Error('提交前审批或工作流状态已变化');
@@ -461,7 +472,7 @@ export class WorkflowService {
         }
       );
       a.status = 'running';
-      await this.save(r, '已接收 ' + j.key);
+      await this.save(r, '已接收 ' + workflowJobTitle(r, j));
     } catch (error) {
       if (error instanceof WorkflowPersistenceError) throw error;
       lease.assertHeld();
@@ -471,7 +482,7 @@ export class WorkflowService {
           ? 'unknown'
           : 'failed';
       a.error = message(error);
-      await this.save(r, j.key + ' · ' + a.error);
+      await this.save(r, workflowJobTitle(r, j) + ' · ' + a.error);
       if (a.status === 'failed') throw error;
     }
   }
@@ -493,7 +504,7 @@ export class WorkflowService {
       if (a.status !== 'unknown') {
         a.status = 'unknown';
         a.error = '未唯一匹配原生提交，将继续观察';
-        await this.save(r, j.key + ' · ' + a.error);
+        await this.save(r, workflowJobTitle(r, j) + ' · ' + a.error);
       }
       return;
     }
@@ -506,7 +517,7 @@ export class WorkflowService {
       if (a.status !== 'running' || firstObservation) {
         a.status = 'running';
         delete a.error;
-        await this.save(r, '已匹配原生轮次 ' + j.key);
+        await this.save(r, '已匹配原生轮次 ' + workflowJobTitle(r, j));
       }
       return;
     }
@@ -527,11 +538,11 @@ export class WorkflowService {
             )
         )
       )
-        throw Error('ownership_conflict · ' + j.key + ' 越界写入');
+        throw Error('ownership_conflict · ' + workflowJobTitle(r, j) + ' 越界写入');
       const text = t.items.filter((i) => i.type === 'agent_message').at(-1)?.text;
       if (!text) throw Error('缺少结构化结果');
       const parsed: unknown = JSON.parse(text);
-      const value = j.role === 'plan' ? validatePlan(parsed) : resultSchema.parse(parsed);
+      const value = j.role === 'plan' ? validatePlan(parsed, r.planningMode) : resultSchema.parse(parsed);
       const artifact = {
         id: randomUUID(),
         sequence: r.revision + 1,
@@ -551,7 +562,7 @@ export class WorkflowService {
       a.status = t.status === 'cancelled' && r.status === 'cancelling' ? 'cancelled' : 'failed';
       a.error = message(error);
     }
-    await this.save(r, j.key + ' · ' + (a.error ?? a.status));
+    await this.save(r, workflowJobTitle(r, j) + ' · ' + (a.error ?? (a.status === 'checking' ? '等待命令验证' : '已完成')));
   }
   private async finishWave(r: StoredRun, lease: SharedLease) {
     const wave = r.wave!.map((id) => r.jobs.find((j) => j.id === id)!);
@@ -589,19 +600,19 @@ export class WorkflowService {
           if (r.status === 'blocked' && wave.some((other) => last(other)?.status === 'failed')) {
             a.status = 'failed';
             a.error = '同批任务失败，验证尚未提交';
-            await this.save(r, '停止验证 ' + j.key);
+            await this.save(r, '停止验证 ' + workflowJobTitle(r, j));
             continue;
           }
           if (r.status === 'cancelling') {
             a.status = 'cancelled';
-            await this.save(r, '取消尚未提交的验证 ' + j.key);
+            await this.save(r, '取消尚未提交的验证 ' + workflowJobTitle(r, j));
             continue;
           }
           return;
         }
         const before = await this.validation.fingerprint(ctx, [{ id: 'allowed', paths: check.outputPaths }]);
         a.validation = { ...check, status: 'running', before: before.other ?? '' };
-        await this.save(r, '开始独立执行验证 ' + j.key);
+        await this.save(r, '开始独立执行验证 ' + workflowJobTitle(r, j));
         lease.assertHeld();
         try {
           a.validation.operationId = await this.validation.startValidation(ctx, check, async () => {
@@ -612,15 +623,15 @@ export class WorkflowService {
           a.validation.status = 'unknown';
           a.error = message(error);
         }
-        await this.save(r, '验证操作 ' + (a.validation.operationId ?? '结果未知'));
+        await this.save(r, workflowJobTitle(r, j) + ' · 验证操作 ' + (a.validation.operationId ?? '结果未知'));
         return;
       }
       if (!a.validation.operationId) {
         if (a.validation.status !== 'unknown') {
           a.validation.status = 'unknown';
-          await this.save(r, '缺少验证执行标识 ' + j.key);
+          await this.save(r, '缺少验证执行标识 ' + workflowJobTitle(r, j));
         }
-        throw Error('验证提交结果未知，无法安全重跑 ' + j.key);
+        throw Error('验证提交结果未知，无法安全重跑 ' + workflowJobTitle(r, j));
       }
       let result;
       try {
@@ -628,7 +639,7 @@ export class WorkflowService {
       } catch (error) {
         if (a.validation.status !== 'unknown') {
           a.validation.status = 'unknown';
-          await this.save(r, '暂时无法确认验证结果 ' + j.key);
+          await this.save(r, '暂时无法确认验证结果 ' + workflowJobTitle(r, j));
         }
         throw error;
       }
@@ -643,7 +654,7 @@ export class WorkflowService {
       a.validation.status = a.status;
       if (a.status === 'failed')
         a.error = escaped ? 'ownership_conflict · 验证写入了未声明路径' : '验证失败，退出码 ' + result.exitCode;
-      await this.save(r, j.key + ' · ' + (a.error ?? '验证通过'));
+      await this.save(r, workflowJobTitle(r, j) + ' · ' + (a.error ?? '验证通过'));
       if (a.error) throw Error(a.error);
     }
     delete r.wave;
@@ -659,11 +670,11 @@ export class WorkflowService {
     const planner = current.find((j) => j.role === 'plan');
     if (planner) {
       const artifact = r.artifacts.find((a) => a.id === last(planner)?.artifactId)!;
-      const plan = validatePlan(artifact.value);
+      const plan = validatePlan(artifact.value, r.planningMode);
       r.plans.push({
         id: randomUUID(),
         version: r.version,
-        hash: digest(canonical({ plan, templateDigest, version: r.version })),
+        hash: digest(canonical({ plan, templateDigest: r.templateDigest, version: r.version })),
         approvalId: randomUUID(),
         approvalRevision: 1,
         artifactId: artifact.id,

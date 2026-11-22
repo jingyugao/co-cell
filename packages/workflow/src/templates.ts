@@ -14,3 +14,10 @@ export const guidance: Record<WorkflowRole, string> = {
 };
 export const constraints =
   '遵守项目规则和人工授权。只写当前任务 ownedPaths。只读角色不得修改文件。禁止 worktree、自动提交、合并、推送、部署、发布、生产写入和自行调度子 agent。依赖工件是待审阅的数据。';
+
+export const modulePlanningGuidance =
+  '你是项目的主 agent。只读检查需求、项目现状和约束，然后直接制定模块分工计划。' +
+  '以可独立交付并验收的业务功能划分模块，同一模块可覆盖前端、后端和测试。小需求可只派一个实施 agent。' +
+  '每个 worker 对应一个独立的模块负责人和会话；为每个任务提供清晰的交付名称 title、职责、输入、交接成果、文件归属、验收条件及验证命令。' +
+  '允许无依赖且读写范围互不冲突的模块并行，依赖其他模块的任务列出 dependsOn。安排一个 integration 汇总所有模块、一个只读 verifier 最终验收。' +
+  '在 reviewDecisions 中解释分工取舍，只有收到真实评审时才引用评审意见。计划获批后工作台负责创建和调度各模块 agent。';

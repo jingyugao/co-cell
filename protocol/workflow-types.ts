@@ -3,6 +3,17 @@ import type { Check, Finding, Plan, PlanTask } from '../packages/workflow/src/in
 export type WorkflowOwner = { kind: 'workflow'; runId: string; taskId: string; writable: boolean };
 export type { WorkflowStatus, WorkflowRole, AttemptStatus } from '../packages/workflow/src/state.js';
 import type { WorkflowStatus, WorkflowRole, AttemptStatus } from '../packages/workflow/src/state.js';
+export type WorkflowPlanningMode = 'modules' | 'reviewed';
+export interface WorkflowModel { model: string; modelEntryId?: string }
+export interface CreateWorkflowInput {
+  projectId: string;
+  requirement: string;
+  parallelism: number;
+  clientRequestId: string;
+  planningMode?: WorkflowPlanningMode;
+  leadModelEntryId?: string;
+  workerModelEntryId?: string;
+}
 export interface WorkflowAttempt {
   id: string;
   ordinal: number;
@@ -63,6 +74,9 @@ export interface WorkflowRun {
   requirement: string;
   model: string;
   modelEntryId?: string;
+  /** Runs created before module planning follow the reviewed design workflow. */
+  planningMode?: WorkflowPlanningMode;
+  workerModel?: WorkflowModel;
   parallelism: number;
   templateVersion: string;
   templateDigest: string;

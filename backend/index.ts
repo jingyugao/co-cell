@@ -190,7 +190,7 @@ const memory = new MemoryService({ repository: webState.memoryRepository, state:
 // uses single-instance mode. CAS also fences a worker that loses its lease.
 const workflowCoordinator = coordinator ?? new MySqlCoordinator(mysqlUrl);
 const workflows = new WorkflowService(webState.workflowRepository, manager, new WorkflowValidationRunner(cellboxProvider.client),
-  () => models.defaultSelection(), workflowCoordinator, error => { void runtimeLog.write({ event: 'workflow.tick.failed', error: String(error) }); });
+  id => models.workflowSelection(id), workflowCoordinator, error => { void runtimeLog.write({ event: 'workflow.tick.failed', error: String(error) }); });
 const reports = new ReportService({ repository: webState.reportRepository, state: webState, materials, collector: materialCollector,
   runner: new ReportRunner({ state: webState, manager, models }), directory: resolve(sharedDataRoot, 'runtime/reports'), coordinator, logger: runtimeLog });
 const knowledge = new KnowledgeService({ repository: webState.knowledgeRepository, materials: webState.memoryRepository,

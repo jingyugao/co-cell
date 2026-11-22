@@ -23,6 +23,9 @@ export function installWorkflowRoutes(app: Hono, service?: WorkflowService) {
         projectId: id,
         requirement: z.string().trim().min(1).max(12000),
         parallelism: z.number().int().min(1).max(4).default(2),
+        planningMode: z.enum(['modules', 'reviewed']).optional(),
+        leadModelEntryId: z.string().trim().min(1).max(100).optional(),
+        workerModelEntryId: z.string().trim().min(1).max(100).optional(),
         clientRequestId: id,
       })
       .parse(await c.req.json());

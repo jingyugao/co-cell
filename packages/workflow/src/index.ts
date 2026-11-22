@@ -40,6 +40,11 @@ export const planSchema = z.strictObject({
   reviewDecisions: text,
   tasks: z.array(taskSchema).min(3).max(32),
 });
+export const modulePlanSchema = planSchema.extend({
+  tasks: z.array(taskSchema.extend({
+    title: z.string().trim().min(1).max(80).describe('Short user-facing name of the deliverable in the language of the requirement.'),
+  })).min(3).max(32),
+});
 export const resultSchema = z.strictObject({
   summary: text,
   evidence: z.array(text).max(16),
@@ -47,8 +52,8 @@ export const resultSchema = z.strictObject({
   needsDecision: z.boolean(),
   passed: z.boolean(),
 });
-export type Plan = z.infer<typeof planSchema>;
-export type PlanTask = z.infer<typeof taskSchema>;
+export type PlanTask = z.infer<typeof taskSchema> & { title?: string };
+export type Plan = Omit<z.infer<typeof planSchema>, 'tasks'> & { tasks: PlanTask[] };
 export type Check = z.infer<typeof checkSchema>;
 export type Finding = z.infer<typeof resultSchema>;
 export const overlaps = (a: string, b: string) => a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
@@ -60,8 +65,8 @@ export function validPath(path: string) {
   );
 }
 
-export function validatePlan(value: unknown): Plan {
-  const plan = planSchema.parse(value);
+export function validatePlan(value: unknown, mode?: 'modules' | 'reviewed'): Plan {
+  const plan = (mode === 'modules' ? modulePlanSchema : planSchema).parse(value);
   const tasks = new Map(plan.tasks.map((t) => [t.key, t]));
   if (tasks.size !== plan.tasks.length) throw Error('任务 key 必须唯一');
   const ancestors = new Map<string, Set<string>>();

@@ -133,6 +133,24 @@
 .wf-job small {
   float: right;
 }
+.wf-assignee,
+.wf-deliverable {
+  display: block;
+  margin-top: 6px;
+}
+.wf-assignee {
+  font-size: 13px;
+  color: #5c6857;
+}
+.wf-job:not([open]) .wf-deliverable {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.wf-controls label {
+  min-width: 0;
+}
 .wf-plan dl {
   display: grid;
   grid-template-columns: 6em 1fr;

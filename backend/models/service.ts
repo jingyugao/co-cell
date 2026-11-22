@@ -192,6 +192,14 @@ export class ModelService {
     return (await this.sessionModelConfig()).defaults;
   }
 
+  async workflowSelection(entryId?: string): Promise<{ model: string; modelEntryId?: string }> {
+    const { defaults, modelOptions } = await this.sessionModelConfig();
+    if (entryId === undefined) return defaults;
+    const option = modelOptions.find(entry => entry.id === entryId);
+    if (!option) throw new HttpError(400, '所选模型不可用，请刷新模型列表');
+    return { model: option.model, modelEntryId: option.id };
+  }
+
   async selection(settings: { model: string; modelEntryId?: string }, selectable = false): Promise<ModelSelection | undefined> {
     const channels = (await this.refresh()).channels.filter(channel => !isClaudeChannel(channel));
     let channel: StoredModelChannel | undefined;

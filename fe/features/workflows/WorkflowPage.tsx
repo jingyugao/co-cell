@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ProjectSummary } from '../../../protocol/types';
-import type { WorkflowRun, WorkflowSummary, WorkflowPlan, WorkflowJob } from '../../../protocol/workflow-types';
+import type { AppConfig, ProjectSummary } from '../../../protocol/types';
+import type { WorkflowRun, WorkflowSummary, WorkflowPlan, WorkflowJob, WorkflowPlanningMode } from '../../../protocol/workflow-types';
+import { workflowJobTitle, workflowModelForRole } from '../../../util/workflow';
 import { api, errorMessage } from '../../lib/api';
 import Markdown from '../chat/Markdown';
 import './workflow.css';
@@ -30,12 +31,17 @@ const labels: Record<string, string> = {
 const label = (s: string) => labels[s] ?? s;
 const base = '/api/workflow-runs';
 const post = (body: unknown): RequestInit => ({ method: 'POST', body: JSON.stringify(body) });
+const deliveryRoles = { worker: '模块 agent', integration: '集成 agent', verifier: '验收 agent' } as const;
 
-function PlanView({ plan }: { plan: WorkflowPlan }) {
+function PlanView({ plan, modular }: { plan: WorkflowPlan; modular: boolean }) {
   const tasks = plan.plan.tasks;
+  const taskName = (key: string) => tasks.find(t => t.key === key)?.title ?? key;
   const graph = [
     'flowchart TD',
-    ...tasks.map((t, i) => 'n' + i + '["' + t.key + '"]'),
+    ...tasks.map((t, i) => {
+      const name = t.title?.replace(/[^\p{L}\p{M}\p{N}_-]+/gu, ' ').trim() || t.key;
+      return 'n' + i + '["' + name + '"]';
+    }),
     ...tasks.flatMap((t, i) =>
       t.dependsOn.map((key) => 'n' + tasks.findIndex((x) => x.key === key) + ' --> n' + i)
     ),
@@ -45,7 +51,7 @@ function PlanView({ plan }: { plan: WorkflowPlan }) {
       <h3>计划 v{plan.version}</h3>
       <code className="wf-hash">{plan.hash}</code>
       <Markdown text={plan.plan.design} />
-      <h4>备选方案与评审意见</h4>
+      <h4>{modular ? '备选方案与分工依据' : '备选方案与评审意见'}</h4>
       <Markdown text={plan.plan.alternatives + '\n\n' + plan.plan.reviewDecisions} />
       <h4>风险与公共契约</h4>
       <Markdown text={plan.plan.risks} />
@@ -57,12 +63,12 @@ function PlanView({ plan }: { plan: WorkflowPlan }) {
       {tasks.map((t) => (
         <section key={t.key}>
           <h4>
-            {t.key} · {t.role}
+            {t.title ?? t.key} · {deliveryRoles[t.role]}
           </h4>
           <p>{t.description}</p>
           <dl>
             <dt>依赖</dt>
-            <dd>{t.dependsOn.join(', ') || '无'}</dd>
+            <dd>{t.dependsOn.map(taskName).join('、') || '无'}</dd>
             <dt>写入</dt>
             <dd>{t.ownedPaths.join(', ') || '只读'}</dd>
             <dt>读取</dt>
@@ -87,16 +93,26 @@ function PlanView({ plan }: { plan: WorkflowPlan }) {
 
 function JobView({ j, run, retry }: { j: WorkflowJob; run: WorkflowRun; retry: (id: string) => void }) {
   const current = j.attempts.at(-1);
+  const modular = run.planningMode === 'modules';
+  const dependencies = run.jobs.filter(d => j.dependencies.includes(d.id));
+  const waiting = dependencies.filter(d => d.attempts.at(-1)?.status !== 'succeeded');
+  const result = run.artifacts.find(a => a.id === current?.artifactId)?.value;
   return (
     <details className="wf-job">
       <summary>
-        <span>{j.key}</span>
-        <small>{current ? label(current.status) : '等待依赖'}</small>
+        <span>{j.version !== run.version && 'v' + j.version + ' · '}{workflowJobTitle(run, j)}</span>
+        <small>{current ? label(current.status) : waiting.length ? '等待依赖' : '等待调度'}</small>
+        {modular && <span className="wf-assignee">
+          {j.spec ? deliveryRoles[j.spec.role] + ' · ' : ''}{workflowModelForRole(run, j.role).model}
+          {!current && waiting.length > 0 && ' · 等待 ' + waiting.map(d => workflowJobTitle(run, d)).join('、')}
+        </span>}
+        {modular && j.spec && <span className="wf-deliverable">
+          {current?.error || (result && 'summary' in result ? result.summary : j.spec.description)}
+        </span>}
       </summary>
-      <p>{j.instruction}</p>
-      {j.dependencies.length > 0 && (
-        <p>依赖 {j.dependencies.map((id) => run.jobs.find((d) => d.id === id)?.key).join(', ')}</p>
-      )}
+      {(!modular || !j.spec || result || current?.error) && <p>{j.instruction}</p>}
+      {modular && j.spec && <p>验收条件 · {j.spec.acceptance}</p>}
+      {dependencies.length > 0 && <p>依赖 {dependencies.map(d => workflowJobTitle(run, d)).join('、')}</p>}
       {j.attempts.map((a) => (
         <section key={a.id}>
           <h4>
@@ -154,6 +170,9 @@ export default function WorkflowPage({ runId, projectId }: { runId?: string; pro
     [loading, setLoading] = useState(true),
     [busy, setBusy] = useState(false);
   const [selectedProject, setSelectedProject] = useState(projectId ?? '');
+  const [planningMode, setPlanningMode] = useState<WorkflowPlanningMode>('modules');
+  const [models, setModels] = useState<AppConfig['modelOptions']>([]);
+  const [leadModelEntryId, setLeadModel] = useState(''), [workerModelEntryId, setWorkerModel] = useState('');
   const mutation = useRef(false),
     createKey = useRef<{ input: string; id: string } | null>(null),
     generation = useRef(0);
@@ -186,14 +205,15 @@ export default function WorkflowPage({ runId, projectId }: { runId?: string; pro
       }
     }
     void load();
-    if (!runId)
-      void api<ProjectSummary[]>('/api/projects', { signal: controller.signal })
-        .then((ps) => {
-          if (live) setProjects(ps.filter((p) => p.executionMode === 'sandbox' && p.status === 'active'));
-        })
-        .catch((e) => {
-          if (live) setReadError(errorMessage(e));
-        });
+    if (!runId) {
+      const onFailure = (e: unknown) => { if (live) setError(errorMessage(e)); };
+      void api<ProjectSummary[]>('/api/projects', { signal: controller.signal }).then(ps => {
+        if (live) setProjects(ps.filter(p => p.executionMode === 'sandbox' && p.status === 'active'));
+      }).catch(onFailure);
+      void api<AppConfig>('/api/config', { signal: controller.signal }).then(config => {
+        if (live) setModels(config.modelOptions ?? []);
+      }).catch(onFailure);
+    }
     return () => {
       live = false;
       controller.abort();
@@ -230,6 +250,10 @@ export default function WorkflowPage({ runId, projectId }: { runId?: string; pro
   const act = (path: string, data: Record<string, unknown> = {}) =>
     run && void submit(base + '/' + run.id + '/' + path, { expectedRevision: run.revision, ...data });
   const plan = run?.plans.at(-1);
+  const modular = run?.planningMode === 'modules';
+  const currentPlan = plan?.version === run?.version ? plan : undefined;
+  const currentJobs = run?.jobs.filter(j => j.version === run.version) ?? [];
+  const previousJobs = run?.jobs.filter(j => j.version !== run.version) ?? [];
   const finished = run && ['completed', 'cancelled'].includes(run.status);
   return (
     <main className="workflow-page">
@@ -241,7 +265,7 @@ export default function WorkflowPage({ runId, projectId }: { runId?: string; pro
         </nav>
         <header>
           <h1>{run ? '工作流详情' : projectId ? '创建项目工作流' : '多 agent 工作台'}</h1>
-          {run && <span className="wf-state">{label(run.status)}</span>}
+          {run && <span className="wf-state">{modular && run.status === 'designing' ? '主 agent 拆分中' : label(run.status)}</span>}
         </header>
         {(error || readError) && (
           <p role="alert" className="wf-alert">
@@ -255,7 +279,8 @@ export default function WorkflowPage({ runId, projectId }: { runId?: string; pro
                 e.preventDefault();
                 void submit(
                   base,
-                  { requirement: requirement.trim(), projectId: selectedProject, parallelism },
+                  { requirement: requirement.trim(), projectId: selectedProject, parallelism, planningMode,
+                    leadModelEntryId: leadModelEntryId || undefined, workerModelEntryId: workerModelEntryId || undefined },
                   true
                 );
               }}
@@ -281,6 +306,26 @@ export default function WorkflowPage({ runId, projectId }: { runId?: string; pro
                   rows={4}
                 />
               </label>
+              <label>计划方式
+                <select value={planningMode} onChange={e => setPlanningMode(e.target.value as WorkflowPlanningMode)}>
+                  <option value="modules">主 agent 拆分功能模块</option>
+                  <option value="reviewed">多方设计与评审</option>
+                </select>
+              </label>
+              <div className="wf-controls">
+                <label>主 agent 与集成模型
+                  <select value={leadModelEntryId} onChange={e => setLeadModel(e.target.value)}>
+                    <option value="">使用默认模型</option>
+                    {models?.map(m => <option value={m.id} key={m.id}>{m.label}</option>)}
+                  </select>
+                </label>
+                <label>执行 agent 模型
+                  <select value={workerModelEntryId} onChange={e => setWorkerModel(e.target.value)}>
+                    <option value="">跟随主 agent</option>
+                    {models?.map(m => <option value={m.id} key={m.id}>{m.label}</option>)}
+                  </select>
+                </label>
+              </div>
               <div className="wf-controls">
                 <label>
                   并行会话
@@ -291,7 +336,7 @@ export default function WorkflowPage({ runId, projectId }: { runId?: string; pro
                   </select>
                 </label>
                 <button className="primary-button" disabled={busy || !selectedProject || !requirement.trim()}>
-                  开始只读设计
+                  {planningMode === 'modules' ? '开始模块拆分' : '开始只读设计'}
                 </button>
               </div>
             </form>
@@ -324,17 +369,33 @@ export default function WorkflowPage({ runId, projectId }: { runId?: string; pro
             </div>
             {tab === '任务' && (
               <>
-                <h2>任务与会话</h2>
-                {run.jobs.map((j) => (
+                <h2>{modular ? '模块分工与会话' : '任务与会话'}</h2>
+                {(modular ? currentJobs : run.jobs).map((j) => (
                   <JobView key={j.id} j={j} run={run} retry={(id) => act('tasks/' + id + '/retry')} />
                 ))}
+                {modular && currentPlan && !currentJobs.some(j => j.spec) &&
+                  currentPlan.plan.tasks.map(t => (
+                    <article className="wf-job" key={t.key}>
+                      <strong>{t.title}</strong><small>{run.status === 'awaiting_approval' ? '待批准' : '未派工'}</small>
+                      <span className="wf-assignee">{deliveryRoles[t.role]} · {workflowModelForRole(run, t.role).model}</span>
+                      <p>{t.description}</p>
+                      <p>验收条件 · {t.acceptance}</p>
+                      {t.dependsOn.length > 0 && <p>依赖 {t.dependsOn.map(key => currentPlan.plan.tasks.find(d => d.key === key)?.title ?? key).join('、')}</p>}
+                    </article>
+                  ))}
+                {modular && previousJobs.length > 0 && (
+                  <details>
+                    <summary>历史分工与会话</summary>
+                    {previousJobs.map(j => <JobView key={j.id} j={j} run={run} retry={id => act('tasks/' + id + '/retry')} />)}
+                  </details>
+                )}
               </>
             )}
             {tab === '计划与审批' && (
               <>
-                {!run.plans.length && <p>方案评审结束后，冻结的计划会显示在这里。</p>}
+                {!run.plans.length && <p>{modular ? '等待主 agent 提交模块分工计划。' : '方案评审结束后，冻结的计划会显示在这里。'}</p>}
                 {run.plans.map((p) => (
-                  <PlanView key={p.id} plan={p} />
+                  <PlanView key={p.id} plan={p} modular={modular} />
                 ))}
                 {run.decisions.map((d) => (
                   <p key={d.id}>

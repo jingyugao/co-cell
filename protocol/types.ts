@@ -266,6 +266,7 @@ export interface ProjectReadOptions {
 }
 export type AgentKind = 'codex' | 'claude-code';
 export interface Session {
+  managedBy?: import("./workflow-types.js").WorkflowOwner;
   projectId?: string;
   id: string;
   /** Legacy sessions without this field use Codex. */
@@ -360,7 +361,7 @@ export interface AppConfig {
   codexVersion: string;
   auth: 'api-key' | 'local-codex';
   approvalPolicy: 'never';
-  capabilities: { interactiveApprovals: false; tokenDeltas: false; sandboxPreviews?: boolean; nativeWebSocket?: boolean; claudeCode?: boolean };
+  capabilities: { interactiveApprovals: false; tokenDeltas: false; sandboxPreviews?: boolean; nativeWebSocket?: boolean; workflows?: boolean; claudeCode?: boolean };
 }
 export type StreamMessage =
   | { type: 'snapshot'; session: Session }

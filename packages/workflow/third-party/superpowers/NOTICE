@@ -1,0 +1,5 @@
+CoCell adapts the design, plan decomposition, parallel dispatch, debugging,
+review, TDD and verification guidance from the MIT-licensed Superpowers project.
+See manifest.json for the reviewed revision and source files. CoCell owns
+scheduling, approval, workspace ownership, evidence and recovery. No upstream
+hooks, installation, worktrees, automatic Git operations or downloads run.

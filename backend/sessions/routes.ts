@@ -23,6 +23,16 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   const requireAllowedExecution = (mode: string | undefined) => {
     if (config.sandbox?.enabled && mode !== 'sandbox') throw new HttpError(403, '已启用容器执行，本机会话仅供查看历史；请在 Sandbox 项目中创建会话');
   };
+  app.use('/api/sessions/:id/*', async (c, next) => {
+    if (!['GET', 'HEAD'].includes(c.req.method) && !c.req.path.endsWith('/connection')
+      && (await manager.readMetadata(c.req.param('id')!)).managedBy) throw new HttpError(409, '此会话由工作台管理，请从工作台操作');
+    await next();
+  });
+  app.use('/api/sessions/:id', async (c, next) => {
+    if (['DELETE', 'PATCH'].includes(c.req.method) && (await manager.readMetadata(c.req.param('id')!)).managedBy)
+      throw new HttpError(409, '此会话由工作台管理，请从工作台操作');
+    await next();
+  });
   app.get('/api/sessions', async c => {
     c.header('Cache-Control', 'no-store');
     return c.json(await manager.listStored());
@@ -62,6 +72,7 @@ export function installSessionsRoutes(app: Hono, manager: SessionManager, config
   app.post('/api/sessions/:id/thread', async c => {
     const { threadId } = z.object({ threadId: z.string().min(1).max(191) }).strict().parse(await c.req.json());
     requireAllowedExecution((await manager.readMetadata(c.req.param('id'))).settings.executionMode);
+    if (await manager.isWorkflowThread(threadId)) throw new HttpError(409, '线程由工作台管理');
     return c.json(await manager.bindNativeThread(c.req.param('id'), threadId));
   });
   app.patch('/api/sessions/:id', async c => {

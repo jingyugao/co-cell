@@ -48,6 +48,10 @@ test('session engine survives relational round trips and legacy rows default to 
   assert.equal(values.length, columns.length);
   const row = Object.fromEntries(columns.map((column, index) => [column, values[index]]));
   assert.equal(sessionFromRow(row).agentKind, 'claude-code');
+  assert.equal(sessionFromRow(row).managedBy, undefined);
+  const managedBy = { kind: 'workflow' as const, runId: 'run', taskId: 'task', writable: false };
+  const managedValues = sessionValues({ ...session, agentKind: 'codex', managedBy });
+  assert.deepEqual(sessionFromRow(Object.fromEntries(columns.map((name,i)=>[name,managedValues[i]]))).managedBy,managedBy);
   assert.equal(row.model_reasoning_effort, 'medium:xhigh');
   assert.equal(sessionFromRow(row).settings.modelReasoningEffort, 'medium');
   assert.equal(sessionFromRow(row).settings.claudeEffort, 'xhigh');

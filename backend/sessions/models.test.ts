@@ -101,3 +101,95 @@ test('Claude sessions pin their managed entry and resolve channel edits before t
     assert.equal(calls.length, 2);
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
+
+test('managed workflow sessions keep their owner after restart and gate native turn submission', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'cocell-managed-'));
+  const store = new MemoryWebStateStore();
+  const at = new Date().toISOString();
+  const workingDirectory = '/home/agent/workspace';
+  const sandbox = { id: 'box', template: 'default', workingDirectory, status: 'ready' as const };
+  const defaults: Settings = {
+    executionMode: 'sandbox',
+    workingDirectory,
+    model: 'model',
+    modelReasoningEffort: 'low',
+    sandboxMode: 'danger-full-access',
+    networkAccessEnabled: true,
+    webSearchMode: 'disabled',
+  };
+  await store.saveProject({
+    id: 'project',
+    name: 'fixture',
+    executionMode: 'sandbox',
+    status: 'active',
+    requirementUrl: null,
+    workingDirectory,
+    sandbox,
+    createdAt: at,
+    updatedAt: at,
+  });
+  let sends = 0;
+  const native = {
+    async close() {},
+    async querySandbox() {
+      return sandbox;
+    },
+    async openNativeConnection() {
+      throw Error('unexpected relay');
+    },
+    async prepareNativeSession(s: Session) {
+      return { threadId: s.threadId, threadOptions: { sandbox: s.settings.sandboxMode }, turnOptions: {} };
+    },
+    async nativeRequest(
+      _session: Session,
+      method: string,
+      params: Record<string, unknown>,
+      guard?: () => Promise<void>
+    ) {
+      if (method === 'thread/start') {
+        assert.equal(params.sandbox, 'read-only');
+        return { thread: { id: 'thread' }, sandbox: { type: 'readOnly', networkAccess: false } };
+      }
+      if (method === 'thread/read') return { thread: { id: 'thread' } };
+      assert.equal(method, 'turn/start');
+      assert.deepEqual(params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+      await guard!();
+      sends++;
+      return { turn: { id: 'turn' } };
+    },
+  };
+  const open = () =>
+    new SessionManager({} as CodexClient, directory, defaults, store, native as unknown as SandboxRuntime);
+  const owner = { kind: 'workflow' as const, runId: 'run', taskId: 'design', writable: false };
+  let manager = open();
+  try {
+    await manager.init();
+    const s = await manager.ensureWorkflowSession('session', owner, 'project', '设计', 'model');
+    assert.deepEqual(s.managedBy, owner);
+    await manager.close();
+    manager = open();
+    await manager.init();
+    const restored = await manager.ensureWorkflowSession('session', owner, 'project', '设计', 'model');
+    assert.equal(restored.settings.sandboxMode, 'read-only');
+    assert.equal(restored.settings.networkAccessEnabled, false);
+    await assert.rejects(
+      manager.ensureWorkflowSession('session', { ...owner, writable: true }, 'project', '实施', 'model'),
+      /归属/
+    );
+    await assert.rejects(manager.startTurn('session', 'manual'), /工作台/);
+    assert.equal(await manager.prepareWorkflowThread('session'), 'thread');
+    assert.equal(await manager.isWorkflowThread('thread'), true);
+    await assert.rejects(
+      manager.submitWorkflowTurn('session', 'thread', 'prompt', {}, async () => {
+        throw Error('stale');
+      }),
+      /stale/
+    );
+    assert.equal(sends, 0);
+    assert.equal(await manager.submitWorkflowTurn('session', 'thread', 'prompt', {}, async () => {}), 'turn');
+    assert.equal(sends, 1);
+  } finally {
+    await manager.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

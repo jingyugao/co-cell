@@ -34,7 +34,7 @@ export interface SandboxRuntime {
   /** Native connections own transports only. App Server owns turn execution. */
   prepareNativeSession?(session: Session, signal: AbortSignal, onSandbox: SaveSandbox): Promise<Pick<NativeSessionConnection, 'threadId' | 'threadOptions' | 'turnOptions'>>;
   openNativeConnection?(session: Session, signal: AbortSignal): Promise<AppServerEndpoint & { release(): Promise<void> }>;
-  nativeRequest?(session: Session, method: string, params: unknown): Promise<any>;
+  nativeRequest?(session: Session, method: string, params: unknown, guard?: () => Promise<void>): Promise<any>;
   compaction?(session: Session, selector: CompactionSelector, threadId?: string, signal?: AbortSignal): Promise<CompactionContent | undefined>;
   uploadNativeImage?(session: Session, path: string): Promise<string>;
   observe?(session: Session, turn: Turn, signal: AbortSignal): AsyncGenerator<NativeTurnObservation>;
@@ -321,8 +321,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       observer.signal.throwIfAborted();
       const options = { workingDirectory: session.settings.workingDirectory, ...(session.settings.model ? { model: session.settings.model } : {}), ...modelOptions,
         modelReasoningEffort: session.settings.modelReasoningEffort, collaborationMode: session.settings.collaborationMode,
-        fastMode: session.settings.fastMode, sandboxMode: 'danger-full-access' as const,
-        webSearchMode: session.settings.webSearchMode, networkAccessEnabled: true, approvalPolicy: 'never' as const, skipGitRepoCheck: true, onInputRequest };
+        fastMode: session.settings.fastMode, sandboxMode: session.managedBy ? session.settings.sandboxMode : 'danger-full-access' as const,
+        webSearchMode: session.settings.webSearchMode, networkAccessEnabled: !session.managedBy, approvalPolicy: 'never' as const, skipGitRepoCheck: true, onInputRequest };
       const thread = session.threadId ? codex.resumeThread(session.threadId, options) : codex.startThread(options);
       const input = images.length ? [{ type: 'text' as const, text: turn.prompt }, ...images.map(path => ({ type: 'local_image' as const, path }))] : turn.prompt;
       const streamed = await thread.runStreamed(input, { signal });
@@ -353,12 +353,12 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       await this.prepareEnvironment(session, entry, signal);
       const model = await this.options.resolveModel?.(session);
       let effectiveModel = model?.model || session.settings.model;
-      const threadOptions = { cwd: session.settings.workingDirectory, approvalPolicy: 'never', sandbox: 'danger-full-access',
+      const threadOptions = { cwd: session.settings.workingDirectory, approvalPolicy: 'never', sandbox: session.managedBy ? session.settings.sandboxMode : 'danger-full-access',
         serviceTier: session.settings.fastMode ? 'fast' : 'default',
         ...(session.settings.model ? { model: session.settings.model } : {}),
         ...(model?.model ? { model: model.model } : {}), ...(model?.modelProvider ? { modelProvider: model.modelProvider } : {}),
         config: { web_search: session.settings.webSearchMode, 'features.fast_mode': true,
-          'sandbox_workspace_write.network_access': true } };
+          'sandbox_workspace_write.network_access': !session.managedBy } };
       const threadId = await this.reader.read(entry.metadata.id, async client => {
         // Provider definitions belong in native configuration. The browser only
         // needs the provider name, never a channel credential.
@@ -374,6 +374,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         if (!session.threadId) return null;
         const response = await client.request('thread/resume', { ...threadOptions, threadId: session.threadId, excludeTurns: true });
         if (session.threadId && model?.modelProvider && response.modelProvider && response.modelProvider !== model.modelProvider) {
+          if (session.managedBy) throw new HttpError(409, '工作台会话的模型渠道已改变');
           const forked = await client.request('thread/fork', { ...threadOptions, threadId: session.threadId });
           return forked.thread.id as string;
         }
@@ -393,7 +394,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     } catch (error) { await this.releaseEntry(entry, true); throw error; }
   }
 
-  async nativeRequest(session: Session, method: string, params: unknown) {
+  async nativeRequest(session: Session, method: string, params: unknown, guard?: () => Promise<void>) {
     if (!session.sandbox) throw new HttpError(409, '项目没有 Sandbox');
     return this.reader.read(session.sandbox.id, async client => {
       if (!['thread/start', 'thread/read', 'thread/turns/list'].includes(method) && session.threadId) {
@@ -401,6 +402,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
         if (thread.status?.type === 'notLoaded')
           await client.threadResume({ threadId: session.threadId, excludeTurns: true });
       }
+      await guard?.();
       return client.request(method, params);
     });
   }
@@ -730,6 +732,9 @@ export class ContainerCodexRuntime implements SandboxRuntime {
       const response = await client.request('thread/turns/list', { threadId: session.threadId,
         itemsView: 'full', sortDirection: 'desc', limit: options.limit ?? 20,
         ...(options.cursor ? { cursor: options.cursor } : {}) });
+      if (session.managedBy && (!Array.isArray(response.data) || response.data.some((t: { status?: string }) =>
+        !['completed','inProgress','interrupted','aborted','cancelled','canceled','failed'].includes(t.status ?? ''))))
+        throw new Error('工作台无法确认原生任务状态');
       return { turns: (response.data ?? []).map((rawTurn: any) => this.mapAppServerTurn(rawTurn)), nextCursor: response.nextCursor ?? null };
     }, options.signal).catch(error => { throw this.safeError(error); });
   }

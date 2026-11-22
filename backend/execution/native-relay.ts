@@ -11,6 +11,8 @@ import { NATIVE_CONNECTION_RENEW_METHOD, NATIVE_CONNECTION_TTL_MS,
 export type NativeRelayEvent = MessageObservation;
 
 export type NativeRelayOpen = {
+  managed?: boolean;
+  threadId?: string | null;
   sandboxId?: string;
   url: string;
   headers?: Record<string, string>;
@@ -21,6 +23,7 @@ export interface NativeRelayOptions {
   publicUrl: string;
   token: string;
   open(sessionId: string, signal: AbortSignal): Promise<NativeRelayOpen>;
+  isWorkflowThread?(threadId: string): Promise<boolean>;
   canRenew(sessionId: string, sandboxId: string | undefined): Promise<boolean>;
   leaseTtlMs?: number;
   observe?(event: NativeRelayEvent): Promise<void> | void;
@@ -48,6 +51,8 @@ type PendingRequest = {
 };
 
 type RelayConnection = {
+  managed?: boolean;
+  threadId?: string | null;
   id: string;
   sessionId: string;
   sandboxId?: string;
@@ -319,7 +324,35 @@ export function createNativeRelay(options: NativeRelayOptions) {
 
   function bind(connection: RelayConnection, initialMessages: Array<{ data: WebSocket.RawData; isBinary: boolean }> = []) {
     const forward = (source: WebSocket, destination: WebSocket, direction: NativeRelayEvent['direction']) => {
-      source.on('message', (data, isBinary) => forwardMessage(connection, destination, direction, data, isBinary));
+      let chain = Promise.resolve(), queuedBytes = 0, queuedFrames = 0;
+      source.on('message', (data, isBinary) => {
+        if (direction !== 'client' || (!options.isWorkflowThread && !connection.managed))
+          return forwardMessage(connection, destination, direction, data, isBinary);
+        const size = Array.isArray(data) ? data.reduce((n, part) => n + part.byteLength, 0) : data.byteLength;
+        queuedBytes += size;
+        if (++queuedFrames > MAX_PENDING_REQUESTS || queuedBytes > MAX_BUFFERED_BYTES)
+          return terminatePair(connection, 1013, 'Relay admission queue is full');
+        chain = chain.then(async () => {
+          if (connection.closing) return;
+          const message = parsedMessage(data);
+          const method = message?.method;
+          const params = message?.params ?? {};
+          const threadId = params.threadId;
+          let allowed = true;
+          if (connection.managed) {
+            allowed = !isBinary && (['initialize', 'initialized', NATIVE_CONNECTION_RENEW_METHOD].includes(method)
+              || (threadId && threadId === connection.threadId && (['thread/read','thread/turns/list'].includes(method)
+                || (method === 'thread/resume' && Object.keys(params).every(k => ['threadId', 'excludeTurns'].includes(k))))));
+          } else if (typeof threadId === 'string' && threadId !== connection.threadId && typeof method === 'string'
+            && !['thread/read', 'thread/turns/list'].includes(method)) {
+            allowed = !await options.isWorkflowThread?.(threadId);
+          }
+          if (allowed) forwardMessage(connection, destination, direction, data, isBinary);
+          else if (message?.id != null && connection.client.readyState === WebSocket.OPEN)
+            connection.client.send(JSON.stringify({ id: message.id, error: { code: -32003, message: '会话由工作台管理，请从工作台操作' } }));
+        }).catch(error => { safeOnError(options.onError, error); terminatePair(connection); })
+          .finally(() => { queuedBytes -= size; queuedFrames--; });
+      });
       source.on('error', error => { safeOnError(options.onError, error); terminatePair(connection); });
       source.on('close', () => {
         if (!connection.closing) {
@@ -479,7 +512,7 @@ export function createNativeRelay(options: NativeRelayOptions) {
           void releaseOpened().catch(error => safeOnError(options.onError, error));
           return;
         }
-        const relay: RelayConnection = { id: randomUUID(), sessionId, sandboxId: pendingSetup.sandboxId, client, upstream, release: releaseOpened,
+        const relay: RelayConnection = { id: randomUUID(), sessionId, managed: opened?.managed, threadId: opened?.threadId, sandboxId: pendingSetup.sandboxId, client, upstream, release: releaseOpened,
           requests: new Map(), pendingRequestCount: 0, pendingRequestBytes: 0, closing: false, released: false,
           leaseExpiresAt: 0, renewing: false };
         connectionOwned = true;

@@ -4,6 +4,8 @@ import { installMemoryRoutes } from './memory/routes.js';
 import type { MemoryService } from './memory/service.js';
 import { installKnowledgeRoutes } from './knowledge/routes.js';
 import type { KnowledgeService } from './knowledge/service.js';
+import { installWorkflowRoutes } from './workflows/routes.js';
+import type { WorkflowService } from './workflows/service.js';
 import { installReportRoutes } from './reports/routes.js';
 import type { ReportService } from './reports/service.js';
 import { installImageRoutes } from './images/routes.js';
@@ -35,7 +37,7 @@ import { installPwaAssets } from './infra/http/pwa.js';
 import { installFileFavoriteRoutes } from './file-favorites/routes.js';
 import type { FileFavoriteRepository } from './file-favorites/repository.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository, knowledge?: KnowledgeService, runtimeLog?: PageLoadLogWriter, reports?: ReportService) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository, knowledge?: KnowledgeService, runtimeLog?: PageLoadLogWriter, reports?: ReportService, workflows?: WorkflowService) {
   const app = new Hono();
   app.get('/healthz', c => c.text('ok'));
   app.use('/api/*', traceHttpRequest);
@@ -52,7 +54,8 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
       || c.req.method === 'POST' && /^\/api\/projects\/[^/]+\/(?:open|sandbox\/resume)$/.test(pathname);
     const sessionScoped = c.req.method === 'GET' && pathname === '/api/sessions'
       || /^\/api\/sessions\/[^/]+(?:\/|$)/.test(pathname);
-    if (pathname === '/api/diagnostics/page-load' && c.req.method === 'POST'
+    if (pathname === '/api/workflow-runs' || pathname.startsWith('/api/workflow-runs/')
+      || pathname === '/api/diagnostics/page-load' && c.req.method === 'POST'
       || pathname.startsWith('/api/tool-runtime/') || projectScoped || sessionScoped) return next();
     await manager.refreshSharedState();
     await next();
@@ -109,6 +112,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   installMemoryRoutes(app, memory);
   installKnowledgeRoutes(app, knowledge);
   installReportRoutes(app, reports);
+  installWorkflowRoutes(app, workflows);
   installFileFavoriteRoutes(app, manager, fileFavorites);
   installProjectsRoutes(app, manager, operatorAccess?.previewSubdomains
     ? { publicUrl: operatorAccess.publicUrl, token: operatorAccess.token } : undefined, images);

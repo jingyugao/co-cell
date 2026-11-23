@@ -3,6 +3,8 @@ import type { Project } from '../../../protocol/types';
 import type { FileFavorite } from '../../../protocol/file-favorite-types.js';
 import type { WorkspaceFilePreview } from '../../../protocol/workspace-types';
 import { loadWorkspaceFile } from '../../lib/workspace-files';
+import { isDelimitedText } from '../../../util/workspace-file-formats';
+import { DocumentPreview } from './DocumentPreview';
 import { api, errorMessage } from '../../lib/api';
 import { fileContentUrl, fileViewUrl } from '../../lib/resource-links';
 import Markdown, { type FileSelection } from '../chat/Markdown';
@@ -28,17 +30,21 @@ export function WorkspaceFileView({ file, onOpenFile, onClose }: {
   const [favoriteLoaded, setFavoriteLoaded] = useState(false);
   const [favoriteBusy, setFavoriteBusy] = useState(false);
   const [favoriteError, setFavoriteError] = useState('');
-  const [source, setSource] = useState(Boolean(file.line));
+  const selectionKey = `${fileKey}\0${file.line ?? ''}`;
+  const [view, setView] = useState<{ selection: string; mode: 'preview' | 'source' | 'table-source' }>();
+  const mode = view?.selection === selectionKey ? view.mode : file.line ? 'table-source' : 'preview';
+  const source = mode !== 'preview';
+  const tableAsSource = mode === 'table-source';
   const body = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const controller = new AbortController();
     setResult(null); setError(''); setLoading(true);
-    void loadWorkspaceFile(file.projectId, file.path, controller.signal)
+    void loadWorkspaceFile(file.projectId, file.path, controller.signal, tableAsSource)
       .then(value => { if (!controller.signal.aborted) setResult(value); })
       .catch(reason => { if (!controller.signal.aborted) setError(errorMessage(reason)); })
       .finally(() => { if (!controller.signal.aborted) { setLoading(false); } });
     return () => { controller.abort(); };
-  }, [file.projectId, file.path, retry]);
+  }, [file.projectId, file.path, retry, tableAsSource]);
   useEffect(() => {
     const controller = new AbortController();
     setFavoriteId(null); setFavoriteLoaded(false); setFavoriteError('');
@@ -52,7 +58,6 @@ export function WorkspaceFileView({ file, onOpenFile, onClose }: {
       .catch(reason => { if (!controller.signal.aborted) { setFavoriteError(`无法读取收藏状态：${errorMessage(reason)}`); setFavoriteLoaded(true); } });
     return () => controller.abort();
   }, [file.projectId, file.path]);
-  useEffect(() => { setSource(Boolean(file.line)); }, [file.path, file.line]);
   useEffect(() => {
     if (!result) return;
     const target = file.line ? body.current?.querySelector(`[data-line="${file.line}"]`) : null;
@@ -65,7 +70,10 @@ export function WorkspaceFileView({ file, onOpenFile, onClose }: {
     } else body.current?.scrollTo(0, 0);
   }, [result, file.line, file.fragment, source]);
   const markdown = /\.(?:md|markdown)$/i.test(file.path);
-  const download = fileContentUrl(file.projectId, file.path) + '&download=1';
+  const table = result && isDelimitedText(result.mimeType) && (result.kind === 'document' || result.size > 0);
+  const contentUrl = fileContentUrl(file.projectId, file.path);
+  const download = contentUrl + '&download=1';
+  const mediaError = () => setError('浏览器无法显示此文件，可下载原文件查看。');
   async function toggleFavorite() {
     if (favoriteBusy || !favoriteLoaded) return;
     const requestFileKey = fileKey;
@@ -92,9 +100,11 @@ export function WorkspaceFileView({ file, onOpenFile, onClose }: {
       <button className={`workspace-file-favorite${favoriteId ? ' selected' : ''}`} onClick={() => void toggleFavorite()} disabled={favoriteBusy || !favoriteLoaded} aria-pressed={Boolean(favoriteId)} title={favoriteId ? '取消收藏文件' : '收藏文件'}>
         <Icon name="bookmark" size={14} />{favoriteBusy ? '保存中…' : !favoriteLoaded ? '检查中…' : favoriteId ? '已收藏' : '收藏'}
       </button>
-      {result?.kind === 'text' && markdown && <button onClick={() => setSource(value => !value)}>{source ? '阅读模式' : '查看源码'}</button>}
+      {((result?.kind === 'text' && markdown) || table) && <button onClick={() => setView({
+        selection: selectionKey, mode: source ? 'preview' : table ? 'table-source' : 'source',
+      })}>{source ? '阅读模式' : '查看源码'}</button>}
       <button onClick={() => setRetry(value => value + 1)} disabled={loading}>刷新</button>
-      <a href={fileContentUrl(file.projectId, file.path)} target="_blank" rel="noopener noreferrer">浏览器查看 ↗</a>
+      <a href={contentUrl} target="_blank" rel="noopener noreferrer">浏览器查看 ↗</a>
       <a href={download} download={result?.name || file.path.split('/').pop()}>下载</a>
       {onClose && <a href={fileViewUrl(file.projectId, file.path, file.line, file.fragment)} target="_blank" rel="noopener noreferrer">独立打开 ↗</a>}
       {result && <span>{result.size.toLocaleString()} 字节 · {result.source === 'backup'
@@ -106,7 +116,10 @@ export function WorkspaceFileView({ file, onOpenFile, onClose }: {
       {loading && <p role="status"><span className="spinner" />正在读取文件，归档文件可能需要较长时间…</p>}
       {error && <div className="inline-error" role="alert">{error}</div>}
       {!loading && result?.kind === 'text' && result.truncated && <p role="status">仅预览前 1 MiB 内容，下载可查看完整文件。</p>}
-      {!loading && result?.kind === 'image' && <img className="workspace-file-image" src={fileContentUrl(file.projectId, file.path)} alt={result.name} />}
+      {!loading && result?.kind === 'image' && <img className="workspace-file-image" src={contentUrl} alt={result.name} onError={mediaError} />}
+      {!loading && result?.kind === 'audio' && <audio aria-label={result.name} controls preload="metadata" src={contentUrl} onError={mediaError} />}
+      {!loading && result?.kind === 'video' && <video aria-label={result.name} controls playsInline preload="metadata" src={contentUrl} onError={mediaError} />}
+      {!loading && result?.kind === 'document' && <DocumentPreview file={result} url={contentUrl} />}
       {!loading && result?.kind === 'text' && (markdown && !source
         ? <Markdown text={result.text ?? ''} projectId={file.projectId} workingDirectory={file.workingDirectory}
             baseDirectory={file.path.slice(0, file.path.lastIndexOf('/')) || '/'} onOpenFile={next => onOpenFile({ ...next, projectId: file.projectId, workingDirectory: file.workingDirectory })} />

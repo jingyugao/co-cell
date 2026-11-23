@@ -1,3 +1,5 @@
+import { isWorkspaceFileName } from '../../util/workspace-file-formats';
+
 /** Link resolution is contextual; the server remains responsible for realpath and access checks. */
 export type ResourceContext = {
   projectId?: string;
@@ -14,7 +16,6 @@ export type ResourceLink =
 
 const localHosts = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '[::]']);
 const localAddress = /^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):\d{1,5}(?:[/?#]|$)/i;
-const documentExtensions = /\.(?:md|mdx|txt|go|js|jsx|ts|tsx|mjs|cjs|json|yaml|yml|toml|xml|html|htm|css|scss|less|py|php|sh|bash|zsh|sql|rs|java|c|h|cc|cpp|hpp|cs|rb|vue|svelte|proto|lock|log|csv|tsv|pdf|png|jpe?g|gif|webp|svg|ico|zip|gz|tar|wasm|ipynb)$/i;
 // A deliberately conservative domain heuristic. Explicit schemes always take precedence.
 const domainTlds = new Set(['com', 'org', 'net', 'edu', 'gov', 'mil', 'int', 'io', 'ai', 'app', 'dev', 'site', 'cn', 'uk', 'de', 'fr', 'jp', 'us', 'co', 'me', 'info', 'biz', 'xyz', 'tech', 'cloud', 'online', 'store', 'tv']);
 const sharedDocs = '/home/agent/workspace/.cocell/codex/docs';
@@ -38,7 +39,7 @@ function looksLikeDomain(value: string): boolean {
   const authority = value.split(/[/?#]/, 1)[0];
   const host = authority.replace(/:\d{1,5}$/, '');
   const labels = host.toLowerCase().split('.');
-  if (labels[0] !== 'www' && documentExtensions.test(host)) return false;
+  if (labels[0] !== 'www' && isWorkspaceFileName(host)) return false;
   return labels.length >= 2 && labels.every(label => /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label))
     && (labels[0] === 'www' || domainTlds.has(labels.at(-1)!));
 }
@@ -84,7 +85,7 @@ export function resolveResource(href: string, context: ResourceContext): Resourc
       explicitFile = true;
     } catch { return null; }
   } else if (/^[a-z][a-z0-9+.-]*:/i.test(input)
-    && !(documentExtensions.test(input.split(':', 1)[0]) && /:\d+(?::\d+)?(?:[?#].*)?$/.test(input))) {
+    && !(isWorkspaceFileName(input.split(':', 1)[0]) && /:\d+(?::\d+)?(?:[?#].*)?$/.test(input))) {
     return null;
   }
 
@@ -106,7 +107,7 @@ export function resolveResource(href: string, context: ResourceContext): Resourc
 
   if (!decodedPath.startsWith('/')) {
     const base = context.baseDirectory ? absolutePath(context.baseDirectory) : workingDirectory;
-    if (!base || (!explicitFile && !context.baseDirectory && !/^\.{1,2}\//.test(decodedPath) && !documentExtensions.test(decodedPath))) return null;
+    if (!base || (!explicitFile && !context.baseDirectory && !/^\.{1,2}\//.test(decodedPath) && !isWorkspaceFileName(decodedPath))) return null;
     // In a chat, a bare phrase ending in an extension is not enough evidence of a path.
     // Explicit ./ paths, document-relative links and percent-encoded filenames remain supported.
     if (!context.baseDirectory && !/^\.{1,2}\//.test(rawPath) && /\s/.test(rawPath)) return null;

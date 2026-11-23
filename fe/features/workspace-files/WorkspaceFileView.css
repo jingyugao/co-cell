@@ -15,6 +15,9 @@
 .workspace-file-body { flex: 1; min-height: 0; overflow: auto; padding: 24px; }
 .workspace-file-body > [role=status] { display: flex; align-items: center; gap: 10px; font-size: 13px; }
 .workspace-file-image { display: block; max-width: 100%; height: auto; margin: auto; }
+.workspace-file-body > video, .workspace-file-body > audio { display: block; width: 100%; max-height: 100%; }
+.workspace-document, .workspace-document > div { height: 100%; min-height: 280px; }
+.workspace-document .zrimo-ui__toolbar { overflow-x: auto; }
 .workspace-file-source { margin: 0; font: 12px/1.8 ui-monospace, monospace; tab-size: 4; min-width: max-content; }
 .workspace-file-source > div { display: flex; min-height: 1.8em; }
 .workspace-file-source .selected { background: #f5e7b1; }

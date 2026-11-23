@@ -1,4 +1,5 @@
 import type { WorkspaceFilePreview } from '../../protocol/workspace-types';
+import { isDelimitedText, workspacePreviewKind } from '../../util/workspace-file-formats';
 import { fileContentUrl } from './resource-links';
 
 const MAX_PREVIEW_BYTES = 1024 * 1024;
@@ -18,15 +19,19 @@ async function check(response: Response) {
 }
 
 /** Headers classify the file; text previews use a bounded byte range. */
-export async function loadWorkspaceFile(projectId: string, path: string, signal: AbortSignal): Promise<WorkspaceFilePreview> {
+export async function loadWorkspaceFile(projectId: string, path: string, signal: AbortSignal, tableAsSource = false): Promise<WorkspaceFilePreview> {
   const url = fileContentUrl(projectId, path);
   const head = await fetch(url, { method: 'HEAD', signal, cache: 'no-cache' });
   await check(head);
-  const mimeType = head.headers.get('content-type') ?? 'application/octet-stream';
+  const mimeType = head.headers.get('content-type')?.split(';')[0].trim().toLowerCase() || 'application/octet-stream';
+  const kind = workspacePreviewKind(mimeType);
   const file: WorkspaceFilePreview = { path, name: path.split('/').pop() || 'download',
-    size: Number(head.headers.get('content-length') ?? 0), mimeType, kind: 'binary', ...sourceMetadata(head) };
-  if (/^image\/(?:png|jpeg|gif|webp)(?:;|$)/i.test(mimeType)) { file.kind = 'image'; return file; }
-  if (!mimeType.startsWith('text/')) return file;
+    size: Number(head.headers.get('content-length') ?? 0), mimeType, kind, ...sourceMetadata(head) };
+  if (isDelimitedText(mimeType) && !tableAsSource && head.headers.get('content-length') !== '0') {
+    return { ...file, kind: 'document' };
+  }
+  if (kind !== 'text') return file;
+  file.kind = 'binary'; // Upgrade to text only after validating the bounded UTF-8 content.
   // Empty files have no satisfiable byte range.
   const response = await fetch(url, { signal, cache: 'no-cache',
     headers: file.size === 0 ? {} : { Range: `bytes=0-${MAX_PREVIEW_BYTES - 1}` } });

@@ -12,7 +12,8 @@ export interface WorkspaceFile {
  * Supports byte ranges (206/416), Last-Modified and conditional requests (304).
  * Content-Length on HEAD describes the full file; on 206 it describes the range.
  */
-export interface WorkspaceFilePreview extends WorkspaceFile {
+export interface WorkspaceFilePreview extends Omit<WorkspaceFile, 'kind'> {
+  kind: WorkspaceFile['kind'] | 'document' | 'audio' | 'video';
   truncated?: boolean;
   source?: 'live' | 'volume' | 'backup';
   backupCreatedAt?: string;

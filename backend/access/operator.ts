@@ -153,7 +153,8 @@ export function installOperatorAccess(app: Hono, options: OperatorAccessOptions)
     c.header('X-Frame-Options', 'DENY');
     if (c.res.headers.get('content-type')?.toLowerCase().includes('text/html') &&
       !c.res.headers.has('content-security-policy')) {
-      c.header('Content-Security-Policy', "script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+      // Office previews instantiate bundled WASM parsers in worker threads.
+      c.header('Content-Security-Policy', "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
     }
   });
   const setSessionCookie = (c: Context, scope: 'operator' | 'preview', requestHost = host) => {

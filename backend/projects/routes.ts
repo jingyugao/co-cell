@@ -9,7 +9,7 @@ import { serviceHost } from './service-host.js';
 import { PROJECT_OPERATION_WAIT_MS } from '../../protocol/types.js';
 import { resumeStream } from './resume-stream.js';
 
-type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'createProjectSandbox' | 'restoreProjectSandbox' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'releaseProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
+type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'createProjectSandbox' | 'restoreProjectSandbox' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'ensureProjectAwake' | 'releaseProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
 
 function projectOperationResponse(c: Context, project: Awaited<ReturnType<ProjectRoutesManager['enterProject']>>) {
   return c.json(project, 200);
@@ -65,6 +65,8 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
   });
   app.post('/api/projects/:id/open', async c => projectOperationResponse(c,
     await manager.enterProject(c.req.param('id'), c.req.raw.signal)));
+  app.post('/api/projects/:id/sandbox/ensure-awake', async c =>
+    c.json(await manager.ensureProjectAwake(c.req.param('id'), c.req.raw.signal)));
   app.post('/api/projects/:id/sandbox/resume', async c => {
     const id = c.req.param('id');
     if (c.req.header('Accept')?.split(',').some(type => type.trim().split(';')[0] === 'text/event-stream'))

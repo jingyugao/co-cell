@@ -452,10 +452,11 @@ export function useNativeSession({ selected, enabled, session, setSession, onErr
     }
   }, [refreshHistory]);
 
-  const waitUntilConnected = useCallback(async () => {
+  const waitUntilConnected = useCallback(async (sessionId?: string) => {
+    const ready = () => connectedRef.current && (!sessionId || (connectionRef.current?.session.id === sessionId && sessionRef.current?.id === sessionId));
     const deadline = Date.now() + 15_000;
-    while (!connectedRef.current && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
-    if (!connectedRef.current) throw new Error('Codex App Server 连接超时，请稍后重试。');
+    while (!ready() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+    if (!ready()) throw new Error('Codex App Server 连接超时，请稍后重试。');
   }, []);
 
   const stop = useCallback(async () => {

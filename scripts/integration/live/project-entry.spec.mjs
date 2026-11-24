@@ -100,7 +100,7 @@ test('real browser: read-only project entry, explicit resume, and draft retentio
     assert.deepEqual(lifecycleWrites, [], 'Entering a ready project must not submit resume');
     return { projectId: id, sandboxId: box, entryMs: performance.now() - start };
   });
-  await env.step('Reopen the checkpointed project without resume, then resume only after an explicit click', async () => {
+  await env.step('Reload the checkpointed project without waking it, then manually resume', async () => {
     await projectList(page);
     const checkpointed = await env.json(`/api/projects/${id}/sandbox/checkpoint`, { method: 'POST', expectedStatus: 200, timeoutMs: env.config.operationTimeout });
     assert.equal(checkpointed.sandboxOperation.status, 'succeeded');
@@ -108,17 +108,16 @@ test('real browser: read-only project entry, explicit resume, and draft retentio
     assert.equal(checkpointed.sandboxBackup, undefined, 'Checkpoint must not launch disk backup');
 
     await page.reload();
-    const card = page.getByRole('article', { name: env.name('browser'), exact: true });
     const entry = page.waitForResponse(response => response.request().method() === 'GET'
       && new URL(response.url()).pathname === `/api/projects/${id}`, { timeout: env.config.operationTimeout });
-    await card.getByRole('button', { name: '进入项目' }).click();
+    await page.goto(`/projects/${id}`);
     const paused = await entry;
     assert.equal(paused.status(), 200);
     const observed = await paused.json();
     assert.equal(observed.sandbox.status, 'paused');
     assert.equal(observed.sandboxOperation.kind, 'checkpoint');
     await expect(editor).toBeEditable(); await expect(editor).toHaveValue('创建时输入的草稿');
-    await expect(send).toBeDisabled();
+    await expect(send).toBeEnabled();
     assert.deepEqual(lifecycleWrites, [], 'Viewing a paused project must not resume it');
 
     await projectList(page);
@@ -200,5 +199,22 @@ test('real browser: read-only project entry, explicit resume, and draft retentio
       resumeProgress: progress.map(({ stage, elapsedMs, remoteStatus, remoteStage, resumePath }) => ({ stage, elapsedMs,
         ...(remoteStatus === undefined ? {} : { remoteStatus }), ...(remoteStage === undefined ? {} : { remoteStage }),
         ...(resumePath === undefined ? {} : { resumePath }) })) };
+  });
+  await env.step('Entering a paused project wakes the same Box once', async () => {
+    await projectList(page);
+    await env.json(`/api/projects/${id}/sandbox/checkpoint`, { method: 'POST', timeoutMs: env.config.operationTimeout });
+    await page.reload();
+    const response = page.waitForResponse(r => r.request().method() === 'POST' &&
+      new URL(r.url()).pathname === `/api/projects/${id}/sandbox/ensure-awake`, { timeout: env.config.operationTimeout });
+    await page.getByRole('article', { name: env.name('browser'), exact: true }).getByRole('button', { name: '进入项目' }).click();
+    const result = await response;
+    assert.equal(result.status(), 200);
+    const awake = await result.json();
+    assert.equal(awake.sandbox.id, box);
+    assert.equal(awake.sandbox.status, 'ready');
+    assert.equal(awake.sandboxOperation.kind, 'resume');
+    assert.equal(awake.sandboxOperation.status, 'succeeded');
+    await expect(editor).toHaveValue('创建时输入的草稿');
+    return { sandboxId: awake.sandbox.id, operationId: awake.sandboxOperation.id };
   });
 });

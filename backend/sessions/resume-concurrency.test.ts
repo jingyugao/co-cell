@@ -8,6 +8,7 @@ import type { SandboxResumeProgress } from '@co-cell/sandbox';
 import { installProjectsRoutes } from '../projects/routes.js';
 import type { Project, Settings } from '../../protocol/types.js';
 import type { SandboxRuntime } from '../execution/container-runtime.js';
+import { MemoryCoordinator } from '../infra/storage/coordination.js';
 import { MemoryWebStateStore } from '../testing/memory-web-state.js';
 import { SessionManager, type CodexClient } from './manager.js';
 
@@ -20,7 +21,7 @@ const initialProject = (): Project => ({ id: 'resume-project', name: 'Resume tes
     workingDirectory: settings.workingDirectory, pausedAt: at } });
 
 async function fixture(resume: (target: Parameters<NonNullable<SandboxRuntime['resume']>>[0], observeStatus: (status: 'paused' | 'ready') => void,
-  onProgress?: (event: SandboxResumeProgress) => void) => Promise<void>) {
+  onProgress?: (event: SandboxResumeProgress) => void) => Promise<void>, coordinator?: MemoryCoordinator) {
   const directory = await mkdtemp(join(tmpdir(), 'cocell-resume-contract-'));
   const state = new MemoryWebStateStore();
   await state.saveProject(initialProject());
@@ -34,7 +35,7 @@ async function fixture(resume: (target: Parameters<NonNullable<SandboxRuntime['r
     },
   } satisfies Partial<SandboxRuntime>;
   const makeManager = async () => {
-    const manager = new SessionManager({} as CodexClient, directory, settings, state, runtime as SandboxRuntime);
+    const manager = new SessionManager({} as CodexClient, directory, settings, state, runtime as SandboxRuntime, undefined, undefined, undefined, {}, undefined, coordinator);
     await manager.init();
     return manager;
   };
@@ -69,6 +70,45 @@ test('project entry is read-only; each explicit resume submits once and surfaces
     const latest = await f.state.getProject('resume-project');
     assert.equal(latest?.sandboxOperation?.status, 'failed');
     assert.equal(latest?.sandboxOperation?.errorCode, 'BUSY');
+  } finally { await f.close(); }
+});
+
+test('simultaneous activity on two API replicas resumes the bound Box once', async () => {
+  let calls = 0;
+  let signalStarted!: () => void, finish!: () => void;
+  const started = new Promise<void>(resolve => { signalStarted = resolve; });
+  const resumed = new Promise<void>(resolve => { finish = resolve; });
+  const f = await fixture(async (_box, observe) => {
+    calls++;
+    signalStarted();
+    await resumed;
+    observe('ready');
+  }, new MemoryCoordinator());
+  const other = await f.makeManager();
+  try {
+    const first = f.manager.ensureProjectAwake('resume-project');
+    const second = other.ensureProjectAwake('resume-project');
+    await started;
+    const joined = other.ensureProjectAwake('resume-project');
+    finish();
+    for (const project of await Promise.all([first, second, joined])) {
+      assert.equal(project.sandbox?.id, 'resume-box');
+      assert.equal(project.sandbox?.status, 'ready');
+    }
+    await other.ensureProjectAwake('resume-project');
+    assert.equal(calls, 1);
+  } finally { finish(); await other.close(); await f.close(); }
+});
+
+test('activity cannot create or restore a released, archived or completed project', async () => {
+  let calls = 0;
+  const f = await fixture(async () => { calls++; });
+  try {
+    for (const patch of [{ sandbox: undefined }, { status: 'archived' }, { status: 'completed' }] as const) {
+      await f.state.saveProject({ ...initialProject(), ...patch });
+      await assert.rejects(f.manager.ensureProjectAwake('resume-project'), /没有可唤醒/);
+    }
+    assert.equal(calls, 0);
   } finally { await f.close(); }
 });
 
@@ -116,7 +156,8 @@ test('unknown resume outcome remains unknown across reads and startup without re
     assert.equal(f.queryCalls(), readsBefore + 1);
 
     restarted = await f.makeManager();
-    assert.equal(calls, 1, 'startup observes the unknown operation and does not take it over');
+    await assert.rejects(restarted.ensureProjectAwake('resume-project'), /response lost/);
+    assert.equal(calls, 1, 'neither startup nor user activity replays an unknown operation');
     assert.equal((await f.state.getProject('resume-project'))?.sandboxOperation?.status, 'unknown');
   } finally {
     if (restarted) await restarted.close();

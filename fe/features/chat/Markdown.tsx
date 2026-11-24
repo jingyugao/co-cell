@@ -4,6 +4,8 @@ import remarkCjkFriendly from 'remark-cjk-friendly/parseOnly';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import { projectAwakePath } from '../../../protocol/resume-types';
+import { api, errorMessage } from '../../lib/api';
 import { MermaidDiagram } from './MermaidDiagram';
 import { fileContentUrl, fileViewUrl, resolveResource, type ResourceContext } from '../../lib/resource-links';
 
@@ -79,6 +81,24 @@ function remarkLocalServices() {
   return walk;
 }
 
+// Open synchronously while the click still has browser user activation.
+async function openServicePreview(projectId: string, url: string) {
+  const tab = window.open('about:blank', '_blank');
+  if (tab) {
+    tab.opener = null;
+    tab.document.title = '沙箱服务预览';
+    tab.document.body.textContent = '正在连接沙箱服务…';
+  }
+  try {
+    await api(projectAwakePath(projectId), { method: 'POST' });
+    if (!tab) window.location.assign(url);
+    else if (!tab.closed) tab.location.replace(url);
+  } catch (error) {
+    if (tab && !tab.closed) tab.document.body.textContent = errorMessage(error);
+    else if (!tab) window.alert(errorMessage(error));
+  }
+}
+
 export function MarkdownLink({ href, resources, children, ...props }: ComponentProps<'a'> & { resources: MarkdownResources }) {
   const resource = href ? resolveResource(href, resources) : null;
   const [selectingFileLink, setSelectingFileLink] = useState(false);
@@ -119,8 +139,20 @@ export function MarkdownLink({ href, resources, children, ...props }: ComponentP
       document.addEventListener('pointercancel', finish, options);
       document.defaultView?.addEventListener('blur', restore, { signal: events.signal });
     }}
+    onAuxClick={event => {
+      props.onAuxClick?.(event);
+      if (!event.defaultPrevented && event.button === 1 && resource?.kind === 'service' && resources.projectId) {
+        event.preventDefault();
+        void openServicePreview(resources.projectId, target);
+      }
+    }}
     onClick={event => {
       props.onClick?.(event);
+      if (!event.defaultPrevented && resource?.kind === 'service' && resources.projectId) {
+        event.preventDefault();
+        void openServicePreview(resources.projectId, target);
+        return;
+      }
       const start = filePointerStart.current;
       filePointerStart.current = undefined;
       if (start && event.detail > 0 && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 3) {

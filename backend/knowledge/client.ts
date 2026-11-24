@@ -1,43 +1,20 @@
-import { createHash } from 'node:crypto';
 import { redactCredentials } from '../../util/errors.js';
 
 const REQUEST_TIMEOUT_MS = 30_000;
-
-export interface RetainRequest {
-  async: true;
-  operation_id: string;
-  items: Array<{
-    content: string;
-    document_id: string;
-    timestamp: string;
-    context: string;
-    metadata: Record<string, string>;
-    tags: string[];
-    observation_scopes: 'shared';
-    update_mode: 'replace';
-  }>;
-}
-
-export interface HindsightOperation {
-  status: string;
-  error_message?: string;
-  child_operations?: Array<{ status: string; error_message?: string }>;
-}
 
 export interface KnowledgeNode {
   id: string;
   kind: 'folder' | 'page';
   name: string;
   children?: KnowledgeNode[];
-  mental_model_id?: string;
+  mental_model_id?: string | null;
+  is_stale?: boolean | null;
 }
 
 export interface HindsightModel {
   id: string;
-  source_query: string;
+  source_query: string | null;
   content: string | null;
-  tags: string[];
-  trigger: Record<string, unknown>;
   last_refreshed_at?: string | null;
   last_refresh_failed_at?: string | null;
   is_stale?: boolean;
@@ -61,21 +38,29 @@ function canonicalBase(value: string): URL {
 }
 
 export class HindsightClient {
-  readonly target: string;
   readonly bankId: string;
   private readonly baseUrl: URL;
 
   constructor(options: { url: string; bankId: string; apiKey?: string }) {
     const bankId = options.bankId.trim();
-    if (!/^[A-Za-z0-9_-]{1,128}$/.test(bankId)) throw new Error('Hindsight bank ID is invalid');
+    if (!/^[A-Za-z0-9_-][A-Za-z0-9_.:-]{0,127}$/.test(bankId)) throw new Error('Hindsight bank ID is invalid');
     this.baseUrl = canonicalBase(options.url);
     this.bankId = bankId;
     this.apiKey = options.apiKey;
-    const canonicalTarget = `${this.baseUrl.origin}${this.baseUrl.pathname}\0${bankId}`;
-    this.target = createHash('sha256').update(canonicalTarget).digest('hex');
   }
 
   private readonly apiKey?: string;
+
+  get origin() { return this.baseUrl.href; }
+
+  async version(): Promise<{ api_version: string }> {
+    const prefix = this.baseUrl.href.replace(/\/+$/, '');
+    try { return await this.fetchJson(new URL(prefix + '/v1/version')); }
+    catch (error) {
+      if (!(error instanceof HindsightError) || error.status !== 404) throw error;
+      return this.fetchJson(new URL(prefix + '/version'));
+    }
+  }
 
   async request<T>(path: string, options: { method?: string; body?: unknown; signal?: AbortSignal } = {}): Promise<T> {
     const relativePath = path.replace(/^\/+/, '');
@@ -86,6 +71,10 @@ export class HindsightClient {
     const prefix = this.baseUrl.pathname.replace(/\/+$/, '');
     const apiRoot = `${prefix}/v1/default/banks/${encodeURIComponent(this.bankId)}`;
     const url = new URL(relativePath ? `${apiRoot}/${relativePath}` : apiRoot, this.baseUrl.origin);
+    return this.fetchJson<T>(url, options);
+  }
+
+  private async fetchJson<T>(url: URL, options: { method?: string; body?: unknown; signal?: AbortSignal } = {}): Promise<T> {
     const headers = new Headers({ accept: 'application/json' });
     if (this.apiKey) headers.set('authorization', `Bearer ${this.apiKey}`);
     if (options.body !== undefined) headers.set('content-type', 'application/json');

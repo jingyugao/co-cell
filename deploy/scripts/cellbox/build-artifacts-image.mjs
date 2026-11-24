@@ -14,7 +14,7 @@ try {
   }
   context = await mkdtemp(join(tmpdir(), 'cocell-artifacts-'));
   const files = [];
-  for (const [name, pkg] of [['codex.tgz', runtimePackages.codex], ['codex-linux-x64.tgz', runtimePackages.codexLinuxX64]]) {
+  for (const [name, pkg] of [['codex.tgz', runtimePackages.codex], ['codex-linux-x64.tgz', runtimePackages.codexLinuxX64], ['hindsight-coding-agents.tgz', runtimePackages.hindsightHooks]]) {
     if (pkg.file !== name) throw new Error(`Unexpected package filename: ${pkg.file}`);
     const destination = join(context, name);
     await copyFile(join(root, 'deploy/box-wrap/artifacts', name), destination);

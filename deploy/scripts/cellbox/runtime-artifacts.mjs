@@ -27,13 +27,13 @@ export async function validateArtifacts(root, { baseImageId, packages = runtimeP
     if (!canonical.startsWith(root + sep) || !(await lstat(path)).isFile()) throw new Error('Artifact must be a regular file inside the bundle');
     if (await fileHash(path) !== file.sha256) throw new Error(`Artifact checksum mismatch: ${file.path}`);
   }
-  for (const file of [packages.codex.file, packages.codexLinuxX64.file, packages.claudeAcp.file, packages.restic.file]) {
+  for (const file of [packages.codex.file, packages.codexLinuxX64.file, packages.hindsightHooks.file, packages.claudeAcp.file, packages.restic.file]) {
     if (!paths.has(file)) throw new Error(`Required artifact missing: ${file}`);
   }
   const debs = await readdir(resolve(root, 'debs')).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
   for (const name of debs) if (name.endsWith('.deb') && !paths.has('debs/' + name)) throw new Error(`Unverified system artifact: ${name}`);
   // Verify publisher checksums independently of the locally generated manifest.
-  for (const artifact of [packages.codex, packages.codexLinuxX64]) {
+  for (const artifact of [packages.codex, packages.codexLinuxX64, packages.hindsightHooks]) {
     const [algorithm, expected] = artifact.integrity.split('-');
     if (algorithm !== 'sha512' || await fileHash(resolve(root, artifact.file), algorithm, 'base64') !== expected)
       throw new Error(`Publisher checksum mismatch: ${artifact.file}`);

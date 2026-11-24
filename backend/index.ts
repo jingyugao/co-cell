@@ -11,6 +11,7 @@ import { WorkflowService } from './workflows/service.js';
 import { WorkflowValidationRunner } from './workflows/validation.js';
 import { ReportService } from './reports/service.js';
 import { ReportRunner } from './reports/runner.js';
+import { HookRetain } from './knowledge/retain.js';
 import { KnowledgeService } from './knowledge/service.js';
 import { HindsightClient } from './knowledge/client.js';
 import { createProjectFileReader } from './workspaces/project-file-reader.js';
@@ -49,6 +50,11 @@ import { publishToolWrappers } from './shared-files/tool-wrappers.js';
 import { loadSharedMountConfig } from './shared-files/config.js';
 
 try { loadEnvFile(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+const hindsightSync = process.env.HINDSIGHT_SYNC_ENABLED ?? 'false';
+const hindsightUrl = process.env.HINDSIGHT_API_URL?.trim();
+const hindsightBank = process.env.HINDSIGHT_BANK_ID?.trim() || 'cocell';
+if (hindsightSync !== 'true' && hindsightSync !== 'false') throw new Error('HINDSIGHT_SYNC_ENABLED must be true or false');
+if (hindsightSync === 'true' && !hindsightUrl) throw new Error('HINDSIGHT_SYNC_ENABLED=true requires HINDSIGHT_API_URL');
 const shutdownTracing = initializeTracing();
 const mysqlUrl = process.env.MYSQL_URL?.trim() ?? '';
 const multiApiFlag = process.env.COCELL_MULTI_API ?? '0';
@@ -151,8 +157,14 @@ const projectSandboxes = new ProjectSandboxes(provider, sandboxImage, sandboxIma
 const systemTools = new SystemTools({ projects: () => webState.listProjects(), enter: id => manager.enterProject(id),
   execute: (id, tool, args) => cellboxProvider.client.runTool(id, tool, args, 40_000) });
 const notifications = new NotificationStore(webState.notificationRepository, process.env.NOTIFICATIONS_DATA_PATH ? resolve(process.env.NOTIFICATIONS_DATA_PATH) : undefined);
+const hindsight = hindsightUrl ? new HindsightClient({ url: hindsightUrl, bankId: hindsightBank, apiKey: process.env.HINDSIGHT_API_KEY }) : undefined;
+const retainHooks = hindsight && hindsightSync === 'true'
+  ? new HookRetain(hindsight, process.env.COCELL_SECRET_MASTER_KEY!, brokerOrigin.origin, id => webState.getProject(id),
+    (projectId, threadId) => webState.sessionIdForThread(projectId, threadId))
+  : undefined;
 const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
   resolveModel: session => modelProvider.threadOptions(session),
+  hindsightHookConfig: project => retainHooks && project && project.name.trim().toLowerCase() !== 'system' ? retainHooks.config(project.id) : { disabled: true },
   resolveProject: async id => { const project = await webState.getProject(id); return project?.removedAt ? undefined : project; },
   logger: runtimeLog, baseUrl: process.env.OPENAI_BASE_URL, modelConfig, configOverrides,
   sharedDataDirectory: pathToFileURL(`${sharedDataRoot}/`),
@@ -173,7 +185,7 @@ manager = new SessionManager(codex, webDataDirectory, defaults, webState, runtim
     autoCheckpointAfterMs,
     ...(lifecycleScanIntervalMs === undefined ? {} : { scanIntervalMs: lifecycleScanIntervalMs }),
   }, notifications, coordinator);
-const claude = new ClaudeBoxClient((id, port) => cellboxProvider.getServiceAccess(id, port));
+const claude = new ClaudeBoxClient((id, port) => cellboxProvider.getServiceAccess(id, port), session => runtime.prepareClaudeHooks(session));
 manager.setClaudeRuntime(claude);
 manager.setModelService(models);
 manager.setProjectFileReader(createProjectFileReader(cellboxProvider.client, (project, path, request) =>
@@ -193,17 +205,13 @@ const workflows = new WorkflowService(webState.workflowRepository, manager, new 
   id => models.workflowSelection(id), workflowCoordinator, error => { void runtimeLog.write({ event: 'workflow.tick.failed', error: String(error) }); });
 const reports = new ReportService({ repository: webState.reportRepository, state: webState, materials, collector: materialCollector,
   runner: new ReportRunner({ state: webState, manager, models }), directory: resolve(sharedDataRoot, 'runtime/reports'), coordinator, logger: runtimeLog });
-const knowledge = new KnowledgeService({ repository: webState.knowledgeRepository, materials: webState.memoryRepository,
-  memory, state: webState, directory: resolve(sharedDataRoot, 'runtime/knowledge'), coordinator, logger: runtimeLog,
-  ...(process.env.HINDSIGHT_API_URL?.trim() ? { client: new HindsightClient({ url: process.env.HINDSIGHT_API_URL.trim(),
-    bankId: process.env.HINDSIGHT_BANK_ID?.trim() || 'cocell', apiKey: process.env.HINDSIGHT_API_KEY }) } : {}) });
+const knowledge = new KnowledgeService({ coordinator, client: hindsight, hooks: retainHooks });
 // Project tables must exist before the Secret schema's foreign keys are created.
-const initializeSchemas = async () => { await webState.init(); await webState.fileFavoriteRepository.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); await webState.knowledgeRepository.init(); await webState.materialsRepository.init(); await webState.reportRepository.init(); await webState.workflowRepository.init(); };
+const initializeSchemas = async () => { await webState.init(); await webState.fileFavoriteRepository.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); await webState.materialsRepository.init(); await webState.reportRepository.init(); await webState.workflowRepository.init(); };
 if (coordinator) await coordinator.run('cocell-schema-init', initializeSchemas);
 else await initializeSchemas();
 await manager.init();
 memory.start();
-knowledge.start();
 reports.start();
 workflows.start();
 // Paused instances are configured on resume. Running instances survive a web

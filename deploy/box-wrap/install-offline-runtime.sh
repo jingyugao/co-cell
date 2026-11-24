@@ -17,6 +17,10 @@ mkdir -p "$codex/node_modules/@openai/codex-linux-x64"
 tar -xzf "$artifacts/codex.tgz" --strip-components=1 -C "$codex"
 tar -xzf "$artifacts/codex-linux-x64.tgz" --strip-components=1 -C "$codex/node_modules/@openai/codex-linux-x64"
 ln -sf "$codex/bin/codex.js" /usr/local/bin/codex
+hooks_dir=/opt/product/cocell/hindsight
+mkdir -p "$hooks_dir"
+tar -xzf "$artifacts/hindsight-coding-agents.tgz" --strip-components=1 -C "$hooks_dir" package/dist package/package.json
+node /opt/product/cocell/install-retain-hooks.mjs
 claude_dir=/opt/product/claude
 mkdir -p "$claude_dir"
 tar -xzf "$artifacts/claude-agent-acp-linux-x64.tar.gz" -C "$claude_dir" claude-agent-acp claude

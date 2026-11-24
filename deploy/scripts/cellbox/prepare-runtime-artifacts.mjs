@@ -34,7 +34,7 @@ try {
     const manifest = await validateArtifacts(artifacts, { baseImageId: info.Id });
     console.log(`Using verified cached artifacts for ${manifest.baseImageId}`); process.exit(0);
   } catch { /* Preparation repairs missing, outdated, or corrupted public artifacts. */ }
-  for (const item of [packages.codex, packages.codexLinuxX64]) {
+  for (const item of [packages.codex, packages.codexLinuxX64, packages.hindsightHooks]) {
     const [algorithm, expected] = item.integrity.split('-'); const path = resolve(artifacts, item.file);
     let matches = false; try { matches = await fileHash(path, algorithm, 'base64') === expected; } catch {}
     if (!matches) await download(item.url, path);
@@ -61,7 +61,7 @@ try {
     '--mount', `type=bind,source=${resolve(artifacts, 'debs')},target=/var/cache/apt/archives`, info.Id,
     '-ec', 'apt-get update && apt-get install --download-only -y --no-install-recommends "$@" && chmod -R a+rX /var/cache/apt/archives', 'sh', ...packages.systemPackages]);
   const files = [];
-  for (const path of [packages.codex.file, packages.codexLinuxX64.file, packages.claudeAcp.file, packages.restic.file,
+  for (const path of [packages.codex.file, packages.codexLinuxX64.file, packages.hindsightHooks.file, packages.claudeAcp.file, packages.restic.file,
     ...(await readdir(resolve(artifacts, 'debs'))).filter(name => name.endsWith('.deb')).map(name => 'debs/' + name)])
     files.push({ path, sha256: await fileHash(resolve(artifacts, path)) });
   await writeFile(resolve(artifacts, 'manifest.json'), JSON.stringify({ baseImage: base, baseImageId: info.Id, packages, files }, null, 2) + '\n');

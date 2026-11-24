@@ -35,6 +35,7 @@ config:
   # Optional API reachable from the backend Pod; credentials use the existing Secret.
   hindsightApiUrl: ""
   hindsightBankId: "cocell"
+  hindsightSyncEnabled: false
   codexProxyKind: ""
   # External model name -> installed catalog template plus capability overrides.
   codexModelMetadata: {}

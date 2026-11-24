@@ -1,9 +1,6 @@
-export type KnowledgeCategory = 'business' | 'repositories' | 'components' | 'workflows';
-
-export interface KnowledgeSettings {
-  revision: number;
-  enabled: boolean;
-}
+export type KnowledgeTreeNode =
+  | { kind: 'folder'; id: string; name: string; children: KnowledgeTreeNode[] }
+  | { kind: 'page'; id: string; name: string };
 
 export interface KnowledgePagePrompt {
   text: string;
@@ -11,7 +8,7 @@ export interface KnowledgePagePrompt {
 }
 
 export interface KnowledgePage {
-  category: KnowledgeCategory;
+  id: string;
   name: string;
   status: 'pending' | 'ready' | 'failed';
   body: string;
@@ -23,23 +20,13 @@ export interface KnowledgePage {
   error?: string;
 }
 
-export interface KnowledgeJob {
-  id: string;
-  memoryId: string;
-  projectName: string;
-  sessionId: string;
-  sessionTitle: string;
-  sourceUpdatedAt: string;
-  status: 'queued' | 'syncing' | 'succeeded' | 'failed';
-  documentCount: number;
-  error?: string;
-  updatedAt: string;
-}
-
 export interface KnowledgeView {
   configured: boolean;
-  settings: KnowledgeSettings;
-  pages: KnowledgePage[];
-  jobs: KnowledgeJob[];
+  /** Read-only deployment setting for agent Stop hooks. */
+  settings: { readonly enabled: boolean };
+  /** The bank's directory in Hindsight order. Only the selected page includes its body. */
+  pages: KnowledgeTreeNode[];
+  selectedPage?: KnowledgePage;
+  bankId?: string;
   error?: string;
 }

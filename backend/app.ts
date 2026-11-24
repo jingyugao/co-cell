@@ -39,6 +39,8 @@ import type { FileFavoriteRepository } from './file-favorites/repository.js';
 
 export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository, knowledge?: KnowledgeService, runtimeLog?: PageLoadLogWriter, reports?: ReportService, workflows?: WorkflowService) {
   const app = new Hono();
+  if (knowledge?.hooks) app.route('/internal/hindsight', knowledge.hooks.routes());
+  app.all('/internal/hindsight/*', c => c.body(null, 403));
   app.get('/healthz', c => c.text('ok'));
   app.use('/api/*', traceHttpRequest);
   if (operatorAccess) installOperatorAccess(app, {

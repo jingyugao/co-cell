@@ -3,6 +3,9 @@
 {{- fail "Set image.tag or image.digest" -}}
 {{- end -}}
 {{- $_ := required "Set cellbox.profile" .Values.cellbox.profile -}}
+{{- if and .Values.config.hindsightSyncEnabled (not .Values.config.hindsightApiUrl) -}}
+{{- fail "config.hindsightSyncEnabled=true requires config.hindsightApiUrl" -}}
+{{- end -}}
 {{- $templateId := .Values.cellbox.templateId | default "" -}}
 {{- $revisionId := .Values.cellbox.revisionId | default "" -}}
 {{- if eq (ne $templateId "") (ne $revisionId "") -}}
@@ -162,6 +165,8 @@ spec:
             - name: OPENAI_BASE_URL
               value: {{ . | quote }}
             {{- end }}
+            - name: HINDSIGHT_SYNC_ENABLED
+              value: {{ .Values.config.hindsightSyncEnabled | default false | quote }}
             {{- with .Values.config.hindsightApiUrl }}
             - name: HINDSIGHT_API_URL
               value: {{ . | quote }}

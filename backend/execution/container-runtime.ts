@@ -88,6 +88,7 @@ export interface ContainerRuntimeOptions {
   baseUrl?: string;
   modelConfig?: Record<string, unknown>;
   resolveModel?: (session: Session) => Promise<Pick<ThreadOptions, 'model' | 'modelProvider' | 'providerConfig'>>;
+  hindsightHookConfig?: (project?: FollowupProject) => { disabled: true } | { apiUrl: string; apiToken: string; bankId: string };
   resolveProject?: (id: string) => Promise<FollowupProject | undefined>;
   configOverrides?: string[];
   sharedDataDirectory?: URL;
@@ -99,6 +100,7 @@ export interface ContainerRuntimeOptions {
 }
 type Preparation = {
   preparing?: Promise<void>;
+  hindsightConfig?: string;
   sharedDocPaths?: Set<string>;
   sharedDocDigests?: Map<string, string>;
   agentInstructionsDigest?: string;
@@ -232,10 +234,40 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     });
   }
 
+  private async configureHindsight(entry: Entry, project: FollowupProject | undefined, signal: AbortSignal, fresh = false) {
+    if (!this.options.hindsightHookConfig) return;
+    const config = JSON.stringify(this.options.hindsightHookConfig(project));
+    const key = JSON.stringify([entry.info?.metadata?.generation, config]);
+    if (!fresh && entry.preparation.hindsightConfig === key) return;
+    try {
+      const deadline = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
+      await entry.sandbox.files.write('/home/agent/.cocell-hindsight.json', config, { user: 'agent', signal: deadline });
+      entry.preparation.hindsightConfig = key;
+    } catch {
+      signal.throwIfAborted();
+      this.options.logger?.write({ event: 'knowledge.hook_config_failed', sandboxId: entry.sandbox.sandboxId });
+    }
+  }
+
+  async prepareClaudeHooks(session: Session) {
+    if (!this.options.hindsightHookConfig || !session.projectId || !session.sandbox) return;
+    const signal = AbortSignal.timeout(5_000);
+    try {
+      const entry = await this.acquire(session, false, undefined, signal);
+      try {
+        const project = await this.options.resolveProject?.(session.projectId);
+        await this.prepare(entry, signal, () => this.configureHindsight(entry, project, signal));
+      } finally { await this.releaseEntry(entry); }
+    } catch {
+      this.options.logger?.write({ event: 'knowledge.hook_config_failed', sandboxId: session.sandbox.id });
+    }
+  }
+
   private async prepareEnvironment(target: WorkspaceTarget, entry: Entry, executionSignal: AbortSignal) {
     return this.prepare(entry, executionSignal, async () => {
       const fresh = await this.options.prepareRemote(entry.sandbox, target, executionSignal, entry.info);
       const project = await this.options.resolveProject?.(target.projectId ?? target.id);
+      await this.configureHindsight(entry, project, executionSignal, fresh);
       if (project) {
         const path = posix.join(project.workingDirectory, PROJECT_FOLLOWUP_FILE);
         const result = await this.command(entry,

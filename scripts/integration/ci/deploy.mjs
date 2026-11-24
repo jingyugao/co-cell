@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdir, mkdtemp, copyFile, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, cp, copyFile, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 assert(process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_OS === 'Linux', 'Only deploy on a disposable GitHub Linux runner');
@@ -43,6 +43,9 @@ build(['-f', join(cellbox, 'images/cellbox-server.Dockerfile'), '-t', images.ser
 const sandboxContext = join(work, 'sandbox'); await mkdir(sandboxContext);
 await copyFile(join(cellbox, 'dist/release/cellbox-container-agent'), join(sandboxContext, 'cellbox-container-agent'));
 await copyFile('deploy/box-wrap/launcher.mjs', join(sandboxContext, 'launcher.mjs'));
+await cp('deploy/box-wrap/acp', join(sandboxContext, 'acp'), { recursive: true });
+await copyFile('deploy/box-wrap/install-retain-hooks.mjs', join(sandboxContext, 'install-retain-hooks.mjs'));
+await copyFile('deploy/box-wrap/runtime-packages.json', join(sandboxContext, 'runtime-packages.json'));
 const codexVersion = JSON.parse(await readFile('package.json', 'utf8')).dependencies['@openai/codex'];
 build(['-f', join(process.cwd(), 'deploy/ci/Sandbox.Dockerfile'), '--build-arg', `CODEX_VERSION=${codexVersion}`, '-t', images.sandbox, sandboxContext]);
 const localSandboxImage = `localhost:5000/cocell-ci/sandbox:${suffix}`;

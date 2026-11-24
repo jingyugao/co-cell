@@ -1,6 +1,14 @@
 import { test, expect, createThroughUI, projectList } from './fixture.mjs';
 
-test('opening a project is read-only, keeps history visible during an operation, and preserves SSE recovery', async ({ page, ui }) => {
+async function openSavedWorkspace(page, sessionId) {
+  await page.addInitScript(savedSession => {
+    localStorage.setItem('codex-project', 'paused');
+    if (savedSession) localStorage.setItem('codex-session', savedSession);
+  }, sessionId);
+  await page.goto('/');
+}
+
+test('opening a running project keeps history visible during an operation and preserves SSE recovery', async ({ page, ui }) => {
   const project = ui.projects.get('paused');
   project.sandbox.status = 'ready';
   project.sandboxOperation = { id: 'checkpoint-op', kind: 'checkpoint', status: 'running', phase: '暂停中', updatedAt: '2026-01-01T00:00:00Z' };
@@ -50,11 +58,10 @@ test('failed paused disk backup offers an explicit backup retry', async ({ page,
 
 test('an existing disk backup does not block explicit resume; project viewing remains available', async ({ page, ui }) => {
   ui.projects.get('paused').sandboxBackup = { id: 'backup', sandboxId: 'paused-box', status: 'running', phase: '上传中', updatedAt: '2026-01-01T00:00:00Z' };
-  await page.goto('/projects/paused');
+  await openSavedWorkspace(page);
   await expect.poll(() => ui.count('GET', '/api/projects/paused')).toBe(1);
   await expect(ui.editor).toBeEditable();
-  await ui.editor.fill('备份期间仍可查看并编辑草稿');
-  await expect(ui.editor).toHaveValue('备份期间仍可查看并编辑草稿');
+  await ui.editor.focus();
   expect(ui.count('POST', '/api/projects/paused/open')).toBe(0);
   expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(0);
   expect(ui.calls.filter(call => call.waitForOperation)).toEqual([]);
@@ -73,8 +80,7 @@ test('an existing disk backup does not block explicit resume; project viewing re
   await ui.complete('paused');
   await projectList(page);
   await card.getByRole('button', { name: '进入项目', exact: true }).click();
-  await expect(ui.editor).toHaveValue('备份期间仍可查看并编辑草稿');
-  await expect(ui.send).toBeEnabled();
+  await expect(ui.editor).toBeEditable();
   expect(ui.count('POST', '/api/projects/paused/open')).toBe(0);
 });
 
@@ -279,24 +285,183 @@ test('an unknown Box allows status refresh and release, never create', async ({ 
   expect(ui.count('POST', '/api/projects/other/sandbox/create')).toBe(0);
 });
 
-test('a paused session does not trigger resume; history loads after an explicit resume', async ({ page, ui }) => {
-  await page.goto('/sessions/old-session');
+for (const path of ['/projects/paused', '/sessions/old-session']) {
+  test(`opening and reloading ${path} in the foreground each wake a paused Box once`, async ({ page, ui }) => {
+    const wakes = () => ui.count('POST', '/api/projects/paused/sandbox/ensure-awake');
+    await page.goto(path);
+    await expect.poll(wakes).toBe(1);
+    await ui.complete('paused');
+    await expect(page.locator('.project-entry-status')).toHaveCount(0);
+
+    await ui.checkpoint('paused', false);
+    const reads = ui.count('GET', '/api/projects');
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await expect.poll(() => ui.count('GET', '/api/projects')).toBeGreaterThan(reads);
+    await expect(page.locator('.project-entry-status')).toBeVisible();
+    expect(wakes()).toBe(1);
+
+    await page.reload();
+    await expect.poll(wakes).toBe(2);
+    await ui.complete('paused');
+    await expect(page.locator('.project-entry-status')).toHaveCount(0);
+    expect(wakes()).toBe(2);
+  });
+}
+
+test('a link loaded in the background stays paused after the tab becomes visible', async ({ page, ui }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+  });
+  await page.goto('/projects/paused');
   await expect(ui.editor).toBeEditable();
-  await ui.editor.fill('恢复之前保留的会话草稿');
-  await expect(ui.editor).toHaveValue('恢复之前保留的会话草稿');
-  expect(ui.count('POST', '/api/projects/paused/open')).toBe(0);
-  expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(0);
+  const reads = ui.count('GET', '/api/projects');
+  await page.evaluate(() => {
+    delete document.visibilityState;
+    delete document.hidden;
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await expect.poll(() => ui.count('GET', '/api/projects')).toBeGreaterThan(reads);
+  await expect(page.locator('.project-entry-status')).toBeVisible();
+  expect(ui.count('POST', '/api/projects/paused/sandbox/ensure-awake')).toBe(0);
+});
+
+test('restoring a saved session and idle refreshes keep a project paused; typing and sending share one wake', async ({ page, ui }) => {
+  const wakes = () => ui.count('POST', '/api/projects/paused/sandbox/ensure-awake');
+  await openSavedWorkspace(page, 'old-session');
+  await expect(ui.editor).toBeEditable();
+  await ui.editor.focus();
+  const projectReads = () => ui.count('GET', '/api/projects');
+  const initialReads = projectReads();
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect.poll(projectReads).toBeGreaterThan(initialReads);
+  const visibleReads = projectReads();
+  await expect.poll(projectReads, { timeout: 15_000 }).toBeGreaterThan(visibleReads);
+  expect(wakes()).toBe(0);
   expect(ui.historyReads).toHaveLength(0);
-  expect(ui.count('GET', '/api/sessions/old-session/events')).toBeGreaterThan(0);
-  await projectList(page);
-  await page.getByRole('article', { name: '暂停项目', exact: true }).getByRole('button', { name: '恢复运行', exact: true }).click();
-  await expect.poll(() => ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(1);
+
+  await ui.editor.fill('恢复并发送一次');
+  await expect.poll(wakes).toBe(1);
+  await expect(ui.editor).toBeEditable();
+  await ui.send.click();
+  expect(ui.submissions).toHaveLength(0);
   await ui.complete('paused');
-  await expect.poll(() => ui.count('GET', '/api/projects/paused')).toBeGreaterThan(0);
+  await expect.poll(() => ui.submissions.length).toBe(1);
+  expect(ui.submissions[0].prompt).toBe('恢复并发送一次');
+  expect(wakes()).toBe(1);
+  expect(ui.count('POST', '/api/projects/paused/sandbox/resume')).toBe(0);
+});
+
+test('sending from a paused native session waits for its Codex handshake and reuses its thread', async ({ page, ui }) => {
+  const session = ui.sessions.get('old-session');
+  await page.route('**/api/config', route => route.fulfill({ json: { defaults: session.settings,
+    sandbox: { enabled: true }, capabilities: { nativeWebSocket: true } } }));
+  await page.route('**/api/sessions/old-session/connection', route => route.fulfill({ json: {
+    session, threadId: session.threadId, websocketPath: '/native-wake-test', turnOptions: {}, threadOptions: {},
+  } }));
+  const rpc = [];
+  await page.routeWebSocket('**/native-wake-test', socket => socket.onMessage(raw => {
+    const request = JSON.parse(raw);
+    rpc.push(request);
+    if (request.id === undefined) return;
+    const result = request.method === 'turn/start' ? { turn: { id: 'woken-turn' } }
+      : request.method === 'thread/queue/list' ? { data: [] } : {};
+    socket.send(JSON.stringify({ id: request.id, result }));
+  }));
+  await openSavedWorkspace(page, 'old-session');
+  await ui.editor.fill('使用原会话继续');
+  await ui.send.click();
+  expect(rpc).toHaveLength(0);
+  await ui.complete('paused');
+  await expect(ui.editor).toHaveValue('');
+  const calls = rpc.filter(call => ['thread/resume', 'turn/start'].includes(call.method));
+  expect(calls.map(call => [call.method, call.params.threadId])).toEqual([
+    ['thread/resume', session.threadId], ['turn/start', session.threadId],
+  ]);
+  expect(calls[1].params.input[0].text).toBe('使用原会话继续');
+  expect(ui.count('POST', '/api/sessions')).toBe(0);
+});
+
+test('choosing a project and switching sessions share its wake without sending the old draft', async ({ page, ui }) => {
+  await page.goto('/#projects');
+  const card = page.getByRole('article', { name: '暂停项目', exact: true });
+  await card.getByRole('button', { name: '进入项目' }).click();
+  const wakes = () => ui.count('POST', '/api/projects/paused/sandbox/ensure-awake');
+  await expect.poll(wakes).toBe(1);
+  await ui.editor.fill('保留在原项目草稿');
+  const nav = page.getByRole('button', { name: '打开导航', exact: true });
+  if (await nav.isVisible()) await nav.click();
+  await page.getByRole('button', { name: '同项目的另一个会话 · 暂停项目', exact: true }).click();
+  await expect(page).toHaveURL(/sessions\/second-session/);
+  await expect(ui.editor).toHaveValue('');
+  await ui.editor.fill('切回项目时取消这次发送');
+  await ui.send.click();
+  await page.goBack();
+  await expect(ui.editor).toHaveValue('保留在原项目草稿');
+  await ui.complete('paused');
+  await expect(ui.send).toBeEnabled();
+  expect(wakes()).toBe(1);
+  expect(ui.submissions).toHaveLength(0);
+});
+
+test('a delayed project detail read cannot overwrite a completed wake', async ({ page, ui }) => {
+  await page.goto('/#projects');
+  const paused = structuredClone(ui.projects.get('paused'));
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let reading = false;
+  await page.route('**/api/projects/paused', async route => {
+    reading = true;
+    await gate;
+    await route.fulfill({ json: paused });
+  });
+  const card = page.getByRole('article', { name: '暂停项目', exact: true });
+  await card.getByRole('button', { name: '进入项目' }).click();
+  await expect.poll(() => reading && ui.count('POST', '/api/projects/paused/sandbox/ensure-awake') === 1).toBe(true);
+  await ui.complete('paused');
+  await expect(page.locator('.project-entry-status')).toHaveCount(0);
+  const completed = page.waitForEvent('requestfinished', req => new URL(req.url()).pathname === '/api/projects/paused');
+  release();
+  await completed;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(page.locator('.project-entry-status')).toHaveCount(0);
+});
+
+test('uploading a file in a paused session waits for readiness', async ({ page, ui }) => {
+  let uploads = 0;
+  await page.route('**/api/sessions/old-session/images', async route => {
+    uploads++;
+    await route.fulfill({ json: { name: 'task.png', path: '/workspace/task.png' } });
+  });
+  await openSavedWorkspace(page, 'old-session');
+  await expect(page.getByRole('button', { name: '添加图片' })).toBeEnabled();
+  await page.locator('input[type=file]').setInputFiles({ name: 'task.png', mimeType: 'image/png', buffer: Buffer.from([137, 80, 78, 71]) });
+  await expect.poll(() => ui.count('POST', '/api/projects/paused/sandbox/ensure-awake')).toBe(1);
+  expect(uploads).toBe(0);
+  await ui.complete('paused');
+  await expect(page.getByRole('button', { name: '移除 task.png' })).toBeVisible();
+  expect(uploads).toBe(1);
+});
+
+test('opening a service preview waits for wake before navigating the new tab', async ({ page, context, ui }) => {
+  await ui.complete('paused');
+  const session = ui.sessions.get('old-session');
+  session.turns = [{ id: 'preview', prompt: '查看预览', images: [], status: 'completed', startedAt: session.createdAt,
+    items: [{ id: 'link', type: 'agent_message', text: '[服务预览](http://localhost:8080/path?x=1#section)' }] }];
+  await context.route('**/api/projects/paused/preview?**', route => route.fulfill({ contentType: 'text/html', body: '<main>preview ready</main>' }));
   await page.goto('/sessions/old-session');
-  await expect(page.getByText('历史任务内容', { exact: true })).toBeVisible();
-  await expect(ui.editor).toHaveValue('恢复之前保留的会话草稿');
-  expect(ui.count('POST', '/api/projects/paused/open')).toBe(0);
+  const link = page.getByRole('link', { name: '服务预览' });
+  await expect(link).toBeVisible();
+  await ui.checkpoint('paused', false);
+  expect(ui.count('POST', '/api/projects/paused/sandbox/ensure-awake')).toBe(0);
+  const opened = context.waitForEvent('page');
+  await link.click();
+  const preview = await opened;
+  await expect.poll(() => ui.count('POST', '/api/projects/paused/sandbox/ensure-awake')).toBe(1);
+  await expect(preview).toHaveURL('about:blank');
+  await ui.complete('paused');
+  await expect(preview.getByText('preview ready')).toBeVisible();
+  expect(new URL(preview.url()).searchParams.get('url')).toBe('http://localhost:8080/path?x=1#section');
 });
 
 test('switching sessions only reads project state and does not reopen or resume the workspace', async ({ page, ui }) => {

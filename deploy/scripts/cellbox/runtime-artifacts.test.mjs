@@ -14,6 +14,7 @@ async function fixture() {
   const contents = new Map([
     ['codex.tgz', Buffer.from('synthetic codex package')],
     ['codex-linux-x64.tgz', Buffer.from('synthetic native codex package')],
+    ['hindsight.tgz', Buffer.from('synthetic Hindsight hooks')],
     ['claude-acp.tgz', Buffer.from('synthetic Claude ACP distribution')],
     ['restic', Buffer.from('synthetic restic binary')],
   ]);
@@ -21,6 +22,7 @@ async function fixture() {
     codexVersion: '1.2.3',
     codex: { file: 'codex.tgz', url: 'https://packages.example.test/codex.tgz', integrity: sha512Integrity(contents.get('codex.tgz')) },
     codexLinuxX64: { file: 'codex-linux-x64.tgz', url: 'https://packages.example.test/codex-linux-x64.tgz', integrity: sha512Integrity(contents.get('codex-linux-x64.tgz')) },
+    hindsightHooks: { file: 'hindsight.tgz', integrity: sha512Integrity(contents.get('hindsight.tgz')) },
     claudeAcp: { file: 'claude-acp.tgz', sha256: sha256(contents.get('claude-acp.tgz')) },
     resticVersion: '0.18.1',
     restic: { file: 'restic', url: 'https://packages.example.test/restic.bz2', sha256: sha256(contents.get('restic')) },
@@ -46,7 +48,7 @@ test('accepts a complete offline runtime artifact bundle with matching package l
   try {
     const manifest = await validateArtifacts(value.root, { baseImageId: value.baseImageId, packages: value.packages });
     assert.equal(manifest.baseImage, 'node:22.18.0-bookworm-slim');
-    assert.equal(manifest.files.length, 4);
+    assert.equal(manifest.files.length, value.contents.size);
   } finally { await rm(value.root, { recursive: true, force: true }); }
 });
 
@@ -77,7 +79,7 @@ test('rejects corrupted payloads even when their manifest checksum is unchanged'
 });
 
 test('rejects a manifest that omits any required runtime payload', async () => {
-  const required = ['codex.tgz', 'codex-linux-x64.tgz', 'claude-acp.tgz', 'restic'];
+  const required = ['codex.tgz', 'codex-linux-x64.tgz', 'hindsight.tgz', 'claude-acp.tgz', 'restic'];
   for (const missing of required) {
     const value = await fixture();
     try {

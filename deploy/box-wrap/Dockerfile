@@ -6,6 +6,7 @@ USER root
 
 # Cellbox adds its static guest binary and creates the agent/debug accounts in
 # its final preparation layer. This image contains no operator credentials.
+COPY deploy/box-wrap/install-retain-hooks.mjs /opt/product/cocell/
 COPY deploy/box-wrap/runtime-packages.json /opt/product/cocell/deploy/box-wrap/
 COPY deploy/scripts/cellbox/runtime-artifacts.mjs deploy/box-wrap/install-offline-runtime.sh /opt/product/cocell/deploy/scripts/cellbox/
 # Preparation downloads and verifies packages before build. The read-only bind

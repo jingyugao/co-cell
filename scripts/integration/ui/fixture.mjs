@@ -130,6 +130,13 @@ export const test = base.extend({
           data.sandboxOperation = operation('release', 'succeeded');
           status = 200;
         }
+        else if (method === 'POST' && path.endsWith('/ensure-awake')) {
+          if (data.status !== 'active' || !data.sandbox) return route.fulfill({ status: 409, json: { error: '项目没有可唤醒的运行环境' } });
+          if (data.sandbox.status !== 'ready') {
+            data.sandboxOperation = operation('resume');
+            rememberPending(id, route, 'ensure-awake', call); return;
+          }
+        }
         else if (method === 'POST' && path.endsWith('/open')) {
           if (data.sandbox?.status === 'ready' && data.sandboxOperation?.status !== 'running') {
             data.sandboxOperation = operation('resume', 'succeeded');

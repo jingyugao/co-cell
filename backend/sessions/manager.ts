@@ -10,6 +10,7 @@ import { CLAUDE_HOST_PORT, type ClaudeBoxClient } from '../execution/claude-box.
 import type { SandboxRuntime, ServiceProxyAccess } from '../execution/container-runtime.js';
 import { SandboxLifecycleService } from '../projects/sandbox-lifecycle.js';
 import { ProjectSandboxOperations } from '../projects/sandbox-operations.js';
+import { canAutoResumeProject } from '../../util/project-sandbox.js';
 import type { ProjectResumeObserver } from '../../protocol/resume-types.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
 
@@ -1538,6 +1539,52 @@ export class SessionManager {
     const project = await this.readProject(id);
     onProgress?.({ stage: 'completed' });
     return project;
+  }
+
+  async ensureProjectAwake(id: string, signal?: AbortSignal): Promise<ProjectSummary> {
+    const read = async (expectedBox?: string) => {
+      const project = await this.readProject(id, {}, signal);
+      if (project.status !== 'active' || project.executionMode !== 'sandbox' || !project.sandbox || project.sandbox.creation)
+        throw new HttpError(409, '项目没有可唤醒的运行环境');
+      if (expectedBox && project.sandbox.id !== expectedBox) throw new HttpError(409, '项目运行环境已更换，请刷新后再操作');
+      return { ...project, sandbox: project.sandbox };
+    };
+    const initial = await read();
+    const boxId = initial.sandbox.id;
+    const ready = (project: ProjectSummary) => {
+      if (project.sandbox?.status !== 'ready') throw new HttpError(409, project.sandboxOperation?.error || 'Sandbox 尚未就绪，请查看项目状态');
+      return project;
+    };
+    const join = async (operationId: string) => {
+      await this.waitForProjectOperation(id, operationId, 120_000, signal);
+      return ready(await read(boxId));
+    };
+
+    const pending = initial.sandboxOperation;
+    if (pending?.kind === 'resume' && pending.status === 'running' && pending.id) return join(pending.id);
+    if (initial.sandbox.status === 'ready') return initial;
+    let acquired = false;
+    try {
+      await this.withProjectOperation(id, async () => {
+        acquired = true;
+        if (this.closing || !this.sandboxOperations) throw new HttpError(503, 'Sandbox 服务暂不可用');
+        const project = await read(boxId);
+        if (project.sandbox.status === 'ready') return;
+        if (!canAutoResumeProject(project)) throw new HttpError(409, project.sandboxOperation?.error || '当前 Sandbox 状态不支持自动恢复，请查看项目状态');
+        await this.projects.refreshOne(id);
+        await this.sandboxOperations.run(id, 'resume');
+      });
+    } catch (error) {
+      // Another replica can hold the lock past its acquisition timeout. Observe
+      // its durable operation even if it had not yet been recorded on entry.
+      if (acquired || signal?.aborted) throw error;
+      const project = await read(boxId);
+      const op = project.sandboxOperation;
+      if (op?.kind === 'resume' && op.status === 'running' && op.id) return join(op.id);
+      if (project.sandbox.status === 'ready') return project;
+      throw error;
+    }
+    return ready(await read(boxId));
   }
 
   async releaseProjectSandbox(id: string): Promise<ProjectSummary> {

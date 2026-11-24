@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { PROJECT_OPERATION_WAIT_MS, type ProjectReadOptions, type ProjectSandboxOperation, type ProjectStatus, type ProjectSummary, type ProjectType } from '../../../protocol/types';
+import { projectAwakePath } from '../../../protocol/resume-types';
 import type { ProjectResumeError, ProjectResumeProgress } from '../../../protocol/resume-types';
 import { api, ApiError } from '../../lib/api';
 import { resumeProjectSandbox as requestResumeProjectSandbox, ResumeRequestError } from '../../lib/project-resume';
@@ -18,6 +19,9 @@ export function useProjects() {
   const [hasProjectIndex, setHasProjectIndex] = useState(false);
   const [resumeTimelines, setResumeTimelines] = useState<Record<string, ProjectResumeTimeline>>({});
   const resumeRequests = useRef(new Map<string, string>());
+  const detailReads = useRef(new Map<string, symbol>());
+  const awakeRequests = useRef(new Map<string, Promise<ProjectSummary>>());
+  const [wakingProjects, setWakingProjects] = useState<string[]>([]);
   const sequence = useRef(0);
   const refreshing = useRef<Promise<ProjectSummary[]> | null>(null);
   const refreshProjects = useCallback(() => {
@@ -31,6 +35,8 @@ export function useProjects() {
     return request;
   }, []);
   const storeProject = useCallback((project: ProjectSummary) => {
+    // A detail GET started before this update can still report the old paused Box.
+    detailReads.current.delete(project.id);
     sequence.current++;
     setProjects(current => [project, ...current.filter(item => item.id !== project.id)]
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
@@ -40,9 +46,16 @@ export function useProjects() {
     await api<ProjectSummary>('/api/projects', { method: 'POST', body: JSON.stringify(values) }),
   ), [storeProject]);
   const enterProject = useCallback(async (id: string, signal?: AbortSignal) => {
-    const project = await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { signal });
-    signal?.throwIfAborted();
-    return storeProject(project);
+    const token = Symbol();
+    detailReads.current.set(id, token);
+    try {
+      const project = await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { signal });
+      signal?.throwIfAborted();
+      if (detailReads.current.get(id) === token) storeProject(project);
+      return project;
+    } finally {
+      if (detailReads.current.get(id) === token) detailReads.current.delete(id);
+    }
   }, [storeProject]);
   const refreshProject = useCallback(async (id: string, signal?: AbortSignal, options?: ProjectReadOptions) => {
     const query = options?.waitForOperation ? `?${new URLSearchParams({
@@ -52,6 +65,23 @@ export function useProjects() {
     signal?.throwIfAborted();
     return storeProject(project);
   }, [storeProject]);
+  const ensureProjectAwake = useCallback((id: string) => {
+    const pending = awakeRequests.current.get(id);
+    if (pending) return pending;
+    setWakingProjects(current => [...current, id]);
+    const request = api<ProjectSummary>(projectAwakePath(id), { method: 'POST' })
+      .then(storeProject)
+      .catch(async error => {
+        await refreshProject(id).catch(() => undefined);
+        throw error;
+      })
+      .finally(() => {
+        awakeRequests.current.delete(id);
+        setWakingProjects(current => current.filter(projectId => projectId !== id));
+      });
+    awakeRequests.current.set(id, request);
+    return request;
+  }, [refreshProject, storeProject]);
   const updateProject = useCallback(async (id: string, values: ProjectUpdate) => storeProject(
     await api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(values) }),
   ), [storeProject]);
@@ -105,6 +135,8 @@ export function useProjects() {
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/release`, { method: 'POST' }),
   ), [runSandboxOperation]);
   const resumeSandbox = useCallback(async (id: string) => {
+    const waking = awakeRequests.current.get(id);
+    if (waking) return waking;
     sequence.current++;
     const requestId = crypto.randomUUID();
     resumeRequests.current.set(id, requestId);
@@ -167,5 +199,5 @@ export function useProjects() {
   const archiveProject = useCallback((id: string, options: { useExistingBackup?: boolean } = {}) => runSandboxOperation(id, 'archive', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify(options) }),
   ), [runSandboxOperation]);
-  return { projects, hasProjectIndex, resumeTimelines, refreshProjects, refreshProject, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
+  return { projects, hasProjectIndex, resumeTimelines, wakingProjects, ensureProjectAwake, refreshProjects, refreshProject, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
 }

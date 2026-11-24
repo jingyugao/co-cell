@@ -10,6 +10,11 @@
     "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.170.0-linux-x64.tgz",
     "integrity": "sha512-6cCZJaZL17tiTAvhd1Pirt8vsV1dP8CfG94+IHygUO4m24oYLQrIInJJLyKzcMv/uUonbu1dF2JmcXhA/s5bsg=="
   },
+  "hindsightHooks": {
+    "file": "hindsight-coding-agents.tgz",
+    "url": "https://registry.npmjs.org/@vectorize-io/hindsight-coding-agents/-/hindsight-coding-agents-0.8.8.tgz",
+    "integrity": "sha512-NqHK64z9gBrblOpaVSaAeHaLQcxPCp7wilY6X4M6k4BvgRO5VwUNY/cMTJZt0C0dJkqEllNY3N6A2fxy3tlfNg=="
+  },
   "claudeAcp": {
     "file": "claude-agent-acp-linux-x64.tar.gz",
     "url": "https://github.com/agentclientprotocol/claude-agent-acp/releases/download/v0.109.0/claude-agent-acp-linux-x64.tar.gz",

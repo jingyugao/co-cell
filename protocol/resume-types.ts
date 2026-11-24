@@ -27,3 +27,9 @@ export interface ProjectResumeError {
   at: string;
   elapsedMs: number;
 }
+
+/** POST on explicit project activity. Returns the ready ProjectSummary, or a
+ * conflict if the bound Sandbox cannot be woken. Safe for concurrent callers. */
+export function projectAwakePath(projectId: string): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/sandbox/ensure-awake`;
+}

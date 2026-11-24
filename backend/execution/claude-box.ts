@@ -8,7 +8,7 @@ type ServiceAccess = (box: string, port: number) => Promise<{url: string; header
 interface Snapshot { threadId: string | null; turns: Turn[] }
 
 export class ClaudeBoxClient {
-  constructor(private readonly access: ServiceAccess) {}
+  constructor(private readonly access: ServiceAccess, private readonly prepareHooks?: (session: Session) => Promise<void>) {}
 
   private async request(box: string, path: string, options: RequestInit = {}, apiKey?: string): Promise<Response> {
     const timeout = AbortSignal.timeout(20_000);
@@ -56,6 +56,7 @@ export class ClaudeBoxClient {
 
   private async sendModelRequest(box: string, session: Session, action: 'turns' | 'answers' | 'reconcile',
     selected: ModelSelection, input: Record<string, unknown>) {
+    await this.prepareHooks?.(session);
     const effort = session.settings.claudeEffort;
     if (effort && effort !== 'default' && (await this.health(box)).supportsEffort !== true)
       throw new HttpError(409, '当前 Sandbox 镜像不支持设置 Claude 推理强度，请选择默认或升级镜像');

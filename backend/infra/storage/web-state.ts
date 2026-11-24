@@ -4,7 +4,6 @@ import { MySqlMemoryRepository } from '../../memory/repository.js';
 import { MySqlMaterialsRepository } from '../../conversation-materials/repository.js';
 import { MySqlWorkflowStore } from '../../workflows/store.js';
 import { MySqlReportRepository } from '../../reports/repository.js';
-import { MySqlKnowledgeRepository } from '../../knowledge/repository.js';
 import { MySqlFileFavoriteRepository } from '../../file-favorites/repository.js';
 import type { ImageCatalogStore, ImageRecord } from '../../images/store.js';
 import type { DefaultImageSelection } from '../../../protocol/image-types.js';
@@ -55,7 +54,6 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   readonly materialsRepository: MySqlMaterialsRepository;
   readonly workflowRepository: MySqlWorkflowStore;
   readonly reportRepository: MySqlReportRepository;
-  readonly knowledgeRepository: MySqlKnowledgeRepository;
   readonly fileFavoriteRepository: MySqlFileFavoriteRepository;
   readonly secretRepository: MySqlSecretRepository;
   readonly toolRepository: MySqlToolRepository;
@@ -68,7 +66,6 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     this.materialsRepository = new MySqlMaterialsRepository(this.pool);
     this.workflowRepository = new MySqlWorkflowStore(this.pool);
     this.reportRepository = new MySqlReportRepository(this.pool);
-    this.knowledgeRepository = new MySqlKnowledgeRepository(this.pool);
     this.fileFavoriteRepository = new MySqlFileFavoriteRepository(this.pool);
     this.secretRepository = new MySqlSecretRepository(this.pool);
     this.toolRepository = new MySqlToolRepository(this.pool);
@@ -206,6 +203,11 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
     if (!questionIndex.length) throw new Error('CoCell session_turns question request index is missing; automatic schema migration is disabled.');
     await this.notificationRepository.init();
   }
+  async sessionIdForThread(projectId: string, threadId: string) {
+    const [rows] = await this.pool.execute<RowDataPacket[]>('SELECT id FROM sessions WHERE project_id=? AND thread_id=? LIMIT 1', [projectId, threadId]);
+    return rows[0]?.id as string | undefined;
+  }
+
   async isWorkflowThread(threadId: string) {
     const [rows] = await this.pool.query<RowDataPacket[]>('SELECT 1 FROM sessions WHERE thread_id=? AND managed_by_json IS NOT NULL LIMIT 1', [threadId]);
     return rows.length > 0;

@@ -74,6 +74,12 @@ fi
 if [[ -n "${HINDSIGHT_BANK_ID:-}" ]]; then
   hindsight_args+=(--set-string "config.hindsightBankId=${HINDSIGHT_BANK_ID}")
 fi
+if [[ -v HINDSIGHT_SYNC_ENABLED ]]; then
+  case "$HINDSIGHT_SYNC_ENABLED" in
+    true|false) hindsight_args+=(--set "config.hindsightSyncEnabled=$HINDSIGHT_SYNC_ENABLED") ;;
+    *) echo "HINDSIGHT_SYNC_ENABLED must be true or false" >&2; exit 2 ;;
+  esac
+fi
 if [[ -n "${COCELL_MULTI_API:-}" ]]; then
   case "$COCELL_MULTI_API" in
     0)

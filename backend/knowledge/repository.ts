@@ -58,13 +58,14 @@ export class MySqlKnowledgeRepository implements KnowledgeRepository {
   }
 
   async settings() {
-    const [rows] = await this.pool.query<RowDataPacket[]>('SELECT revision,document FROM knowledge_settings WHERE id=1');
+    const [rows] = await this.pool.query<RowDataPacket[]>(
+      "SELECT revision,document->>'$.enabled' AS enabled FROM knowledge_settings WHERE id=1");
     if (!rows[0]) return undefined;
-    return { ...parse<Omit<KnowledgeSettings, 'revision'>>(rows[0].document), revision: Number(rows[0].revision) };
+    return { enabled: rows[0].enabled === 'true', revision: Number(rows[0].revision) };
   }
 
   async saveSettings(settings: KnowledgeSettings, expectedRevision: number) {
-    const document = JSON.stringify({ enabled: settings.enabled, prompts: settings.prompts });
+    const document = JSON.stringify({ enabled: settings.enabled });
     if (!expectedRevision) {
       try {
         await this.pool.query('INSERT INTO knowledge_settings(id,revision,document) VALUES(1,?,CAST(? AS JSON))', [settings.revision, document]);

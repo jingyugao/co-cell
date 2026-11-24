@@ -1,19 +1,22 @@
 export type KnowledgeCategory = 'business' | 'repositories' | 'components' | 'workflows';
-export type KnowledgePrompts = Record<KnowledgeCategory, string>;
 
 export interface KnowledgeSettings {
   revision: number;
   enabled: boolean;
-  prompts: KnowledgePrompts;
 }
 
-export interface KnowledgeSettingsInput extends KnowledgeSettings {}
+export interface KnowledgePagePrompt {
+  text: string;
+  version: string;
+}
 
 export interface KnowledgePage {
   category: KnowledgeCategory;
   name: string;
   status: 'pending' | 'ready' | 'failed';
   body: string;
+  /** Present only after successfully reading this page's source query from Hindsight. */
+  prompt?: KnowledgePagePrompt;
   updatedAt?: string;
   isStale: boolean;
   sourceCount: number;

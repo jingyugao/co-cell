@@ -1,17 +1,38 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { KnowledgeCategory, KnowledgePage, KnowledgeSettings, KnowledgeSettingsInput, KnowledgeView } from '../../protocol/knowledge-types.js';
+import type { KnowledgeCategory, KnowledgePage, KnowledgePagePrompt, KnowledgeSettings, KnowledgeView } from '../../protocol/knowledge-types.js';
 import { MemoryCoordinator, type SharedCoordinator } from '../infra/storage/coordination.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 import type { MemoryRepository, StoredMemory } from '../memory/repository.js';
 import type { MemoryService } from '../memory/service.js';
 import { HttpError, redactCredentials } from '../../util/errors.js';
 import { HindsightClient, HindsightError, type HindsightModel, type HindsightOperation, type KnowledgeNode, type RetainRequest } from './client.js';
-import { categories, defaultPrompts, observationsMission, pageTrigger, retainMission } from './prompts.js';
 import type { KnowledgeRepository, StoredKnowledgeJob } from './repository.js';
 
+const categories = [
+  { key: 'business', name: '业务模块总览' },
+  { key: 'repositories', name: '代码仓库总览' },
+  { key: 'components', name: '工具组件总览' },
+  { key: 'workflows', name: '运营工作流总览' },
+] as const;
+
+const pageTrigger = (category: KnowledgeCategory) => ({
+  mode: 'delta',
+  fact_types: category === 'repositories' ? ['world', 'experience', 'observation'] : ['observation'],
+  exclude_mental_models: true,
+  refresh_after_consolidation: true,
+  min_refresh_interval_seconds: 3600,
+  reflect_search_observations_max_tokens: 6000,
+  reflect_search_observations_include_entities: false,
+  keep_trace: true,
+});
+
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+function pagePrompt(model: HindsightModel): KnowledgePagePrompt {
+  if (typeof model.source_query !== 'string') throw new HttpError(502, 'Hindsight 未返回知识页提示词');
+  return { text: model.source_query, version: hash(JSON.stringify([model.id, model.source_query])) };
+}
 const errorText = (error: unknown) => redactCredentials(error instanceof Error ? error.message : String(error)).slice(0, 1000);
 const is404 = (error: unknown) => error instanceof HindsightError && error.status === 404;
 const transient = (error: unknown) => error instanceof HindsightError && (error.status === 0 || error.status === 429 || error.status >= 500);
@@ -42,10 +63,10 @@ export class KnowledgeService {
 
   constructor(private deps: Dependencies) { this.coordinator = deps.coordinator ?? new MemoryCoordinator(); }
   async settings(): Promise<KnowledgeSettings> {
-    return await this.deps.repository.settings() ?? { revision: 0, enabled: false, prompts: { ...defaultPrompts } };
+    return await this.deps.repository.settings() ?? { revision: 0, enabled: false };
   }
 
-  async update(input: KnowledgeSettingsInput) {
+  async update(input: KnowledgeSettings) {
     if (input.enabled && !this.deps.client) throw new HttpError(400, '请先在服务端配置 HINDSIGHT_API_URL');
     const settings = { ...input, revision: input.revision + 1 };
     if (!await this.deps.repository.saveSettings(settings, input.revision)) throw new HttpError(409, '知识设置已变化，请刷新后重试');
@@ -68,13 +89,51 @@ export class KnowledgeService {
         try {
           const model = await client.request<HindsightModel>(`mental-models/${encodeURIComponent(node.mental_model_id)}`, { signal: this.controller.signal });
           return { ...empty, status: model.last_refresh_failed_at ? 'failed' : model.last_refreshed_at ? 'ready' : 'pending',
-            body: model.last_refreshed_at ? model.content ?? '' : '', updatedAt: model.last_refreshed_at ?? undefined,
+            body: model.last_refreshed_at ? model.content ?? '' : '', prompt: pagePrompt(model), updatedAt: model.last_refreshed_at ?? undefined,
             isStale: Boolean(model.is_stale), sourceCount: Object.values(model.reflect_response?.based_on ?? {}).reduce((sum, items) => sum + items.length, 0),
             ...(model.last_refresh_failed_at ? { error: 'Hindsight 页面生成失败，请检查服务状态后点击“重新生成”' } : {}) } as KnowledgePage;
         } catch (error) { return { ...empty, status: 'failed' as const, error: errorText(error) }; }
       }));
     } catch (error) { view.error = errorText(error); }
     return view;
+  }
+
+  async updatePagePrompt(category: KnowledgeCategory, input: KnowledgePagePrompt): Promise<KnowledgePagePrompt> {
+    const client = this.deps.client;
+    if (!client) throw new HttpError(503, 'Hindsight 尚未配置');
+    const lease = await this.coordinator.tryAcquire(`knowledge:prompt:${category}`);
+    if (!lease) throw new HttpError(409, '该提示词正在保存，请稍后重试');
+    const signal = AbortSignal.any([this.controller.signal, lease.signal]);
+    try {
+      const tree = await client.request<{ roots: KnowledgeNode[] }>('knowledge-base/tree', { signal });
+      const name = categories.find(item => item.key === category)!.name;
+      const node = tree.roots.find(node => node.kind === 'page' && node.name === name);
+      if (!node?.mental_model_id) throw new HttpError(409, '知识页尚未创建或已移除，请重新加载');
+      const path = `mental-models/${encodeURIComponent(node.mental_model_id)}`;
+      const read = async () => pagePrompt(await client.request<HindsightModel>(path, { signal }));
+      const current = await read();
+      if (current.text === input.text) return current;
+      if (current.version !== input.version) throw new HttpError(409, 'Hindsight 中的提示词已变化，请重新加载后再编辑');
+      lease.assertHeld();
+      try {
+        await client.request(`knowledge-base/nodes/${encodeURIComponent(node.id)}`, { method: 'PATCH', body: { source_query: input.text }, signal });
+      } catch (error) {
+        if (!transient(error) || signal.aborted) throw error;
+        // The upstream may have committed before its response was lost.
+        const actual = await read();
+        if (actual.text === input.text) return actual;
+        throw error;
+      }
+      const saved = await read();
+      if (saved.text !== input.text) throw new HttpError(409, 'Hindsight 中的提示词已变化，请重新加载');
+      return saved;
+    } catch (error) {
+      if (error instanceof HindsightError) {
+        if (error.status >= 400 && error.status < 500) throw new HttpError(error.status, `Hindsight 拒绝了提示词请求（HTTP ${error.status}）`);
+        throw new HttpError(502, '无法确认 Hindsight 中的提示词，请刷新查看后重试');
+      }
+      throw error;
+    } finally { await lease.release(); }
   }
 
   async retry(id: string, updatedAt: string) {
@@ -151,7 +210,7 @@ export class KnowledgeService {
     try {
       assertActive();
       if (this.reconciled?.revision !== settings.revision || Date.now() - this.reconciled.at >= 60_000) {
-        await this.reconcile(client, settings, signal, assertActive);
+        await this.reconcile(client, signal, assertActive);
         this.reconciled = { revision: settings.revision, at: Date.now() };
       }
       if (Date.now() - this.lastScan >= 60_000) { await this.enqueue(client.target, signal); this.lastScan = Date.now(); }
@@ -176,7 +235,7 @@ export class KnowledgeService {
     } finally { await lease.release(); }
   }
 
-  private async reconcile(client: HindsightClient, settings: KnowledgeSettings, signal: AbortSignal, assertActive: () => void) {
+  private async reconcile(client: HindsightClient, signal: AbortSignal, assertActive: () => void) {
     let current: { config: Record<string, unknown> };
     try { current = await client.request('config', { signal }); }
     catch (error) {
@@ -188,8 +247,6 @@ export class KnowledgeService {
     const updates = {
       enable_auto_consolidation: true,
       retain_chunk_size: 24_000,
-      retain_mission: retainMission,
-      observations_mission: observationsMission,
     };
     if (Object.entries(updates).some(([key, value]) => current.config[key] !== value)) {
       assertActive();
@@ -199,13 +256,13 @@ export class KnowledgeService {
     for (const category of categories) {
       assertActive();
       const node = tree.roots.find(node => node.kind === 'page' && node.name === category.name);
-      const body = { name: category.name, source_query: settings.prompts[category.key], tags: [], max_tokens: 2200, trigger: pageTrigger(category.key) };
+      const body = { tags: [], max_tokens: 2200, trigger: pageTrigger(category.key) };
       if (!node?.mental_model_id) {
         // A timed-out create is reconciled by name on the next pass, never blindly repeated.
-        await client.request('knowledge-base/pages', { method: 'POST', body, signal });
+        await client.request('knowledge-base/pages', { method: 'POST', body: { ...body, name: category.name, source_query: category.name }, signal });
       } else {
         const model = await client.request<HindsightModel>(`mental-models/${encodeURIComponent(node.mental_model_id)}`, { signal });
-        const changed = model.source_query !== body.source_query || model.tags.length > 0 ||
+        const changed = model.tags.length > 0 ||
           Object.entries(body.trigger).some(([key, value]) => JSON.stringify(model.trigger[key]) !== JSON.stringify(value));
         if (changed) {
           assertActive();

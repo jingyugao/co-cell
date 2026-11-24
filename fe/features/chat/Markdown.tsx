@@ -1,5 +1,6 @@
 import { Children, createContext, isValidElement, memo, useContext, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown';
+import remarkCjkFriendly from 'remark-cjk-friendly/parseOnly';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
@@ -192,7 +193,7 @@ function Markdown({ text, projectId, workingDirectory, baseDirectory, onOpenFile
       return target ? <img {...props} src={target} alt={alt || ''} loading="lazy" referrerPolicy="no-referrer" /> : <span>{alt || '无法定位图片'}</span>;
     },
   }), [id, projectId, workingDirectory, baseDirectory, onOpenFile]);
-  return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath, remarkBracketMath, remarkLocalServices, [remarkHeadingIds, { prefix: `markdown-${id}-` }]]} rehypePlugins={[[rehypeKatex, { trust: false, strict: 'ignore' }]]} urlTransform={url => {
+  return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm, remarkCjkFriendly, remarkMath, remarkBracketMath, remarkLocalServices, [remarkHeadingIds, { prefix: `markdown-${id}-` }]]} rehypePlugins={[[rehypeKatex, { trust: false, strict: 'ignore' }]]} urlTransform={url => {
     // Custom file schemes are consumed by our renderers, never passed to the browser.
     if (resolveResource(url, { projectId, workingDirectory, baseDirectory })) return url;
     return defaultUrlTransform(normalizeServiceUrl(url));

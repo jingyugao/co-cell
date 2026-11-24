@@ -379,6 +379,9 @@ export default function App() {
     let alive = true;
     const controller = new AbortController();
     let scopedRoute: string | undefined;
+    const navigation = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
+    const foregroundUrl = document.visibilityState === 'visible' && !('wasDiscarded' in document && document.wasDiscarded)
+      && (navigation?.type === 'navigate' || navigation?.type === 'reload') ? window.location.href : null;
     scopedBootstrap.current = false;
     markPageLoad('bootstrapStartedMs');
     const configRequest = api<AppConfig>('/api/config', { signal: controller.signal });
@@ -420,6 +423,12 @@ export default function App() {
       const nextPage = !target.projectId && route.page === 'chat' ? 'projects' : route.page;
       currentPage.current = nextPage; setPage(nextPage);
       if (!target.error) {
+        // Check the original link before a saved selection at "/" becomes a project URL.
+        if (foregroundUrl === window.location.href && document.visibilityState === 'visible' && route.explicit && route.page === 'chat') {
+          const project = projectList.find(item => item.id === target.projectId);
+          const session = list.find(item => item.id === target.sessionId);
+          if (project && canAutoResumeProject(project) && !session?.archivedAt && !session?.managedBy) wakeOnActivity(project);
+        }
         const url = routeUrl(nextPage, target);
         window.history.replaceState(null, '', url); currentUrl.current = url;
       }

@@ -1,6 +1,14 @@
 import { test, expect, createThroughUI, projectList } from './fixture.mjs';
 
-test('opening a project is read-only, keeps history visible during an operation, and preserves SSE recovery', async ({ page, ui }) => {
+async function openSavedWorkspace(page, sessionId) {
+  await page.addInitScript(savedSession => {
+    localStorage.setItem('codex-project', 'paused');
+    if (savedSession) localStorage.setItem('codex-session', savedSession);
+  }, sessionId);
+  await page.goto('/');
+}
+
+test('opening a running project keeps history visible during an operation and preserves SSE recovery', async ({ page, ui }) => {
   const project = ui.projects.get('paused');
   project.sandbox.status = 'ready';
   project.sandboxOperation = { id: 'checkpoint-op', kind: 'checkpoint', status: 'running', phase: '暂停中', updatedAt: '2026-01-01T00:00:00Z' };
@@ -50,7 +58,7 @@ test('failed paused disk backup offers an explicit backup retry', async ({ page,
 
 test('an existing disk backup does not block explicit resume; project viewing remains available', async ({ page, ui }) => {
   ui.projects.get('paused').sandboxBackup = { id: 'backup', sandboxId: 'paused-box', status: 'running', phase: '上传中', updatedAt: '2026-01-01T00:00:00Z' };
-  await page.goto('/projects/paused');
+  await openSavedWorkspace(page);
   await expect.poll(() => ui.count('GET', '/api/projects/paused')).toBe(1);
   await expect(ui.editor).toBeEditable();
   await ui.editor.focus();
@@ -277,11 +285,50 @@ test('an unknown Box allows status refresh and release, never create', async ({ 
   expect(ui.count('POST', '/api/projects/other/sandbox/create')).toBe(0);
 });
 
-test('idle activity and reload keep a project paused; typing and sending share one wake', async ({ page, ui }) => {
-  const wakes = () => ui.count('POST', '/api/projects/paused/sandbox/ensure-awake');
-  await page.goto('/sessions/old-session');
+for (const path of ['/projects/paused', '/sessions/old-session']) {
+  test(`opening and reloading ${path} in the foreground each wake a paused Box once`, async ({ page, ui }) => {
+    const wakes = () => ui.count('POST', '/api/projects/paused/sandbox/ensure-awake');
+    await page.goto(path);
+    await expect.poll(wakes).toBe(1);
+    await ui.complete('paused');
+    await expect(page.locator('.project-entry-status')).toHaveCount(0);
+
+    await ui.checkpoint('paused', false);
+    const reads = ui.count('GET', '/api/projects');
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await expect.poll(() => ui.count('GET', '/api/projects')).toBeGreaterThan(reads);
+    await expect(page.locator('.project-entry-status')).toBeVisible();
+    expect(wakes()).toBe(1);
+
+    await page.reload();
+    await expect.poll(wakes).toBe(2);
+    await ui.complete('paused');
+    await expect(page.locator('.project-entry-status')).toHaveCount(0);
+    expect(wakes()).toBe(2);
+  });
+}
+
+test('a link loaded in the background stays paused after the tab becomes visible', async ({ page, ui }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+  });
+  await page.goto('/projects/paused');
   await expect(ui.editor).toBeEditable();
-  await page.reload();
+  const reads = ui.count('GET', '/api/projects');
+  await page.evaluate(() => {
+    delete document.visibilityState;
+    delete document.hidden;
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await expect.poll(() => ui.count('GET', '/api/projects')).toBeGreaterThan(reads);
+  await expect(page.locator('.project-entry-status')).toBeVisible();
+  expect(ui.count('POST', '/api/projects/paused/sandbox/ensure-awake')).toBe(0);
+});
+
+test('restoring a saved session and idle refreshes keep a project paused; typing and sending share one wake', async ({ page, ui }) => {
+  const wakes = () => ui.count('POST', '/api/projects/paused/sandbox/ensure-awake');
+  await openSavedWorkspace(page, 'old-session');
   await expect(ui.editor).toBeEditable();
   await ui.editor.focus();
   const projectReads = () => ui.count('GET', '/api/projects');
@@ -321,7 +368,7 @@ test('sending from a paused native session waits for its Codex handshake and reu
       : request.method === 'thread/queue/list' ? { data: [] } : {};
     socket.send(JSON.stringify({ id: request.id, result }));
   }));
-  await page.goto('/sessions/old-session');
+  await openSavedWorkspace(page, 'old-session');
   await ui.editor.fill('使用原会话继续');
   await ui.send.click();
   expect(rpc).toHaveLength(0);
@@ -386,7 +433,7 @@ test('uploading a file in a paused session waits for readiness', async ({ page, 
     uploads++;
     await route.fulfill({ json: { name: 'task.png', path: '/workspace/task.png' } });
   });
-  await page.goto('/sessions/old-session');
+  await openSavedWorkspace(page, 'old-session');
   await expect(page.getByRole('button', { name: '添加图片' })).toBeEnabled();
   await page.locator('input[type=file]').setInputFiles({ name: 'task.png', mimeType: 'image/png', buffer: Buffer.from([137, 80, 78, 71]) });
   await expect.poll(() => ui.count('POST', '/api/projects/paused/sandbox/ensure-awake')).toBe(1);

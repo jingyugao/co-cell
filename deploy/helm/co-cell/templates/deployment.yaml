@@ -75,6 +75,12 @@ spec:
               containerPort: 3001
               protocol: TCP
           env:
+            {{- with .Values.cellbox.runtimeNamespace }}
+            - name: COCELL_KUBECONFIG
+              value: /var/run/co-cell/proxy/config
+            - name: COCELL_CELLBOX_NAMESPACE
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.config.codexModelMetadata }}
             - name: CODEX_MODEL_METADATA_JSON
               value: {{ . | toJson | quote }}
@@ -209,6 +215,11 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            {{- if .Values.cellbox.runtimeNamespace }}
+            - name: proxy-identity
+              mountPath: /var/run/co-cell/proxy
+              readOnly: true
+            {{- end }}
             - name: mounts-config
               mountPath: /etc/co-cell/mounts
               readOnly: true
@@ -221,6 +232,18 @@ spec:
               mountPath: /app/shared
             {{- end }}
       volumes:
+        {{- if .Values.cellbox.runtimeNamespace }}
+        - name: proxy-identity
+          projected:
+            sources:
+              - serviceAccountToken: {path: token, expirationSeconds: 3600}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items: [{key: ca.crt, path: ca.crt}]
+              - configMap:
+                  name: {{ include "co-cell.fullname" . }}-proxy-kubeconfig
+                  items: [{key: config, path: config}]
+        {{- end }}
         - name: mounts-config
           configMap:
             name: {{ include "co-cell.fullname" . }}-mounts

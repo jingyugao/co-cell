@@ -38,9 +38,10 @@ export class ToolRoles {
       permissions.push({ tool: tool.name, enabled: permission.enabled, credentials: [...names] });
     }
     const now = new Date().toISOString();
-    const role = { id: id ?? randomUUID(), name, permissions, createdAt: previous?.createdAt ?? now, updatedAt: now };
-    await this.repository.roles.saveRole(role, id ? 'update' : 'create');
-    return role;
+    const role = { id: id ?? randomUUID(), name, permissions, ...(input.apiResources && { apiResources: [...new Set(input.apiResources)].sort() }),
+      createdAt: previous?.createdAt ?? now, updatedAt: now };
+    await this.repository.roles.saveRole(role, id ? 'update' : 'create', input.expectedUpdatedAt);
+    return { ...role, apiResources: role.apiResources ?? previous?.apiResources ?? [] };
   }
   async delete(id: string) { await this.repository.roles.deleteRole(id); return { ok: true }; }
   async setDefault(roleId: string) { await this.repository.roles.setDefault(roleId); return this.catalog(); }
@@ -48,7 +49,7 @@ export class ToolRoles {
     const assignment = await this.repository.roles.assignment(projectId);
     if (!assignment) return { roleId: null, permissions: [] };
     const role = assignment.roleId ? (await this.repository.roles.catalog()).roles.find(role => role.id === assignment.roleId) : undefined;
-    return { roleId: assignment.roleId, permissions: role?.permissions ?? [] };
+    return { roleId: assignment.roleId, permissions: role?.permissions ?? [], ...(role?.apiResources && { apiResources: role.apiResources }) };
   }
   async assign(projectId: string, roleId: string | null) {
     await this.repository.roles.assign(projectId, roleId);

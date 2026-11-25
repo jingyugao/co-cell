@@ -3,18 +3,24 @@ import { z } from 'zod';
 import type { SecretService } from './service.js';
 import { TOOL_NAME_PATTERN } from '../../util/tool-secrets.js';
 import { HttpError } from '../../util/errors.js';
+import { RESOURCE_NAME } from '../../protocol/api-resource-types.js';
+import type { RoleCatalog } from '../../protocol/secret-types.js';
 const id = z.string().uuid();
 const tool = z.string().trim().regex(TOOL_NAME_PATTERN);
-export function installSecretRoutes(app: Hono, secrets: SecretService, projectExists: (id: string) => boolean) {
+export function installSecretRoutes(app: Hono, secrets: SecretService, projectExists: (id: string) => boolean,
+  resourceNames?: () => Promise<string[]>) {
   const project = (value: string) => { id.parse(value); if (!projectExists(value)) throw new HttpError(404, '项目不存在'); return value; };
   const permission = z.object({ tool, enabled: z.boolean(), credentials: z.array(z.string().min(1).max(256)).max(256).optional() }).strict();
-  const roleInput = z.object({ name: z.string().trim().min(1).max(100), permissions: z.array(permission).max(256) }).strict();
+  const roleInput = z.object({ name: z.string().trim().min(1).max(100), permissions: z.array(permission).max(256),
+    apiResources: z.array(z.string().regex(RESOURCE_NAME)).max(2048).optional() }).strict();
+  const roleUpdate = roleInput.extend({ expectedUpdatedAt: z.string().max(30).optional() });
+  const withResources = async (roles: RoleCatalog) => resourceNames ? { ...roles, availableApiResources: await resourceNames() } : roles;
   const assignment = z.object({ roleId: id.nullable() }).strict();
-  app.get('/api/tool-roles', async c => c.json(await secrets.roles.catalog()));
+  app.get('/api/tool-roles', async c => c.json(await withResources(await secrets.roles.catalog())));
   app.get('/api/tools', async c => c.json(await secrets.toolCatalog()));
   app.post('/api/tool-roles', async c => c.json(await secrets.roles.save(roleInput.parse(await c.req.json())), 201));
-  app.put('/api/tool-roles/default', async c => c.json(await secrets.roles.setDefault(z.object({ roleId: id }).strict().parse(await c.req.json()).roleId)));
-  app.put('/api/tool-roles/:id', async c => c.json(await secrets.roles.save(roleInput.parse(await c.req.json()), id.parse(c.req.param('id')))));
+  app.put('/api/tool-roles/default', async c => c.json(await withResources(await secrets.roles.setDefault(z.object({ roleId: id }).strict().parse(await c.req.json()).roleId))));
+  app.put('/api/tool-roles/:id', async c => c.json(await secrets.roles.save(roleUpdate.parse(await c.req.json()), id.parse(c.req.param('id')))));
   app.delete('/api/tool-roles/:id', async c => c.json(await secrets.roles.delete(id.parse(c.req.param('id')))));
   app.get('/api/projects/:id/tool-role', async c => c.json(await secrets.roles.state(project(c.req.param('id')))));
   app.put('/api/projects/:id/tool-role', async c => c.json(await secrets.roles.assign(project(c.req.param('id')), assignment.parse(await c.req.json()).roleId)));

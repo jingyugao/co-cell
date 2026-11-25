@@ -1,0 +1,56 @@
+{{- with .Values.cellbox.runtimeNamespace }}
+{{- if eq (include "co-cell.serviceAccountName" $) "default" }}
+{{- fail "Configure a dedicated CoCell service account for the Sandbox HTTP proxy" }}
+{{- end }}
+{{- $name := printf "%s-%s-proxy" $.Release.Namespace (include "co-cell.fullname" $) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ . | quote }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: ["cellbox.jingyugao.github.io"]
+    resources: ["cellboxes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ . | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "co-cell.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "co-cell.fullname" $ }}-proxy-kubeconfig
+data:
+  config: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+      - name: runtime
+        cluster:
+          server: https://kubernetes.default.svc
+          certificate-authority: /var/run/co-cell/proxy/ca.crt
+    contexts:
+      - name: proxy
+        context: {cluster: runtime, user: proxy}
+    current-context: proxy
+    users:
+      - name: proxy
+        user:
+          auth-provider:
+            name: tokenFile
+            config: {tokenFile: /var/run/co-cell/proxy/token}
+{{- end }}

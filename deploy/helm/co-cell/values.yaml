@@ -15,6 +15,8 @@ tracing:
 existingSecret: ""
 
 cellbox:
+  # Setting the runtime namespace enables read-only IP lookup for the Sandbox HTTP proxy.
+  runtimeNamespace: ""
   apiUrl: ""
   # Optional data namespace. Empty uses the Cellbox API's configured default.
   clientId: ""

@@ -7,7 +7,7 @@ export interface RoleRepository {
   init(): Promise<void>;
   bootstrap(): Promise<void>;
   catalog(): Promise<RoleCatalog>;
-  saveRole(role: ToolRole, mode: 'create' | 'update'): Promise<void>;
+  saveRole(role: ToolRole, mode: 'create' | 'update', expectedUpdatedAt?: string): Promise<void>;
   deleteRole(id: string): Promise<void>;
   setDefault(roleId: string): Promise<void>;
   assignment(projectId: string): Promise<ProjectRoleAssignment | null>;
@@ -17,6 +17,9 @@ export interface RoleRepository {
 }
 
 const parse = <T>(value: T | string): T => typeof value === 'string' ? JSON.parse(value) as T : value;
+/** Bind one project ID. Embed in the resource lookup to check current grants in the same DB snapshot. */
+export const projectApiResourceNamesSql = `SELECT g.resource_name FROM project_tool_roles p
+  JOIN tool_role_api_resources g ON g.role_id=p.role_id WHERE p.project_id=?`;
 const isDuplicateKey = (error: unknown) => typeof error === 'object' && error !== null &&
   ('code' in error && error.code === 'ER_DUP_ENTRY' || 'errno' in error && error.errno === 1062);
 
@@ -25,6 +28,11 @@ export class MySqlRoleRepository implements RoleRepository {
 
   async init() {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS tool_roles (id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE, connections JSON NOT NULL, created_at VARCHAR(30) NOT NULL, updated_at VARCHAR(30) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS tool_role_api_resources (
+      role_id CHAR(36) NOT NULL, resource_name VARCHAR(64) NOT NULL, PRIMARY KEY (role_id,resource_name),
+      FOREIGN KEY (role_id) REFERENCES tool_roles(id) ON DELETE CASCADE,
+      FOREIGN KEY (resource_name) REFERENCES api_proxy_resources(name) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS tool_role_settings (id TINYINT UNSIGNED PRIMARY KEY, default_role_id CHAR(36) NULL, CONSTRAINT tool_role_default_fk FOREIGN KEY(default_role_id) REFERENCES tool_roles(id) ON DELETE RESTRICT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS project_tool_roles (project_id CHAR(36) PRIMARY KEY, role_id CHAR(36) NULL, INDEX project_tool_roles_role_id_idx(role_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     // Existing installations may still have the constraints from an earlier
@@ -78,22 +86,28 @@ export class MySqlRoleRepository implements RoleRepository {
   }
 
   async catalog(): Promise<RoleCatalog> {
-    const [roles] = await this.pool.query<RowDataPacket[]>('SELECT id,name,connections,created_at,updated_at FROM tool_roles ORDER BY name,id');
+    const [roles] = await this.pool.query<RowDataPacket[]>(`SELECT id,name,connections,created_at,updated_at,
+      (SELECT JSON_ARRAYAGG(g.resource_name) FROM tool_role_api_resources g WHERE g.role_id=r.id) AS api_resources
+      FROM tool_roles r ORDER BY r.name,r.id`);
     const [settings] = await this.pool.query<RowDataPacket[]>('SELECT default_role_id FROM tool_role_settings WHERE id=1');
     const defaultRoleId = settings[0]?.default_role_id as string | null | undefined;
     if (!defaultRoleId) throw new HttpError(503, '工具角色尚未初始化，请先完成服务初始化');
     return {
-      roles: roles.map(row => ({ id: row.id, name: row.name, permissions: parse<ToolPermission[]>(row.connections).filter(permission => typeof permission.enabled === 'boolean'), createdAt: row.created_at, updatedAt: row.updated_at })),
+      roles: roles.map(row => ({ id: row.id, name: row.name, permissions: parse<ToolPermission[]>(row.connections).filter(permission => typeof permission.enabled === 'boolean'),
+        apiResources: parse<string[]>(row.api_resources ?? []).sort(), createdAt: row.created_at, updatedAt: row.updated_at })),
       defaultRoleId,
     };
   }
 
-  async saveRole(role: ToolRole, mode: 'create' | 'update'): Promise<void> {
+  async saveRole(role: ToolRole, mode: 'create' | 'update', expectedUpdatedAt?: string): Promise<void> {
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
       if (mode === 'update') {
-        const [existing] = await connection.query<RowDataPacket[]>('SELECT id FROM tool_roles WHERE id=? FOR UPDATE', [role.id]);
+        const [existing] = await connection.query<RowDataPacket[]>(
+          'SELECT id FROM tool_roles WHERE id=?' + (expectedUpdatedAt === undefined ? '' : ' AND updated_at=?') + ' FOR UPDATE',
+          expectedUpdatedAt === undefined ? [role.id] : [role.id, expectedUpdatedAt]);
+        if (!existing.length && expectedUpdatedAt !== undefined) throw new HttpError(409, '角色已变更，请刷新后重试');
         if (!existing.length) throw new HttpError(404, '角色不存在');
       }
       if (mode === 'update') {
@@ -101,10 +115,16 @@ export class MySqlRoleRepository implements RoleRepository {
       } else {
         await connection.query('INSERT INTO tool_roles(id,name,connections,created_at,updated_at) VALUES(?,?,CAST(? AS JSON),?,?)', [role.id, role.name, JSON.stringify(role.permissions), role.createdAt, role.updatedAt]);
       }
+      if (role.apiResources !== undefined) {
+        if (mode === 'update') await connection.query('DELETE FROM tool_role_api_resources WHERE role_id=?', [role.id]);
+        if (role.apiResources.length) await connection.query('INSERT INTO tool_role_api_resources(role_id,resource_name) VALUES ?',
+          [role.apiResources.map(name => [role.id, name])]);
+      }
       await connection.commit();
     } catch (error) {
       await connection.rollback();
       if (isDuplicateKey(error)) throw new HttpError(409, '角色名称已存在');
+      if ((error as { code?: string }).code === 'ER_NO_REFERENCED_ROW_2') throw new HttpError(409, 'API 资源已变更，请刷新后重试');
       throw error;
     } finally { connection.release(); }
   }
@@ -219,14 +239,15 @@ export class MemoryRoleRepository implements RoleRepository {
     if (!this.defaultRoleId) throw new HttpError(503, '工具角色尚未初始化，请先完成服务初始化');
     return { roles: [...this.roles.values()].map(role => structuredClone(role)).sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id)), defaultRoleId: this.defaultRoleId };
   }
-  async saveRole(role: ToolRole, mode: 'create' | 'update'): Promise<void> {
+  async saveRole(role: ToolRole, mode: 'create' | 'update', expectedUpdatedAt?: string): Promise<void> {
     const previous = this.roles.get(role.id);
     if (mode === 'update' && !previous) throw new HttpError(404, '角色不存在');
+    if (expectedUpdatedAt !== undefined && previous?.updatedAt !== expectedUpdatedAt) throw new HttpError(409, '角色已变更，请刷新后重试');
     if (mode === 'create' && previous) throw new HttpError(409, '角色已存在');
     if ([...this.roles.values()].some(existing => existing.id !== role.id && existing.name.toLowerCase() === role.name.toLowerCase())) {
       throw new HttpError(409, '角色名称已存在');
     }
-    this.roles.set(role.id, structuredClone(role));
+    this.roles.set(role.id, { ...structuredClone(previous), ...structuredClone(role) });
   }
   async deleteRole(id: string): Promise<void> {
     if (this.defaultRoleId === id) throw new HttpError(409, '默认角色不能删除');

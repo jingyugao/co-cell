@@ -147,6 +147,9 @@ if [[ ( -n "$cellbox_template" && -n "$cellbox_revision" ) || ( -z "$cellbox_tem
   exit 2
 fi
 cellbox_args=(--set-string "cellbox.profile=${cellbox_profile}")
+if [[ -n "${COCELL_CELLBOX_NAMESPACE:-}" ]]; then
+  cellbox_args+=(--set-string "cellbox.runtimeNamespace=${COCELL_CELLBOX_NAMESPACE}")
+fi
 if [[ -n "$cellbox_template" ]]; then
   cellbox_args+=(--set-string "cellbox.templateId=${cellbox_template}" --set-string cellbox.revisionId=)
 else

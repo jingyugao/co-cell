@@ -2,6 +2,8 @@ import { ClaudeBoxClient } from './execution/claude-box.js';
 import { createPreviewProxy } from './projects/preview-proxy.js';
 import { readSystemRequirementInfo } from './projects/requirements.js';
 import { SystemTools } from './execution/system-tools.js';
+import { createBoxSource } from './resource-proxy/box-source.js';
+import { createResourceProxy } from './resource-proxy/proxy.js';
 import { ModelService } from './models/service.js';
 import { MemoryService } from './memory/service.js';
 import { ConversationMaterialsService } from './conversation-materials/service.js';
@@ -96,6 +98,8 @@ const sharedDirectory = await loadSharedMountConfig();
 if (!sharedDirectory) throw new Error('CoCell tool wrappers require the shared persistent directory');
 const sharedDataRoot = resolve(sharedDirectory ? '/app/shared' : (process.env.SHARED_DATA_DIRECTORY || 'data'));
 const webState = createWebStateStore(mysqlUrl);
+const apiResources = webState.apiResources(secretCrypto);
+const resourceProxy = createResourceProxy(apiResources, createBoxSource(process.env.COCELL_KUBECONFIG, process.env.COCELL_CELLBOX_NAMESPACE));
 if (sharedDirectory) {
   const publish = async () => {
     await publishSharedDirectory(sharedDataRoot, resolve('data'), { version: 1, appServerArgs: appServerArguments, env: appServerEnv });
@@ -207,7 +211,7 @@ const reports = new ReportService({ repository: webState.reportRepository, state
   runner: new ReportRunner({ state: webState, manager, models }), directory: resolve(sharedDataRoot, 'runtime/reports'), coordinator, logger: runtimeLog });
 const knowledge = new KnowledgeService({ coordinator, client: hindsight, hooks: retainHooks });
 // Project tables must exist before the Secret schema's foreign keys are created.
-const initializeSchemas = async () => { await webState.init(); await webState.fileFavoriteRepository.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); await webState.materialsRepository.init(); await webState.reportRepository.init(); await webState.workflowRepository.init(); };
+const initializeSchemas = async () => { await webState.init(); await apiResources.init(); await webState.fileFavoriteRepository.init(); await notifications.init(); await tools.init(); await secrets.init(); await models.init(); await webState.memoryRepository.init(); await webState.materialsRepository.init(); await webState.reportRepository.init(); await webState.workflowRepository.init(); };
 if (coordinator) await coordinator.run('cocell-schema-init', initializeSchemas);
 else await initializeSchemas();
 await manager.init();
@@ -247,7 +251,7 @@ const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
   inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), notifications,
-  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge, runtimeLog, reports, workflows);
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge, runtimeLog, reports, workflows, apiResources);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }
@@ -278,6 +282,11 @@ closeNativeSandboxConnections = id => nativeRelay.closeSandbox(id);
 const server = createServer((request, response) => {
   void (async () => {
     if (previewProxy && await previewProxy.handle(request, response)) return;
+    // Preview subdomains keep their own /proxy paths and login flow.
+    if (/^\/proxy(?:[/?]|$)/.test(request.url ?? '') &&
+        !(previewSubdomains && request.headers.host?.toLowerCase().endsWith('.' + publicHost))) {
+      return resourceProxy(request, response);
+    }
     if (!vite || /^\/(?:api|mcp|auth)(?:\/|\?|$)/.test(request.url??'') ||
         !isAuthenticatedDevRequest(request,publicHost,process.env.COCELL_ACCESS_TOKEN!)) {
       await listener(request,response);

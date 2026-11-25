@@ -19,8 +19,9 @@ export default function RoleManager() {
   const [loading, setLoading] = useState(true), [busy, setBusy] = useState(false), [error, setError] = useState('');
   const [editing, setEditing] = useState<ToolRole | 'new' | null>(null);
   const [name, setName] = useState(''), [permissions, setPermissions] = useState<ToolPermission[]>([]);
+  const [apiResources, setApiResources] = useState<string[]>([]);
   const editorBaseline = useRef('');
-  const editorDirty = editing !== null && JSON.stringify({ name, permissions }) !== editorBaseline.current;
+  const editorDirty = editing !== null && JSON.stringify({ name, permissions, apiResources }) !== editorBaseline.current;
   const draftGuard = useDraftStatus('role-editor', editorDirty, busy && editing !== null);
 
   async function refresh() {
@@ -54,7 +55,9 @@ export default function RoleManager() {
     const nextPermissions = [...(tools ?? []).map(entry => current.find(permission => permission.tool === entry.name) ?? emptyPermission(entry)),
       ...current.filter(permission => !(tools ?? []).some(entry => entry.name === permission.tool))]
       .map(permission => ({ ...permission, ...(permission.credentials ? { credentials: [...permission.credentials] } : {}) }));
-    editorBaseline.current = JSON.stringify({ name: role?.name ?? '', permissions: nextPermissions });
+    const grants = role?.apiResources ?? [];
+    editorBaseline.current = JSON.stringify({ name: role?.name ?? '', permissions: nextPermissions, apiResources: grants });
+    setApiResources(grants);
     setPermissions(nextPermissions);
     setEditing(role ?? 'new');
   }
@@ -106,7 +109,9 @@ export default function RoleManager() {
     }
     setBusy(true); setError('');
     try {
-      const body = JSON.stringify({ name: name.trim(), permissions: normalized });
+      const body = JSON.stringify({ name: name.trim(), permissions: normalized, ...(catalog.availableApiResources && {
+        apiResources, ...(editing && editing !== 'new' && { expectedUpdatedAt: editing.updatedAt }),
+      }) });
       const path = editing === 'new' ? '/api/tool-roles' : `/api/tool-roles/${editing?.id}`;
       await api(path, { method: editing === 'new' ? 'POST' : 'PUT', body });
       setEditing(null); await refresh();
@@ -131,6 +136,14 @@ export default function RoleManager() {
     {editing && <EditorDialog title={editing === 'new' ? '新建角色' : `编辑角色：${editing.name}`} busy={busy} error={error} onClose={closeEditor}>
       <form className="secret-form role-form" onSubmit={event => void save(event)}>
       <label>角色名称<input required maxLength={100} value={name} onChange={event => setName(event.target.value)} /></label>
+      {Boolean(catalog?.availableApiResources?.length) && <fieldset className="role-tool-group" disabled={busy}>
+        <legend>API 资源权限</legend>
+        {catalog!.availableApiResources!.map(resource => <label key={resource} className="role-credential-check">
+          <input type="checkbox" checked={apiResources.includes(resource)} onChange={event => {
+            const enabled = event.target.checked;
+            setApiResources(current => enabled ? [...current, resource].sort() : current.filter(item => item !== resource));
+          }} /><span>{resource}</span></label>)}
+      </fieldset>}
       <div className="role-connections-heading"><strong>工具权限</strong><span>勾选工具或共享 HOME 中的连接名称。未选中的连接不会授权给项目。</span></div>
       {!ready ? <p role="status">正在读取工具目录…</p> : <div className="role-tool-list">{tools!.map(entry => {
         const permission = permissions.find(item => item.tool === entry.name) ?? emptyPermission(entry);
@@ -171,6 +184,7 @@ export default function RoleManager() {
     {loading ? <p role="status">正在读取工具角色…</p> : !catalog?.roles.length ? <div className="connections-empty">暂无工具角色。</div> : <div className="secret-list">{catalog.roles.map(role => <article className="connection-card role-card" key={role.id}>
       <div className="connection-profile-title"><strong>{role.name}</strong><span>{catalog.defaultRoleId === role.id ? '默认角色' : ''}</span></div>
       {role.permissions.some(permission => permission.enabled) ? <ul>{role.permissions.map(permissionSummary)}</ul> : <p>无工具权限</p>}
+      {!!role.apiResources?.length && <p>API 资源 · {role.apiResources.join('、')}</p>}
       <div className="secret-actions"><button className="secondary-button" disabled={busy || catalog.defaultRoleId === role.id} onClick={() => void setDefault(role.id)}>{catalog.defaultRoleId === role.id ? '当前默认角色' : '设为默认'}</button><button className="secondary-button" aria-label={`编辑角色：${role.name}`} disabled={busy || !ready} onClick={() => start(role)}>编辑</button><button className="secondary-button" disabled={busy} onClick={() => void remove(role)}>删除</button></div>
     </article>)}</div>}
   </section>;

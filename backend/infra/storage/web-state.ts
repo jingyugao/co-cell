@@ -1,4 +1,6 @@
 import { MySqlPreviewGrantStore } from '../../access/preview-grants.js';
+import { ApiResourceStore } from '../../resource-proxy/store.js';
+import type { SecretCrypto } from '../../secrets/crypto.js';
 import { MySqlModelRepository } from '../../models/repository.js';
 import { MySqlMemoryRepository } from '../../memory/repository.js';
 import { MySqlMaterialsRepository } from '../../conversation-materials/repository.js';
@@ -58,6 +60,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
   readonly secretRepository: MySqlSecretRepository;
   readonly toolRepository: MySqlToolRepository;
   readonly notificationRepository: MySqlNotificationRepository;
+  apiResources(crypto: SecretCrypto) { return new ApiResourceStore(this.pool, crypto); }
   constructor(url: string) {
     this.pool = createPool({ uri: requireMySqlUrl(url), connectionLimit: 10, charset: 'utf8mb4', timezone: 'Z' });
     this.previewGrants = new MySqlPreviewGrantStore(this.pool);

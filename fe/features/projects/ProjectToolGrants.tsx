@@ -66,6 +66,7 @@ export default function ProjectToolGrants({ projectId, name, onClose }: { projec
         </fieldset>
         {!role && selection !== 'none' ? <p className="tool-secret-note" role="status">当前项目关联的角色已不存在。请明确选择一个角色或“无权限”后保存。</p> : role && <section className="project-role-preview" aria-label={`${role.name} 权限预览`}>
           <h3>{role.name} · 权限预览</h3>
+          {!!role.apiResources?.length && <p>API 资源 · {role.apiResources.join('、')}</p>}
           {!role.permissions.some(permission => permission.enabled) ? <p className="tool-secret-note">此角色没有启用的工具。</p> : <ul>{role.permissions.filter(permission => permission.enabled).map(permission => <PermissionPreview key={permission.tool} permission={permission} tools={tools!} />)}</ul>}
         </section>}
       </>}

@@ -1,3 +1,5 @@
+import { installApiResourceRoutes } from './resource-proxy/routes.js';
+import type { ApiResourceStore } from './resource-proxy/store.js';
 import { installModelRoutes } from './models/routes.js';
 import type { ModelService } from './models/service.js';
 import { installMemoryRoutes } from './memory/routes.js';
@@ -37,7 +39,7 @@ import { installPwaAssets } from './infra/http/pwa.js';
 import { installFileFavoriteRoutes } from './file-favorites/routes.js';
 import type { FileFavoriteRepository } from './file-favorites/repository.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository, knowledge?: KnowledgeService, runtimeLog?: PageLoadLogWriter, reports?: ReportService, workflows?: WorkflowService) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository, knowledge?: KnowledgeService, runtimeLog?: PageLoadLogWriter, reports?: ReportService, workflows?: WorkflowService, apiResources?: ApiResourceStore) {
   const app = new Hono();
   if (knowledge?.hooks) app.route('/internal/hindsight', knowledge.hooks.routes());
   app.all('/internal/hindsight/*', c => c.body(null, 403));
@@ -110,6 +112,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
     recordPageLoad(runtimeLog, parsed.data, c.req.header('user-agent'));
     return c.body(null, 204);
   });
+  if (apiResources) installApiResourceRoutes(app, apiResources);
   if (models) installModelRoutes(app, models);
   installMemoryRoutes(app, memory);
   installKnowledgeRoutes(app, knowledge);
@@ -122,7 +125,8 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   installNotificationRoutes(app, notifications);
   installArchiveRoutes(app, manager);
   installSandboxesRoutes(app, sandboxes, manager);
-  if (secrets) installSecretRoutes(app, secrets, id => manager.listProjects().some(project => project.id === id));
+  if (secrets) installSecretRoutes(app, secrets, id => manager.listProjects().some(project => project.id === id),
+    apiResources && (async () => (await apiResources.list()).map(resource => resource.name)));
   if (secrets?.tools) installToolRoutes(app, secrets.tools, secrets);
   installImageRoutes(app, images);
   installSharedFilesRoutes(app, sharedFiles);

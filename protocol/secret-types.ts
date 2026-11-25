@@ -13,8 +13,9 @@ export interface ToolPermission { tool: ProxyTool; enabled: boolean; credentials
 export type ToolCatalogEntry =
   | { name: ProxyTool; kind: 'tool' }
   | { name: ProxyTool; kind: 'tool-with-credential'; credentials: string[]; defaultCredential?: string };
-export interface ToolRole { id: string; name: string; permissions: ToolPermission[]; createdAt: string; updatedAt: string }
-export interface ToolRoleInput { name: string; permissions: ToolPermission[] }
-export interface RoleCatalog { roles: ToolRole[]; defaultRoleId: string }
+export interface ToolRole { id: string; name: string; permissions: ToolPermission[]; apiResources?: string[]; createdAt: string; updatedAt: string }
+/** Omit apiResources on update to preserve the role's existing proxy grants. */
+export interface ToolRoleInput { name: string; permissions: ToolPermission[]; apiResources?: string[]; expectedUpdatedAt?: string }
+export interface RoleCatalog { roles: ToolRole[]; defaultRoleId: string; availableApiResources?: string[] }
 export interface ProjectRoleAssignment { roleId: string | null }
-export interface ProjectRoleState extends ProjectRoleAssignment { permissions: ToolPermission[] }
+export interface ProjectRoleState extends ProjectRoleAssignment { permissions: ToolPermission[]; apiResources?: string[] }

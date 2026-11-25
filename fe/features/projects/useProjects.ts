@@ -190,6 +190,9 @@ export function useProjects() {
       await refreshProjects().catch(() => undefined);
     }
   }, [refreshProjects, storeProject]);
+  const upgradeHarness = useCallback((id: string) => runSandboxOperation(id, 'refresh', () =>
+    api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/refresh-runtime`, { method: 'POST' }),
+  ), [runSandboxOperation]);
   const checkpointSandbox = useCallback((id: string) => runSandboxOperation(id, 'checkpoint', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/sandbox/checkpoint`, { method: 'POST' }),
   ), [runSandboxOperation]);
@@ -199,5 +202,5 @@ export function useProjects() {
   const archiveProject = useCallback((id: string, options: { useExistingBackup?: boolean } = {}) => runSandboxOperation(id, 'archive', () =>
     api<ProjectSummary>(`/api/projects/${encodeURIComponent(id)}/archive`, { method: 'POST', body: JSON.stringify(options) }),
   ), [runSandboxOperation]);
-  return { projects, hasProjectIndex, resumeTimelines, wakingProjects, ensureProjectAwake, refreshProjects, refreshProject, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, backupSandbox, archiveProject };
+  return { projects, hasProjectIndex, resumeTimelines, wakingProjects, ensureProjectAwake, refreshProjects, refreshProject, enterProject, createProject, updateProject, deleteProject, createSandbox, restoreSandbox, releaseSandbox, resumeSandbox, checkpointSandbox, upgradeHarness, backupSandbox, archiveProject };
 }

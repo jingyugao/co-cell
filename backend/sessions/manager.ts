@@ -1614,8 +1614,8 @@ export class SessionManager {
     });
   }
 
-  async refreshProjectSandboxRuntime(id: string): Promise<ProjectSummary> {
-    await this.runProjectSandboxOperation(id, 'refresh');
+  async refreshProjectSandboxRuntime(id: string, harnessRevision?: string): Promise<ProjectSummary> {
+    await this.runProjectSandboxOperation(id, 'refresh', { harnessRevision });
     return this.readProject(id);
   }
 
@@ -1651,7 +1651,7 @@ export class SessionManager {
   }
 
   private async runProjectSandboxOperation(id: string, kind: NonNullable<Project['sandboxOperation']>['kind'],
-    options: { useExistingBackup?: boolean } = {}, eligible?: (project: Project) => boolean) {
+    options: { useExistingBackup?: boolean; harnessRevision?: string } = {}, eligible?: (project: Project) => boolean) {
     if (this.closing) throw new HttpError(503, '服务正在关闭');
     if (!this.sandboxOperations) throw new HttpError(503, 'Sandbox 未配置');
     await this.withProjectOperation(id, async () => {

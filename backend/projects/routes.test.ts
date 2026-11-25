@@ -166,3 +166,18 @@ test('explicit create and restore routes submit the chosen action once', async (
   assert.equal((await app.request('/api/projects/p/sandbox/restore', { method: 'POST', body: JSON.stringify({ imageVersionId: 'v2' }) })).status, 200);
   assert.deepEqual(calls, [['create', 'p'], ['restore', 'p', 'v2']]);
 });
+
+test('refresh-runtime forwards the selected Harness release and supports the published default', async () => {
+  const calls: (string | undefined)[] = [];
+  const app = new Hono();
+  installProjectsRoutes(app, { async refreshProjectSandboxRuntime(id: string, revision?: string) {
+    assert.equal(id, 'project');
+    calls.push(revision);
+    return {};
+  } } as unknown as Parameters<typeof installProjectsRoutes>[1]);
+  const revision = 'f'.repeat(64);
+  for (const body of [undefined, JSON.stringify({ revision })]) {
+    assert.equal((await app.request('/api/projects/project/sandbox/refresh-runtime', { method: 'POST', body })).status, 200);
+  }
+  assert.deepEqual(calls, [undefined, revision]);
+});

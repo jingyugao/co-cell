@@ -1,3 +1,4 @@
+import { selectHarness } from '../shared-files/harness.js';
 import { traced } from '@co-cell/sandbox';
 import { createHash, randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
@@ -221,6 +222,16 @@ export class CellboxRuntimeIntegration {
     finally {
         await client?.close();
     } }); }
+    async upgradeHarness(boxId: string, requested?: string) {
+        const { provider, sharedDataRoot } = this.options;
+        const box = await provider.client.getBox(boxId);
+        if (!sharedDataRoot || !box.capabilities.workloadReleases) throw new HttpError(422, '此 Box 未配置挂载的 Harness');
+        if (box.phase !== 'running') throw new HttpError(409, 'Sandbox 未运行');
+        const revision = await selectHarness(sharedDataRoot, boxId, requested);
+        if (!revision) throw new Error('Harness release missing');
+        await provider.client.updateWorkload(boxId, revision);
+        return revision;
+    }
     async close() {
         this.prepared.clear();
     }

@@ -4,6 +4,30 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { parseConfig, startLauncher } from './launcher.mjs';
+import { attachReleaseSkills } from './release-skills.mjs';
+
+test('upgrading release skills updates both harnesses and preserves personal skills', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cocell-release-skills-'));
+  const home = join(root, 'home'), workspace = join(root, 'workspace');
+  const directories = [join(home, '.agents/skills'), join(workspace, '.cocell/codex/skills'), join(workspace, '.cocell/claude/skills')];
+  try {
+    for (const directory of directories) await mkdir(join(directory, 'personal'), { recursive: true });
+    for (const [sha, names] of [['a', ['shared', 'removed', 'personal']], ['b', ['shared', 'added', 'personal']]]) {
+      const assets = join(root, 'versions', sha.repeat(64), 'assets');
+      for (const name of names) await mkdir(join(assets, 'skills', name), { recursive: true });
+      await attachReleaseSkills(assets, home, workspace);
+      for (const directory of directories) {
+        assert.equal(await readlink(join(directory, 'shared')), join(assets, 'skills/shared'));
+        assert.equal((await stat(join(directory, 'personal'))).isDirectory(), true);
+        await assert.rejects(readlink(join(directory, 'personal')), { code: 'EINVAL' });
+        if (sha === 'b') {
+          assert.equal(await readlink(join(directory, 'added')), join(assets, 'skills/added'));
+          await assert.rejects(readlink(join(directory, 'removed')), { code: 'ENOENT' });
+        }
+      }
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('external model metadata reaches App Server without replacing built-in models', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cocell-model-catalog-'));
@@ -24,7 +48,8 @@ process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);
     await writeFile(join(startupDirectory, 'config.json'), JSON.stringify({ version: 1, appServerArgs: [], env: {
       CODEX_MODEL_METADATA_JSON: JSON.stringify({ 'external-model': { template: 'template', experimental_supported_tools: ['send_user_message_async'] } }),
     } }), { mode: 0o600 });
-    launched = startLauncher({ workspace, agentHome: join(root, 'agent'), startupDirectory, codex, signal: stop.signal, log: () => {} });
+    launched = startLauncher({ workspace, agentHome: join(root, 'agent'), startupDirectory, codex, signal: stop.signal,
+      acpHost: async () => { throw new Error('ACP port unavailable'); }, log: () => {} });
     await until(async () => Boolean(await stat(report).catch(() => null)));
     const result = JSON.parse(await readFile(report, 'utf8'));
     assert.deepEqual(result.catalog.models[0], original);

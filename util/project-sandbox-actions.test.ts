@@ -15,7 +15,7 @@ test('observed Cellbox phase overrides stale SDK status, but active remote opera
     sandboxOperation: { kind: 'resume', status: 'succeeded', phase: '完成', updatedAt: now } });
   const running = projectSandboxActions(value);
   assert.equal(running.state, 'running');
-  assert.deepEqual(running.actions.map(action => action.id), ['checkpoint', 'release']);
+  assert.deepEqual(running.actions.map(action => action.id), ['checkpoint', 'upgradeHarness', 'release']);
   for (const sandbox of [{ ...box, phase: 'running', operationId: 'remote-operation' }, { ...box, phase: 'suspending' }]) {
     const view = projectSandboxActions({ ...value, sandbox });
     assert.equal(view.state, 'processing');

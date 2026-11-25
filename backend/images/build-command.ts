@@ -4,7 +4,12 @@ import { HttpError } from '../../util/errors.js';
 
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 /** No downloads: the source or user's command supplies Node.js, Codex and project tools. */
-export async function prepareImageRequest(url: string, userCommand?: string) {
+export async function prepareImageRequest(url: string, userCommand?: string, mounted = false) {
+  if (mounted) {
+    if (Buffer.byteLength(userCommand ?? '') > 65536) throw new HttpError(400, '构建命令超过 64 KiB');
+    return { url, platform: 'linux/amd64' as const, buildCommand: userCommand ?? '',
+      runCommand: `docker run -w /home/agent/workspace --entrypoint /opt/cellbox/bin/cellbox-container-agent ${quote(url)} mounted-workload` };
+  }
   const sources = [
     ['deploy/box-wrap/profile-loader.sh', '/etc/profile.d/cocell-tools.sh'],
     ['deploy/box-wrap/tool-path.sh', '/opt/product/cocell/tool-path.sh'],

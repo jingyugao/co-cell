@@ -633,3 +633,24 @@ test('workflow reviews the frozen command before submitting one version-bound de
   await expect(page.getByText('并行实施', { exact: true })).toBeVisible();
   expect(decisions).toHaveLength(1);
 });
+
+test('upgrade Harness submits once from a running conversation', async ({ page, ui }) => {
+  const project = ui.projects.get('other');
+  project.activeSessionId = 'running-session';
+  let submissions = 0;
+  const dialogs = [];
+  page.on('dialog', async dialog => { dialogs.push(dialog.message()); await dialog.dismiss(); });
+  await page.route('**/api/projects/other/sandbox/refresh-runtime', async route => {
+    expect(route.request().method()).toBe('POST');
+    submissions++;
+    await route.fulfill({ json: { ...project, sandboxOperation: {
+      kind: 'refresh', status: 'succeeded', phase: '完成', updatedAt: new Date().toISOString(),
+    } } });
+  });
+  await page.goto('/#projects');
+  const button = page.getByRole('article', { name: '另一个项目', exact: true }).getByRole('button', { name: '升级 Harness' });
+  await expect(button).toBeEnabled();
+  await button.click();
+  await expect.poll(() => submissions).toBe(1);
+  expect(dialogs).toEqual([]);
+});

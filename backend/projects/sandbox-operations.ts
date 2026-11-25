@@ -16,7 +16,7 @@ import { BackupCatalogUnavailable } from '../sandboxes/cellbox-volume-backups.js
 import { sandboxMounts } from '../../util/sandbox-mounts.js';
 import type { ProjectResumeObserver } from '../../protocol/resume-types.js';
 
-type OperationOptions = { useExistingBackup?: boolean; imageVersionId?: string; onResumeProgress?: ProjectResumeObserver;
+type OperationOptions = { harnessRevision?: string; useExistingBackup?: boolean; imageVersionId?: string; onResumeProgress?: ProjectResumeObserver;
   automaticArchiveAttempt?: number; releaseObservation?: SandboxReleaseObservation };
 
 const target = (project: Project): WorkspaceTarget => ({ id: project.id, projectId: project.id,
@@ -136,7 +136,10 @@ export class ProjectSandboxOperations {
         else if (kind === 'restore') await this.restore(id, false, selection);
         else if (kind === 'backup') await this.backup(id);
         else if (kind === 'delete') await this.remove(id);
-        else if (kind === 'refresh') throw new HttpError(422, '当前 Cellbox 不支持原地刷新；请选择明确版本创建新环境。');
+        else if (kind === 'refresh') {
+          if (!project.sandbox || !this.deps.runtime.upgradeHarness) throw new HttpError(422, 'Sandbox 不支持升级 Harness');
+          operation.harnessRevision = await this.deps.runtime.upgradeHarness(project.sandbox.id, options.harnessRevision);
+        }
         else await this.archive(id, options);
         operation.status = 'succeeded'; operation.phase = operation.cleanupError ? '操作完成，资源清理未完成' : '完成'; operation.updatedAt = new Date().toISOString();
         await this.deps.projects.updateSandboxOperation(id, { ...operation });

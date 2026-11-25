@@ -16,6 +16,8 @@ export interface CellboxCapabilities {
   exec: boolean; files: boolean; http: boolean; websocket: boolean;
   pty: boolean; reconnectExec: boolean; freeze: boolean;
   suspend: 'none' | 'same-node-checkpoint'; archives: string; protectedTools: boolean;
+  workloadReleases?: boolean;
+  mountedReleaseTools?: boolean;
   sharedDirectory?: boolean;
   persistentHome?: boolean;
   mountedDebugHome?: boolean;
@@ -279,6 +281,9 @@ export class CellboxClient {
   listBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes', { signal }); }
   listResourceBoxes(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/boxes?observation=resource', { signal }); }
   listCheckpoints(signal?: AbortSignal) { return this.request<CellboxBox[]>('GET', '/v1/checkpoints', { signal }); }
+  updateWorkload(id: string, revision: string) {
+    return this.request<void>('PUT', `/v1/boxes/${this.id(id)}/workload`, { body: { revision }, response: 'empty', timeoutMs: 15000 });
+  }
   getBox(id: string, signal?: AbortSignal) { return this.request<CellboxBox>('GET', `/v1/boxes/${this.id(id)}`, { signal }); }
   listVolumes(signal?: AbortSignal) { return this.request<CellboxVolume[]>('GET', '/v1/volumes', { signal }); }
   getVolume(id: string, signal?: AbortSignal) { return this.request<CellboxVolume>('GET', `/v1/volumes/${this.id(id)}`, { signal }); }

@@ -6,7 +6,7 @@ import type { SessionManager } from '../sessions/manager.js';
 import { workspaceFileResponse } from '../workspaces/http-files.js';
 import { applicationCookies, applicationSetCookie, previewLocation } from './preview-policy.js';
 import { serviceHost } from './service-host.js';
-import { PROJECT_OPERATION_WAIT_MS } from '../../protocol/types.js';
+import { PROJECT_OPERATION_WAIT_MS, type HarnessUpgradeRequest } from '../../protocol/types.js';
 import { resumeStream } from './resume-stream.js';
 
 type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'createProjectSandbox' | 'restoreProjectSandbox' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'ensureProjectAwake' | 'releaseProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
@@ -75,7 +75,13 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
   });
   app.post('/api/projects/:id/sandbox/checkpoint', async c => projectOperationResponse(c, await manager.checkpointProjectSandbox(c.req.param('id'))));
   app.post('/api/projects/:id/sandbox/release', async c => projectOperationResponse(c, await manager.releaseProjectSandbox(c.req.param('id'))));
-  app.post('/api/projects/:id/sandbox/refresh-runtime', async c => projectOperationResponse(c, await manager.refreshProjectSandboxRuntime(c.req.param('id'))));
+  app.post('/api/projects/:id/sandbox/refresh-runtime', async c => {
+    const raw = await c.req.text();
+    let body: unknown;
+    try { body = raw ? JSON.parse(raw) : {}; } catch { throw new HttpError(400, '请求 JSON 无效'); }
+    const { revision }: HarnessUpgradeRequest = z.object({ revision: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict().parse(body);
+    return projectOperationResponse(c, await manager.refreshProjectSandboxRuntime(c.req.param('id'), revision));
+  });
   const content = async (c: Context) => {
     const path = c.req.query('path');
     if (!path) throw new HttpError(400, '缺少文件路径');

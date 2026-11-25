@@ -1,8 +1,9 @@
+import { selectHarness } from '../shared-files/harness.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { SandboxExtension, SandboxLifecycleContext } from '@co-cell/sandbox';
-import type { CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
+import { CellboxError, type CellboxSandboxProvider } from '../../packages/sandbox/src/providers/cellbox/index.js';
 import type { SecretService } from '../secrets/service.js';
 import type { ToolHomeRuntimeConfig } from '../../protocol/secret-types.js';
 import type { RuntimeLog } from '../infra/diagnostics/runtime-log.js';
@@ -46,6 +47,9 @@ export class SandboxRuntimeConfig {
         if (this.options.sharedDataRoot) await unlink(this.sourcePath(context.sandboxId)).catch(error => {
           if (error.code !== 'ENOENT') throw error;
         });
+        if (this.options.sharedDataRoot) await unlink(join(this.options.sharedDataRoot, 'harness', 'boxes', context.sandboxId)).catch(error => {
+          if (error.code !== 'ENOENT') throw error;
+        });
         await this.options.secrets?.repository.forgetRuntime(context.sandboxId);
         assertActive(context.signal);
       }
@@ -85,6 +89,18 @@ export class SandboxRuntimeConfig {
     assertActive(signal);
     const box = await this.options.provider.client.getBox(boxId, signal);
     assertActive(signal);
+    if (this.options.sharedDataRoot && box.capabilities.workloadReleases
+        && (context.action === 'create' || box.phase === 'staged' && ['activate', 'restore'].includes(context.action))) {
+      const revision = await selectHarness(this.options.sharedDataRoot, boxId, undefined, true);
+      // Ordinary creates are already running; staged restores start their selected release on activate.
+      if (revision && box.phase === 'running') {
+        try { await this.options.provider.client.updateWorkload(boxId, revision); }
+        catch (error) {
+          // Prepared images with an older Guest can still start their image-provided command.
+          if (!(error instanceof CellboxError) || error.code !== 'UNSUPPORTED_CAPABILITY') throw error;
+        }
+      }
+    }
     if (!box.capabilities.protectedTools) return;
     if (box.phase !== 'running' && box.phase !== 'staged') throw new Error(`Cannot configure Cellbox in phase ${box.phase}`);
     const generation = box.generation;

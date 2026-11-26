@@ -1,3 +1,4 @@
+import { guestNode, type AgentRuntime } from '../shared-files/agent-runtime.js';
 import { proxyFetch } from 'httpxy';
 import { traced } from '@co-cell/sandbox';
 import { withNativeUserInput } from '../../util/user-input.js';
@@ -79,6 +80,7 @@ export interface SandboxRuntime {
 export type NativeTurnObservation = { type: 'snapshot'; turn: Turn } | { type: 'event'; event: AgentEvent };
 export type { AppServerEndpoint } from './app-server-reader.js';
 export interface ContainerRuntimeOptions {
+  agents?: AgentRuntime;
   paths: { root: string; runtime: string; codexHome: string; node: string };
   prepareRemote: (sandbox: SandboxHandle, target: WorkspaceTarget, signal: AbortSignal, info?: SandboxInfo) => Promise<boolean>;
   acquireRemoteUsage?: (sandboxId: string, initializationDirectory?: string, info?: SandboxInfo) => Promise<() => Promise<void>>;
@@ -258,29 +260,47 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   }
 
   async prepareClaudeHooks(session: Session) {
-    if (!this.options.hindsightHookConfig || !session.projectId || !session.sandbox) return;
-    const signal = AbortSignal.timeout(5_000);
+    if (!session.projectId || !session.sandbox || (!this.options.agents && !this.options.hindsightHookConfig)) return;
+    const signal = AbortSignal.timeout(this.options.agents ? 60_000 : 5_000);
     try {
       const entry = await this.acquire(session, false, undefined, signal);
       try {
-        const project = await this.options.resolveProject?.(session.projectId);
-        await this.prepare(entry, signal, () => this.configureHindsight(entry, project, signal));
+        if (this.options.agents) {
+          await this.options.prepareRemote(entry.sandbox, session, signal, entry.info);
+          await this.options.agents.apply(entry.sandbox, session.projectId,
+            Boolean(this.options.sharedFilesMounted?.(entry.sandbox.sandboxId)), false, signal);
+        }
+        if (this.options.hindsightHookConfig) {
+          try {
+            const project = await this.options.resolveProject?.(session.projectId);
+            await this.prepare(entry, signal, () => this.configureHindsight(entry, project, signal));
+          } catch {
+            this.options.logger?.write({ event: 'knowledge.hook_config_failed', sandboxId: session.sandbox.id });
+          }
+        }
       } finally { await this.releaseEntry(entry); }
-    } catch {
+    } catch (error) {
+      if (this.options.agents) throw error;
       this.options.logger?.write({ event: 'knowledge.hook_config_failed', sandboxId: session.sandbox.id });
     }
   }
 
-  private async prepareEnvironment(target: WorkspaceTarget, entry: Entry, executionSignal: AbortSignal) {
+  private async prepareEnvironment(target: WorkspaceTarget, entry: Entry, executionSignal: AbortSignal, refreshCodex = false) {
     return this.prepare(entry, executionSignal, async () => {
       const fresh = await this.options.prepareRemote(entry.sandbox, target, executionSignal, entry.info);
       const project = await this.options.resolveProject?.(target.projectId ?? target.id);
       await this.configureHindsight(entry, project, executionSignal, fresh);
       if (project) {
         const path = posix.join(project.workingDirectory, PROJECT_FOLLOWUP_FILE);
+        const nodeCommand = this.options.agents ? guestNode(entry.sandbox.sandboxId, this.node) : quote(this.node);
         const result = await this.command(entry,
-          `${quote(this.node)} -e ${quote(INITIALIZE_PROJECT_FOLLOWUP)} ${quote(path)} ${quote(projectFollowupDocument(project))}`, executionSignal);
+          `${nodeCommand} -e ${quote(INITIALIZE_PROJECT_FOLLOWUP)} ${quote(path)} ${quote(projectFollowupDocument(project))}`, executionSignal);
         if (result.exitCode !== 0) throw new Error('无法初始化项目跟进文件');
+      }
+      if (this.options.agents && project) {
+        await this.options.agents.apply(entry.sandbox, project.id, Boolean(this.options.sharedFilesMounted?.(entry.sandbox.sandboxId)),
+          false, executionSignal, refreshCodex ? target.settings.workingDirectory : undefined);
+        return;
       }
       if (this.options.sharedFilesMounted?.(entry.sandbox.sandboxId)) return;
       // Older instances without the directory mount still receive snapshots.
@@ -342,8 +362,8 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     try {
       const modelOptions = await this.options.resolveModel?.(session);
       entry = await this.acquire(session, true, onSandbox, startupSignal);
-      // Publish the global AGENTS.md and shared docs before every turn.
-      await this.prepareEnvironment(session, entry, startupSignal);
+      // Resolve the project's Agent before the native thread starts or resumes.
+      await this.prepareEnvironment(session, entry, startupSignal, true);
       observer.signal.throwIfAborted();
       const images: string[] = [];
       if (turn.images.length) {
@@ -390,7 +410,7 @@ export class ContainerCodexRuntime implements SandboxRuntime {
   async prepareNativeSession(session: Session, signal: AbortSignal, onSandbox: SaveSandbox) {
     const entry = await this.acquire(session, true, onSandbox, signal);
     try {
-      await this.prepareEnvironment(session, entry, signal);
+      await this.prepareEnvironment(session, entry, signal, true);
       const model = await this.options.resolveModel?.(session);
       let effectiveModel = model?.model || session.settings.model;
       const threadOptions = { cwd: session.settings.workingDirectory, approvalPolicy: 'never', sandbox: session.managedBy ? session.settings.sandboxMode : 'danger-full-access',

@@ -1,3 +1,5 @@
+import type { AgentProfiles } from './shared-files/agent-profiles.js';
+import { installAgentRoutes, profileFiles } from './shared-files/agent-routes.js';
 import { installApiResourceRoutes } from './resource-proxy/routes.js';
 import type { ApiResourceStore } from './resource-proxy/store.js';
 import { installModelRoutes } from './models/routes.js';
@@ -39,7 +41,7 @@ import { installPwaAssets } from './infra/http/pwa.js';
 import { installFileFavoriteRoutes } from './file-favorites/routes.js';
 import type { FileFavoriteRepository } from './file-favorites/repository.js';
 
-export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository, knowledge?: KnowledgeService, runtimeLog?: PageLoadLogWriter, reports?: ReportService, workflows?: WorkflowService, apiResources?: ApiResourceStore) {
+export function createApp(manager: SessionManager, config: AppConfig, allowedHosts: string[], sandboxes: SandboxInventoryReader, sharedFiles = new SharedFiles(), notifications?: NotificationStore, operatorAccess?: OperatorAccessOptions, images?: ImageCatalog, secrets?: SecretService, models?: ModelService, memory?: MemoryService, fileFavorites?: FileFavoriteRepository, knowledge?: KnowledgeService, runtimeLog?: PageLoadLogWriter, reports?: ReportService, workflows?: WorkflowService, apiResources?: ApiResourceStore, agents?: AgentProfiles, applyAgent?: (id:string) => Promise<string>) {
   const app = new Hono();
   if (knowledge?.hooks) app.route('/internal/hindsight', knowledge.hooks.routes());
   app.all('/internal/hindsight/*', c => c.body(null, 403));
@@ -120,7 +122,7 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
   installWorkflowRoutes(app, workflows);
   installFileFavoriteRoutes(app, manager, fileFavorites);
   installProjectsRoutes(app, manager, operatorAccess?.previewSubdomains
-    ? { publicUrl: operatorAccess.publicUrl, token: operatorAccess.token } : undefined, images);
+    ? { publicUrl: operatorAccess.publicUrl, token: operatorAccess.token } : undefined, images, agents, applyAgent);
   installSessionsRoutes(app, manager, config);
   installNotificationRoutes(app, notifications);
   installArchiveRoutes(app, manager);
@@ -129,7 +131,8 @@ export function createApp(manager: SessionManager, config: AppConfig, allowedHos
     apiResources && (async () => (await apiResources.list()).map(resource => resource.name)));
   if (secrets?.tools) installToolRoutes(app, secrets.tools, secrets);
   installImageRoutes(app, images);
-  installSharedFilesRoutes(app, sharedFiles);
+  installSharedFilesRoutes(app, agents ? profileFiles(agents,'default') : sharedFiles);
+  if (agents) installAgentRoutes(app,agents);
   app.all('/api/*', c => c.json({ error: '接口不存在' }, 404));
   return app;
 }

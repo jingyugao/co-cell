@@ -1,3 +1,7 @@
+import { HttpError } from '../util/errors.js';
+import { AgentProfiles } from './shared-files/agent-profiles.js';
+import { AgentRuntime } from './shared-files/agent-runtime.js';
+import { agentOssPublisher } from './shared-files/agent-oss.js';
 import { ClaudeBoxClient } from './execution/claude-box.js';
 import { createPreviewProxy } from './projects/preview-proxy.js';
 import { readSystemRequirementInfo } from './projects/requirements.js';
@@ -112,6 +116,24 @@ for(const name of ['CELLBOX_API_URL','CELLBOX_PROFILE','COCELL_ACCESS_TOKEN'])if
 if(process.env.COCELL_ACCESS_TOKEN!.length<32)throw new Error('COCELL_ACCESS_TOKEN must contain at least 32 bytes');
 const cellboxProvider=new CellboxSandboxProvider({baseUrl:process.env.CELLBOX_API_URL!,clientId:process.env.CELLBOX_CLIENT_ID,profileId:process.env.CELLBOX_PROFILE!,kind:'k8s-resumable',workspace:'/home/agent/workspace',templateId:process.env.CELLBOX_TEMPLATE_ID,revisionId:process.env.CELLBOX_REVISION_ID});
 await cellboxProvider.initialize();
+const agents = new AgentProfiles(sharedDataRoot,coordinator,agentOssPublisher());
+await agents.init();
+const agentRuntime = new AgentRuntime(agents,async id => {
+  const project = await webState.getProject(id);
+  if (!project || project.removedAt) throw new HttpError(404,'项目不存在');
+  return project.agentProfileId ?? 'default';
+}, CELLBOX_PRODUCT_PATHS.node, async (boxId, cwd, signal) => {
+  await appServerReader.read(boxId, client => client.request('skills/list', { cwds: [cwd], forceReload: true }), signal);
+});
+const applyAgent = async (projectId:string) => {
+  const project = await webState.getProject(projectId);
+  if (!project || project.removedAt) throw new HttpError(404,'项目不存在');
+  if (!project.sandbox) throw new HttpError(409,'项目尚未创建 Sandbox');
+  const box = await cellboxProvider.client.getBox(project.sandbox.id);
+  if (box.phase !== 'running') throw new HttpError(409,'请先恢复项目 Sandbox');
+  return agentRuntime.apply(await cellboxProvider.connectForSetup(box.id), projectId,
+    sharedDirectory && box.capabilities.sharedDirectory === true, true, AbortSignal.timeout(60_000), project.workingDirectory);
+};
 let manager: SessionManager;
 let closeNativeSandboxConnections = async (_id: string): Promise<void> => {};
 const tools = new DynamicTools(webState.toolRepository, sharedDataRoot, coordinator);
@@ -119,7 +141,7 @@ const secrets = new SecretService(webState.secretRepository, tools);
 if (sharedDirectory) await secrets.mountHomes(sharedDataRoot);
 const appServerReader: AppServerReader = new AppServerReader(id => cellboxRuntime.appServer(id),
   error => { void runtimeLog.write({ event: 'sandbox.access_release_failed', error }); }, multiApi ? 0 : undefined);
-const cellboxRuntime=new CellboxRuntimeIntegration({provider:cellboxProvider,profileId:process.env.CELLBOX_PROFILE!,appServerArgs:appServerArguments,
+const cellboxRuntime=new CellboxRuntimeIntegration({agentRuntime,provider:cellboxProvider,profileId:process.env.CELLBOX_PROFILE!,appServerArgs:appServerArguments,
   extensions: [{ name: 'native-app-server-connections', pre: async context => {
     if (context.sandboxId && ['pause', 'checkpoint', 'destroy'].includes(context.action))
       await closeNativeSandboxConnections(context.sandboxId);
@@ -166,7 +188,7 @@ const retainHooks = hindsight && hindsightSync === 'true'
   ? new HookRetain(hindsight, process.env.COCELL_SECRET_MASTER_KEY!, brokerOrigin.origin, id => webState.getProject(id),
     (projectId, threadId) => webState.sessionIdForThread(projectId, threadId))
   : undefined;
-const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
+const runtime = new ContainerCodexRuntime({ agents:agentRuntime, sandboxes: projectSandboxes, provider, apiKey: apiKey || '',
   resolveModel: session => modelProvider.threadOptions(session),
   hindsightHookConfig: project => retainHooks && project && project.name.trim().toLowerCase() !== 'system' ? retainHooks.config(project.id) : { disabled: true },
   resolveProject: async id => { const project = await webState.getProject(id); return project?.removedAt ? undefined : project; },
@@ -174,7 +196,12 @@ const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provide
   sharedDataDirectory: pathToFileURL(`${sharedDataRoot}/`),
   ...(sharedDirectory ? { sharedFilesMounted: (id: string) => cellboxRuntime.usesSharedDirectory(id) } : {}),
   appServer, appServerReader, paths:CELLBOX_PRODUCT_PATHS, prepareRemote:(handle,target,signal,info)=>cellboxRuntime.prepare(handle,target,signal,info),
-  upgradeHarness:(id, revision)=>cellboxRuntime.upgradeHarness(id, revision),
+  upgradeHarness:async (id, revision)=>{
+    const applied = await cellboxRuntime.upgradeHarness(id, revision);
+    const projectId = await agentRuntime.boundProject(id);
+    if (projectId) await agentRuntime.apply(await cellboxProvider.connectForSetup(id),projectId,true,false,AbortSignal.timeout(60_000));
+    return applied;
+  },
   remoteArchives:cellboxRuntime.remoteArchives,
   serviceAccess:(id:string,port:number)=>cellboxProvider.getServiceAccess(id,port) });
 const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || 'data/web-state');
@@ -252,7 +279,7 @@ const publicHost=new URL(publicUrl).host;
 const additionalAllowedHosts = (process.env.ALLOWED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean);
 const app = createApp(manager, config, [...new Set([`localhost:${port}`, `127.0.0.1:${port}`, publicHost,...additionalAllowedHosts])],
   inventory, new SharedFiles(sharedDataRoot, sharedDirectory, coordinator), notifications,
-  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge, runtimeLog, reports, workflows, apiResources);
+  { token:process.env.COCELL_ACCESS_TOKEN!,publicUrl,previewSubdomains,previewGrants:webState.previewGrants,refreshProjects:()=>manager.refreshSharedState(),projects:()=>manager.listProjects() }, imageCatalog, secrets, models, memory, webState.fileFavoriteRepository, knowledge, runtimeLog, reports, workflows, apiResources, agents, applyAgent);
 let vite: import('vite').ViteDevServer | undefined;
 if (process.env.NODE_ENV === 'production') installProductionStatic(app);
 else { const { createServer: createViteServer } = await import('vite'); vite = await createViteServer({ server: { middlewareMode: true, ws:false, hmr:false }, appType: 'spa' }); }

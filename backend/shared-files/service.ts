@@ -16,7 +16,7 @@ function decode(bytes: Uint8Array): string | undefined {
 export class SharedFiles {
   private tail: Promise<unknown> = Promise.resolve();
   constructor(private root = process.env.SHARED_DATA_DIRECTORY || fileURLToPath(new URL('../../data/', import.meta.url)),
-    private mounted = false, private coordinator?: SharedCoordinator) {}
+    private mounted = false, private coordinator?: SharedCoordinator, private skills = false) {}
   private serial<T>(action: () => Promise<T>): Promise<T> {
     const next = this.tail.then(action);
     this.tail = next.catch(() => {});
@@ -24,9 +24,9 @@ export class SharedFiles {
   }
   private validate(path: string) {
     if (path.length > 2048 || /[\\\x00-\x1f\x7f]/.test(path) ||
-      (path !== 'AGENTS.md' && !path.startsWith('docs/')) ||
-      path.split('/').some(part => !part || part === '.' || part === '..' || part.startsWith('.shared-write-'))) {
-      throw new HttpError(400, '路径须为 AGENTS.md 或 docs/ 下的文件，不能包含路径跳转');
+      (path !== 'AGENTS.md' && !path.startsWith('docs/') && !(this.skills && /^skills\/[a-z0-9][a-z0-9-]{0,63}\/.+/.test(path))) ||
+      path.split('/').some(part => !part || part === '.' || part === '..' || part.startsWith('.shared-write-') || part === '.git')) {
+      throw new HttpError(400, this.skills ? '路径须为 AGENTS.md、docs/ 下的文件或 skills/<名称>/ 下的文件' : '路径须为 AGENTS.md 或 docs/ 下的文件，不能包含路径跳转');
     }
   }
   private withPathLock<T>(path: string, action: () => Promise<T>) {
@@ -78,13 +78,14 @@ export class SharedFiles {
         const info = await lstat(join(this.root, path)).catch(error => { if (!missing(error)) throw error; return null; });
         if (!info?.isDirectory() || info.isSymbolicLink()) return;
         for (const entry of await readdir(join(this.root, path), { withFileTypes: true })) {
-          if (entry.name.startsWith('.shared-write-')) continue;
+          if (entry.name.startsWith('.shared-write-') || entry.name === '.git') continue;
           const child = `${path}/${entry.name}`;
           if (entry.isDirectory()) await walk(child);
           else if (entry.isFile()) paths.push(child);
         }
       };
       await walk('docs');
+      if (this.skills) await walk('skills');
       const files = [];
       for (const path of paths.sort()) {
         try {
@@ -118,7 +119,10 @@ export class SharedFiles {
           const handle = await open(temp, 'wx', 0o600);
           try {
             await handle.writeFile(bytes);
-            if (this.mounted || path === 'AGENTS.md') await handle.chmod(0o644);
+            if (this.mounted || path === 'AGENTS.md') {
+              const executable = expectedVersion && (await lstat(location)).mode & 0o111;
+              await handle.chmod(executable ? 0o755 : 0o644);
+            }
           } finally { await handle.close(); }
           if (expectedVersion === undefined) {
             await link(temp, location).catch(error => {

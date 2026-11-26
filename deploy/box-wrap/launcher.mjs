@@ -105,7 +105,8 @@ async function attachSharedFiles(codexHome, sharedDirectory, assets) {
   for (const name of ['AGENTS.md', 'docs']) {
     const destination = join(codexHome, name);
     const published = assets && join(assets, name);
-    const source = published && await lstat(published).catch(err => { if (err.code !== 'ENOENT') throw err; })
+    const configured = assets?.startsWith('/var/lib/cellbox/shared/agents/versions/');
+    const source = configured ? published : published && await lstat(published).catch(err => { if (err.code !== 'ENOENT') throw err; })
       ? published : sharedDirectory && join(sharedDirectory, name);
     if (!source) continue;
     if (await readlink(destination).catch(error => {

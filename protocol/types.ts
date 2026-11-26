@@ -179,6 +179,8 @@ export interface ProjectSandboxBackup {
 }
 
 export interface Project {
+  /** Older project records use the default Agent. */
+  agentProfileId?: string;
   id: string;
   name: string;
   /** Missing values are legacy ordinary projects. */

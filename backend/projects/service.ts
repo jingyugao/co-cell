@@ -10,7 +10,7 @@ import { RecordWriteQueue } from '../infra/storage/record-write-queue.js';
 import { mergeRecord } from '../infra/storage/record-merge.js';
 import type { WebStateStore } from '../infra/storage/web-state.js';
 
-export type ProjectInput = { name?: string; requirementUrl?: string | null; type?: ProjectType; imageSelection?: ProjectImageSelection };
+export type ProjectInput = { agentProfileId?: string; name?: string; requirementUrl?: string | null; type?: ProjectType; imageSelection?: ProjectImageSelection };
 export type ProjectUpdate = Partial<Omit<ProjectInput, 'imageSelection'>> & { status?: ProjectStatus };
 
 /** Owns project records and guards operations against concurrent deletion. */
@@ -328,7 +328,7 @@ export class ProjectService {
     if (!name) throw new HttpError(400, '请输入项目名称或绑定飞书需求');
     this.validate({ name });
     const now = this.now().toISOString();
-    const project: Project = { id: randomUUID(), name, type, ...(weekOf ? { weekOf } : {}), requirementUrl, ...(info ? { requirementStatus: info.status } : {}),
+    const project: Project = { id: randomUUID(), name, type, agentProfileId: input.agentProfileId ?? 'default', ...(weekOf ? { weekOf } : {}), requirementUrl, ...(info ? { requirementStatus: info.status } : {}),
       ...(input.imageSelection ? { imageSelection: structuredClone(input.imageSelection) } : {}),
       executionMode: settings.executionMode ?? 'local', workingDirectory: settings.workingDirectory,
       status: 'active', completedAt: null, archivedAt: null, createdAt: now, updatedAt: now };
@@ -352,6 +352,7 @@ export class ProjectService {
           if (project.type !== 2 && input.requirementUrl) throw new HttpError(400, '只有飞书项目可以绑定飞书需求');
           project.requirementUrl = input.requirementUrl;
         }
+        if (input.agentProfileId !== undefined) project.agentProfileId = input.agentProfileId;
         if (input.name !== undefined) project.name = input.name.trim();
         const now = new Date().toISOString();
         if (input.status !== undefined && input.status !== project.status) {

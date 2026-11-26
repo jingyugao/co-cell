@@ -183,6 +183,12 @@ spec:
             - name: CODEX_PROXY_KIND
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.config.agentOssBucket }}
+            - name: COCELL_AGENT_OSS_BUCKET
+              value: {{ . | quote }}
+            - name: OSS_REGION
+              value: {{ $.Values.config.ossRegion | default "us-east-1" | quote }}
+            {{- end }}
             {{- with .Values.config.ossEndpoint }}
             - name: OSS_ENDPOINT
               value: {{ . | quote }}

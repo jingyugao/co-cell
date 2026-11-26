@@ -1,3 +1,4 @@
+import { guestNode } from '../shared-files/agent-runtime.js';
 import { selectHarness } from '../shared-files/harness.js';
 import { traced } from '@co-cell/sandbox';
 import { createHash, randomUUID } from 'node:crypto';
@@ -152,7 +153,7 @@ export class CellboxRuntimeIntegration {
             // startup config locally. Only a custom project subdirectory needs exec.
             if (target.settings.workingDirectory !== workspace) {
                 const script = `const fs=require('node:fs'),path=require('node:path');let p=${JSON.stringify(workspace)};for(const part of ${JSON.stringify(target.settings.workingDirectory.slice(workspace.length + 1).split('/'))}){p=path.join(p,part);try{fs.mkdirSync(p,{mode:0o700})}catch(e){if(e.code!=='EEXIST')throw e}const s=fs.lstatSync(p);if(!s.isDirectory()||s.isSymbolicLink()||s.uid!==process.getuid())throw Error('Unsafe project directory');}`;
-                await handle.commands.run(`${node} -e ${q(script)}`, { user: 'agent', signal, timeoutMs: 30000 });
+                await handle.commands.run(`${guestNode(handle.sandboxId, node)} -e ${q(script)}`, { user: 'agent', signal, timeoutMs: 30000 });
             }
             return;
         }

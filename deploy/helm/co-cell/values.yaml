@@ -32,6 +32,8 @@ config:
   # Defaults to this release's internal service origin.
   toolBrokerUrl: ""
   ossEndpoint: ""
+  agentOssBucket: ""
+  ossRegion: "us-east-1"
   codexModel: ""
   openaiBaseUrl: ""
   # Optional API reachable from the backend Pod; credentials use the existing Secret.

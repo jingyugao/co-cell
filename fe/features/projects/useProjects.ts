@@ -5,7 +5,7 @@ import type { ProjectResumeError, ProjectResumeProgress } from '../../../protoco
 import { api, ApiError } from '../../lib/api';
 import { resumeProjectSandbox as requestResumeProjectSandbox, ResumeRequestError } from '../../lib/project-resume';
 
-export type ProjectValues = { name: string; requirementUrl: string | null; type: ProjectType; imageId?: string; imageVersionId?: string };
+export type ProjectValues = { agentProfileId?: string; name: string; requirementUrl: string | null; type: ProjectType; imageId?: string; imageVersionId?: string };
 export type ProjectUpdate = Partial<Omit<ProjectValues, 'imageId' | 'imageVersionId'>> & { status?: ProjectStatus };
 export interface ProjectResumeTimeline {
   requestId: string;

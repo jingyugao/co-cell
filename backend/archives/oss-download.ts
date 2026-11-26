@@ -5,6 +5,26 @@ import type { RemoteArchiveRef } from '../../protocol/remote-archive-types.js';
 const hmac = (key: string | Buffer, value: string) => createHmac('sha256', key).update(value).digest();
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 
+export function signedOssRequest(method:'GET'|'PUT', bucket:string, objectKey:string, region:string, endpoint:string, accessKey:string, secretKey:string, body?:Buffer) {
+  const payloadHash = body ? createHash('sha256').update(body).digest('hex') : 'UNSIGNED-PAYLOAD';
+  const origin = new URL(endpoint);
+  if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password || origin.search || origin.hash)
+    throw new Error('OSS endpoint is invalid');
+  const now = new Date().toISOString().replace(/[-:]|\.\d{3}/g, '');
+  const date = now.slice(0, 8);
+  const uri = `/${encodeURIComponent(bucket)}/${objectKey.split('/').map(encodeURIComponent).join('/')}`;
+  const headers = { host: origin.host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': now };
+  const signedHeaders = Object.keys(headers).sort().join(';');
+  const canonicalHeaders = Object.keys(headers).sort().map(name => `${name}:${headers[name as keyof typeof headers]}\n`).join('');
+  const scope = `${date}/${region}/s3/aws4_request`;
+  const canonical = [method, uri, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+  const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretKey}`, date), region), 's3'), 'aws4_request');
+  const signature = createHmac('sha256', signingKey).update(['AWS4-HMAC-SHA256', now, scope, sha256(canonical)].join('\n')).digest('hex');
+  return fetch(new URL(uri, origin), { method, ...(body ? { body: Uint8Array.from(body) } : {}), headers: {
+    ...headers, authorization: `AWS4-HMAC-SHA256 Credential=${accessKey}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+  }, redirect: 'error', signal: AbortSignal.timeout(method === 'GET' ? 300_000 : 30_000) });
+}
+
 export async function downloadOssArchive(ref: RemoteArchiveRef, destination: string,
   endpoint = process.env.OSS_ENDPOINT, accessKey = process.env.OSS_ACCESS_KEY, secretKey = process.env.OSS_SECRET_KEY) {
   const meta = ref.metadata;
@@ -18,22 +38,7 @@ export async function downloadOssArchive(ref: RemoteArchiveRef, destination: str
       ref.id !== `oss:${objectKey}` || !/^[a-f0-9]{64}$/.test(ref.sha256) ||
       !Number.isSafeInteger(ref.sizeBytes) || ref.sizeBytes < 1 || !endpoint || !accessKey || !secretKey)
     throw new Error('OSS archive download configuration or metadata is invalid');
-  const origin = new URL(endpoint);
-  if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password || origin.search || origin.hash)
-    throw new Error('OSS endpoint is invalid');
-  const now = new Date().toISOString().replace(/[-:]|\.\d{3}/g, '');
-  const date = now.slice(0, 8);
-  const uri = `/${encodeURIComponent(bucket)}/${objectKey.split('/').map(encodeURIComponent).join('/')}`;
-  const headers = { host: origin.host, 'x-amz-content-sha256': 'UNSIGNED-PAYLOAD', 'x-amz-date': now };
-  const signedHeaders = Object.keys(headers).sort().join(';');
-  const canonicalHeaders = Object.keys(headers).sort().map(name => `${name}:${headers[name as keyof typeof headers]}\n`).join('');
-  const scope = `${date}/${region}/s3/aws4_request`;
-  const canonical = ['GET', uri, '', canonicalHeaders, signedHeaders, 'UNSIGNED-PAYLOAD'].join('\n');
-  const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretKey}`, date), region), 's3'), 'aws4_request');
-  const signature = createHmac('sha256', signingKey).update(['AWS4-HMAC-SHA256', now, scope, sha256(canonical)].join('\n')).digest('hex');
-  const response = await fetch(new URL(uri, origin), { headers: {
-    ...headers, authorization: `AWS4-HMAC-SHA256 Credential=${accessKey}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
-  }, redirect: 'error', signal: AbortSignal.timeout(5 * 60_000) });
+  const response = await signedOssRequest('GET',bucket,objectKey,region,endpoint,accessKey,secretKey);
   if (response.status !== 200 || !response.body) throw new Error(`OSS archive download failed with HTTP ${response.status}`);
   const file = await open(destination, 'wx', 0o600);
   let complete = false;

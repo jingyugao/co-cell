@@ -654,3 +654,51 @@ test('upgrade Harness submits once from a running conversation', async ({ page, 
   await expect.poll(() => submissions).toBe(1);
   expect(dialogs).toEqual([]);
 });
+
+test('Agent 管理编辑技能并为项目选择一个 Agent', async ({ page, ui }) => {
+  const profile = {id:'default',name:'默认 Agent',description:'',revision:'a'.repeat(64),remoteSkills:[]};
+  const alternate = {...profile,id:'b'.repeat(36),name:'研发 Agent'};
+  const files = new Map([['AGENTS.md','原有规则']]);
+  const metadata = ([path, content]) => ({path,size:content.length,editable:true,version:profile.revision,updatedAt:'2026-01-01'});
+  await page.route('**/api/agents',route=>route.fulfill({json:[profile,alternate]}));
+  await page.route('**/api/agents/default/files**',async route=>{
+    const request = route.request(), url = new URL(request.url());
+    if(url.pathname.endsWith('/content')) {
+      const path = url.searchParams.get('path'); await route.fulfill({json:{path,content:files.get(path),version:profile.revision}});
+    } else if(request.method()==='POST') {
+      const {path,content} = request.postDataJSON(); files.set(path,content); await route.fulfill({status:201,json:{path,content,version:profile.revision}});
+    } else await route.fulfill({json:{files:[...files].map(metadata)}});
+  });
+  await page.goto('/#files');
+  await expect(page.getByRole('heading',{name:'Agent 管理'})).toBeVisible();
+  await page.getByRole('button',{name:'新建 skill',exact:true}).click();
+  await page.getByLabel('Skill 名称',{exact:true}).fill('review');
+  await page.getByLabel('Skill 说明',{exact:true}).fill('Review a patch');
+  await page.getByLabel('文件内容',{exact:false}).fill('检查变更');
+  await page.getByRole('button',{name:'创建文件',exact:true}).click();
+  await expect.poll(()=>files.get('skills/review/SKILL.md') ?? '').toContain('name: review');
+  const source = { name: 'brand-guidelines', repository: 'https://github.com/anthropics/skills', directory: 'skills/brand-guidelines', ref: 'main' };
+  const requests = [];
+  await page.route('**/api/agents/default/remote-skills', async route => {
+    const data = route.request().postDataJSON();
+    requests.push(data);
+    const commit = (requests.length === 1 ? '1' : '2').repeat(40);
+    await route.fulfill({ json: { ...profile, revision: commit.padEnd(64, '0'), remoteSkills: [{ ...source, commit }] } });
+  });
+  await page.getByRole('button', { name: '导入 GitHub skill' }).click();
+  await page.getByLabel('Skill 名称', { exact: true }).fill(source.name);
+  await page.getByLabel('GitHub 仓库').fill(source.repository);
+  await page.getByLabel('Skill 子目录').fill(source.directory);
+  await page.getByLabel('分支、标签或 commit').fill(source.ref);
+  await page.getByRole('button', { name: '导入', exact: true }).click();
+  await expect(page.getByRole('link', { name: /11111111/ })).toBeVisible();
+  expect(requests[0]).toEqual({ ...source, expectedRevision: profile.revision });
+  await page.getByRole('button', { name: '从远程更新' }).click();
+  await expect(page.getByRole('link', { name: /22222222/ })).toBeVisible();
+  expect(requests[1].expectedRevision).toBe('1'.repeat(40).padEnd(64, '0'));
+  await page.goto('/#projects');
+  const card = page.getByRole('article',{name:ui.projects.get('other').name,exact:true});
+  const update = page.waitForRequest(r=>new URL(r.url()).pathname==='/api/projects/other' && r.method()==='PATCH');
+  await card.getByLabel('项目 Agent').selectOption(alternate.id);
+  expect((await update).postDataJSON()).toEqual({agentProfileId:alternate.id});
+});

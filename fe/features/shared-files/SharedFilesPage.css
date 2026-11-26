@@ -2,3 +2,10 @@
 @media(min-width:1800px){.shared-files-scroll{padding:40px 55px}.shared-files-workspace{grid-template-columns:285px minmax(0,1fr)}}
 @media(max-width:1100px){.shared-files-scroll{padding:28px 22px}.shared-files-workspace{grid-template-columns:215px minmax(0,1fr)}.shared-file-editor{padding:19px}.shared-file-editor-heading{align-items:flex-start;flex-direction:column;gap:12px}.shared-file-actions{align-self:flex-end}}
 @media(max-width:700px){.shared-files-scroll{padding:23px 14px}.shared-files-heading{gap:12px;align-items:flex-start}.shared-files-heading h1{font-size:23px}.shared-files-heading p{font-size:11px}.shared-files-heading>.primary-button{font-size:10px;padding:9px 10px}.shared-files-eyebrow{font-size:8px;letter-spacing:1.3px}.shared-files-scope{font-size:9px}.shared-files-workspace{display:flex;flex-direction:column;min-height:650px}.shared-files-browser{border-right:0;border-bottom:1px solid #e1e6d8}.shared-files-browser-heading{padding:14px 14px 11px}.shared-files-list{max-height:175px}.shared-file-row{padding:9px 10px}.shared-file-row-info{gap:2px}.shared-files-help{display:none}.shared-file-editor{padding:18px 14px;min-height:440px}.shared-file-content{min-height:320px;font-size:12px;padding:12px}.shared-file-editor-footer{font-size:9px;align-items:flex-start}.shared-file-content-label>span{font-size:8px}.shared-file-empty,.shared-file-readonly{padding:40px 15px}.shared-file-editor-heading h2{font-size:15px}}
+
+.agent-toolbar,.agent-source,.project-agent-control{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:16px 0}
+.agent-toolbar label,.agent-config-form label{display:grid;gap:6px;font-size:13px}
+.agent-toolbar select,.agent-config-form input:not([type=checkbox]),.project-agent-control select{border:1px solid #cbd3c1;border-radius:6px;padding:8px 10px;background:white;color:inherit;max-width:100%}
+.agent-config-form{display:grid;gap:12px;max-width:540px;margin:20px 0}
+.agent-usage,.project-agent-control span{font-size:12px;color:#66745c}
+.agent-source a{overflow-wrap:anywhere}

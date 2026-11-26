@@ -39,7 +39,7 @@ export const PROJECT_COLUMNS = `id,name,type,week_of,requirement_url,requirement
  sandbox_last_active_at,sandbox_paused_at,sandbox_reclaimed_at,sandbox_artifacts_cleaned_at,sandbox_create_json,image_catalog_id,image_name,image_category,image_version_id,image_version,
  template_id,revision_id,image_reference,image_migration_required,
  sandbox_operation_json,sandbox_backup_json,latest_backup_json,remote_archives_json,pending_sandbox_cleanup_json,
- pending_volume_cleanup_json,archive_cleanup_source_id,lifecycle_history_json,removed_at,completed_at,archived_at,created_at,updated_at`;
+ pending_volume_cleanup_json,archive_cleanup_source_id,lifecycle_history_json,removed_at,completed_at,archived_at,created_at,updated_at,agent_profile_id`;
 export function projectValues(project: Project): unknown[] {
   // image_version_id retains the selector; revision_id stores its concrete resolved revision.
   return [project.id, project.name, project.type ?? 1, project.weekOf ?? null, project.requirementUrl,
@@ -56,7 +56,8 @@ export function projectValues(project: Project): unknown[] {
       generation: s.generation, operationId: s.operationId, lastActiveAt: s.lastActiveAt, pausedAt: s.pausedAt,
       template: s.template, image: s.image, workingDirectory: s.workingDirectory, creation: s.creation,
     }))), json(project.pendingVolumeCleanup), project.archiveCleanupSourceId ?? null, json(project.lifecycleHistory),
-    date(project.removedAt), date(project.completedAt), date(project.archivedAt), date(project.createdAt), date(project.updatedAt)];
+    date(project.removedAt), date(project.completedAt), date(project.archivedAt), date(project.createdAt), date(project.updatedAt),
+    project.agentProfileId === 'default' ? null : project.agentProfileId ?? null];
 }
 export function projectFromRow(row: Record<string, unknown>): Project {
   const mounts = fromJson<SandboxMount[]>(row.mounts_json, []);
@@ -79,6 +80,7 @@ export function projectFromRow(row: Record<string, unknown>): Project {
   const archivedAt = iso(row.archived_at);
   return {
     id: String(row.id), name: String(row.name), type: Number(row.type) as Project['type'],
+    agentProfileId: row.agent_profile_id == null ? 'default' : String(row.agent_profile_id),
     ...(row.week_of ? { weekOf: row.week_of instanceof Date ? row.week_of.toISOString().slice(0, 10) : String(row.week_of).slice(0, 10) } : {}),
     requirementUrl: row.requirement_url == null ? null : String(row.requirement_url),
     requirementStatus: row.requirement_status == null ? null : String(row.requirement_status),

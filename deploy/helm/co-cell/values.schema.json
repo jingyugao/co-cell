@@ -115,6 +115,8 @@
           "type": "string",
           "pattern": "^$|^https?://[^/@\\s?#]+/?$"
         },
+        "agentOssBucket": { "type": "string", "pattern": "^$|^[a-z0-9][a-z0-9.-]{2,62}$" },
+        "ossRegion": { "type": "string" },
         "ossEndpoint": {
           "type": "string",
           "pattern": "^$|^https?://[^/@\\s?#]+(?:/[^\\s?#]*)?$"

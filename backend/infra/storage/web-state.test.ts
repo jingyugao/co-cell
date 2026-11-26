@@ -151,7 +151,11 @@ test('project mutation uses the latest locked row, skips no-op writes, and rolls
   const store = Object.create(MySqlWebStateStore.prototype) as MySqlWebStateStore;
   Object.assign(store, { pool: { getConnection: async () => connection } });
 
-  const result = await store.mutateProject(id, current => { current.name = 'callback name'; });
+  const agent = '47af0b44-9909-46d0-a09b-bfc19ad04cbe';
+  assert.equal(projectFromRow(stored).agentProfileId, 'default');
+  const result = await store.mutateProject(id, current => { current.name = 'callback name'; current.agentProfileId = agent; });
+  assert.equal(stored.agent_profile_id, agent);
+  assert.equal(projectFromRow(stored).agentProfileId, agent);
   assert.equal(result.name, 'callback name');
   assert.equal(stored.name, 'callback name');
   assert.equal(stored.requirement_status, 'externally refreshed');

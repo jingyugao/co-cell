@@ -1,3 +1,4 @@
+import type { AgentProfiles } from '../shared-files/agent-profiles.js';
 import type { ImageCatalog } from '../images/service.js';
 import type { Context, Hono } from 'hono';
 import { z } from 'zod';
@@ -6,7 +7,7 @@ import type { SessionManager } from '../sessions/manager.js';
 import { workspaceFileResponse } from '../workspaces/http-files.js';
 import { applicationCookies, applicationSetCookie, previewLocation } from './preview-policy.js';
 import { serviceHost } from './service-host.js';
-import { PROJECT_OPERATION_WAIT_MS } from '../../protocol/types.js';
+import { PROJECT_OPERATION_WAIT_MS, type HarnessUpgradeRequest } from '../../protocol/types.js';
 import { resumeStream } from './resume-stream.js';
 
 type ProjectRoutesManager = Pick<SessionManager, 'listProjects' | 'listProjectsWithArchives' | 'getProject' | 'readProject' | 'enterProject' | 'createProject' | 'updateProject' | 'deleteProject' | 'preview' | 'projectService' | 'projectFileResponse' | 'createProjectSandbox' | 'restoreProjectSandbox' | 'rebuildProjectSandbox' | 'resumeProjectSandbox' | 'ensureProjectAwake' | 'releaseProjectSandbox' | 'checkpointProjectSandbox' | 'archiveProjectNow' | 'backupProjectNow' | 'refreshProjectSandboxRuntime'>;
@@ -37,7 +38,7 @@ export async function proxyProjectService(manager: Pick<SessionManager, 'project
 }
 
 export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
-  previewHosts?: { publicUrl: string; token: string }, images?: ImageCatalog) {
+  previewHosts?: { publicUrl: string; token: string }, images?: ImageCatalog, agents?: AgentProfiles, applyAgent?: (id:string) => Promise<string>) {
   app.post('/api/projects/:id/archive', async c => {
     const body = await c.req.text();
     let parsed: unknown;
@@ -75,7 +76,13 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
   });
   app.post('/api/projects/:id/sandbox/checkpoint', async c => projectOperationResponse(c, await manager.checkpointProjectSandbox(c.req.param('id'))));
   app.post('/api/projects/:id/sandbox/release', async c => projectOperationResponse(c, await manager.releaseProjectSandbox(c.req.param('id'))));
-  app.post('/api/projects/:id/sandbox/refresh-runtime', async c => projectOperationResponse(c, await manager.refreshProjectSandboxRuntime(c.req.param('id'))));
+  app.post('/api/projects/:id/sandbox/refresh-runtime', async c => {
+    const raw = await c.req.text();
+    let body: unknown;
+    try { body = raw ? JSON.parse(raw) : {}; } catch { throw new HttpError(400, '请求 JSON 无效'); }
+    const { revision }: HarnessUpgradeRequest = z.object({ revision: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict().parse(body);
+    return projectOperationResponse(c, await manager.refreshProjectSandboxRuntime(c.req.param('id'), revision));
+  });
   const content = async (c: Context) => {
     const path = c.req.query('path');
     if (!path) throw new HttpError(400, '缺少文件路径');
@@ -110,7 +117,12 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
   app.all('/api/projects/:id/service/:port', service);
   app.all('/api/projects/:id/service/:port/*', service);
 
-  const projectSchema = z.object({ name: z.string().trim().min(1).max(100), requirementUrl: z.string().trim().max(4096).url().refine(value => /^https?:\/\//i.test(value), '仅支持 HTTP 或 HTTPS 链接').nullable().optional() }).strict();
+  app.post('/api/projects/:id/agent/apply',async c => {
+    if (!applyAgent) throw new HttpError(503,'Agent 管理尚未初始化');
+    return c.json({revision:await applyAgent(c.req.param('id'))});
+  });
+  const agentProfileId = z.string().max(64).refine(async id => { if (!agents) return id === 'default'; await agents.get(id); return true; },'Agent 不存在').optional();
+  const projectSchema = z.object({ agentProfileId, name: z.string().trim().min(1).max(100), requirementUrl: z.string().trim().max(4096).url().refine(value => /^https?:\/\//i.test(value), '仅支持 HTTP 或 HTTPS 链接').nullable().optional() }).strict();
   app.get('/api/projects', async c => {
     c.header('Cache-Control', 'no-store');
     return c.json(await manager.listProjectsWithArchives());
@@ -119,7 +131,7 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
     .refine(input => Boolean(input.name || input.requirementUrl), '请输入项目名称或绑定飞书需求')
     .refine(input => Boolean(input.imageId) === Boolean(input.imageVersionId), '镜像和版本必须一起选择');
   app.post('/api/projects', async c => {
-    const { imageId, imageVersionId, ...input } = createSchema.parse(await c.req.json());
+    const { imageId, imageVersionId, ...input } = await createSchema.parseAsync(await c.req.json());
     if (imageId && !images) throw new HttpError(503, '镜像管理尚未初始化');
     const reservation = imageId ? await images!.acquireSelection(imageId, imageVersionId!) : await images?.acquireLatestSelection();
     try {
@@ -135,6 +147,6 @@ export function installProjectsRoutes(app: Hono, manager: ProjectRoutesManager,
       .parse({ waitForOperation: c.req.query('waitForOperation'), waitMs: c.req.query('waitMs') });
     return c.json(await manager.readProject(c.req.param('id'), options, c.req.raw.signal));
   });
-  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional() }).parse(await c.req.json()))));
+  app.patch('/api/projects/:id', async c => c.json(await manager.updateProject(c.req.param('id'), await projectSchema.partial().extend({ status: z.enum(['active', 'completed', 'archived']).optional() }).parseAsync(await c.req.json()))));
   app.delete('/api/projects/:id', async c => { await manager.deleteProject(c.req.param('id')); return c.json({ ok: true }); });
 }

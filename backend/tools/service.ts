@@ -113,7 +113,7 @@ export class DynamicTools {
     const catalog = JSON.stringify(tools.map(({ name, description, instructions }) => ({ name, description, instructions })));
     const files = [{ path: 'catalog.json', content: catalog, mode: 0o644 }, ...tools.map(tool => ({
       path: `bin/${tool.name}`, mode: 0o755,
-      content: `#!/bin/sh\nexec /usr/local/bin/node /opt/product/cocell/tool-client.mjs --dynamic '${tool.name}' "$@"\n`,
+      content: `#!/bin/sh\nif [ -n "\${COCELL_HARNESS_BIN:-}" ]; then exec "$COCELL_HARNESS_BIN/cocell" '${tool.name}' "$@"; fi\nexec /usr/local/bin/node /opt/product/cocell/tool-client.mjs --dynamic '${tool.name}' "$@"\n`,
     }))];
     const version = createHash('sha256').update(JSON.stringify(files)).digest('hex');
     const versions = join(this.root, 'versions');

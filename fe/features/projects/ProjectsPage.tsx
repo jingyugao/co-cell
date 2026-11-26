@@ -1,3 +1,5 @@
+import type { AgentProfile } from '../../../protocol/agent-profile-types';
+import { api } from '../../lib/api';
 import ImagePicker from '../images/ImagePicker';
 import RestoreVersionPicker from '../images/RestoreVersionPicker';
 import { useEffect, useRef, useState } from 'react';
@@ -25,6 +27,7 @@ type Props = {
   onRestoreSandbox: (id: string, imageVersionId?: string) => Promise<ProjectSummary>;
   onReleaseSandbox: (id: string) => Promise<ProjectSummary>;
   onResumeSandbox: (id: string) => Promise<ProjectSummary>;
+  onUpgradeHarness: (id: string) => Promise<ProjectSummary>;
   onBackupSandbox: (id: string) => Promise<ProjectSummary>;
   onCheckpointSandbox: (id: string) => Promise<ProjectSummary>;
   onArchiveProject: (id: string, options?: { useExistingBackup?: boolean }) => Promise<ProjectSummary>;
@@ -37,7 +40,7 @@ type Props = {
   initialView?: 'active' | 'completed' | 'archived';
 };
 
-const operationLabels = { rebuild: '重建环境', create: '创建 Sandbox', checkpoint: 'Checkpoint', backup: '备份', restore: '恢复环境', resume: '恢复运行', release: '释放运行环境', refresh: '刷新运行环境', archive: '归档', delete: '删除项目' };
+const operationLabels = { rebuild: '重建环境', create: '创建 Sandbox', checkpoint: 'Checkpoint', backup: '备份', restore: '恢复环境', resume: '恢复运行', release: '释放运行环境', refresh: '升级 Harness', archive: '归档', delete: '删除项目' };
 const date = (value: string) => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) : '—';
 const backupDate = (value: string) => {
   const timestamp = Date.parse(value);
@@ -70,13 +73,15 @@ function projectImageLabel(project: ProjectSummary) {
   return project.imageSelection ? `${project.imageSelection.imageName} · latest` : '系统默认镜像 · latest';
 }
 
-function ProjectForm({ busy, onSubmit, onCancel }: {
+function ProjectForm({ agents, busy, onSubmit, onCancel }: {
+  agents: AgentProfile[];
   busy: boolean;
   onSubmit: (values: ProjectValues) => Promise<void>;
   onCancel: () => void;
 }) {
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
+  const [agentId, setAgentId] = useState('default');
   const [image, setImage] = useState<{ imageId: string; imageVersionId: string }>();
   const [type, setType] = useState<ProjectType>(1);
   const [error, setError] = useState('');
@@ -96,12 +101,15 @@ function ProjectForm({ busy, onSubmit, onCancel }: {
       catch { setError('请输入有效的 HTTP 或 HTTPS 需求链接。'); return; }
     }
     setError('');
-    try { await onSubmit({ name: automaticName ? '' : trimmedName, requirementUrl: feishu ? url.trim() : null, type, ...image }); }
+    try { await onSubmit({ name: automaticName ? '' : trimmedName, requirementUrl: feishu ? url.trim() : null, type, ...(agentId !== 'default' ? {agentProfileId:agentId} : {}), ...image }); }
     catch (err) { setError(err instanceof Error ? err.message : '保存失败，请重试。'); }
   }}>
     <label>项目类型<select value={type} disabled={busy} onChange={event => { const next = Number(event.target.value) as ProjectType; setType(next); if (next === 3 && !name.trim()) setName('本周项目'); }}><option value={1}>普通项目</option><option value={2}>飞书项目</option><option value={3}>本周项目</option></select></label>
     <label>项目名称<input ref={input} required={!automaticName} maxLength={100} value={automaticName ? '' : name} disabled={busy || automaticName} placeholder={automaticName ? '自动使用飞书需求名称' : type === 3 ? '例如：本周重点事项' : '例如：订单系统改造'} onChange={event => setName(event.target.value)} /></label>
     {feishu && <label>飞书需求链接<input type="url" required maxLength={4096} value={url} disabled={busy} placeholder="https://…" onChange={event => setUrl(event.target.value)} /></label>}
+    <label>项目 Agent<select value={agentId} disabled={busy} onChange={e=>setAgentId(e.target.value)}>
+      {agents.length ? agents.map(a=><option key={a.id} value={a.id}>{a.name}</option>) : <option value="default">默认 Agent</option>}
+    </select></label>
     <ImagePicker disabled={busy} onChange={setImage} />
     <p className="project-form-hint">飞书项目自动读取需求名称；本周项目按周归类，已存在时会提示。创建后立即进入项目，可以先输入任务，环境会在后台准备。</p>
     {error && <p className="project-error" role="alert">{error}</p>}
@@ -126,13 +134,15 @@ function DeletingProjectRow({ project, onRetry }: { project: ProjectSummary; onR
   </div>;
 }
 
-function ProjectCard({ project, resumeTimeline, config, onRefresh, onUpdate, onDelete, onCreateSandbox, onRestoreSandbox, onReleaseSandbox, onResumeSandbox, onCheckpointSandbox, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onStatus }: Pick<Props, 'config' | 'onRefresh' | 'onUpdate' | 'onDelete' | 'onCreateSandbox' | 'onRestoreSandbox' | 'onReleaseSandbox' | 'onResumeSandbox' | 'onCheckpointSandbox' | 'onBackupSandbox' | 'onArchiveProject' | 'onOpenProject' | 'onViewBackup'> & {
+function ProjectCard({ agents, project, resumeTimeline, config, onRefresh, onUpdate, onDelete, onCreateSandbox, onRestoreSandbox, onReleaseSandbox, onResumeSandbox, onCheckpointSandbox, onUpgradeHarness, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onStatus }: Pick<Props, 'config' | 'onRefresh' | 'onUpdate' | 'onDelete' | 'onCreateSandbox' | 'onRestoreSandbox' | 'onReleaseSandbox' | 'onResumeSandbox' | 'onCheckpointSandbox' | 'onUpgradeHarness' | 'onBackupSandbox' | 'onArchiveProject' | 'onOpenProject' | 'onViewBackup'> & {
+  agents: AgentProfile[];
   project: ProjectSummary;
   resumeTimeline?: ResumeTimelineState;
   onStatus: (name: string, status: 'active' | 'completed') => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [agentStatus, setAgentStatus] = useState('');
   const [showToolGrants, setShowToolGrants] = useState(false);
   const [error, setError] = useState('');
   const pending = useRef(false);
@@ -238,7 +248,7 @@ function ProjectCard({ project, resumeTimeline, config, onRefresh, onUpdate, onD
       void onResumeSandbox(project.id).catch(() => {}).finally(() => setBusy(false));
       return;
     }
-    const handlers = { checkpoint: onCheckpointSandbox, resume: onResumeSandbox, create: onCreateSandbox, backup: onBackupSandbox };
+    const handlers = { upgradeHarness: onUpgradeHarness, checkpoint: onCheckpointSandbox, resume: onResumeSandbox, create: onCreateSandbox, backup: onBackupSandbox };
     const label = sandboxView.actions.find(action => action.id === id)!.label;
     void run(label, () => handlers[id](project.id));
   }
@@ -252,6 +262,24 @@ function ProjectCard({ project, resumeTimeline, config, onRefresh, onUpdate, onD
     {project.requirementUrl && /^https?:\/\//i.test(project.requirementUrl) ? <div className="project-requirement-wrap"><a className="project-requirement" href={project.requirementUrl} target="_blank" rel="noopener noreferrer" title={project.requirementUrl}>飞书需求 ↗<span>{project.requirementUrl}</span></a>{project.requirementStatus && <p className="project-requirement-status"><span>飞书项目状态</span><strong>{project.requirementStatus}</strong></p>}</div> : project.type === 2 ? <p className="project-unlinked">飞书需求待绑定</p> : <p className="project-unlinked">{typeLabel}</p>}
     <dl className="project-details"><div><dt>项目镜像</dt><dd>{projectImageLabel(project)}</dd></div><div><dt>会话</dt><dd>{project.sessionCount} 个</dd></div><div><dt>Sandbox</dt><dd>{sandboxDescription}</dd></div><div><dt>最新备份</dt><dd>{!completed && onViewBackup && project.archiveVersions?.length ? <ArchiveVersionBadge project={project} onView={onViewBackup} /> : backup ? <time dateTime={backup.createdAt} title={date(backup.createdAt)}>{backupDate(backup.createdAt)}</time> : project.archiveVersions?.[0] ? <time dateTime={project.archiveVersions[0].createdAt} title={date(project.archiveVersions[0].createdAt)}>{backupDate(project.archiveVersions[0].createdAt)}</time> : '暂无备份'}</dd></div>{project.backupPolicy?.enabled && <div><dt>磁盘保留</dt><dd>每个磁盘保留最近 {project.backupPolicy.keepLast} 版</dd></div>}<div><dt>开始时间</dt><dd><time dateTime={project.createdAt}>{date(project.createdAt)}</time></dd></div></dl>
     {(() => { const mounts = project.sandbox?.mounts ?? project.sandboxMounts ?? []; return mounts.length > 0 && <div className="project-mounts"><strong>保留的挂载盘</strong><ul>{mounts.map(mount => <li key={`${mount.volumeId}:${mount.mountPath}`}><code>{mount.mountPath}</code><span>{mount.volumeId}</span>{mount.readOnly && <span>只读</span>}</li>)}</ul></div>; })()}
+    {agents.length > 0 && !completed && <div className="project-agent-control">
+      <label>项目 Agent <select value={project.agentProfileId ?? 'default'} disabled={busy} onChange={event => {
+        const agentProfileId = event.target.value;
+        void run('切换 Agent', async () => {
+          setAgentStatus('');
+          await onUpdate(project.id, { agentProfileId });
+          setAgentStatus('已切换，启动会话时使用新配置');
+        });
+      }}>{agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
+      {sandboxView.state === 'running' && !archived && <button className="secondary-button" disabled={busy} onClick={() =>
+        void run('应用 Agent 配置', async () => {
+          setAgentStatus('');
+          const result = await api<{ revision: string }>(`/api/projects/${project.id}/agent/apply`, { method: 'POST' });
+          setAgentStatus('已应用 ' + result.revision.slice(0, 8));
+        })
+      }>应用最新 Agent 配置</button>}
+      {agentStatus && <span role="status">{agentStatus}</span>}
+    </div>}
     {completed ? <section className="project-action-group" aria-label="项目操作"><h3>项目操作</h3><div className="project-card-actions">
       <button className="primary-button" disabled={busy} onClick={() => void changeStatus()}>{busy ? '处理中…' : '恢复'}</button>
       <button className="secondary-button" disabled={busy} onClick={() => void deleteCompletedProject()}>{busy ? '处理中…' : '删除'}</button>
@@ -275,7 +303,7 @@ function ProjectCard({ project, resumeTimeline, config, onRefresh, onUpdate, onD
         <h3>Sandbox 操作</h3>
         <div className="project-card-actions">
           {sandboxView.actions.map(action => <button key={action.id} className="secondary-button"
-            disabled={action.id === 'refresh' ? refreshing : busy || hasTask || Boolean(action.disabledReason)}
+            disabled={action.id === 'refresh' ? refreshing : busy || (action.id !== 'upgradeHarness' && hasTask) || Boolean(action.disabledReason)}
             title={action.disabledReason ?? (action.id === 'create' && project.sandboxMounts?.length ? '使用所选镜像的最新成功版本创建新 Sandbox，复用保留的挂载盘' : undefined)}
             onClick={() => sandboxAction(action.id)}>{action.id === 'refresh' && refreshing ? '刷新中…' : action.id === 'backup' && backupFailed && sandboxView.state !== 'released' ? '重试磁盘备份' : action.label}</button>)}
         </div>
@@ -307,8 +335,16 @@ function ProjectCard({ project, resumeTimeline, config, onRefresh, onUpdate, onD
   </article>;
 }
 
-export default function ProjectsPage({ projects, resumeTimelines = {}, config, loading, onRefresh, onCreate, onUpdate, onDelete, onCreateSandbox, onRestoreSandbox, onReleaseSandbox, onResumeSandbox, onCheckpointSandbox, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onMenu, onBack, initialView = 'active' }: Props) {
+export default function ProjectsPage({ projects, resumeTimelines = {}, config, loading, onRefresh, onCreate, onUpdate, onDelete, onCreateSandbox, onRestoreSandbox, onReleaseSandbox, onResumeSandbox, onCheckpointSandbox, onUpgradeHarness, onBackupSandbox, onArchiveProject, onOpenProject, onViewBackup, onMenu, onBack, initialView = 'active' }: Props) {
   const [creating, setCreating] = useState(false);
+  const [agents,setAgents] = useState<AgentProfile[]>([]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void api<AgentProfile[]>('/api/agents', { signal: controller.signal })
+      .then(setAgents)
+      .catch(err => { if (!controller.signal.aborted) setError(err instanceof Error ? err.message : 'Agent 列表读取失败'); });
+    return () => controller.abort();
+  }, []);
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState('');
   const [view, setView] = useState<'active' | 'completed' | 'archived'>(initialView);
@@ -336,7 +372,7 @@ export default function ProjectsPage({ projects, resumeTimelines = {}, config, l
     const timer = window.setInterval(() => { void onRefresh().catch(err => setError(err instanceof Error ? err.message : '状态读取失败，请刷新重试。')); }, 3_000);
     return () => window.clearInterval(timer);
   }, [projects, onRefresh]);
-  const card = (project: ProjectSummary) => <ProjectCard key={project.id} project={project} resumeTimeline={resumeTimelines[project.id]} config={config} onRefresh={onRefresh} onUpdate={onUpdate} onDelete={onDelete} onCreateSandbox={onCreateSandbox} onRestoreSandbox={onRestoreSandbox} onReleaseSandbox={onReleaseSandbox} onResumeSandbox={onResumeSandbox} onCheckpointSandbox={onCheckpointSandbox} onBackupSandbox={onBackupSandbox} onArchiveProject={async (id, options) => {
+  const card = (project: ProjectSummary) => <ProjectCard agents={agents} key={project.id} project={project} resumeTimeline={resumeTimelines[project.id]} config={config} onRefresh={onRefresh} onUpdate={onUpdate} onDelete={onDelete} onCreateSandbox={onCreateSandbox} onRestoreSandbox={onRestoreSandbox} onReleaseSandbox={onReleaseSandbox} onResumeSandbox={onResumeSandbox} onCheckpointSandbox={onCheckpointSandbox} onUpgradeHarness={onUpgradeHarness} onBackupSandbox={onBackupSandbox} onArchiveProject={async (id, options) => {
     const result = await onArchiveProject(id, options);
     setMessage(`「${project.name}」已归档，可在“归档”页查看。`);
     return result;
@@ -353,7 +389,7 @@ export default function ProjectsPage({ projects, resumeTimelines = {}, config, l
       {!config ? <p className="project-notice" role="status">正在读取项目配置…</p> : !canCreate && <p className="project-notice">创建项目需要先在服务端配置 Cellbox。已有项目仍可查看。</p>}
       {error && <p className="project-error project-page-error" role="alert">{error}</p>}
       {message && <p className="project-message" role="status">{message}</p>}
-      {creating && canCreate && <section className="project-create-panel"><h2>创建项目</h2><ProjectForm busy={busy} onCancel={stopCreating} onSubmit={async values => {
+      {creating && canCreate && <section className="project-create-panel"><h2>创建项目</h2><ProjectForm agents={agents} busy={busy} onCancel={stopCreating} onSubmit={async values => {
         setBusy(true);
         try { const project = await onCreate(values); setCreating(false); onOpenProject(project.id); }
         finally { setBusy(false); }

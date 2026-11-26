@@ -116,12 +116,13 @@ class BootstrapTemplateTests(unittest.TestCase):
     def test_new_template_uses_same_default_and_revision_warm_slots(self):
         os.environ["CELLBOX_TEMPLATE_ID"] = ""
         os.environ["COCELL_CELLBOX_CREATE_TEMPLATE"] = "1"
+        os.environ["COCELL_MOUNTED_BASE_IMAGE"] = IMAGE
         calls = []
 
         def request(_base, path, _client, method="GET", payload=None):
             calls.append((path, method, payload))
             if path == "/v1/profiles":
-                return 200, [{"id": "profile-small"}]
+                return 200, [{"id": "profile-small", "capabilities": {"mountedReleaseTools": True}}]
             if path == "/v1/templates" and method == "POST":
                 return 201, {"id": "template-created"}
             if path == "/v1/templates/template-created/revisions" and method == "POST":
@@ -138,6 +139,8 @@ class BootstrapTemplateTests(unittest.TestCase):
         revision_posts = [call for call in calls if call[0] == "/v1/templates/template-created/revisions"]
         self.assertEqual(template_posts[0][2]["defaultWarmSlots"], 1)
         self.assertEqual(revision_posts[0][2]["warmSlots"], 1)
+        self.assertEqual(revision_posts[0][2]["runCommand"],
+                         f"docker run -w /home/agent/workspace --entrypoint /opt/cellbox/bin/cellbox-container-agent {IMAGE} mounted-workload")
 
     def test_explicit_zero_disables_warm_slots_for_new_template_and_revision(self):
         os.environ["CELLBOX_TEMPLATE_ID"] = ""

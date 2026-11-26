@@ -59,3 +59,63 @@ test('shared file version checks serialize writes across API instances', async (
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('Agent profiles migrate effective rules once, publish isolated revisions and reject stale edits', async () => {
+  const { AgentProfiles } = await import('./agent-profiles.js');
+  const { profileFiles } = await import('./agent-routes.js');
+  const root = await mkdtemp(join(tmpdir(), 'cocell-agents-'));
+  try {
+    const sha = 'a'.repeat(64), assets = join(root,'harness/versions',sha,'assets');
+    await mkdir(join(assets,'skills/review'),{recursive:true});
+    await writeFile(join(root,'AGENTS.md'),'legacy');
+    await writeFile(join(assets,'AGENTS.md'),'bundled');
+    await writeFile(join(assets,'skills/review/SKILL.md'),'review');
+    await writeFile(join(root,'harness/current'),sha);
+    let rejectPublish = false;
+    const catalog = new AgentProfiles(root,undefined,async () => { if (rejectPublish) throw Error('OSS unavailable'); });
+    await Promise.all([catalog.init(),catalog.init()]);
+    const initial = await catalog.get('default'), clone = await catalog.create('研发','',initial.id);
+    const files = profileFiles(catalog,clone.id), original = await files.read('AGENTS.md');
+    assert.equal(original.content,'bundled');
+    const results = await Promise.allSettled(['first','second'].map(content => files.write('AGENTS.md',content,original.version)));
+    assert.deepEqual(results.map(r=>r.status).sort(),['fulfilled','rejected']);
+    assert.equal(await readFile(join(catalog.assets(initial.revision),'AGENTS.md'),'utf8'),'bundled');
+    assert.equal((await catalog.files(initial).read('skills/review/SKILL.md')).content,'review');
+    const current = await catalog.get(clone.id);
+    rejectPublish = true;
+    await assert.rejects(files.write('docs/failure.md','draft'),/OSS unavailable/);
+    assert.deepEqual(await catalog.get(clone.id),current);
+    const reopened = new AgentProfiles(root);
+    await reopened.init();
+    assert.equal((await reopened.get('default')).revision,initial.revision);
+    assert.equal((await reopened.get(clone.id)).revision,current.revision);
+  } finally { await rm(root,{recursive:true,force:true}); }
+});
+
+test('project Agent changes invalidate native skill discovery until the running server acknowledges it', async () => {
+  const { AgentProfiles } = await import('./agent-profiles.js');
+  const { AgentRuntime } = await import('./agent-runtime.js');
+  const root = await mkdtemp(join(tmpdir(), 'cocell-agent-pin-'));
+  try {
+    const profiles = new AgentProfiles(root);
+    await profiles.init();
+    const other = await profiles.create('Review', '', 'default');
+    let agent = 'default';
+    let calls = 0;
+    const runtime = new AgentRuntime(profiles, async () => agent, '/usr/local/bin/node', async (_box, cwd) => {
+      assert.equal(cwd, '/home/agent/workspace');
+      if (++calls === 1) throw Error('Codex not ready');
+    });
+    const handle = { sandboxId: 'box-1', commands: { run: async () => ({ exitCode: 0 }) } } as unknown as Parameters<typeof runtime.apply>[0];
+    const apply = (cwd?: string) => runtime.apply(handle, 'project-1', true, false, AbortSignal.timeout(2000), cwd);
+    await apply();
+    await assert.rejects(apply('/home/agent/workspace'), /Codex not ready/);
+    await apply('/home/agent/workspace');
+    await apply('/home/agent/workspace');
+    assert.equal(calls, 2);
+    agent = other.id;
+    await apply(); // A Claude session can switch the profile before the next Codex turn.
+    await apply('/home/agent/workspace');
+    assert.equal(calls, 3);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

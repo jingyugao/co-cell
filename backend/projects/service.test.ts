@@ -422,3 +422,20 @@ test('late callbacks cannot reattach a released Box and explicit creation retain
     assert.equal(service.get(original.id).sandbox?.id, replacement.id);
   } finally { await service.close(); }
 });
+
+test('projects share an Agent and independently replace their persisted binding', async () => {
+  const state = new MemoryState([project()]);
+  const projects = new ProjectService(state);
+  const settings = { workingDirectory: '/home/agent/workspace', executionMode: 'sandbox' } as Settings;
+  await projects.init();
+  try {
+    const original = await projects.create({ name: 'First' }, settings);
+    const other = await projects.create({ name: 'Second', agentProfileId: 'default' }, settings);
+    assert.equal(original.agentProfileId, other.agentProfileId);
+    await projects.update(original.id, { agentProfileId: 'a14d65fb-6b76-4598-8200-db89c213bf03' });
+    assert.equal((await state.getProject(original.id))?.agentProfileId, 'a14d65fb-6b76-4598-8200-db89c213bf03');
+    assert.equal((await state.getProject(other.id))?.agentProfileId, 'default');
+    await projects.update(project().id, { agentProfileId: 'default' });
+    assert.equal((await state.getProject(project().id))?.agentProfileId, 'default');
+  } finally { await projects.close(); }
+});

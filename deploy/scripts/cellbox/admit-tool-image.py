@@ -18,6 +18,7 @@ if len(profiles) != 1:
     raise SystemExit('Expected exactly one profile')
 profile = profiles[0]
 if profile.get('sharedReadOnlyHostPath'):
+    profile['guest'].setdefault('env', {})['CELLBOX_WORKLOAD_RELEASES'] = '/var/lib/cellbox/shared/harness'
     profile['guest'].setdefault('credentialSources', {})['cocell_tool_runtime'] = '/var/lib/cellbox/shared/runtime/tool-configs/{boxId}.json'
 trusted = profile.setdefault('trustedToolImages', [])
 if sys.argv[3] not in trusted:

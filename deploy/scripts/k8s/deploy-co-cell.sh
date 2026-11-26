@@ -67,6 +67,12 @@ fi
 preview_args=()
 mount_args=()
 multi_api_args=()
+agent_oss_args=()
+if [[ -n "${COCELL_AGENT_OSS_BUCKET:-}" ]]; then
+  agent_oss_args+=(--set-string "config.agentOssBucket=$COCELL_AGENT_OSS_BUCKET")
+  if [[ -n "${OSS_ENDPOINT:-}" ]]; then agent_oss_args+=(--set-string "config.ossEndpoint=$OSS_ENDPOINT"); fi
+  if [[ -n "${OSS_REGION:-}" ]]; then agent_oss_args+=(--set-string "config.ossRegion=$OSS_REGION"); fi
+fi
 hindsight_args=()
 if [[ -n "${HINDSIGHT_API_URL+x}" ]]; then
   hindsight_args+=(--set-string "config.hindsightApiUrl=${HINDSIGHT_API_URL}")
@@ -183,6 +189,7 @@ helm upgrade "$release" "$chart" \
   "${multi_api_args[@]}" \
   "${mount_args[@]}" \
   "${cellbox_args[@]}" \
+  "${agent_oss_args[@]}" \
   "${hindsight_args[@]}" \
   --set-string "image.repository=${image_repository}" \
   --set-string "image.tag=${image_tag}" \

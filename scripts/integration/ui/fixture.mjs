@@ -99,6 +99,7 @@ export const test = base.extend({
       else if (['/api/tool-definitions', '/api/tool-scripts'].includes(path) && method === 'GET') data = [];
       else if (path === '/api/notifications') data = [];
       else if (path === '/api/images') data = [{ id: 'default', name: '系统默认镜像', category: '系统', origin: 'profile', versions: [{ id: 'default', version: '当前配置', status: 'succeeded', source: 'default', projectReady: true }] }];
+      else if (path === '/api/agents' && method === 'GET') data = [{ id: 'default', name: '默认 Agent', description: '', revision: 'a'.repeat(64), remoteSkills: [] }];
       else if (path === '/api/projects' && method === 'GET') data = [...projects.values()];
       else if (path === '/api/projects' && method === 'POST') {
         data = project('new', request.postDataJSON().name); delete data.sandbox;
@@ -113,6 +114,7 @@ export const test = base.extend({
         }
         else if (method === 'PATCH' && path === `/api/projects/${id}`) {
           const next = request.postDataJSON();
+          if (next.agentProfileId) data.agentProfileId = next.agentProfileId;
           if (next.status !== undefined) { data.status = next.status; data.completedAt = next.status === 'completed' ? now : null; }
         }
         else if (method === 'DELETE' && path === `/api/projects/${id}`) {

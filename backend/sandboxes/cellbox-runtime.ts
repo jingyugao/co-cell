@@ -1,3 +1,5 @@
+import { guestNode } from '../shared-files/agent-runtime.js';
+import { selectHarness } from '../shared-files/harness.js';
 import { traced } from '@co-cell/sandbox';
 import { createHash, randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
@@ -151,7 +153,7 @@ export class CellboxRuntimeIntegration {
             // startup config locally. Only a custom project subdirectory needs exec.
             if (target.settings.workingDirectory !== workspace) {
                 const script = `const fs=require('node:fs'),path=require('node:path');let p=${JSON.stringify(workspace)};for(const part of ${JSON.stringify(target.settings.workingDirectory.slice(workspace.length + 1).split('/'))}){p=path.join(p,part);try{fs.mkdirSync(p,{mode:0o700})}catch(e){if(e.code!=='EEXIST')throw e}const s=fs.lstatSync(p);if(!s.isDirectory()||s.isSymbolicLink()||s.uid!==process.getuid())throw Error('Unsafe project directory');}`;
-                await handle.commands.run(`${node} -e ${q(script)}`, { user: 'agent', signal, timeoutMs: 30000 });
+                await handle.commands.run(`${guestNode(handle.sandboxId, node)} -e ${q(script)}`, { user: 'agent', signal, timeoutMs: 30000 });
             }
             return;
         }
@@ -221,6 +223,16 @@ export class CellboxRuntimeIntegration {
     finally {
         await client?.close();
     } }); }
+    async upgradeHarness(boxId: string, requested?: string) {
+        const { provider, sharedDataRoot } = this.options;
+        const box = await provider.client.getBox(boxId);
+        if (!sharedDataRoot || !box.capabilities.workloadReleases) throw new HttpError(422, '此 Box 未配置挂载的 Harness');
+        if (box.phase !== 'running') throw new HttpError(409, 'Sandbox 未运行');
+        const revision = await selectHarness(sharedDataRoot, boxId, requested);
+        if (!revision) throw new Error('Harness release missing');
+        await provider.client.updateWorkload(boxId, revision);
+        return revision;
+    }
     async close() {
         this.prepared.clear();
     }

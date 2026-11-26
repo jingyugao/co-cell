@@ -115,7 +115,7 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       sandbox_operation_json JSON NULL,sandbox_backup_json JSON NULL,latest_backup_json JSON NULL,sandbox_create_json JSON NULL,
       remote_archives_json JSON NULL,pending_sandbox_cleanup_json JSON NULL,pending_volume_cleanup_json JSON NULL,
       archive_cleanup_source_id VARCHAR(200) NULL,lifecycle_history_json JSON NULL,removed_at DATETIME(3) NULL,completed_at DATETIME(3) NULL,
-      archived_at DATETIME(3) NULL,created_at DATETIME(3) NOT NULL,updated_at DATETIME(3) NOT NULL,
+      archived_at DATETIME(3) NULL,created_at DATETIME(3) NOT NULL,updated_at DATETIME(3) NOT NULL,agent_profile_id CHAR(36) NULL,
       UNIQUE KEY projects_current_box (current_box_id),INDEX projects_status_updated(status,updated_at),INDEX projects_type_week(type,week_of)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
     await this.pool.query(`CREATE TABLE IF NOT EXISTS app_server_events (
@@ -129,10 +129,11 @@ export class MySqlWebStateStore implements WebStateStore, ImageCatalogStore {
       "SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='projects' AND COLUMN_NAME='status'");
     if (projectStatus.length && !projectStatus[0].COLUMN_TYPE.includes("'deleting'"))
       await this.pool.query("ALTER TABLE projects MODIFY COLUMN status ENUM('active','completed','archived','deleting') NOT NULL DEFAULT 'active'");
-    const [createColumns] = await this.pool.query<Array<RowDataPacket & { COLUMN_NAME: string }>>(
-      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='projects' AND COLUMN_NAME='sandbox_create_json'");
-    if (!createColumns.length) {
-      try { await this.pool.query('ALTER TABLE projects ADD COLUMN sandbox_create_json JSON NULL'); }
+    const [projectColumns] = await this.pool.query<Array<RowDataPacket & { COLUMN_NAME: string }>>(
+      "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='projects' AND COLUMN_NAME IN ('sandbox_create_json','agent_profile_id')");
+    for (const [name, definition] of [['sandbox_create_json', 'JSON NULL'], ['agent_profile_id', 'CHAR(36) NULL']]) {
+      if (projectColumns.some(column => column.COLUMN_NAME === name)) continue;
+      try { await this.pool.query(`ALTER TABLE projects ADD COLUMN ${name} ${definition}`); }
       catch (error) {
         if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ER_DUP_FIELDNAME')) throw error;
       }

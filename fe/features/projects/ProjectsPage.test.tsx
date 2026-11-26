@@ -19,7 +19,7 @@ function page(projects: ProjectSummary[], initialView?: 'active' | 'completed' |
   return renderToStaticMarkup(<ProjectsPage
     projects={projects} config={config} loading={false} initialView={initialView}
     onRefresh={async () => projects} onCreate={async () => project()} onUpdate={async () => project()}
-    onDelete={async () => {}} onCreateSandbox={async () => project()} onRestoreSandbox={async () => project()} onReleaseSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()} onBackupSandbox={async () => project()} onArchiveProject={async () => project()}
+    onDelete={async () => {}} onCreateSandbox={async () => project()} onRestoreSandbox={async () => project()} onReleaseSandbox={async () => project()} onResumeSandbox={async () => project()} onCheckpointSandbox={async () => project()} onUpgradeHarness={async () => project()} onBackupSandbox={async () => project()} onArchiveProject={async () => project()}
     onOpenProject={() => {}} onViewBackup={() => {}} onMenu={() => {}} onBack={() => {}}
   />);
 }
@@ -71,7 +71,7 @@ test('a released project with retained mounts can back them up without creating 
   })]);
   assert.match(html, /新建 Sandbox/);
   assert.match(html, /从备份恢复/);
-  assert.match(html, /Node Runtime · Cellbox stable/);
+  assert.match(html, /Node Runtime · latest/);
   assert.doesNotMatch(html, /Node Runtime · 1\.0/);
   assert.match(html, /保留的挂载盘[\s\S]*\/workspace[\s\S]*project-volume/);
   const sandboxActions = html.match(/aria-label="Sandbox 操作"[\s\S]*?<\/section>/)![0];

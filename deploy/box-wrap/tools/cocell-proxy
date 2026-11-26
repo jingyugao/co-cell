@@ -1,5 +1,5 @@
 #!/usr/local/bin/node
-import { runProtectedTool } from '/opt/product/cocell/protected-tool.mjs';
+import { runProtectedTool } from '../../product/cocell/protected-tool.mjs';
 
 const forwarded = process.argv.slice(4);
 const tool = forwarded.shift();

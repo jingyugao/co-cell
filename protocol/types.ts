@@ -116,7 +116,10 @@ export interface Turn {
   userInputRequests?: UserInputRequest[];
 }
 export type ProjectStatus = 'active' | 'completed' | 'archived' | 'deleting';
+export interface HarnessUpgradeRequest { revision?: string }
+
 export interface ProjectSandboxOperation {
+  harnessRevision?: string;
   /** Local request identifier for observation; never used for remote replay. */
   id?: string;
   /** Legacy ownership metadata retained for reading old records only. */

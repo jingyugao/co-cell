@@ -64,6 +64,7 @@ export interface SandboxRuntime {
   resume?(target: WorkspaceTarget, signal?: AbortSignal, onProgress?: (event: SandboxResumeProgress) => void): Promise<void>;
   checkpoint?(target: WorkspaceTarget): Promise<void>;
   release?(target: WorkspaceTarget, expected?: SandboxReleaseObservation): Promise<SandboxState>;
+  upgradeHarness?(id: string, revision?: string): Promise<string>;
   verifySandbox?(sandbox: SandboxState, timeoutMs?: number): Promise<void>;
   verifyHistory?(sandbox: SandboxState, threadIds: string[]): Promise<void>;
   fenceSandbox?(sandbox: SandboxState): Promise<void>;
@@ -94,6 +95,7 @@ export interface ContainerRuntimeOptions {
   sharedDataDirectory?: URL;
   sharedFilesMounted?: (sandboxId: string) => boolean;
   logger?: RuntimeLog;
+  upgradeHarness?: (id: string, revision?: string) => Promise<string>;
   appServer?: (sandboxId: string) => Promise<AppServerEndpoint>;
   appServerReader?: AppServerReader;
   serviceAccess?: (sandboxId: string, port: number) => Promise<CellboxServiceAccess>;
@@ -144,6 +146,12 @@ export class ContainerCodexRuntime implements SandboxRuntime {
     }, error => { void options.logger?.write({ event: 'sandbox.access_release_failed', error: this.safeError(error).message }); });
   }
 
+  async upgradeHarness(id: string, requested?: string) {
+    if (!this.options.upgradeHarness) throw new HttpError(422, 'Sandbox 不支持升级 Harness');
+    const revision = await this.options.upgradeHarness(id, requested);
+    await this.reader.waitUntilReady(id);
+    return revision;
+  }
   get remoteArchives() { return this.options.remoteArchives; }
   private get root() { return this.options.paths.root; }
   private get runtimeDirectory() { return this.options.paths.runtime; }

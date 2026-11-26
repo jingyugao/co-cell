@@ -1,12 +1,12 @@
 import type { ProjectSummary } from '../protocol/types.js';
 
 export type ProjectSandboxViewState = 'local' | 'running' | 'paused' | 'released' | 'missing' | 'processing' | 'failed' | 'unknown';
-export type ProjectSandboxAction = 'checkpoint' | 'resume' | 'release' | 'create' | 'backup' | 'restore' | 'refresh';
+export type ProjectSandboxAction = 'checkpoint' | 'resume' | 'release' | 'create' | 'backup' | 'restore' | 'refresh' | 'upgradeHarness';
 
 /** Presentation rules only. Cellbox admits every mutation and owns consistency. */
 export const projectSandboxActionConfig: Record<ProjectSandboxViewState, { label: string; actions: readonly ProjectSandboxAction[] }> = {
   local: { label: '本地运行', actions: [] },
-  running: { label: '运行中', actions: ['checkpoint', 'release'] },
+  running: { label: '运行中', actions: ['checkpoint', 'upgradeHarness', 'release'] },
   paused: { label: '已暂停', actions: ['resume', 'backup', 'release'] },
   released: { label: '已释放', actions: ['create', 'backup', 'restore'] },
   missing: { label: '尚未创建', actions: ['create', 'restore'] },
@@ -17,7 +17,7 @@ export const projectSandboxActionConfig: Record<ProjectSandboxViewState, { label
 
 const actionLabels: Record<ProjectSandboxAction, string> = {
   checkpoint: 'Checkpoint · 暂停', resume: '恢复运行', release: '释放运行环境', create: '新建 Sandbox',
-  backup: '磁盘备份', restore: '从备份恢复', refresh: '刷新状态',
+  backup: '磁盘备份', restore: '从备份恢复', refresh: '刷新状态', upgradeHarness: '升级 Harness',
 };
 const transitionPhases = new Set(['creating', 'checkpointing', 'suspending', 'resuming', 'restoring', 'staged', 'deleting']);
 

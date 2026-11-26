@@ -175,3 +175,28 @@ test('an aborted queued runtime configuration never starts after the active one 
     assert.equal(fake.acknowledgements.size, 1);
   } finally { releaseRead(); }
 });
+
+test('ordinary Box creation starts the published Harness and retries retain the original selection', async () => {
+  const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const root = await mkdtemp(join(tmpdir(), 'cocell-harness-'));
+  const first = 'a'.repeat(64), next = 'b'.repeat(64), revisions: string[] = [];
+  try {
+    for (const revision of [first, next]) {
+      const dir = join(root, 'harness', 'versions', revision);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, 'launch'), '', { mode: 0o755 });
+    }
+    const provider = { client: {
+      getBox: async () => ({ phase: 'running', capabilities: { workloadReleases: true } }),
+      updateWorkload: async (_id: string, revision: string) => { revisions.push(revision); },
+    } } as unknown as CellboxSandboxProvider;
+    const lifecycle = new SandboxLifecycle([new SandboxRuntimeConfig({ provider, sharedDataRoot: root }).extension]);
+    for (const [box, published] of [['one', first], ['one', next], ['two', next]]) {
+      await writeFile(join(root, 'harness', 'current'), published);
+      await lifecycle.run({ action: 'create', resourceKey: box, sandboxId: box }, async () => {});
+    }
+    assert.deepEqual(revisions, [first, first, next]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

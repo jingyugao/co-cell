@@ -174,6 +174,7 @@ const runtime = new ContainerCodexRuntime({ sandboxes: projectSandboxes, provide
   sharedDataDirectory: pathToFileURL(`${sharedDataRoot}/`),
   ...(sharedDirectory ? { sharedFilesMounted: (id: string) => cellboxRuntime.usesSharedDirectory(id) } : {}),
   appServer, appServerReader, paths:CELLBOX_PRODUCT_PATHS, prepareRemote:(handle,target,signal,info)=>cellboxRuntime.prepare(handle,target,signal,info),
+  upgradeHarness:(id, revision)=>cellboxRuntime.upgradeHarness(id, revision),
   remoteArchives:cellboxRuntime.remoteArchives,
   serviceAccess:(id:string,port:number)=>cellboxProvider.getServiceAccess(id,port) });
 const webDataDirectory = resolve(process.env.CODEX_WEB_DATA_DIR || 'data/web-state');

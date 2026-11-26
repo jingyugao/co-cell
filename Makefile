@@ -55,7 +55,7 @@ deploy-cellbox-api deploy-cellbox-controller deploy-cellbox-local-metadata:
 
 deploy-cocell-sandbox:
 	@test -n "$${CELLBOX_SOURCE_DIR:-}" || { echo "Set CELLBOX_SOURCE_DIR to the Cellbox source directory" >&2; exit 2; }
-	@test -n "$${COCELL_REGISTRY_ENDPOINT:-}" || { echo "Set COCELL_REGISTRY_ENDPOINT to the local HTTP registry origin" >&2; exit 2; }
+	@test -n "$${COCELL_MOUNTED_BASE_IMAGE:-}$${COCELL_REGISTRY_ENDPOINT:-}" || { echo "Set COCELL_MOUNTED_BASE_IMAGE or the prepared image registry COCELL_REGISTRY_ENDPOINT" >&2; exit 2; }
 	@test -n "$${CELLBOX_PROFILE:-}" -a -n "$${CELLBOX_CLIENT_ID:-}" || { echo "Set CELLBOX_PROFILE and CELLBOX_CLIENT_ID" >&2; exit 2; }
 	@test -n "$${COCELL_SANDBOX_IMAGE_TAG:-}" || { echo "Set COCELL_SANDBOX_IMAGE_TAG to a new vMAJOR.MINOR.PATCH version" >&2; exit 2; }
 	@test -n "$${CELLBOX_TEMPLATE_ID:-}$${CELLBOX_REVISION_ID:-}" -o "$${COCELL_CELLBOX_CREATE_TEMPLATE:-0}" = 1 || { echo "Set a template/revision selector or explicitly opt into first template creation" >&2; exit 2; }

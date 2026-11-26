@@ -1,6 +1,6 @@
 #!/usr/local/bin/node
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { encodeWorkingDirectory } from '../../util/tool-working-directory.mjs';
 
 const invocationArgs = process.argv.slice(2);
@@ -43,7 +43,8 @@ if (!dynamicName || ['--help', '-h', 'help', 'list'].includes(dynamicName)) {
 }
 const tool = 'cocell_tool';
 let allowed = [];
-try { allowed = JSON.parse(readFileSync('/opt/product/cocell/proxy-tool-ids.json', 'utf8')); }
+const bundled = new URL('./proxy-tool-ids.json', import.meta.url);
+try { allowed = JSON.parse(readFileSync(existsSync(bundled) ? bundled : '/opt/product/cocell/proxy-tool-ids.json', 'utf8')); }
 catch { /* No local proxy tools were configured for this image. */ }
 if (!Array.isArray(allowed) || !allowed.includes(tool) ||
     !/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(dynamicName ?? '')) {

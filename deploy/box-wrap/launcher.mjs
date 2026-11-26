@@ -101,10 +101,13 @@ async function takeConfig(path, shared = false) {
   }
 }
 
-async function attachSharedFiles(codexHome, sharedDirectory) {
+async function attachSharedFiles(codexHome, sharedDirectory, assets) {
   for (const name of ['AGENTS.md', 'docs']) {
     const destination = join(codexHome, name);
-    const source = join(sharedDirectory, name);
+    const published = assets && join(assets, name);
+    const source = published && await lstat(published).catch(err => { if (err.code !== 'ENOENT') throw err; })
+      ? published : sharedDirectory && join(sharedDirectory, name);
+    if (!source) continue;
     if (await readlink(destination).catch(error => {
       if (['ENOENT', 'EINVAL'].includes(error.code)) return null;
       throw error;
@@ -215,7 +218,7 @@ async function runCodex(config, { workspace, agentHome, codex, codexHome, shared
 export async function startLauncher({ workspace = DEFAULT_WORKSPACE, codex = DEFAULT_CODEX,
   agentHome = '/home/agent',
   startupDirectory = '/home/agent/.cocell-startup', sharedDirectory = process.env.COCELL_LAUNCHER_SHARED_DIRECTORY,
-  pollMs = POLL_MS, signal, acpHost, log = message => console.error(`cocell launcher: ${message}`) } = {}) {
+  assets, pollMs = POLL_MS, signal, acpHost, log = message => console.error(`cocell launcher: ${message}`) } = {}) {
   if (!signal) throw new Error('an AbortSignal is required');
   const cocellDir = join(workspace, '.cocell');
   const runtimeDir = startupDirectory;
@@ -223,7 +226,7 @@ export async function startLauncher({ workspace = DEFAULT_WORKSPACE, codex = DEF
   await ensurePrivateDirectory(cocellDir);
   if (!sharedDirectory) await ensurePrivateDirectory(runtimeDir);
   await ensurePrivateDirectory(codexHome);
-  if (sharedDirectory) await attachSharedFiles(codexHome, sharedDirectory);
+  if (sharedDirectory || assets) await attachSharedFiles(codexHome, sharedDirectory, assets);
   await attachCodexHome(agentHome, codexHome);
   const configPath = sharedDirectory ? join(sharedDirectory, 'runtime', 'config.json') : join(runtimeDir, 'config.json');
   log(sharedDirectory ? 'reading shared startup config' : 'waiting for provisioning config');

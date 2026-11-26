@@ -37,18 +37,34 @@ if shared is not None:
         profile["sharedReadOnlyHostPath"] = shared["hostPath"]
     else:
         profile.pop("sharedReadOnlyHostPath", None)
-profile.pop("debugReadOnlyHostPath", None)
-profile.pop("debugReadWriteHostPath", None)
+# A mounted import changes the template's base image. Preserve the operator's
+# default profile image, including its debug HOME policy for existing templates.
+mounted_import = bool(os.environ.get("COCELL_MOUNTED_BASE_IMAGE"))
+if mounted_import and not profile.get("sharedReadOnlyHostPath"):
+    raise SystemExit("A mounted base image requires the shared read-only directory")
+if not mounted_import:
+    profile.pop("debugReadOnlyHostPath", None)
+    profile.pop("debugReadWriteHostPath", None)
 guest = profile.setdefault("guest", {})
-guest.setdefault("agent", sample["guest"]["agent"])
-guest["debug"] = sample["guest"]["debug"]
-guest.pop("debugHome", None)
-guest["workspace"] = sample["guest"]["workspace"]
-guest["command"] = sample["guest"]["command"]
+if not mounted_import:
+    guest.setdefault("agent", sample["guest"]["agent"])
+    guest["debug"] = sample["guest"]["debug"]
+    guest.pop("debugHome", None)
+    guest["workspace"] = sample["guest"]["workspace"]
+    guest["command"] = sample["guest"]["command"]
 if profile.get("sharedReadOnlyHostPath"):
-    guest.setdefault("env", {})["COCELL_LAUNCHER_SHARED_DIRECTORY"] = "/var/lib/cellbox/shared"
+    env = guest.setdefault("env", {})
+    env["CELLBOX_WORKLOAD_RELEASES"] = "/var/lib/cellbox/shared/harness"
+    if mounted_import:
+        env["CELLBOX_RELEASE_TOOLS"] = "cocell_tool,cocell_archive_restore"
+    if os.environ.get("CELLBOX_GUEST_UPDATE_PUBLIC_KEY"):
+        env["CELLBOX_GUEST_UPDATE_PUBLIC_KEY"] = os.environ["CELLBOX_GUEST_UPDATE_PUBLIC_KEY"]
+    env["COCELL_LAUNCHER_SHARED_DIRECTORY"] = "/var/lib/cellbox/shared"
     guest.setdefault("credentialSources", {})["cocell_tool_runtime"] = "/var/lib/cellbox/shared/runtime/tool-configs/{boxId}.json"
 else:
+    guest.setdefault("env", {}).pop("CELLBOX_GUEST_UPDATE_PUBLIC_KEY", None)
+    guest.setdefault("env", {}).pop("CELLBOX_RELEASE_TOOLS", None)
+    guest.setdefault("env", {}).pop("CELLBOX_WORKLOAD_RELEASES", None)
     guest.setdefault("env", {}).pop("COCELL_LAUNCHER_SHARED_DIRECTORY", None)
     guest.setdefault("credentialSources", {}).pop("cocell_tool_runtime", None)
 # Register the protected entries once; auto-trusted imports inherit them.
@@ -66,11 +82,12 @@ if dispatcher is None:
 dispatcher.update({"executable": "/opt/cellbox/tools/cocell-proxy", "args": ["--dynamic", "-"],
                    "passThroughArgs": True, "credentialEnv": {"COCELL_TOOL_RUNTIME": "cocell_tool_runtime"},
                    "workspaceRead": True, "workspaceWrite": False})
-profile["image"] = image
+if not mounted_import:
+    profile["image"] = image
 # CoCell's internal profile inherits tools and managed HOME for each new import.
 profile["autoTrustImportedImages"] = True
 trusted = profile.setdefault("trustedToolImages", [])
-if image not in trusted:
+if not mounted_import and image not in trusted:
     trusted.append(image)
 if os.environ.get("COCELL_DEBUG_HOME_VERSION") == "1":
     if not profile.get("sharedReadOnlyHostPath"):

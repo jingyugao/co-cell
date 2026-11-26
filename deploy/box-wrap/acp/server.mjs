@@ -121,6 +121,7 @@ export async function startClaudeAcpHost({ directory, workspace, agentHome, shar
     if (extra !== undefined && (!extra || typeof extra !== 'object' || Array.isArray(extra))) throw failure(400, '模型配置无效');
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('CODEX_') && !key.startsWith('CELLBOX_') && !key.startsWith('COCELL_') && !key.startsWith('OPENAI_') && !key.startsWith('ANTHROPIC_') && key !== 'CLAUDE_CODE_OAUTH_TOKEN' && key !== 'NODE_OPTIONS' && key !== 'NODE_PATH' && key !== 'LD_PRELOAD' && key !== 'LD_LIBRARY_PATH'));
     if (agentHome) env.HOME = agentHome;
+    if (process.env.COCELL_HARNESS_BIN) env.COCELL_HARNESS_BIN = process.env.COCELL_HARNESS_BIN;
     if (sharedDirectory) env.PATH = [join(sharedDirectory, 'tools/current/bin'), env.PATH].filter(Boolean).join(':');
     env.CLAUDE_CONFIG_DIR = join(dirname(directory), 'claude');
     env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1';

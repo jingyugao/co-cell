@@ -24,9 +24,9 @@ test('CoCell profile enables automatic import trust and migrates native tools to
         ] } }, peer,
     ] } } };
     const image = `registry.example/new@sha256:${'b'.repeat(64)}`;
-    const update = input => JSON.parse(execFileSync('uv', ['run', '--no-project', 'python', 'deploy/scripts/cellbox/patch-cocell-profile.py',
+    const update = (input, env = {}) => JSON.parse(execFileSync('uv', ['run', '--no-project', 'python', 'deploy/scripts/cellbox/patch-cocell-profile.py',
       'cocell', image, 'deploy/box-wrap/profile.sample.json'], { input: JSON.stringify(input), encoding: 'utf8',
-      env: { ...process.env, COCELL_MOUNTS_CONFIG: mounts, COCELL_DEBUG_READ_ONLY_HOST_PATH: '', COCELL_DEBUG_READ_WRITE_HOST_PATH: '', COCELL_DEBUG_HOME_VERSION: '1' } }));
+      env: { ...process.env, COCELL_MOUNTS_CONFIG: mounts, COCELL_DEBUG_READ_ONLY_HOST_PATH: '', COCELL_DEBUG_READ_WRITE_HOST_PATH: '', COCELL_DEBUG_HOME_VERSION: '1', COCELL_MOUNTED_BASE_IMAGE: '', ...env } }));
     const patched = update(values), profile = patched.api.config.profiles[0];
     assert.equal(profile.autoTrustImportedImages, true);
     assert.equal(profile.debugReadWriteHostPath, '/operator/shared/runtime/debug-homes');
@@ -44,5 +44,10 @@ test('CoCell profile enables automatic import trust and migrates native tools to
     assert.equal(profile.guest.tools.some(tool => tool.id === 'cocell_archive_backup'), false,
       'the removed CoCell backup payload must not remain registered');
     assert.deepEqual(update({ api: { ...values.api, config: patched.api.config } }), {}, 'An identical profile must not trigger another rollout');
+    const imported = update(patched, { COCELL_MOUNTED_BASE_IMAGE: image, COCELL_DEBUG_HOME_VERSION: '' }).api.config.profiles[0];
+    assert.equal(imported.image, profile.image);
+    assert.deepEqual(imported.guest.command, profile.guest.command);
+    assert.equal(imported.debugReadWriteHostPath, profile.debugReadWriteHostPath);
+    assert.equal(imported.guest.env.CELLBOX_RELEASE_TOOLS, 'cocell_tool,cocell_archive_restore');
   } finally { await rm(root, { recursive: true, force: true }); }
 });

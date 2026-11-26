@@ -99,6 +99,14 @@ def main() -> int:
         if status != 200 or not isinstance(profiles, list) or not any(p.get("id") == profile for p in profiles):
             raise RuntimeError("Configured CELLBOX_PROFILE is not available in Cellbox")
 
+        capabilities = next(p for p in profiles if p.get("id") == profile).get("capabilities", {})
+        if capabilities.get("mountedReleaseTools"):
+            run_command = f"docker run -w /home/agent/workspace --entrypoint /opt/cellbox/bin/cellbox-container-agent {shlex.quote(image)} mounted-workload"
+        elif os.environ.get("COCELL_MOUNTED_BASE_IMAGE"):
+            raise RuntimeError("Configured profile must support mountedReleaseTools before importing a bare base image")
+        else:
+            run_command = f"docker run --entrypoint /usr/local/bin/node {shlex.quote(image)} /opt/product/cocell/launcher.mjs"
+
         if create:
             # This POST is deliberately submitted once. An interrupted response is an unknown outcome;
             # the operator must inspect the catalog before attempting another create.
@@ -126,8 +134,7 @@ def main() -> int:
         status, operation = request(base, f"/v1/templates/{family_id}/revisions", client, "POST",
                                     {"userVersion": version, "baseImage": image, "profileId": profile,
                                      "warmSlots": warm_slots,
-                                     "runCommand": "docker run --entrypoint /usr/local/bin/node "
-                                                   + shlex.quote(image) + " /opt/product/cocell/launcher.mjs"})
+                                     "runCommand": run_command})
         if status != 202 or not isinstance(operation, dict) or not operation.get("id"):
             raise RuntimeError("Revision build submission was not confirmed; inspect Cellbox operations before retrying")
         operation_id = operation["id"]

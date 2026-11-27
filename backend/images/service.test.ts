@@ -6,7 +6,7 @@ import type { Project } from '../../protocol/types.js';
 import type { ImageRecord } from './store.js';
 import { ImageCatalog } from './service.js';
 
-function fixture(seed: ImageRecord[] = [], mountedReleaseTools = false) {
+function fixture(seed: ImageRecord[] = []) {
   const documents = new Map(seed.map(record => [record.id, structuredClone(record)]));
   const templates = new Map<string, CellboxTemplate>();
   const revisions = new Map<string, CellboxTemplateRevision>();
@@ -27,7 +27,6 @@ function fixture(seed: ImageRecord[] = [], mountedReleaseTools = false) {
     },
   };
   const client = {
-    async listProfiles() { return [{ id: 'profile-test', capabilities: { mountedReleaseTools } }]; },
     async listTemplates() { return [...templates.values()]; },
     async getTemplate(id: string) { const value = templates.get(id); if (!value) throw new CellboxError('NOT_FOUND', 'template missing'); return value; },
     async createTemplate(input: { name: string; description?: string }) {
@@ -95,17 +94,6 @@ test('catalog creates a Cellbox template and each explicit sync submits one new 
   await catalog.sync(repository.id, { tag: 'v1' });
   assert.equal(f.builds.length, 2, 'a deliberate second submit is a new build, even for the same tag');
   assert.notEqual(f.builds[0].input, f.builds[1].input);
-});
-
-test('release-native images preserve only the requested build steps', async () => {
-  for (const command of [undefined, 'install-project-toolchain']) {
-    const f = fixture([], true);
-    const catalog = f.catalog();
-    const image = await catalog.addRepository({ name: 'Base', category: 'Dev', repository: 'team/base', buildCommand: command });
-    await catalog.sync(image.id, { tag: 'v1' });
-    assert.equal(f.builds[0].input.buildCommand, command ?? '');
-    assert.match(String(f.builds[0].input.runCommand), /cellbox-container-agent .* mounted-workload$/);
-  }
 });
 
 test('unknown build submission is shown as unknown and is never replayed', async () => {

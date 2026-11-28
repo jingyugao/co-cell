@@ -1,5 +1,34 @@
 import { test, expect } from './fixture.mjs';
 
+test('typing updates the draft without rerendering conversation history', async ({ page, ui }) => {
+  await ui.complete('paused');
+  const session = ui.sessions.get('old-session');
+  session.turns = [{ id: 'rendered-turn', prompt: '已有任务', images: [], status: 'completed',
+    startedAt: session.createdAt, completedAt: session.createdAt,
+    items: [{ id: 'rendered-reply', type: 'agent_message', text: '已有的 **Markdown** 回复' }] }];
+  await page.addInitScript(() => { window.__conversationHistoryRenders = 0; });
+  await page.route('**/fe/features/chat/ConversationHistory.tsx', async route => {
+    const response = await route.fetch();
+    const source = await response.text();
+    const instrumented = source.replace(/function ConversationHistory\([^)]*\) \{/, match =>
+      `${match}\nglobalThis.__conversationHistoryRenders++;`);
+    expect(instrumented).not.toBe(source);
+    await route.fulfill({ response, body: instrumented });
+  });
+  await page.goto('/sessions/old-session');
+  await expect(page.locator('.agent-message')).toContainText('已有的');
+  await expect(page.locator('.agent-message strong')).toHaveText('Markdown');
+  await expect.poll(() => ui.count('GET', '/api/sessions/old-session/subagents')).toBe(1);
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const initialRenders = await page.evaluate(() => window.__conversationHistoryRenders);
+  expect(initialRenders).toBeGreaterThan(0);
+  await ui.editor.pressSequentially('输入不会刷新历史', { delay: 20 });
+  await expect(ui.editor).toHaveValue('输入不会刷新历史');
+  expect(await page.evaluate(() => window.__conversationHistoryRenders)).toBe(initialRenders);
+  await page.reload();
+  await expect(ui.editor).toHaveValue('输入不会刷新历史');
+});
+
 test('subagent read failures retry after readiness and clear the warning on success', async ({ page, ui }) => {
   ui.complete('paused');
   let reads = 0;
